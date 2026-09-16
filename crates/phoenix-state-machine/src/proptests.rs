@@ -248,11 +248,15 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
     (
         proptest::collection::vec(arb_user_question(), 1..=4),
         "[a-z]{8}",
+        "[a-z]{8}",
     )
-        .prop_map(|(questions, tool_use_id)| ConvState::AwaitingUserResponse {
-            questions,
-            tool_use_id,
-        })
+        .prop_map(
+            |(questions, tool_use_id, request_id)| ConvState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+                request_id,
+            },
+        )
 }
 
 fn arb_awaiting_recovery_state() -> impl Strategy<Value = ConvState> {
@@ -367,6 +371,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
+            request_id: "tool-auq-1".to_string(),
             answers,
             annotations: None,
         }
@@ -395,7 +400,9 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
-        Just(Event::UserQuestionDismissed),
+        Just(Event::UserQuestionDismissed {
+            request_id: "tool-auq-1".to_string()
+        }),
         arb_grace_turn_exhausted_event(),
     ]
 }
@@ -614,13 +621,16 @@ proptest! {
         );
     }
 
-    // Invariant 5c: ContextExhausted is stable (ignores non-message events)
     #[test]
     fn prop_context_exhausted_stable(
         summary in "[a-zA-Z0-9 ]{0,50}",
         event in arb_event().prop_filter("not UserMessage", |e| !matches!(e, Event::UserMessage { .. }))
     ) {
         let state = ConvState::ContextExhausted { summary: summary.clone() };
+        if matches!(event, Event::UserQuestionResponse { .. } | Event::UserQuestionDismissed { .. }) {
+            prop_assert!(transition(&state, &test_context(), event).is_err(), "a consumed question identity must reject even in a stable terminal state");
+            return Ok(());
+        }
         let result = transition(&state, &test_context(), event);
         prop_assert!(
             result.is_ok(),
@@ -685,7 +695,7 @@ proptest! {
         if let Ok(result) = transition(&state, &test_context(), event) {
             if result.new_state != state {
                 prop_assert!(
-                    result.effects.iter().any(|e| matches!(e, Effect::PersistState)),
+                    result.effects.iter().any(|e| matches!(e, Effect::PersistState | Effect::CommitQuestionRequest { .. })),
                     "State changed but no PersistState effect: {:?} -> {:?}",
                     state,
                     result.new_state

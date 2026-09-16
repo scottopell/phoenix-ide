@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS message_images (
     PRIMARY KEY (message_id, ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS question_dismissal_pauses (
+    conversation_id TEXT PRIMARY KEY NOT NULL REFERENCES conversations(id) ON DELETE CASCADE
+);
+
 -- Pending steering messages, normalized out of the conversations.steering_queue
 -- blob. A steering entry is a queued user message; its own attachments are
 -- grandchild collections (never an earned blob). skill_* is an all-or-nothing

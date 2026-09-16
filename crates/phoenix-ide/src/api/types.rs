@@ -490,7 +490,13 @@ pub struct ProductConversationRouteResponse {
     pub transcript_row_id: String,
 }
 
-/// Response with conversation and messages
+#[derive(Debug, Serialize)]
+pub struct ConversationStatusResponse {
+    pub conversation: serde_json::Value,
+    pub agent_working: bool,
+    pub presentation_mode: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConversationWithMessagesResponse {
     pub conversation: serde_json::Value,

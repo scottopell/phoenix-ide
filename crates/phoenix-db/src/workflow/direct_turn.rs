@@ -274,6 +274,16 @@ pub struct AtomicContinuationSettlementInput {
     pub command: TurnCommand,
 }
 
+#[derive(Debug, Clone)]
+pub struct AtomicQuestionSettlementInput {
+    pub conversation_id: String,
+    pub request_id: String,
+    pub message: Message,
+    pub completed_state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+    pub command: TurnCommand,
+}
+
 fn authority_event(
     authority: &super::LocalAttemptAuthority,
     turn_id: TurnAuthorityId,
@@ -1576,6 +1586,118 @@ impl WorkflowRepository {
         Ok(Some(summary))
     }
 
+    pub async fn establish_question_direct_turn(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+    ) -> crate::QuestionCommitResult {
+        self.establish_question_direct_turn_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn establish_question_direct_turn_at_cut(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+        cut: TransactionCut,
+    ) -> crate::QuestionCommitResult {
+        let result = self.settle_question_direct_turn_at_cut(input, cut).await;
+        crate::question_response::establish_question_commit(
+            &self.pool,
+            result,
+            &input.request_id,
+            &input.message,
+            &input.completed_state,
+            input.state_updated_at,
+            Some(&input.command),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn settle_question_direct_turn_atomically(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+    ) -> DbResult<bool> {
+        self.settle_question_direct_turn_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn settle_question_direct_turn_at_cut(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+        cut: TransactionCut,
+    ) -> DbResult<bool> {
+        if input.completed_state != ConvState::Idle {
+            return Err(DbError::Serialization(
+                "question direct-turn settlement requires idle state".to_string(),
+            ));
+        }
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
+        let (mut connection, pool_timing) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
+            .await?;
+        let (mut tx, timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
+            })
+            .await?;
+        let committed = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                let (turn_id, expected_generation, _) = terminal_command_parts(&input.command)?;
+                let owns: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM durable_turns WHERE turn_id = ?1
+                 AND conversation_id = ?2 AND generation = ?3 AND owns_conversation = 1
+                 AND terminal_kind IS NULL)",
+                )
+                .bind(to_i64(turn_id.0, "turn_id")?)
+                .bind(&input.conversation_id)
+                .bind(to_i64(expected_generation, "generation")?)
+                .fetch_one(&mut *tx.tx)
+                .await?;
+                if !owns {
+                    return Ok(false);
+                }
+                if !crate::commit_question_response_tx(
+                    &mut tx.tx,
+                    &input.conversation_id,
+                    &input.request_id,
+                    &input.message,
+                    &input.completed_state,
+                    input.state_updated_at,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: Some(PersistedConversationProjection {
+                            state: input.completed_state.clone(),
+                            state_updated_at: input.state_updated_at,
+                        }),
+                    },
+                )
+                .await?;
+                Ok(true)
+            })
+            .await?;
+        if !committed || cut == TransactionCut::BeforeCommit {
+            telemetry.observe_rollback_db(timing, tx.rollback()).await?;
+            if cut == TransactionCut::BeforeCommit {
+                return Err(injected_cut(cut));
+            }
+        } else {
+            telemetry.observe_commit_db(timing, tx.commit()).await?;
+            if cut == TransactionCut::AfterCommit {
+                return Err(injected_cut(cut));
+            }
+        }
+        Ok(committed)
+    }
+
     pub async fn settle_continuation_direct_turn_atomically(
         &self,
         input: &AtomicContinuationSettlementInput,
@@ -2379,7 +2501,9 @@ fn terminal_from_sql(
     }
 }
 
-fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
+pub(crate) fn terminal_command_parts(
+    command: &TurnCommand,
+) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
     match command {
         TurnCommand::Complete {
             turn_id,
@@ -2799,6 +2923,10 @@ async fn update_conversation_state_for_adoption_tx(
     if updated != 1 {
         return Err(DbError::ConversationNotFound(conversation.0.clone()));
     }
+    sqlx::query("DELETE FROM question_dismissal_pauses WHERE conversation_id = ?1")
+        .bind(&conversation.0)
+        .execute(&mut *tx.tx)
+        .await?;
     Ok(())
 }
 
@@ -3278,7 +3406,7 @@ fn disposition_sql(disposition: AcceptedDisposition) -> &'static str {
     }
 }
 
-fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
+pub(crate) fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
     match terminal {
         TurnTerminal::Completed => ("Completed", None),
         TurnTerminal::Cancelled => ("Cancelled", None),
@@ -4125,6 +4253,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_delivers_accepted_resume_and_releases_later_steering() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "queued-beats-direct", 29).await;
+        let authority = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        sqlx::query("INSERT INTO question_dismissal_pauses (conversation_id) VALUES ('conv-a')")
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text)
+             VALUES ('queued-first', 'conv-a', 0, 'older queued objective')",
+        )
+        .execute(repo.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                authority,
+                1,
+                1,
+                "message-conv-a-queued-beats-direct",
+                10,
+            ))
+            .await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized { .. }
+            )
+        ));
+        let pause_still_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM question_dismissal_pauses WHERE conversation_id = 'conv-a')",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert!(!pause_still_exists);
+        let queued_steering_still_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id = 'conv-a' AND message_id = 'queued-first')",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert!(queued_steering_still_exists);
+    }
+
+    #[tokio::test]
     async fn committed_canonical_payload_mismatch_is_classification_error() {
         let repo = repo().await;
         let (turn_id, workflow_id) = created_turn(&repo, "payload-drift", 28).await;
@@ -4796,6 +4976,178 @@ mod tests {
             repo.probe_terminal_projection(&expected).await.unwrap(),
             TerminalProjectionProbe::Superseded
         );
+    }
+
+    #[tokio::test]
+    async fn question_settlement_commits_marker_idle_and_owner_release_as_one_unit() {
+        for cut in [
+            TransactionCut::None,
+            TransactionCut::BeforeCommit,
+            TransactionCut::AfterCommit,
+        ] {
+            let repo = repo().await;
+            let created = repo
+                .accept_authoritative_turn(&input("conv-a", "question-dismiss", 8))
+                .await
+                .unwrap();
+            let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+                panic!("expected turn");
+            };
+            let pending = ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "pending".into(),
+                request_id: "pending".into(),
+            };
+            sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'awaiting_user_response' WHERE id = 'conv-a'")
+                .bind(serde_json::to_string(&pending).unwrap()).execute(&repo.pool).await.unwrap();
+            let content = crate::MessageContent::system("[ask-user-question-dismissed]");
+            let settlement = AtomicQuestionSettlementInput {
+                conversation_id: "conv-a".into(),
+                request_id: "pending".into(),
+                message: crate::Message {
+                    message_id: "dismissal".into(),
+                    conversation_id: "conv-a".into(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: Some(serde_json::json!({"hidden": true})),
+                    usage_data: None,
+                    created_at: Utc::now(),
+                },
+                completed_state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                command: TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+            };
+            let result = repo
+                .establish_question_direct_turn_at_cut(&settlement, cut)
+                .await;
+            let committed = cut != TransactionCut::BeforeCommit;
+            if committed {
+                assert!(matches!(
+                    result,
+                    super::super::LocalAuthorityResult::DurableFactEstablished(
+                        crate::QuestionCommitOutcome::Committed
+                    )
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    super::super::LocalAuthorityResult::DurableFactEstablished(
+                        crate::QuestionCommitOutcome::NotCommitted(_)
+                    )
+                ));
+            }
+            let turn = repo
+                .load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(turn.owns_conversation(), !committed);
+            assert_eq!(turn.generation, u64::from(committed));
+            let state_json: String =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<ConvState>(&state_json).unwrap(),
+                if committed { ConvState::Idle } else { pending }
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = 'dismissal'")
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, i64::from(committed));
+            assert_eq!(
+                repo.settle_question_direct_turn_atomically(&settlement)
+                    .await
+                    .unwrap(),
+                !committed
+            );
+            assert!(!repo
+                .settle_question_direct_turn_atomically(&settlement)
+                .await
+                .unwrap());
+            let turn = repo
+                .load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(turn.generation, 1);
+            assert!(!turn.owns_conversation());
+            repo.pool.close().await;
+            assert!(matches!(
+                repo.establish_question_direct_turn(&settlement).await,
+                super::super::LocalAuthorityResult::DurableFactUnclassified
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn question_settlement_rejects_stale_turn_authority_without_consuming_request() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "question-stale-turn", 8))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected turn");
+        };
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "pending".into(),
+            request_id: "pending".into(),
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'awaiting_user_response' WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&pending).unwrap()).execute(&repo.pool).await.unwrap();
+        let content = crate::MessageContent::system("[ask-user-question-dismissed]");
+        let settlement = AtomicQuestionSettlementInput {
+            conversation_id: "conv-a".into(),
+            request_id: "pending".into(),
+            message: crate::Message {
+                message_id: "stale-dismissal".into(),
+                conversation_id: "conv-a".into(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: Some(serde_json::json!({"hidden": true})),
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            completed_state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 99,
+            },
+        };
+        assert!(!repo
+            .settle_question_direct_turn_atomically(&settlement)
+            .await
+            .unwrap());
+        assert!(repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owns_conversation());
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(serde_json::from_str::<ConvState>(&state).unwrap(), pending);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE message_id = 'stale-dismissal'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

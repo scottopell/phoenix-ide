@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   historyMergeEventCursorFloor,
+  historyHasAuthoritativeTranscriptGeneration,
+  historyRequestHasCursor,
+  historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type ActiveHistoryRequest,
@@ -17,6 +20,7 @@ const manualRequest = (currentView: HistoryView, token = 1): ActiveHistoryReques
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
+  snapshotStartedAtPhase: {type:'idle'},
   intent: { kind: 'reader_expansion', restore: { kind: 'reader_anchor', messageId: 'm50', viewportStartOffset: 12 } },
 });
 
@@ -24,6 +28,7 @@ const deepLinkRequest = (currentView: HistoryView, token = 1): ActiveHistoryRequ
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
+  snapshotStartedAtPhase: {type:'idle'},
   intent: { kind: 'deep_link', targetMessageId: 'm1' },
 });
 
@@ -32,6 +37,40 @@ describe('history expansion reducer', () => {
     const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: 17 };
 
     expect(historyMergeEventCursorFloor(request)).toBe(17);
+  });
+
+  it('requires a live cursor before a history response can participate in phase adoption', () => {
+    const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: null };
+
+    expect(historyRequestHasCursor(request)).toBe(false);
+  });
+
+  it('requires authoritative transcript generation before checking history response currency', () => {
+    expect(historyHasAuthoritativeTranscriptGeneration(null)).toBe(false);
+    expect(historyHasAuthoritativeTranscriptGeneration(3)).toBe(true);
+  });
+
+  it('rejects a superseded equal-cursor history response by request token', () => {
+    const currentView = view('a', 1);
+    const first = { ...deepLinkRequest(currentView, 1), snapshotStartedAtEventSeq: 12 };
+    const second = { ...deepLinkRequest(currentView, 2), snapshotStartedAtEventSeq: 12 };
+
+    expect(historyResponseMatchesCurrentRequest(
+      first,
+      second.token,
+      currentView,
+      currentView.transcriptGeneration,
+      currentView.conversationId,
+      currentView.transcriptGeneration,
+    )).toBe(false);
+    expect(historyResponseMatchesCurrentRequest(
+      second,
+      second.token,
+      currentView,
+      currentView.transcriptGeneration,
+      currentView.conversationId,
+      currentView.transcriptGeneration,
+    )).toBe(true);
   });
 
   it('rejects an A generation 1 response after A generation 3 replaces it', () => {

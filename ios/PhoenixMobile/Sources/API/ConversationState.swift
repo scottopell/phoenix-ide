@@ -52,7 +52,8 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(questions: [UserQuestion])
+    case awaitingUserResponse(requestId: String, questions: [UserQuestion])
+    case questionIdentityUnavailable
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
     case provisioning
@@ -73,7 +74,8 @@ enum ConversationState: Equatable {
     /// `{ "type": ..., ...fields }` object.
     static func parse(_ json: JSONValue?) -> ConversationState {
         guard let json else { return .unknown }
-        guard let type = json.stringValue ?? json["type"]?.stringValue else {
+        guard let type = json.stringValue ?? json["type"]?.stringValue,
+              !type.isEmpty, type == type.trimmingCharacters(in: .whitespacesAndNewlines) else {
             return .unknown
         }
         switch type {
@@ -95,9 +97,12 @@ enum ConversationState: Equatable {
         case "awaiting_continuation":
             return .awaitingContinuation
         case "awaiting_user_response":
+            guard let requestId = json["request_id"]?.stringValue,
+                  !requestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return .questionIdentityUnavailable }
             let questions = (json["questions"]?.arrayValue ?? [])
                 .compactMap(UserQuestion.parse)
-            return .awaitingUserResponse(questions: questions)
+            return .awaitingUserResponse(requestId: requestId, questions: questions)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,
@@ -137,6 +142,13 @@ enum ConversationState: Equatable {
             return .other(type: type)
         }
     }
+    var questionStatusIsUnverifiable: Bool {
+        switch self {
+        case .questionIdentityUnavailable, .unknown: return true
+        default: return false
+        }
+    }
+
     /// Mirrors the server's chat/steering acceptance families. Plain
     /// cancellation rejects chat, while tool and sub-agent cancellation
     /// still accept a follow-up for after the current turn.
@@ -148,7 +160,7 @@ enum ConversationState: Equatable {
         case .error(_, let kind):
             return kind.isUserResumable
         case .awaitingLlm, .awaitingContinuation, .cancelling,
-             .awaitingUserResponse, .awaitingTaskApproval,
+             .awaitingUserResponse, .questionIdentityUnavailable, .awaitingTaskApproval,
              .awaitingRecovery, .provisioning,
              .contextExhausted,
              .creationFailed, .terminal, .handedOff, .other, .unknown:
@@ -163,7 +175,7 @@ enum ConversationState: Equatable {
              .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,
-             .awaitingUserResponse, .error, .creationFailed, .contextExhausted, .cancelling,
+             .awaitingUserResponse, .questionIdentityUnavailable, .error, .creationFailed, .contextExhausted, .cancelling,
              .cancellingTool, .cancellingSubAgents, .terminal, .handedOff,
              .other, .unknown:
             return false

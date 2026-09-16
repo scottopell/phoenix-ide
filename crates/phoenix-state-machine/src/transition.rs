@@ -431,6 +431,12 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
     }
 }
 
+#[must_use]
+pub fn accepts_question_request(state: &ConvState, request_id: &str) -> bool {
+    matches!(state, ConvState::AwaitingUserResponse { request_id: pending, .. }
+        if pending == request_id)
+}
+
 /// Pure transition function — compatibility wrapper.
 ///
 /// Dispatches to `transition_parent` or `transition_sub_agent` based on
@@ -1734,6 +1740,7 @@ fn creation_provisioned_transition(
             | Effect::PersistCheckpoint { .. }
             | Effect::PersistToolResults { .. }
             | Effect::PersistHiddenSystemMarker { .. }
+            | Effect::CommitQuestionRequest { .. }
             | Effect::PersistSubAgentResults { .. }
             | Effect::RequestContinuation { .. }
             | Effect::BeginContinuation { .. }
@@ -1803,6 +1810,19 @@ pub fn transition_parent(
     context: &ConvContext,
     event: ParentEvent,
 ) -> Result<ParentTransitionResult, TransitionError> {
+    if let ParentEvent::Parent(
+        ParentOnlyEvent::UserQuestionResponse { request_id, .. }
+        | ParentOnlyEvent::UserQuestionDismissed { request_id },
+    ) = &event
+    {
+        if !matches!(state, ParentState::AwaitingUserResponse { request_id: pending, .. } if pending == request_id)
+        {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: event.variant_name(),
+            });
+        }
+    }
     match (state, event) {
         // ============================================================
         // Parent-only state: AwaitingTaskApproval
@@ -1942,20 +1962,21 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingUserResponse { .. },
-            ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed),
+            ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed { request_id }),
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistHiddenSystemMarker {
-                    marker: USER_QUESTION_DISMISSED_MARKER,
+                .with_effect(Effect::CommitQuestionRequest {
+                    request_id,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                    resolution: crate::effect::QuestionResolution::Dismissed,
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change()),
         ),
 
         (
             ParentState::AwaitingUserResponse { questions, .. },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                request_id,
                 answers,
                 annotations,
             }),
@@ -1995,14 +2016,11 @@ pub fn transition_parent(
                 ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
                     attempt: 1,
                 }))
-                .with_effect(Effect::PersistMessage {
-                    content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    display_data: None,
-                    usage_data: None,
+                .with_effect(Effect::CommitQuestionRequest {
+                    request_id,
                     message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
+                    resolution: crate::effect::QuestionResolution::Answer { text: user_text },
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
             )
@@ -2549,6 +2567,7 @@ pub fn transition_parent(
                     ParentTransitionResult::new(ParentState::AwaitingUserResponse {
                         questions: input.questions.clone(),
                         tool_use_id: tool.id.clone(),
+                        request_id: uuid::Uuid::new_v4().to_string(),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
@@ -5784,6 +5803,63 @@ mod tests {
     }
 
     #[test]
+    fn question_request_incarnations_do_not_reuse_provider_tool_identity() {
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+        let ask = || {
+            transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "reused".into(),
+                        name: "ask_user_question".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    tool_calls: vec![make_ask_user_question_tool_call("reused")],
+                    end_turn: false,
+                    usage: Usage::default(),
+                    request_id: "provider-request".into(),
+                },
+            )
+            .unwrap()
+            .new_state
+        };
+        let first = ask();
+        let next = ask();
+        let ConvState::AwaitingUserResponse {
+            request_id: first_id,
+            tool_use_id: first_tool,
+            ..
+        } = &first
+        else {
+            panic!("pending")
+        };
+        let ConvState::AwaitingUserResponse {
+            request_id: next_id,
+            tool_use_id: next_tool,
+            ..
+        } = &next
+        else {
+            panic!("pending")
+        };
+        assert_eq!(first_tool, next_tool);
+        assert_ne!(first_id, next_id);
+        for event in [
+            Event::UserQuestionResponse {
+                request_id: first_id.clone(),
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            },
+            Event::UserQuestionDismissed {
+                request_id: first_id.clone(),
+            },
+        ] {
+            assert!(transition(&first, &test_context(), event.clone()).is_ok());
+            assert!(transition(&next, &test_context(), event).is_err());
+        }
+    }
+
+    #[test]
     fn test_ask_user_question_must_be_only_tool() {
         use crate::state::ToolInput;
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
@@ -6049,6 +6125,40 @@ mod tests {
     }
 
     #[test]
+    fn question_mutations_are_bound_to_the_pending_request() {
+        let pending = |id: &str| ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: id.to_string(),
+            request_id: id.to_string(),
+        };
+        for event in [
+            Event::UserQuestionResponse {
+                request_id: "request-a".into(),
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            },
+            Event::UserQuestionDismissed {
+                request_id: "request-a".into(),
+            },
+        ] {
+            let accepted =
+                transition(&pending("request-a"), &test_context(), event.clone()).unwrap();
+            assert!(
+                transition(&accepted.new_state, &test_context(), event.clone()).is_err(),
+                "duplicate must not consume twice"
+            );
+            assert!(
+                transition(&pending("request-b"), &test_context(), event.clone()).is_err(),
+                "old operation must not consume the next request"
+            );
+            assert!(
+                transition(&ConvState::Idle, &test_context(), event).is_err(),
+                "consumed request must reject"
+            );
+        }
+    }
+
+    #[test]
     fn test_awaiting_user_response_with_answer_goes_to_llm_requesting() {
         use crate::state::UserQuestion;
 
@@ -6060,6 +6170,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".to_string(),
         };
 
         let mut answers = std::collections::HashMap::new();
@@ -6069,6 +6180,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
+                request_id: "tool-auq-1".to_string(),
                 answers,
                 annotations: None,
             },
@@ -6081,13 +6193,15 @@ mod tests {
             result.new_state
         );
 
-        // Should have PersistMessage (user answers) + PersistState + RequestLlm
         assert!(
-            result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::PersistMessage { .. })),
-            "Should have PersistMessage effect for user answers"
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::CommitQuestionRequest {
+                    resolution: crate::effect::QuestionResolution::Answer { .. },
+                    ..
+                }
+            )),
+            "Should commit user answer and consumed state together"
         );
         assert!(
             result
@@ -6110,9 +6224,17 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".to_string(),
         };
 
-        let result = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionDismissed {
+                request_id: "tool-auq-1".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(
             matches!(result.new_state, ConvState::Idle),
@@ -6137,11 +6259,14 @@ mod tests {
         );
 
         assert!(
-            result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::PersistState)),
-            "Dismiss should persist the Idle state"
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::CommitQuestionRequest {
+                    resolution: crate::effect::QuestionResolution::Dismissed,
+                    ..
+                }
+            )),
+            "Dismiss should atomically persist its marker and Idle state"
         );
     }
 
@@ -6157,6 +6282,7 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".to_string(),
         };
 
         let result = transition(
@@ -6191,9 +6317,17 @@ mod tests {
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".to_string(),
         };
 
-        let dismissed = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
+        let dismissed = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionDismissed {
+                request_id: "tool-auq-1".to_string(),
+            },
+        )
+        .unwrap();
 
         let result = transition(
             &dismissed.new_state,

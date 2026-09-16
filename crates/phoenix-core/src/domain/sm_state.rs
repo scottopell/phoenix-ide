@@ -840,6 +840,7 @@ mod tests {
             ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "t1".into(),
+                request_id: "t1".into(),
             },
             ConvState::ContextExhausted {
                 summary: "s".into(),
@@ -1234,6 +1235,7 @@ pub enum ConvState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
+        request_id: String,
     },
 
     /// Context window exhausted - conversation is read-only
@@ -1336,6 +1338,7 @@ pub enum ParentState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
+        request_id: String,
     },
     ContextExhausted {
         summary: String,
@@ -1394,9 +1397,11 @@ impl From<ParentState> for ConvState {
             ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_id,
             } => ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_id,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
             ParentState::HandedOff { successor_conv_id } => {
@@ -1607,9 +1612,11 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_id,
             } => Ok(ParentState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+                request_id,
             }),
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })

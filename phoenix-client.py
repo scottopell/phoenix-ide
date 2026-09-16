@@ -234,19 +234,20 @@ class PhoenixClient:
         return resp.json().get('hits', [])
 
 
-    def respond_to_question(self, conv_id: str, answers: dict[str, str]) -> dict:
+    def respond_to_question(self, conv_id: str, request_id: str, answers: dict[str, str]) -> dict:
         """Answer a pending user question (AwaitingUserResponse state)."""
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/respond",
-            json={"answers": answers},
+            json={"request_id": request_id, "answers": answers},
         )
         resp.raise_for_status()
         return resp.json()
 
-    def dismiss_question(self, conv_id: str) -> dict:
+    def dismiss_question(self, conv_id: str, request_id: str) -> dict:
         """Dismiss a pending user question without answering."""
         resp = self.http.post(
-            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question"
+            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question",
+            json={"request_id": request_id},
         )
         resp.raise_for_status()
         return resp.json()
@@ -929,6 +930,16 @@ def print_tasks(tasks: list[dict]) -> None:
             click.echo(f"    owner: {t['conversation_slug']}")
 
 
+def pending_question_identity(conversation: dict) -> str:
+    state = conversation.get("state")
+    if not isinstance(state, dict) or state.get("type", state.get("kind")) != "awaiting_user_response":
+        raise click.UsageError("This conversation is no longer awaiting an answer. Reload it before responding.")
+    identity = state.get("request_id")
+    if not isinstance(identity, str) or not identity.strip():
+        raise click.UsageError("Pending question identity is missing. Update Phoenix and reload the conversation; no answer or dismissal was sent.")
+    return identity
+
+
 def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
     """Parse repeated --flag KEY=VALUE options into a dict.
 
@@ -1334,11 +1345,11 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                         f"left unanswered: {', '.join(repr(q) for q in sorted(unanswered))}. "
                         f"The server irreversibly skips unanswered questions."
                     )
-            client.respond_to_question(conv['id'], answers)
+            client.respond_to_question(conv['id'], pending_question_identity(conv), answers)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_question:
-            client.dismiss_question(conv['id'])
+            client.dismiss_question(conv['id'], pending_question_identity(conv))
             click.echo(f"Dismissed question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_error:

@@ -613,6 +613,8 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    question_commit_unclassified: AtomicBool,
+    question_dismissal_pauses: Mutex<std::collections::HashSet<String>>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -677,6 +679,8 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            question_commit_unclassified: AtomicBool::new(false),
+            question_dismissal_pauses: Mutex::new(std::collections::HashSet::new()),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -710,6 +714,11 @@ impl InMemoryStorage {
 
     pub fn set_continuation_start_recovery_error(&self, error: bool) {
         *self.continuation_start_recovery_error.lock().unwrap() = error;
+    }
+
+    pub fn set_question_commit_unclassified(&self, value: bool) {
+        self.question_commit_unclassified
+            .store(value, Ordering::SeqCst);
     }
 
     pub fn set_fail_state_update(&self, fail: bool) {
@@ -1625,6 +1634,54 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn question_dismissal_paused(&self, conv_id: &str) -> Result<bool, String> {
+        Ok(self
+            .question_dismissal_pauses
+            .lock()
+            .unwrap()
+            .contains(conv_id))
+    }
+
+    async fn settle_question_direct_turn(
+        &self,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+        request_id: &str,
+        message: &Message,
+    ) -> phoenix_db::QuestionCommitResult {
+        use phoenix_db::{workflow::LocalAuthorityResult, QuestionCommitOutcome};
+        {
+            let mut failures = self.settle_active_direct_turn_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return LocalAuthorityResult::DurableFactEstablished(
+                    QuestionCommitOutcome::NotCommitted(
+                        "active direct turn settlement failed before commit".to_string(),
+                    ),
+                );
+            }
+        }
+        let result = self
+            .commit_question_response(
+                &settlement.conversation_id,
+                request_id,
+                message,
+                &settlement.state,
+                settlement.state_updated_at,
+            )
+            .await;
+        if matches!(
+            result,
+            LocalAuthorityResult::DurableFactEstablished(QuestionCommitOutcome::Committed)
+        ) {
+            self.settle_active_direct_turn_calls
+                .lock()
+                .unwrap()
+                .push(settlement.clone());
+            *self.active_direct_turn.lock().unwrap() = None;
+        }
+        result
+    }
+
     async fn settle_continuation_direct_turn(
         &self,
         settlement: &crate::runtime::traits::ContinuationDirectTurnSettlement,
@@ -1971,6 +2028,64 @@ impl StateStore for InMemoryStorage {
             *self.active_direct_turn.lock().unwrap() = None;
         }
         Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
+    async fn commit_question_response(
+        &self,
+        conv_id: &str,
+        request_id: &str,
+        message: &Message,
+        completed_state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> phoenix_db::QuestionCommitResult {
+        use phoenix_db::{workflow::LocalAuthorityResult, QuestionCommitOutcome};
+        if self.question_commit_unclassified.load(Ordering::SeqCst) {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        }
+        let command = || -> Result<bool, String> {
+            if message.conversation_id != conv_id {
+                return Err("question response message targets another conversation".to_string());
+            }
+            if !matches!(
+                completed_state,
+                ConvState::Idle | ConvState::LlmRequesting { attempt: 1 }
+            ) {
+                return Err(
+                    "question response requires idle or initial LLM requesting state".to_string(),
+                );
+            }
+            let mut states = self.states.lock().unwrap();
+            if !matches!(states.get(conv_id), Some(ConvState::AwaitingUserResponse { request_id: pending, .. }) if pending == request_id)
+            {
+                return Ok(false);
+            }
+            if *self.fail_state_update.lock().unwrap() {
+                return Err("injected state update failure".to_string());
+            }
+            if *self.fail_message_add.lock().unwrap() {
+                return Err("injected message persistence failure".to_string());
+            }
+            let mut messages = self.messages.lock().unwrap();
+            let mut timestamps = self.state_updated_ats.lock().unwrap();
+            messages
+                .entry(conv_id.to_string())
+                .or_default()
+                .push(message.clone());
+            states.insert(conv_id.to_string(), completed_state.clone());
+            timestamps.insert(conv_id.to_string(), state_updated_at);
+            if matches!(completed_state, ConvState::Idle) {
+                self.question_dismissal_pauses
+                    .lock()
+                    .unwrap()
+                    .insert(conv_id.to_string());
+            }
+            Ok(true)
+        };
+        LocalAuthorityResult::DurableFactEstablished(match command() {
+            Ok(true) => QuestionCommitOutcome::Committed,
+            Ok(false) => QuestionCommitOutcome::Rejected,
+            Err(error) => QuestionCommitOutcome::NotCommitted(error),
+        })
     }
 
     async fn commit_continuation(

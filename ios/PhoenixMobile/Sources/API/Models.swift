@@ -417,6 +417,12 @@ struct ConversationResponse: Codable {
     var conversation: Conversation
 }
 
+struct ConversationStatusResponse: Decodable {
+    var conversation: Conversation
+    var agent_working: Bool?
+    var presentation_mode: String?
+}
+
 struct ConversationWithMessagesResponse: Codable {
     var conversation: Conversation
     var messages: [Message]

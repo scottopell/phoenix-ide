@@ -10,6 +10,7 @@ struct QuestionCard: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
     let questions: [UserQuestion]
+    let requestId: String
 
     var body: some View {
         QuestionCardBody(
@@ -17,8 +18,9 @@ struct QuestionCard: View {
             isOnline: model.connectivity.isOnline,
             acceptsActions: session.acceptsConversationActions,
             busy: session.actionInFlight != nil,
-            onAnswer: { session.perform(.respondToQuestions(answers: $0)) },
-            onDismiss: { session.perform(.dismissQuestion) })
+            onAnswer: { session.perform(.respondToQuestions(requestId: requestId, answers: $0)) },
+            onDismiss: { session.perform(.dismissQuestion(requestId: requestId)) })
+            .id([session.conversationId, requestId])
     }
 }
 

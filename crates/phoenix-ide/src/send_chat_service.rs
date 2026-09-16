@@ -238,7 +238,12 @@ impl SendChatApplicationService {
             };
             if let Err(error) = self
                 .runtime
-                .enqueue_steer_message(&conversation.id, event, &request_fingerprint)
+                .enqueue_steer_message(
+                    &conversation.id,
+                    event,
+                    &request_fingerprint,
+                    crate::db::SteeringAdmissionSource::ExplicitUserMessage,
+                )
                 .await
             {
                 return match error {
@@ -1298,9 +1303,14 @@ mod tests {
             user_agent: req.user_agent.clone(),
             skill_invocation: None,
         };
-        db.append_steering_entry(&req.conversation_id, &entry, &fingerprint)
-            .await
-            .unwrap();
+        db.append_steering_entry(
+            &req.conversation_id,
+            &entry,
+            &fingerprint,
+            crate::db::SteeringAdmissionSource::ExplicitUserMessage,
+        )
+        .await
+        .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1339,9 +1349,14 @@ mod tests {
             user_agent: req.user_agent.clone(),
             skill_invocation: None,
         };
-        db.append_steering_entry(&req.conversation_id, &entry, &fingerprint)
-            .await
-            .unwrap();
+        db.append_steering_entry(
+            &req.conversation_id,
+            &entry,
+            &fingerprint,
+            crate::db::SteeringAdmissionSource::ExplicitUserMessage,
+        )
+        .await
+        .unwrap();
         let mut changed = req;
         changed.expansion_policy = MessageExpansionPolicy::LiteralText;
 
@@ -1370,9 +1385,14 @@ mod tests {
             user_agent: req.user_agent.clone(),
             skill_invocation: None,
         };
-        db.append_steering_entry(&req.conversation_id, &entry, &fingerprint)
-            .await
-            .unwrap();
+        db.append_steering_entry(
+            &req.conversation_id,
+            &entry,
+            &fingerprint,
+            crate::db::SteeringAdmissionSource::ExplicitUserMessage,
+        )
+        .await
+        .unwrap();
         db.add_message(
             &req.message_id,
             &req.conversation_id,

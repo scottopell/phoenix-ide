@@ -11,7 +11,7 @@ function state(type: ConversationState['type']): ConversationState {
     case 'awaiting_task_approval':
       return { type, title: 'Approve sidebar polish', priority: 'p2', plan: 'Verify the sidebar fixture states.' };
     case 'awaiting_user_response':
-      return { type, questions: [] };
+      return { type, request_id: 'fixture-request', tool_use_id: 'fixture-question', questions: [] };
     case 'context_exhausted':
       return { type, summary: 'Context window exhausted' };
     default:

@@ -258,6 +258,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
 
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'p') {
+        window.dispatchEvent(new CustomEvent('command-palette-opening'));
         e.preventDefault();
         e.stopPropagation();
         setState(prev => {

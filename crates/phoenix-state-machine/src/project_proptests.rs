@@ -451,7 +451,7 @@ mod state_machine_props {
             event in arb_event(),
         ) {
             if let Ok(result) = transition(&state, &test_context(), event) {
-                let persist_pos = result.effects.iter().position(|e| matches!(e, Effect::PersistState));
+                let persist_pos = result.effects.iter().position(|e| matches!(e, Effect::PersistState | Effect::CommitQuestionRequest { .. }));
                 let request_llm_pos = result.effects.iter().position(|e| matches!(e, Effect::RequestLlm));
                 let execute_tool_pos = result.effects.iter().position(|e| matches!(e, Effect::ExecuteTool { .. }));
 
@@ -842,7 +842,11 @@ mod random_walk {
                 },
             },
 
-            ConvState::AwaitingUserResponse { questions, .. } => {
+            ConvState::AwaitingUserResponse {
+                questions,
+                request_id,
+                ..
+            } => {
                 match rng.random_range(0..2) {
                     0 => {
                         // Build answers matching the questions
@@ -860,11 +864,14 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
+                            request_id: request_id.clone(),
                             answers,
                             annotations: None,
                         }
                     }
-                    _ => Event::UserQuestionDismissed,
+                    _ => Event::UserQuestionDismissed {
+                        request_id: request_id.clone(),
+                    },
                 }
             }
 
@@ -908,7 +915,12 @@ mod random_walk {
         //    Exception: ResolveTask effect handles its own persistence atomically
         //    alongside mode and cwd updates (execute_resolve_task).
         if old_state.variant_name() != new_state.variant_name() {
-            let has_persist = effects.iter().any(|e| matches!(e, Effect::PersistState));
+            let has_persist = effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::PersistState | Effect::CommitQuestionRequest { .. }
+                )
+            });
             let has_atomic_persist = effects.iter().any(|effect| {
                 matches!(
                     effect,
@@ -927,9 +939,12 @@ mod random_walk {
         }
 
         // 3. Effect ordering: PersistState before RequestLlm, PersistState before ExecuteTool
-        let persist_pos = effects
-            .iter()
-            .position(|e| matches!(e, Effect::PersistState));
+        let persist_pos = effects.iter().position(|e| {
+            matches!(
+                e,
+                Effect::PersistState | Effect::CommitQuestionRequest { .. }
+            )
+        });
         let request_llm_pos = effects.iter().position(|e| matches!(e, Effect::RequestLlm));
         let execute_tool_pos = effects
             .iter()

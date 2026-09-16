@@ -27,9 +27,23 @@ enum ConversationAction: Equatable {
     case provideTaskFeedback(TaskFeedback)
     /// Answer the agent's questions (awaiting_user_response). Answers are
     /// keyed by question text, encoded per QuestionAnswers.
-    case respondToQuestions(answers: [String: String])
+    case respondToQuestions(requestId: String, answers: [String: String])
     /// Dismiss the questions without answering and return the conversation to idle.
-    case dismissQuestion
+    case dismissQuestion(requestId: String)
+
+    var questionRequestId: String? {
+        switch self {
+        case .respondToQuestions(let requestId, _), .dismissQuestion(let requestId):
+            return requestId
+        default:
+            return nil
+        }
+    }
+
+    var questionRetryLabel: String {
+        if case .dismissQuestion = self { return "Retry dismissal" }
+        return "Retry same answer"
+    }
 
     var waitsForAuthoritativeStateChange: Bool {
         true
