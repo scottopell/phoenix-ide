@@ -18,10 +18,10 @@ import process from 'node:process';
  * @property {string} readyAttribute       data-* attribute the fixture sets to the scenario id when settled.
  * @property {string} outDir               Output directory for PNGs (resolved against cwd).
  * @property {{width:number,height:number}} [viewport]   Capture viewport; defaults to 960x900.
- * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
+ * @property {{name:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
- * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
- * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
+ * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
+ * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number,hasTouch?:boolean,isMobile?:boolean}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
  * @property {(outDir:string) => Promise<void>} [onComplete] Optional report writer after every scenario succeeds.
  */
 
@@ -78,7 +78,13 @@ function normalizeViewportMatrix(viewportMatrix, viewport) {
     if (!Number.isFinite(item.width) || !Number.isFinite(item.height)) {
       throw new Error(`viewportMatrix[${index}] must include finite width and height`);
     }
-    return { name: item.name, width: item.width, height: item.height };
+    return {
+      name: item.name,
+      width: item.width,
+      height: item.height,
+      ...(item.hasTouch === undefined ? {} : { hasTouch: Boolean(item.hasTouch) }),
+      ...(item.isMobile === undefined ? {} : { isMobile: Boolean(item.isMobile) }),
+    };
   });
 }
 
@@ -179,45 +185,50 @@ export async function captureSurface(config) {
   const stories = await discoverStories(storyPrefix);
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await browserType.launch();
-  const page = await browser.newPage({
-    viewport: { width: captureViewports[0].width, height: captureViewports[0].height },
-    deviceScaleFactor: 1,
-  });
-  const consoleErrors = [];
-  page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(message.text());
-  });
-  page.on('pageerror', (error) => consoleErrors.push(error.message));
-  page.on('requestfailed', (request) => {
-    const errorText = request.failure()?.errorText ?? 'unknown';
-    if (request.resourceType() === 'font' && errorText === 'net::ERR_ABORTED') return;
-    consoleErrors.push(`Network request failed: ${request.url()} (${errorText})`);
-  });
-  page.on('response', (response) => {
-    if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
-  });
 
   try {
     for (const { storyKey, id } of stories) {
       for (const currentViewport of captureViewports) {
-        consoleErrors.length = 0;
-        await page.setViewportSize({ width: currentViewport.width, height: currentViewport.height });
-        const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
-          ?? buildLadleStoryUrl(baseUrl, storyKey);
-        await page.goto(url, { waitUntil: 'networkidle' });
-        await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
-        const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
-        if (!captured) {
-          await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
-        }
-        const unexpectedErrors = consoleErrors.filter((error) => {
-          const expected = expectedConsoleErrors.get(id) ?? [];
-          return !expected.some((item) => error.includes(item));
+        const context = await browser.newContext({
+          viewport: { width: currentViewport.width, height: currentViewport.height },
+          deviceScaleFactor: 1,
+          hasTouch: currentViewport.hasTouch ?? false,
+          isMobile: currentViewport.isMobile ?? false,
         });
-        if (unexpectedErrors.length > 0) {
-          throw new Error(`Console errors while capturing ${id}${currentViewport.name ? ` (${currentViewport.name})` : ''}:\n${unexpectedErrors.join('\n')}`);
+        const page = await context.newPage();
+        const consoleErrors = [];
+        page.on('console', (message) => {
+          if (message.type() === 'error') consoleErrors.push(message.text());
+        });
+        page.on('pageerror', (error) => consoleErrors.push(error.message));
+        page.on('requestfailed', (request) => {
+          const errorText = request.failure()?.errorText ?? 'unknown';
+          if (request.resourceType() === 'font' && errorText === 'net::ERR_ABORTED') return;
+          consoleErrors.push(`Network request failed: ${request.url()} (${errorText})`);
+        });
+        page.on('response', (response) => {
+          if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
+        });
+        try {
+          const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
+            ?? buildLadleStoryUrl(baseUrl, storyKey);
+          await page.goto(url, { waitUntil: 'networkidle' });
+          await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
+          const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
+          if (!captured) {
+            await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
+          }
+          const unexpectedErrors = consoleErrors.filter((error) => {
+            const expected = expectedConsoleErrors.get(id) ?? [];
+            return !expected.some((item) => error.includes(item));
+          });
+          if (unexpectedErrors.length > 0) {
+            throw new Error(`Console errors while capturing ${id}${currentViewport.name ? ` (${currentViewport.name})` : ''}:\n${unexpectedErrors.join('\n')}`);
+          }
+          console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
+        } finally {
+          await context.close();
         }
-        console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
       }
     }
     await onComplete?.(resolvedOut);

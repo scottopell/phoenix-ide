@@ -84,6 +84,7 @@ export type { ProductConversationListResponse } from './generated/ProductConvers
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
+import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
@@ -2111,6 +2112,19 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json();
       throw new Error(err.error || 'Failed to rename');
+    }
+    return resp.json();
+  },
+
+  async renameProductConversation(reference: string, title: string): Promise<ProductConversationListRowType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/title`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to rename product conversation');
     }
     return resp.json();
   },

@@ -41,6 +41,40 @@ pub struct SnapshotQuery {
     pub open_id: Option<uuid::Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RenameProductConversationRequest {
+    pub title: String,
+}
+
+pub async fn rename_product_conversation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(req): Json<RenameProductConversationRequest>,
+) -> Result<Json<ProductConversationListRow>, AppError> {
+    let title = normalize_product_conversation_title(&req.title)?;
+    state
+        .db
+        .set_ordinary_product_conversation_title(&reference, &title)
+        .await
+        .map_err(db_to_app)?;
+    let aggregate = state
+        .db
+        .read_ordinary_product_conversation_snapshot(&reference, None, None, 1)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Json(list_row_from_aggregate(&aggregate.aggregate)))
+}
+
+fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
+    let normalized = title.trim();
+    if normalized.is_empty() {
+        return Err(AppError::BadRequest(
+            "Product conversation title cannot be empty".to_string(),
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AggregateCursor {
     product_conversation_id: String,
@@ -278,6 +312,33 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
             &projection.latest_state,
             projection.latest_continued_in_conv_id.is_some(),
             &projection.latest_transcript_row_id,
+        ),
+    }
+}
+
+fn list_row_from_aggregate(aggregate: &ProductConversationAggregate) -> ProductConversationListRow {
+    let latest = aggregate.segments.last().expect("aggregate has segment");
+    let lifecycle = aggregate
+        .product_conversation
+        .ordinary_lifecycle()
+        .expect("ordinary aggregate read returned Coordinator");
+    ProductConversationListRow {
+        product_conversation_id: aggregate.product_conversation.id().to_string(),
+        canonical_route: canonical_route(aggregate),
+        canonical_root: transcript_row_view(&aggregate.root),
+        ordinary_lifecycle: lifecycle_view(lifecycle),
+        latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
+        updated_at: aggregate.updated_at.to_rfc3339(),
+        presentation: presentation(
+            aggregate.root.conversation.title.as_deref(),
+            aggregate.root.conversation.slug.as_deref(),
+            &latest.transcript_row.conversation.state,
+            latest
+                .transcript_row
+                .conversation
+                .continued_in_conv_id
+                .is_some(),
+            &aggregate.latest_transcript_row_id,
         ),
     }
 }
@@ -1063,6 +1124,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_renames_product_conversation_title_without_changing_slug() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("pc-rename-root", "original-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let _successor =
+            create_completed_continuation(&state, &root, "rename-handoff", "rename-opening").await;
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/product-conversations/pc-rename-root/title")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Renamed Product Conversation"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["canonical_root"]["title"],
+            "Renamed Product Conversation"
+        );
+        assert_eq!(body["canonical_root"]["slug"], "original-slug");
+        assert_eq!(
+            body["presentation"]["display_name"],
+            "Renamed Product Conversation"
+        );
+
+        let root_after = state.db.get_conversation(&root.id).await.unwrap();
+        assert_eq!(
+            root_after.title.as_deref(),
+            Some("Renamed Product Conversation")
+        );
+        assert_eq!(root_after.slug.as_deref(), Some("original-slug"));
+    }
+
+    #[tokio::test]
     async fn router_lists_one_ordinary_row_and_resolves_member_snapshot() {
         let state = make_test_state().await;
         let root = state
@@ -1827,6 +1932,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(appended_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_refuses_product_title_rename_for_excluded_references() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("ordinary-root", "ordinary-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let subagent = state
+            .db
+            .create_subagent_conversation(
+                "sub-title-denied",
+                "sub-title-denied",
+                "/tmp",
+                &root.id,
+                "model",
+                &root.conv_mode,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                root.attached_work_scope_id.as_ref(),
+            )
+            .await
+            .unwrap();
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let absent = "absent-title-denied".to_string();
+        for reference in [&subagent.id, &coordinator.id, &absent] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/product-conversations/{reference}/title"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"title":"Denied"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]

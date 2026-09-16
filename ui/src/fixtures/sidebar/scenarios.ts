@@ -125,21 +125,23 @@ const conversations: Conversation[] = [
   })),
 ];
 
-const productConversations: ProductConversationListRow[] = [
-  {
-    product_conversation_id: 'pc-continued-fixture',
-    canonical_route: '/product-conversations/pc-continued-fixture',
-    canonical_root: {
-      transcript_row_id: 'pc-root-transcript',
-      slug: 'fixture-product-root',
-      title: 'Fixture Product Root',
+const productConversations: Partial<Record<SidebarScenario['id'], ProductConversationListRow[]>> = {
+  'product-actions-continued': [
+    {
+      product_conversation_id: 'pc-continued-fixture',
+      canonical_route: '/product-conversations/pc-continued-fixture',
+      canonical_root: {
+        transcript_row_id: 'pc-root-transcript',
+        slug: 'fixture-product-root',
+        title: 'Fixture Product Root',
+      },
+      ordinary_lifecycle: 'open',
+      latest_transcript_row_id: 'pc-latest-continuation',
+      updated_at: isoAgo(3),
+      presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
     },
-    ordinary_lifecycle: 'open',
-    latest_transcript_row_id: 'pc-latest-continuation',
-    updated_at: isoAgo(3),
-    presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
-  },
-];
+  ],
+};
 
 const archivedConversations: Conversation[] = [
   conv('phoenix-archived-1', 'archived-sidebar-discovery', 'phoenix', {
