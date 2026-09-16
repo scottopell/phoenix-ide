@@ -1296,6 +1296,18 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
     )
 
 
+def _is_llm_first_byte_witness(event_name: str, event_data: object) -> bool:
+    if event_name == "llm_first_byte":
+        return True
+    if event_name != "init" or not isinstance(event_data, dict):
+        return False
+    pending_events = event_data.get("pending_events", [])
+    return isinstance(pending_events, list) and any(
+        isinstance(pending, dict) and pending.get("type") == "llm_first_byte"
+        for pending in pending_events
+    )
+
+
 async def _new_conv_until_first_byte_async(base_url: str, text: str, timeout: float) -> str:
     conv_id = str(uuid.uuid4())
     message_id = str(uuid.uuid4())
@@ -1320,7 +1332,8 @@ async def _new_conv_until_first_byte_async(base_url: str, text: str, timeout: fl
                         async with aconnect_sse(client, "GET", stream_url) as source:
                             source.response.raise_for_status()
                             async for event in source.aiter_sse():
-                                if event.event == "llm_first_byte":
+                                event_data = json.loads(event.data)
+                                if _is_llm_first_byte_witness(event.event, event_data):
                                     response = await create_task
                                     response.raise_for_status()
                                     return conv_id
@@ -1746,6 +1759,18 @@ class StartupRetryTests(unittest.TestCase):
         self.assertFalse(_is_addr_in_use("database migration failed"))
 
 
+class StreamReadinessTests(unittest.TestCase):
+    def test_llm_first_byte_witness_accepts_top_level_and_init_replay(self):
+        self.assertTrue(_is_llm_first_byte_witness("llm_first_byte", {}))
+        self.assertTrue(
+            _is_llm_first_byte_witness(
+                "init", {"pending_events": [{"type": "llm_first_byte"}]}
+            )
+        )
+        self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": []}))
+        self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": [{}]}))
+
+
 class ScenarioSelectorTests(unittest.TestCase):
     def test_select_scenarios_defaults_to_all(self):
         self.assertEqual([name for name, _ in SCENARIOS], [name for name, _ in _select_scenarios([])])
@@ -1815,6 +1840,7 @@ def _run_self_tests() -> int:
             HarnessIsolationTests,
             CpuProfilingTests,
             StartupRetryTests,
+            StreamReadinessTests,
             ScenarioSelectorTests,
         )
     )
