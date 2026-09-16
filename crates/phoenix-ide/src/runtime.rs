@@ -9681,6 +9681,7 @@ mod scope_liveness_tests {
                 "claude-sonnet-5",
                 Some(phoenix_core::domain::llm_types::ModelEffort::High),
                 ServiceTier::Standard,
+                "anthropic",
             )
             .await
             .expect("persist unsupported effort");
