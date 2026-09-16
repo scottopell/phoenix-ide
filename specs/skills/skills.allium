@@ -433,10 +433,12 @@ invariant SkillNamesUnique {
 }
 
 ------------------------------------------------------------
--- Open Questions
+-- Unsupported Frontmatter
 ------------------------------------------------------------
 
-open question "context-mode: fork — a planned frontmatter field that would cause skill invocation to run in an isolated context (similar to a sub-agent) rather than injecting into the current conversation. Semantics, lifecycle, and delivery format are unresolved. Not implementing yet."
+-- `context-mode: fork` is unsupported. Skill invocation delivers the skill body
+-- in the current conversation; it does not create an isolated context or
+-- sub-agent lifecycle.
 
 -- REQ-SK-002 delivery split: resolved. User slash path → user-role message.
 -- LLM tool path → tool result. Both are intentional; see rule comment above.
