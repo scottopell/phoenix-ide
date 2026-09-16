@@ -583,6 +583,9 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
+        ToolOutput::TrustedInstructions { output, .. } => ToolOutcome::TrustedInstructions {
+            output: cap_tool_output_text(output),
+        },
         ToolOutput::Error {
             output,
             images,
@@ -593,6 +596,20 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
+    }
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    match &result.outcome {
+        ToolOutcome::TrustedInstructions { output } => {
+            MessageContent::trusted_builtin_instructions(&result.tool_use_id, output)
+        }
+        _ => MessageContent::tool_with_images(
+            &result.tool_use_id,
+            result.output(),
+            result.is_error(),
+            result.images().to_vec(),
+        ),
     }
 }
 
@@ -1320,6 +1337,7 @@ fn render_messages<'a>(
                 tool_use_id,
                 content,
                 is_error,
+                origin,
                 images,
             }) => {
                 // Cleared results render as a placeholder with no images; kept
@@ -1336,7 +1354,13 @@ fn render_messages<'a>(
                                 data: img.data.clone(),
                             })
                             .collect();
-                        (content.clone(), sources)
+                        let text = match origin {
+                            crate::db::ToolContentOrigin::Ordinary => content.clone(),
+                            crate::db::ToolContentOrigin::TrustedBuiltinInstructions => {
+                                format!("<trusted_builtin_skill>{content}</trusted_builtin_skill>")
+                            }
+                        };
+                        (text, sources)
                     };
 
                 // Tool results go in user message
@@ -6109,12 +6133,7 @@ where
 
             AuthoritativeEffect::PersistToolResults { results } => {
                 for result in results {
-                    let content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let content = tool_result_message_content(&result);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let seq = self.broadcast_tx.next_seq();
                     let msg = self
@@ -7510,12 +7529,7 @@ where
             .into_iter()
             .zip(reserved_seqs.into_iter().skip(1))
             .map(|(result, sequence_id)| {
-                let content = MessageContent::tool_with_images(
-                    &result.tool_use_id,
-                    result.output(),
-                    result.is_error(),
-                    result.images().to_vec(),
-                );
+                let content = tool_result_message_content(&result);
                 crate::db::Message {
                     message_id: tool_result_message_id(&result.tool_use_id),
                     conversation_id: conv_id.clone(),
@@ -7607,12 +7621,7 @@ where
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
                 for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let tool_content = tool_result_message_content(result);
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
@@ -12575,6 +12584,14 @@ mod authoritative_user_message_effect_tests {
                 request.system[0].text,
                 CompactionPolicy::for_coordinator(coordinator).system_prompt()
             );
+            if coordinator {
+                assert!(!request.system[0]
+                    .text
+                    .contains("cannot create conversations"));
+                assert!(!request.system[0]
+                    .text
+                    .contains("NEVER call Phoenix HTTP API through Bash"));
+            }
             assert!(request.messages.len() < 63);
         }
     }
@@ -18391,6 +18408,52 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn persist_checkpoint_preserves_trusted_instruction_origin() {
+        use crate::db::{MessageContent, ToolContentOrigin, ToolOutcome, ToolResult};
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-checkpoint",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "trusted-skill-1".to_string(),
+                name: "skill".to_string(),
+                input: serde_json::json!({"skill_name": "phoenix-api"}),
+            }],
+            None,
+            None,
+        );
+        let result = ToolResult {
+            tool_use_id: "trusted-skill-1".to_string(),
+            outcome: ToolOutcome::TrustedInstructions {
+                output: "authenticated instructions".to_string(),
+            },
+            duration_ms: None,
+        };
+        let data = CheckpointData::tool_round(assistant, vec![result]).expect("tool_round");
+
+        rt.execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("PersistCheckpoint must succeed");
+
+        let msgs = storage.get_all_messages("conv-trusted-checkpoint");
+        assert!(matches!(
+            msgs.iter().find_map(|message| match &message.content {
+                MessageContent::Tool(content) if content.tool_use_id == "trusted-skill-1" => {
+                    Some(content.origin)
+                }
+                _ => None,
+            }),
+            Some(ToolContentOrigin::TrustedBuiltinInstructions)
+        ));
+    }
+
+    #[tokio::test]
     async fn retired_terminal_checkpoint_does_not_publish_deleted_rows() {
         use crate::state_machine::{AssistantMessage, CheckpointData};
         use phoenix_llm::ContentBlock;
@@ -18827,9 +18890,9 @@ mod work_subagent_cwd_guard_tests {
 
     fn tool_result_text(result: &ToolResult) -> String {
         match &result.outcome {
-            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => {
-                output.clone()
-            }
+            ToolOutcome::Success { output, .. }
+            | ToolOutcome::TrustedInstructions { output }
+            | ToolOutcome::Error { output, .. } => output.clone(),
             ToolOutcome::Cancelled { message } => message.clone(),
         }
     }
@@ -19461,6 +19524,16 @@ mod tool_output_to_outcome_tests {
     use super::tool_output_to_outcome;
     use crate::db::ToolOutcome;
     use crate::tools::{ToolImage, ToolOutput};
+
+    #[test]
+    fn trusted_instructions_are_a_distinct_persisted_outcome() {
+        assert!(matches!(
+            ToolOutcome::TrustedInstructions {
+                output: "trusted".to_string()
+            },
+            ToolOutcome::TrustedInstructions { ref output } if output == "trusted"
+        ));
+    }
 
     #[test]
     fn success_output_maps_to_success_outcome() {

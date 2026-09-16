@@ -234,6 +234,15 @@ pub enum ToolOutput {
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
     },
+    /// Instructions from an authenticated audience-bound built-in skill.
+    ///
+    /// The private authority field prevents ordinary Tool implementations outside
+    /// this crate from constructing this provenance.
+    TrustedInstructions {
+        output: String,
+        #[allow(private_interfaces)]
+        _authority: skill::AuthenticatedBuiltin,
+    },
     Error {
         output: String,
         images: Vec<ToolImage>,
@@ -267,6 +276,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 *display_data = Some(data);
             }
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -274,7 +284,9 @@ impl ToolOutput {
     #[must_use]
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
-            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
+            Self::Success { output, .. }
+            | Self::TrustedInstructions { output, .. }
+            | Self::Error { output, .. } => *output = text.into(),
         }
         self
     }
@@ -286,6 +298,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 *llm_usage = Some(Box::new(usage));
             }
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -295,6 +308,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 llm_usage.take().map(|usage| *usage)
             }
+            Self::TrustedInstructions { .. } => None,
         }
     }
 
@@ -302,6 +316,7 @@ impl ToolOutput {
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -309,7 +324,10 @@ impl ToolOutput {
     /// Whether the tool reported success.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
+        matches!(
+            self,
+            Self::Success { .. } | Self::TrustedInstructions { .. }
+        )
     }
 
     /// The tool's textual output — success payload or error message.
@@ -321,7 +339,9 @@ impl ToolOutput {
     #[must_use]
     pub fn output(&self) -> &str {
         match self {
-            Self::Success { output, .. } | Self::Error { output, .. } => output,
+            Self::Success { output, .. }
+            | Self::TrustedInstructions { output, .. }
+            | Self::Error { output, .. } => output,
         }
     }
 
@@ -331,6 +351,7 @@ impl ToolOutput {
     pub fn images(&self) -> &[ToolImage] {
         match self {
             Self::Success { images, .. } | Self::Error { images, .. } => images,
+            Self::TrustedInstructions { .. } => &[],
         }
     }
 
@@ -342,6 +363,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 display_data.as_ref()
             }
+            Self::TrustedInstructions { .. } => None,
         }
     }
 }
@@ -917,12 +939,15 @@ fn parent_coordination_tools(agents: Vec<phoenix_agents::AgentDefinition>) -> Ve
     vec![
         Arc::new(SpawnAgentsTool::with_agents(agents)),
         Arc::new(AskUserQuestionTool),
-        Arc::new(SkillTool),
+        Arc::new(SkillTool::default()),
     ]
 }
 
 fn explore_coordination_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(AskUserQuestionTool), Arc::new(SkillTool)]
+    vec![
+        Arc::new(AskUserQuestionTool),
+        Arc::new(SkillTool::default()),
+    ]
 }
 
 /// Sub-agent terminal tools — how a sub-agent reports its result or error
@@ -998,10 +1023,12 @@ impl ToolRegistry {
     /// read tools, explicitly WorkScope-targeted unsandboxed Bash, and the
     /// singular cross-conversation text-message action. Browser, MCP, dedicated
     /// task/project/workspace mutation, creation, approval, and other lifecycle
-    /// tools are absent.
+    /// tools are absent; the existing skill tool exposes Coordinator-only reference
+    /// material.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        tools.push(Arc::new(SkillTool::for_global_coordinator()));
         tools.append(&mut global_read_tools);
         Self { tools }
     }
@@ -1294,7 +1321,6 @@ mod tests {
         assert!(out.is_success());
         assert!(matches!(out, ToolOutput::Success { .. }));
     }
-
     #[test]
     fn error_constructor_is_always_an_error() {
         let out = ToolOutput::error("ok, completed successfully");
@@ -1343,6 +1369,20 @@ mod tests {
         ExploreToolPolicy {
             bash: ExploreBashCapability::Unavailable,
         }
+    }
+
+    #[test]
+    fn coordinator_registry_adds_only_existing_skill_and_think_to_supplied_tools() {
+        let registry = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)]);
+        assert_eq!(
+            names(&registry),
+            BTreeSet::from([
+                "read_file".to_string(),
+                "skill".to_string(),
+                "think".to_string(),
+            ])
+        );
+        assert!(!names(&registry).contains("phoenix_operator"));
     }
 
     #[test]

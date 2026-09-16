@@ -16,11 +16,16 @@ use "../skills/skills.allium" as skills
 
 -- A built-in skill is content compiled into the phoenix binary as part of
 -- an embedded directory tree. At server startup the tree is materialized
--- to a real on-disk directory; from that point onward built-ins behave as
--- ordinary filesystem skills.
+-- to a real on-disk directory. Ordinary invocation uses that extracted tree;
+-- privileged Coordinator invocation authenticates and reads embedded bytes.
 external entity BuiltinSkillAsset {
     relative_path: String   -- path within the embedded tree, e.g. "spears/SKILL.md"
     content: String         -- file content; underlying type is &'static [u8] in Rust
+}
+
+external entity TrustedBuiltinSkillResult {
+    audience: String
+    content: String
 }
 
 ------------------------------------------------------------
@@ -79,16 +84,20 @@ rule ScanBuiltinExtractDir {
 
     ensures: for child_dir in immediate_subdirectories(builtin_dir)
              where has_skill_md(child_dir)
+               and is_readable(child_dir + "/SKILL.md")
                and current_builtin_name(directory_name(child_dir))
+               and extracted_bytes(child_dir + "/SKILL.md") = embedded_bytes(directory_name(child_dir))
                and frontmatter_name(child_dir) = directory_name(child_dir)
                and not name_taken(catalog, frontmatter_name(child_dir)):
         SkillRegistered(
             name: frontmatter_name(child_dir),
             description: frontmatter_description(child_dir),
             argument_hint: frontmatter_argument_hint(child_dir),
+            audience: frontmatter_audience(child_dir, default: "conversation"),
             source: Builtin(path: child_dir + "/SKILL.md")
         )
-    -- immediate_subdirectories / has_skill_md / current_builtin_name /
+    -- immediate_subdirectories / has_skill_md / is_readable /
+    -- current_builtin_name / extracted_bytes / embedded_bytes /
     -- directory_name / frontmatter_*: black box helpers
 
     @guidance
@@ -103,14 +112,40 @@ rule ScanBuiltinExtractDir {
         -- after the walk-up + children + $HOME scans.
 }
 
-------------------------------------------------------------
--- Rules: Invocation
-------------------------------------------------------------
+rule DiscoverCoordinatorBuiltin {
+    when: CoordinatorBuiltinCatalogRequested(builtin_dir)
 
--- Built-in invocation has no dedicated rule because it is structurally
--- identical to filesystem invocation: both source variants carry a real
--- absolute path, and `invoke_skill` reads via std::fs::read_to_string in
--- both cases. See skills.allium ExpandSkill.
+    ensures: for skill in builtins(builtin_dir)
+             where skill.audience = "global-coordinator"
+             and extracted_bytes(skill) = embedded_bytes(skill):
+        skill in coordinator_catalog
+    ensures: for skill in builtins(builtin_dir)
+             where skill.audience != "global-coordinator"
+             or extracted_bytes(skill) != embedded_bytes(skill):
+        skill not in coordinator_catalog
+
+    @guidance
+        -- Coordinator discovery scans only Phoenix's extracted built-ins. It
+        -- does not scan repository or user filesystem skill directories.
+}
+
+rule InvokeCoordinatorBuiltin {
+    when: CoordinatorBuiltinInvocation(skill, args)
+
+    requires: skill.audience = "global-coordinator"
+    requires: skill.name in current_builtin_name
+    requires: args = ""
+
+    ensures: TrustedBuiltinSkillResult.created(
+        audience: "global-coordinator",
+        content: expand_embedded_skill(embedded_bytes(skill))
+    )
+
+    @guidance
+        -- Invocation reads the immutable asset embedded in the binary, not the
+        -- mutable extraction cache. Embedded companion references are included
+        -- in the authenticated result.
+}
 
 ------------------------------------------------------------
 -- Rules: Catalog Rendering
@@ -164,22 +199,31 @@ invariant SourceImpliesReadableFile {
 -- force and is reinforced here: built-ins do not break name uniqueness
 -- because they are filtered by the same name-dedup as filesystem skills.
 
-------------------------------------------------------------
--- Resolved Decisions
-------------------------------------------------------------
+rule IgnoreRemovedBuiltinDirectories {
+    when: DiscoverBuiltins(builtin_dir)
 
--- (resolved) Naming: built-in. Decided 2026-05-04.
--- (resolved) Override: filesystem wins. Decided 2026-05-04.
--- (resolved) UI grouping: separate "Built-in" group. Decided 2026-05-04.
--- (resolved) Companion files: extract to disk; no separate API.
---            Decided 2026-05-04. Built-in directories are materialized at
---            startup so the LLM uses the same `cat`/`read` workflow it
---            already uses for filesystem-skill companion files.
+    ensures: for child_dir in immediate_subdirectories(builtin_dir)
+             where basename(child_dir) not in current_builtin_name:
+        no Skill.discovered(path: child_dir + "/SKILL.md")
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
+    @guidance
+        -- Extraction prunes files only inside names that remain embedded.
+        -- A directory for a removed or renamed built-in may remain on disk,
+        -- but the immutable embedded-name allowlist keeps it undiscoverable.
+}
 
-open question "Pruning stale extracts: when a phoenix version removes or renames a built-in, the previously-extracted files remain under <HOME>/.phoenix-ide/builtin-skills/. Discovery ignores stale directories whose names are no longer embedded, but disk cleanup is still manual. If this becomes a real user complaint, design a mechanism that records the extracted asset list and removes leftovers without racing concurrent phoenix processes."
+rule BuiltinAvailabilityHasNoDisableConfiguration {
+    when: DiscoverSkills(working_dir)
 
-open question "Disabling a built-in without providing a filesystem replacement: not currently supported. Workaround is an empty filesystem SKILL.md to shadow. If this becomes a real user request, design an opt-out config (e.g. ~/.phoenix-ide/disabled-skills.toml)."
+    ensures: for name in current_builtin_name
+             where not name_taken(filesystem_catalog, name)
+               and is_readable(builtin_dir + "/" + name + "/SKILL.md")
+               and extracted_bytes(builtin_dir + "/" + name + "/SKILL.md") = embedded_bytes(name):
+        exists Skill.discovered(name: name, source: "Builtin")
+
+    @guidance
+        -- Phoenix has no built-in disable configuration. A valid filesystem
+        -- skill with the same name replaces the built-in by the normal
+        -- filesystem-wins precedence rule; an invalid or empty SKILL.md is
+        -- ignored and therefore does not disable the built-in.
+}
