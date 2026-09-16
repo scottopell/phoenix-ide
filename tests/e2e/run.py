@@ -1296,36 +1296,74 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
     )
 
 
+async def _new_conv_until_first_byte_async(base_url: str, text: str, timeout: float) -> str:
+    conv_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+    payload = {
+        "conversation_id": conv_id,
+        "cwd": str(ROOT),
+        "model": _default_model(base_url),
+        "text": text,
+        "images": [],
+        "message_id": message_id,
+    }
+    stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
+    create_url = f"{base_url}/api/conversations/new"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            create_task = asyncio.create_task(client.post(create_url, json=payload))
+            try:
+                while True:
+                    try:
+                        async with aconnect_sse(client, "GET", stream_url) as source:
+                            source.response.raise_for_status()
+                            async for event in source.aiter_sse():
+                                if event.event == "llm_first_byte":
+                                    response = await create_task
+                                    response.raise_for_status()
+                                    return conv_id
+                            raise RuntimeError(
+                                "SSE stream closed before the initial turn emitted llm_first_byte"
+                            )
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code != 404:
+                            raise
+                        if create_task.done():
+                            response = await create_task
+                            response.raise_for_status()
+                        await asyncio.sleep(0)
+            finally:
+                if not create_task.done():
+                    create_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await create_task
+
+
+def _new_conv_until_first_byte(base_url: str, text: str, timeout: float) -> str:
+    try:
+        return asyncio.run(_new_conv_until_first_byte_async(base_url, text, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        raise TimeoutError(
+            f"initial turn did not emit llm_first_byte in {timeout:g}s"
+        ) from error
+
+
 def scenario_mid_stream_cancel(base_url: str) -> None:
-    """Cancel during streaming; verify state reaches idle cleanly."""
-    conv = _new_conv(base_url, "[[scenario:long]] start streaming")
-    # Creation returns an instant provisioning shell; poll until the worker has
-    # submitted the first turn before cancelling. Waiting on the SSE iterator can
-    # block past the deadline when no event arrives during async provisioning.
-    deadline = time.monotonic() + 10.0
-    last_state = None
-    while time.monotonic() < deadline:
-        snap = _get_conv(base_url, conv["id"])
-        last_state = _state_str(snap["conversation"]["state"])
-        if last_state not in ("idle", "provisioning"):
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError(f"conversation did not start before cancel deadline (last: {last_state})")
-    resp = _cancel(base_url, conv["id"])
-    assert not resp.get("no_op", False), "cancel was a no-op — conversation already idle before we cancelled"
-    # State should converge to idle within a few seconds.
-    deadline = time.monotonic() + 5.0
-    last_state = None
-    while time.monotonic() < deadline:
-        snap = _get_conv(base_url, conv["id"])
-        last_state = _state_str(snap["conversation"]["state"])
-        if last_state == "idle":
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"after cancel, state did not become idle (last: {last_state})")
-
-
+    """Cancel an initial turn after its identity-bound streaming witness."""
+    conv_id = _new_conv_until_first_byte(
+        base_url, "[[scenario:long]] start streaming", SCENARIO_TIMEOUT_SECONDS
+    )
+    resp = _cancel(base_url, conv_id)
+    assert not resp.get("no_op", False), "cancel was a no-op after llm_first_byte"
+    _poll_to_idle_with_messages(
+        base_url,
+        conv_id,
+        lambda _messages: True,
+        "mid-stream cancellation finalization",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
 def scenario_image_roundtrip(base_url: str) -> None:
     image = {"media_type": "image/png", "data": TINY_PNG_B64}
     conv = _new_conv(base_url, "[[scenario:plain_text]] describe", images=[image])
