@@ -18792,7 +18792,7 @@ mod work_subagent_cwd_guard_tests {
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
-                openai_responses_key: Some("test-key".into()),
+                openai_api_key: Some("test-key".into()),
                 ..Default::default()
             })),
             crate::terminal::ActiveTerminals::new(),

@@ -1191,6 +1191,9 @@ impl ModelRegistry {
     }
 
     /// Registered services, with the connection actually used by each service.
+    ///
+    /// # Panics
+    /// Panics if a registry lock is poisoned.
     #[must_use]
     pub fn available_execution_routes(&self) -> Vec<ExecutionRoute> {
         let services = self.services.read().expect("services lock poisoned");
@@ -1231,6 +1234,10 @@ impl ModelRegistry {
             .then(|| Arc::clone(service))
     }
 
+    /// Validate an exact registered route and its optional effort.
+    ///
+    /// # Errors
+    /// Returns an error when the route is absent or does not support the effort.
     pub fn validate_execution_route(
         &self,
         model: &str,
