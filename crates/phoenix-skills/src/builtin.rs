@@ -306,7 +306,8 @@ mod tests {
         assert!(reference.contains("GET /api/auth/status"));
         assert!(reference.contains("writable_transcript_row_id"));
         assert!(reference.contains("/{latest_transcript_row_id}/continue"));
-        assert!(reference.contains("verified as `ContextExhausted`"));
+        assert!(reference.contains("conversation.state.type == \"context_exhausted\""));
+        assert!(!reference.contains("verified as `ContextExhausted`"));
         assert!(reference.contains("/{writable_transcript_row_id}/chat"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
         assert!(reference.contains("Reuse the same `message_id`"));
