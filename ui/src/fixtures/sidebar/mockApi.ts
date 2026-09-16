@@ -11,6 +11,9 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
     getLocalServices: api.getLocalServices,
     getProjects: api.getProjects,
     listModels: api.listModels,
+    listProductConversations: api.listProductConversations,
+    renameConversation: api.renameConversation,
+    archiveConversation: api.archiveConversation,
   };
 
   api.codexLoginPreflight = async (): Promise<CodexLoginPreflight> => ({
@@ -31,6 +34,24 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
     llm_configured: false,
     credential_status: 'not_configured',
   });
+  api.listProductConversations = async () => ({ product_conversations: data.productConversations ?? [] });
+  api.renameConversation = async (id: string, name: string) => ({
+    conversation: {
+      id,
+      slug: name,
+      title: name,
+      model: 'fixture',
+      cwd: '/tmp/sidebar-fixture',
+      created_at: new Date(0).toISOString(),
+      updated_at: new Date(0).toISOString(),
+      message_count: 0,
+      archived: false,
+      browser_session_active: false,
+      terminal_uses_tmux: false,
+      work_scope_key: `conversation:${id}`,
+    },
+  });
+  api.archiveConversation = async () => ({ ok: true });
 
   return () => {
     api.codexLoginPreflight = original.codexLoginPreflight;
@@ -39,5 +60,8 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
     api.getLocalServices = original.getLocalServices;
     api.getProjects = original.getProjects;
     api.listModels = original.listModels;
+    api.listProductConversations = original.listProductConversations;
+    api.renameConversation = original.renameConversation;
+    api.archiveConversation = original.archiveConversation;
   };
 }

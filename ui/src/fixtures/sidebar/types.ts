@@ -1,10 +1,11 @@
-import type { Conversation, Project } from '../../api';
+import type { Conversation, ProductConversationListRow, Project } from '../../api';
 
 export type SidebarScenarioId =
   | 'expanded-all-active'
   | 'expanded-project-archived'
   | 'expanded-empty-project'
-  | 'collapsed-overflow';
+  | 'collapsed-overflow'
+  | 'product-actions-continued';
 
 export interface SidebarScenario {
   id: SidebarScenarioId;
@@ -18,4 +19,5 @@ export interface SidebarFixtureData {
   projects: Project[];
   conversations: Conversation[];
   archivedConversations: Conversation[];
+  productConversations?: ProductConversationListRow[];
 }
