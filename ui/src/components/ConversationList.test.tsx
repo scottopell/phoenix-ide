@@ -36,7 +36,7 @@ vi.mock('../utils', async () => {
   };
 });
 
-import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
+import { ConversationList, ConversationRow, ChainBlock, productConversationPresentationIndicator } from './ConversationList';
 
 describe('ConversationList — global navigation', () => {
   it('exposes a labeled Coordinator entry from the mobile list header', () => {
@@ -159,6 +159,38 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
   ...overrides,
+});
+
+describe('ProductConversation presentation indicator', () => {
+  it.each([
+    ['needs_action kind', makeProductConversation('needs-kind', { presentation: { kind: 'needs_action', display_name: 'Needs Kind' } }), 'Needs action', 'awaiting-approval'],
+    ['awaiting user response mode', makeProductConversation('awaiting-mode', { presentation: { kind: 'state', display_name: 'Awaiting', presentation_mode: 'needs_action' } }), 'Needs action', 'awaiting-approval'],
+    ['working mode', makeProductConversation('working-mode', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } }), 'Working', 'working'],
+    ['error mode', makeProductConversation('error-mode', { presentation: { kind: 'state', display_name: 'Error', presentation_mode: 'error' } }), 'Error', 'error'],
+    ['done mode', makeProductConversation('done-mode', { presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }), 'Completed', 'terminal'],
+    ['history idle', makeProductConversation('history-idle', { ordinary_lifecycle: 'history', presentation: { kind: 'state', display_name: 'History', presentation_mode: 'idle' } }), 'History', 'terminal'],
+  ])('%s maps to one authoritative indicator', (_name, row, label, dotClass) => {
+    expect(productConversationPresentationIndicator(row)).toEqual({ label, ariaLabel: label, dotClass });
+  });
+
+  it('renders one indicator element for a continued product conversation row', () => {
+    const row = makeProductConversation('continued-indicator', {
+      canonical_root: { transcript_row_id: 'root-row', slug: 'root-slug', title: 'Root Title' },
+      latest_transcript_row_id: 'latest-row',
+      presentation: { kind: 'state', display_name: 'Awaiting User', presentation_mode: 'needs_action' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[row]} />
+      </MemoryRouter>,
+    );
+
+    const rowNode = container.querySelector('[data-product-conversation-id="continued-indicator"]');
+    expect(rowNode).not.toBeNull();
+    expect(rowNode!.querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(rowNode as HTMLElement).getByLabelText('Needs action')).toBeInTheDocument();
+  });
 });
 
 describe('ConversationRow — cached PR badge', () => {

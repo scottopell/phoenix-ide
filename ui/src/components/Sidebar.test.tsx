@@ -183,6 +183,110 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
+  it('renames product conversations through the canonical-root transcript id', async () => {
+    apiMock.renameConversation.mockResolvedValue({ conversation: makeConv('unused', 'renamed-product') });
+    const row = makeProductConversation('pc-continued', {
+      canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
+      latest_transcript_row_id: 'latest-continuation-row',
+    });
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-continued']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-continued" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Rename product conversation Old Product/ }));
+    const input = getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'renamed-product' } });
+    fireEvent.click(getByRole('button', { name: 'Rename' }));
+
+    await waitFor(() => expect(apiMock.renameConversation).toHaveBeenCalledWith('canonical-root-row', 'renamed-product'));
+    expect(apiMock.renameConversation).not.toHaveBeenCalledWith('latest-continuation-row', expect.anything());
+  });
+
+  it('closes product conversations through the latest continuation id', async () => {
+    apiMock.archiveConversation.mockResolvedValue(undefined);
+    const row = makeProductConversation('pc-continued', {
+      canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
+      latest_transcript_row_id: 'latest-continuation-row',
+    });
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-continued']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-continued" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Close product conversation Old Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledWith('latest-continuation-row'));
+    expect(apiMock.archiveConversation).not.toHaveBeenCalledWith('canonical-root-row');
+  });
+
+  it('does not expose product conversation actions for history rows', async () => {
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-history', { ordinary_lifecycle: 'history' })],
+    });
+
+    const { queryByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    expect(queryByRole('button', { name: /Rename product conversation/ })).toBeNull();
+    expect(queryByRole('button', { name: /Close product conversation/ })).toBeNull();
+  });
+
+  it('keeps product rename dialog open and unchanged on conflict', async () => {
+    apiMock.renameConversation.mockRejectedValue(new ConflictError({ error_type: 'conflict', error: 'stale rename' }));
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-conflict', { canonical_root: { transcript_row_id: 'root-conflict', slug: 'old-product', title: 'Old Product' } })],
+    });
+
+    const { getByRole, findByText, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-conflict']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-conflict" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-conflict"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Rename product conversation Old Product/ }));
+    fireEvent.change(getByRole('textbox'), { target: { value: 'new-product' } });
+    fireEvent.click(getByRole('button', { name: 'Rename' }));
+
+    expect(await findByText('stale rename')).toBeInTheDocument();
+    expect(container.querySelector('[data-product-conversation-id="pc-conflict"]')).not.toBeNull();
+  });
+
+  it('ignores older product-list responses after a newer refresh wins', async () => {
+    let resolveFirst!: (value: { product_conversations: ProductConversationListRow[] }) => void;
+    const first = new Promise<{ product_conversations: ProductConversationListRow[] }>((resolve) => { resolveFirst = resolve; });
+    apiMock.listProductConversations.mockReturnValueOnce(first);
+    apiMock.listProductConversations.mockResolvedValueOnce({ product_conversations: [makeProductConversation('pc-newer')] });
+
+    const { container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-newer']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-newer" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    notifyProductConversationListMayHaveChanged();
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull());
+    resolveFirst({ product_conversations: [makeProductConversation('pc-older')] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull();
+    expect(container.querySelector('[data-product-conversation-id="pc-older"]')).toBeNull();
+  });
+
   it('coalesces product-list refresh triggers from visibility, focus, and online without request loops', async () => {
     const { container } = render(
       <MemoryRouter initialEntries={['/c/cached-slug']}>

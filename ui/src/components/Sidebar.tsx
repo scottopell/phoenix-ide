@@ -117,6 +117,9 @@ export function Sidebar({
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+  const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
   // Fetch once at mount, and refetch whenever the credential health flips.
   // The shared models poller fires on credential transitions (login completes,
@@ -266,6 +269,19 @@ export function Sidebar({
     }
   }, [renameTarget, onConversationCreated, applyRenameSnapshot]);
 
+  const handleProductRename = useCallback(async (newName: string) => {
+    if (!productRenameTarget) return;
+    try {
+      await api.renameConversation(productRenameTarget.canonical_root.transcript_row_id, newName);
+      setProductRenameTarget(null);
+      setProductRenameError(undefined);
+      onConversationCreated();
+      setProductConversationsRetry((revision) => revision + 1);
+    } catch (err) {
+      setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
+    }
+  }, [productRenameTarget, onConversationCreated]);
+
   const handleGenerateRename = useCallback(async () => {
     if (!renameTarget) return;
     try {
@@ -288,6 +304,28 @@ export function Sidebar({
     setRenameError(undefined);
     setRenameTarget(conv);
   }, []);
+
+  const handleSetProductRenameTarget = useCallback((row: ProductConversationListRow) => {
+    setProductRenameError(undefined);
+    setProductRenameTarget(row);
+  }, []);
+
+  const handleSetProductCloseTarget = useCallback((row: ProductConversationListRow) => {
+    setProductCloseTarget(row);
+  }, []);
+
+  const handleProductClose = useCallback(async () => {
+    if (!productCloseTarget) return;
+    try {
+      await api.archiveConversation(productCloseTarget.latest_transcript_row_id);
+      setProductCloseTarget(null);
+      onConversationCreated();
+      setProductConversationsRetry((revision) => revision + 1);
+    } catch (err) {
+      notifyArchiveCloseConflict(productCloseTarget.latest_transcript_row_id, err);
+      console.error('Failed to close product conversation:', err);
+    }
+  }, [productCloseTarget, onConversationCreated]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -345,21 +383,24 @@ export function Sidebar({
           compact
         />
         <div className="sidebar-collapsed-dots">
-          {collapsedProductConversations.map((row) => (
-            <button
-              key={row.product_conversation_id}
-              className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
-              onClick={() => navigate(row.canonical_route)}
-              title={row.presentation.display_name}
-              aria-label={`Open ${row.presentation.display_name}`}
-            >
-              <span
-                className={`conv-state-dot ${productConversationPresentationIndicator(row).dotClass}`}
-                role="img"
-                aria-label={productConversationPresentationIndicator(row).ariaLabel}
-              />
-            </button>
-          ))}
+          {collapsedProductConversations.map((row) => {
+            const indicator = productConversationPresentationIndicator(row);
+            return (
+              <button
+                key={row.product_conversation_id}
+                className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
+                onClick={() => navigate(row.canonical_route)}
+                title={row.presentation.display_name}
+                aria-label={`Open ${row.presentation.display_name}`}
+              >
+                <span
+                  className={`conv-state-dot ${indicator.dotClass}`}
+                  role="img"
+                  aria-label={indicator.ariaLabel}
+                />
+              </button>
+            );
+          })}
           {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = matchesRouteSegment(conv, activeSlug);
@@ -477,6 +518,8 @@ export function Sidebar({
           onRename={handleSetRenameTarget}
           onConversationClick={handleConversationClick}
           onProductConversationClick={(row) => navigate(row.canonical_route)}
+          onProductConversationRename={handleSetProductRenameTarget}
+          onProductConversationClose={handleSetProductCloseTarget}
           activeSlug={activeSlug}
           sidebarMode
         />
@@ -489,6 +532,22 @@ export function Sidebar({
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ConfirmDialog
+        visible={productCloseTarget !== null}
+        title="Close Product Conversation"
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will close the current continuation.`}
+        confirmText="Close"
+        danger
+        onConfirm={handleProductClose}
+        onCancel={() => setProductCloseTarget(null)}
+      />
+      <RenameDialog
+        visible={productRenameTarget !== null}
+        currentName={productRenameTarget?.canonical_root.slug ?? productRenameTarget?.presentation.display_name ?? ''}
+        error={productRenameError ?? undefined}
+        onRename={handleProductRename}
+        onCancel={() => { setProductRenameTarget(null); setProductRenameError(undefined); }}
       />
       <RenameDialog
         visible={renameTarget !== null}

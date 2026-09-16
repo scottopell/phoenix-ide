@@ -34,6 +34,8 @@ interface ConversationListProps {
   onRename: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationClose?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -202,39 +204,22 @@ export function productConversationPresentationIndicator(row: ProductConversatio
   }
 }
 
-function productRowAsConversation(row: ProductConversationListRow): Conversation {
-  return {
-    id: row.latest_transcript_row_id,
-    slug: row.canonical_root.slug ?? row.latest_transcript_row_id,
-    title: row.canonical_root.title,
-    created_at: row.updated_at,
-    updated_at: row.updated_at,
-    archived: row.ordinary_lifecycle === 'history',
-    model: '',
-    cwd: '',
-    message_count: 0,
-    browser_session_active: false,
-    terminal_uses_tmux: false,
-    work_scope_key: '',
-  };
-}
-
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
   row,
   isActive,
   isKeyboardSelected,
   effectiveCwd,
   onClick,
-  onArchive,
-  onRename,
+  onProductConversationClose,
+  onProductConversationRename,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
   effectiveCwd?: string | undefined;
   onClick: (row: ProductConversationListRow) => void;
-  onArchive: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onProductConversationClose?: (row: ProductConversationListRow) => void;
+  onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
   const classes = [
     'conv-item',
@@ -245,7 +230,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const displayTitle = productConversationDisplayTitle(row);
   const indicator = productConversationPresentationIndicator(row);
   const statusTitle = indicator.label;
-  const actionConversation = productRowAsConversation(row);
+  const actionsEnabled = row.ordinary_lifecycle !== 'history';
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -278,12 +263,13 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {row.ordinary_lifecycle !== 'history' && (
+      {actionsEnabled && (onProductConversationRename || onProductConversationClose) && (
         <div className="conv-actions">
           <button
             type="button"
             className="conv-action-btn"
-            onClick={(event) => { event.stopPropagation(); onRename(actionConversation); }}
+            disabled={!onProductConversationRename}
+            onClick={(event) => { event.stopPropagation(); onProductConversationRename?.(row); }}
             aria-label={`Rename product conversation ${displayTitle}`}
             title="Rename"
           >
@@ -292,7 +278,8 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           <button
             type="button"
             className="conv-action-btn danger"
-            onClick={(event) => { event.stopPropagation(); onArchive(actionConversation); }}
+            disabled={!onProductConversationClose}
+            onClick={(event) => { event.stopPropagation(); onProductConversationClose?.(row); }}
             aria-label={`Close product conversation ${displayTitle}`}
             title="Close"
           >
@@ -670,6 +657,8 @@ export function ConversationList({
   onRename,
   onConversationClick,
   onProductConversationClick,
+  onProductConversationRename,
+  onProductConversationClose,
   activeSlug,
   sidebarMode,
   listDensity,
@@ -920,8 +909,8 @@ export function ConversationList({
                 if (onProductConversationClick) onProductConversationClick(productRow);
                 else navigate(productRow.canonical_route);
               }}
-              onArchive={onArchive}
-              onRename={onRename}
+              {...(onProductConversationClose ? { onProductConversationClose } : {})}
+              {...(onProductConversationRename ? { onProductConversationRename } : {})}
             />
           ))
         ) : (
