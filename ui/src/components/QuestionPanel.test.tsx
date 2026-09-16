@@ -73,13 +73,32 @@ describe('QuestionPanel request and draft contract', () => {
       toJSON: () => ({}),
     } as DOMRect);
     const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(500);
-    render(<QuestionPanel {...defaults} questions={[question, {...question, question:'Second?', header:'Second'}]} />);
+    const many = [question, {...question, question:'Second?', header:'Second'}, {...question, question:'Third?', header:'Third'}, {...question, question:'Fourth?', header:'Fourth'}];
+    render(<QuestionPanel {...defaults} questions={many} />);
 
+    expect(screen.getByLabelText('Answer agent questions')).toHaveClass('question-panel--short');
     expect(screen.getByRole('navigation', {name:'Questions'})).toBeInTheDocument();
     expect(screen.getByRole('button', {name:'Second, unanswered'})).toBeEnabled();
 
     rect.mockRestore();
     width.mockRestore();
+  });
+
+  it('restores focus to the preview disclosure when Escape collapses expanded preview', () => {
+    const scrollHeight = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(400);
+    const preview = 'Compare this code:\n\n```ts\nconst value = "long code";\n```';
+    const {container} = render(<QuestionPanel {...defaults} questions={[{...question, options:[{label:'Code', preview}]}]} />);
+    fireEvent.click(screen.getByRole('radio', {name:'Code'}));
+    const disclosure = screen.getByRole('button', {name:'Show full preview'});
+    fireEvent.click(disclosure);
+    const code = container.querySelector<HTMLElement>('.question-preview-text pre');
+    expect(code).toBeTruthy();
+    code!.focus();
+    fireEvent.keyDown(code!, {key:'Escape'});
+
+    expect(screen.getByRole('button', {name:'Show full preview'})).toHaveFocus();
+
+    scrollHeight.mockRestore();
   });
   it('does not toggle multiselect Other when its editor is clicked; empty Other invalidates form', () => {
     render(<QuestionPanel {...defaults} questions={[{...question,multiSelect:true}]} />);

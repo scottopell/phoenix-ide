@@ -1367,17 +1367,6 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Ok(MaterializeAuthoritativeTurnOutcome::StaleAuthority);
         }
-        let deferred_steering_waiting = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM question_dismissal_pauses WHERE conversation_id = ?1)
-                    AND EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id = ?1)",
-        )
-        .bind(&turn.conversation.0)
-        .fetch_one(&mut *tx.tx)
-        .await?;
-        if deferred_steering_waiting {
-            tx.rollback().await?;
-            return Ok(MaterializeAuthoritativeTurnOutcome::StaleAuthority);
-        }
         let message = insert_canonical_message_tx(
             &mut tx,
             &turn,
@@ -4264,7 +4253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_refuses_to_release_dismissal_pause_when_steering_arrived() {
+    async fn materialization_delivers_accepted_resume_and_releases_later_steering() {
         let repo = repo().await;
         let (turn_id, workflow_id) = created_turn(&repo, "queued-beats-direct", 29).await;
         let authority = repo
@@ -4296,7 +4285,7 @@ mod tests {
             ))
             .await,
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(
-                MaterializeAuthoritativeTurnOutcome::StaleAuthority
+                MaterializeAuthoritativeTurnOutcome::Materialized { .. }
             )
         ));
         let pause_still_exists: bool = sqlx::query_scalar(
@@ -4305,7 +4294,14 @@ mod tests {
         .fetch_one(repo.pool())
         .await
         .unwrap();
-        assert!(pause_still_exists);
+        assert!(!pause_still_exists);
+        let queued_steering_still_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id = 'conv-a' AND message_id = 'queued-first')",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert!(queued_steering_still_exists);
     }
 
     #[tokio::test]

@@ -300,6 +300,31 @@
   display: none;
 }
 
+.question-panel--short .question-context {
+  flex-wrap: nowrap;
+}
+
+.question-panel--short .question-context strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.question-panel--short .question-context nav {
+  flex: 0 1 auto;
+  flex-basis: auto;
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.question-panel--short .question-context nav button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 @container (min-width: 840px) {
   .question-preview-layout {
     grid-template-columns: minmax(420px, 3fr) minmax(320px, 2fr);
