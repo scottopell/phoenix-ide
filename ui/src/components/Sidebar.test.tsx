@@ -281,10 +281,11 @@ describe('Sidebar — ProductConversation navigation', () => {
     notifyProductConversationListMayHaveChanged();
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull());
     resolveFirst({ product_conversations: [makeProductConversation('pc-older')] });
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull();
-    expect(container.querySelector('[data-product-conversation-id="pc-older"]')).toBeNull();
+    await waitFor(() => {
+      expect(container.querySelector('[data-product-conversation-id="pc-newer"]')).not.toBeNull();
+      expect(container.querySelector('[data-product-conversation-id="pc-older"]')).toBeNull();
+    });
   });
 
   it('coalesces product-list refresh triggers from visibility, focus, and online without request loops', async () => {

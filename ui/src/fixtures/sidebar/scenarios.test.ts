@@ -7,6 +7,7 @@ describe('sidebar fixture scenarios', () => {
       'expanded-all-active',
       'expanded-project-archived',
       'expanded-empty-project',
+      'product-actions-continued',
       'collapsed-overflow',
     ]);
 
@@ -20,6 +21,11 @@ describe('sidebar fixture scenarios', () => {
     const slugs = new Set([
       ...sidebarFixtureData.conversations.map((conv) => conv.slug),
       ...sidebarFixtureData.archivedConversations.map((conv) => conv.slug),
+      ...(sidebarFixtureData.productConversations ?? []).flatMap((row) => [
+        row.product_conversation_id,
+        row.canonical_root.slug,
+        row.latest_transcript_row_id,
+      ].filter((identity): identity is string => Boolean(identity))),
     ]);
 
     for (const scenario of sidebarScenarios) {
