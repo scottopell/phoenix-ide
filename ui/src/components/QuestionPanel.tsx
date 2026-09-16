@@ -46,6 +46,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
   const root = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const previewRef = useRef<HTMLElement>(null);
+  const previewDisclosureRef = useRef<HTMLButtonElement>(null);
   const otherChoiceRef = useRef<HTMLInputElement>(null);
   const previewTextRef = useRef<HTMLDivElement>(null);
   const [previewOverflow, setPreviewOverflow] = useState(false);
@@ -216,7 +217,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
         if (event.target === notesRef.current) notesButton.current?.focus(); else otherChoiceRef.current?.focus();
       } else if (!locked) {
         if (draft?.notesOpen) { update(value => ({ ...value, notesOpen: false })); notesButton.current?.focus(); }
-        else if (draft?.previewOpen) update(value => ({ ...value, previewOpen: false }));
+        else if (draft?.previewOpen) { update(value => ({ ...value, previewOpen: false })); previewDisclosureRef.current?.focus(); }
         else setConfirmDismiss(true);
       }
       return;
@@ -303,7 +304,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
           {previewMode && <section ref={previewRef} className={`question-preview-pane${bounds.previewFits ? ' question-preview-pane--sticky' : ''}`} aria-label="Selected option preview">
             <h3 tabIndex={-1}>Preview{choice ? ` — ${choice.label}` : otherSelected ? ' — Other' : ''}</h3>
             {preview ? <><div ref={previewTextRef} className={`question-preview-text${draft.previewOpen ? '' : ' question-preview-text--collapsed'}`}><ReactMarkdown components={previewComponents}>{preview}</ReactMarkdown></div>
-              {previewOverflow && <button type="button" disabled={locked} onClick={() => update(value => ({ ...value, previewOpen: !value.previewOpen }))} aria-expanded={draft.previewOpen}>{draft.previewOpen ? 'Show less' : 'Show full preview'}</button>}</>
+              {previewOverflow && <button ref={previewDisclosureRef} type="button" disabled={locked} onClick={() => update(value => ({ ...value, previewOpen: !value.previewOpen }))} aria-expanded={draft.previewOpen}>{draft.previewOpen ? 'Show less' : 'Show full preview'}</button>}</>
               : <p>{otherSelected ? 'Your custom answer will be sent.' : choice ? 'No preview for this option.' : 'Choose an option to view its preview.'}</p>}
           </section>}
         </div>
