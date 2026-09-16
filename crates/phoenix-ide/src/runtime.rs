@@ -5098,18 +5098,20 @@ impl RuntimeManager {
                     conv.product_conversation_id.as_str().to_string(),
                     conv.id.clone(),
                 );
-                let previous_tool = crate::coordinator_tools::previous_transcripts_tool(
+                let host_bound_tools = crate::coordinator_tools::predecessor_host_bound_tools(
                     global_read.clone(),
                     previous_binding.clone(),
                 );
-                let host_bound_tools = vec![previous_tool.clone()];
                 let send_chat =
                     Arc::new(crate::send_chat_service::SendChatApplicationService::new(
                         self.db.clone(),
                         self.clone(),
                     ));
-                let writing_tools =
-                    crate::coordinator_tools::writing_tools(global_read.clone(), send_chat);
+                let writing_tools = crate::coordinator_tools::predecessor_writing_tools(
+                    global_read.clone(),
+                    send_chat,
+                    previous_binding,
+                );
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
                     ConvMode::Explore { .. } if approved_task_objective.is_some() => (
                         ToolRegistry::git_backed_writing_parent(
