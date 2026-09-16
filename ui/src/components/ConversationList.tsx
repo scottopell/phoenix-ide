@@ -176,29 +176,47 @@ function productConversationDisplayTitle(row: ProductConversationListRow): strin
     || row.canonical_root.transcript_row_id;
 }
 
-function productConversationStatusLabel(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'Needs action';
+export type ProductConversationPresentationIndicator = {
+  label: string;
+  dotClass: string;
+  ariaLabel: string;
+};
+
+export function productConversationPresentationIndicator(row: ProductConversationListRow): ProductConversationPresentationIndicator {
+  if (row.presentation.kind === 'needs_action') {
+    return { label: 'Needs action', dotClass: 'awaiting-approval', ariaLabel: 'Needs action' };
+  }
   switch (row.presentation.presentation_mode) {
-    case 'needs_action': return 'Needs action';
-    case 'working': return 'Working';
-    case 'error': return 'Error';
-    case 'done': return 'Completed';
-    default: return row.ordinary_lifecycle === 'history' ? 'History' : 'Open';
+    case 'needs_action':
+      return { label: 'Needs action', dotClass: 'awaiting-approval', ariaLabel: 'Needs action' };
+    case 'working':
+      return { label: 'Working', dotClass: 'working', ariaLabel: 'Working' };
+    case 'error':
+      return { label: 'Error', dotClass: 'error', ariaLabel: 'Error' };
+    case 'done':
+      return { label: 'Completed', dotClass: 'terminal', ariaLabel: 'Completed' };
+    default:
+      return row.ordinary_lifecycle === 'history'
+        ? { label: 'History', dotClass: 'terminal', ariaLabel: 'History' }
+        : { label: 'Open', dotClass: 'idle', ariaLabel: 'Open' };
   }
 }
 
-function productConversationStateDotClass(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
-  switch (row.presentation.presentation_mode) {
-    case 'working':
-      return 'working';
-    case 'error':
-      return 'error';
-    case 'done':
-      return 'terminal';
-    default:
-      return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
-  }
+function productRowAsConversation(row: ProductConversationListRow): Conversation {
+  return {
+    id: row.latest_transcript_row_id,
+    slug: row.canonical_root.slug ?? row.latest_transcript_row_id,
+    title: row.canonical_root.title,
+    created_at: row.updated_at,
+    updated_at: row.updated_at,
+    archived: row.ordinary_lifecycle === 'history',
+    model: '',
+    cwd: '',
+    message_count: 0,
+    browser_session_active: false,
+    terminal_uses_tmux: false,
+    work_scope_key: '',
+  };
 }
 
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
@@ -207,12 +225,16 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   isKeyboardSelected,
   effectiveCwd,
   onClick,
+  onArchive,
+  onRename,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
   effectiveCwd?: string | undefined;
   onClick: (row: ProductConversationListRow) => void;
+  onArchive: (conv: Conversation) => void;
+  onRename: (conv: Conversation) => void;
 }) {
   const classes = [
     'conv-item',
@@ -221,7 +243,9 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
-  const statusTitle = productConversationStatusLabel(row);
+  const indicator = productConversationPresentationIndicator(row);
+  const statusTitle = indicator.label;
+  const actionConversation = productRowAsConversation(row);
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -238,8 +262,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         <div className="conv-item-slug">
           <span className="conv-item-slug-main">
             <span
-              className={`conv-state-dot ${productConversationStateDotClass(row)}`}
+              className={`conv-state-dot ${indicator.dotClass}`}
               title={statusTitle}
+              role="img"
+              aria-label={indicator.ariaLabel}
             />
             <span className="conv-item-title">{displayTitle}</span>
           </span>
@@ -252,6 +278,28 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
+      {row.ordinary_lifecycle !== 'history' && (
+        <div className="conv-actions">
+          <button
+            type="button"
+            className="conv-action-btn"
+            onClick={(event) => { event.stopPropagation(); onRename(actionConversation); }}
+            aria-label={`Rename product conversation ${displayTitle}`}
+            title="Rename"
+          >
+            ✎
+          </button>
+          <button
+            type="button"
+            className="conv-action-btn danger"
+            onClick={(event) => { event.stopPropagation(); onArchive(actionConversation); }}
+            aria-label={`Close product conversation ${displayTitle}`}
+            title="Close"
+          >
+            ×
+          </button>
+        </div>
+      )}
     </li>
   );
 });
@@ -872,6 +920,8 @@ export function ConversationList({
                 if (onProductConversationClick) onProductConversationClick(productRow);
                 else navigate(productRow.canonical_route);
               }}
+              onArchive={onArchive}
+              onRename={onRename}
             />
           ))
         ) : (
