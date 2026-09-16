@@ -1,4 +1,4 @@
-import type { Conversation, ConversationState, Project, PrDisplayState } from '../../api';
+import type { Conversation, ConversationState, ProductConversationListRow, Project, PrDisplayState } from '../../api';
 import type { SidebarFixtureData, SidebarScenario } from './types';
 
 const now = Date.parse('2026-07-08T16:00:00Z');
@@ -125,6 +125,22 @@ const conversations: Conversation[] = [
   })),
 ];
 
+const productConversations: ProductConversationListRow[] = [
+  {
+    product_conversation_id: 'pc-continued-fixture',
+    canonical_route: '/product-conversations/pc-continued-fixture',
+    canonical_root: {
+      transcript_row_id: 'pc-root-transcript',
+      slug: 'fixture-product-root',
+      title: 'Fixture Product Root',
+    },
+    ordinary_lifecycle: 'open',
+    latest_transcript_row_id: 'pc-latest-continuation',
+    updated_at: isoAgo(3),
+    presentation: { kind: 'state', display_name: 'Fixture Product Root', presentation_mode: 'working' },
+  },
+];
+
 const archivedConversations: Conversation[] = [
   conv('phoenix-archived-1', 'archived-sidebar-discovery', 'phoenix', {
     archived: true,
@@ -150,6 +166,7 @@ export const sidebarFixtureData: SidebarFixtureData = {
   projects,
   conversations,
   archivedConversations,
+  productConversations,
 };
 
 export const sidebarScenarios: SidebarScenario[] = [
@@ -173,6 +190,13 @@ export const sidebarScenarios: SidebarScenario[] = [
     collapsed: false,
     initialProjectId: 'docs',
     activeSlug: null,
+  },
+  {
+    id: 'product-actions-continued',
+    theme: 'dark',
+    collapsed: false,
+    initialProjectId: null,
+    activeSlug: 'pc-continued-fixture',
   },
   {
     id: 'collapsed-overflow',
