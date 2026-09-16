@@ -2,7 +2,7 @@ import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalSt
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
-import { ConversationList } from './ConversationList';
+import { ConversationList, productConversationPresentationIndicator } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
 import { SettingsDropdown } from './SettingsDropdown';
@@ -38,17 +38,6 @@ function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: 
     || row.canonical_root.transcript_row_id === routeIdentity
     || row.canonical_root.slug === routeIdentity
   );
-}
-
-function productRowDotClass(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
-  switch (row.presentation.presentation_mode) {
-    case 'needs_action': return 'awaiting-approval';
-    case 'working': return 'working';
-    case 'error': return 'error';
-    case 'done': return 'terminal';
-    default: return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
-  }
 }
 
 function collapsedDotProductConversations(
@@ -119,6 +108,7 @@ export function Sidebar({
   const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
   const refreshScheduledRef = useRef<number | null>(null);
+  const productConversationRefreshSeqRef = useRef(0);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
     getProductConversationListRevision,
@@ -146,15 +136,17 @@ export function Sidebar({
 
   useEffect(() => {
     let cancelled = false;
+    const requestSeq = productConversationRefreshSeqRef.current + 1;
+    productConversationRefreshSeqRef.current = requestSeq;
     api.listProductConversations()
       .then((response) => {
-        if (!cancelled) {
+        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
           setProductConversations(response.product_conversations);
           setProductConversationsError(null);
         }
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
           setProductConversationsError(error instanceof Error ? error.message : 'Failed to refresh conversations');
         }
       });
@@ -361,7 +353,11 @@ export function Sidebar({
               title={row.presentation.display_name}
               aria-label={`Open ${row.presentation.display_name}`}
             >
-              <span className={`conv-state-dot ${productRowDotClass(row)}`} />
+              <span
+                className={`conv-state-dot ${productConversationPresentationIndicator(row).dotClass}`}
+                role="img"
+                aria-label={productConversationPresentationIndicator(row).ariaLabel}
+              />
             </button>
           ))}
           {collapsedConversations.map(conv => {
