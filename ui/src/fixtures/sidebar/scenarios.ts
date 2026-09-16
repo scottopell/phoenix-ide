@@ -196,7 +196,7 @@ export const sidebarScenarios: SidebarScenario[] = [
     theme: 'dark',
     collapsed: false,
     initialProjectId: null,
-    activeSlug: 'pc-continued-fixture',
+    activeSlug: 'fixture-product-root',
   },
   {
     id: 'collapsed-overflow',
