@@ -583,7 +583,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
-        ToolOutput::TrustedInstructions { output } => ToolOutcome::TrustedInstructions {
+        ToolOutput::TrustedInstructions { output, .. } => ToolOutcome::TrustedInstructions {
             output: cap_tool_output_text(output),
         },
         ToolOutput::Error {
@@ -596,6 +596,20 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
+    }
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    match &result.outcome {
+        ToolOutcome::TrustedInstructions { output } => {
+            MessageContent::trusted_builtin_instructions(&result.tool_use_id, output)
+        }
+        _ => MessageContent::tool_with_images(
+            &result.tool_use_id,
+            result.output(),
+            result.is_error(),
+            result.images().to_vec(),
+        ),
     }
 }
 
@@ -6146,20 +6160,7 @@ where
 
             AuthoritativeEffect::PersistToolResults { results } => {
                 for result in results {
-                    let content = match &result.outcome {
-                        ToolOutcome::TrustedInstructions { output } => {
-                            MessageContent::trusted_builtin_instructions(
-                                &result.tool_use_id,
-                                output,
-                            )
-                        }
-                        _ => MessageContent::tool_with_images(
-                            &result.tool_use_id,
-                            result.output(),
-                            result.is_error(),
-                            result.images().to_vec(),
-                        ),
-                    };
+                    let content = tool_result_message_content(&result);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let seq = self.broadcast_tx.next_seq();
                     let msg = self
@@ -7555,12 +7556,7 @@ where
             .into_iter()
             .zip(reserved_seqs.into_iter().skip(1))
             .map(|(result, sequence_id)| {
-                let content = MessageContent::tool_with_images(
-                    &result.tool_use_id,
-                    result.output(),
-                    result.is_error(),
-                    result.images().to_vec(),
-                );
+                let content = tool_result_message_content(&result);
                 crate::db::Message {
                     message_id: tool_result_message_id(&result.tool_use_id),
                     conversation_id: conv_id.clone(),
@@ -7652,12 +7648,7 @@ where
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
                 for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let tool_content = tool_result_message_content(result);
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
@@ -19060,6 +19051,52 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn persist_checkpoint_preserves_trusted_instruction_origin() {
+        use crate::db::{MessageContent, ToolContentOrigin, ToolOutcome, ToolResult};
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-checkpoint",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "trusted-skill-1".to_string(),
+                name: "skill".to_string(),
+                input: serde_json::json!({"skill_name": "phoenix-api"}),
+            }],
+            None,
+            None,
+        );
+        let result = ToolResult {
+            tool_use_id: "trusted-skill-1".to_string(),
+            outcome: ToolOutcome::TrustedInstructions {
+                output: "authenticated instructions".to_string(),
+            },
+            duration_ms: None,
+        };
+        let data = CheckpointData::tool_round(assistant, vec![result]).expect("tool_round");
+
+        rt.execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("PersistCheckpoint must succeed");
+
+        let msgs = storage.get_all_messages("conv-trusted-checkpoint");
+        assert!(matches!(
+            msgs.iter().find_map(|message| match &message.content {
+                MessageContent::Tool(content) if content.tool_use_id == "trusted-skill-1" => {
+                    Some(content.origin)
+                }
+                _ => None,
+            }),
+            Some(ToolContentOrigin::TrustedBuiltinInstructions)
+        ));
+    }
+
+    #[tokio::test]
     async fn retired_terminal_checkpoint_does_not_publish_deleted_rows() {
         use crate::state_machine::{AssistantMessage, CheckpointData};
         use phoenix_llm::ContentBlock;
@@ -20132,10 +20169,11 @@ mod tool_output_to_outcome_tests {
     use crate::tools::{ToolImage, ToolOutput};
 
     #[test]
-    fn trusted_instructions_do_not_collapse_to_ordinary_success() {
-        let outcome = tool_output_to_outcome(ToolOutput::trusted_instructions("trusted"));
+    fn trusted_instructions_are_a_distinct_persisted_outcome() {
         assert!(matches!(
-            outcome,
+            ToolOutcome::TrustedInstructions {
+                output: "trusted".to_string()
+            },
             ToolOutcome::TrustedInstructions { ref output } if output == "trusted"
         ));
     }

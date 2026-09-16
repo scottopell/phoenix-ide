@@ -10,7 +10,11 @@ This reference describes the server API, not a privileged bypass. Use the Phoeni
 4. Keep secrets out of command arguments, shell tracing, files, logs, summaries, and tool output. Prefer an already-populated environment variable expanded inside the scoped shell. Do not inspect the Phoenix database or process environment to hunt for a credential, and do not echo or interpolate a secret into diagnostic output.
 5. A `401` or `403` is a stop condition. Do not weaken or route around authorization.
 
-Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Parse JSON structurally rather than relying on display text.
+Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv: pass the header through curl's stdin configuration, for example `printf '%s\n' "header = \"Authorization: Bearer $PHOENIX_PASSWORD\"" | curl --config - --fail-with-body --silent --show-error "$PHOENIX_ORIGIN/api/auth/status"`. Parse JSON structurally rather than relying on display text.
+
+## Discover the default model
+
+`GET /api/models/default` returns the deployment's default model identifier. Read it before creating a conversation when the user did not name a supported model; do not guess a model ID.
 
 ## Resolve the current target
 

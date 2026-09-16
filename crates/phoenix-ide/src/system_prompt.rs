@@ -121,13 +121,12 @@ pub(crate) fn build_coordinator_system_prompt_with_options(
             "\n\nTrusted Global Coordinator bash is not sandboxed. Every bash run need active work_scope_id from current snapshot. Phoenix find that WorkScope cwd. No default repo or cwd. Normal bash limits and audit stay."
         }
     });
-    prompt.push_str("\n\nNo dedicated lifecycle tools are provided. Use documented Phoenix APIs through scoped Bash for user-authorized lifecycle actions; preserve normal authorization and verify results.");
-
     let skills = crate::skills::discover_builtin_skills_for_audience(
         builtin_dir,
         crate::skills::SkillAudience::GlobalCoordinator,
     );
     if !skills.is_empty() {
+        prompt.push_str("\n\nNo dedicated lifecycle tools are provided. Use documented Phoenix APIs through scoped Bash for user-authorized lifecycle actions; preserve normal authorization and verify results.");
         prompt.push_str("\n\n<available_skills>\n");
         prompt.push_str("The following Coordinator-only built-in skills are available. Invoke them with the `skill` tool.\n");
         for skill in &skills {

@@ -30,11 +30,11 @@ embedded file to `target_dir/<skill>/<...>` (idempotent — only rewrites files
 whose contents differ). Default target is `<HOME>/.phoenix-ide/builtin-skills/`.
 
 `SkillSource` is an enum: `Filesystem { path, source_dir }` for user-installed
-skills; `Builtin { path }` for extracted built-ins. Both variants carry a real
-filesystem path, so `invoke_skill`, the system-prompt catalog, the HTTP API,
-and the UI panel all use one read path. The variant exists so the catalog
-can render `(built-in)` and the UI can group built-ins separately, but no
-component branches on it for content access.
+skills; `Builtin { path }` for extracted built-ins. Ordinary conversation
+skills use their filesystem source path. The Coordinator accepts only an
+extracted built-in whose bytes match the embedded asset, then invokes that
+skill and its references from immutable embedded bytes; its authenticated
+instructions do not read the extraction cache.
 
 Discovery scans the user's `.claude/skills/` and `.agents/skills/` first,
 then the built-in extract directory. The existing name-dedup ("first seen

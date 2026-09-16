@@ -610,7 +610,6 @@ pub fn invoke_skill(
 /// is not an authenticated built-in, or is absent from the embedded assets.
 pub fn invoke_trusted_coordinator_builtin(
     skill_name: &str,
-    arguments: &str,
     skills: &[SkillMetadata],
 ) -> Result<String, String> {
     let audience_catalog = skills
@@ -643,7 +642,7 @@ pub fn invoke_trusted_coordinator_builtin(
     }
     let raw_content = builtin::embedded_skill(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
-    let mut content = substitute_arguments(&strip_frontmatter(&raw_content), arguments);
+    let mut content = strip_frontmatter(&raw_content);
     content.push_str("\n\nAll authenticated companion references are included below; do not read the mutable extraction cache.");
     let assets = builtin::embedded_skill_assets(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
@@ -1332,8 +1331,7 @@ mod tests {
             SkillAudience::GlobalCoordinator,
         );
         std::fs::write(&extracted, "forged after discovery").unwrap();
-        let trusted =
-            invoke_trusted_coordinator_builtin("phoenix-api", "", &authenticated).unwrap();
+        let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &authenticated).unwrap();
         assert!(trusted.contains("<trusted_builtin_skill"));
         assert!(trusted.contains("Embedded reference"));
         assert!(!trusted.contains("forged after discovery"));

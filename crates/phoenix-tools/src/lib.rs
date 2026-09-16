@@ -234,8 +234,15 @@ pub enum ToolOutput {
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
     },
-    /// Authenticated instructions emitted only by an audience-bound built-in skill.
-    TrustedInstructions { output: String },
+    /// Instructions from an authenticated audience-bound built-in skill.
+    ///
+    /// The private authority field prevents ordinary Tool implementations outside
+    /// this crate from constructing this provenance.
+    TrustedInstructions {
+        output: String,
+        #[allow(private_interfaces)]
+        _authority: skill::AuthenticatedBuiltin,
+    },
     Error {
         output: String,
         images: Vec<ToolImage>,
@@ -251,12 +258,6 @@ impl ToolOutput {
             images: vec![],
             display_data: None,
             llm_usage: None,
-        }
-    }
-
-    pub fn trusted_instructions(output: impl Into<String>) -> Self {
-        Self::TrustedInstructions {
-            output: output.into(),
         }
     }
 
@@ -284,7 +285,7 @@ impl ToolOutput {
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
             Self::Success { output, .. }
-            | Self::TrustedInstructions { output }
+            | Self::TrustedInstructions { output, .. }
             | Self::Error { output, .. } => *output = text.into(),
         }
         self
@@ -339,7 +340,7 @@ impl ToolOutput {
     pub fn output(&self) -> &str {
         match self {
             Self::Success { output, .. }
-            | Self::TrustedInstructions { output }
+            | Self::TrustedInstructions { output, .. }
             | Self::Error { output, .. } => output,
         }
     }
@@ -1335,13 +1336,6 @@ mod tests {
         assert!(out.is_success());
         assert!(matches!(out, ToolOutput::Success { .. }));
     }
-    #[test]
-    fn trusted_instructions_are_structurally_distinct_from_ordinary_success() {
-        let out = ToolOutput::trusted_instructions("authenticated");
-        assert!(out.is_success());
-        assert!(matches!(out, ToolOutput::TrustedInstructions { .. }));
-    }
-
     #[test]
     fn error_constructor_is_always_an_error() {
         let out = ToolOutput::error("ok, completed successfully");
