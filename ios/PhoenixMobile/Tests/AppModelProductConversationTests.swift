@@ -2941,7 +2941,12 @@ final class AppModelProductConversationTests: XCTestCase {
     func testFirstSuccessorInitPreservesCanonicalAggregateProjectionMetadata() async throws {
         let baseDirectory = isolatedDiskDirectory()
         let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
+        let probe = SendProbe()
+        let host = "first-successor-projection.invalid"
+        let (api, registration) = makeHTTPAPI(probe: probe, host: host)
+        defer { TestURLProtocol.uninstall(host: host, owner: registration) }
         let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
         let root = conversation(
             id: "row-1", aggregateId: "pc-1", slug: "canonical-slug", title: "Canonical title")
         var canonical = root
@@ -2972,6 +2977,14 @@ final class AppModelProductConversationTests: XCTestCase {
         let restored = ConversationListStore(
             hasCachedSnapshot: { $0 == "row-2" },
             context: store.listPersistenceContext!)
+        let restoredCanonical = try XCTUnwrap(restored.conversations.first)
+        XCTAssertEqual(restoredCanonical.id, "row-1")
+        XCTAssertEqual(restoredCanonical.slug, "canonical-slug")
+        XCTAssertEqual(restoredCanonical.title, "Canonical title")
+        XCTAssertEqual(restoredCanonical.task_title, "Canonical task")
+        XCTAssertEqual(restoredCanonical.archived, false)
+        XCTAssertEqual(restoredCanonical.state, successor.state)
+        XCTAssertEqual(restoredCanonical.transcriptRowIdentity, "row-1")
         XCTAssertEqual(
             restored.cachedNavigationTranscriptRowId(
                 forAggregateId: "pc-1",
