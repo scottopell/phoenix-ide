@@ -170,21 +170,49 @@ final class ServerTrustDelegate: NSObject, URLSessionTaskDelegate {
 /// REST client for the Phoenix API. Non-browser clients authenticate with
 /// `Authorization: Bearer <password>`; the phoenix-auth cookie is a
 /// browser-only session token, not a client credential.
+struct APIConfigurationIdentity: Codable, Equatable, Hashable, Sendable {
+    let serverURL: String
+    let credentialGeneration: String
+    let trustSelfSigned: Bool
+
+    init(serverURL: String, credentialGeneration: String, trustSelfSigned: Bool) {
+        self.serverURL = serverURL
+        self.credentialGeneration = credentialGeneration
+        self.trustSelfSigned = trustSelfSigned
+    }
+
+    var persistenceScope: PersistenceScopeIdentity {
+        PersistenceScopeIdentity(
+            serverURL: serverURL,
+            credentialGeneration: credentialGeneration)
+    }
+}
+
 struct PhoenixAPI: Sendable {
     let baseURL: URL
     let password: String?
     private let trustDelegate: ServerTrustDelegate
+    private let allowSelfSigned: Bool
     private let session: URLSession
     /// Long-lived session for SSE: effectively no per-request deadline; the
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    let configurationIdentity: APIConfigurationIdentity
+
+    init?(
+        baseURL: URL,
+        password: String?,
+        allowSelfSigned: Bool,
+        configurationIdentity: APIConfigurationIdentity
+    ) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
             return nil
         }
         self.baseURL = baseURL
         self.password = password
+        self.configurationIdentity = configurationIdentity
+        self.allowSelfSigned = allowSelfSigned
 
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate
@@ -203,6 +231,28 @@ struct PhoenixAPI: Sendable {
         streamConfig.waitsForConnectivity = false
         self.streamSession = URLSession(
             configuration: streamConfig, delegate: delegate, delegateQueue: nil)
+    }
+
+    init?(
+        baseURL: URL,
+        password: String?,
+        allowSelfSigned: Bool,
+        configurationIdentity: APIConfigurationIdentity,
+        session: URLSession,
+        streamSession: URLSession? = nil
+    ) {
+        guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
+            return nil
+        }
+        self.baseURL = baseURL
+        self.password = password
+        self.configurationIdentity = configurationIdentity
+        self.allowSelfSigned = allowSelfSigned
+
+        let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
+        self.trustDelegate = delegate
+        self.session = session
+        self.streamSession = streamSession ?? session
     }
 
     private func request(path: String, query: [URLQueryItem] = []) throws -> URLRequest {
@@ -317,7 +367,7 @@ struct PhoenixAPI: Sendable {
         }
 
         return Conversation(
-            id: row.latest_transcript_row_id,
+            id: row.canonical_root.transcript_row_id,
             product_conversation_id: row.product_conversation_id,
             slug: row.canonical_root.slug,
             title: row.canonical_root.title,
