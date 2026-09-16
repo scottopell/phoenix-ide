@@ -5094,9 +5094,10 @@ impl RuntimeManager {
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
                     ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::direct(agent_catalog.to_vec())
-                            .try_with_writing_conversation_tools(writing_tools)
-                            .map_err(|error| error.clone())?,
+                        ToolRegistry::git_backed_writing_parent(
+                            agent_catalog.to_vec(),
+                            writing_tools,
+                        )?,
                         None,
                     ),
                     ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
@@ -5107,38 +5108,20 @@ impl RuntimeManager {
                         ),
                         Some(writing_tools),
                     ),
-                    ConvMode::Direct => {
-                        // Full tool suite for Direct mode. `propose_task` (the
-                        // fork proposal) is offered only when the working dir is
-                        // inside a git repo — a fork cuts from the repository's
-                        // default branch (REQ-PROJ-036).
-                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
-                        let registry =
-                            if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
-                                .is_some()
-                            {
-                                registry.with_propose_task()
-                            } else {
-                                registry
-                            };
-                        (
-                            registry.try_with_writing_conversation_tools(writing_tools)?,
-                            None,
-                        )
-                    }
+                    ConvMode::Direct => (
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                            .try_with_writing_conversation_tools(writing_tools)?,
+                        None,
+                    ),
                     ConvMode::Work { .. }
                     | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => {
-                        // Full tool suite plus `propose_task` (non-blocking fork
-                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
-                        // history, so the tool is always offered.
-                        (
-                            ToolRegistry::direct(agent_catalog.to_vec())
-                                .with_propose_task()
-                                .try_with_writing_conversation_tools(writing_tools)?,
-                            None,
-                        )
-                    }
+                    | ConvMode::DetachedApprovedTask { .. } => (
+                        ToolRegistry::git_backed_writing_parent(
+                            agent_catalog.to_vec(),
+                            writing_tools,
+                        )?,
+                        None,
+                    ),
                 };
                 ToolRegistryExecutor::with_mcp(
                     registry,

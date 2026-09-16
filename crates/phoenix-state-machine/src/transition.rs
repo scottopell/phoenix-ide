@@ -6724,8 +6724,9 @@ mod tests {
     // ========================================================================
     // Fork proposal interception (REQ-PROJ-033/036).
     //
-    // Explore parks (in-place Explore->Work gateway, unchanged); Work/Branch/
-    // Direct-in-a-git-repo record a non-blocking fork and keep running.
+    // Explore parks in the blocking review path, including when an approved
+    // objective has already granted write authority. Work/Branch and legacy
+    // Direct-in-a-git-repo calls take the fork path below.
     // ========================================================================
     mod fork_proposal {
         use super::*;
@@ -6809,15 +6810,17 @@ mod tests {
         }
 
         #[test]
-        fn explore_valid_file_parks_into_awaiting_task_approval() {
+        fn approved_explore_with_write_authority_parks_without_git_or_fork_effects() {
             let (tmp, rel) = worktree_with_task();
-            let ctx = ctx_for(
+            let mut ctx = ctx_for(
                 &tmp,
                 ModeKind::Managed,
                 Some(ModeContext::Explore {
                     next_taskmd_id_hint: None,
                 }),
             );
+            ctx.resource_authority = phoenix_core::work_scope::ResourceAuthority::Work;
+            ctx.work_scope_worktree = Some(tmp.path().to_path_buf());
 
             let result = transition(
                 &ConvState::LlmRequesting { attempt: 1 },
@@ -6828,19 +6831,35 @@ mod tests {
 
             assert!(
                 matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
-                "Explore must park, got {:?}",
+                "approved Explore must park, got {:?}",
                 result.new_state
             );
             assert!(
                 result
                     .effects
                     .iter()
-                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
-                "Explore parks via PersistCheckpoint"
+                    .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })),
+                "approved Explore parks via PersistCheckpoint"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::PersistState)),
+                "approved Explore persists AwaitingTaskApproval"
             );
             assert!(
                 fork_proposal_effect(&result.effects).is_none(),
-                "Explore must NOT record a fork proposal"
+                "approved Explore must not record a fork proposal"
+            );
+            assert!(
+                !result.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::ApproveTask { .. }
+                        | Effect::ApproveTaskFreshHandoff { .. }
+                        | Effect::ResolveTask { .. }
+                )),
+                "proposal interception must not perform an approval or lifecycle Git effect"
             );
         }
 
