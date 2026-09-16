@@ -3133,7 +3133,7 @@ pub async fn cascade_tmux_on_delete(
 /// the Phoenix process environment, which would leak server secrets (LLM API
 /// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
 /// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+fn set_tmux_server_env(cmd: &mut tokio::process::Command, server_token: &str) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     cmd.env_clear();
     let launch_uuid = uuid::Uuid::new_v4().to_string();
@@ -3144,7 +3144,7 @@ fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
-    cmd.env(SERVER_TOKEN_VAR, uuid::Uuid::new_v4().to_string());
+    cmd.env(SERVER_TOKEN_VAR, server_token);
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -3532,7 +3532,7 @@ async fn spawn_session_owned(
     cwd: &Path,
     contain_test_spawn: bool,
 ) -> Result<(), TmuxError> {
-    let tmux_args = [
+    let mut tmux_args = vec![
         "-f".to_string(),
         config_path.to_string_lossy().into_owned(),
         "-S".to_string(),
@@ -3544,6 +3544,16 @@ async fn spawn_session_owned(
         "-s".to_string(),
         TMUX_DEFAULT_SESSION.to_string(),
     ];
+    let server_token = uuid::Uuid::new_v4().to_string();
+    if contain_test_spawn {
+        tmux_args.extend([
+            ";".to_string(),
+            "set-environment".to_string(),
+            "-g".to_string(),
+            SERVER_TOKEN_VAR.to_string(),
+            server_token.clone(),
+        ]);
+    }
     let (mut cmd, creator_handoff) =
         tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
@@ -3551,7 +3561,7 @@ async fn spawn_session_owned(
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd);
+    set_tmux_server_env(&mut cmd, &server_token);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3612,6 +3622,17 @@ async fn spawn_session_owned(
                 reason: format!("failed to probe pane readiness: {e}"),
             })?;
         if panes.status.success() && !panes.stdout.is_empty() {
+            if contain_test_spawn {
+                #[cfg(any(test, feature = "test-support"))]
+                super::test_server::register_owned_server(socket_path, &server_token).map_err(
+                    |error| TmuxError::SpawnFailed {
+                        socket_path: socket_path.to_path_buf(),
+                        reason: format!("failed to register exact test-owned processes: {error}"),
+                    },
+                )?;
+                #[cfg(not(any(test, feature = "test-support")))]
+                unreachable!("test spawn containment is unavailable in production builds");
+            }
             return Ok(());
         }
         // Retain the last probe's exit/stderr so an exhausted poll says WHY
