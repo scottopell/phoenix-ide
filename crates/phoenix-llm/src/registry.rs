@@ -1351,9 +1351,18 @@ impl ModelRegistry {
     pub fn for_test_with_sonnet(service: Arc<dyn LlmService>) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         services.insert("claude-sonnet-5".to_string(), service);
+        let specs = all_models()
+            .into_iter()
+            .filter(|spec| spec.id == "claude-sonnet-5")
+            .map(|mut spec| {
+                // The injected service declares no reasoning-effort capabilities.
+                spec.effort_capabilities = super::EffortCapabilities::Unknown;
+                (spec.id.clone(), spec)
+            })
+            .collect();
         Self {
             services: std::sync::RwLock::new(services),
-            specs: std::sync::RwLock::new(HashMap::new()),
+            specs: std::sync::RwLock::new(specs),
             default_model: std::sync::RwLock::new("claude-sonnet-5".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
