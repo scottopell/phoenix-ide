@@ -70,6 +70,13 @@ pub use workflow::*;
 /// Maximum pending steering entries permitted per conversation.
 pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
 
+/// Resolved spawn settings written in the child's creation transaction.
+pub struct SubAgentExecution<'a> {
+    pub connection: &'a str,
+    pub effort: Option<ModelEffort>,
+    pub persona: Option<&'a str>,
+}
+
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::{
     EffectiveEffort, EffortSource, LlmAttemptMetrics, LlmAttemptOutcome, LlmTransport, ModelEffort,
@@ -3370,10 +3377,27 @@ impl Database {
         Ok(())
     }
 
-    /// Read a sub-agent conversation's persisted persona, if any.
+    /// Read a sub-agent's connection; pre-feature conversations have no row.
     ///
     /// # Errors
     ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_sub_agent_execution_connection(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT connection FROM sub_agent_execution_routes WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
+    /// Read a sub-agent conversation's persisted persona, if any.
+    ///
+    /// # Errors
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_sub_agent_persona(&self, conversation_id: &str) -> DbResult<Option<String>> {
         let row: Option<(String,)> =
@@ -3900,6 +3924,7 @@ impl Database {
             seed_label,
             llm_language,
             ExpectedParentScope::NotChecked,
+            None,
         )
         .await
     }
@@ -3919,6 +3944,7 @@ impl Database {
         conv_mode: &ConvMode,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         parent_scope: Option<&WorkScopeId>,
+        execution: SubAgentExecution<'_>,
     ) -> DbResult<Conversation> {
         self.create_conversation_with_project_inner(
             id,
@@ -3934,6 +3960,7 @@ impl Database {
             None,
             llm_language,
             ExpectedParentScope::Snapshot(parent_scope),
+            Some(execution),
         )
         .await
     }
@@ -3954,6 +3981,7 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         expected_parent_scope: ExpectedParentScope<'_>,
+        sub_agent_execution: Option<SubAgentExecution<'_>>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -4028,6 +4056,9 @@ impl Database {
                         values
                     }
                 };
+            let inherited_effort = sub_agent_execution
+                .as_ref()
+                .map_or(inherited_effort, |execution| execution.effort);
             let product_conversation_id =
                 if let Some(product_conversation_id) = inherited_product_conversation_id {
                     product_conversation_id
@@ -4097,6 +4128,24 @@ impl Database {
 
             match result {
                 Ok(_) => {
+                    if let Some(execution) = &sub_agent_execution {
+                        sqlx::query(
+                            "INSERT INTO sub_agent_execution_routes (conversation_id, connection) VALUES (?1, ?2)",
+                        )
+                        .bind(id)
+                        .bind(execution.connection)
+                        .execute(&mut *tx)
+                        .await?;
+                        if let Some(persona) = execution.persona {
+                            sqlx::query(
+                                "INSERT INTO sub_agent_personas (conversation_id, persona) VALUES (?1, ?2)",
+                            )
+                            .bind(id)
+                            .bind(persona)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    }
                     tx.commit().await?;
                     break (work_scope_id, inherited_effort, product_conversation_id);
                 }
@@ -8794,7 +8843,7 @@ impl Database {
         Ok(false)
     }
 
-    /// Atomically update the model, effort, and service tier.
+    /// Atomically update model settings and the selected connection of a child.
     ///
     /// # Errors
     ///
@@ -8805,8 +8854,10 @@ impl Database {
         model: &str,
         effort: Option<ModelEffort>,
         service_tier: ServiceTier,
+        connection: &str,
     ) -> DbResult<()> {
         let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversations SET model = ?1, effort = ?2, service_tier = ?3, updated_at = ?4 WHERE id = ?5",
         )
@@ -8815,11 +8866,21 @@ impl Database {
         .bind(service_tier.as_wire_name())
         .bind(now.to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        sqlx::query(
+            "INSERT INTO sub_agent_execution_routes (conversation_id, connection)
+             SELECT id, ?1 FROM conversations WHERE id = ?2 AND parent_conversation_id IS NOT NULL
+             ON CONFLICT(conversation_id) DO UPDATE SET connection = excluded.connection",
+        )
+        .bind(connection)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -16840,6 +16901,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::Low),
             ServiceTier::Fast,
+            "codex",
         )
         .await
         .unwrap();
@@ -16868,12 +16930,24 @@ mod tests {
         db.create_conversation("tier-cas", "tier-cas", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.update_conversation_model_and_effort("tier-cas", "gpt-5.4", None, ServiceTier::Fast)
-            .await
-            .unwrap();
-        db.update_conversation_model_and_effort("tier-cas", "gpt-5.6-sol", None, ServiceTier::Fast)
-            .await
-            .unwrap();
+        db.update_conversation_model_and_effort(
+            "tier-cas",
+            "gpt-5.4",
+            None,
+            ServiceTier::Fast,
+            "codex",
+        )
+        .await
+        .unwrap();
+        db.update_conversation_model_and_effort(
+            "tier-cas",
+            "gpt-5.6-sol",
+            None,
+            ServiceTier::Fast,
+            "codex",
+        )
+        .await
+        .unwrap();
 
         let normalized = db
             .compare_and_set_conversation_service_tier(
@@ -21693,6 +21767,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -21715,7 +21790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unattached_sub_agent_inherits_parent_effort_without_a_work_scope() {
+    async fn unattached_sub_agent_persists_selection_without_parent_effort_leak() {
         let db = Database::open_in_memory().await.unwrap();
         let parent = db
             .get_or_create_coordinator(
@@ -21729,6 +21804,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -21746,15 +21822,212 @@ mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                SubAgentExecution {
+                    connection: "codex",
+                    effort: None,
+                    persona: Some("Review carefully."),
+                },
             )
             .await
             .unwrap();
 
         assert_eq!(child.attached_work_scope_id, None);
-        assert_eq!(child.effort, Some(ModelEffort::High));
+        assert_eq!(child.effort, None);
+        assert_eq!(db.get_conversation(&child.id).await.unwrap().effort, None);
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            db.get_sub_agent_persona(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Review carefully.")
+        );
         assert_eq!(
             child.product_conversation_id,
             parent.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_selection_failure_rolls_back_conversation_and_persona() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&parent.id)
+                .await
+                .unwrap(),
+            None
+        );
+        let result = db
+            .create_subagent_conversation(
+                "invalid-route-child",
+                "invalid-route-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+                SubAgentExecution {
+                    connection: " ",
+                    effort: Some(ModelEffort::High),
+                    persona: Some("Must not survive failed creation."),
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM conversations WHERE id = 'invalid-route-child'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            db.get_sub_agent_persona("invalid-route-child")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_sub_agent_execution_connection("invalid-route-child")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn child_model_upgrade_updates_connection_atomically_without_pinning_parent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let child = db
+            .create_subagent_conversation(
+                "route-upgrade-child",
+                "route-upgrade-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+                SubAgentExecution {
+                    connection: "codex",
+                    effort: Some(ModelEffort::High),
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+        for id in [&child.id, &parent.id] {
+            db.update_conversation_model_and_effort(
+                id,
+                "claude-sonnet-5",
+                Some(ModelEffort::Low),
+                ServiceTier::Standard,
+                "anthropic",
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&parent.id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(db
+            .update_conversation_model_and_effort(
+                &child.id,
+                "gpt-5.4",
+                Some(ModelEffort::High),
+                ServiceTier::Fast,
+                " ",
+            )
+            .await
+            .is_err());
+        let child = db.get_conversation(&child.id).await.unwrap();
+        assert_eq!(child.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(child.effort, Some(ModelEffort::Low));
+        assert_eq!(child.service_tier, ServiceTier::Standard);
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_child_model_change_records_newly_selected_connection() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("legacy-parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "legacy-child",
+            "child",
+            "/tmp",
+            false,
+            Some("legacy-parent"),
+            Some("gpt-5.4"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-child")
+                .await
+                .unwrap(),
+            None
+        );
+
+        db.update_conversation_model_and_effort(
+            "legacy-child",
+            "claude-sonnet-5",
+            None,
+            ServiceTier::Standard,
+            "anthropic",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-child")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-parent")
+                .await
+                .unwrap(),
+            None
         );
     }
 
@@ -21804,6 +22077,11 @@ mod tests {
                     },
                     phoenix_core::llm_language::LlmLanguage::default(),
                     Some(&expected_scope),
+                    SubAgentExecution {
+                        connection: "codex",
+                        effort: Some(ModelEffort::High),
+                        persona: None,
+                    },
                 )
                 .await
         });
@@ -21862,6 +22140,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -21887,6 +22166,11 @@ mod tests {
                     },
                     phoenix_core::llm_language::LlmLanguage::default(),
                     Some(&expected_scope),
+                    SubAgentExecution {
+                        connection: "codex",
+                        effort: Some(ModelEffort::High),
+                        persona: None,
+                    },
                 )
                 .await
             });
@@ -21977,6 +22261,11 @@ mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 Some(&captured_scope),
+                SubAgentExecution {
+                    connection: "codex",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();
@@ -22269,6 +22558,7 @@ mod tests {
             "claude-opus-test",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "anthropic",
         )
         .await
         .unwrap();

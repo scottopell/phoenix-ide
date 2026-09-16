@@ -6,7 +6,7 @@ Sub-agents enable parallel task execution by spawning independent child
 conversations that run concurrently and report results back to a parent
 conversation. Each sub-agent runs in isolation and cannot spawn its own
 sub-agents. The parent specifies mode (explore for read-only research,
-work for write access) and optionally a model and turn budget per
+work for write access) and optionally a worker, execution selector, and turn budget per
 sub-agent. Mode enforcement rejects Work sub-agent requests from Explore parents
 when such requests are received. Top-level Explore always exposes `spawn_agents`;
 process-wide sandbox support gates only whether Explore parents and spawned
@@ -55,19 +55,21 @@ only the architectural seams.
   `submit_result` / `submit_error` while retaining completed ordinary-tool
   history for synthesis. The admission guard remains a malformed-response
   backstop.
-- **Spawn defaults** treat blank model/cwd overrides as absent, resolve relative
-  cwd values from the parent conversation, and render model overrides from the
-  same registry snapshot used for executor validation.
+- **Spawn execution** uses an optional tier or exact model/connection selector,
+  independently of an optional named worker. Worker candidates provide defaults;
+  generic omission inherits the parent's model, connection, and effort. Exact
+  model omission of effort uses its native default. Request schema and admission
+  share a resolved catalog. Selected connection identity is persisted for runtime
+  recreation without adding server-restart survival guarantees.
+- **Path defaults** treat blank cwd overrides as absent and resolve relative cwd
+  values from the parent conversation.
 - **Sub-agent wake handle** is the child conversation / agent id. Wake contracts
   can wait on that handle reaching terminal state, but the wake payload is not a
   parent-to-child continuation channel and does not grant more budget.
-- **Named agents** (see [`../agents/`](../agents/executive.md)) thread
-  through this layer: `SubAgentTask` gains an optional `agent_type`;
-  `SubAgentSpec` gains `agent_name` and `persona`;
-  `SpawnRejectedUnknownAgentType` rejects an unmatched `agent_type`; and
-  `SubAgentSpecsResolved` resolves mode/model with the agent definition as
-  the middle precedence layer. Persona discovery and composition are owned
-  by `agents.allium`.
+- **Named workers** supply persona and execution preferences, never mode or tools.
+  The XDG config and candidate catalog are owned by
+  [`agents.allium`](../agents/agents.allium); [ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md)
+  records the selection and filesystem retirement decisions.
 
 ## Status Summary
 
@@ -79,13 +81,21 @@ only the architectural seams.
 | **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer; conservation invariant tested in proptests |
 | **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `cancelling_sub_agents` state, propagates `UserCancel`; missing-runtime synthesises failure |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
-| **REQ-SA-007:** Model Tier Selection | ✅ Superseded | Replaced by REQ-PROJ-008 mode defaults + explicit `model` override |
+| **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
 | **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
-| **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | Blank overrides inherit; relative cwd is parent-relative; model enum is registry-backed |
+| **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | `omitted_execution_and_blank_cwd_use_defaults`, `relative_cwd_resolves_from_parent_working_directory`, and `advertised_model_removed_from_live_registry_is_rejected` |
 
-**Progress:** 9 of 11 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
+**Progress:** 9 complete; 1 deferred; 1 proposed for wake runtime.
+
+## Execution-selection verification
+
+Validation on devmbp passed the full Rust suite, compilation, code generation,
+generated-file staleness, Allium, spec shape, spec anchors, end-to-end tests, and
+dev.py tests at `caab8290d`. `unknown_model_on_later_task_rejected_before_any_spawn`
+verifies batch admission before dispatch; `sub_agent_selection_failure_rolls_back_conversation_and_persona`
+verifies atomic child persistence.
 
 ## Deferred refinements
 

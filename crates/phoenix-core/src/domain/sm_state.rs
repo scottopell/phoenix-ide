@@ -34,6 +34,7 @@ pub struct ReadImageInput {
 
 /// Task specification for `spawn_agents` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubAgentTask {
     pub task: String,
     #[serde(default)]
@@ -41,18 +42,30 @@ pub struct SubAgentTask {
     #[serde(default)]
     pub mode: Option<SubAgentMode>,
     #[serde(default)]
-    pub model: Option<String>,
+    pub execution: Option<ExecutionSelection>,
     #[serde(default)]
     pub max_turns: Option<u32>,
-    /// Named agent persona to spawn (see `specs/agents/`). Must match a
-    /// discovered agent name; supplies the sub-agent's persona and its
-    /// default model/mode.
+    /// Configured worker whose instructions apply to this task.
     #[serde(default)]
     pub agent_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionSelection {
+    Tier {
+        name: String,
+    },
+    Model {
+        model: String,
+        connection: String,
+        reasoning_effort: Option<crate::domain::llm_types::ModelEffort>,
+    },
+}
+
 /// Input for the `spawn_agents` tool (parent only)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnAgentsInput {
     pub tasks: Vec<SubAgentTask>,
 }
@@ -2175,6 +2188,8 @@ pub struct SubAgentSpec {
     pub mode: SubAgentMode,
     /// Resolved model ID for this sub-agent
     pub model_id: String,
+    pub connection: String,
+    pub effort: Option<crate::domain::llm_types::ModelEffort>,
     /// Maximum LLM turns before forced completion
     pub max_turns: u32,
     /// Named agent that produced this spec, if any (see `specs/agents/`).

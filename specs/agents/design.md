@@ -1,5 +1,10 @@
 # Named Agents — Technical Design
 
+> Legacy design history. Worker discovery and model-default sections are superseded
+> by [ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md).
+> Use `requirements.md` and the Allium specification for the active contract.
+
+
 ## Architecture Overview
 
 A named agent is a single Markdown file with YAML frontmatter (metadata) and a

@@ -3,14 +3,15 @@ name = "phoenix-agents"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
-description = "Named sub-agent discovery and metadata for Phoenix IDE: filesystem agent definitions (.claude/agents, .agents/agents), frontmatter parsing, and persona resolution. Core-only — no axum/HTTP glue."
+description = "User-configured named workers and execution tiers for Phoenix IDE."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-# Shared domain vocabulary (`SubAgentMode`).
 phoenix-core = { path = "../phoenix-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

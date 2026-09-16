@@ -63,6 +63,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
+| [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 
 ## For agents: which decisions bind your task
 
@@ -70,6 +71,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

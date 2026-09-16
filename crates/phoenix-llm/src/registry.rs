@@ -516,6 +516,14 @@ const fn codex_bridge_transport() -> LlmTransport {
     LlmTransport::Websocket
 }
 
+/// A model and its registered connection, with route-specific effort support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRoute {
+    pub model: String,
+    pub connection: String,
+    pub supported_efforts: super::EffortCapabilities,
+}
+
 /// Registry of available LLM models.
 ///
 /// Most state is frozen at construction. The Codex/ChatGPT bridge bits are
@@ -1182,6 +1190,88 @@ impl ModelRegistry {
         models
     }
 
+    /// Registered services, with the connection actually used by each service.
+    ///
+    /// # Panics
+    /// Panics if a registry lock is poisoned.
+    #[must_use]
+    pub fn available_execution_routes(&self) -> Vec<ExecutionRoute> {
+        let services = self.services.read().expect("services lock poisoned");
+        let specs = self.specs.read().expect("specs lock poisoned");
+        let mut routes: Vec<_> = specs
+            .values()
+            .filter_map(|spec| {
+                let service = services.get(&spec.id)?;
+                Some(ExecutionRoute {
+                    model: spec.id.clone(),
+                    connection: Self::execution_connection(spec, service.as_ref()),
+                    supported_efforts: spec.effort_capabilities_for(service.as_ref()),
+                })
+            })
+            .collect();
+        routes.sort_by(|left, right| left.model.cmp(&right.model));
+        routes
+    }
+
+    #[must_use]
+    pub fn connection_for_model(&self, model: &str) -> Option<String> {
+        let services = self.services.read().ok()?;
+        let specs = self.specs.read().ok()?;
+        let (spec, service) = specs.get(model).zip(services.get(model))?;
+        Some(Self::execution_connection(spec, service.as_ref()))
+    }
+
+    #[must_use]
+    pub fn get_execution_service(
+        &self,
+        model: &str,
+        connection: &str,
+    ) -> Option<Arc<dyn LlmService>> {
+        let services = self.services.read().ok()?;
+        let specs = self.specs.read().ok()?;
+        let (spec, service) = specs.get(model).zip(services.get(model))?;
+        (Self::execution_connection(spec, service.as_ref()) == connection)
+            .then(|| Arc::clone(service))
+    }
+
+    /// Validate an exact registered route and its optional effort.
+    ///
+    /// # Errors
+    /// Returns an error when the route is absent or does not support the effort.
+    pub fn validate_execution_route(
+        &self,
+        model: &str,
+        connection: &str,
+        effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    ) -> Result<ExecutionRoute, String> {
+        let route = self
+            .available_execution_routes()
+            .into_iter()
+            .find(|route| route.model == model && route.connection == connection)
+            .ok_or_else(|| format!("Model '{model}' is unavailable through '{connection}'"))?;
+        if let Some(effort) = effort {
+            if !route.supported_efforts.supports(effort) {
+                return Err(format!(
+                    "Model '{model}' through '{connection}' does not support effort '{effort:?}'"
+                ));
+            }
+        }
+        Ok(route)
+    }
+
+    fn execution_connection(spec: &super::ModelSpec, service: &dyn LlmService) -> String {
+        if service.uses_codex_bridge() {
+            return "codex".to_string();
+        }
+        match spec.backend {
+            ModelBackend::Anthropic => "anthropic",
+            ModelBackend::OpenAIResponses => "openai_responses",
+            ModelBackend::OpenAIChatCompletions => "openai_chat_completions",
+            ModelBackend::Mock => "mock",
+        }
+        .to_string()
+    }
+
     /// Get detailed information about available models
     ///
     /// # Panics
@@ -1261,9 +1351,18 @@ impl ModelRegistry {
     pub fn for_test_with_sonnet(service: Arc<dyn LlmService>) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         services.insert("claude-sonnet-5".to_string(), service);
+        let specs = all_models()
+            .into_iter()
+            .filter(|spec| spec.id == "claude-sonnet-5")
+            .map(|mut spec| {
+                // The injected service declares no reasoning-effort capabilities.
+                spec.effort_capabilities = super::EffortCapabilities::Unknown;
+                (spec.id.clone(), spec)
+            })
+            .collect();
         Self {
             services: std::sync::RwLock::new(services),
-            specs: std::sync::RwLock::new(HashMap::new()),
+            specs: std::sync::RwLock::new(specs),
             default_model: std::sync::RwLock::new("claude-sonnet-5".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
@@ -2207,6 +2306,77 @@ mod tests {
         .into_iter()
         .next()
         .unwrap()
+    }
+
+    #[test]
+    fn execution_routes_follow_connections_not_display_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut external = external_openai_model();
+        external.family = "OpenAI".to_string();
+        let registry = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            openai_responses_base_url: Some("https://example.test/v1/responses".to_string()),
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            external_models: vec![external],
+            ..Default::default()
+        });
+        assert_eq!(registry.provider_display_name("gpt-5.5"), "OpenAI");
+        assert_eq!(
+            registry.provider_display_name("openai-compatible/custom"),
+            "OpenAI"
+        );
+        assert_eq!(
+            registry.connection_for_model("gpt-5.5").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            registry
+                .connection_for_model("openai-compatible/custom")
+                .as_deref(),
+            Some("openai_responses")
+        );
+        assert!(registry
+            .validate_execution_route("gpt-5.5", "openai_responses", None)
+            .is_err());
+        assert!(registry
+            .validate_execution_route("gpt-5.5", "codex", None)
+            .is_ok());
+        assert!(registry
+            .get_execution_service("gpt-5.5", "codex")
+            .unwrap()
+            .uses_codex_bridge());
+        assert!(registry
+            .get_execution_service("gpt-5.5", "openai_responses")
+            .is_none());
+        assert!(!registry
+            .get_execution_service("openai-compatible/custom", "openai_responses")
+            .unwrap()
+            .uses_codex_bridge());
+    }
+
+    #[test]
+    fn execution_routes_codex_only_excludes_anthropic_and_checks_effort() {
+        use phoenix_core::domain::llm_types::ModelEffort;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ModelRegistry::new(&LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        });
+        let routes = registry.available_execution_routes();
+        assert!(!routes.is_empty());
+        assert!(routes.iter().all(|route| route.connection != "anthropic"));
+        assert_eq!(registry.connection_for_model("claude-sonnet-4-6"), None);
+        assert!(registry
+            .validate_execution_route("gpt-5.5", "codex", Some(ModelEffort::High))
+            .is_ok());
+        assert!(registry
+            .validate_execution_route("gpt-5.5", "codex", Some(ModelEffort::Minimal))
+            .is_err());
+        assert!(registry
+            .validate_execution_route("opus", "anthropic", None)
+            .is_err());
     }
 
     #[test]

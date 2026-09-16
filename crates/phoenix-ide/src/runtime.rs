@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+mod agent_execution;
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -3790,22 +3791,21 @@ impl RuntimeManager {
             return;
         }
 
-        if let Some(effort) = parent_conv.effort {
-            if !self.llm_registry.supports_effort(&spec.model_id, effort) {
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!(
-                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
-                                spec.model_id
-                            ),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
-                return;
-            }
+        if let Err(error) = self.llm_registry.validate_execution_route(
+            &spec.model_id,
+            &spec.connection,
+            spec.effort,
+        ) {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error,
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
         }
 
         // Derive sub-agent conv_mode from spec.mode + parent's mode.
@@ -3892,6 +3892,11 @@ impl RuntimeManager {
                 &sub_conv_mode,
                 parent_conv.llm_language,
                 parent_scope.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: &spec.connection,
+                    effort: spec.effort,
+                    persona: spec.persona.as_deref(),
+                },
             )
             .await
         {
@@ -3912,21 +3917,6 @@ impl RuntimeManager {
                 return;
             }
         };
-
-        // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
-        // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
-        // falling back to the generic prompt. Best-effort: the live
-        // conv_context built below carries the persona regardless, so a write
-        // failure only degrades a subsequent resume — logged, not fatal.
-        if let Some(persona) = spec.persona.as_deref() {
-            if let Err(e) = self.db.set_sub_agent_persona(&conv.id, persona).await {
-                tracing::warn!(
-                    error = %e,
-                    conv_id = %conv.id,
-                    "Failed to persist sub-agent persona; a resumed runtime would fall back to the generic prompt"
-                );
-            }
-        }
 
         // 2. Insert initial task as synthetic user message
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -4010,7 +4000,8 @@ impl RuntimeManager {
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone());
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone())
+            .with_connection(Some(spec.connection.clone()));
         // Select tool registry based on sub-agent mode (REQ-PROJ-008).
         // Sub-agents get MCP access via the parent's MCP manager.
         let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
@@ -4022,7 +4013,6 @@ impl RuntimeManager {
         let tool_executor = ToolRegistryExecutor::with_mcp(
             registry,
             self.mcp_manager.clone(),
-            Arc::from(Vec::new()),
             Arc::from(Vec::new()),
         );
 
@@ -5037,24 +5027,32 @@ impl RuntimeManager {
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
+        let pinned_connection = if is_sub_agent {
+            self.db
+                .get_sub_agent_execution_connection(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id)
+            .with_connection(pinned_connection);
 
         // Tool registry selection -- sub-agents get a restricted tool set
         // (no spawn_agents, no ask_user_question, no skill); parent
         // conversations get the mode-appropriate registry. Both layers wrap
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
-        // Freeze the named-agent catalog once per conversation so the
-        // spawn_agents schema and the executor's agent_type resolution share a
-        // single catalog instead of independently re-discovering the filesystem
-        // (REQ-AG-008). Sub-agents cannot spawn, so theirs is empty.
+        let agent_config = if is_sub_agent || is_coordinator {
+            phoenix_agents::AgentConfig::default()
+        } else {
+            phoenix_agents::load_user_config().unwrap_or_else(|error| {
+                tracing::error!(%error, "Phoenix agent configuration unavailable; using generic workers only");
+                phoenix_agents::AgentConfig::default()
+            })
+        };
         let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> =
-            if is_sub_agent || is_coordinator {
-                Arc::from(Vec::new())
-            } else {
-                Arc::from(phoenix_agents::discover_agents(context.filesystem_root()))
-            };
-        let available_model_ids = self.llm_registry.available_models();
+            Arc::from(agent_config.agents.clone());
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
@@ -5066,7 +5064,6 @@ impl RuntimeManager {
                 registry,
                 self.mcp_manager.clone(),
                 agent_catalog.clone(),
-                Arc::from(available_model_ids.clone()),
             )
         } else {
             use crate::db::ConvMode;
@@ -5097,7 +5094,7 @@ impl RuntimeManager {
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
                     ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
+                        ToolRegistry::direct(agent_catalog.to_vec())
                             .try_with_writing_conversation_tools(writing_tools)
                             .map_err(|error| error.clone())?,
                         None,
@@ -5106,7 +5103,6 @@ impl RuntimeManager {
                         ToolRegistry::explore(
                             &context.tasks_dir_name,
                             agent_catalog.to_vec(),
-                            available_model_ids.clone(),
                             ExploreToolPolicy::from_platform(&self.platform),
                         ),
                         Some(writing_tools),
@@ -5116,10 +5112,7 @@ impl RuntimeManager {
                         // fork proposal) is offered only when the working dir is
                         // inside a git repo — a fork cuts from the repository's
                         // default branch (REQ-PROJ-036).
-                        let registry = ToolRegistry::direct(
-                            agent_catalog.to_vec(),
-                            available_model_ids.clone(),
-                        );
+                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
                         let registry =
                             if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
                                 .is_some()
@@ -5140,12 +5133,9 @@ impl RuntimeManager {
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
                         (
-                            ToolRegistry::direct(
-                                agent_catalog.to_vec(),
-                                available_model_ids.clone(),
-                            )
-                            .with_propose_task()
-                            .try_with_writing_conversation_tools(writing_tools)?,
+                            ToolRegistry::direct(agent_catalog.to_vec())
+                                .with_propose_task()
+                                .try_with_writing_conversation_tools(writing_tools)?,
                             None,
                         )
                     }
@@ -5154,7 +5144,6 @@ impl RuntimeManager {
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
-                    Arc::from(available_model_ids.clone()),
                 )
                 .with_writing_tools(upgrade_writing_tools)
             }
@@ -5271,7 +5260,7 @@ impl RuntimeManager {
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
-            .with_agent_catalog(agent_catalog);
+            .with_agent_config(agent_config);
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -7718,6 +7707,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 parent.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create subordinate participant");
@@ -8534,7 +8528,12 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn subagent_persistence_keeps_one_owner_across_all_semantic_writes() {
-        let manager = Arc::new(test_manager().await);
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
         let parent = manager
             .db()
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
@@ -8560,7 +8559,9 @@ mod scope_liveness_tests {
                             cwd: "/tmp".to_string(),
                             timeout: std::time::Duration::from_secs(60),
                             mode: SubAgentMode::Explore,
-                            model_id: "gpt-5.4".to_string(),
+                            model_id: "gpt-5.6-sol".to_string(),
+                            connection: "openai_responses".into(),
+                            effort: None,
                             max_turns: 1,
                             agent_name: Some("fence-test".to_string()),
                             persona: Some("test persona".to_string()),
@@ -8668,6 +8669,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -8713,6 +8719,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -8752,6 +8763,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -8856,6 +8872,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -9660,6 +9681,7 @@ mod scope_liveness_tests {
                 "claude-sonnet-5",
                 Some(phoenix_core::domain::llm_types::ModelEffort::High),
                 ServiceTier::Standard,
+                "anthropic",
             )
             .await
             .expect("persist unsupported effort");

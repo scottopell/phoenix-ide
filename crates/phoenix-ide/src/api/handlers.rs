@@ -5147,13 +5147,13 @@ async fn upgrade_conversation_model(
         .map_err(map_admission_db_error)?;
     let _admission = admission.lock().await;
 
-    if state.llm_registry.get(&req.model).is_none() {
+    let Some(connection) = state.llm_registry.connection_for_model(&req.model) else {
         return Err(AppError::BadRequest(format!(
             "Unknown model '{}'. Available: {:?}",
             req.model,
             state.llm_registry.available_models()
         )));
-    }
+    };
     if let crate::api::types::EffortUpdate::Set(effort) = req.effort {
         if !state.llm_registry.supports_effort(&req.model, effort) {
             return Err(AppError::BadRequest(format!(
@@ -5225,7 +5225,13 @@ async fn upgrade_conversation_model(
     state
         .runtime
         .db()
-        .update_conversation_model_and_effort(&id, &req.model, next_effort, next_service_tier)
+        .update_conversation_model_and_effort(
+            &id,
+            &req.model,
+            next_effort,
+            next_service_tier,
+            &connection,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -13978,6 +13984,11 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvMode::Direct,
                 root.llm_language,
                 scope,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create subordinate participant");
@@ -15601,9 +15612,70 @@ mod upgrade_model_state_guard_tests {
                 "claude-opus-4-7",
                 None,
                 phoenix_core::domain::llm_types::ServiceTier::Standard,
+                "anthropic",
             )
             .await
             .expect("seed model");
+    }
+
+    #[tokio::test]
+    async fn child_model_switch_updates_its_pinned_connection() {
+        let state = make_test_state().await;
+        let parent = state
+            .db
+            .create_conversation("upgrade-parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = state
+            .db
+            .create_subagent_conversation(
+                "upgrade-child",
+                "child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.6-sol",
+                &ConvMode::Direct,
+                parent.llm_language,
+                parent.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "codex",
+                    effort: None,
+                    persona: Some("Keep these instructions"),
+                },
+            )
+            .await
+            .unwrap();
+
+        upgrade(&state, &child.id, "claude-sonnet-5").await.unwrap();
+
+        assert_eq!(
+            state
+                .db
+                .get_conversation(&child.id)
+                .await
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            state
+                .db
+                .get_sub_agent_execution_connection(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            state
+                .db
+                .get_sub_agent_persona(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Keep these instructions")
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,8 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
-use phoenix_agents::AgentDefinition;
+use phoenix_agents::{AgentDefinition, ModelEffort};
+use phoenix_core::domain::sm_state::SpawnAgentsInput;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -97,69 +98,47 @@ impl Tool for SubmitErrorTool {
     }
 }
 
-/// Tool for parent conversations to spawn sub-agents.
-///
-/// Holds the working-directory's discovered named agents (sorted by name) so
-/// `input_schema` can render them as an `agent_type` enum (REQ-AG-004). The
-/// catalog is captured per-conversation at registry-construction time; the
-/// `Tool` trait's `input_schema(&self)` has no working-directory parameter, so
-/// capturing here is what lets a static schema method emit a dynamic enum.
+#[derive(Debug, Clone)]
+pub struct SpawnModelChoice {
+    pub model: String,
+    pub connection: String,
+    pub efforts: Vec<ModelEffort>,
+}
+
 #[derive(Default)]
 pub struct SpawnAgentsTool {
     agents: Vec<AgentDefinition>,
-    model_ids: Vec<String>,
+    tiers: Vec<String>,
+    models: Vec<SpawnModelChoice>,
 }
 
 impl SpawnAgentsTool {
-    /// A spawn tool with no named agents — `agent_type` is omitted from the
-    /// schema. Used by tests and any caller without a discovered catalog.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            agents: Vec::new(),
-            model_ids: Vec::new(),
-        }
+        Self::default()
     }
 
-    /// A spawn tool whose schema exposes the given named agents as the
-    /// `agent_type` enum. `agents` must be sorted by name (the discovery
-    /// contract) for the rendered schema to be cache-stable (REQ-AG-008).
     #[must_use]
     pub fn with_agents(agents: Vec<AgentDefinition>) -> Self {
+        Self::with_execution_choices(agents, Vec::new(), Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_execution_choices(
+        mut agents: Vec<AgentDefinition>,
+        mut tiers: Vec<String>,
+        mut models: Vec<SpawnModelChoice>,
+    ) -> Self {
+        agents.sort_by(|a, b| a.name.cmp(&b.name));
+        tiers.sort();
+        tiers.dedup();
+        models.sort_by(|a, b| (&a.model, &a.connection).cmp(&(&b.model, &b.connection)));
         Self {
             agents,
-            model_ids: Vec::new(),
+            tiers,
+            models,
         }
     }
-
-    /// A spawn tool whose model override enum and executor validation share the
-    /// same registry-backed model IDs. The caller supplies a sorted snapshot so
-    /// the schema remains stable for the conversation.
-    #[must_use]
-    pub fn with_catalogs(agents: Vec<AgentDefinition>, model_ids: Vec<String>) -> Self {
-        Self { agents, model_ids }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SpawnAgentsInput {
-    tasks: Vec<TaskSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Authoritative parsing/resolution happens in the executor.
-struct TaskSpec {
-    task: String,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    mode: Option<String>, // "explore" or "work"
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    max_turns: Option<u32>,
-    #[serde(default)]
-    agent_type: Option<String>,
 }
 
 #[async_trait]
@@ -169,7 +148,7 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the available named personas. Omit execution to use the named worker's preferences, or otherwise inherit the parent's model, connection, and effort. Choose a configured tier or an explicit model connection to override execution. Execution selection is independent of permissions. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -185,11 +164,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model; Explore sub-agents may run in parallel. Work: full tool suite, inherits the parent model, and runs one at a time per parent. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
-            },
-            "model": {
-                "type": "string",
-                "description": "LLM model override. Omit or leave blank to use the mode default. When set, choose one of the model IDs available in this environment's model registry."
+                "description": "Sub-agent mode. Explore (default): read-only tools; Explore sub-agents may run in parallel. Work: full tool suite and runs one at a time per parent. Mode does not choose the model, connection, or effort. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
             },
             "max_turns": {
                 "type": "integer",
@@ -198,20 +173,50 @@ impl Tool for SpawnAgentsTool {
             }
         });
 
-        task_props["model"]["anyOf"] = json!([
-            { "enum": self.model_ids },
-            { "pattern": "^\\s*$" }
-        ]);
+        let mut execution_options = Vec::new();
+        if !self.tiers.is_empty() {
+            execution_options.push(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "name"],
+                "properties": {
+                    "type": { "type": "string", "enum": ["tier"] },
+                    "name": { "type": "string", "enum": self.tiers }
+                }
+            }));
+        }
+        for model in &self.models {
+            let mut properties = json!({
+                "type": { "type": "string", "enum": ["model"] },
+                "model": { "type": "string", "enum": [model.model] },
+                "connection": { "type": "string", "enum": [model.connection] }
+            });
+            if !model.efforts.is_empty() {
+                properties["reasoning_effort"] = json!({
+                    "type": "string",
+                    "enum": model.efforts,
+                    "description": "Optional effort for this model connection. Omit to use this model's default effort."
+                });
+            }
+            execution_options.push(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "model", "connection"],
+                "properties": properties
+            }));
+        }
+        if !execution_options.is_empty() {
+            task_props["execution"] = json!({
+                "oneOf": execution_options,
+                "description": "Execution override: select one configured tier or one exact available model connection. Omit to use the named worker's preferences, otherwise inherit the parent's model, connection, and effort. Explicit models never silently fall back."
+            });
+        }
 
-        // REQ-AG-004: surface discovered named agents as a typed agent_type
-        // enum. Omitted entirely when none are discovered, so the schema is a
-        // strict subset of the agent-free shape. The catalog is pre-sorted by
-        // name, so the rendered enum is byte-stable turn-to-turn (REQ-AG-008).
         if !self.agents.is_empty() {
             use std::fmt::Write as _;
             let names: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
             let mut description = String::from(
-                "Named agent persona to spawn. Omit this field for a generic Phoenix sub-agent. When set, it supplies the sub-agent's persona and its default model/mode. Available named personas:",
+                "Named agent persona to spawn. Omit this field for a generic Phoenix sub-agent. When set, it supplies the sub-agent's instructions and execution preferences. An execution override replaces those preferences; permissions remain separate. Available named personas:",
             );
             for agent in &self.agents {
                 let _ = write!(description, "\n- {}: {}", agent.name, agent.description);
@@ -225,12 +230,14 @@ impl Tool for SpawnAgentsTool {
 
         json!({
             "type": "object",
+            "additionalProperties": false,
             "required": ["tasks"],
             "properties": {
                 "tasks": {
                     "type": "array",
                     "items": {
                         "type": "object",
+                        "additionalProperties": false,
                         "required": ["task"],
                         "properties": task_props
                     },
@@ -342,11 +349,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             body: format!("You are {name}."),
-            path: std::path::PathBuf::from(format!("/agents/{name}.md")),
-            source_dir: ".claude/agents".to_string(),
-            model: None,
-            mode: None,
-            tools: None,
+            execution: None,
         }
     }
 
@@ -414,61 +417,81 @@ mod tests {
     }
 
     #[test]
-    fn schema_exposes_registry_model_ids() {
-        let schema = SpawnAgentsTool::with_catalogs(
+    fn schema_pins_each_model_to_its_connection_and_efforts() {
+        let schema = SpawnAgentsTool::with_execution_choices(
             Vec::new(),
-            vec!["gpt-a".to_string(), "gpt-b".to_string()],
+            vec!["fast".into(), "capable".into()],
+            vec![
+                SpawnModelChoice {
+                    model: "gpt-a".into(),
+                    connection: "codex".into(),
+                    efforts: vec![ModelEffort::High],
+                },
+                SpawnModelChoice {
+                    model: "gpt-a".into(),
+                    connection: "gateway".into(),
+                    efforts: Vec::new(),
+                },
+            ],
         )
         .input_schema();
+        let choices = &schema["properties"]["tasks"]["items"]["properties"]["execution"]["oneOf"];
         assert_eq!(
-            schema["properties"]["tasks"]["items"]["properties"]["model"]["anyOf"][0],
-            json!({ "enum": ["gpt-a", "gpt-b"] })
+            choices[0]["properties"]["name"]["enum"],
+            json!(["capable", "fast"])
         );
+        assert_eq!(
+            choices[1]["properties"]["connection"]["enum"],
+            json!(["codex"])
+        );
+        assert_eq!(
+            choices[1]["properties"]["reasoning_effort"]["enum"],
+            json!(["high"])
+        );
+        assert_eq!(
+            choices[1]["required"],
+            json!(["type", "model", "connection"])
+        );
+        assert_eq!(
+            choices[2]["properties"]["connection"]["enum"],
+            json!(["gateway"])
+        );
+        assert!(choices[2]["properties"].get("reasoning_effort").is_none());
+        assert_eq!(choices[2]["additionalProperties"], false);
     }
 
     #[test]
-    fn schema_model_constraint_includes_blank_default() {
-        let schema =
-            SpawnAgentsTool::with_catalogs(Vec::new(), vec!["gpt-a".to_string()]).input_schema();
-        let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
-        assert_eq!(model["anyOf"][0], json!({ "enum": ["gpt-a"] }));
-        assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));
-    }
-
-    #[test]
-    fn empty_catalog_constrains_model_to_blank_default() {
+    fn generic_schema_has_no_unresolved_execution_choices() {
         let schema = SpawnAgentsTool::new().input_schema();
-        let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
-        assert_eq!(model["anyOf"][0], json!({ "enum": [] }));
-        assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));
+        let properties = &schema["properties"]["tasks"]["items"]["properties"];
+        assert!(properties.get("model").is_none());
+        assert!(properties.get("execution").is_none());
     }
 
     #[test]
-    fn schema_model_guidance_is_provider_neutral() {
-        let schema = SpawnAgentsTool::new().input_schema();
-        let props = &schema["properties"]["tasks"]["items"]["properties"];
-        let mode_guidance = props["mode"]["description"].as_str().unwrap();
-        let override_guidance = props["model"]["description"].as_str().unwrap();
-        let guidance = format!("{mode_guidance}\n{override_guidance}");
-
-        assert!(
-            mode_guidance.contains("registry/provider-selected cheap model"),
-            "mode guidance should describe the provider-neutral explore default: {mode_guidance}"
-        );
-        assert!(
-            mode_guidance.contains("inherits the parent model"),
-            "mode guidance should describe the work-mode default: {mode_guidance}"
-        );
-        assert!(
-            override_guidance.contains("model IDs available in this environment's model registry"),
-            "model override guidance should describe registry validation: {override_guidance}"
-        );
-        for provider_specific_alias in ["claude-haiku-4-5", "claude-sonnet-4-6", "haiku model"] {
-            assert!(
-                !guidance.contains(provider_specific_alias),
-                "spawn_agents schema guidance should not mention provider-specific alias {provider_specific_alias:?}: {guidance}"
-            );
+    fn task_parser_rejects_legacy_model_and_mixed_execution() {
+        for task in [
+            json!({"task":"Review", "model":"opus"}),
+            json!({"task":"Review", "execution":{"type":"tier", "name":"fast", "model":"opus"}}),
+            json!({"task":"Review", "execution":{"type":"model", "model":"opus"}}),
+        ] {
+            assert!(serde_json::from_value::<SpawnAgentsInput>(json!({"tasks":[task]})).is_err());
         }
+        assert!(serde_json::from_value::<SpawnAgentsInput>(json!({"tasks":[{"task":"Review", "execution":{"type":"model", "model":"gpt-a", "connection":"codex"}}]})).is_ok());
+        assert!(serde_json::from_value::<SpawnAgentsInput>(
+            json!({"tasks":[{"task":"Review", "execution":{"type":"tier", "name":"fast"}}]})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn mode_guidance_separates_permissions_from_execution() {
+        let schema = SpawnAgentsTool::new().input_schema();
+        let guidance = schema["properties"]["tasks"]["items"]["properties"]["mode"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(guidance.contains("Mode does not choose the model, connection, or effort"));
+        assert!(!guidance.contains("cheap model"));
     }
 
     #[test]
