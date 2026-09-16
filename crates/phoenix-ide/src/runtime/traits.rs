@@ -2002,18 +2002,23 @@ impl RegistryLlmClient {
     }
 
     fn service(&self) -> Result<Arc<dyn phoenix_llm::LlmService>, LlmError> {
-        let service = match self.connection.as_deref() {
+        match self.connection.as_deref() {
             Some(connection) => self
                 .registry
-                .get_execution_service(&self.model_id, connection),
-            None => self.registry.get(&self.model_id),
-        };
-        service.ok_or_else(|| {
-            LlmError::network(format!(
-                "Model '{}' is unavailable through its selected connection",
-                self.model_id
-            ))
-        })
+                .get_execution_service(&self.model_id, connection)
+                .ok_or_else(|| {
+                    LlmError::invalid_request(format!(
+                        "Model '{}' is unavailable through selected connection '{connection}'",
+                        self.model_id
+                    ))
+                }),
+            None => self.registry.get(&self.model_id).ok_or_else(|| {
+                LlmError::network(format!(
+                    "Model '{}' is unavailable through its selected connection",
+                    self.model_id
+                ))
+            }),
+        }
     }
 }
 
@@ -2038,7 +2043,7 @@ impl LlmClient for RegistryLlmClient {
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
-        self.registry.get(&self.model_id).map_or(
+        self.service().map_or(
             phoenix_llm::ContinuationRequestLimits::TokenWindowOnly,
             |llm| llm.continuation_request_limits(),
         )
@@ -2276,5 +2281,66 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+    }
+}
+
+#[cfg(test)]
+mod registry_llm_client_tests {
+    use super::*;
+
+    fn codex_registry() -> (tempfile::TempDir, Arc<ModelRegistry>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"test","refresh_token":"test","account_id":"test"}}"#,
+        )
+        .unwrap();
+        let credential = phoenix_llm::CodexCredential::load(path).unwrap().0;
+        let registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(credential),
+            ..Default::default()
+        }));
+        (dir, registry)
+    }
+
+    #[test]
+    fn pinned_route_mismatch_is_not_a_retryable_network_failure() {
+        let (_dir, registry) = codex_registry();
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+            .with_connection(Some("openai_responses".to_string()));
+        let error = match client.service() {
+            Ok(_) => panic!("must not substitute Codex for the selected direct connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
+        assert!(!error.kind.is_auto_retryable());
+        assert!(error.message.contains("openai_responses"));
+        assert!(
+            RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+                .with_connection(Some("codex".to_string()))
+                .service()
+                .is_ok()
+        );
+        let unpinned = RegistryLlmClient::new(registry, "missing-model".to_string());
+        assert!(unpinned.service().err().unwrap().kind.is_auto_retryable());
+    }
+
+    #[test]
+    fn continuation_limits_use_the_selected_connection() {
+        let (_dir, registry) = codex_registry();
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+            .with_connection(Some("codex".to_string()));
+        assert!(matches!(
+            client.continuation_request_limits(),
+            phoenix_llm::ContinuationRequestLimits::MaxInputItems { .. }
+        ));
+        let mismatch = RegistryLlmClient::new(registry, "gpt-5.5".to_string())
+            .with_connection(Some("openai_responses".to_string()));
+        assert_eq!(
+            mismatch.continuation_request_limits(),
+            phoenix_llm::ContinuationRequestLimits::TokenWindowOnly
+        );
     }
 }
