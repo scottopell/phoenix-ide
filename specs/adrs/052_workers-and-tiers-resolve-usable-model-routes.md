@@ -84,7 +84,8 @@ registry aliases distinguish models registered through different backends.
 - **Neutral:** Config edits apply when the parent runtime is created again.
   Route availability refresh can alter tool definitions and their cache prefix.
 - **Neutral:** The selected connection needs one narrow persisted child binding.
-  Prefeature children without that binding retain their existing behavior. This
+  Prefeature children without that binding retain their existing behavior until
+  an explicit user model change records a newly selected connection. This
   does not expand restart survival, rollback, or live-replacement guarantees.
 - **Neutral:** Skills remain reusable expertise. Plugin hosting is outside scope.
 

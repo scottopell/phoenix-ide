@@ -8843,7 +8843,7 @@ impl Database {
         Ok(false)
     }
 
-    /// Atomically update model settings and the connection of an already-pinned child.
+    /// Atomically update model settings and the selected connection of a child.
     ///
     /// # Errors
     ///
@@ -8872,7 +8872,9 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         sqlx::query(
-            "UPDATE sub_agent_execution_routes SET connection = ?1 WHERE conversation_id = ?2",
+            "INSERT INTO sub_agent_execution_routes (conversation_id, connection)
+             SELECT id, ?1 FROM conversations WHERE id = ?2 AND parent_conversation_id IS NOT NULL
+             ON CONFLICT(conversation_id) DO UPDATE SET connection = excluded.connection",
         )
         .bind(connection)
         .bind(id)
@@ -21978,6 +21980,54 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("anthropic")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_child_model_change_records_newly_selected_connection() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("legacy-parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "legacy-child",
+            "child",
+            "/tmp",
+            false,
+            Some("legacy-parent"),
+            Some("gpt-5.4"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-child")
+                .await
+                .unwrap(),
+            None
+        );
+
+        db.update_conversation_model_and_effort(
+            "legacy-child",
+            "claude-sonnet-5",
+            None,
+            ServiceTier::Standard,
+            "anthropic",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-child")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            db.get_sub_agent_execution_connection("legacy-parent")
+                .await
+                .unwrap(),
+            None
         );
     }
 
