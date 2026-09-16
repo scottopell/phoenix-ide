@@ -68,6 +68,42 @@ pub fn skill_names() -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// Read a built-in asset from the binary's immutable embedded bytes.
+#[must_use]
+pub fn embedded_asset(path: &str) -> Option<String> {
+    let asset = BuiltinAssets::get(path)?;
+    std::str::from_utf8(asset.data.as_ref())
+        .ok()
+        .map(str::to_owned)
+}
+
+/// Read one built-in skill definition from immutable embedded bytes.
+#[must_use]
+pub fn embedded_skill(name: &str) -> Option<String> {
+    if !skill_names().iter().any(|candidate| candidate == name) {
+        return None;
+    }
+    embedded_asset(&format!("{name}/SKILL.md"))
+}
+
+/// Read every embedded text asset for one built-in skill, sorted by path.
+#[must_use]
+pub fn embedded_skill_assets(name: &str) -> Option<Vec<(String, String)>> {
+    if !skill_names().iter().any(|candidate| candidate == name) {
+        return None;
+    }
+    let prefix = format!("{name}/");
+    let mut assets = BuiltinAssets::iter()
+        .filter_map(|path| {
+            let path = path.into_owned();
+            path.strip_prefix(&prefix)?;
+            embedded_asset(&path).map(|content| (path, content))
+        })
+        .collect::<Vec<_>>();
+    assets.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(assets)
+}
+
 /// Extract every embedded built-in file to `target_dir/<skill>/<...>`.
 /// Overwrites embedded files and removes every non-embedded file found under a
 /// currently bundled skill directory. The target directory is Phoenix-owned;
@@ -199,9 +235,26 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn skill_names_includes_spears_and_allium_only() {
+    fn skill_names_includes_all_embedded_skills() {
         let names = skill_names();
-        assert_eq!(names, vec!["allium".to_string(), "spears".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "allium".to_string(),
+                "phoenix-api".to_string(),
+                "spears".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn embedded_skill_reads_immutable_asset() {
+        let content = embedded_skill("phoenix-api").unwrap();
+        assert!(content.contains("audience: global-coordinator"));
+        assert!(embedded_skill("missing").is_none());
+        assert!(embedded_asset("phoenix-api/references/api-reference.md")
+            .unwrap()
+            .contains("ContextExhausted"));
     }
 
     #[test]
@@ -230,6 +283,36 @@ mod tests {
         assert!(tmp.path().join("spears/SKILL.md").is_file());
         assert!(tmp.path().join("spears/references/discovery.md").is_file());
         assert!(tmp.path().join("spears/adrs/_TEMPLATE.md").is_file());
+        assert!(tmp.path().join("phoenix-api/SKILL.md").is_file());
+        assert!(tmp
+            .path()
+            .join("phoenix-api/references/api-reference.md")
+            .is_file());
+    }
+
+    #[test]
+    fn phoenix_api_content_preserves_authorization_and_verification_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        extract_to(tmp.path()).unwrap();
+        let skill = std::fs::read_to_string(tmp.path().join("phoenix-api/SKILL.md")).unwrap();
+        let reference =
+            std::fs::read_to_string(tmp.path().join("phoenix-api/references/api-reference.md"))
+                .unwrap();
+
+        assert!(skill.contains("audience: global-coordinator"));
+        assert!(skill.contains("user has authorized"));
+        assert!(skill.contains("never print, persist"));
+        assert!(skill.contains("acceptance, not proof"));
+        assert!(reference.contains("GET /api/auth/status"));
+        assert!(reference.contains("writable_transcript_row_id"));
+        assert!(reference.contains("/{latest_transcript_row_id}/continue"));
+        assert!(reference.contains("verified as `ContextExhausted`"));
+        assert!(reference.contains("/{writable_transcript_row_id}/chat"));
+        assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
+        assert!(reference.contains("Reuse the same `message_id`"));
+        assert!(reference.contains("messages/reconcile"));
+        assert!(reference.contains("Current APIs do not provide"));
+        assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
     }
 
     #[test]

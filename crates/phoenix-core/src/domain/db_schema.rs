@@ -845,6 +845,10 @@ pub enum ToolOutcome {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolContentImage>,
     },
+    /// Authenticated instructions from an audience-bound immutable built-in skill.
+    TrustedInstructions {
+        output: String,
+    },
     Error {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -938,13 +942,18 @@ impl ToolResult {
     #[allow(dead_code)] // Used in tests; main code uses is_error()
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(self.outcome, ToolOutcome::Success { .. })
+        matches!(
+            self.outcome,
+            ToolOutcome::Success { .. } | ToolOutcome::TrustedInstructions { .. }
+        )
     }
 
     #[must_use]
     pub fn output(&self) -> &str {
         match &self.outcome {
-            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => output,
+            ToolOutcome::Success { output, .. }
+            | ToolOutcome::TrustedInstructions { output }
+            | ToolOutcome::Error { output, .. } => output,
             ToolOutcome::Cancelled { message } => message,
         }
     }
@@ -955,7 +964,7 @@ impl ToolResult {
             ToolOutcome::Success { display_data, .. } | ToolOutcome::Error { display_data, .. } => {
                 display_data.as_ref()
             }
-            ToolOutcome::Cancelled { .. } => None,
+            ToolOutcome::TrustedInstructions { .. } | ToolOutcome::Cancelled { .. } => None,
         }
     }
 
@@ -963,7 +972,7 @@ impl ToolResult {
     pub fn images(&self) -> &[ToolContentImage] {
         match &self.outcome {
             ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
-            ToolOutcome::Cancelled { .. } => &[],
+            ToolOutcome::TrustedInstructions { .. } | ToolOutcome::Cancelled { .. } => &[],
         }
     }
 }
@@ -1111,12 +1120,26 @@ impl ImageData {
     }
 }
 
+/// The source authority of persisted tool-result content.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolContentOrigin {
+    /// Normal tool output remains untrusted data.
+    #[default]
+    Ordinary,
+    /// Instructions authenticated from an immutable, audience-bound built-in.
+    TrustedBuiltinInstructions,
+}
+
 /// Tool result message content
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolContent {
     pub tool_use_id: String,
     pub content: String,
     pub is_error: bool,
+    // owned: pre-feature rows were ordinary tool results; default is correct.
+    #[serde(default)]
+    pub origin: ToolContentOrigin,
     /// Images to send to the LLM as image content blocks (not tokenized as text).
     ///
     /// serde(default): owned backward-compat decision, not a pending-migration
@@ -1134,6 +1157,21 @@ impl ToolContent {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
             is_error,
+            origin: ToolContentOrigin::Ordinary,
+            images: vec![],
+        }
+    }
+
+    #[must_use]
+    pub fn trusted_builtin_instructions(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error: false,
+            origin: ToolContentOrigin::TrustedBuiltinInstructions,
             images: vec![],
         }
     }
@@ -1450,8 +1488,20 @@ impl MessageContent {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
             is_error,
+            origin: ToolContentOrigin::Ordinary,
             images,
         })
+    }
+
+    #[must_use]
+    pub fn trusted_builtin_instructions(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::Tool(ToolContent::trusted_builtin_instructions(
+            tool_use_id,
+            content,
+        ))
     }
 
     /// Create system content
@@ -2145,7 +2195,9 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"type":"success","output":"ok"}"#).unwrap();
         match success {
             ToolOutcome::Success { images, .. } => assert!(images.is_empty()),
-            other @ (ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. }) => {
+            other @ (ToolOutcome::Error { .. }
+            | ToolOutcome::TrustedInstructions { .. }
+            | ToolOutcome::Cancelled { .. }) => {
                 panic!("expected Success, got {other:?}")
             }
         }
@@ -2153,7 +2205,9 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"type":"error","output":"boom"}"#).unwrap();
         match error {
             ToolOutcome::Error { images, .. } => assert!(images.is_empty()),
-            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+            other @ (ToolOutcome::Success { .. }
+            | ToolOutcome::TrustedInstructions { .. }
+            | ToolOutcome::Cancelled { .. }) => {
                 panic!("expected Error, got {other:?}")
             }
         }

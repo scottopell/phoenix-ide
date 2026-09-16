@@ -16,6 +16,8 @@ The first batch ships:
   `references/language-reference.md` shipped alongside the SKILL.md.
 - **`/spears`** — spEARS requirements-driven development workflow, with
   workflow-specific reference files shipped alongside the SKILL.md.
+- **`phoenix-api`** — Global Coordinator-only reference for user-authorized
+  lifecycle actions through supported Phoenix HTTP APIs and scoped Bash.
 
 The mechanism is general — additional built-in skills are added by dropping
 a directory under `src/skills/builtin/` and committing.
@@ -40,6 +42,22 @@ wins") gives the user override for free. Extracted directories whose names
 are no longer embedded in the current binary are ignored, so removed built-ins
 do not remain visible after an upgrade.
 
+Audience metadata defaults to ordinary conversations. The `global-coordinator`
+audience is honored only for Phoenix built-ins: Coordinator discovery scans only
+the extracted built-in directory, and the audience-bound Skill tool enforces the
+same boundary during invocation. Filesystem skills cannot self-promote into the
+Coordinator catalog.
+Coordinator catalog entries are admitted only when the extracted definition
+matches the immutable bytes embedded in the binary. Invocation reads those
+embedded instructions and companion references directly and marks the result as
+trusted built-in skill content; it never trusts the mutable extraction cache.
+
+Extraction prunes unexpected files inside built-in directories that remain
+bundled. Directories for removed or renamed built-ins may remain on disk but are
+excluded by the embedded-name allowlist. Phoenix has no disable configuration;
+a valid filesystem skill with the same name replaces an ordinary built-in by
+normal precedence, while an invalid or empty definition does not disable it.
+
 ## Status Summary
 
 | Requirement | Status | Notes |
@@ -50,6 +68,7 @@ do not remain visible after an upgrade.
 | **REQ-BS-004:** Invocation parity | ✅ Complete | Single `read_to_string` path; both sources use real disk paths |
 | **REQ-BS-005:** spEARS workflow skill | ✅ Complete | `spears/SKILL.md` + workflow references extracted at startup |
 | **REQ-BS-006:** Allium with companion files | ✅ Complete | `allium/SKILL.md` + `allium/references/language-reference.md` extracted at startup |
+| **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator |
 
 ## Cross-Spec References
 
