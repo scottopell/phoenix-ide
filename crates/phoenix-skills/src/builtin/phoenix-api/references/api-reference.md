@@ -14,7 +14,7 @@ Use `curl --fail-with-body --silent --show-error` and capture response bodies wi
 
 ## Discover the default model
 
-`GET /api/models/default` returns the deployment's default model identifier. Read it before creating a conversation when the user did not name a supported model; do not guess a model ID.
+`GET /api/models` returns `models` and `default`. Read it before creating a conversation when the user did not name a supported model; use the `default` model identifier when present and do not guess a model ID.
 
 ## Resolve the current target
 
