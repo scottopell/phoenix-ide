@@ -3701,7 +3701,21 @@ async fn watchdog_owned_spawn(
         reason: format!("watchdog-owned tmux spawn failed: {error}"),
     })?;
     if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
-        retire_failed_test_spawn(control_socket).await;
+        if let Err(retire_error) = super::test_server::retire_owned_server(
+            socket_path,
+            control_socket,
+            processes,
+            server_token,
+        )
+        .await
+        {
+            tracing::error!(
+                socket = %socket_path.display(),
+                control = %control_socket.display(),
+                %retire_error,
+                "watchdog could not prove retirement after tmux publication failure"
+            );
+        }
         return Err(TmuxError::SpawnFailed {
             socket_path: socket_path.to_path_buf(),
             reason: format!("failed to publish contained tmux socket: {error}"),
@@ -5476,17 +5490,28 @@ mod tests {
         let owner = TestTmuxServerOwner::new();
         let socket = owner.path().join("publication-conflict.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let error = spawn_session_owned(
-            &socket,
-            &owner.path().join(SERVER_CONFIG_FILENAME),
-            owner.path(),
-            Some(owner.control_root_path()),
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            spawn_session_owned(
+                &socket,
+                &owner.path().join(SERVER_CONFIG_FILENAME),
+                owner.path(),
+                Some(owner.control_root_path()),
+            ),
         )
         .await
+        .expect("publication-failure retirement must complete within its protocol deadline")
         .expect_err("visible publication conflict must fail spawn");
         assert!(error
             .to_string()
             .contains("failed to publish contained tmux socket"));
+        assert!(socket.exists(), "publication replacement must remain bound");
+        assert_eq!(
+            listener.local_addr().unwrap().as_pathname(),
+            Some(socket.as_path()),
+            "publication replacement must remain untouched"
+        );
+        drop(listener);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let live_control = std::fs::read_dir(owner.control_root_path())
@@ -5504,7 +5529,6 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
         }
-        drop(listener);
         std::fs::remove_file(socket).unwrap();
         owner.shutdown();
     }

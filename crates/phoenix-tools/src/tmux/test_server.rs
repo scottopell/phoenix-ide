@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 root = Path(sys.argv[1])
 parent = int(sys.argv[2])
@@ -35,6 +36,10 @@ control_root = Path(sys.argv[3])
 owned = []
 unconfirmed_obligations = []
 identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
+adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
+cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
+quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
+provisional = []
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -190,12 +195,62 @@ def record_owned(socket, device, inode, control, identities):
         owned.remove(record)
     owned.append((socket, device, inode, control, tuple(identities)))
 
+def exact_record(socket, control, identities):
+    expected = tuple(identities)
+    for record in owned:
+        if record[0] == socket and record[3] == control:
+            if tuple(record[4]) == expected:
+                return record
+    return None
+
+def tmux_format_literal(value):
+    if not value or any(not (character.isascii() and (character.isalnum() or character == "-"))
+                        for character in value):
+        raise RuntimeError("tmux ownership token has invalid protocol characters")
+    return value
+
+def retire_record(record, deadline):
+    _, device, inode, control, processes = record
+    expected_token = tmux_format_literal(processes[0][2])
+    states = [identity_state(identity) for identity in processes]
+    if all(state == "absent" for state in states):
+        return True
+    if states[0] != "owned" or states[1] not in ("owned", "absent"):
+        return False
+    try:
+        control_stat = control.stat()
+        if control_stat.st_dev != device or control_stat.st_ino != inode:
+            return False
+        expected_server = processes[0][0]
+        subprocess.run(
+            ["tmux", "-S", str(control), "if-shell", "-F",
+             f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
+             "kill-server", ""],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+            timeout=remaining_timeout(deadline),
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+    while time.monotonic() < deadline:
+        if all(identity_state(identity) == "absent" for identity in processes):
+            return True
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    return False
+
 def spawn_owned(request):
     rejected = request.with_name(request.name.replace(".spawn-", ".rejected-", 1))
     acknowledged = request.with_name(request.name.replace(".spawn-", ".registered-", 1))
     control = None
     try:
-        socket_name, control_name, config, cwd, token, env_path = request.read_text().split("\t")
+        fields = request.read_text().split("\t")
+        if len(fields) == 7:
+            socket_name, control_name, config, cwd, token, env_path, adopt_name = fields
+        elif len(fields) == 6:
+            socket_name, control_name, config, cwd, token, env_path = fields
+            adopt_name = request.name.replace(".spawn-", ".adopt-", 1)
+        else:
+            raise RuntimeError("spawn request was malformed")
         socket = root / socket_name
         control = control_root / control_name
         if socket.parent != root or control.parent != control_root or control.exists():
@@ -214,6 +269,11 @@ def spawn_owned(request):
         control_stat = control.stat()
         record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
         unconfirmed_obligations.remove(obligation)
+        adopt = control_root / adopt_name
+        if adopt.parent != control_root:
+            raise RuntimeError("adoption marker is not an exact child of control root")
+        provisional.append((socket, control, tuple(identities), adopt, acknowledged,
+                            time.monotonic() + adoption_timeout))
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
         ))
@@ -227,6 +287,55 @@ def spawn_owned(request):
             request.unlink(missing_ok=True)
         except OSError:
             pass
+    return True
+
+def remove_retired_control(record):
+    _, device, inode, control, _ = record
+    quarantine = control_root / f".retired-control-{uuid.uuid4()}"
+    try:
+        os.replace(control, quarantine)
+        moved_stat = quarantine.stat()
+        if moved_stat.st_dev != device or moved_stat.st_ino != inode:
+            try:
+                if not control.exists():
+                    os.replace(quarantine, control)
+            except OSError:
+                pass
+            return False
+        quarantine.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+def retire(request):
+    rejected = request.with_name(request.name.replace(".retire-", ".retire-rejected-", 1))
+    acknowledged = request.with_name(request.name.replace(".retire-", ".retired-", 1))
+    try:
+        fields = request.read_text().split("\t")
+        if len(fields) != 7:
+            raise RuntimeError("retirement request was malformed")
+        socket = root / fields[0]
+        control = control_root / fields[1]
+        expected_token = tmux_format_literal(fields[4])
+        identities = ((int(fields[2]), fields[3], expected_token), (int(fields[5]), fields[6], None))
+        record = exact_record(socket, control, identities)
+        if record is None:
+            raise RuntimeError("retirement identity did not match an owned record")
+        if not retire_record(record, time.monotonic() + identity_timeout):
+            raise RuntimeError("exact owned record retirement could not be proven")
+        if not remove_retired_control(record):
+            raise RuntimeError("retired control endpoint could not be removed exactly")
+        owned.remove(record)
+        publish_response(acknowledged, "retired")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
+        try:
+            publish_response(rejected, str(error))
+        except OSError:
+            return False
+    finally:
+        request.unlink(missing_ok=True)
     return True
 
 def register(request):
@@ -272,6 +381,34 @@ while not (root / ".cleanup-request").exists():
         request = None
     if request is not None:
         break
+    now = time.monotonic()
+    for item in list(provisional):
+        socket, control, identities, adopt, acknowledged, deadline = item
+        if adopt.exists():
+            adopt.unlink(missing_ok=True)
+            acknowledged.unlink(missing_ok=True)
+            provisional.remove(item)
+        elif now >= deadline:
+            record = exact_record(socket, control, identities)
+            retired = record is not None and retire_record(
+                record, time.monotonic() + identity_timeout
+            )
+            if retired and remove_retired_control(record):
+                owned.remove(record)
+            else:
+                publish_response(
+                    control_root / f".lease-failed-{acknowledged.name}",
+                    "exact provisional retirement could not be proven",
+                )
+                unconfirmed_obligations.append((socket, control))
+            provisional.remove(item)
+    for request in control_root.glob(".retire-*"):
+        if not retire(request):
+            break
+    else:
+        request = None
+    if request is not None:
+        break
     for request in control_root.glob(".register-*"):
         if not register(request):
             break
@@ -295,7 +432,14 @@ try:
 except FileNotFoundError:
     pass
 
+cleanup_deadline = time.monotonic() + cleanup_timeout
 for _, device, inode, control, processes in owned:
+    if time.monotonic() >= cleanup_deadline:
+        break
+    try:
+        expected_token = tmux_format_literal(processes[0][2])
+    except RuntimeError:
+        continue
     states = [identity_state(identity) for identity in processes]
     server_state, pane_state = states
     if server_state == "absent" and pane_state == "absent":
@@ -309,18 +453,19 @@ for _, device, inode, control, processes in owned:
         expected_server = processes[0][0]
         killed = subprocess.run(
             ["tmux", "-S", str(control), "if-shell", "-F",
-             f"#{{==:#{{pid}},{expected_server}}}", "kill-server", ""],
+             f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
+             "kill-server", ""],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=0.5,
+            timeout=remaining_timeout(cleanup_deadline),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         pass
 
 quiet = 0
-for _ in range(50):
+while time.monotonic() < cleanup_deadline:
     unconfirmed = False
     states = [
         identity_state(identity)
@@ -343,20 +488,37 @@ for _ in range(50):
             device, inode, control, processes = registered
             states = [identity_state(identity) for identity in processes]
             try:
-                socket_stat = socket.stat()
                 control_stat = control.stat()
             except OSError:
                 unconfirmed = True
                 continue
-            if (socket_stat.st_dev != device or socket_stat.st_ino != inode
-                    or control_stat.st_dev != device or control_stat.st_ino != inode):
+            if (control_stat.st_dev != device or control_stat.st_ino != inode
+                    or any(state != "absent" for state in states)):
                 unconfirmed = True
                 continue
-            if all(state == "absent" for state in states):
-                socket.unlink()
-                if socket.exists():
+            if quarantine_hook:
+                subprocess.run(
+                    [quarantine_hook, str(socket)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                    timeout=remaining_timeout(cleanup_deadline),
+                )
+            quarantine = root / f".quarantine-{uuid.uuid4()}"
+            try:
+                os.replace(socket, quarantine)
+                moved_stat = quarantine.stat()
+                if moved_stat.st_dev == device and moved_stat.st_ino == inode:
+                    quarantine.unlink()
+                else:
+                    try:
+                        if not socket.exists():
+                            os.replace(quarantine, socket)
+                    except OSError:
+                        pass
                     unconfirmed = True
-            else:
+            except FileNotFoundError:
+                pass
+            except OSError:
                 unconfirmed = True
             continue
         try:
@@ -366,7 +528,7 @@ for _ in range(50):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
-                timeout=0.5,
+                timeout=remaining_timeout(cleanup_deadline),
             )
             if probe.returncode == 0:
                 killed = subprocess.run(
@@ -375,7 +537,7 @@ for _ in range(50):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
-                    timeout=0.5,
+                    timeout=remaining_timeout(cleanup_deadline),
                 )
                 if killed.returncode == 0:
                     socket.unlink(missing_ok=True)
@@ -383,7 +545,7 @@ for _ in range(50):
                     unconfirmed = True
             else:
                 unconfirmed = True
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
             unconfirmed = True
     sockets = any(path.is_socket() for path in root.glob("*.sock"))
     creators = False
@@ -405,7 +567,7 @@ for _ in range(50):
         if control_root.exists():
             shutil.rmtree(control_root)
         sys.exit(0)
-    time.sleep(0.1)
+    time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
 sys.exit(1)
 "##;
@@ -444,6 +606,15 @@ impl TestTmuxServerOwner {
     fn new_with_watchdog_options(
         watchdog_path: Option<&Path>,
         identity_timeout: Option<Duration>,
+    ) -> Self {
+        Self::new_with_watchdog_test_options(watchdog_path, identity_timeout, None, None)
+    }
+
+    fn new_with_watchdog_test_options(
+        watchdog_path: Option<&Path>,
+        identity_timeout: Option<Duration>,
+        cleanup_timeout: Option<Duration>,
+        quarantine_hook: Option<&Path>,
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -487,6 +658,15 @@ impl TestTmuxServerOwner {
                 "PHOENIX_TMUX_IDENTITY_TIMEOUT",
                 timeout.as_secs_f64().to_string(),
             );
+        }
+        if let Some(timeout) = cleanup_timeout {
+            command.env(
+                "PHOENIX_TMUX_CLEANUP_TIMEOUT",
+                timeout.as_secs_f64().to_string(),
+            );
+        }
+        if let Some(hook) = quarantine_hook {
+            command.env("PHOENIX_TMUX_QUARANTINE_HOOK", hook);
         }
         if let Some(path) = watchdog_path {
             let inherited_path = std::env::var_os("PATH").unwrap_or_default();
@@ -720,6 +900,7 @@ pub(crate) async fn spawn_owned_server(
     let pending = control_root.join(format!(".pending-spawn-{nonce}"));
     let acknowledged = control_root.join(format!(".registered-{nonce}"));
     let rejected = control_root.join(format!(".rejected-{nonce}"));
+    let adopted = control_root.join(format!(".adopt-{nonce}"));
     let env_file = control_root.join(format!(".environment-{nonce}.json"));
     fs::write(
         &env_file,
@@ -729,9 +910,7 @@ pub(crate) async fn spawn_owned_server(
         paths: vec![
             pending.clone(),
             request.clone(),
-            acknowledged.clone(),
             rejected.clone(),
-            control_root.join(format!(".pending-registered-{nonce}")),
             control_root.join(format!(".pending-rejected-{nonce}")),
             env_file.clone(),
         ],
@@ -739,12 +918,16 @@ pub(crate) async fn spawn_owned_server(
     fs::write(
         &pending,
         format!(
-            "{socket_name}\t{control_name}\t{}\t{}\t{token}\t{}",
+            "{socket_name}\t{control_name}\t{}\t{}\t{token}\t{}\t{}",
             protocol_field(config_path, "config path")?,
             protocol_field(cwd, "cwd")?,
             protocol_field(
                 Path::new(env_file.file_name().expect("env file has name")),
                 "env file",
+            )?,
+            protocol_field(
+                Path::new(adopted.file_name().expect("adoption marker has name")),
+                "adoption marker",
             )?
         ),
     )?;
@@ -752,7 +935,9 @@ pub(crate) async fn spawn_owned_server(
     let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
     loop {
         if let Ok(value) = fs::read_to_string(&acknowledged) {
-            return parse_acknowledged_processes(&value);
+            let processes = parse_acknowledged_processes(&value)?;
+            fs::write(&adopted, [])?;
+            return Ok(processes);
         }
         if let Ok(reason) = fs::read_to_string(&rejected) {
             return Err(io::Error::other(format!(
@@ -763,6 +948,67 @@ pub(crate) async fn spawn_owned_server(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "tmux watchdog did not acknowledge spawn",
+            ));
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+pub(crate) async fn retire_owned_server(
+    socket: &Path,
+    control_socket: &Path,
+    processes: TestServerProcesses,
+    expected_token: &str,
+) -> io::Result<()> {
+    let control_root = control_socket
+        .parent()
+        .ok_or_else(|| io::Error::other("tmux test control socket has no root"))?;
+    let socket_name = protocol_field(
+        Path::new(
+            socket
+                .file_name()
+                .ok_or_else(|| io::Error::other("socket has no name"))?,
+        ),
+        "socket name",
+    )?;
+    let control_name = protocol_field(
+        Path::new(
+            control_socket
+                .file_name()
+                .ok_or_else(|| io::Error::other("control has no name"))?,
+        ),
+        "control name",
+    )?;
+    let nonce = uuid::Uuid::new_v4();
+    let request = control_root.join(format!(".retire-{nonce}"));
+    let pending = control_root.join(format!(".pending-retire-{nonce}"));
+    let retired = control_root.join(format!(".retired-{nonce}"));
+    let rejected = control_root.join(format!(".retire-rejected-{nonce}"));
+    fs::write(
+        &pending,
+        format!(
+            "{socket_name}\t{control_name}\t{}\t{}\t{expected_token}\t{}\t{}",
+            processes.server.pid,
+            processes.server.start_time,
+            processes.pane.pid,
+            processes.pane.start_time,
+        ),
+    )?;
+    fs::rename(&pending, &request)?;
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        if retired.exists() {
+            return Ok(());
+        }
+        if let Ok(reason) = fs::read_to_string(&rejected) {
+            return Err(io::Error::other(format!(
+                "tmux watchdog rejected retirement: {reason}"
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tmux watchdog did not acknowledge retirement",
             ));
         }
         tokio::task::yield_now().await;
@@ -923,7 +1169,7 @@ fn wait_for_watchdog(watchdog: &mut Child) -> io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::process::ExitStatus;
 
@@ -1082,11 +1328,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_uses_immutable_process_token_after_global_token_mutation() {
+    fn cleanup_fails_closed_after_accepted_server_token_mutation() {
         if which::which("tmux").is_err() {
             return;
         }
         let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("mutated-global-token.sock");
         let (socket, processes) = spawn_server_with_processes(&owner, "mutated-global-token");
         let status = Command::new("tmux")
             .arg("-S")
@@ -1096,8 +1345,22 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        owner.shutdown();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert_eq!(probe_sync(&control), ProbeResult::Live);
+        assert!(phoenix_core::process_identity::process_identity_matches(
+            processes.server
+        ));
+        assert!(Command::new("tmux")
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
         assert_exact_processes_gone(processes);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
@@ -1185,7 +1448,8 @@ mod tests {
 
     #[test]
     fn per_iteration_probe_uncertainty_blocks_quiet_success() {
-        assert!(WATCHDOG_PROGRAM.contains("for _ in range(50):\n    unconfirmed = False"));
+        assert!(WATCHDOG_PROGRAM
+            .contains("while time.monotonic() < cleanup_deadline:\n    unconfirmed = False"));
         assert!(WATCHDOG_PROGRAM.contains(
             "not unconfirmed_state and not unconfirmed and not sockets and not creators"
         ));
@@ -1472,9 +1736,91 @@ mod tests {
         let requests = fs::read_to_string(accepted).unwrap();
         assert_eq!(requests.lines().count(), 1);
         assert!(requests.contains(&format!(
-            "if-shell -F #{{==:#{{pid}},{}}} kill-server",
+            "if-shell -F #{{&&:#{{==:#{{pid}},{}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},",
             processes.server.pid
         )));
+        assert!(requests.contains("}} kill-server"));
+        assert!(
+            !requests.contains("#{==:#{PHOENIX_TMUX_SERVER_TOKEN},#{PHOENIX_TMUX_SERVER_TOKEN}}")
+        );
+    }
+
+    #[test]
+    fn matching_pid_with_mismatched_token_does_not_kill_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let socket = owner.path().join("token-mismatch.sock");
+        let control = owner.control_root_path().join("token-mismatch.sock");
+        let (_, processes) = spawn_server_with_processes(&owner, "token-mismatch");
+        let predicate = format!(
+            "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},wrong-token}}}}",
+            processes.server.pid
+        );
+
+        assert!(Command::new("tmux")
+            .args([
+                "-S",
+                &control.to_string_lossy(),
+                "if-shell",
+                "-F",
+                &predicate,
+                "kill-server",
+                "",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(probe_sync(&control), ProbeResult::Live);
+        assert!(socket.exists());
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[test]
+    fn malformed_retirement_token_is_rejected_and_server_survives() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let socket = owner.path().join("malformed-token.sock");
+        let control = owner.control_root_path().join("malformed-token.sock");
+        let (_, processes) = spawn_server_with_processes(&owner, "malformed-token");
+        fs::write(
+            owner.control_root_path().join(".retire-malformed"),
+            format!(
+                "malformed-token.sock\tmalformed-token.sock\t{}\t{}\tbad,token\t{}\t{}",
+                processes.server.pid,
+                processes.server.start_time,
+                processes.pane.pid,
+                processes.pane.start_time
+            ),
+        )
+        .unwrap();
+        wait_until(
+            || {
+                owner
+                    .control_root_path()
+                    .join(".retire-rejected-malformed")
+                    .exists()
+            },
+            "malformed retirement rejection",
+        );
+
+        assert_eq!(probe_sync(&control), ProbeResult::Live);
+        assert!(socket.exists());
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[test]
+    fn retirement_wire_and_lookup_include_expected_token() {
+        assert!(WATCHDOG_PROGRAM.contains("expected_token = tmux_format_literal(fields[4])"));
+        assert!(
+            WATCHDOG_PROGRAM.contains("identities = ((int(fields[2]), fields[3], expected_token),")
+        );
+        assert!(WATCHDOG_PROGRAM.contains("if tuple(record[4]) == expected:"));
     }
 
     #[test]
@@ -1583,12 +1929,161 @@ mod tests {
         fs::remove_dir_all(control_root).unwrap();
     }
 
+    #[tokio::test]
+    async fn acknowledged_but_unadopted_spawn_expires_and_is_retired() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let env_file = control_root.join("lease-env.json");
+        fs::write(
+            &env_file,
+            serde_json::to_vec(&vec![
+                ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+                (
+                    "PHOENIX_TMUX_SERVER_TOKEN".to_owned(),
+                    "lease-token".to_owned(),
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            control_root.join(".spawn-lease"),
+            format!(
+                "lease.sock\tlease.sock\t{}\t{}\tlease-token\tlease-env.json\t.adopt-lease",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".registered-lease").exists(),
+            "provisional spawn acknowledgement",
+        );
+        let processes = parse_acknowledged_processes(
+            &fs::read_to_string(control_root.join(".registered-lease")).unwrap(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while phoenix_core::process_identity::process_identity_matches(processes.server)
+            || phoenix_core::process_identity::process_identity_matches(processes.pane)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "provisional server did not retire"
+            );
+            tokio::task::yield_now().await;
+        }
+        owner.shutdown();
+        assert!(!root.exists());
+        assert!(!control_root.exists());
+    }
+
+    #[test]
+    fn cleanup_deadline_bounds_every_cleanup_subprocess() {
+        assert!(WATCHDOG_PROGRAM.contains("cleanup_deadline = time.monotonic() + cleanup_timeout"));
+        assert!(WATCHDOG_PROGRAM.contains("timeout=remaining_timeout(cleanup_deadline)"));
+        assert!(!WATCHDOG_PROGRAM.contains("for _ in range(50):"));
+        assert!(CLEANUP_TIMEOUT > Duration::from_secs_f64(6.5));
+    }
+
+    #[test]
+    fn final_visible_unlink_moves_and_authenticates_quarantine_entry() {
+        assert!(WATCHDOG_PROGRAM.contains("os.replace(socket, quarantine)"));
+        assert!(WATCHDOG_PROGRAM.contains("moved_stat = quarantine.stat()"));
+        assert!(
+            WATCHDOG_PROGRAM.contains("moved_stat.st_dev == device and moved_stat.st_ino == inode")
+        );
+        assert!(WATCHDOG_PROGRAM.contains("os.replace(quarantine, socket)"));
+    }
+
+    #[test]
+    fn replacement_at_final_quarantine_boundary_is_restored_and_preserved() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("replace-socket");
+        write_tmux_wrapper(
+            hook_dir.path(),
+            "#!/bin/sh\nrm -f \"$1\"\npython3 - \"$1\" <<'PY'\nimport socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.close()\nPY\n",
+        );
+        fs::rename(hook_dir.path().join("tmux"), &hook).unwrap();
+        let owner =
+            TestTmuxServerOwner::new_with_watchdog_test_options(None, None, None, Some(&hook));
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("final-swap.sock");
+        let control = control_root.join("final-swap.sock");
+        let (_, processes) = spawn_server_with_processes(&owner, "final-swap");
+        assert!(Command::new("tmux")
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_exact_processes_gone(processes);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert!(socket.exists(), "replacement must be restored or preserved");
+        assert_ne!(
+            fs::metadata(&socket).unwrap().ino(),
+            fs::metadata(&control).unwrap().ino()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn short_shared_cleanup_deadline_retains_unvisited_owned_records() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            Some(Duration::from_millis(1)),
+            None,
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let mut processes = Vec::new();
+        for index in 0..4 {
+            let (_, captured) = spawn_server_with_processes(&owner, &format!("bounded-{index}"));
+            processes.push(captured);
+        }
+        let started = Instant::now();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert!(started.elapsed() < CLEANUP_TIMEOUT);
+        assert!(processes.iter().any(|captured| {
+            phoenix_core::process_identity::process_identity_matches(captured.server)
+        }));
+        for index in 0..4 {
+            let control = control_root.join(format!("bounded-{index}.sock"));
+            let _ = Command::new("tmux")
+                .args(["-S", &control.to_string_lossy(), "kill-server"])
+                .status();
+        }
+        for captured in processes {
+            assert_exact_processes_gone(captured);
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
     #[test]
     fn cleanup_uses_incarnation_bound_socket_without_numeric_pid_signals() {
         assert!(!WATCHDOG_PROGRAM.contains("os.kill(identity[0]"));
         assert!(!WATCHDOG_PROGRAM.contains("os.link(socket, control)"));
         assert!(WATCHDOG_PROGRAM.contains(
-            "[\"tmux\", \"-S\", str(control), \"if-shell\", \"-F\",\n             f\"#{{==:#{{pid}},{expected_server}}}\", \"kill-server\", \"\"]"
+            "[\"tmux\", \"-S\", str(control), \"if-shell\", \"-F\",\n             f\"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}\",\n             \"kill-server\", \"\"]"
         ));
     }
 
