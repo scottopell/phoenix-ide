@@ -1171,7 +1171,10 @@ function ProductConversationPageInner() {
         messages={messages}
         recallDisabled={!liveControlsEnabled}
         onCoordinatorProfileSaved={(profile) => {
-          setSnapshot((current) => current ? { ...current, project_coordinator_profile: profile } : current);
+          setOwnedSnapshot((current) => current ? {
+            ...current,
+            value: { ...current.value, project_coordinator_profile: profile },
+          } : current);
           setSnapshotRetry((retry) => retry + 1);
         }}
       />
