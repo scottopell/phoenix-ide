@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
-pub(super) struct TrustedInstructions {
+pub struct TrustedInstructions {
     output: String,
 }
 
 impl TrustedInstructions {
-    pub(super) fn output(&self) -> &str {
+    pub fn output(&self) -> &str {
         &self.output
     }
 
