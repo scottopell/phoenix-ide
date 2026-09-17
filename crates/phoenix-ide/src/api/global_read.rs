@@ -1071,8 +1071,8 @@ async fn resolve_work(
     let title = root
         .chain_name
         .clone()
-        .or(current.title.clone())
         .or(root.title.clone())
+        .or(current.title.clone())
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
     Ok(ResolveGlobalReferenceResponse {
