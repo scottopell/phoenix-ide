@@ -325,10 +325,23 @@ export function ConversationListPage() {
   const handleProductClose = async () => {
     if (!productCloseTarget) return;
     try {
-      if (productCloseTarget.canonical_root.transcript_row_id === productCloseTarget.latest_transcript_row_id) {
-        await api.archiveConversation(productCloseTarget.canonical_root.transcript_row_id);
+      const rootId = productCloseTarget.canonical_root.transcript_row_id;
+      const singleRow = rootId === productCloseTarget.latest_transcript_row_id;
+      if (isOnline) {
+        if (singleRow) {
+          await api.archiveConversation(rootId);
+        } else {
+          await api.archiveChain(rootId);
+        }
       } else {
-        await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+        await queueOperation({
+          type: singleRow ? 'archive' : 'archive_chain',
+          conversationId: rootId,
+          payload: {},
+          createdAt: new Date(),
+          retryCount: 0,
+          status: 'pending',
+        });
       }
       setProductCloseTarget(null);
       setProductListRevision((revision) => revision + 1);
