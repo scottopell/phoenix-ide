@@ -639,9 +639,36 @@ rule ReadOnlyAmbientReferenceNeverAuthorizesWriter {
     ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: no_write_authority)
 
     @guidance
-        -- A pathname relationship is not write authority. Current working directory,
-        -- process root, executable text, mappings, and read-only descriptors remain
+        -- A pathname relationship is not write authority. Process root,
+        -- executable text, mappings, and read-only non-directory descriptors remain
         -- non-authorizing observations even when their path lies below quarantine.
+}
+
+rule NamespaceAmbientReferenceAuthorizesWriter {
+    when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    let attempt = RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope}
+    requires: access_mode = namespace_write
+    requires: match_kind = namespace_directory
+    requires: complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    ensures: AmbientWriterEvidenceRow.created(
+        attempt: attempt,
+        inspection: attempt.inspection,
+        resource_identity: ambient_worktree_identity(product_conversation, scope),
+        evidence: AmbientWriterEvidence {
+            detector: detector,
+            process_id: process_id,
+            process_incarnation: process_incarnation,
+            executable: executable,
+            matched_path: matched_path,
+            match_kind: match_kind,
+            access_mode: access_mode
+        }
+    )
+    ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: positive_writer)
+
+    @guidance
+        -- A retained current working directory or read-only directory descriptor
+        -- authorizes namespace mutation through relative path operations.
 }
 
 rule WritableAmbientDescriptorRecordsAuditableEvidence {
@@ -668,7 +695,7 @@ rule WritableAmbientDescriptorRecordsAuditableEvidence {
 
 rule IncompleteAmbientWriterIdentityIsIndeterminate {
     when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
-    requires: access_mode in { write_only, read_write, writable_shared_mapping }
+    requires: access_mode in { write_only, read_write, writable_shared_mapping, namespace_write }
     requires: not complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
     ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: detector_indeterminate)
 }
@@ -857,6 +884,22 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
 }
 
 
+rule LegacyFk787PartialRetryCanResumeFromPriorCleanupAuthority {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    let obligation = bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    requires: obligation.phase = awaiting_retirement_inspection
+    requires: exists obligation.active_retirement_snapshot
+    requires: active_generation_is_legacy_fk787_partial_retry(product_conversation, attempt_id)
+    requires: every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(product_conversation, attempt_id)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Preserve historical evidence and resume through the ordinary retirement
+        -- executor. It freshly validates each retained worktree identity and
+        -- adopts exact prior cleanup authority before
+        -- destructive cleanup. Every other shape remains in repair/reinspection.
+}
+
 rule PrStatusObservedAsAdvisoryCloseGuidance {
     when: PrStatusQueried(product_conversation)
     ensures: PrStatusResultDelivered(product_conversation, found: Boolean, display_state: PrDisplayState?, check_state: PrCheckState?, number: Integer?, unavailable_reason: String?)
@@ -906,6 +949,23 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       A deterministic digest of the canonical length-prefixed sequence of each
 --       ordered scope identity and inspection fingerprint. Any target-set, order, or
 --       per-scope fingerprint change produces a different aggregate fingerprint.
+--
+--   active_generation_is_legacy_fk787_partial_retry(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True iff every captured WorkScope has an active retry inspection and sealed
+--       inventory, the active generation has no dispatch or cleanup plan, and each exact
+--       captured worktree has an active manual-repair residual whose detail identifies
+--       SQLite foreign-key code 787 from the cleanup-plan persistence defect.
+--
+--   every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True iff every exact captured worktree identity has a dispatch and cleanup
+--       plan under a different snapshot generation of the same attempt. Another
+--       attempt never supplies authority.
 --
 --   pending_worktree_retirement_scope(
 --       product_conversation: bedrock/ProductConversation,

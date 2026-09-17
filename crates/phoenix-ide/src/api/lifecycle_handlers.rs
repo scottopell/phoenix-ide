@@ -686,6 +686,12 @@ pub(crate) async fn retry_close_retirement(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let _admission_guard = admission.lock().await;
     let aggregate = state
         .db
         .get_ordinary_product_conversation(&transcript.product_conversation_id)

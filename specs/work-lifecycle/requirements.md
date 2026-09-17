@@ -159,6 +159,12 @@ AND SHALL perform final directory retirement only through a random Phoenix-owned
 WHEN a crash or external mutation makes that identity ambiguous
 THE SYSTEM SHALL preserve any safe leftover and route the exact Close attempt to `NeedsRepair`
 
+WHEN a persisted Close attempt contains the legacy FK787 partial-retry shape—an active retry inspection and sealed inventory with exact captured worktree identity, no active dispatch or cleanup plan, and an active `manual_repair_required` residual caused by the cleanup-plan foreign-key defect—while an older generation of the same attempt retains identity-exact dispatch and cleanup-plan authority
+THE SYSTEM SHALL recognize that shape during ordinary startup or user-authorized resume without rewriting historical evidence
+AND SHALL freshly validate live filesystem identity before destructive cleanup
+AND SHALL adopt only the identity-exact same-attempt prior authority needed to converge the active generation
+AND SHALL leave every non-exact shape in typed repair or reinspection
+
 Concurrent malicious mutation inside a Phoenix-owned private namespace, and mutation of resources outside Phoenix ownership, are outside the supported Close reliability boundary
 
 WHEN retirement succeeds overall

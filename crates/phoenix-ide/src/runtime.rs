@@ -7306,6 +7306,7 @@ mod scope_liveness_tests {
     use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseAttemptId};
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
+    #[cfg(target_os = "linux")]
     use phoenix_db::AdoptCloseWorktreeCleanupPlanRequest;
     use phoenix_llm::ModelRegistry;
 
@@ -7459,6 +7460,7 @@ mod scope_liveness_tests {
         conversation_id: &str,
         subordinate_id: Option<&str>,
         attempt: &str,
+        deletion_pending: bool,
     ) -> (
         tempfile::TempDir,
         CloseAttemptId,
@@ -7548,6 +7550,50 @@ mod scope_liveness_tests {
         } else {
             None
         };
+
+        if deletion_pending {
+            let deletion_conversation_id = subordinate_id.unwrap_or(conversation_id);
+            manager
+                .db()
+                .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+                    id: format!("{deletion_conversation_id}-creation"),
+                    conversation_id: deletion_conversation_id.to_string(),
+                    message_id: None,
+                    intent: crate::db::ConversationCreationIntent {
+                        cwd: worktree.to_string_lossy().to_string(),
+                        model: None,
+                        effort: None,
+                        text: String::new(),
+                        expansion_preflighted: true,
+                        llm_text: None,
+                        skill_invocation: None,
+                        message_id: String::new(),
+                        images: vec![],
+                        files: vec![],
+                        mode: Some("branch".to_string()),
+                        base_branch: None,
+                        checkout_ref: None,
+                        seed_parent_id: None,
+                        seed_label: None,
+                        approved_task: None,
+                    },
+                })
+                .await
+                .unwrap();
+            manager
+                .db()
+                .request_conversation_creation_deletion(
+                    deletion_conversation_id,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE conversations SET archived=1 WHERE id=?1")
+                .bind(conversation_id)
+                .execute(manager.db().pool())
+                .await
+                .unwrap();
+        }
 
         sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
             .bind(conversation_id)
@@ -8189,6 +8235,7 @@ mod scope_liveness_tests {
         assert!(quarantine.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
@@ -8203,6 +8250,7 @@ mod scope_liveness_tests {
             "retained-retry",
             Some("retained-retry-subordinate"),
             "retained-retry-attempt",
+            false,
         )
         .await;
         let worktree = repository.path().join("worktree");
@@ -8483,6 +8531,265 @@ mod scope_liveness_tests {
         assert!(violations.is_empty());
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn retry_resumes_legacy_fk787_generation_from_prior_cleanup_authority() {
+        use phoenix_core::domain::close::ClosePhase;
+        use phoenix_db::RecordCloseRetirementDispatchRequest;
+        use phoenix_db::RecordCloseWorktreeCleanupPlanRequest;
+        use phoenix_db::RouteCloseAttemptToRepairRequest;
+
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let manager = test_manager()
+            .await
+            .with_test_no_ambient_writers(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let (repository, attempt_id, scope, _, _, subordinate) = prepare_clean_close_with_tmux(
+            &manager,
+            &owner,
+            "retained-generation-retry",
+            Some("retained-generation-archived-descendant"),
+            "retained-generation-attempt",
+            true,
+        )
+        .await;
+        let worktree = repository.path().join("worktree");
+        let subordinate = subordinate.unwrap();
+        let source_snapshot = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .cloned()
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.scope == scope)
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(worktree_identity) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must resolve");
+        };
+        let resource = phoenix_core::domain::close::RetiredResourceIdentity::parse(
+            phoenix_core::domain::close::RetiredResourceKind::Worktree,
+            phoenix_core::domain::close::LossItemIdentity::Worktree(worktree_identity),
+        )
+        .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        let admin_dir = close_retirement::exact_worktree_administrative_dir(
+            &worktree,
+            &repository.path().join(".git"),
+        )
+        .unwrap();
+        let admin_dir_incarnation =
+            close_retirement::observe_administrative_dir_incarnation(&admin_dir).unwrap();
+        manager
+            .db()
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+                administrative_dir: admin_dir.clone(),
+                administrative_dir_incarnation: admin_dir_incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        let retained_worktree =
+            close_retirement::worktree_quarantine_path(match resource.identity() {
+                phoenix_core::domain::close::LossItemIdentity::Worktree(identity) => identity,
+                _ => unreachable!("worktree resource has worktree identity"),
+            })
+            .unwrap();
+        std::fs::rename(&worktree, &retained_worktree).unwrap();
+        manager
+            .db()
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: resource.clone(),
+                reason: phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                detail: "historical retry setup".to_string(),
+                cause: None,
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        let target_snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), target_snapshot.clone())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .record_close_retirement_evidence(phoenix_db::RecordCloseRetirementEvidenceRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: target_snapshot.clone(),
+                resource: resource.clone(),
+                outcome: phoenix_core::domain::close::RetirementOutcome::Residual {
+                    residual_reason:
+                        phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                },
+                detail: Some(
+                    "error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                        .to_string(),
+                ),
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: resource.clone(),
+                reason: phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                detail: "error returned from database: (code: 787) FOREIGN KEY constraint failed"
+                    .to_string(),
+                cause: None,
+            })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        assert_ne!(source_snapshot, target_snapshot);
+        assert_eq!(source_snapshot.fingerprint(), target_snapshot.fingerprint());
+        assert_eq!(
+            manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        let target_shape: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_retirement_inspections
+                  WHERE attempt_id=?1
+                    AND generation LIKE 'server_git_status_v2_retry_%'),
+                 (SELECT COUNT(*) FROM close_retirement_resources
+                  WHERE attempt_id=?1 AND inspection_generation=?2
+                    AND proof_kind='residual'
+                    AND residual_reason='manual_repair_required'
+                    AND detail LIKE '%(code: 787) FOREIGN KEY constraint failed%'),
+                 (SELECT COUNT(*) FROM close_retirement_inventories
+                  WHERE attempt_id=?1 AND inspection_generation=?2 AND sealed=1),
+                 (SELECT COUNT(*) FROM close_retirement_resource_dispatches
+                  WHERE attempt_id=?1 AND inspection_generation=?2),
+                 (SELECT COUNT(*) FROM close_worktree_cleanup_plans
+                  WHERE attempt_id=?1 AND inspection_generation=?2)",
+        )
+        .bind(attempt_id.as_str())
+        .bind(target_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(target_shape, (1, 1, 1, 0, 0));
+        let bypass_error = sqlx::query("DELETE FROM conversations WHERE id=?1")
+            .bind(&subordinate.id)
+            .execute(manager.db().pool())
+            .await
+            .expect_err("captured member scope bypass deletion must fail");
+        assert!(bypass_error
+            .to_string()
+            .contains("active Close rejects sealed participant deletion"));
+        let cleanup_now = chrono::Utc::now();
+        let cleanup = manager
+            .db()
+            .claim_next_conversation_creation_cleanup(
+                "retained-generation-worker",
+                "retained-generation-token",
+                cleanup_now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("deletion-pending creation cleanup must be claimable");
+        let participant_state: String = sqlx::query_scalar(
+            "SELECT settlement_state FROM close_attempt_participants
+             WHERE attempt_id=?1 AND conversation_id=?2",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&subordinate.id)
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(participant_state, "live");
+        manager
+            .db()
+            .finish_conversation_creation_cleanup(&cleanup, cleanup_now)
+            .await
+            .unwrap();
+        assert!(!worktree.exists());
+        assert!(retained_worktree.exists());
+
+        manager
+            .inspect_close_retirement(attempt_id.clone())
+            .await
+            .expect("ordinary retry should resume the exported legacy FK787 generation");
+
+        let completed = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        assert_eq!(completed.snapshot(), Some(&target_snapshot));
+        assert!(!worktree.exists());
+        assert!(!retained_worktree.exists());
+        assert!(manager
+            .db()
+            .get_conversation(&subordinate.id)
+            .await
+            .is_err());
+        assert!(
+            manager
+                .db()
+                .get_conversation("retained-generation-retry")
+                .await
+                .unwrap()
+                .archived
+        );
+        let adoption_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id=?1 AND source_inspection_generation=?2
+               AND target_inspection_generation=?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(source_snapshot.generation())
+        .bind(target_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(adoption_rows, 1);
+    }
+
     #[tokio::test]
     async fn complete_close_retirement_and_publish_persists_archive_before_emitting_update() {
         use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
@@ -8711,6 +9018,7 @@ mod scope_liveness_tests {
                 "live-tmux-close",
                 None,
                 "live-tmux-attempt",
+                false,
             )
             .await;
         let replacement_token =
@@ -8753,6 +9061,7 @@ mod scope_liveness_tests {
                 "restart-tmux-close",
                 None,
                 "restart-tmux-attempt",
+                false,
             )
             .await;
         replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
