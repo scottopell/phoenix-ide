@@ -295,10 +295,7 @@ for _ in range(50):
         for _, _, _, _, processes in owned
         for identity in processes
     ]
-    unresolved_controls = [
-        control for _, control in unconfirmed_obligations if control.exists()
-    ]
-    unconfirmed_state = any(state != "absent" for state in states) or bool(unresolved_controls)
+    unconfirmed_state = any(state != "absent" for state in states) or bool(unconfirmed_obligations)
     registered_sockets = {
         socket: (device, inode, processes)
         for socket, device, inode, _, processes in owned
@@ -1064,6 +1061,13 @@ mod tests {
     }
 
     #[test]
+    fn successful_identity_reconciliation_removes_the_spawn_obligation() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "identities = observe_control(control, token)\n        control_stat = control.stat()\n        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))\n        unconfirmed_obligations.remove(obligation)"
+        ));
+    }
+
+    #[test]
     fn unlinked_socket_cleanup_kills_registered_server_and_pane() {
         if which::which("tmux").is_err() {
             return;
@@ -1146,6 +1150,81 @@ mod tests {
         assert!(panic.is_err());
         assert!(root.exists());
         assert!(control_root.exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    fn process_absent_or_zombie(identity: ProcessIdentity) -> bool {
+        if !phoenix_core::process_identity::process_identity_matches(identity) {
+            return true;
+        }
+        Command::new("ps")
+            .args(["-o", "state=", "-p", &identity.pid.to_string()])
+            .output()
+            .ok()
+            .is_some_and(|output| output.status.success() && output.stdout.contains(&b'Z'))
+    }
+
+    #[test]
+    fn missing_unconfirmed_control_preserves_roots_and_prevents_false_success() {
+        let fake_bin = TempDir::new().unwrap();
+        let fake_tmux = fake_bin.path().join("tmux");
+        let daemon = fake_bin.path().join("daemon");
+        fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\ncontrol=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -S ]; then control=$2; break; fi\n  shift\ndone\ncase \"$*\" in *new-session*)\n  : > \"$control\"\n  /usr/bin/nohup /bin/sleep 10 >/dev/null 2>&1 &\n  printf '%s' \"$!\" > '{}'\n  /bin/rm \"$control\"\n  ;;\nesac\nexit 1\n",
+                daemon.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let env_file = control_root.join("missing-env.json");
+        fs::write(
+            &env_file,
+            serde_json::to_vec(&vec![(
+                "PATH".to_owned(),
+                fake_bin.path().to_string_lossy().into_owned(),
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            control_root.join(".spawn-missing-unconfirmed"),
+            format!(
+                "missing.sock\tmissing.sock\t{}\t{}\ttoken\tmissing-env.json",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(|| daemon.exists(), "detached fake daemon");
+        let daemon_pid = fs::read_to_string(&daemon).unwrap().parse::<u32>().unwrap();
+        let daemon_identity = phoenix_core::process_identity::current_process_identity(daemon_pid)
+            .expect("detached fake daemon has exact birth identity");
+        wait_until(
+            || control_root.join(".rejected-missing-unconfirmed").exists(),
+            "missing-control spawn rejection",
+        );
+        assert!(!control_root.join("missing.sock").exists());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert!(root.exists());
+        assert!(control_root.exists());
+        assert!(phoenix_core::process_identity::process_identity_matches(
+            daemon_identity
+        ));
+        wait_until(
+            || process_absent_or_zombie(daemon_identity),
+            "detached fake daemon natural exit",
+        );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
     }
