@@ -50,6 +50,8 @@ heartbeat_stale = 0.5
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
 adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
 publication_hook = os.environ.get("PHOENIX_TMUX_PUBLICATION_HOOK")
+record_hook = os.environ.get("PHOENIX_TMUX_RECORD_HOOK")
+retirement_hook = os.environ.get("PHOENIX_TMUX_RETIREMENT_HOOK")
 provisional = []
 adopted_pending_publication = []
 preserved_visible_paths = set()
@@ -196,11 +198,15 @@ def original_control_root_exists():
         return False
 
 def owner_alive():
-    if not original_root_exists() or (root / ".cleanup-request").exists():
+    if (not original_root_exists() or not original_control_root_exists()
+            or (root / ".cleanup-request").exists()):
         return False
-    if heartbeat.exists():
+    try:
         return time.time() - heartbeat.stat().st_mtime <= heartbeat_stale
-    return os.getppid() == parent
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 def reserve_spawn(socket, control):
     if any(existing_socket == socket or existing_control == control
@@ -235,15 +241,25 @@ def record_owned(socket, device, inode, control, identities):
             owned.remove(record)
     processes = tuple(identities)
     previous = retained_controls.get(control.name)
-    if previous is not None:
+    if previous is not None and previous[3] is not None:
         (control_root / previous[3]).unlink(missing_ok=True)
+    record = (socket, device, inode, control, processes)
+    owned.append(record)
+    retained_controls[control.name] = (device, inode, processes, None)
+    if record_hook:
+        injected = subprocess.run(
+            [record_hook, str(control)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False, timeout=1.0,
+        )
+        if injected.returncode != 0:
+            raise OSError("injected control anchor failure")
     anchor = control_root / f".control-anchor-{uuid.uuid4()}"
     os.link(control, anchor)
     anchor_stat = anchor.stat()
     if anchor_stat.st_dev != device or anchor_stat.st_ino != inode:
         anchor.unlink(missing_ok=True)
         raise RuntimeError("tmux control anchor identity did not match")
-    owned.append((socket, device, inode, control, processes))
     retained_controls[control.name] = (device, inode, processes, anchor.name)
 
 def exact_record(socket, control, identities):
@@ -260,6 +276,19 @@ def tmux_format_literal(value):
         raise RuntimeError("tmux ownership token has invalid protocol characters")
     return value
 
+def persist_record_processes(record, processes):
+    updated = (record[0], record[1], record[2], record[3], tuple(processes))
+    for index, candidate in enumerate(owned):
+        if candidate is record or candidate == record:
+            owned[index] = updated
+            break
+    retained = retained_controls.get(record[3].name)
+    if retained is not None:
+        retained_controls[record[3].name] = (
+            retained[0], retained[1], tuple(processes), retained[3]
+        )
+    return updated
+
 def retire_record(record, deadline):
     _, device, inode, control, recorded_processes = record
     processes = list(recorded_processes)
@@ -274,6 +303,13 @@ def retire_record(record, deadline):
         if control_stat.st_dev != device or control_stat.st_ino != inode:
             return False
         expected_server = processes[0][0]
+        if retirement_hook:
+            subprocess.run(
+                [retirement_hook, str(control)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False,
+                timeout=remaining_timeout(deadline),
+            )
         observed_server, pane_pids = query_control_processes(control, deadline)
         if observed_server != expected_server:
             return False
@@ -285,6 +321,7 @@ def retire_record(record, deadline):
                     return False
                 processes.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
+        record = persist_record_processes(record, processes)
         subprocess.run(
             ["tmux", "-S", str(control), "if-shell", "-F",
              f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
@@ -301,7 +338,23 @@ def retire_record(record, deadline):
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     return False
 
+class EnvironmentError(RuntimeError):
+    pass
+
+def load_environment(path):
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise EnvironmentError(str(error)) from error
+    if (not isinstance(value, list)
+            or any(not isinstance(pair, list) or len(pair) != 2
+                   or not isinstance(pair[0], str) or not isinstance(pair[1], str)
+                   for pair in value)):
+        raise EnvironmentError("spawn environment must be string pairs")
+    return dict(value)
+
 def spawn_owned(request):
+    global cleanup_failed
     rejected = request.with_name(request.name.replace(".spawn-", ".rejected-", 1))
     acknowledged = request.with_name(request.name.replace(".spawn-", ".registered-", 1))
     control = None
@@ -318,7 +371,7 @@ def spawn_owned(request):
         control = control_root / control_name
         if socket.parent != root or control.parent != control_root or control.exists():
             raise RuntimeError("spawn paths are not unused exact children of owned roots")
-        environment = dict(json.loads((control_root / env_path).read_text()))
+        environment = load_environment(control_root / env_path)
         obligation = reserve_spawn(socket, control)
         spawned = subprocess.run(
             ["tmux", "-f", config, "-S", str(control), "new-session", "-d", "-c", cwd,
@@ -353,7 +406,14 @@ def spawn_owned(request):
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
         ))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as error:
+    except EnvironmentError as error:
+        cleanup_failed = True
+        try:
+            publish_response(rejected, str(error))
+        except OSError:
+            pass
+        return False
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         try:
             publish_response(rejected, str(error))
         except OSError:
@@ -721,6 +781,9 @@ def remove_authenticated_control_root():
                     break
                 continue
             device, inode, processes, anchor_name = registered
+            if anchor_name is None:
+                authenticated = False
+                break
             try:
                 entry_stat = entry.stat()
                 anchor_stat = (quarantine / anchor_name).stat()
@@ -912,19 +975,21 @@ fn set_path_env(command: &mut Command, name: &str, value: Option<&Path>) {
 
 fn configure_watchdog_env(
     command: &mut Command,
-    identity_timeout: Option<Duration>,
-    cleanup_timeout: Option<Duration>,
+    deadlines: (Option<Duration>, Option<Duration>),
     quarantine_hook: Option<&Path>,
     adoption: (Option<Duration>, Option<&Path>),
     publication: (Option<Duration>, Option<&Path>),
+    lifecycle_hooks: (Option<&Path>, Option<&Path>),
 ) {
-    set_duration_env(command, "PHOENIX_TMUX_IDENTITY_TIMEOUT", identity_timeout);
-    set_duration_env(command, "PHOENIX_TMUX_CLEANUP_TIMEOUT", cleanup_timeout);
+    set_duration_env(command, "PHOENIX_TMUX_IDENTITY_TIMEOUT", deadlines.0);
+    set_duration_env(command, "PHOENIX_TMUX_CLEANUP_TIMEOUT", deadlines.1);
     set_duration_env(command, "PHOENIX_TMUX_ADOPTION_TIMEOUT", adoption.0);
     set_duration_env(command, "PHOENIX_TMUX_PUBLICATION_TIMEOUT", publication.0);
     set_path_env(command, "PHOENIX_TMUX_ADOPTION_HOOK", adoption.1);
     set_path_env(command, "PHOENIX_TMUX_QUARANTINE_HOOK", quarantine_hook);
     set_path_env(command, "PHOENIX_TMUX_PUBLICATION_HOOK", publication.1);
+    set_path_env(command, "PHOENIX_TMUX_RECORD_HOOK", lifecycle_hooks.0);
+    set_path_env(command, "PHOENIX_TMUX_RETIREMENT_HOOK", lifecycle_hooks.1);
 }
 
 impl TestTmuxServerOwner {
@@ -949,23 +1014,23 @@ impl TestTmuxServerOwner {
     ) -> Self {
         Self::new_with_watchdog_test_options(
             watchdog_path,
-            identity_timeout,
+            (identity_timeout, None),
             None,
             None,
             None,
-            None,
+            (None, None),
             (None, None),
         )
     }
 
     pub(crate) fn new_with_watchdog_test_options(
         watchdog_path: Option<&Path>,
-        identity_timeout: Option<Duration>,
-        cleanup_timeout: Option<Duration>,
+        deadlines: (Option<Duration>, Option<Duration>),
         quarantine_hook: Option<&Path>,
         adoption_timeout: Option<Duration>,
         adoption_hook: Option<&Path>,
         publication: (Option<Duration>, Option<&Path>),
+        lifecycle_hooks: (Option<&Path>, Option<&Path>),
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -1006,11 +1071,11 @@ impl TestTmuxServerOwner {
             .stderr(Stdio::null());
         configure_watchdog_env(
             &mut command,
-            identity_timeout,
-            cleanup_timeout,
+            deadlines,
             quarantine_hook,
             (adoption_timeout, adoption_hook),
             publication,
+            lifecycle_hooks,
         );
         if let Some(path) = watchdog_path {
             let inherited_path = std::env::var_os("PATH").unwrap_or_default();
@@ -1786,6 +1851,41 @@ mod tests {
         }
     }
 
+    fn stop_heartbeat(owner: &mut TestTmuxServerOwner) {
+        owner.heartbeat_stop.store(true, Ordering::Release);
+        if let Some(heartbeat) = owner.heartbeat.take() {
+            heartbeat.join().unwrap();
+        }
+    }
+
+    fn await_watchdog_exit(owner: &mut TestTmuxServerOwner) -> ExitStatus {
+        wait_for_watchdog(owner.watchdog.as_mut().expect("watchdog is live"))
+            .expect("watchdog must exit")
+    }
+
+    fn disarm_owner(owner: &mut TestTmuxServerOwner) {
+        owner.watchdog.take();
+        owner.root.take();
+        owner.control_root.take();
+    }
+
+    fn write_raw_spawn_request(
+        root: &Path,
+        control_root: &Path,
+        nonce: &str,
+        environment_name: &str,
+    ) {
+        fs::write(
+            control_root.join(format!(".spawn-{nonce}")),
+            format!(
+                "{nonce}.sock\t{nonce}.sock\t{}\t{}\t{nonce}-token\t{environment_name}",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn authenticated_process_exit_unlinks_exact_stale_socket_and_removes_root() {
         if which::which("tmux").is_err() {
@@ -2470,6 +2570,206 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_disappearance_enters_cleanup_and_retires_exact_processes() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let mut owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (_, processes) = spawn_server_with_processes(&owner, "heartbeat-loss");
+        stop_heartbeat(&mut owner);
+        fs::remove_file(root.join(".parent-heartbeat")).unwrap();
+
+        let status = await_watchdog_exit(&mut owner);
+
+        assert!(status.success());
+        assert_exact_processes_gone(&processes);
+        assert!(!root.exists());
+        assert!(!control_root.exists());
+        disarm_owner(&mut owner);
+    }
+
+    #[test]
+    fn captured_identities_survive_fallible_anchor_creation() {
+        let Ok(real_tmux) = which::which("tmux") else {
+            return;
+        };
+        let hook_dir = TempDir::new().unwrap();
+        let observed = hook_dir.path().join("observed");
+        let hook = hook_dir.path().join("fail-anchor");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nserver=$('{}' -S \"$1\" display-message -p '#{{pid}}')\npane=$('{}' -S \"$1\" list-panes -a -F '#{{pane_pid}}' | head -1)\nprintf '%s\\n%s\\n' \"$server\" \"$pane\" > '{}'\nexit 1\n",
+                real_tmux.display(),
+                real_tmux.display(),
+                observed.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, None),
+            None,
+            None,
+            None,
+            (None, None),
+            (Some(&hook), None),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        write_adoption_environment(&control_root, "anchor-env.json", "anchor-token");
+        write_raw_spawn_request(&root, &control_root, "anchor", "anchor-env.json");
+        wait_until(
+            || observed.exists(),
+            "captured identities before anchor failure",
+        );
+        let identities = fs::read_to_string(&observed)
+            .unwrap()
+            .lines()
+            .map(|pid| {
+                let pid = pid.parse().unwrap();
+                phoenix_core::process_identity::current_process_identity(pid).unwrap()
+            })
+            .collect::<Vec<_>>();
+        wait_until(
+            || control_root.join(".rejected-anchor").exists(),
+            "anchor failure rejection",
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "missing durable anchor must fail cleanup closed"
+        );
+        for identity in identities {
+            wait_until(
+                || !phoenix_core::process_identity::process_identity_matches(identity),
+                "captured process retirement after anchor failure",
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn retirement_discovered_hup_resistant_pane_blocks_false_cleanup_success() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let pane_pid_file = hook_dir.path().join("pane-pid");
+        let hook = hook_dir.path().join("add-surviving-pane");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] && exit 0\ntmux -S \"$1\" new-window -d -t main sh -c 'trap \"\" HUP; echo $$ > \"{}\"; exec sleep 30'\n",
+                pane_pid_file.display(),
+                pane_pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, Some(Duration::from_secs(2))),
+            None,
+            None,
+            None,
+            (None, None),
+            (None, Some(&hook)),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (_, original) = spawn_server_with_processes(&owner, "late-pane");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "surviving late pane must prevent cleanup success"
+        );
+        assert_exact_processes_gone(&original);
+        let pane_pid = fs::read_to_string(&pane_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let late_pane = phoenix_core::process_identity::current_process_identity(pane_pid)
+            .expect("late pane remains alive and inspectable");
+        assert!(phoenix_core::process_identity::process_identity_matches(
+            late_pane
+        ));
+        unsafe { libc::kill(pane_pid.cast_signed(), libc::SIGTERM) };
+        wait_until(
+            || !phoenix_core::process_identity::process_identity_matches(late_pane),
+            "late pane test cleanup",
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn replacement_control_root_cannot_process_spawn_requests() {
+        let mut owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let moved_control_root = control_root.with_extension("original");
+        stop_heartbeat(&mut owner);
+        fs::rename(&control_root, &moved_control_root).unwrap();
+        fs::create_dir(&control_root).unwrap();
+        fs::write(control_root.join("replacement-env.json"), "[]").unwrap();
+        write_raw_spawn_request(
+            &root,
+            &control_root,
+            "replacement-root",
+            "replacement-env.json",
+        );
+
+        let status = await_watchdog_exit(&mut owner);
+
+        assert!(!status.success());
+        assert!(control_root.join(".spawn-replacement-root").exists());
+        assert!(!control_root.join("replacement-root.sock").exists());
+        assert!(!root.join("replacement-root.sock").exists());
+        disarm_owner(&mut owner);
+        assert!(!root.exists());
+        assert!(!control_root.exists());
+        fs::remove_dir_all(moved_control_root).unwrap();
+    }
+
+    #[test]
+    fn malformed_environment_shape_retires_all_owned_processes_and_fails_closed() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (_, processes) = spawn_server_with_processes(&owner, "malformed-environment");
+        fs::write(control_root.join("wrong-shape.json"), "null").unwrap();
+        write_raw_spawn_request(&root, &control_root, "wrong-shape", "wrong-shape.json");
+        wait_until(
+            || control_root.join(".rejected-wrong-shape").exists(),
+            "wrong-shape environment rejection",
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err(), "malformed environment must remain visible");
+        assert_exact_processes_gone(&processes);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
     fn spawn_batch_rechecks_parent_liveness_before_each_dequeue() {
         assert!(WATCHDOG_PROGRAM.contains(
             "for request in control_root.glob(\".spawn-*\"):\n        if not owner_alive() or not spawn_owned(request):"
@@ -2710,11 +3010,11 @@ mod tests {
         fs::set_permissions(&hook, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();
@@ -2866,11 +3166,11 @@ mod tests {
         fs::set_permissions(&hook, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();
@@ -2919,12 +3219,12 @@ mod tests {
         fs::set_permissions(&hook, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             None,
             None,
             (None, Some(&hook)),
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2996,11 +3296,11 @@ mod tests {
         fs::set_permissions(&hook, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             Some(Duration::from_secs(2)),
             Some(&hook),
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();
@@ -3084,11 +3384,11 @@ mod tests {
         fs::set_permissions(&hook, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             Some(Duration::ZERO),
             Some(&hook),
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();
@@ -3163,11 +3463,11 @@ mod tests {
         fs::rename(hook_dir.path().join("tmux"), &hook).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             Some(&hook),
             None,
             None,
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();
@@ -3201,11 +3501,11 @@ mod tests {
         }
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            Some(Duration::from_millis(1)),
-            None,
+            (None, Some(Duration::from_millis(1))),
             None,
             None,
+            None,
+            (None, None),
             (None, None),
         );
         let root = owner.path().to_path_buf();

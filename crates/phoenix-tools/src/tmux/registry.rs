@@ -5492,12 +5492,12 @@ mod tests {
         }
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             None,
-            None,
-            None,
+            (None, None),
             None,
             None,
             None,
             (Some(Duration::ZERO), None),
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
