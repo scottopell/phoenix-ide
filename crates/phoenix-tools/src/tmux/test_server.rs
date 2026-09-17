@@ -52,6 +52,7 @@ adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
 publication_hook = os.environ.get("PHOENIX_TMUX_PUBLICATION_HOOK")
 record_hook = os.environ.get("PHOENIX_TMUX_RECORD_HOOK")
 retirement_hook = os.environ.get("PHOENIX_TMUX_RETIREMENT_HOOK")
+root_quarantine_hook = os.environ.get("PHOENIX_TMUX_ROOT_QUARANTINE_HOOK")
 provisional = []
 adopted_pending_publication = []
 preserved_visible_paths = set()
@@ -224,6 +225,7 @@ def reserve_spawn(socket, control):
     return obligation
 
 def record_owned(socket, device, inode, control, identities):
+    tmux_format_literal(identities[0][2])
     conflicts = [
         record for record in owned
         if record[0] == socket or record[3] == control
@@ -241,11 +243,11 @@ def record_owned(socket, device, inode, control, identities):
             owned.remove(record)
     processes = tuple(identities)
     previous = retained_controls.get(control.name)
-    if previous is not None and previous[3] is not None:
-        (control_root / previous[3]).unlink(missing_ok=True)
     record = (socket, device, inode, control, processes)
     owned.append(record)
     retained_controls[control.name] = (device, inode, processes, None)
+    if previous is not None and previous[3] is not None:
+        (control_root / previous[3]).unlink(missing_ok=True)
     if record_hook:
         injected = subprocess.run(
             [record_hook, str(control)],
@@ -295,13 +297,13 @@ def retire_record(record, deadline):
     expected_token = tmux_format_literal(processes[0][2])
     states = [identity_state(identity) for identity in processes]
     if all(state == "absent" for state in states):
-        return True
+        return record
     if states[0] != "owned" or any(state not in ("owned", "absent") for state in states[1:]):
-        return False
+        return None
     try:
         control_stat = control.stat()
         if control_stat.st_dev != device or control_stat.st_ino != inode:
-            return False
+            return None
         expected_server = processes[0][0]
         if retirement_hook:
             subprocess.run(
@@ -312,13 +314,13 @@ def retire_record(record, deadline):
             )
         observed_server, pane_pids = query_control_processes(control, deadline)
         if observed_server != expected_server:
-            return False
+            return None
         known_pids = {identity[0] for identity in processes}
         for pane_pid in pane_pids:
             if pane_pid not in known_pids:
                 started = birth(pane_pid)
                 if started is None:
-                    return False
+                    return None
                 processes.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
         record = persist_record_processes(record, processes)
@@ -331,12 +333,12 @@ def retire_record(record, deadline):
             timeout=remaining_timeout(deadline),
         )
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
-        return False
+        return None
     while time.monotonic() < deadline:
         if all(identity_state(identity) == "absent" for identity in processes):
-            return True
+            return record
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-    return False
+    return None
 
 class EnvironmentError(RuntimeError):
     pass
@@ -367,6 +369,7 @@ def spawn_owned(request):
             adopt_name = request.name.replace(".spawn-", ".adopt-", 1)
         else:
             raise RuntimeError("spawn request was malformed")
+        token = tmux_format_literal(token)
         socket = root / socket_name
         control = control_root / control_name
         if socket.parent != root or control.parent != control_root or control.exists():
@@ -493,7 +496,10 @@ def retire_registered(socket, control, identities):
             return False
     except OSError:
         return False
-    retired = retire_record(record, retirement_deadline())
+    retired_record = retire_record(record, retirement_deadline())
+    retired = retired_record is not None
+    if retired:
+        record = retired_record
     try:
         socket_stat = socket.stat()
         visible_owned = socket_stat.st_dev == record[1] and socket_stat.st_ino == record[2]
@@ -515,8 +521,7 @@ def retire_registered(socket, control, identities):
         retired = False
     if not retired:
         return False
-    if visible_replacement:
-        preserved_visible_paths.add(socket)
+    preserved_visible_paths.add(socket)
     provisional[:] = [
         item for item in provisional
         if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
@@ -573,6 +578,7 @@ def register(request):
     try:
         fields = request.read_text().split("\t")
         socket_name, control_name, expected_token = fields
+        expected_token = tmux_format_literal(expected_token)
         socket = root / socket_name
         control = control_root / control_name
         if (socket.parent != root or control.parent != control_root
@@ -817,8 +823,7 @@ while time.monotonic() < cleanup_deadline:
         for identity in processes
     ]
     unconfirmed_state = (any(state != "absent" for state in states)
-                         or bool(unconfirmed_obligations)
-                         or bool(preserved_visible_paths))
+                         or bool(unconfirmed_obligations))
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -926,9 +931,41 @@ while time.monotonic() < cleanup_deadline:
             continue
         root_quarantine = root.with_name(f"{root.name}.retired-{uuid.uuid4()}")
         try:
+            expected_namespace = {
+                entry.name: (entry.lstat().st_dev, entry.lstat().st_ino, entry.lstat().st_mode)
+                for entry in root.iterdir()
+            }
+            if root_quarantine_hook:
+                subprocess.run(
+                    [root_quarantine_hook, str(root)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                    timeout=remaining_timeout(cleanup_deadline),
+                )
             os.replace(root, root_quarantine)
             moved_root_stat = root_quarantine.stat()
             if (moved_root_stat.st_dev, moved_root_stat.st_ino) != root_identity:
+                if not root.exists():
+                    os.replace(root_quarantine, root)
+                sys.exit(1)
+            observed_namespace = {
+                entry.name: (entry.lstat().st_dev, entry.lstat().st_ino, entry.lstat().st_mode)
+                for entry in root_quarantine.iterdir()
+            }
+            reconciled = True
+            for name, identity in observed_namespace.items():
+                if expected_namespace.get(name) == identity:
+                    continue
+                record = next((candidate for candidate in owned if candidate[0].name == name), None)
+                if (record is None or identity[:2] != (record[1], record[2])
+                        or any(identity_state(process) != "absent" for process in record[4])):
+                    reconciled = False
+                    break
+                (root_quarantine / name).unlink()
+            if (not reconciled
+                    or any(name not in observed_namespace
+                           or observed_namespace[name] != identity
+                           for name, identity in expected_namespace.items())):
                 if not root.exists():
                     os.replace(root_quarantine, root)
                 sys.exit(1)
@@ -979,7 +1016,7 @@ fn configure_watchdog_env(
     quarantine_hook: Option<&Path>,
     adoption: (Option<Duration>, Option<&Path>),
     publication: (Option<Duration>, Option<&Path>),
-    lifecycle_hooks: (Option<&Path>, Option<&Path>),
+    lifecycle_hooks: (Option<&Path>, Option<&Path>, Option<&Path>),
 ) {
     set_duration_env(command, "PHOENIX_TMUX_IDENTITY_TIMEOUT", deadlines.0);
     set_duration_env(command, "PHOENIX_TMUX_CLEANUP_TIMEOUT", deadlines.1);
@@ -990,6 +1027,11 @@ fn configure_watchdog_env(
     set_path_env(command, "PHOENIX_TMUX_PUBLICATION_HOOK", publication.1);
     set_path_env(command, "PHOENIX_TMUX_RECORD_HOOK", lifecycle_hooks.0);
     set_path_env(command, "PHOENIX_TMUX_RETIREMENT_HOOK", lifecycle_hooks.1);
+    set_path_env(
+        command,
+        "PHOENIX_TMUX_ROOT_QUARANTINE_HOOK",
+        lifecycle_hooks.2,
+    );
 }
 
 impl TestTmuxServerOwner {
@@ -1019,7 +1061,7 @@ impl TestTmuxServerOwner {
             None,
             None,
             (None, None),
-            (None, None),
+            (None, None, None),
         )
     }
 
@@ -1030,7 +1072,7 @@ impl TestTmuxServerOwner {
         adoption_timeout: Option<Duration>,
         adoption_hook: Option<&Path>,
         publication: (Option<Duration>, Option<&Path>),
-        lifecycle_hooks: (Option<&Path>, Option<&Path>),
+        lifecycle_hooks: (Option<&Path>, Option<&Path>, Option<&Path>),
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -2618,7 +2660,7 @@ mod tests {
             None,
             None,
             (None, None),
-            (Some(&hook), None),
+            (Some(&hook), None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2658,6 +2700,56 @@ mod tests {
     }
 
     #[test]
+    fn retirement_discovered_exited_pane_uses_updated_owned_record() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let once = hook_dir.path().join("once");
+        let hook = hook_dir.path().join("add-short-pane");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] && exit 0\ntouch '{}'\ntmux -S \"$1\" new-window -d -t main sleep 0.05\n",
+                once.display(),
+                once.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, Some(Duration::from_secs(2))),
+            None,
+            None,
+            None,
+            (None, None),
+            (None, Some(&hook), None),
+        );
+        let (_, processes) = spawn_server_with_processes(&owner, "late-exited-pane");
+
+        owner.shutdown();
+
+        assert_exact_processes_gone(&processes);
+    }
+
+    #[test]
+    fn replacement_identity_is_retained_before_previous_anchor_cleanup() {
+        let append = WATCHDOG_PROGRAM
+            .find("owned.append(record)")
+            .expect("replacement identity is retained");
+        let retain = WATCHDOG_PROGRAM
+            .find("retained_controls[control.name] = (device, inode, processes, None)")
+            .expect("replacement control identity is retained");
+        let previous_anchor = WATCHDOG_PROGRAM
+            .find("(control_root / previous[3]).unlink(missing_ok=True)")
+            .expect("previous anchor is removed");
+        assert!(append < previous_anchor && retain < previous_anchor);
+    }
+
+    #[test]
     fn retirement_discovered_hup_resistant_pane_blocks_false_cleanup_success() {
         if which::which("tmux").is_err() {
             return;
@@ -2684,7 +2776,7 @@ mod tests {
             None,
             None,
             (None, None),
-            (None, Some(&hook)),
+            (None, Some(&hook), None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2743,6 +2835,77 @@ mod tests {
         assert!(!root.exists());
         assert!(!control_root.exists());
         fs::remove_dir_all(moved_control_root).unwrap();
+    }
+
+    #[test]
+    fn malformed_spawn_token_is_rejected_before_ownership_admission() {
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        fs::write(control_root.join("invalid-token-env.json"), "[]").unwrap();
+        write_raw_spawn_request(
+            &root,
+            &control_root,
+            "invalid_token",
+            "invalid-token-env.json",
+        );
+        wait_until(
+            || control_root.join(".rejected-invalid_token").exists(),
+            "invalid token rejection",
+        );
+        assert!(!control_root.join("invalid_token.sock").exists());
+        assert!(!root.join("invalid_token.sock").exists());
+
+        owner.shutdown();
+    }
+
+    #[test]
+    fn final_root_quarantine_reconciles_late_namespace_entry() {
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("publish-late-entry");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nmktemp \"$1/late-entry.XXXXXX\" >/dev/null\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, None),
+            None,
+            None,
+            None,
+            (None, None),
+            (None, None, Some(&hook)),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "late namespace entry must fail cleanup closed"
+        );
+        assert!(fs::read_dir(&root).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("late-entry.")));
+        fs::remove_dir_all(root).unwrap();
+        if control_root.exists() {
+            fs::remove_dir_all(control_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn retired_path_ownership_blocks_later_unregistered_kill() {
+        assert!(WATCHDOG_PROGRAM.contains("if retired:\n        record = retired_record"));
+        assert!(WATCHDOG_PROGRAM.contains("preserved_visible_paths.add(socket)"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "if socket in preserved_visible_paths:\n            unconfirmed = True\n            continue"
+        ));
     }
 
     #[test]
@@ -2921,7 +3084,7 @@ mod tests {
             .find("anchor_stat.st_dev != record[1] or anchor_stat.st_ino != record[2]")
             .expect("retirement authenticates the retained inode");
         let retire = WATCHDOG_PROGRAM
-            .find("retired = retire_record(record")
+            .find("retired_record = retire_record(record")
             .expect("retirement follows anchor authentication");
         let classify = WATCHDOG_PROGRAM
             .find("visible_owned = socket_stat.st_dev == record[1]")
@@ -3015,7 +3178,7 @@ mod tests {
             Some(Duration::from_secs(1)),
             Some(&hook),
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3171,7 +3334,7 @@ mod tests {
             Some(Duration::from_secs(1)),
             Some(&hook),
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3224,7 +3387,7 @@ mod tests {
             None,
             None,
             (None, Some(&hook)),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3301,7 +3464,7 @@ mod tests {
             Some(Duration::from_secs(2)),
             Some(&hook),
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3389,7 +3552,7 @@ mod tests {
             Some(Duration::ZERO),
             Some(&hook),
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3468,7 +3631,7 @@ mod tests {
             None,
             None,
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3506,7 +3669,7 @@ mod tests {
             None,
             None,
             (None, None),
-            (None, None),
+            (None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -3760,9 +3923,9 @@ mod tests {
     #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
         assert!(WATCHDOG_PROGRAM
-            .contains("if all(state == \"absent\" for state in states):\n        return True"));
+            .contains("if all(state == \"absent\" for state in states):\n        return record"));
         assert!(WATCHDOG_PROGRAM.contains(
-            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):\n        return False"
+            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):\n        return None"
         ));
         assert!(WATCHDOG_PROGRAM.contains("retire_record(record, cleanup_deadline)"));
     }
