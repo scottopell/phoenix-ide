@@ -34,6 +34,7 @@ root = Path(sys.argv[1])
 parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 owned = []
+retained_controls = {}
 unconfirmed_obligations = []
 cleanup_deadline = None
 identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
@@ -199,7 +200,9 @@ def record_owned(socket, device, inode, control, identities):
         raise RuntimeError("live tmux ownership record already exists")
     for record in conflicts:
         owned.remove(record)
-    owned.append((socket, device, inode, control, tuple(identities)))
+    processes = tuple(identities)
+    owned.append((socket, device, inode, control, processes))
+    retained_controls[control.name] = (device, inode, processes)
 
 def exact_record(socket, control, identities):
     expected = tuple(identities)
@@ -435,11 +438,11 @@ def retire(request):
     )
     try:
         fields = request.read_text().split("\t")
+        if len(fields) < 7 or len(fields[5:]) % 2 != 0:
+            raise RuntimeError("retirement request was malformed")
         socket = root / fields[0]
         control = control_root / fields[1]
         expected_token = tmux_format_literal(fields[4])
-        if len(fields) < 7 or len(fields[5:]) % 2 != 0:
-            raise RuntimeError("retirement request was malformed")
         identities = [(int(fields[2]), fields[3], expected_token)]
         identities.extend(
             (int(fields[index]), fields[index + 1], None)
@@ -641,6 +644,46 @@ for index, record in enumerate(owned):
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         pass
 
+def remove_authenticated_control_root():
+    if not control_root.exists():
+        return True
+    quarantine = control_root.with_name(f"{control_root.name}.retired-{uuid.uuid4()}")
+    try:
+        os.replace(control_root, quarantine)
+    except OSError:
+        return False
+    expected = dict(retained_controls)
+    authenticated = True
+    try:
+        for entry in quarantine.iterdir():
+            registered = expected.get(entry.name)
+            if registered is None:
+                if entry.is_socket() or entry.is_symlink():
+                    authenticated = False
+                    break
+                continue
+            device, inode, processes = registered
+            try:
+                entry_stat = entry.stat()
+            except OSError:
+                authenticated = False
+                break
+            if (entry_stat.st_dev != device or entry_stat.st_ino != inode
+                    or any(identity_state(identity) != "absent" for identity in processes)):
+                authenticated = False
+                break
+        if authenticated:
+            shutil.rmtree(quarantine)
+            return not control_root.exists()
+    except OSError:
+        authenticated = False
+    try:
+        if not control_root.exists():
+            os.replace(quarantine, control_root)
+    except OSError:
+        pass
+    return False
+
 quiet = 0
 while time.monotonic() < cleanup_deadline:
     unconfirmed = False
@@ -748,10 +791,12 @@ while time.monotonic() < cleanup_deadline:
             creators = True
     quiet = quiet + 1 if not unconfirmed_state and not unconfirmed and not sockets and not creators else 0
     if quiet >= 5:
+        if not remove_authenticated_control_root():
+            quiet = 0
+            time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
+            continue
         if root.exists():
             shutil.rmtree(root)
-        if control_root.exists():
-            shutil.rmtree(control_root)
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
@@ -2271,6 +2316,67 @@ mod tests {
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn replacement_control_endpoint_survives_after_subject_and_original_exit() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("control-replacement.sock");
+        let (socket, processes) = spawn_server_with_processes(&owner, "control-replacement");
+        fs::remove_file(&socket).unwrap();
+        assert!(Command::new("tmux")
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_exact_processes_gone(&processes);
+        fs::remove_file(&control).ok();
+        let replacement = std::os::unix::net::UnixListener::bind(&control).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "replacement control must fail cleanup closed"
+        );
+        assert!(control.exists(), "replacement control endpoint was removed");
+        assert_eq!(
+            replacement.local_addr().unwrap().as_pathname(),
+            Some(control.as_path())
+        );
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn one_field_retirement_request_cannot_abandon_other_owned_records() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (_, first) = spawn_server_with_processes(&owner, "malformed-first");
+        let (_, second) = spawn_server_with_processes(&owner, "malformed-second");
+        fs::write(
+            control_root.join(".retire-request-one-field"),
+            "only-one-field",
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".retire-rejected-one-field").exists(),
+            "malformed retirement rejection",
+        );
+
+        owner.shutdown();
+
+        assert_exact_processes_gone(&first);
+        assert_exact_processes_gone(&second);
     }
 
     #[test]

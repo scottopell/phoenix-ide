@@ -5566,7 +5566,9 @@ mod tests {
             return;
         }
         let owner = TestTmuxServerOwner::new();
-        let control = owner.control_root_path().join("cancel-boundary.sock");
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("cancel-boundary.sock");
         let token = uuid::Uuid::new_v4().to_string();
         let status = std::process::Command::new("tmux")
             .args([
@@ -5592,7 +5594,14 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(!control.exists() || crate::tmux::probe::probe_sync(&control) != ProbeResult::Live);
-        owner.shutdown();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(
+            panic.is_err(),
+            "unregistered control entry must fail final cleanup closed"
+        );
+        assert!(control.exists(), "unknown control entry must be preserved");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
