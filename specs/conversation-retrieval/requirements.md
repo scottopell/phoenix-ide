@@ -384,6 +384,13 @@ offset), so one huge message cannot exceed the bound
 THE SYSTEM SHALL NOT return a single read result large enough to push
 the next bounded-loop model call past its context window
 
+THE read tool SHALL issue only versioned opaque string cursors whose payload
+identifies the host scope, requested source, persisted message identity,
+intra-message offset, and source-content freshness
+AND SHALL reject unsupported cursor types, versions, scopes, targets, or stale
+source identities with guidance to restart the read without a cursor rather
+than reinterpreting them
+
 **Rationale:** An agentic consumer (the unified conversation page's read-only transcript Q&A, or an application-wide Q&A surface) drives retrieval as a tool and iterates. If the model could choose its own scope, a conversation Q&A agent could read conversations outside its host-bound transcript family — the scope would be a suggestion, not a boundary. Making the host fix the scope at tool-construction time makes the boundary structural: the same agent code becomes unified-conversation Q&A or global Q&A purely by which scope the host binds, and neither can escape its binding. This is the correct-by-construction form of "the model can dig as deep as it wants, but only within the conversations it was given."
 
 ---
@@ -448,6 +455,8 @@ cursor against the host-bound predecessor scope before returning content
 AND SHALL use the bounded full-content paging contract of REQ-RET-008
 AND SHALL identify source transcript/message references and treat recalled
 content as historical evidence rather than new instructions
+AND SHALL use the shared versioned opaque-string cursor contract of REQ-RET-008
+without accepting a predecessor-specific cursor representation
 
 WHEN the authoritative predecessor set is empty
 THE SYSTEM SHALL distinguish that outcome from a search miss or unavailable

@@ -322,7 +322,17 @@ impl Tool for ReadConversation {
         }
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","properties":{"conversation_id":{"type":"string"},"cursor":{"type":"integer","minimum":0}},"required":["conversation_id"]})
+        json!({
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "string"},
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque versioned cursor returned by this tool. Numeric cursors are rejected; restart without cursor."
+                }
+            },
+            "required": ["conversation_id"]
+        })
     }
     fn clearable(&self) -> bool {
         true
@@ -332,26 +342,25 @@ impl Tool for ReadConversation {
             .get("conversation_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let parsed_cursor = input
-            .get("cursor")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok());
+        let cursor = match input.get("cursor") {
+            None => None,
+            Some(Value::String(cursor)) => Some(cursor.as_str()),
+            Some(Value::Number(_)) => {
+                return ToolOutput::error(
+                    "numeric read_conversation cursors are no longer accepted; restart this read without a cursor",
+                )
+            }
+            Some(_) => {
+                return ToolOutput::error(
+                    "unsupported read_conversation cursor type; restart this read without a cursor",
+                )
+            }
+        };
         match &self.scope {
-            ConversationRecallScope::Global => result(
-                self.service
-                    .read_conversation(conversation, parsed_cursor.unwrap_or(0))
-                    .await,
-            ),
+            ConversationRecallScope::Global => {
+                result(self.service.read_conversation(conversation, cursor).await)
+            }
             ConversationRecallScope::StrictPredecessors(binding) => {
-                let cursor = match (input.get("cursor"), parsed_cursor) {
-                    (None, _) => 0,
-                    (Some(_), Some(cursor)) => cursor,
-                    (Some(_), None) => {
-                        return ToolOutput::error(
-                            "cursor must be a non-negative integer within the host range",
-                        )
-                    }
-                };
                 let output = self
                     .service
                     .read_predecessor_conversation(binding, conversation, cursor)
@@ -723,13 +732,19 @@ mod tests {
 
         let output = tool
             .run(
-                json!({"conversation_id": "@conv:predecessor", "cursor": "bad"}),
+                json!({"conversation_id": "@conv:predecessor", "cursor": 7}),
                 context("current"),
             )
             .await;
 
         assert!(!output.is_success());
-        assert!(output.output().contains("non-negative integer"));
+        assert!(output
+            .output()
+            .contains("restart this read without a cursor"));
+        assert_eq!(
+            tool.input_schema()["properties"]["cursor"]["type"],
+            "string"
+        );
     }
 
     async fn tool_and_context() -> (WorkScopeCoordinatorBash, ToolContext) {

@@ -4,6 +4,7 @@ use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalS
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use sqlx::Row;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use super::handlers::AppError;
 
 const SEARCH_TOP_K: usize = 10;
-const READ_PAGE_CHARS: usize = 7000;
 const READ_MESSAGE_BATCH: i64 = 64;
 
 #[cfg(test)]
@@ -59,7 +59,6 @@ fn record_read_messages(messages: &[crate::db::Message]) {
         );
     }
 }
-const READ_TARGET_SIDE_MESSAGES: i64 = 32;
 const SNAPSHOT_ROW_LIMIT: usize = 40;
 const SNAPSHOT_BYTE_LIMIT: usize = 32 * 1024;
 const PREVIOUS_LIST_LIMIT: usize = 20;
@@ -207,6 +206,34 @@ pub(crate) struct PreviousTranscriptsBinding {
     executing_transcript_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+enum ConversationReadCursorScope {
+    Global,
+    Chain {
+        root_conversation_id: String,
+    },
+    StrictPredecessors {
+        product_conversation_id: String,
+        executing_transcript_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ConversationReadCursor {
+    version: u8,
+    scope: ConversationReadCursorScope,
+    target_conversation_id: String,
+    message_id: String,
+    message_sequence: i64,
+    byte_offset: usize,
+    rendered_sha256: String,
+}
+
+const CONVERSATION_READ_CURSOR_VERSION: u8 = 1;
+const LEGACY_NUMERIC_CURSOR_MESSAGE: &str =
+    "numeric read_conversation cursors are no longer accepted; restart this read without a cursor";
+
 impl PreviousTranscriptsBinding {
     #[must_use]
     pub(crate) fn new(product_conversation_id: String, executing_transcript_id: String) -> Self {
@@ -239,7 +266,7 @@ pub(crate) enum PreviousTranscriptsOutput {
         transcript: PreviousTranscriptSummary,
         starts_at: Option<PreviousTranscriptReadStart>,
         content: String,
-        next_cursor: Option<usize>,
+        next_cursor: Option<String>,
         truncated: bool,
     },
     NoPredecessors,
@@ -549,7 +576,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
     pub(crate) async fn read_conversation(
         &self,
         conversation: &str,
-        cursor: usize,
+        cursor: Option<&str>,
     ) -> Result<String, String> {
         let target = resolve_conversation_read_target(self, conversation).await?;
         let conv = self
@@ -557,15 +584,40 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
             .get_conversation(&target.conversation_id)
             .await
             .map_err(|e| format!("conversation not found: {e}"))?;
-        if let Some(message_id) = target.message_id.as_deref() {
-            read_conversation_around_message(&self.db, &conv, message_id)
+        let scope = ConversationReadCursorScope::Global;
+        let position = if let Some(message_id) = target.message_id.as_deref() {
+            if cursor.is_some() {
+                return Err(
+                    "message-fragment reads cannot be combined with a cursor; continue with the conversation id and the returned cursor"
+                        .to_string(),
+                );
+            }
+            let message = self
+                .db
+                .get_message_by_id(message_id)
                 .await
-                .map_err(|e| format!("read failed: {e}"))
+                .map_err(|error| format!("message not found: {error}"))?;
+            if message.conversation_id != conv.id {
+                return Err("message does not belong to the requested conversation".to_string());
+            }
+            let rendered = render_global_message_line(&conv, &message);
+            PreviousReadPosition {
+                message_sequence: message.sequence_id,
+                byte_offset: 0,
+                message_id: Some(message.message_id),
+                rendered_sha256: Some(rendered_sha256(&rendered)),
+            }
         } else {
-            read_conversation_page(&self.db, &conv, cursor)
+            decode_conversation_read_cursor(cursor, &scope, &conv.id)?
+        };
+        let page =
+            render_message_page_bounded_as(&self.db, &conv, position, ReadRenderKind::Global)
                 .await
-                .map_err(|e| format!("read failed: {e}"))
-        }
+                .map_err(|error| match error {
+                    PreviousReadError::InvalidCursor(message) => message,
+                    PreviousReadError::Database(error) => format!("read failed: {error}"),
+                })?;
+        render_global_read_page(&scope, &conv, page)
     }
 
     pub(crate) async fn resolve_message_target(
@@ -614,9 +666,34 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         &self,
         binding: &PreviousTranscriptsBinding,
         transcript_ref: &str,
-        cursor: usize,
+        cursor: Option<&str>,
     ) -> PreviousTranscriptsOutput {
         self.previous_read(binding, transcript_ref, cursor).await
+    }
+
+    pub(crate) async fn read_chain_conversation(
+        &self,
+        root_conversation_id: &str,
+        target_conversation_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<String, String> {
+        let conv = self
+            .db
+            .get_conversation(target_conversation_id)
+            .await
+            .map_err(|error| format!("conversation not found: {error}"))?;
+        let scope = ConversationReadCursorScope::Chain {
+            root_conversation_id: root_conversation_id.to_string(),
+        };
+        let position = decode_conversation_read_cursor(cursor, &scope, &conv.id)?;
+        let page =
+            render_message_page_bounded_as(&self.db, &conv, position, ReadRenderKind::Global)
+                .await
+                .map_err(|error| match error {
+                    PreviousReadError::InvalidCursor(message) => message,
+                    PreviousReadError::Database(error) => format!("read failed: {error}"),
+                })?;
+        render_global_read_page(&scope, &conv, page)
     }
 
     async fn previous_list(
@@ -750,7 +827,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         &self,
         binding: &PreviousTranscriptsBinding,
         transcript_ref: &str,
-        cursor: usize,
+        cursor: Option<&str>,
     ) -> PreviousTranscriptsOutput {
         let target = match resolve_conversation_read_target(self, transcript_ref).await {
             Ok(target) if target.message_id.is_none() => target.conversation_id,
@@ -766,7 +843,11 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                 }
             }
         };
-        let position = match decode_previous_read_cursor(cursor) {
+        let scope = ConversationReadCursorScope::StrictPredecessors {
+            product_conversation_id: binding.product_conversation_id.clone(),
+            executing_transcript_id: binding.executing_transcript_id.clone(),
+        };
+        let position = match decode_conversation_read_cursor(cursor, &scope, &target) {
             Ok(position) => position,
             Err(message) => return PreviousTranscriptsOutput::InvalidCursor { message },
         };
@@ -801,7 +882,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         let next_cursor = match page
             .next_cursor
-            .map(encode_previous_read_cursor)
+            .map(|position| encode_conversation_read_cursor(&scope, &target, &position))
             .transpose()
         {
             Ok(cursor) => cursor,
@@ -925,10 +1006,18 @@ struct PreviousReadPageStart {
     byte_offset: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviousReadPosition {
     message_sequence: i64,
     byte_offset: usize,
+    message_id: Option<String>,
+    rendered_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadRenderKind {
+    Global,
+    StrictPredecessor,
 }
 
 #[derive(Debug)]
@@ -1047,73 +1136,108 @@ fn decode_previous_list_cursor(
         .map_err(|_| "cursor offset is invalid".to_string())
 }
 
-fn encode_previous_read_cursor(position: PreviousReadPosition) -> Result<usize, String> {
-    let sequence = u64::try_from(position.message_sequence)
-        .map_err(|_| "cursor message sequence is invalid".to_string())?;
-    if sequence == 0 {
-        return Err("cursor message sequence is invalid".to_string());
+fn encode_cursor_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
     }
-    let offset = u64::try_from(position.byte_offset)
-        .map_err(|_| "cursor byte offset is invalid".to_string())?;
-    let sum = sequence
-        .checked_add(offset)
-        .ok_or_else(|| "cursor is outside the supported range".to_string())?;
-    let paired = sum
-        .checked_mul(
-            sum.checked_add(1)
-                .ok_or_else(|| "cursor is outside the supported range".to_string())?,
-        )
-        .and_then(|value| value.checked_div(2))
-        .and_then(|value| value.checked_add(offset))
-        .ok_or_else(|| "cursor is outside the supported range".to_string())?;
-    usize::try_from(paired).map_err(|_| "cursor is outside the host range".to_string())
+    encoded
 }
 
-fn decode_previous_read_cursor(cursor: usize) -> Result<PreviousReadPosition, String> {
-    if cursor == 0 {
+fn decode_cursor_bytes(encoded: &str) -> Result<Vec<u8>, String> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(
+            "invalid read_conversation cursor; restart this read without a cursor".to_string(),
+        );
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).map_err(|_| {
+                "invalid read_conversation cursor; restart this read without a cursor".to_string()
+            })?;
+            u8::from_str_radix(digits, 16).map_err(|_| {
+                "invalid read_conversation cursor; restart this read without a cursor".to_string()
+            })
+        })
+        .collect()
+}
+
+fn rendered_sha256(rendered: &str) -> String {
+    encode_cursor_bytes(Sha256::digest(rendered.as_bytes()).as_ref())
+}
+
+fn encode_conversation_read_cursor(
+    scope: &ConversationReadCursorScope,
+    target_conversation_id: &str,
+    position: &PreviousReadPosition,
+) -> Result<String, String> {
+    let message_id = position
+        .message_id
+        .clone()
+        .ok_or_else(|| "cursor message identity is missing".to_string())?;
+    let rendered_sha256 = position
+        .rendered_sha256
+        .clone()
+        .ok_or_else(|| "cursor freshness identity is missing".to_string())?;
+    let cursor = ConversationReadCursor {
+        version: CONVERSATION_READ_CURSOR_VERSION,
+        scope: scope.clone(),
+        target_conversation_id: target_conversation_id.to_string(),
+        message_id,
+        message_sequence: position.message_sequence,
+        byte_offset: position.byte_offset,
+        rendered_sha256,
+    };
+    let json = serde_json::to_vec(&cursor)
+        .map_err(|error| format!("failed to encode read cursor: {error}"))?;
+    Ok(format!("v1.{}", encode_cursor_bytes(&json)))
+}
+
+fn decode_conversation_read_cursor(
+    cursor: Option<&str>,
+    expected_scope: &ConversationReadCursorScope,
+    expected_target: &str,
+) -> Result<PreviousReadPosition, String> {
+    let Some(cursor) = cursor else {
         return Ok(PreviousReadPosition {
             message_sequence: 0,
             byte_offset: 0,
+            message_id: None,
+            rendered_sha256: None,
         });
-    }
-    let paired = u64::try_from(cursor).map_err(|_| "cursor is outside host range".to_string())?;
-    let mut low = 0_u64;
-    let mut high = paired.min(6_074_000_999).saturating_add(1);
-    while low.saturating_add(1) < high {
-        let middle = low.saturating_add(high.saturating_sub(low) / 2);
-        let triangular = middle
-            .checked_mul(middle.saturating_add(1))
-            .and_then(|value| value.checked_div(2));
-        if triangular.is_some_and(|value| value <= paired) {
-            low = middle;
-        } else {
-            high = middle;
-        }
-    }
-    let root = low;
-    let triangular = root
-        .checked_mul(root.saturating_add(1))
-        .and_then(|value| value.checked_div(2))
-        .ok_or_else(|| "cursor is invalid".to_string())?;
-    let byte_offset = paired
-        .checked_sub(triangular)
-        .ok_or_else(|| "cursor is invalid".to_string())?;
-    let message_sequence = root
-        .checked_sub(byte_offset)
-        .ok_or_else(|| "cursor is invalid".to_string())?;
-    if message_sequence == 0 {
-        return Err("cursor message sequence is invalid".to_string());
-    }
-    let position = PreviousReadPosition {
-        message_sequence: i64::try_from(message_sequence)
-            .map_err(|_| "cursor message sequence is invalid".to_string())?,
-        byte_offset: usize::try_from(byte_offset)
-            .map_err(|_| "cursor byte offset is invalid".to_string())?,
     };
-    if encode_previous_read_cursor(position)? != cursor {
-        return Err("cursor is invalid".to_string());
+    if cursor.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(LEGACY_NUMERIC_CURSOR_MESSAGE.to_string());
     }
-    Ok(position)
+    let encoded = cursor.strip_prefix("v1.").ok_or_else(|| {
+        "unsupported read_conversation cursor version; restart this read without a cursor"
+            .to_string()
+    })?;
+    let json = decode_cursor_bytes(encoded)?;
+    let decoded: ConversationReadCursor = serde_json::from_slice(&json).map_err(|_| {
+        "invalid read_conversation cursor; restart this read without a cursor".to_string()
+    })?;
+    if decoded.version != CONVERSATION_READ_CURSOR_VERSION {
+        return Err(
+            "unsupported read_conversation cursor version; restart this read without a cursor"
+                .to_string(),
+        );
+    }
+    if &decoded.scope != expected_scope || decoded.target_conversation_id != expected_target {
+        return Err("read_conversation cursor does not belong to this host scope and target; restart this read without a cursor".to_string());
+    }
+    if decoded.message_sequence <= 0 {
+        return Err("read_conversation cursor message sequence is invalid; restart this read without a cursor".to_string());
+    }
+    Ok(PreviousReadPosition {
+        message_sequence: decoded.message_sequence,
+        byte_offset: decoded.byte_offset,
+        message_id: Some(decoded.message_id),
+        rendered_sha256: Some(decoded.rendered_sha256),
+    })
 }
 
 fn json_escaped_char_bytes(ch: char) -> usize {
@@ -1124,7 +1248,7 @@ fn json_escaped_char_bytes(ch: char) -> usize {
     }
 }
 
-fn finish_read_content(content: &mut String, next_cursor: Option<PreviousReadPosition>) {
+fn finish_read_content(content: &mut String, next_cursor: Option<&PreviousReadPosition>) {
     if content.is_empty() && next_cursor.is_none() {
         content.push_str("(end of conversation)");
     }
@@ -1133,7 +1257,7 @@ fn finish_read_content(content: &mut String, next_cursor: Option<PreviousReadPos
 async fn initial_read_target(
     db: &crate::db::Database,
     conversation_id: &str,
-    cursor: PreviousReadPosition,
+    cursor: &PreviousReadPosition,
 ) -> Result<Option<Vec<crate::db::Message>>, PreviousReadError> {
     if cursor.message_sequence <= 0 {
         return Ok(None);
@@ -1153,13 +1277,23 @@ async fn render_message_page_bounded(
     conv: &Conversation,
     cursor: PreviousReadPosition,
 ) -> Result<BoundedMessagePage, PreviousReadError> {
+    render_message_page_bounded_as(db, conv, cursor, ReadRenderKind::StrictPredecessor).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn render_message_page_bounded_as(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    cursor: PreviousReadPosition,
+    render_kind: ReadRenderKind,
+) -> Result<BoundedMessagePage, PreviousReadError> {
     let mut out = String::new();
     let mut encoded_content_bytes = 0usize;
     let mut page_start = None;
     let mut next_cursor = None;
     let mut after_sequence = 0;
     let mut cursor_pending = cursor.message_sequence > 0;
-    let mut target_only = initial_read_target(db, &conv.id, cursor).await?;
+    let mut target_only = initial_read_target(db, &conv.id, &cursor).await?;
     loop {
         let messages = if let Some(messages) = target_only.take() {
             messages
@@ -1192,7 +1326,20 @@ async fn render_message_page_bounded(
                 }
                 continue;
             }
-            let line = render_previous_message_line(conv, &message);
+            let line = match render_kind {
+                ReadRenderKind::Global => render_global_message_line(conv, &message),
+                ReadRenderKind::StrictPredecessor => render_previous_message_line(conv, &message),
+            };
+            let line_freshness = rendered_sha256(&line);
+            if cursor_pending
+                && (cursor.message_id.as_deref() != Some(message.message_id.as_str())
+                    || cursor.rendered_sha256.as_deref() != Some(line_freshness.as_str()))
+            {
+                return Err(PreviousReadError::InvalidCursor(
+                    "read_conversation cursor is stale or identifies another message; restart this read without a cursor"
+                        .to_string(),
+                ));
+            }
             #[cfg(test)]
             read_measurement::RENDERED_BYTES.fetch_add(
                 u64::try_from(line.len()).unwrap_or(u64::MAX),
@@ -1223,6 +1370,8 @@ async fn render_message_page_bounded(
                     next_cursor = Some(PreviousReadPosition {
                         message_sequence: message.sequence_id,
                         byte_offset: line_offset,
+                        message_id: Some(message.message_id.clone()),
+                        rendered_sha256: Some(line_freshness.clone()),
                     });
                     break;
                 }
@@ -1244,12 +1393,13 @@ async fn render_message_page_bounded(
             break;
         }
     }
-    finish_read_content(&mut out, next_cursor);
+    finish_read_content(&mut out, next_cursor.as_ref());
+    let truncated = next_cursor.is_some();
     Ok(BoundedMessagePage {
         start: page_start,
         content: out,
         next_cursor,
-        truncated: next_cursor.is_some(),
+        truncated,
     })
 }
 
@@ -1330,52 +1480,13 @@ async fn format_global_search_hits(
     out
 }
 
-async fn read_conversation_page(
-    db: &crate::db::Database,
+fn render_global_read_page(
+    scope: &ConversationReadCursorScope,
     conv: &Conversation,
-    cursor: usize,
-) -> Result<String, DbError> {
-    let mut header = format!(
-        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n",
-        conv.id,
-        conv.title
-            .as_deref()
-            .or(conv.slug.as_deref())
-            .unwrap_or(&conv.id),
-        conversation_href(conv),
-        conv.updated_at
-    );
-    let body = render_message_page(db, conv, cursor).await?;
-    header.push_str(&body);
-    Ok(header)
-}
-
-async fn read_conversation_around_message(
-    db: &crate::db::Database,
-    conv: &Conversation,
-    message_id: &str,
-) -> Result<String, DbError> {
-    let target = db.get_message_by_id(message_id).await?;
-    if target.conversation_id != conv.id {
-        return Err(DbError::MessageNotFound(message_id.to_string()));
-    }
-    let probe_limit = READ_TARGET_SIDE_MESSAGES.saturating_add(1);
-    let (mut before, mut after) = db
-        .get_messages_around(&conv.id, target.sequence_id, probe_limit, probe_limit)
-        .await?;
-    let side_limit = usize::try_from(READ_TARGET_SIDE_MESSAGES).unwrap_or(0);
-    let has_more_before = before.len() > side_limit;
-    let has_more_after = after.len() > side_limit;
-    if has_more_before {
-        before.remove(0);
-    }
-    after.truncate(side_limit);
-    let mut messages = before;
-    messages.push(target);
-    messages.extend(after);
-
-    let mut out = format!(
-        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
+    page: BoundedMessagePage,
+) -> Result<String, String> {
+    let mut output = format!(
+        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n{}",
         conv.id,
         conv.title
             .as_deref()
@@ -1383,69 +1494,17 @@ async fn read_conversation_around_message(
             .unwrap_or(&conv.id),
         conversation_href(conv),
         conv.updated_at,
-        message_id,
-        has_more_before,
-        has_more_after,
+        page.content,
     );
-    for message in messages {
-        if !message_is_hidden(&message) {
-            out.push_str(&render_global_message_line(conv, &message));
-        }
+    if let Some(position) = page.next_cursor {
+        let cursor = encode_conversation_read_cursor(scope, &conv.id, &position)?;
+        write!(
+            output,
+            "\n[… more content; call read_conversation again with cursor={cursor}]"
+        )
+        .map_err(|error| error.to_string())?;
     }
-    Ok(out)
-}
-
-async fn render_message_page(
-    db: &crate::db::Database,
-    conv: &Conversation,
-    cursor: usize,
-) -> Result<String, DbError> {
-    let end = cursor.saturating_add(READ_PAGE_CHARS);
-    let mut out = String::new();
-    let mut pos = 0usize;
-    let mut has_more = false;
-    let mut after_sequence = 0;
-    loop {
-        let messages = db
-            .get_messages_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
-            .await?;
-        if messages.is_empty() {
-            break;
-        }
-        for message in messages {
-            after_sequence = message.sequence_id;
-            if message_is_hidden(&message) {
-                continue;
-            }
-            let line = render_global_message_line(conv, &message);
-            for ch in line.chars() {
-                if pos >= end {
-                    has_more = true;
-                    break;
-                }
-                if pos >= cursor {
-                    out.push(ch);
-                }
-                pos += 1;
-            }
-            if has_more {
-                break;
-            }
-        }
-        if has_more {
-            break;
-        }
-    }
-    if out.is_empty() && !has_more {
-        return Ok("(end of conversation)".to_string());
-    }
-    if has_more {
-        Ok(format!(
-            "{out}\n[… more content; call read_conversation again with cursor={end}]"
-        ))
-    } else {
-        Ok(out)
-    }
+    Ok(output)
 }
 
 fn message_is_hidden(message: &crate::db::Message) -> bool {
@@ -1510,7 +1569,7 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         href,
         conv.id,
         message.message_id,
-        render_full_message_text(message).trim()
+        render_full_message_text(message)
     )
 }
 
@@ -2024,12 +2083,13 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_previous_read_cursor, encode_previous_read_cursor, message_id_fragment,
+        decode_conversation_read_cursor, encode_conversation_read_cursor, message_id_fragment,
         message_is_hidden, parse_conv_handle, read_measurement, render_full_message_text,
         render_previous_message_line, serialize_previous_transcripts_output_bounded,
-        split_fragment, GlobalMessageTargetError, GlobalReadService, PreviousReadPosition,
-        PreviousTranscriptReadStart, PreviousTranscriptsBinding, PreviousTranscriptsOutput,
-        PreviousTranscriptsRequest, PREVIOUS_READ_CONTENT_JSON_BYTES, PREVIOUS_TOOL_RESULT_BYTES,
+        split_fragment, ConversationReadCursorScope, GlobalMessageTargetError, GlobalReadService,
+        PreviousReadPosition, PreviousTranscriptReadStart, PreviousTranscriptsBinding,
+        PreviousTranscriptsOutput, PreviousTranscriptsRequest, PREVIOUS_READ_CONTENT_JSON_BYTES,
+        PREVIOUS_TOOL_RESULT_BYTES,
     };
     use std::sync::Arc;
 
@@ -2071,6 +2131,28 @@ mod tests {
         assert!(!rendered.contains("Coordinator reads text only"));
     }
 
+    #[tokio::test]
+    async fn global_message_rendering_preserves_boundary_whitespace() {
+        let (service, _) = predecessor_service().await;
+        let conv = service.db.get_conversation("pred-a").await.unwrap();
+        let message = crate::db::Message {
+            message_id: "message".to_string(),
+            conversation_id: conv.id.clone(),
+            sequence_id: 1,
+            message_type: phoenix_core::domain::db_schema::MessageType::User,
+            content: phoenix_core::domain::db_schema::MessageContent::user(
+                "\t  indented\ntrailing  ",
+            ),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let rendered = super::render_global_message_line(&conv, &message);
+
+        assert!(rendered.contains("\n\t  indented\ntrailing  \n\n"));
+    }
+
     #[test]
     fn parses_durable_conversation_references() {
         assert_eq!(
@@ -2082,19 +2164,37 @@ mod tests {
     }
 
     #[test]
-    fn previous_read_cursor_round_trips_message_position_and_rejects_invalid_offsets() {
+    fn read_cursor_round_trips_scope_target_position_and_freshness() {
+        let scope = ConversationReadCursorScope::StrictPredecessors {
+            product_conversation_id: "product".to_string(),
+            executing_transcript_id: "current".to_string(),
+        };
         let position = PreviousReadPosition {
             message_sequence: 42,
             byte_offset: 17,
+            message_id: Some("message".to_string()),
+            rendered_sha256: Some("digest".to_string()),
         };
-        let cursor = encode_previous_read_cursor(position).unwrap();
-        assert_eq!(decode_previous_read_cursor(cursor), Ok(position));
-        assert!(decode_previous_read_cursor(usize::MAX).is_err());
-        assert!(encode_previous_read_cursor(PreviousReadPosition {
-            message_sequence: i64::MAX,
-            byte_offset: usize::MAX,
-        })
-        .is_err());
+        let cursor = encode_conversation_read_cursor(&scope, "predecessor", &position).unwrap();
+        assert_eq!(
+            decode_conversation_read_cursor(Some(&cursor), &scope, "predecessor"),
+            Ok(position)
+        );
+        assert!(decode_conversation_read_cursor(Some(&cursor), &scope, "other").is_err());
+        assert!(
+            decode_conversation_read_cursor(Some("123"), &scope, "predecessor")
+                .unwrap_err()
+                .contains("restart this read without a cursor")
+        );
+        let other_scope = ConversationReadCursorScope::StrictPredecessors {
+            product_conversation_id: "other-product".to_string(),
+            executing_transcript_id: "current".to_string(),
+        };
+        assert!(
+            decode_conversation_read_cursor(Some(&cursor), &other_scope, "predecessor")
+                .unwrap_err()
+                .contains("host scope and target")
+        );
     }
 
     #[test]
@@ -2243,6 +2343,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_read_rejects_cross_target_stale_and_numeric_cursor_replay() {
+        let (service, binding) = predecessor_service().await;
+        service
+            .db
+            .add_message_with_seq(
+                "global-large",
+                "pred-a",
+                2,
+                &crate::db::MessageContent::user("x".repeat(PREVIOUS_READ_CONTENT_JSON_BYTES * 2)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = service.read_conversation("pred-a", None).await.unwrap();
+        let cursor = first
+            .split("cursor=")
+            .nth(1)
+            .and_then(|value| value.strip_suffix("]"))
+            .expect("opaque continuation cursor");
+
+        let other = service
+            .predecessor_conversations(&binding)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|conversation| conversation.id != "pred-a")
+            .unwrap();
+        assert!(service
+            .read_conversation(&other.id, Some(cursor))
+            .await
+            .unwrap_err()
+            .contains("host scope and target"));
+        assert!(service
+            .read_conversation("pred-a", Some("7000"))
+            .await
+            .unwrap_err()
+            .contains("restart this read without a cursor"));
+
+        let changed = crate::db::MessageContent::user("changed source");
+        sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'global-large'")
+            .bind(changed.to_stored_json().to_string())
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        assert!(service
+            .read_conversation("pred-a", Some(cursor))
+            .await
+            .unwrap_err()
+            .contains("stale"));
+    }
+
+    #[tokio::test]
     async fn previous_transcripts_orientation_excludes_persisted_titles() {
         let (service, binding) = predecessor_service().await;
         sqlx::query("UPDATE conversations SET title = ?1 WHERE id <> ?2")
@@ -2290,7 +2443,7 @@ mod tests {
         assert!(transcripts[1].immediate_predecessor);
 
         let output = service
-            .read_predecessor_conversation(&binding, "@conv:pred-a", 0)
+            .read_predecessor_conversation(&binding, "@conv:pred-a", None)
             .await;
         let PreviousTranscriptsOutput::ReadPage {
             starts_at, content, ..
@@ -2305,20 +2458,15 @@ mod tests {
         assert!(content.contains("\n\t  alpha only predecessor evidence  \n\n"));
 
         let fragmented = service
-            .read_predecessor_conversation(&binding, "@conv:pred-a#message-a-msg", 0)
+            .read_predecessor_conversation(&binding, "@conv:pred-a#message-a-msg", None)
             .await;
         assert!(matches!(
             fragmented,
             PreviousTranscriptsOutput::InvalidTarget { .. }
         ));
 
-        let invalid_cursor = encode_previous_read_cursor(PreviousReadPosition {
-            message_sequence: 1,
-            byte_offset: 999_999,
-        })
-        .unwrap();
         let invalid_cursor_output = service
-            .read_predecessor_conversation(&binding, "@conv:pred-a", invalid_cursor)
+            .read_predecessor_conversation(&binding, "@conv:pred-a", Some("123"))
             .await;
         assert!(matches!(
             invalid_cursor_output,
@@ -2329,7 +2477,7 @@ mod tests {
             .read_predecessor_conversation(
                 &binding,
                 &format!("@conv:{}", binding.executing_transcript_id),
-                0,
+                None,
             )
             .await;
         assert!(matches!(
@@ -2354,7 +2502,7 @@ mod tests {
             .await
             .unwrap();
         let output = service
-            .read_predecessor_conversation(&binding, "@conv:pred-a", 0)
+            .read_predecessor_conversation(&binding, "@conv:pred-a", None)
             .await;
         let PreviousTranscriptsOutput::ReadPage {
             content,
@@ -2372,7 +2520,7 @@ mod tests {
         let mut saw_intra_message_start = false;
         while let Some(cursor) = next_cursor {
             let page = service
-                .read_predecessor_conversation(&binding, "@conv:pred-a", cursor)
+                .read_predecessor_conversation(&binding, "@conv:pred-a", Some(&cursor))
                 .await;
             let PreviousTranscriptsOutput::ReadPage {
                 starts_at,
@@ -2403,6 +2551,59 @@ mod tests {
             .collect::<String>();
         assert!(saw_intra_message_start);
         assert_eq!(reconstructed, expected);
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_rejects_cross_target_and_stale_cursor_replay() {
+        let (service, binding) = predecessor_service().await;
+        service
+            .db
+            .add_message_with_seq(
+                "replay-target",
+                "pred-a",
+                2,
+                &crate::db::MessageContent::user("x".repeat(PREVIOUS_READ_CONTENT_JSON_BYTES * 2)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = service
+            .read_predecessor_conversation(&binding, "@conv:pred-a", None)
+            .await;
+        let PreviousTranscriptsOutput::ReadPage {
+            next_cursor: Some(cursor),
+            ..
+        } = first
+        else {
+            panic!("expected continuation cursor, got {first:?}");
+        };
+        let predecessors = service.predecessor_conversations(&binding).await.unwrap();
+        let other = predecessors
+            .iter()
+            .find(|conversation| conversation.id != "pred-a")
+            .unwrap();
+        let cross_target = service
+            .read_predecessor_conversation(&binding, &format!("@conv:{}", other.id), Some(&cursor))
+            .await;
+        assert!(matches!(
+            cross_target,
+            PreviousTranscriptsOutput::InvalidCursor { .. }
+        ));
+
+        let changed = crate::db::MessageContent::user("changed source");
+        sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'replay-target'")
+            .bind(changed.to_stored_json().to_string())
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        let stale = service
+            .read_predecessor_conversation(&binding, "@conv:pred-a", Some(&cursor))
+            .await;
+        assert!(matches!(
+            stale,
+            PreviousTranscriptsOutput::InvalidCursor { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2441,13 +2642,32 @@ mod tests {
         .await
         .unwrap();
 
-        let cursor = encode_previous_read_cursor(PreviousReadPosition {
-            message_sequence: 2,
-            byte_offset: 1,
-        })
+        let conv = service.db.get_conversation("pred-a").await.unwrap();
+        let message = service
+            .db
+            .get_message_range("pred-a", 2, 2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let rendered = render_previous_message_line(&conv, &message);
+        let scope = ConversationReadCursorScope::StrictPredecessors {
+            product_conversation_id: binding.product_conversation_id.clone(),
+            executing_transcript_id: binding.executing_transcript_id.clone(),
+        };
+        let cursor = encode_conversation_read_cursor(
+            &scope,
+            "pred-a",
+            &PreviousReadPosition {
+                message_sequence: 2,
+                byte_offset: 1,
+                message_id: Some("large-target".to_string()),
+                rendered_sha256: Some(super::rendered_sha256(&rendered)),
+            },
+        )
         .unwrap();
         let continuation = service
-            .read_predecessor_conversation(&binding, "@conv:pred-a", cursor)
+            .read_predecessor_conversation(&binding, "@conv:pred-a", Some(&cursor))
             .await;
 
         assert!(matches!(
@@ -2463,6 +2683,7 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     #[ignore = "manual bounded paging measurement"]
     async fn measure_predecessor_read_paging() {
@@ -2509,21 +2730,40 @@ mod tests {
                 .await
                 .unwrap();
             }
-            let initial_cursor = encode_previous_read_cursor(PreviousReadPosition {
-                message_sequence: 2,
-                byte_offset: 0,
-            })
+            let conv = service.db.get_conversation("pred-a").await.unwrap();
+            let message = service
+                .db
+                .get_message_range("pred-a", 2, 2)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let rendered = render_previous_message_line(&conv, &message);
+            let scope = ConversationReadCursorScope::StrictPredecessors {
+                product_conversation_id: binding.product_conversation_id.clone(),
+                executing_transcript_id: binding.executing_transcript_id.clone(),
+            };
+            let initial_cursor = encode_conversation_read_cursor(
+                &scope,
+                "pred-a",
+                &PreviousReadPosition {
+                    message_sequence: 2,
+                    byte_offset: 0,
+                    message_id: Some("measured-target".to_string()),
+                    rendered_sha256: Some(super::rendered_sha256(&rendered)),
+                },
+            )
             .unwrap();
             for run in 0..5 {
                 read_measurement::reset();
                 let started = std::time::Instant::now();
-                let mut cursor = initial_cursor;
+                let mut cursor = initial_cursor.clone();
                 let mut pages = 0_u64;
                 let mut output_bytes = 0_u64;
                 let mut reconstructed = String::new();
                 loop {
                     let output = service
-                        .read_predecessor_conversation(&binding, "@conv:pred-a", cursor)
+                        .read_predecessor_conversation(&binding, "@conv:pred-a", Some(&cursor))
                         .await;
                     let PreviousTranscriptsOutput::ReadPage {
                         content,
@@ -2633,7 +2873,7 @@ mod tests {
         ));
 
         let output = service
-            .read_predecessor_conversation(&binding, "@conv:foreign", 0)
+            .read_predecessor_conversation(&binding, "@conv:foreign", None)
             .await;
         assert!(matches!(
             output,

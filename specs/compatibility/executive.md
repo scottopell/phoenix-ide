@@ -10,6 +10,8 @@ Database restore or replacement is an offline operator procedure. Phoenix does n
 
 Internal SQLite timestamps use mixed representations. New or changed internal timestamp columns must converge on explicitly unit-named integer Unix microseconds unless a more specific normative requirement identifies an external reader and requires another representation.
 
+Internal model-tool cursor contracts may make an intentional type break when the former representation cannot preserve authority or freshness. Such breaks fail explicitly rather than silently translating old arguments.
+
 ## Requirement coverage
 
 | Requirement | Current coverage / gap |
@@ -19,6 +21,7 @@ Internal SQLite timestamps use mixed representations. New or changed internal ti
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |
 | REQ-COMP-004 | Single managed-runtime ownership and offline replacement are defined; no live replacement or mixed-version sharing protocol is supported. Operator guidance and stale fencing machinery require follow-up audit. |
 | REQ-COMP-005 | Policy applies to newly introduced or structurally changed internal timestamp columns. Unchanged historical timestamp columns are outside this initial convergence rule. |
+| REQ-COMP-006 | `read_conversation` uses a versioned opaque string cursor across global, Chain Q&A, and predecessor surfaces. Numeric historical calls fail with restart guidance; no translator or persisted cursor compatibility layer is provided. Focused cross-target/stale/numeric regressions and the full repository gate cover the contract. |
 
 ## Next work
 
