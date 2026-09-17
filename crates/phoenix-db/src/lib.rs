@@ -38,6 +38,8 @@ use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
     WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
+#[cfg(test)]
+use std::future::Future;
 
 pub use close_foundation::*;
 pub use coordinator_query::{
@@ -518,18 +520,20 @@ pub struct ConversationCreationMetadataUpdate {
     pub desired_base_branch: Option<Option<String>>,
 }
 
+use phoenix_workflow::ClientTurnKey;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuationDispatchIntent {
     pub parent_conversation_id: String,
     pub successor_conversation_id: String,
-    pub message_id: String,
+    pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewContinuationDispatchIntent {
-    pub message_id: String,
+    pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
 }
@@ -1242,6 +1246,15 @@ pub(crate) struct CloseFoundationTestLatch {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+enum ContinuationTestHook {
+    PreReservationBarrier(std::sync::Arc<tokio::sync::Barrier>),
+    ContendedBeginImmediate {
+        attempted: std::sync::Arc<tokio::sync::Notify>,
+    },
+}
+
+#[cfg(test)]
 impl CloseFoundationTestLatch {
     pub(crate) fn new() -> Self {
         Self {
@@ -1342,6 +1355,8 @@ pub struct Database {
     #[cfg(test)]
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
+    continuation_test_hook: Option<std::sync::Arc<ContinuationTestHook>>,
+    #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
@@ -1362,6 +1377,8 @@ impl Clone for Database {
             sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
             #[cfg(test)]
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
+            #[cfg(test)]
+            continuation_test_hook: self.continuation_test_hook.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
@@ -1597,6 +1614,8 @@ impl Database {
             sub_agent_creation_test_latch: None,
             #[cfg(test)]
             close_foundation_test_latch: None,
+            #[cfg(test)]
+            continuation_test_hook: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
             #[cfg(test)]
@@ -4315,13 +4334,17 @@ impl Database {
         .bind(parent_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|row| ContinuationDispatchIntent {
-            parent_conversation_id: row.get("parent_conversation_id"),
-            successor_conversation_id: row.get("successor_conversation_id"),
-            message_id: row.get("message_id"),
-            handoff: row.get("handoff"),
-            user_agent: row.get("user_agent"),
-        }))
+        row.map(|row| {
+            Ok(ContinuationDispatchIntent {
+                parent_conversation_id: row.get("parent_conversation_id"),
+                successor_conversation_id: row.get("successor_conversation_id"),
+                message_id: ClientTurnKey::try_from(row.get::<String, _>("message_id"))
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                handoff: row.get("handoff"),
+                user_agent: row.get("user_agent"),
+            })
+        })
+        .transpose()
     }
 
     /// Deletes a continuation intent after its message is durably represented elsewhere.
@@ -7705,6 +7728,13 @@ impl Database {
             ));
         }
 
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
+            self.continuation_test_hook.as_deref()
+        {
+            barrier.wait().await;
+        }
+
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -7731,22 +7761,59 @@ impl Database {
 
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
+        #[cfg(test)]
+        let mut begin_immediate = begin_immediate;
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
+            self.continuation_test_hook.as_deref()
+        {
+            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    attempted.notify_waiters();
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
+                }
+            })
+            .await;
+        }
+        let mut tx = begin_immediate.await?;
 
+        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
+        let reservation = sqlx::query(
             "INSERT INTO product_continuation_reservations (
                  predecessor_conversation_id, successor_conversation_id,
                  product_conversation_id
-             ) VALUES (?1, ?2, ?3)",
+             ) SELECT ?1, ?2, ?3
+             WHERE EXISTS (
+                 SELECT 1 FROM conversations
+                 WHERE id = ?1 AND continued_in_conv_id IS NULL
+             )",
         )
         .bind(parent_id)
         .bind(&new_id)
         .bind(parent.product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
+        if reservation.rows_affected() == 0 {
+            drop(tx);
+            drop(conn);
+            let refetched = self.get_conversation(parent_id).await?;
+            if let Some(existing_id) = refetched.continued_in_conv_id {
+                return Ok(ContinueOutcome::AlreadyContinued(
+                    self.get_conversation(&existing_id).await?,
+                ));
+            }
+            return Err(DbError::ContinuationPrecondition(
+                "continuation reservation was not admitted".to_string(),
+            ));
+        }
         let reserved = if parent.runtime_role == RuntimeRole::Coordinator {
             sqlx::query(
                 "UPDATE conversations
@@ -7771,6 +7838,7 @@ impl Database {
         };
         if reserved.rows_affected() == 0 {
             drop(tx);
+            drop(conn);
             let refetched = self.get_conversation(parent_id).await?;
             if let Some(existing_id) = refetched.continued_in_conv_id {
                 return Ok(ContinueOutcome::AlreadyContinued(
@@ -7879,7 +7947,7 @@ impl Database {
             )
             .bind(parent_id)
             .bind(&new_id)
-            .bind(&intent.message_id)
+            .bind(intent.message_id.as_str())
             .bind(&intent.handoff)
             .bind(intent.user_agent.as_deref())
             .bind(&now_str)
@@ -22475,7 +22543,7 @@ mod tests {
         .await;
 
         let requested = NewContinuationDispatchIntent {
-            message_id: "opening-message".to_string(),
+            message_id: ClientTurnKey::try_from("opening-message").unwrap(),
             handoff: "Exact edited handoff".to_string(),
             user_agent: Some("test-agent".to_string()),
         };
@@ -22492,7 +22560,7 @@ mod tests {
         };
         let intent = intent.expect("created successor must have an intent");
         assert_eq!(intent.successor_conversation_id, successor_id);
-        assert_eq!(intent.message_id, "opening-message");
+        assert_eq!(intent.message_id.as_str(), "opening-message");
         assert_eq!(intent.handoff, "Exact edited handoff");
 
         let content = MessageContent::User(UserContent::new("Exact edited handoff"));
@@ -22520,7 +22588,7 @@ mod tests {
         db.continue_conversation_with_intent(
             "parent-retry-intent",
             NewContinuationDispatchIntent {
-                message_id: "original-message".to_string(),
+                message_id: ClientTurnKey::try_from("original-message").unwrap(),
                 handoff: "Original handoff".to_string(),
                 user_agent: None,
             },
@@ -22532,7 +22600,7 @@ mod tests {
             .continue_conversation_with_intent(
                 "parent-retry-intent",
                 NewContinuationDispatchIntent {
-                    message_id: "different-message".to_string(),
+                    message_id: ClientTurnKey::try_from("different-message").unwrap(),
                     handoff: "Must not replace original".to_string(),
                     user_agent: None,
                 },
@@ -22541,7 +22609,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, ContinueOutcome::AlreadyContinued(_)));
         let intent = intent.unwrap();
-        assert_eq!(intent.message_id, "original-message");
+        assert_eq!(intent.message_id.as_str(), "original-message");
         assert_eq!(intent.handoff, "Original handoff");
     }
 
@@ -22733,8 +22801,12 @@ mod tests {
     /// the first (idempotent return) and does NOT create a second new conv.
     /// The parent's `continued_in_conv_id` is unchanged by the second call.
     #[tokio::test]
-    async fn test_continue_conversation_idempotent_double_continue() {
-        let db = Database::open_in_memory().await.unwrap();
+    async fn max_one_pool_idempotent_continuation_releases_fallback_connection() {
+        let mut db = Database::open_in_memory().await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::PreReservationBarrier(barrier.clone()),
+        ));
         setup_exhausted_parent(
             &db,
             "parent-double",
@@ -22744,30 +22816,53 @@ mod tests {
         )
         .await;
 
-        let first = match db.continue_conversation("parent-double").await.unwrap() {
-            ContinueOutcome::Created(c) => c,
-            other @ (ContinueOutcome::AlreadyContinued(_)
-            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
-                panic!("first call should create, got {other:?}")
-            }
-        };
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let first =
+            tokio::spawn(async move { first_db.continue_conversation("parent-double").await });
+        let second =
+            tokio::spawn(async move { second_db.continue_conversation("parent-double").await });
+        barrier.wait().await;
 
-        let second = match db.continue_conversation("parent-double").await.unwrap() {
-            ContinueOutcome::AlreadyContinued(c) => c,
-            other @ (ContinueOutcome::Created(_)
-            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
-                panic!("second call should return AlreadyContinued, got {other:?}")
-            }
-        };
-
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("first max-one continuation must not hang")
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second max-one continuation must not hang")
+            .unwrap()
+            .unwrap();
+        let outcomes = [first, second];
         assert_eq!(
-            first.id, second.id,
-            "idempotent return must yield the same continuation id"
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ContinueOutcome::Created(_)))
+                .count(),
+            1,
+            "one contender must reserve the continuation"
         );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ContinueOutcome::AlreadyContinued(_)))
+                .count(),
+            1,
+            "the contender that loses reservation must take the fallback"
+        );
+        let ids = outcomes.map(|outcome| match outcome {
+            ContinueOutcome::Created(conversation)
+            | ContinueOutcome::AlreadyContinued(conversation) => conversation.id,
+            ContinueOutcome::ParentNotContextExhausted { .. } => {
+                panic!("expected continuation outcome")
+            }
+        });
+        assert_eq!(ids[0], ids[1], "both contenders share the winner");
 
         // Parent pointer unchanged.
         let refreshed_parent = db.get_conversation("parent-double").await.unwrap();
-        assert_eq!(refreshed_parent.continued_in_conv_id, Some(first.id));
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(ids[0].clone()));
 
         // No phantom third conversation exists.
         let all = db.list_conversations().await.unwrap();
@@ -22777,6 +22872,119 @@ mod tests {
             "only parent + single continuation should be listed; got: {:?}",
             all.iter().map(|c| &c.id).collect::<Vec<_>>(),
         );
+    }
+
+    #[tokio::test]
+    async fn close_and_continuation_serialize_to_typed_admission_fence() {
+        let (_dir, mut close_db, mut continuation_db) = open_test_db_pair().await;
+        let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
+        let continuation_immediate_attempted = std::sync::Arc::new(tokio::sync::Notify::new());
+        close_db.close_foundation_test_latch = Some(close_latch.clone());
+        continuation_db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::ContendedBeginImmediate {
+                attempted: continuation_immediate_attempted.clone(),
+            },
+        ));
+        let parent = setup_exhausted_parent(
+            &close_db,
+            "parent-close-race",
+            "parent-close-race",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let product_conversation_id = parent.product_conversation_id.clone();
+        let parent_id = parent.id.clone();
+
+        let close_entered = close_latch.transaction_entered.notified();
+        let close = tokio::spawn(async move {
+            close_db
+                .begin_close_foundation(
+                    &product_conversation_id,
+                    &TranscriptConversationId::parse(parent_id).unwrap(),
+                    "close-vs-continuation",
+                )
+                .await
+        });
+        close_entered.await;
+
+        let continuation_immediate_attempted = continuation_immediate_attempted.notified();
+        let continuation_parent_id = parent.id.clone();
+        let continuation = tokio::spawn(async move {
+            continuation_db
+                .continue_conversation(&continuation_parent_id)
+                .await
+        });
+        continuation_immediate_attempted.await;
+        close_latch.release_transaction.notify_waiters();
+        close.await.unwrap().unwrap();
+
+        assert!(matches!(
+            continuation.await.unwrap(),
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_refuses_parent_with_active_close_obligation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-close-fenced",
+            "parent-close-fenced",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        db.begin_close_foundation(
+            &parent.product_conversation_id,
+            &TranscriptConversationId::parse(parent.id.clone()).unwrap(),
+            "continue-close-fence",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.continue_conversation(&parent.id).await,
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
+        assert!(db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_refuses_history_product_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-history",
+            "parent-history",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(parent.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.continue_conversation(&parent.id).await,
+            Err(DbError::ProductConversationUnavailable(id)) if id == parent.product_conversation_id
+        ));
+        assert!(db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
     }
 
     /// Parent not in `ContextExhausted` state: transaction does not run;

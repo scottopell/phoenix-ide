@@ -745,6 +745,11 @@ WHEN the opening handoff is persisted as the successor's message or steering ent
 THE SYSTEM SHALL atomically consume the pending dispatch intent
 AND SHALL NOT retain the handoff payload in a second accepted representation
 
+WHEN forward migration encounters a pending opening-handoff intent with an empty client message identifier produced by a supported Phoenix version
+THE SYSTEM SHALL retire that undispatchable intent without fabricating an identifier
+AND SHALL preserve the already-created successor and its predecessor-to-successor link
+AND subsequent continuation requests SHALL return that existing successor identity
+
 WHEN a request loses a continuation-creation race to an earlier handoff
 THE SYSTEM SHALL report that the existing successor won
 AND SHALL NOT claim that the losing request's handoff was accepted

@@ -64,6 +64,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
+| [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 
 ## For agents: which decisions bind your task
 
@@ -97,6 +98,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
+| Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
@@ -121,7 +123,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
-      │   └── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   └── ADR-053 (Invalid continuation intents retire without fabricated identity)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)

@@ -1055,6 +1055,7 @@ mod tests {
         ContinuationContent, ContinueOutcome, ConvState, MessageContent,
         NewContinuationDispatchIntent,
     };
+    use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
 
     async fn performance_fixture(
@@ -1222,7 +1223,7 @@ mod tests {
             .continue_conversation_with_intent(
                 &root.id,
                 NewContinuationDispatchIntent {
-                    message_id: "opening".to_string(),
+                    message_id: ClientTurnKey::try_from("opening").unwrap(),
                     handoff: "accepted opening handoff".to_string(),
                     user_agent: None,
                 },

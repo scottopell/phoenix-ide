@@ -505,7 +505,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_sub_agent_execution_connection",
         sql: MIGRATION_097,
     },
+    Migration {
+        version: 98,
+        name: "retire_invalid_continuation_dispatch_intents",
+        sql: MIGRATION_098,
+    },
 ];
+
+const MIGRATION_098: &str = r"
+DELETE FROM continuation_dispatch_intents
+WHERE message_id = '';
+
+CREATE TRIGGER continuation_dispatch_intents_require_message_id_insert
+BEFORE INSERT ON continuation_dispatch_intents
+FOR EACH ROW WHEN NEW.message_id = ''
+BEGIN
+    SELECT RAISE(ABORT, 'continuation dispatch message id must be non-empty');
+END;
+
+CREATE TRIGGER continuation_dispatch_intents_require_message_id_update
+BEFORE UPDATE OF message_id ON continuation_dispatch_intents
+FOR EACH ROW WHEN NEW.message_id = ''
+BEGIN
+    SELECT RAISE(ABORT, 'continuation dispatch message id must be non-empty');
+END;
+";
 
 const MIGRATION_097: &str = r"
 CREATE TABLE sub_agent_execution_routes (
@@ -10125,6 +10149,97 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn migration_098_retires_shipped_empty_continuation_intent_without_losing_successor() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 continued_in_conv_id TEXT REFERENCES conversations(id)
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL,
+                 sequence_id INTEGER NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_045).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_074).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id) VALUES
+                 ('parent'), ('successor'), ('valid-parent'), ('valid-successor')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET continued_in_conv_id = 'successor' WHERE id = 'parent'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES ('parent', 'successor', '', 'historical handoff', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES (
+                 'valid-parent', 'valid-successor', 'valid-message',
+                 'valid handoff', '2026-01-01'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        stamp_migrations_except(&pool, 98).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+
+        let successor: Option<String> = sqlx::query_scalar(
+            "SELECT continued_in_conv_id FROM conversations WHERE id = 'parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(successor.as_deref(), Some("successor"));
+        let intent_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM continuation_dispatch_intents")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(intent_count, 1);
+        let valid_message_id: String = sqlx::query_scalar(
+            "SELECT message_id FROM continuation_dispatch_intents
+             WHERE parent_conversation_id = 'valid-parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_message_id, "valid-message");
+        let empty_insert = sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES ('parent', 'successor', '', 'retry', '2026-01-02')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(empty_insert.is_err());
+    }
 
     #[test]
     fn compiled_migration_digest_binds_version_name_and_sql_body() {
