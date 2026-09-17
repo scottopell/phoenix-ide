@@ -38,6 +38,8 @@ use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
     WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
+#[cfg(test)]
+use std::future::Future;
 
 pub use close_foundation::*;
 pub use coordinator_query::{
@@ -1247,6 +1249,7 @@ pub(crate) struct CloseFoundationTestLatch {
 #[derive(Debug)]
 struct ContinuationImmediateTestLatch {
     immediate_attempted: tokio::sync::Notify,
+    pre_reservation_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 #[cfg(test)]
@@ -1254,6 +1257,7 @@ impl ContinuationImmediateTestLatch {
     fn new() -> Self {
         Self {
             immediate_attempted: tokio::sync::Notify::new(),
+            pre_reservation_barrier: None,
         }
     }
 }
@@ -7732,6 +7736,13 @@ impl Database {
             ));
         }
 
+        #[cfg(test)]
+        if let Some(latch) = &self.continuation_immediate_test_latch {
+            if let Some(barrier) = &latch.pre_reservation_barrier {
+                barrier.wait().await;
+            }
+        }
+
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -7759,27 +7770,56 @@ impl Database {
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
         let mut conn = self.pool.acquire().await?;
+        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
+        #[cfg(test)]
+        let mut begin_immediate = begin_immediate;
         #[cfg(test)]
         if let Some(latch) = &self.continuation_immediate_test_latch {
-            latch.immediate_attempted.notify_waiters();
+            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    latch.immediate_attempted.notify_waiters();
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
+                }
+            })
+            .await;
         }
-        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = begin_immediate.await?;
 
         require_product_conversation_admission_tx(&mut tx, parent_id).await?;
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
+        let reservation = sqlx::query(
             "INSERT INTO product_continuation_reservations (
                  predecessor_conversation_id, successor_conversation_id,
                  product_conversation_id
-             ) VALUES (?1, ?2, ?3)",
+             ) SELECT ?1, ?2, ?3
+             WHERE EXISTS (
+                 SELECT 1 FROM conversations
+                 WHERE id = ?1 AND continued_in_conv_id IS NULL
+             )",
         )
         .bind(parent_id)
         .bind(&new_id)
         .bind(parent.product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
+        if reservation.rows_affected() == 0 {
+            drop(tx);
+            drop(conn);
+            let refetched = self.get_conversation(parent_id).await?;
+            if let Some(existing_id) = refetched.continued_in_conv_id {
+                return Ok(ContinueOutcome::AlreadyContinued(
+                    self.get_conversation(&existing_id).await?,
+                ));
+            }
+            return Err(DbError::ContinuationPrecondition(
+                "continuation reservation was not admitted".to_string(),
+            ));
+        }
         let reserved = if parent.runtime_role == RuntimeRole::Coordinator {
             sqlx::query(
                 "UPDATE conversations
@@ -22768,7 +22808,11 @@ mod tests {
     /// The parent's `continued_in_conv_id` is unchanged by the second call.
     #[tokio::test]
     async fn max_one_pool_idempotent_continuation_releases_fallback_connection() {
-        let db = Database::open_in_memory().await.unwrap();
+        let mut db = Database::open_in_memory().await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let mut latch = ContinuationImmediateTestLatch::new();
+        latch.pre_reservation_barrier = Some(barrier.clone());
+        db.continuation_immediate_test_latch = Some(std::sync::Arc::new(latch));
         setup_exhausted_parent(
             &db,
             "parent-double",
@@ -22778,37 +22822,53 @@ mod tests {
         )
         .await;
 
-        let first = match db.continue_conversation("parent-double").await.unwrap() {
-            ContinueOutcome::Created(c) => c,
-            other @ (ContinueOutcome::AlreadyContinued(_)
-            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
-                panic!("first call should create, got {other:?}")
-            }
-        };
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let first =
+            tokio::spawn(async move { first_db.continue_conversation("parent-double").await });
+        let second =
+            tokio::spawn(async move { second_db.continue_conversation("parent-double").await });
+        barrier.wait().await;
 
-        let second = match tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            db.continue_conversation("parent-double"),
-        )
-        .await
-        .expect("max-one pool fallback must not hang")
-        .unwrap()
-        {
-            ContinueOutcome::AlreadyContinued(c) => c,
-            other @ (ContinueOutcome::Created(_)
-            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
-                panic!("second call should return AlreadyContinued, got {other:?}")
-            }
-        };
-
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("first max-one continuation must not hang")
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second max-one continuation must not hang")
+            .unwrap()
+            .unwrap();
+        let outcomes = [first, second];
         assert_eq!(
-            first.id, second.id,
-            "idempotent return must yield the same continuation id"
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ContinueOutcome::Created(_)))
+                .count(),
+            1,
+            "one contender must reserve the continuation"
         );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ContinueOutcome::AlreadyContinued(_)))
+                .count(),
+            1,
+            "the contender that loses reservation must take the fallback"
+        );
+        let ids = outcomes.map(|outcome| match outcome {
+            ContinueOutcome::Created(conversation)
+            | ContinueOutcome::AlreadyContinued(conversation) => conversation.id,
+            ContinueOutcome::ParentNotContextExhausted { .. } => {
+                panic!("expected continuation outcome")
+            }
+        });
+        assert_eq!(ids[0], ids[1], "both contenders share the winner");
 
         // Parent pointer unchanged.
         let refreshed_parent = db.get_conversation("parent-double").await.unwrap();
-        assert_eq!(refreshed_parent.continued_in_conv_id, Some(first.id));
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(ids[0].clone()));
 
         // No phantom third conversation exists.
         let all = db.list_conversations().await.unwrap();
