@@ -583,8 +583,8 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
-        ToolOutput::TrustedInstructions { output, .. } => ToolOutcome::TrustedInstructions {
-            output: cap_tool_output_text(output),
+        ToolOutput::TrustedInstructions(instructions) => ToolOutcome::TrustedInstructions {
+            output: cap_tool_output_text(instructions.output()),
         },
         ToolOutput::Error {
             output,
@@ -600,16 +600,43 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
 }
 
 fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    match &result.outcome {
-        ToolOutcome::TrustedInstructions { output } => {
-            MessageContent::trusted_builtin_instructions(&result.tool_use_id, output)
+    MessageContent::tool_with_images(
+        &result.tool_use_id,
+        result.output(),
+        result.is_error(),
+        result.images().to_vec(),
+    )
+}
+
+fn trusted_tool_results(results: &[ToolResult]) -> Vec<(String, String)> {
+    results
+        .iter()
+        .filter_map(|result| match &result.outcome {
+            ToolOutcome::TrustedInstructions { output } => {
+                Some((result.tool_use_id.clone(), output.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[(String, String)]) {
+    for message in messages {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = block
+            {
+                if let Some((_, trusted)) = trusted_results
+                    .iter()
+                    .find(|(trusted_id, _)| trusted_id == tool_use_id)
+                {
+                    *content = format!("<trusted_builtin_skill>{trusted}</trusted_builtin_skill>");
+                }
+            }
         }
-        _ => MessageContent::tool_with_images(
-            &result.tool_use_id,
-            result.output(),
-            result.is_error(),
-            result.images().to_vec(),
-        ),
     }
 }
 
@@ -1337,7 +1364,6 @@ fn render_messages<'a>(
                 tool_use_id,
                 content,
                 is_error,
-                origin,
                 images,
             }) => {
                 // Cleared results render as a placeholder with no images; kept
@@ -1354,13 +1380,7 @@ fn render_messages<'a>(
                                 data: img.data.clone(),
                             })
                             .collect();
-                        let text = match origin {
-                            crate::db::ToolContentOrigin::Ordinary => content.clone(),
-                            crate::db::ToolContentOrigin::TrustedBuiltinInstructions => {
-                                format!("<trusted_builtin_skill>{content}</trusted_builtin_skill>")
-                            }
-                        };
-                        (text, sources)
+                        (content.clone(), sources)
                     };
 
                 // Tool results go in user message
@@ -1653,6 +1673,7 @@ where
     /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
+    pending_trusted_tool_results: Vec<(String, String)>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -1945,6 +1966,7 @@ where
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
+            pending_trusted_tool_results: Vec::new(),
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -6159,6 +6181,7 @@ where
             }
 
             AuthoritativeEffect::PersistToolResults { results } => {
+                self.pending_trusted_tool_results = trusted_tool_results(&results);
                 for result in results {
                     let content = tool_result_message_content(&result);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
@@ -6821,7 +6844,7 @@ where
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
         self.refresh_active_prompt_projection().await?;
-        let frozen_messages = assemble_cleared_messages(
+        let mut frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
             &self
@@ -6835,6 +6858,9 @@ where
             &self.clear_watermark_cache,
         )
         .await;
+
+        let trusted_results = std::mem::take(&mut self.pending_trusted_tool_results);
+        overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
@@ -6948,7 +6974,10 @@ where
                 phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
             };
         let mut system_prompt = if is_coordinator {
-            crate::system_prompt::build_coordinator_system_prompt(llm_language)
+            crate::system_prompt::build_coordinator_system_prompt(
+                llm_language,
+                tool_executor.coordinator_skill_catalog().as_ref(),
+            )
         } else {
             build_system_prompt(
                 working_dir
@@ -7533,6 +7562,7 @@ where
             assistant_message,
             tool_results,
         } = data;
+        self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -7616,6 +7646,7 @@ where
                 assistant_message,
                 tool_results,
             } => {
+                self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
                 let conv_id = self.context.conversation_id.clone();
 
                 // Build the assistant message row.
@@ -19051,8 +19082,8 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
-    async fn persist_checkpoint_preserves_trusted_instruction_origin() {
-        use crate::db::{MessageContent, ToolContentOrigin, ToolOutcome, ToolResult};
+    async fn persist_checkpoint_downgrades_trusted_instruction_to_ordinary_content() {
+        use crate::db::{MessageContent, ToolOutcome, ToolResult};
         use crate::state_machine::{AssistantMessage, CheckpointData};
         use phoenix_llm::ContentBlock;
 
@@ -19088,11 +19119,11 @@ mod steer_drain_detector_tests {
         assert!(matches!(
             msgs.iter().find_map(|message| match &message.content {
                 MessageContent::Tool(content) if content.tool_use_id == "trusted-skill-1" => {
-                    Some(content.origin)
+                    Some((content.content.as_str(), content.is_error))
                 }
                 _ => None,
             }),
-            Some(ToolContentOrigin::TrustedBuiltinInstructions)
+            Some(("authenticated instructions", false))
         ));
     }
 

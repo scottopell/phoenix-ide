@@ -252,9 +252,9 @@ mod tests {
         let content = embedded_skill("phoenix-api").unwrap();
         assert!(content.contains("audience: global-coordinator"));
         assert!(embedded_skill("missing").is_none());
-        assert!(embedded_asset("phoenix-api/references/api-reference.md")
-            .unwrap()
-            .contains("ContextExhausted"));
+        let reference = embedded_asset("phoenix-api/references/api-reference.md").unwrap();
+        assert!(reference.contains("Supported Phoenix HTTP API reference"));
+        assert!(reference.contains("/api/product-conversations"));
     }
 
     #[test]

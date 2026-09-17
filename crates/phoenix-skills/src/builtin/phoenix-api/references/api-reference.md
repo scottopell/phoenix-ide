@@ -10,7 +10,11 @@ This reference describes the server API, not a privileged bypass. Use the Phoeni
 4. Keep secrets out of command arguments, shell tracing, files, logs, summaries, and tool output. Prefer an already-populated environment variable expanded inside the scoped shell. Do not inspect the Phoenix database or process environment to hunt for a credential, and do not echo or interpolate a secret into diagnostic output.
 5. A `401` or `403` is a stop condition. Do not weaken or route around authorization.
 
-Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv: pass the header through curl's stdin configuration, for example `printf '%s\n' "header = \"Authorization: Bearer $PHOENIX_PASSWORD\"" | curl --config - --fail-with-body --silent --show-error "$PHOENIX_ORIGIN/api/auth/status"`. Parse JSON structurally rather than relying on display text.
+Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv and preserve it byte-for-byte: write `Authorization: Bearer ` followed by the environment variable's raw bytes and a newline to a mode-600 temporary header file (for example with `printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD"`), pass that file with `curl --header @path`, then remove it before the Bash command returns. Do not place the credential in curl config syntax, which interprets backslash escapes. Parse JSON structurally rather than relying on display text.
+
+## WorkScope admission
+
+Coordinator API operations through scoped Bash require an active `work_scope_id` from the current snapshot. Phoenix resolves that WorkScope's server-side cwd; there is no default repository or cwd. When no active WorkScope exists, first-conversation creation is unavailable through this surface.
 
 ## Discover the default model
 
@@ -27,7 +31,7 @@ ProductConversation references accepted by the read APIs may be a product-conver
 
 For chat or cancel, use the snapshot's current `writable_transcript_row_id`. If it is absent, Phoenix has not exposed a writable target for those operations; do not substitute `latest_transcript_row_id`. Re-resolve immediately before acting because continuation can change the writable transcript.
 
-Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, read that transcript, and continue only after `conversation.state.type == "context_exhausted"`. Do not require or target `writable_transcript_row_id` for continuation.
+Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, require `ordinary_lifecycle == "open"`, read that transcript, and continue only after `conversation.state.type == "context_exhausted"`. A History aggregate must receive a separate Open follow-up; do not call `/continue`. Do not require or target `writable_transcript_row_id` for continuation.
 
 ## Create a ProductConversation
 
@@ -49,12 +53,12 @@ The accepted response contains `canonical_route`, `product_conversation_id`, and
 
 Creation recovery surfaces:
 
-- `GET /api/product-conversations/creation` lists creation attempts with `request_id`, optional published aggregate identity, status, last error, and allowed actions.
+- `GET /api/product-conversations/creation` returns `product_creations` and optional `next_cursor`. Follow `?cursor={next_cursor}` until the requested `request_id` is found or no cursor remains.
 - `POST /api/product-conversations/creation/{request_id}/retry-delivery` retries delivery for that creation identity.
 - `POST /api/product-conversations/creation/{request_id}/cancel` requests cancellation.
-- `DELETE /api/product-conversations/creation/{request_id}` deletes a terminal recovery record where allowed.
+- `DELETE /api/product-conversations/creation/{request_id}` requests deletion where `allowed_actions` includes `delete`; it returns acceptance, then the creation worker performs cleanup.
 
-Read `allowed_actions` first. These are creation-recovery operations, not a general conversation retry API.
+Read `allowed_actions` first. After deletion acceptance, re-read the recovery listing until the resulting state is observed. These are creation-recovery operations, not a general conversation retry API.
 
 ## Send or steer a message
 
@@ -92,7 +96,7 @@ Each entry is `persisted`, `steering_queued`, or `absent`; the response also rep
 }
 ```
 
-Before this request, re-resolve the ProductConversation topology and verify that `GET /api/conversations/{latest_transcript_row_id}` reports `ContextExhausted`. Reuse the same `message_id` for an exact uncertain retry. The response contains successor `conversation_id`, optional `slug`, and status `accepted`, `dispatch_failed`, or `already_exists`; `error` is present only when the successor exists but opening-message dispatch was not accepted. Preserve the returned successor identity even on `dispatch_failed`. Verify by re-reading the ProductConversation snapshot, confirming the new writable transcript, and reading the successor conversation. `accepted` and `already_exists` identify durable continuation outcomes; neither alone proves subsequent assistant execution completed.
+Before this request, re-resolve the ProductConversation topology, verify `ordinary_lifecycle == "open"`, and verify that `GET /api/conversations/{latest_transcript_row_id}` reports `conversation.state.type == "context_exhausted"`. Reuse the same `message_id` for an exact uncertain retry. The response contains successor `conversation_id`, optional `slug`, and status `accepted`, `dispatch_failed`, or `already_exists`; `error` is present only when the successor exists but opening-message dispatch was not accepted. Preserve the returned successor identity even on `dispatch_failed`. Verify by re-reading the ProductConversation snapshot, confirming the new writable transcript, and reading the successor conversation. `accepted` and `already_exists` identify durable continuation outcomes; neither alone proves subsequent assistant execution completed.
 
 Do not fold automatic continuation policy into this workflow. Continue only when the user authorized it.
 

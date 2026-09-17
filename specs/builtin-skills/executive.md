@@ -65,10 +65,10 @@ normal precedence, while an invalid or empty definition does not disable it.
 | **REQ-BS-001:** Source distinction | ✅ Complete | `SkillSource` enum tags filesystem vs built-in |
 | **REQ-BS-002:** Filesystem precedence on name collision | ✅ Complete | Built-in scan runs after filesystem walk; name dedup wins |
 | **REQ-BS-003:** Catalog rendering | ✅ Complete | `(built-in)` annotation in system prompt; `"Built-in"` group in UI |
-| **REQ-BS-004:** Invocation parity | ✅ Complete | Ordinary filesystem and built-in skills invoke from their readable source path; authenticated Coordinator built-ins invoke immutable embedded bytes after extracted-byte authentication |
+| **REQ-BS-004:** Invocation parity | ✅ Complete | Filesystem skills invoke from their readable source path; all built-ins expand immutable embedded definitions, while authenticated Coordinator invocation additionally verifies the extracted definition and includes embedded companion references |
 | **REQ-BS-005:** spEARS workflow skill | ✅ Complete | `spears/SKILL.md` + workflow references extracted at startup |
 | **REQ-BS-006:** Allium with companion files | ✅ Complete | `allium/SKILL.md` + `allium/references/language-reference.md` extracted at startup |
-| **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator |
+| **REQ-SK-008:** Runtime audience binding | ✅ Complete | `phoenix-api` is cataloged and invocable only by the Global Coordinator; authenticated delivery is limited to the current live request and persisted tool history is ordinary data |
 
 ## Cross-Spec References
 

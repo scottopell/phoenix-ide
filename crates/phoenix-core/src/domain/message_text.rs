@@ -126,7 +126,7 @@ mod tests {
     use super::*;
     use crate::domain::db_schema::{
         ContinuationContent, ErrorContent, Message, MessageContent, MessageType, SkillContent,
-        SystemContent, ToolContent, ToolContentOrigin, UserContent,
+        SystemContent, ToolContent, UserContent,
     };
     use crate::domain::llm_types::ContentBlock;
     use chrono::Utc;
@@ -226,7 +226,6 @@ mod tests {
             tool_use_id: "t".into(),
             content: "error: missing semicolon at foo.rs:42".into(),
             is_error: true,
-            origin: ToolContentOrigin::Ordinary,
             images: vec![],
         }));
         assert_eq!(index_text(&m), "error: missing semicolon at foo.rs:42");
@@ -241,7 +240,6 @@ mod tests {
             tool_use_id: "t".into(),
             content: body,
             is_error: true,
-            origin: ToolContentOrigin::Ordinary,
             images: vec![],
         }));
         let out = index_text(&m);

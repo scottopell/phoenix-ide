@@ -235,14 +235,7 @@ pub enum ToolOutput {
         llm_usage: Option<Box<ToolLlmUsage>>,
     },
     /// Instructions from an authenticated audience-bound built-in skill.
-    ///
-    /// The private authority field prevents ordinary Tool implementations outside
-    /// this crate from constructing this provenance.
-    TrustedInstructions {
-        output: String,
-        #[allow(private_interfaces)]
-        _authority: skill::AuthenticatedBuiltin,
-    },
+    TrustedInstructions(skill::TrustedInstructions),
     Error {
         output: String,
         images: Vec<ToolImage>,
@@ -276,7 +269,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 *display_data = Some(data);
             }
-            Self::TrustedInstructions { .. } => {}
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -284,9 +277,8 @@ impl ToolOutput {
     #[must_use]
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
-            Self::Success { output, .. }
-            | Self::TrustedInstructions { output, .. }
-            | Self::Error { output, .. } => *output = text.into(),
+            Self::TrustedInstructions(instructions) => instructions.replace_output(text.into()),
+            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
         }
         self
     }
@@ -298,7 +290,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 *llm_usage = Some(Box::new(usage));
             }
-            Self::TrustedInstructions { .. } => {}
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -308,7 +300,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 llm_usage.take().map(|usage| *usage)
             }
-            Self::TrustedInstructions { .. } => None,
+            Self::TrustedInstructions(_) => None,
         }
     }
 
@@ -316,7 +308,7 @@ impl ToolOutput {
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,
-            Self::TrustedInstructions { .. } => {}
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -326,7 +318,7 @@ impl ToolOutput {
     pub fn is_success(&self) -> bool {
         matches!(
             self,
-            Self::Success { .. } | Self::TrustedInstructions { .. }
+            Self::Success { .. } | Self::TrustedInstructions(_)
         )
     }
 
@@ -339,9 +331,8 @@ impl ToolOutput {
     #[must_use]
     pub fn output(&self) -> &str {
         match self {
-            Self::Success { output, .. }
-            | Self::TrustedInstructions { output, .. }
-            | Self::Error { output, .. } => output,
+            Self::TrustedInstructions(instructions) => instructions.output(),
+            Self::Success { output, .. } | Self::Error { output, .. } => output,
         }
     }
 
@@ -351,7 +342,7 @@ impl ToolOutput {
     pub fn images(&self) -> &[ToolImage] {
         match self {
             Self::Success { images, .. } | Self::Error { images, .. } => images,
-            Self::TrustedInstructions { .. } => &[],
+            Self::TrustedInstructions(_) => &[],
         }
     }
 
@@ -363,7 +354,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 display_data.as_ref()
             }
-            Self::TrustedInstructions { .. } => None,
+            Self::TrustedInstructions(_) => None,
         }
     }
 }
@@ -1026,9 +1017,14 @@ impl ToolRegistry {
     /// tools are absent; the existing skill tool exposes Coordinator-only reference
     /// material.
     #[must_use]
-    pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn coordinator(
+        mut global_read_tools: Vec<Arc<dyn Tool>>,
+        coordinator_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
-        tools.push(Arc::new(SkillTool::for_global_coordinator()));
+        if let Some(catalog) = coordinator_catalog {
+            tools.push(Arc::new(SkillTool::for_global_coordinator(catalog)));
+        }
         tools.append(&mut global_read_tools);
         Self { tools }
     }
@@ -1387,17 +1383,20 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_registry_adds_only_existing_skill_and_think_to_supplied_tools() {
-        let registry = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)]);
+    fn coordinator_registry_registers_skill_only_with_authenticated_catalog() {
+        let no_catalog = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)], None);
         assert_eq!(
-            names(&registry),
-            BTreeSet::from([
-                "read_file".to_string(),
-                "skill".to_string(),
-                "think".to_string(),
-            ])
+            names(&no_catalog),
+            BTreeSet::from(["read_file".to_string(), "think".to_string()])
         );
-        assert!(!names(&registry).contains("phoenix_operator"));
+
+        let temp = tempfile::TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let catalog =
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()));
+        let with_catalog = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)], catalog);
+        assert!(names(&with_catalog).contains("skill"));
+        assert!(!names(&with_catalog).contains("phoenix_operator"));
     }
 
     #[test]

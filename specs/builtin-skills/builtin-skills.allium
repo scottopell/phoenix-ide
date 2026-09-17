@@ -140,6 +140,8 @@ rule InvokeCoordinatorBuiltin {
         audience: "global-coordinator",
         content: expand_embedded_skill(embedded_bytes(skill))
     )
+    ensures: TrustedBuiltinSkillResult.delivered_to_current_request_only()
+    ensures: persisted_tool_result(skill).is_ordinary_untrusted_data()
 
     @guidance
         -- Invocation reads the immutable asset embedded in the binary, not the
