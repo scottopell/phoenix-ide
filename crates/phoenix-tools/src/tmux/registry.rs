@@ -3557,6 +3557,75 @@ fn tmux_new_session_args(
     args
 }
 
+fn test_control_socket(test_control_root: Option<&Path>) -> Result<Option<PathBuf>, TmuxError> {
+    let Some(root) = test_control_root else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(root).map_err(|error| TmuxError::SpawnFailed {
+        socket_path: root.to_path_buf(),
+        reason: format!("failed to prepare test control root: {error}"),
+    })?;
+    Ok(Some(root.join(format!(
+        "{}.sock",
+        uuid::Uuid::new_v4().as_simple()
+    ))))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn retire_test_spawn_sync(control_socket: &Path) {
+    let Ok(mut child) = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(control_socket)
+        .arg("kill-server")
+        .env_remove("TMUX")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while child.try_wait().ok().flatten().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        // test-timing-allow: Drop must synchronously bound and reap the exact cleanup child.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct TestSpawnRetirementGuard {
+    control_socket: PathBuf,
+    armed: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestSpawnRetirementGuard {
+    fn new(control_socket: PathBuf) -> Self {
+        Self {
+            control_socket,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestSpawnRetirementGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            retire_test_spawn_sync(&self.control_socket);
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 async fn retire_failed_test_spawn(control_socket: &Path) {
     let _ = tokio::time::timeout(
@@ -3606,15 +3675,12 @@ async fn spawn_session_owned(
     test_control_root: Option<&Path>,
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
-    let control_socket = test_control_root
-        .map(|root| root.join(format!("{}.sock", uuid::Uuid::new_v4().as_simple())));
+    let control_socket = test_control_socket(test_control_root)?;
     let launch_socket = control_socket.as_deref().unwrap_or(socket_path);
-    if let Some(control_root) = test_control_root {
-        std::fs::create_dir_all(control_root).map_err(|error| TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to prepare test control root: {error}"),
-        })?;
-    }
+    #[cfg(any(test, feature = "test-support"))]
+    let mut retirement_guard = control_socket
+        .as_ref()
+        .map(|socket| TestSpawnRetirementGuard::new(socket.clone()));
     let tmux_args = tmux_new_session_args(
         launch_socket,
         config_path,
@@ -3693,6 +3759,9 @@ async fn spawn_session_owned(
             #[cfg(any(test, feature = "test-support"))]
             if let Some(control_socket) = control_socket.as_deref() {
                 publish_and_register_test_spawn(socket_path, control_socket, &server_token).await?;
+                if let Some(guard) = retirement_guard.as_mut() {
+                    guard.disarm();
+                }
             }
             #[cfg(not(any(test, feature = "test-support")))]
             if control_socket.is_some() {
@@ -5288,6 +5357,41 @@ mod tests {
         }
         drop(listener);
         std::fs::remove_file(socket).unwrap();
+        owner.shutdown();
+    }
+
+    #[test]
+    fn cancellation_guard_retires_hidden_server_before_watchdog_registration() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let control = owner.control_root_path().join("cancel-boundary.sock");
+        let token = uuid::Uuid::new_v4().to_string();
+        let status = std::process::Command::new("tmux")
+            .args([
+                "-S",
+                &control.to_string_lossy(),
+                "new-session",
+                "-d",
+                "-s",
+                "main",
+                "sleep 300",
+            ])
+            .env_remove("TMUX")
+            .env(SERVER_TOKEN_VAR, token)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        {
+            let _guard = TestSpawnRetirementGuard::new(control.clone());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::tmux::probe::probe_sync(&control) == ProbeResult::Live {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!control.exists() || crate::tmux::probe::probe_sync(&control) != ProbeResult::Live);
         owner.shutdown();
     }
 

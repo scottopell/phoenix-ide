@@ -201,14 +201,12 @@ try:
 except FileNotFoundError:
     pass
 
-termination_failed = False
 for _, _, _, control, processes in owned:
     states = [identity_state(identity) for identity in processes]
     server_state, pane_state = states
     if server_state == "absent" and pane_state == "absent":
         continue
     if server_state != "owned" or pane_state not in ("owned", "absent"):
-        termination_failed = True
         continue
     try:
         killed = subprocess.run(
@@ -219,10 +217,8 @@ for _, _, _, control, processes in owned:
             check=False,
             timeout=0.5,
         )
-        if killed.returncode != 0:
-            termination_failed = True
     except (OSError, subprocess.TimeoutExpired):
-        termination_failed = True
+        pass
 
 quiet = 0
 for _ in range(50):
@@ -231,7 +227,7 @@ for _ in range(50):
         for _, _, _, _, processes in owned
         for identity in processes
     ]
-    unconfirmed = termination_failed or any(state != "absent" for state in states)
+    unconfirmed = any(state != "absent" for state in states)
     registered_sockets = {
         socket: (device, inode, processes)
         for socket, device, inode, _, processes in owned
@@ -1041,6 +1037,31 @@ mod tests {
     }
 
     #[test]
+    fn natural_exit_racing_kill_server_uses_final_identity_state() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let (socket, processes) = spawn_server_with_processes(&owner, "natural-exit");
+        assert!(Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .arg("kill-server")
+            .status()
+            .unwrap()
+            .success());
+        wait_until(
+            || {
+                !phoenix_core::process_identity::process_identity_matches(processes.server)
+                    && !phoenix_core::process_identity::process_identity_matches(processes.pane)
+            },
+            "natural server and pane exit",
+        );
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[test]
     fn control_endpoint_authenticates_identity_after_visible_socket_replacement() {
         if which::which("tmux").is_err() {
             return;
@@ -1090,7 +1111,7 @@ mod tests {
     #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "if server_state == \"absent\" and pane_state == \"absent\":\n        continue\n    if server_state != \"owned\" or pane_state not in (\"owned\", \"absent\"):\n        termination_failed = True"
+            "if server_state == \"absent\" and pane_state == \"absent\":\n        continue\n    if server_state != \"owned\" or pane_state not in (\"owned\", \"absent\"):\n        continue"
         ));
     }
 
