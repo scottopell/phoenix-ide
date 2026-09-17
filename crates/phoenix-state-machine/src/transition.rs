@@ -6947,9 +6947,12 @@ mod tests {
             let checkpoint = result
                 .effects
                 .iter()
-                .find_map(|effect| match effect {
-                    Effect::PersistCheckpoint { data } => Some(data),
-                    _ => None,
+                .find_map(|effect| {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match effect {
+                        Effect::PersistCheckpoint { data } => Some(data),
+                        _ => None,
+                    }
                 })
                 .expect("Direct rejection must persist a tool result");
             let CheckpointData::ToolRound { tool_results, .. } = checkpoint;

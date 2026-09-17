@@ -8392,7 +8392,7 @@ where
                 &self.context.conversation_id,
                 &TaskApprovalHandoffData {
                     task_id: reviewed.task_id,
-                    task_title: reviewed.task_title,
+                    task_title: reviewed.task_title.clone(),
                     title: title.to_string(),
                     priority,
                     plan: plan.to_string(),
@@ -8424,6 +8424,64 @@ where
             .broadcast_tx
             .admitted_publication(admitted)
             .persisted_message(msg);
+        let task_title = reviewed.task_title;
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|seq| SseEvent::ConversationUpdate {
+                sequence_id: seq,
+                update: crate::runtime::ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: Some(task_title),
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                },
+            });
+        Ok(())
+    }
+
+    fn restore_retryable_task_approval(
+        &mut self,
+        task_file: String,
+        title: String,
+        priority: crate::task_source::Priority,
+        plan: String,
+        error: &str,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), String> {
+        self.install_live_state(
+            ConvState::AwaitingTaskApproval {
+                task_file,
+                title,
+                priority,
+                plan,
+            },
+            Utc::now(),
+            true,
+        )?;
+        self.settle_turn_span();
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|seq| SseEvent::Error {
+                sequence_id: seq,
+                error: crate::runtime::user_facing_error::UserFacingError::retryable(
+                    "Task approval failed",
+                    format!(
+                        "Phoenix could not finalise the task: {error}. The conversation stays in approval state — try approving again or abandon."
+                    ),
+                ),
+            });
         Ok(())
     }
 
@@ -8444,9 +8502,16 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         if self.is_approved_explore_follow_up() {
-            return self
+            let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
                 .await;
+            if let Err(error) = result {
+                self.restore_retryable_task_approval(
+                    task_file, title, priority, plan, &error, admitted,
+                )?;
+                return Err(error);
+            }
+            return Ok(());
         }
         if matches!(
             self.context.mode_context.as_ref(),
@@ -8800,6 +8865,8 @@ fn persist_fresh_approved_task_artifact_blocking(
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original_path_was_tracked =
+        run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
     let mut snapshot = reread_reviewed_task_handoff_snapshot(
         cwd,
         cwd,
@@ -8829,16 +8896,18 @@ fn persist_fresh_approved_task_artifact_blocking(
     }
     ensure_gitignore_has_phoenix(cwd)?;
     run_git(cwd, &["add", "--", &snapshot.task_file])?;
-    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
-        run_git(
-            cwd,
-            &[
-                "commit",
-                "-m",
-                &format!("task {}: {}", snapshot.task_id, expected_title),
-            ],
-        )
-        .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
+    let mut approved_paths = vec![snapshot.task_file.as_str()];
+    if original_path_was_tracked && snapshot.task_file != task_file {
+        approved_paths.push(task_file);
+    }
+    let mut diff_args = vec!["diff", "--cached", "--quiet", "--"];
+    diff_args.extend(approved_paths.iter().copied());
+    if run_git(cwd, &diff_args).is_err() {
+        let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
+        let mut commit_args = vec!["commit", "--only", "-m", &commit_message, "--"];
+        commit_args.extend(approved_paths.iter().copied());
+        run_git(cwd, &commit_args)
+            .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
     }
     Ok(snapshot)
 }
@@ -15205,6 +15274,86 @@ mod approved_explore_follow_up_tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
+    fn approved_explore_runtime(
+        worktree: PathBuf,
+        task_file: &str,
+        plan: &str,
+        storage: Arc<InMemoryStorage>,
+        broadcast_tx: SseBroadcaster,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let mut context = ConvContext::new(
+            "approved-explore-follow-up",
+            worktree.clone(),
+            "test-model",
+            200_000,
+        );
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
+        context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+        context.work_scope_worktree = Some(worktree);
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let event_tx = mpsc::channel::<Event>(1).0;
+        ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: task_file.to_string(),
+                title: "Follow up".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: plan.to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcast_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn follow_up_validation_failure_restores_approval_state() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-failure",
+            "task-72003-existing-failure",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let reviewed_plan = "# Follow up\n\nReviewed.\n";
+        std::fs::write(worktree.join(task_file), "# Follow up\n\nEdited.\n").unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
+        runtime.state = ConvState::LlmRequesting { attempt: 1 };
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                reviewed_plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect_err("edited task must fail approval");
+
+        assert!(error.contains("no longer matches the approved plan"));
+        assert!(matches!(
+            runtime.state,
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn follow_up_approval_preserves_existing_branch_and_replaces_objective() {
         let (_tmp, repo_root) = init_repo();
@@ -15217,18 +15366,11 @@ mod approved_explore_follow_up_tests {
         let task_file = "tasks/72004-p1-ready--follow-up.md";
         let plan = "# Follow up\n\nImplement the next bounded change.\n";
         std::fs::write(worktree.join(task_file), plan).unwrap();
-
-        let mut context = ConvContext::new(
-            "approved-explore-follow-up",
-            worktree.clone(),
-            "test-model",
-            200_000,
-        );
-        context.mode_context = Some(ModeContext::Explore {
-            next_taskmd_id_hint: None,
-        });
-        context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-        context.work_scope_worktree = Some(worktree.clone());
+        std::fs::write(worktree.join("unrelated.txt"), "base\n").unwrap();
+        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
+        run_git(&worktree, &["commit", "-m", "unrelated baseline"]).unwrap();
+        std::fs::write(worktree.join("unrelated.txt"), "staged work\n").unwrap();
+        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
 
         let storage = Arc::new(InMemoryStorage::new());
         storage
@@ -15246,27 +15388,14 @@ mod approved_explore_follow_up_tests {
             )
             .await
             .expect("existing approved objective");
-        let (_event_tx, event_rx) = mpsc::channel(8);
-        let event_tx = mpsc::channel::<Event>(1).0;
-        let mut runtime = ConversationRuntime::new(
-            context,
-            ConvState::AwaitingTaskApproval {
-                task_file: task_file.to_string(),
-                title: "Follow up".to_string(),
-                priority: crate::task_source::Priority::P1,
-                plan: plan.to_string(),
-            },
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
             storage.clone(),
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx,
-            SseBroadcaster::new(16, 0),
+            broadcast_tx,
         );
         let branch_before = run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
         let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
@@ -15293,12 +15422,36 @@ mod approved_explore_follow_up_tests {
         );
         run_git(&worktree, &["diff", "--exit-code", "HEAD", "--", "tasks"])
             .expect("approved follow-up artifact must be committed");
+        assert_eq!(
+            run_git(&worktree, &["show", "HEAD:unrelated.txt"]).unwrap(),
+            "base",
+            "follow-up commit must exclude unrelated staged work"
+        );
+        assert!(
+            run_git(&worktree, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .lines()
+                .any(|path| path == "unrelated.txt"),
+            "unrelated staged work must remain staged"
+        );
         assert_eq!(storage.recorded_messages().len(), 1);
         let replacement = storage
             .approved_task_authority("approved-explore-follow-up")
             .expect("replacement objective");
         assert_eq!(replacement.task_id, "72004");
         assert_eq!(replacement.task_file, promoted_task_file);
+        assert!(
+            std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                SseEvent::ConversationUpdate {
+                    update: crate::runtime::ConversationMetadataUpdate {
+                        task_title: Some(ref title),
+                        ..
+                    },
+                    ..
+                } if title == "Follow up"
+            ))
+        );
     }
 }
 

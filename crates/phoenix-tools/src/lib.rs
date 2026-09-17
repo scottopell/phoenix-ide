@@ -1085,9 +1085,8 @@ impl ToolRegistry {
         Ok(self)
     }
 
-    /// Create the full-write registry for a Git-backed parent conversation.
-    /// `propose_task` is part of this capability shape because every Git-backed
-    /// parent uses the blocking task-review flow (REQ-PROJ-033/036).
+    /// Create the full-write registry for a Git-backed parent conversation,
+    /// including the `propose_task` capability (REQ-PROJ-033/036).
     ///
     /// # Errors
     ///
