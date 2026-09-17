@@ -1187,6 +1187,11 @@ final class AppModel {
         if let aggregateId = listStore.aggregateId(forTranscriptRowId: transcriptRowId) {
             return aggregateId
         }
+        if let aggregateId = productConversationDetails.first(where: {
+            $0.value.aggregateMemberTranscriptRowIds.contains(transcriptRowId)
+        })?.key {
+            return aggregateId
+        }
         let persistedAggregateIds = Set(listStore.transcriptToAggregate.values)
             .union(productConversationDetails.keys)
         guard let scope = api?.configurationIdentity.persistenceScope else { return nil }
@@ -1267,6 +1272,9 @@ final class AppModel {
             aggregateId: aggregateId,
             scope: api.configurationIdentity.persistenceScope,
             legacyScope: legacySnapshotPersistenceScope)
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope)
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
             aggregate == aggregateId ? id : nil
         })
@@ -1276,6 +1284,8 @@ final class AppModel {
             aggregateAuthority: aggregateId,
             triggerConversationId: transcriptRowId,
             memberConversationIds: persistedMembers
+                .union(discovery.currentAuthorityMemberIds)
+                .union(discovery.persistedOutboxOwnerIds)
                 .union(listMembers)
                 .union(segmentTranscriptRowIds)
                 .union(Set([transcriptRowId].compactMap { $0 })),
@@ -1365,6 +1375,9 @@ final class AppModel {
             aggregateId: report.aggregateAuthority,
             scope: report.configurationIdentity.persistenceScope,
             legacyScope: legacySnapshotPersistenceScope)
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: report.aggregateAuthority,
+            scope: report.configurationIdentity.persistenceScope)
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
             aggregate == report.aggregateAuthority ? id : nil
         })
@@ -1373,7 +1386,11 @@ final class AppModel {
             configurationIdentity: report.configurationIdentity,
             aggregateAuthority: report.aggregateAuthority,
             triggerConversationId: report.conversationId,
-            memberConversationIds: persistedMembers.union(listMembers).union([report.conversationId]),
+            memberConversationIds: persistedMembers
+                .union(discovery.currentAuthorityMemberIds)
+                .union(discovery.persistedOutboxOwnerIds)
+                .union(listMembers)
+                .union([report.conversationId]),
             fenceState: .needsCommit))
     }
 
@@ -1793,18 +1810,20 @@ final class AppModel {
     private func authoritativeAggregateMemberIds(
         aggregateId: String,
         triggeringTranscriptRowId: String
-    ) -> Set<String> {
+    ) async -> Set<String> {
         let detailMembers = productConversationDetails[aggregateId]?.aggregateMemberTranscriptRowIds ?? []
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { transcriptRowId, mappedAggregateId in
             mappedAggregateId == aggregateId ? transcriptRowId : nil
         })
         guard let api else { return detailMembers.union(listMembers).union([triggeringTranscriptRowId]) }
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope)
         return detailMembers
             .union(listMembers)
             .union([triggeringTranscriptRowId])
-            .union(conversationPersistenceStore.persistedConversationIds(
-                aggregateId: aggregateId,
-                scope: api.configurationIdentity.persistenceScope))
+            .union(discovery.currentAuthorityMemberIds)
+            .union(discovery.persistedOutboxOwnerIds)
     }
 
     func closeUnavailableExplanation(for conversation: Conversation) -> String? {
@@ -1855,11 +1874,17 @@ final class AppModel {
             productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
                 ?? listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
         } ?? conversationId
-        let memberIds = aggregateId.map {
-            authoritativeAggregateMemberIds(
-                aggregateId: $0,
+        let memberIds = if let aggregateId {
+            await authoritativeAggregateMemberIds(
+                aggregateId: aggregateId,
                 triggeringTranscriptRowId: conversationId)
-        } ?? [conversationId]
+        } else {
+            Set([conversationId])
+        }
+        guard self.api?.configurationIdentity == api.configurationIdentity else {
+            lastActionError = "Conversation settings changed before archiving. Try again."
+            return false
+        }
         for memberId in memberIds {
             if sessions[memberId]?.outbox.visibleEntries.isEmpty == false {
                 lastActionError =
