@@ -77,6 +77,12 @@ fn normalize_product_conversation_title(title: &str) -> Result<String, AppError>
             "Product conversation title cannot be empty".to_string(),
         ));
     }
+    if normalized.chars().count() > super::chains::CHAIN_NAME_MAX_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "Product conversation title must be at most {} characters",
+            super::chains::CHAIN_NAME_MAX_CHARS,
+        )));
+    }
     Ok(normalized.to_string())
 }
 
@@ -1154,6 +1160,11 @@ mod tests {
             .unwrap();
         let _successor =
             create_completed_continuation(&state, &root, "rename-handoff", "rename-opening").await;
+        sqlx::query("UPDATE conversations SET chain_name = 'Legacy Chain Name' WHERE id = ?1")
+            .bind(&root.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
 
         let response = create_router(state.clone())
             .oneshot(
@@ -1186,6 +1197,55 @@ mod tests {
             Some("Renamed Product Conversation")
         );
         assert_eq!(root_after.slug.as_deref(), Some("original-slug"));
+        assert_eq!(root_after.chain_name, None);
+
+        let legacy_chain = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chains/pc-rename-root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_chain.status(), StatusCode::OK);
+        let legacy_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(legacy_chain.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_body["chain_name"], serde_json::Value::Null);
+        assert_eq!(legacy_body["display_name"], "Renamed Product Conversation");
+    }
+
+    #[tokio::test]
+    async fn router_rejects_overlong_product_conversation_title() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("pc-long-title", "pc-long-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let title = "x".repeat(super::super::chains::CHAIN_NAME_MAX_CHARS + 1);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/product-conversations/{}/title",
+                        root.product_conversation_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "title": title }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

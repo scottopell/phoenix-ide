@@ -418,13 +418,16 @@ impl Database {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             };
             let root_id: String = row.try_get("id")?;
-            let result =
-                sqlx::query("UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3")
-                    .bind(title)
-                    .bind(now.to_rfc3339())
-                    .bind(root_id)
-                    .execute(&mut *transaction)
-                    .await?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                     SET title = ?1, chain_name = NULL, updated_at = ?2
+                     WHERE id = ?3",
+            )
+            .bind(title)
+            .bind(now.to_rfc3339())
+            .bind(root_id)
+            .execute(&mut *transaction)
+            .await?;
             if result.rows_affected() == 0 {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             }
