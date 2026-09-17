@@ -110,6 +110,76 @@ def publish_response(path, value):
     pending.write_text(value)
     os.replace(pending, path)
 
+def observe_control(control, expected_token):
+    observed = subprocess.run(
+        ["tmux", "-S", str(control), "display-message", "-p", "#{pid}|#{pane_pid}"],
+        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+    )
+    if observed.returncode != 0:
+        raise RuntimeError("tmux identity query failed")
+    process_fields = observed.stdout.removesuffix("\n").split("|")
+    server_pid, pane_pid = process_fields
+    if (not server_pid.isascii() or not server_pid.isdecimal()
+            or not pane_pid.isascii() or not pane_pid.isdecimal()):
+        raise RuntimeError("tmux identity output was malformed")
+    token_result = subprocess.run(
+        ["tmux", "-S", str(control), "show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"],
+        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+    )
+    token = token_result.stdout.strip().partition("=")[2]
+    if token_result.returncode != 0 or token != expected_token:
+        raise RuntimeError("tmux server token did not match registration")
+    identities = [
+        (int(server_pid), birth(int(server_pid)), token),
+        (int(pane_pid), birth(int(pane_pid)), None),
+    ]
+    if any(started is None for _, started, _ in identities):
+        raise RuntimeError("process birth identity was unavailable")
+    return identities
+
+def spawn_owned(request):
+    rejected = request.with_name(request.name.replace(".spawn-", ".rejected-", 1))
+    acknowledged = request.with_name(request.name.replace(".spawn-", ".registered-", 1))
+    control = None
+    try:
+        socket_name, control_name, config, cwd, token = request.read_text().split("\t")
+        socket = root / socket_name
+        control = control_root / control_name
+        if socket.parent != root or control.parent != control_root or control.exists():
+            raise RuntimeError("spawn paths are not unused exact children of owned roots")
+        spawned = subprocess.run(
+            ["tmux", "-f", config, "-S", str(control), "new-session", "-d", "-c", cwd,
+             "-s", "main", ";", "set-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN", token],
+            stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
+                 "SHELL": os.environ.get("SHELL", "/bin/bash"),
+                 "PHOENIX_TMUX_SERVER_TOKEN": token},
+        )
+        if spawned.returncode != 0:
+            raise RuntimeError(f"tmux spawn failed: {spawned.stderr}")
+        identities = observe_control(control, token)
+        control_stat = control.stat()
+        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
+        publish_response(acknowledged, "\t".join(
+            str(value) for identity in identities for value in identity[:2]
+        ))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
+        if control is not None and control.exists():
+            try:
+                subprocess.run(["tmux", "-S", str(control), "kill-server"], timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            publish_response(rejected, str(error))
+        except OSError:
+            return False
+    finally:
+        try:
+            request.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
+
 def register(request):
     rejected = request.with_name(request.name.replace(".register-", ".rejected-", 1))
     acknowledged = request.with_name(request.name.replace(".register-", ".registered-", 1))
@@ -121,40 +191,8 @@ def register(request):
         if (socket.parent != root or control.parent != control_root
                 or control.is_symlink() or not control.is_socket()):
             raise RuntimeError("registration control is not an exact child of the owned control root")
-        observed = subprocess.run(
-            ["tmux", "-S", str(control), "display-message", "-p",
-             "#{pid}|#{pane_pid}"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=0.5,
-        )
-        if observed.returncode != 0:
-            raise RuntimeError("tmux identity query failed")
-        process_fields = observed.stdout.removesuffix("\n").split("|")
-        server_pid, pane_pid = process_fields
-        if (not server_pid.isascii() or not server_pid.isdecimal()
-                or not pane_pid.isascii() or not pane_pid.isdecimal()):
-            raise RuntimeError("tmux identity output was malformed")
-        token_result = subprocess.run(
-            ["tmux", "-S", str(control), "show-environment", "-g",
-             "PHOENIX_TMUX_SERVER_TOKEN"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=0.5,
-        )
-        token = token_result.stdout.strip().partition("=")[2]
-        if token_result.returncode != 0 or token != expected_token:
-            raise RuntimeError("tmux server token did not match registration")
-        identities = [
-            (int(server_pid), birth(int(server_pid)), token),
-            (int(pane_pid), birth(int(pane_pid)), None),
-        ]
-        if any(started is None for _, started, _ in identities):
-            raise RuntimeError("process birth identity was unavailable")
+        identities = observe_control(control, expected_token)
+        server_pid, pane_pid = str(identities[0][0]), str(identities[1][0])
         control_stat = control.stat()
         owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
         try:
@@ -178,6 +216,13 @@ def register(request):
 (root / ".armed").touch()
 heartbeat = root / ".parent-heartbeat"
 while not (root / ".cleanup-request").exists():
+    for request in control_root.glob(".spawn-*"):
+        if not spawn_owned(request):
+            break
+    else:
+        request = None
+    if request is not None:
+        break
     for request in control_root.glob(".register-*"):
         if not register(request):
             break
@@ -201,7 +246,7 @@ try:
 except FileNotFoundError:
     pass
 
-for _, _, _, control, processes in owned:
+for _, device, inode, control, processes in owned:
     states = [identity_state(identity) for identity in processes]
     server_state, pane_state = states
     if server_state == "absent" and pane_state == "absent":
@@ -209,6 +254,12 @@ for _, _, _, control, processes in owned:
     if server_state != "owned" or pane_state not in ("owned", "absent"):
         continue
     try:
+        control_stat = control.stat()
+        token = processes[0][2]
+        observed = observe_control(control, token)
+        if (control_stat.st_dev != device or control_stat.st_ino != inode
+                or observed[0][:2] != processes[0][:2]):
+            continue
         killed = subprocess.run(
             ["tmux", "-S", str(control), "kill-server"],
             stdin=subprocess.DEVNULL,
@@ -566,6 +617,107 @@ impl Drop for RegistrationArtifacts {
     }
 }
 
+fn protocol_field(path: &Path, label: &str) -> io::Result<String> {
+    path.to_str()
+        .filter(|value| !value.contains('\t'))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| io::Error::other(format!("{label} is not protocol-safe UTF-8")))
+}
+
+pub(crate) async fn spawn_owned_server(
+    socket: &Path,
+    control_socket: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    token: &str,
+) -> io::Result<TestServerProcesses> {
+    let control_root = control_socket
+        .parent()
+        .ok_or_else(|| io::Error::other("tmux test control socket has no root"))?;
+    let socket_name = protocol_field(
+        Path::new(
+            socket
+                .file_name()
+                .ok_or_else(|| io::Error::other("socket has no name"))?,
+        ),
+        "socket name",
+    )?;
+    let control_name = protocol_field(
+        Path::new(
+            control_socket
+                .file_name()
+                .ok_or_else(|| io::Error::other("control has no name"))?,
+        ),
+        "control name",
+    )?;
+    let nonce = uuid::Uuid::new_v4();
+    let request = control_root.join(format!(".spawn-{nonce}"));
+    let pending = control_root.join(format!(".pending-spawn-{nonce}"));
+    let acknowledged = control_root.join(format!(".registered-{nonce}"));
+    let rejected = control_root.join(format!(".rejected-{nonce}"));
+    let _artifacts = RegistrationArtifacts {
+        paths: [
+            pending.clone(),
+            request.clone(),
+            acknowledged.clone(),
+            rejected.clone(),
+            control_root.join(format!(".pending-registered-{nonce}")),
+            control_root.join(format!(".pending-rejected-{nonce}")),
+        ],
+    };
+    fs::write(
+        &pending,
+        format!(
+            "{socket_name}\t{control_name}\t{}\t{}\t{token}",
+            protocol_field(config_path, "config path")?,
+            protocol_field(cwd, "cwd")?
+        ),
+    )?;
+    fs::rename(pending, request)?;
+    let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        if let Ok(value) = fs::read_to_string(&acknowledged) {
+            return parse_acknowledged_processes(&value);
+        }
+        if let Ok(reason) = fs::read_to_string(&rejected) {
+            return Err(io::Error::other(format!(
+                "tmux watchdog rejected spawn: {reason}"
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tmux watchdog did not acknowledge spawn",
+            ));
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+fn parse_acknowledged_processes(value: &str) -> io::Result<TestServerProcesses> {
+    let fields = value.split('\t').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err(io::Error::other(
+            "tmux watchdog returned malformed process identities",
+        ));
+    }
+    let parse = |value: &str| {
+        value
+            .parse::<u128>()
+            .map_err(|error| io::Error::other(format!("invalid tmux process identity: {error}")))
+    };
+    Ok(TestServerProcesses {
+        server: ProcessIdentity {
+            pid: u32::try_from(parse(fields[0])?).map_err(io::Error::other)?,
+            start_time: parse(fields[1])?,
+        },
+        pane: ProcessIdentity {
+            pid: u32::try_from(parse(fields[2])?).map_err(io::Error::other)?,
+            start_time: parse(fields[3])?,
+        },
+    })
+}
+
 pub(crate) fn register_owned_server(
     socket: &Path,
     control_socket: &Path,
@@ -608,32 +760,7 @@ pub(crate) fn register_owned_server(
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
         if let Ok(value) = fs::read_to_string(&acknowledged) {
-            let fields = value.split('\t').collect::<Vec<_>>();
-            if fields.len() != 4 {
-                return Err(io::Error::other(
-                    "tmux watchdog returned malformed process identities",
-                ));
-            }
-            let parse = |value: &str| {
-                value.parse::<u128>().map_err(|error| {
-                    io::Error::other(format!("invalid tmux process identity: {error}"))
-                })
-            };
-            let server_pid = u32::try_from(parse(fields[0])?)
-                .map_err(|error| io::Error::other(format!("invalid tmux server pid: {error}")))?;
-            let pane_pid = u32::try_from(parse(fields[2])?)
-                .map_err(|error| io::Error::other(format!("invalid tmux pane pid: {error}")))?;
-            let acknowledged = TestServerProcesses {
-                server: ProcessIdentity {
-                    pid: server_pid,
-                    start_time: parse(fields[1])?,
-                },
-                pane: ProcessIdentity {
-                    pid: pane_pid,
-                    start_time: parse(fields[3])?,
-                },
-            };
-            return Ok(acknowledged);
+            return parse_acknowledged_processes(&value);
         }
         if let Ok(reason) = fs::read_to_string(&rejected) {
             return Err(io::Error::other(format!(
@@ -977,9 +1104,16 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_revalidates_control_inode_and_authenticated_identity_before_kill() {
+        assert!(WATCHDOG_PROGRAM.contains("control_stat.st_dev"));
+        assert!(WATCHDOG_PROGRAM.contains("control_stat.st_ino"));
+        assert!(WATCHDOG_PROGRAM.contains("observe_control(control, token)"));
+    }
+
+    #[test]
     fn pane_identity_is_bound_to_authenticated_server_without_requiring_late_token() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "(int(server_pid), birth(int(server_pid)), token),\n            (int(pane_pid), birth(int(pane_pid)), None),"
+            "(int(server_pid), birth(int(server_pid)), token),\n        (int(pane_pid), birth(int(pane_pid)), None),"
         ));
         assert!(WATCHDOG_PROGRAM.contains("if token is None:\n        return \"owned\""));
     }
@@ -1280,6 +1414,37 @@ finally:
     }
 
     #[test]
+    fn forced_creator_sigkill_before_publication_is_reclaimed_by_watchdog() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let marker_dir = TempDir::new().unwrap();
+        let marker = marker_dir.path().join("creator-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::test_server::tests::forced_termination_fixture",
+                "--nocapture",
+                "--ignored",
+            ])
+            .env("PHOENIX_TMUX_TEST_DEATH_MARKER", &marker)
+            .env("PHOENIX_TMUX_TEST_DEATH_BEFORE_PUBLICATION", "1")
+            .spawn()
+            .unwrap();
+        wait_until(|| marker.exists(), "hidden watchdog-owned server readiness");
+        unsafe { libc::kill(child.id().cast_signed(), libc::SIGKILL) };
+        assert_killed(child.wait().unwrap());
+        let values = fs::read_to_string(&marker).unwrap();
+        let mut values = values.lines();
+        let root = PathBuf::from(values.next().unwrap());
+        let control_root = PathBuf::from(values.next().unwrap());
+        wait_until(
+            || !root.exists() && !control_root.exists(),
+            "watchdog cleanup after creator SIGKILL",
+        );
+    }
+
+    #[test]
     fn forced_test_runner_termination_kills_exact_server() {
         run_forced_termination_case(false);
     }
@@ -1297,8 +1462,41 @@ finally:
         };
         let owner = TestTmuxServerOwner::new();
         let root = owner.path().to_path_buf();
-        let (socket, processes) = spawn_server_with_processes(&owner, "forced-death");
+        if std::env::var_os("PHOENIX_TMUX_TEST_DEATH_BEFORE_PUBLICATION").is_some() {
+            let control_root = owner.control_root_path().to_path_buf();
+            let control = control_root.join("creator-death.sock");
+            let token = uuid::Uuid::new_v4().to_string();
+            let pending = control_root.join(".pending-spawn-creator-death");
+            let request = control_root.join(".spawn-creator-death");
+            fs::write(
+                &pending,
+                format!(
+                    "creator-death.sock\tcreator-death.sock\t{}\t{}\t{token}",
+                    owner.path().join("_phoenix.tmux.conf").display(),
+                    owner.path().display()
+                ),
+            )
+            .unwrap();
+            fs::rename(pending, request).unwrap();
+            wait_until(
+                || crate::tmux::probe::probe_sync(&control) == ProbeResult::Live,
+                "hidden server before publication",
+            );
+            let marker = PathBuf::from(marker);
+            let pending_marker = marker.with_extension("pending");
+            fs::write(
+                &pending_marker,
+                format!("{}\n{}\n", owner.path().display(), control_root.display()),
+            )
+            .unwrap();
+            fs::rename(pending_marker, marker).unwrap();
+            std::mem::forget(owner);
+            loop {
+                thread::park();
+            }
+        }
         let marker = PathBuf::from(marker);
+        let (socket, processes) = spawn_server_with_processes(&owner, "forced-death");
         let pending_marker = marker.with_extension("pending");
         let mut file = fs::File::create(&pending_marker).unwrap();
         writeln!(file, "{}", root.display()).unwrap();

@@ -3628,19 +3628,26 @@ impl Drop for TestSpawnRetirementGuard {
 
 #[cfg(any(test, feature = "test-support"))]
 async fn retire_failed_test_spawn(control_socket: &Path) {
-    let _ = tokio::time::timeout(
-        Duration::from_millis(500),
-        tokio::process::Command::new("tmux")
-            .arg("-S")
-            .arg(control_socket)
-            .arg("kill-server")
-            .env_remove("TMUX")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-    )
-    .await;
+    let mut command = tokio::process::Command::new("tmux");
+    command
+        .arg("-S")
+        .arg(control_socket)
+        .arg("kill-server")
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    if tokio::time::timeout(Duration::from_millis(500), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3668,6 +3675,76 @@ async fn publish_and_register_test_spawn(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+async fn watchdog_owned_spawn(
+    socket_path: &Path,
+    control_socket: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    server_token: &str,
+) -> Result<(), TmuxError> {
+    let processes = super::test_server::spawn_owned_server(
+        socket_path,
+        control_socket,
+        config_path,
+        cwd,
+        server_token,
+    )
+    .await
+    .map_err(|error| TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: format!("watchdog-owned tmux spawn failed: {error}"),
+    })?;
+    if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
+        retire_failed_test_spawn(control_socket).await;
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to publish contained tmux socket: {error}"),
+        });
+    }
+    debug_assert!(processes.server.pid > 0 && processes.pane.pid > 0);
+    Ok(())
+}
+
+async fn wait_for_spawned_pane(socket_path: &Path, config_path: &Path) -> Result<(), TmuxError> {
+    let mut last_diag = String::from("no probe ran");
+    for attempt in 0..PANE_READY_MAX_ATTEMPTS {
+        let panes = tokio::process::Command::new("tmux")
+            .args([
+                "-f",
+                &config_path.to_string_lossy(),
+                "-S",
+                &socket_path.to_string_lossy(),
+                "list-panes",
+                "-t",
+                TMUX_DEFAULT_SESSION,
+            ])
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|error| TmuxError::SpawnFailed {
+                socket_path: socket_path.to_path_buf(),
+                reason: format!("failed to probe pane readiness: {error}"),
+            })?;
+        if panes.status.success() && !panes.stdout.is_empty() {
+            return Ok(());
+        }
+        last_diag = format!(
+            "exit {:?}, stderr: {}",
+            panes.status.code(),
+            String::from_utf8_lossy(&panes.stderr).trim()
+        );
+        if attempt + 1 < PANE_READY_MAX_ATTEMPTS {
+            tokio::time::sleep(PANE_READY_POLL_INTERVAL).await;
+        }
+    }
+    Err(TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: format!("session spawned but pane never became ready after {PANE_READY_MAX_ATTEMPTS} probes (last: {last_diag})"),
+    })
+}
+
 async fn spawn_session_owned(
     socket_path: &Path,
     config_path: &Path,
@@ -3676,6 +3753,11 @@ async fn spawn_session_owned(
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
     let control_socket = test_control_socket(test_control_root)?;
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(control_socket) = control_socket.as_deref() {
+        watchdog_owned_spawn(socket_path, control_socket, config_path, cwd, &server_token).await?;
+        return Ok(());
+    }
     let launch_socket = control_socket.as_deref().unwrap_or(socket_path);
     #[cfg(any(test, feature = "test-support"))]
     let mut retirement_guard = control_socket
@@ -3733,60 +3815,15 @@ async fn spawn_session_owned(
     // immediately after can come back empty with a 0 exit. Poll list-panes
     // until the pane exists so the postcondition "spawn_session returns =>
     // pane usable" holds for every caller, not just well-timed ones. Task 62006.
-    let mut last_diag = String::from("no probe ran");
-    for attempt in 0..PANE_READY_MAX_ATTEMPTS {
-        let panes = tokio::process::Command::new("tmux")
-            .args([
-                "-f",
-                &config_path.to_string_lossy(),
-                "-S",
-                &launch_socket.to_string_lossy(),
-                "list-panes",
-                "-t",
-                TMUX_DEFAULT_SESSION,
-            ])
-            .env_remove("TMUX")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| TmuxError::SpawnFailed {
-                socket_path: socket_path.to_path_buf(),
-                reason: format!("failed to probe pane readiness: {e}"),
-            })?;
-        if panes.status.success() && !panes.stdout.is_empty() {
-            #[cfg(any(test, feature = "test-support"))]
-            if let Some(control_socket) = control_socket.as_deref() {
-                publish_and_register_test_spawn(socket_path, control_socket, &server_token).await?;
-                if let Some(guard) = retirement_guard.as_mut() {
-                    guard.disarm();
-                }
-            }
-            #[cfg(not(any(test, feature = "test-support")))]
-            if control_socket.is_some() {
-                unreachable!("test spawn containment is unavailable in production builds");
-            }
-            return Ok(());
-        }
-        // Retain the last probe's exit/stderr so an exhausted poll says WHY
-        // (no session vs socket/auth error vs empty pane list), not just "never
-        // became ready".
-        last_diag = format!(
-            "exit {:?}, stderr: {}",
-            panes.status.code(),
-            String::from_utf8_lossy(&panes.stderr).trim()
-        );
-        if attempt + 1 < PANE_READY_MAX_ATTEMPTS {
-            tokio::time::sleep(PANE_READY_POLL_INTERVAL).await;
+    wait_for_spawned_pane(launch_socket, config_path).await?;
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(control_socket) = control_socket.as_deref() {
+        publish_and_register_test_spawn(socket_path, control_socket, &server_token).await?;
+        if let Some(guard) = retirement_guard.as_mut() {
+            guard.disarm();
         }
     }
-    Err(TmuxError::SpawnFailed {
-        socket_path: socket_path.to_path_buf(),
-        reason: format!(
-            "session spawned but pane never became ready after {PANE_READY_MAX_ATTEMPTS} probes (last: {last_diag})"
-        ),
-    })
+    Ok(())
 }
 
 /// Default socket directory, resolved through [`PhoenixRuntimeEnvironment`]:
