@@ -41,8 +41,10 @@ publication_timeout = float(os.environ.get("PHOENIX_TMUX_PUBLICATION_TIMEOUT", "
 cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
 adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
+publication_hook = os.environ.get("PHOENIX_TMUX_PUBLICATION_HOOK")
 provisional = []
 adopted_pending_publication = []
+preserved_visible_paths = set()
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -357,19 +359,39 @@ def retire_registered(socket, control, identities):
     record = exact_record(socket, control, expected)
     if record is None:
         return False
-    if not retire_record(record, time.monotonic() + identity_timeout):
+    control_anchor = control_root / f".retiring-control-{uuid.uuid4()}"
+    try:
+        os.link(control, control_anchor)
+        anchor_stat = control_anchor.stat()
+        if anchor_stat.st_dev != record[1] or anchor_stat.st_ino != record[2]:
+            control_anchor.unlink(missing_ok=True)
+            return False
+    except OSError:
         return False
+    retired = retire_record(record, time.monotonic() + identity_timeout)
     try:
         socket_stat = socket.stat()
         visible_owned = socket_stat.st_dev == record[1] and socket_stat.st_ino == record[2]
+        visible_replacement = not visible_owned
     except FileNotFoundError:
         visible_owned = False
+        visible_replacement = False
     except OSError:
+        retired = False
+        visible_owned = False
+        visible_replacement = False
+    if retired and visible_owned:
+        retired = remove_exact_visible(record)
+    if retired:
+        retired = remove_retired_control(record)
+    try:
+        control_anchor.unlink()
+    except OSError:
+        retired = False
+    if not retired:
         return False
-    if visible_owned and not remove_exact_visible(record):
-        return False
-    if not remove_retired_control(record):
-        return False
+    if visible_replacement:
+        preserved_visible_paths.add(socket)
     provisional[:] = [
         item for item in provisional
         if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
@@ -475,12 +497,25 @@ while not (root / ".cleanup-request").exists():
                 retain_obligation(socket, control)
         elif publish_valid:
             try:
-                publish_response(publication_acknowledged, "published")
+                if publication_hook:
+                    subprocess.run(
+                        [publication_hook, str(published), str(publication_acknowledged)],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, check=False, timeout=1.0,
+                    )
                 published.unlink(missing_ok=True)
                 adopted_pending_publication.remove(item)
+                publish_response(publication_acknowledged, "published")
             except OSError:
-                adopted_pending_publication.remove(item)
-                unconfirmed_obligations.append((socket, control))
+                retire_registered(socket, control, identities)
+                retain_obligation(socket, control)
+                try:
+                    publish_response(
+                        adoption_rejected,
+                        "publication marker cleanup failed; exact retirement attempted",
+                    )
+                except OSError:
+                    pass
         elif published.exists() or now >= deadline:
             if retire_registered(socket, control, identities):
                 try:
@@ -591,7 +626,9 @@ while time.monotonic() < cleanup_deadline:
         for _, _, _, _, processes in owned
         for identity in processes
     ]
-    unconfirmed_state = any(state != "absent" for state in states) or bool(unconfirmed_obligations)
+    unconfirmed_state = (any(state != "absent" for state in states)
+                         or bool(unconfirmed_obligations)
+                         or bool(preserved_visible_paths))
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -639,6 +676,9 @@ while time.monotonic() < cleanup_deadline:
                 pass
             except OSError:
                 unconfirmed = True
+            continue
+        if socket in preserved_visible_paths:
+            unconfirmed = True
             continue
         try:
             probe = subprocess.run(
@@ -712,6 +752,29 @@ fn set_duration_env(command: &mut Command, name: &str, value: Option<Duration>) 
     }
 }
 
+fn set_path_env(command: &mut Command, name: &str, value: Option<&Path>) {
+    if let Some(value) = value {
+        command.env(name, value);
+    }
+}
+
+fn configure_watchdog_env(
+    command: &mut Command,
+    identity_timeout: Option<Duration>,
+    cleanup_timeout: Option<Duration>,
+    quarantine_hook: Option<&Path>,
+    adoption: (Option<Duration>, Option<&Path>),
+    publication: (Option<Duration>, Option<&Path>),
+) {
+    set_duration_env(command, "PHOENIX_TMUX_IDENTITY_TIMEOUT", identity_timeout);
+    set_duration_env(command, "PHOENIX_TMUX_CLEANUP_TIMEOUT", cleanup_timeout);
+    set_duration_env(command, "PHOENIX_TMUX_ADOPTION_TIMEOUT", adoption.0);
+    set_duration_env(command, "PHOENIX_TMUX_PUBLICATION_TIMEOUT", publication.0);
+    set_path_env(command, "PHOENIX_TMUX_ADOPTION_HOOK", adoption.1);
+    set_path_env(command, "PHOENIX_TMUX_QUARANTINE_HOOK", quarantine_hook);
+    set_path_env(command, "PHOENIX_TMUX_PUBLICATION_HOOK", publication.1);
+}
+
 impl TestTmuxServerOwner {
     /// Creates an isolated short socket root and its detached cleanup watchdog.
     ///
@@ -739,7 +802,7 @@ impl TestTmuxServerOwner {
             None,
             None,
             None,
-            None,
+            (None, None),
         )
     }
 
@@ -750,7 +813,7 @@ impl TestTmuxServerOwner {
         quarantine_hook: Option<&Path>,
         adoption_timeout: Option<Duration>,
         adoption_hook: Option<&Path>,
-        publication_timeout: Option<Duration>,
+        publication: (Option<Duration>, Option<&Path>),
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -789,32 +852,14 @@ impl TestTmuxServerOwner {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        set_duration_env(
+        configure_watchdog_env(
             &mut command,
-            "PHOENIX_TMUX_IDENTITY_TIMEOUT",
             identity_timeout,
-        );
-        set_duration_env(
-            &mut command,
-            "PHOENIX_TMUX_CLEANUP_TIMEOUT",
             cleanup_timeout,
+            quarantine_hook,
+            (adoption_timeout, adoption_hook),
+            publication,
         );
-        set_duration_env(
-            &mut command,
-            "PHOENIX_TMUX_ADOPTION_TIMEOUT",
-            adoption_timeout,
-        );
-        set_duration_env(
-            &mut command,
-            "PHOENIX_TMUX_PUBLICATION_TIMEOUT",
-            publication_timeout,
-        );
-        if let Some(hook) = adoption_hook {
-            command.env("PHOENIX_TMUX_ADOPTION_HOOK", hook);
-        }
-        if let Some(hook) = quarantine_hook {
-            command.env("PHOENIX_TMUX_QUARANTINE_HOOK", hook);
-        }
         if let Some(path) = watchdog_path {
             let inherited_path = std::env::var_os("PATH").unwrap_or_default();
             let mut paths = vec![path.to_path_buf()];
@@ -2175,6 +2220,75 @@ mod tests {
         fs::remove_dir_all(control_root).unwrap();
     }
 
+    #[test]
+    fn dead_identity_requires_a_retained_inode_anchor_before_visible_cleanup() {
+        let anchor = WATCHDOG_PROGRAM
+            .find("os.link(control, control_anchor)")
+            .expect("retirement retains the independently named control inode");
+        let authenticate = WATCHDOG_PROGRAM
+            .find("anchor_stat.st_dev != record[1] or anchor_stat.st_ino != record[2]")
+            .expect("retirement authenticates the retained inode");
+        let retire = WATCHDOG_PROGRAM
+            .find("retired = retire_record(record")
+            .expect("retirement follows anchor authentication");
+        let classify = WATCHDOG_PROGRAM
+            .find("visible_owned = socket_stat.st_dev == record[1]")
+            .expect("retirement classifies the visible endpoint");
+        let remove_control = WATCHDOG_PROGRAM
+            .find("retired = remove_retired_control(record)")
+            .expect("control cleanup follows process retirement");
+        let unlink_anchor = WATCHDOG_PROGRAM
+            .find("control_anchor.unlink()")
+            .expect("anchor removal follows endpoint decisions");
+        assert!(anchor < authenticate && authenticate < retire);
+        assert!(retire < classify && classify < remove_control);
+        assert!(remove_control < unlink_anchor);
+    }
+
+    #[test]
+    fn live_unrelated_tmux_replacement_survives_retirement_and_final_sweep() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("live-replacement.sock");
+        let (socket, processes) = spawn_server_with_processes(&owner, "live-replacement");
+        fs::remove_file(&socket).unwrap();
+        assert!(Command::new("tmux")
+            .args([
+                "-S",
+                &socket.to_string_lossy(),
+                "new-session",
+                "-d",
+                "-s",
+                "unrelated",
+                "sleep 300",
+            ])
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "protected replacement must fail cleanup closed"
+        );
+        assert_exact_processes_gone(processes);
+        assert_eq!(probe_sync(&socket), ProbeResult::Live);
+        assert!(Command::new("tmux")
+            .args(["-S", &socket.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_ne!(probe_sync(&control), ProbeResult::Live);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
     fn write_adoption_environment(control_root: &Path, name: &str, token: &str) {
         fs::write(
             control_root.join(name),
@@ -2209,7 +2323,7 @@ mod tests {
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2365,7 +2479,7 @@ mod tests {
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2401,6 +2515,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_marker_cleanup_failure_never_acknowledges_success() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("replace-publication-marker");
+        fs::write(&hook, "#!/bin/sh\nrm -f \"$1\"\nmkdir \"$1\"\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            (None, Some(&hook)),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("publication-cleanup-failure.sock");
+        let control = control_root.join("publication-cleanup-failure.sock");
+        let token = "publication-cleanup-failure-token";
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+        ];
+        let adopted = spawn_owned_server(
+            &socket,
+            &control,
+            &root.join("config"),
+            &root,
+            token,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let processes = adopted.processes;
+        fs::hard_link(&control, &socket).unwrap();
+
+        adopted
+            .commit_publication()
+            .await
+            .expect_err("marker cleanup failure must not acknowledge publication");
+
+        assert!(!control_root
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publication-acknowledged-")));
+        assert_exact_processes_gone(processes);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(
+            panic.is_err(),
+            "marker failure evidence must prevent cleanup success"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancellation_while_waiting_for_adoption_ack_never_publishes() {
         if which::which("tmux").is_err() {
             return;
@@ -2423,7 +2602,7 @@ mod tests {
             None,
             Some(Duration::from_secs(2)),
             Some(&hook),
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2511,7 +2690,7 @@ mod tests {
             None,
             Some(Duration::ZERO),
             Some(&hook),
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2590,7 +2769,7 @@ mod tests {
             Some(&hook),
             None,
             None,
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2628,7 +2807,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            (None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();

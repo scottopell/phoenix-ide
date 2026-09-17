@@ -5497,8 +5497,10 @@ mod tests {
             None,
             None,
             None,
-            Some(Duration::ZERO),
+            (Some(Duration::ZERO), None),
         );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
         let socket = owner.path().join("publication-conflict.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let error = tokio::time::timeout(
@@ -5522,7 +5524,6 @@ mod tests {
             Some(socket.as_path()),
             "publication replacement must remain untouched"
         );
-        drop(listener);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let live_control = std::fs::read_dir(owner.control_root_path())
@@ -5540,8 +5541,23 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
         }
-        std::fs::remove_file(socket).unwrap();
-        owner.shutdown();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(
+            panic.is_err(),
+            "preserved publication replacement must keep cleanup fail-closed"
+        );
+        assert!(
+            socket.exists(),
+            "final sweep removed the protected replacement"
+        );
+        assert_eq!(
+            listener.local_addr().unwrap().as_pathname(),
+            Some(socket.as_path()),
+            "protected replacement must remain bound after cleanup"
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
