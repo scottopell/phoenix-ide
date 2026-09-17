@@ -3346,7 +3346,7 @@ mod tests {
             tool_calls: vec![submit_result_call],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &context, event).unwrap();
@@ -3400,7 +3400,7 @@ mod tests {
             tool_calls: vec![submit_error_call],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &context, event).unwrap();
@@ -3515,7 +3515,7 @@ mod tests {
             tool_calls: vec![bash_call, submit_call],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &context, event);
@@ -3572,7 +3572,7 @@ mod tests {
             tool_calls: vec![submit_call],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &context, event).unwrap();

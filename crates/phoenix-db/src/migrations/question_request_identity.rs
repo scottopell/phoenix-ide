@@ -60,7 +60,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version = 97")
+        sqlx::query("DELETE FROM _migrations WHERE version = 98")
             .execute(db.pool())
             .await
             .unwrap();
@@ -163,7 +163,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version = 97")
+        sqlx::query("DELETE FROM _migrations WHERE version = 98")
             .execute(db.pool())
             .await
             .unwrap();
@@ -224,7 +224,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version = 97")
+        sqlx::query("DELETE FROM _migrations WHERE version = 98")
             .execute(db.pool())
             .await
             .unwrap();
@@ -242,7 +242,7 @@ mod tests {
             };
             assert_eq!(tool_use_id, "reused-provider-id");
             assert_eq!(questions[0].question, "Choice?");
-            uuid::Uuid::parse_str(&request_id).unwrap();
+            uuid::Uuid::parse_str(request_id.as_str()).unwrap();
             identities.push(request_id);
         }
         assert_ne!(identities[0], identities[1]);

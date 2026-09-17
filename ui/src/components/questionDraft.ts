@@ -11,6 +11,7 @@ export const createQuestionDraft = (question: UserQuestion): QuestionDraft => ({
   selection: question.multiSelect ? { kind: 'multiple', values: [] } : { kind: 'single', value: null },
   other: '', notes: '', notesOpen: false, previewOpen: false,
 });
+const questionKey = (question: UserQuestion, index: number) => question.id ?? `q${index + 1}`;
 export function selected(draft: QuestionDraft, index: number): boolean {
   return draft.selection.kind === 'single' ? draft.selection.value === index : draft.selection.values.includes(index);
 }
@@ -30,10 +31,11 @@ export function answerPayload(questions: UserQuestion[], drafts: QuestionDraft[]
     const draft = drafts[index]!;
     const labels = question.options.filter((_, option) => selected(draft, option)).map(option => option.label);
     if (selected(draft, question.options.length)) labels.push(draft.other.trim());
-    answers[question.question] = labels.join(', ');
+    const key = questionKey(question, index);
+    answers[key] = labels.join(', ');
     const preview = draft.selection.kind === 'single' && draft.selection.value !== null
       ? question.options[draft.selection.value]?.preview : undefined;
-    if (draft.notes || preview) annotations[question.question] = {
+    if (draft.notes || preview) annotations[key] = {
       ...(draft.notes ? { notes: draft.notes } : {}), ...(preview ? { preview } : {}),
     };
   });

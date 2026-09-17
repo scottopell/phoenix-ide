@@ -6,6 +6,7 @@ use crate::domain::llm_types::ContentBlock;
 use crate::domain::patch_types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -98,6 +99,8 @@ pub struct ProposeTaskInput {
 /// A single question presented to the user (REQ-AUQ-001)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub question: String,
     pub header: String,
     pub options: Vec<QuestionOption>,
@@ -1072,6 +1075,56 @@ pub enum RecoveryResumeTarget {
     ConversationTurn,
     ContinuationSummary { request: ContinuationSummaryRequest },
 }
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QuestionRequestId(String);
+
+impl QuestionRequestId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for QuestionRequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<String> for QuestionRequestId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for QuestionRequestId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl PartialEq<str> for QuestionRequestId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for QuestionRequestId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for QuestionRequestId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1248,7 +1301,7 @@ pub enum ConvState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
-        request_id: String,
+        request_id: QuestionRequestId,
     },
 
     /// Context window exhausted - conversation is read-only
@@ -1351,7 +1404,7 @@ pub enum ParentState {
     AwaitingUserResponse {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
-        request_id: String,
+        request_id: QuestionRequestId,
     },
     ContextExhausted {
         summary: String,

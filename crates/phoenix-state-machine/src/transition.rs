@@ -1984,7 +1984,10 @@ pub fn transition_parent(
             let answers_text = questions
                 .iter()
                 .filter_map(|q| {
-                    let a = answers.get(&q.question)?;
+                    let answer_key = q.id.as_deref().unwrap_or(q.question.as_str());
+                    let a = answers
+                        .get(answer_key)
+                        .or_else(|| answers.get(&q.question))?;
                     let q_text = &q.question;
                     let mut parts = vec![format!("\"{}\" = \"{}\"", q_text, a)];
                     let question_data = questions.iter().find(|qq| qq.question == *q_text);
@@ -1999,7 +2002,9 @@ pub fn transition_parent(
                         }
                     }
                     if let Some(ref anns) = annotations {
-                        if let Some(ann) = anns.get(q_text.as_str()) {
+                        if let Some(ann) =
+                            anns.get(answer_key).or_else(|| anns.get(q_text.as_str()))
+                        {
                             if let Some(ref notes) = ann.notes {
                                 parts.push(format!("user notes: {notes}"));
                             }
@@ -2549,6 +2554,40 @@ pub fn transition_parent(
                     }
                 };
 
+                if input.questions.is_empty() {
+                    let err_msg = "ask_user_question requires at least one question.".to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
+                            "ask_user_question produces exactly one tool_use and one result",
+                        );
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                let questions: Vec<_> = input
+                    .questions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, question)| {
+                        let mut question = question.clone();
+                        question.id = Some(format!("q{}", index + 1));
+                        question
+                    })
+                    .collect();
+
                 let tool_result = ToolResult::success(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
@@ -2565,9 +2604,9 @@ pub fn transition_parent(
 
                 return Ok(
                     ParentTransitionResult::new(ParentState::AwaitingUserResponse {
-                        questions: input.questions.clone(),
+                        questions,
                         tool_use_id: tool.id.clone(),
-                        request_id: uuid::Uuid::new_v4().to_string(),
+                        request_id: uuid::Uuid::new_v4().to_string().into(),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
@@ -5221,7 +5260,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .unwrap();
@@ -5353,7 +5392,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .unwrap();
@@ -5567,7 +5606,7 @@ mod tests {
                 tool_calls: vec![propose_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .expect("sub-agent sole propose_task must produce Ok transition");
@@ -5731,6 +5770,7 @@ mod tests {
             tool_id,
             ToolInput::AskUserQuestion(AskUserQuestionInput {
                 questions: vec![UserQuestion {
+                    id: None,
                     question: "Which library?".to_string(),
                     header: "Dependencies".to_string(),
                     options: vec![
@@ -5774,7 +5814,7 @@ mod tests {
                 tool_calls: vec![tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .unwrap();
@@ -5846,12 +5886,12 @@ mod tests {
         assert_ne!(first_id, next_id);
         for event in [
             Event::UserQuestionResponse {
-                request_id: first_id.clone(),
+                request_id: first_id.as_str().to_string(),
                 answers: std::collections::HashMap::new(),
                 annotations: None,
             },
             Event::UserQuestionDismissed {
-                request_id: first_id.clone(),
+                request_id: first_id.as_str().to_string(),
             },
         ] {
             assert!(transition(&first, &test_context(), event.clone()).is_ok());
@@ -5892,7 +5932,7 @@ mod tests {
                 tool_calls: vec![auq_tool, bash_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         );
 
@@ -5963,7 +6003,7 @@ mod tests {
                 tool_calls: vec![propose_tool, bash_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         );
 
@@ -6024,7 +6064,7 @@ mod tests {
                 tool_calls: vec![propose_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .expect("transition must succeed");
@@ -6089,7 +6129,7 @@ mod tests {
                 tool_calls: vec![auq_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             },
         )
         .expect("transition must succeed");
@@ -6129,7 +6169,7 @@ mod tests {
         let pending = |id: &str| ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: id.to_string(),
-            request_id: id.to_string(),
+            request_id: id.to_string().into(),
         };
         for event in [
             Event::UserQuestionResponse {
@@ -6164,13 +6204,14 @@ mod tests {
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
+                id: None,
                 question: "Which library?".to_string(),
                 header: "Dependencies".to_string(),
                 options: vec![],
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".into(),
         };
 
         let mut answers = std::collections::HashMap::new();
@@ -6180,7 +6221,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
-                request_id: "tool-auq-1".to_string(),
+                request_id: "tool-auq-1".into(),
                 answers,
                 annotations: None,
             },
@@ -6218,20 +6259,21 @@ mod tests {
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
+                id: None,
                 question: "Which library?".to_string(),
                 header: "Dependencies".to_string(),
                 options: vec![],
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".into(),
         };
 
         let result = transition(
             &state,
             &test_context(),
             Event::UserQuestionDismissed {
-                request_id: "tool-auq-1".to_string(),
+                request_id: "tool-auq-1".into(),
             },
         )
         .unwrap();
@@ -6276,13 +6318,14 @@ mod tests {
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
+                id: None,
                 question: "Which library?".to_string(),
                 header: "Dependencies".to_string(),
                 options: vec![],
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".into(),
         };
 
         let result = transition(
@@ -6311,20 +6354,21 @@ mod tests {
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
+                id: None,
                 question: "Which library?".to_string(),
                 header: "Dependencies".to_string(),
                 options: vec![],
                 multi_select: false,
             }],
             tool_use_id: "tool-auq-1".to_string(),
-            request_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".into(),
         };
 
         let dismissed = transition(
             &state,
             &test_context(),
             Event::UserQuestionDismissed {
-                request_id: "tool-auq-1".to_string(),
+                request_id: "tool-auq-1".into(),
             },
         )
         .unwrap();
@@ -6913,7 +6957,7 @@ mod tests {
                 tool_calls: vec![propose_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             }
         }
 
@@ -7225,7 +7269,7 @@ mod tests {
                 tool_calls: vec![propose_tool, bash_tool],
                 end_turn: false,
                 usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
+                request_id: "test-req-id".into(),
             };
 
             let result = transition(&ConvState::LlmRequesting { attempt: 1 }, &ctx, event)

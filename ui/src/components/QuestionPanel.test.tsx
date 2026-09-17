@@ -10,6 +10,10 @@ beforeEach(() => { vi.spyOn(api,'getConversationStatus').mockResolvedValue({conv
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe('QuestionPanel request and draft contract', () => {
+  it('fails closed without throwing when a malformed request has no questions', () => {
+    render(<QuestionPanel {...defaults} questions={[]} />);
+    expect(screen.getByRole('region', {name:'Questions unavailable'})).toHaveTextContent('No questions are available');
+  });
   it('closes open notes before dismissal from another control', () => {
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('button', {name:'Add notes (optional)'}));
@@ -38,7 +42,7 @@ describe('QuestionPanel request and draft contract', () => {
     fireEvent.click(screen.getByRole('button',{name:'Add notes (optional)'}));
     expect(container.querySelector('.question-preview-text pre')).toBe(code);
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    await waitFor(()=>expect(send).toHaveBeenCalledWith('conv','request-1',{'Where to search?':'Code'},{'Where to search?':{preview}}));
+    await waitFor(()=>expect(send).toHaveBeenCalledWith('conv','request-1',{q1:'Code'},{q1:{preview}}));
   });
   it('starts unanswered, derives preview from selection, and includes collapsed notes', async () => {
     const send = vi.spyOn(api, 'respondToQuestion').mockResolvedValue({success:true});
@@ -53,7 +57,7 @@ describe('QuestionPanel request and draft contract', () => {
     fireEvent.change(screen.getByLabelText('Notes for the agent'), {target:{value:'Keep this note'}});
     fireEvent.click(screen.getByRole('button', {name:'Edit notes · included'}));
     fireEvent.click(screen.getByRole('button', {name:'Send answer'}));
-    await waitFor(() => expect(send).toHaveBeenCalledWith('conv','request-1',{'Where to search?':'Family'}, {'Where to search?':{notes:'Keep this note'}}));
+    await waitFor(() => expect(send).toHaveBeenCalledWith('conv','request-1',{q1:'Family'}, {q1:{notes:'Keep this note'}}));
   });
   it('retains Other across selection/navigation and excludes deselected custom drafts', () => {
     render(<QuestionPanel {...defaults} questions={[question, {...question, question:'Second?', header:'Second'}]} />);
@@ -65,6 +69,19 @@ describe('QuestionPanel request and draft contract', () => {
     fireEvent.click(screen.getByRole('button', {name:'Back'}));
     fireEvent.click(screen.getByRole('button', {name:'Edit custom answer'}));
     expect(screen.getByLabelText('Custom answer')).toHaveValue('Custom scope');
+  });
+
+  it('submits duplicate question text under stable per-question ids', async () => {
+    const respond = vi.fn().mockResolvedValue({ success: true });
+    vi.spyOn(api, 'respondToQuestion').mockImplementation(respond);
+    render(<QuestionPanel {...defaults} questions={[{...question, id:'q1'}, {...question, id:'q2', options:[...question.options, {label:'Defer'}]}]} />);
+    fireEvent.click(screen.getByRole('radio', {name:'Current'}));
+    fireEvent.click(screen.getByRole('button', {name:'Next'}));
+    fireEvent.click(screen.getByRole('radio', {name:'Defer'}));
+    fireEvent.click(screen.getByRole('button', {name:'Send answers'}));
+    await waitFor(() => expect(respond).toHaveBeenCalled());
+
+    expect(respond).toHaveBeenCalledWith('conv', 'request-1', {q1:'Current', q2:'Defer'}, {q1:{preview:'current preview'}});
   });
 
   it('keeps question navigation available in short multi-question layouts', () => {
@@ -89,10 +106,13 @@ describe('QuestionPanel request and draft contract', () => {
     const preview = 'Compare this code:\n\n```ts\nconst value = "long code";\n```';
     const {container} = render(<QuestionPanel {...defaults} questions={[{...question, options:[{label:'Code', preview}]}]} />);
     fireEvent.click(screen.getByRole('radio', {name:'Code'}));
+    const collapsedCode = container.querySelector<HTMLElement>('.question-preview-text pre');
+    expect(collapsedCode).toHaveAttribute('tabindex', '-1');
     const disclosure = screen.getByRole('button', {name:'Show full preview'});
     fireEvent.click(disclosure);
     const code = container.querySelector<HTMLElement>('.question-preview-text pre');
     expect(code).toBeTruthy();
+    expect(code).toHaveAttribute('tabindex', '0');
     code!.focus();
     fireEvent.keyDown(code!, {key:'Escape'});
 

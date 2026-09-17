@@ -18488,6 +18488,7 @@ mod steer_drain_detector_tests {
         let id = "question-answer-once";
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![crate::state_machine::state::UserQuestion {
+                id: None,
                 question: "Choice?".into(),
                 header: "Choice".into(),
                 options: vec![],

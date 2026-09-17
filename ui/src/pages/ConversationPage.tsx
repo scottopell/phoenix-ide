@@ -796,6 +796,7 @@ function ConversationPageContent({
     onValidatedSteeringQueued: (messageId) => {
       reconcileAuthoritative([messageId]);
     },
+    isConsumedQuestionRequest: (requestId) => atomRef.current.consumedQuestionRequestIds.includes(requestId),
   });
 
   const isOffline =

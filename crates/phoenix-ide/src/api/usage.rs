@@ -1123,7 +1123,7 @@ mod tests {
 
         let summary = build_ttft_summary(vec![
             UsageRecentLlmMetricRow {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 retry_attempt: 1,
                 created_at: "2025-08-10T01:00:00+00:00".to_string(),
                 provider: "anthropic".to_string(),
@@ -1133,7 +1133,7 @@ mod tests {
                 dispatch_to_first_generation_event_ms: Some(800),
             },
             UsageRecentLlmMetricRow {
-                request_id: "req-2".to_string(),
+                request_id: "req-2".into(),
                 retry_attempt: 1,
                 created_at: "2025-08-10T02:00:00+00:00".to_string(),
                 provider: "anthropic".to_string(),
@@ -1143,7 +1143,7 @@ mod tests {
                 dispatch_to_first_generation_event_ms: None,
             },
             UsageRecentLlmMetricRow {
-                request_id: "req-3".to_string(),
+                request_id: "req-3".into(),
                 retry_attempt: 2,
                 created_at: "2025-08-10T03:00:00+00:00".to_string(),
                 provider: "anthropic".to_string(),
@@ -1153,7 +1153,7 @@ mod tests {
                 dispatch_to_first_generation_event_ms: Some(6_000),
             },
             UsageRecentLlmMetricRow {
-                request_id: "req-4".to_string(),
+                request_id: "req-4".into(),
                 retry_attempt: 2,
                 created_at: "2025-08-11T03:00:00+00:00".to_string(),
                 provider: "openai".to_string(),

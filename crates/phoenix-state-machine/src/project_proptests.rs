@@ -632,7 +632,7 @@ mod random_walk {
                             tool_calls,
                             end_turn: true,
                             usage: Usage::default(),
-                            request_id: "test-req-id".to_string(),
+                            request_id: "test-req-id".into(),
                         }
                     }
                     1 => {
@@ -864,13 +864,13 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
-                            request_id: request_id.clone(),
+                            request_id: request_id.as_str().to_string(),
                             answers,
                             annotations: None,
                         }
                     }
                     _ => Event::UserQuestionDismissed {
-                        request_id: request_id.clone(),
+                        request_id: request_id.as_str().to_string(),
                     },
                 }
             }
@@ -1104,7 +1104,7 @@ mod random_walk {
                         tool_calls: vec![tc],
                         end_turn: true,
                         usage: Usage::default(),
-                        request_id: "test-req-id".to_string(),
+                        request_id: "test-req-id".into(),
                     }
                 } else {
                     generate_valid_event(&state, &mut rng)

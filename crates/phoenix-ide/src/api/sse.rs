@@ -671,7 +671,7 @@ mod tests {
             SseEvent::Token {
                 sequence_id: 43,
                 text: "Hel".to_string(),
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
             },
             SseEvent::StateChange {
                 sequence_id: 44,
@@ -1302,7 +1302,7 @@ mod tests {
         let _ = broadcaster.send_seq(|seq| SseEvent::Token {
             sequence_id: seq,
             text: "x".to_string(),
-            request_id: "r".to_string(),
+            request_id: "r".into(),
         });
         // A persisted Message reaches the broadcaster — anchor advances,
         // ring clears.

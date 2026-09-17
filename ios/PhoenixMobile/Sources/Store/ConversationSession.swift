@@ -480,6 +480,7 @@ final class ConversationSession {
         var phase: QuestionAttemptPhase = .sending
     }
     private var actionAttempt: ActionAttempt?
+    private var consumedQuestionRequestIds: Set<String> = []
     var actionInFlight: ConversationAction? { actionAttempt?.action }
 
     var questionResolvedWaitingForStream: Bool {
@@ -621,13 +622,15 @@ final class ConversationSession {
                     try await api.dismissQuestion(conversationId: conversationId, requestId: requestId)
                 }
                 guard actionAttempt?.token == token else { return }
-                if action.questionRequestId != nil {
+                if let requestId = action.questionRequestId {
+                    consumedQuestionRequestIds.insert(requestId)
                     await resolveQuestionOperation(token: token)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }
-                if action.questionRequestId != nil,
+                if let requestId = action.questionRequestId,
                    (error as? APIError)?.isStaleQuestionRejection == true {
+                    consumedQuestionRequestIds.insert(requestId)
                     await resolveQuestionOperation(token: token)
                     return
                 }
@@ -893,7 +896,11 @@ final class ConversationSession {
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
+            if case .awaitingUserResponse(let requestId, _) = ConversationState.parse(state), consumedQuestionRequestIds.contains(requestId) {
+                return
+            }
             cancelNeedsAgentDoneFallback = false
+
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state

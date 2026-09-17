@@ -522,6 +522,7 @@ export interface SubAgentResult {
 }
 
 export interface UserQuestion {
+  id?: string;
   question: string;
   header: string;
   options: QuestionOption[];

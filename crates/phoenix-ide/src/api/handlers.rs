@@ -11245,7 +11245,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .send_seq(|seq| SseEvent::Token {
                 sequence_id: seq,
                 text: "token-a".to_string(),
-                request_id: "req".to_string(),
+                request_id: "req".into(),
             })
             .expect("token-a");
         handle
@@ -11253,7 +11253,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .send_seq(|seq| SseEvent::Token {
                 sequence_id: seq,
                 text: "token-b".to_string(),
-                request_id: "req".to_string(),
+                request_id: "req".into(),
             })
             .expect("token-b");
 
@@ -13349,7 +13349,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "tool-question".to_string(),
-                    request_id: "tool-question".to_string(),
+                    request_id: "tool-question".into(),
                 },
             )
             .await

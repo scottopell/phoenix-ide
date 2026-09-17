@@ -161,6 +161,8 @@ interface UseConnectionOptions {
   onValidatedInit?: (payload: InitPayload) => void;
   /** Called when a validated live event transfers one steering identity to server authority. */
   onValidatedSteeringQueued?: (messageId: string) => void;
+  /** Reject stale question-state side effects before notification/ref mutation. */
+  isConsumedQuestionRequest?: (requestId: string) => boolean;
 }
 
 function buildStreamUrl(
@@ -228,6 +230,7 @@ export function useConnection({
   getTranscriptGeneration,
   onValidatedInit,
   onValidatedSteeringQueued,
+  isConsumedQuestionRequest,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -261,6 +264,7 @@ export function useConnection({
   const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
   const onValidatedInitRef = useRef(onValidatedInit);
   const onValidatedSteeringQueuedRef = useRef(onValidatedSteeringQueued);
+  const isConsumedQuestionRequestRef = useRef(isConsumedQuestionRequest);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -285,6 +289,10 @@ export function useConnection({
   useEffect(() => {
     onValidatedSteeringQueuedRef.current = onValidatedSteeringQueued;
   }, [onValidatedSteeringQueued]);
+
+  useEffect(() => {
+    isConsumedQuestionRequestRef.current = isConsumedQuestionRequest;
+  }, [isConsumedQuestionRequest]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -503,19 +511,24 @@ export function useConnection({
               res.data.error && parsedPhase.type === 'error'
                 ? { ...parsedPhase, error: res.data.error }
                 : parsedPhase;
-            notifyConversationStateChange(
-              latestConversationRef.current
-                ? { ...latestConversationRef.current, state: nextPhase }
-                : null,
-              latestPhaseRef.current,
-              nextPhase,
-            );
-            latestPhaseRef.current = nextPhase;
-            if (latestConversationRef.current) {
-              latestConversationRef.current = {
-                ...latestConversationRef.current,
-                state: nextPhase,
-              };
+              const suppressStateSideEffects = nextPhase.type === 'awaiting_user_response'
+                && (isConsumedQuestionRequestRef.current?.(nextPhase.request_id) ?? false);
+
+            if (!suppressStateSideEffects) {
+              notifyConversationStateChange(
+                latestConversationRef.current
+                  ? { ...latestConversationRef.current, state: nextPhase }
+                  : null,
+                latestPhaseRef.current,
+                nextPhase,
+              );
+              latestPhaseRef.current = nextPhase;
+              if (latestConversationRef.current) {
+                latestConversationRef.current = {
+                  ...latestConversationRef.current,
+                  state: nextPhase,
+                };
+              }
             }
             stampedDispatch({
               type: 'sse_state_change',

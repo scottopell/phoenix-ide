@@ -7001,7 +7001,7 @@ mod broadcaster_tests {
         let _ = b.send_seq(|seq| SseEvent::Token {
             sequence_id: seq,
             text: "x".to_string(),
-            request_id: "r".to_string(),
+            request_id: "r".into(),
         });
         // Then the eager assistant message.
         let _ = b.send_ephemeral_message(test_message(3, "eager"));

@@ -237,6 +237,7 @@ fn arb_user_question() -> impl Strategy<Value = state::UserQuestion> {
         ),
     )
         .prop_map(|(question, header, options)| state::UserQuestion {
+            id: None,
             question,
             header,
             options,
@@ -254,7 +255,7 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
             |(questions, tool_use_id, request_id)| ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-                request_id,
+                request_id: request_id.into(),
             },
         )
 }
@@ -323,7 +324,7 @@ fn arb_llm_response_event() -> impl Strategy<Value = Event> {
             tool_calls,
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         }
     })
 }
@@ -371,7 +372,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
-            request_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".into(),
             answers,
             annotations: None,
         }
@@ -401,7 +402,7 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         arb_task_approval_event(),
         arb_user_question_response_event(),
         Just(Event::UserQuestionDismissed {
-            request_id: "tool-auq-1".to_string()
+            request_id: "tool-auq-1".into()
         }),
         arb_grace_turn_exhausted_event(),
     ]
@@ -735,7 +736,7 @@ proptest! {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &test_context(), event);
@@ -764,7 +765,7 @@ proptest! {
             tool_calls: tool_calls.clone(),
             end_turn: false,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         };
 
         let result = transition(&state, &test_context(), event);
@@ -1140,7 +1141,7 @@ fn test_complete_tool_cycle() {
             tool_calls: vec![tool.clone()],
             end_turn: false,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         },
     )
     .unwrap();
@@ -1177,7 +1178,7 @@ fn test_complete_tool_cycle() {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         },
     )
     .unwrap();
@@ -1229,7 +1230,7 @@ fn test_retry_cycle() {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         },
     )
     .unwrap();
@@ -1287,7 +1288,7 @@ fn test_multi_tool_chain() {
             tool_calls: vec![tool1.clone(), tool2.clone(), tool3.clone()],
             end_turn: false,
             usage: Usage::default(),
-            request_id: "test-req-id".to_string(),
+            request_id: "test-req-id".into(),
         },
     )
     .unwrap();
@@ -1999,7 +2000,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                     tool_calls,
                     end_turn: true,
                     usage: Usage::default(),
-                    request_id: "test-req-id".to_string(),
+                    request_id: "test-req-id".into(),
                 }
             }
             1 => LlmOutcome::RateLimited {

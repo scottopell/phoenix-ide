@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useId, type KeyboardEvent, type CSSProperties, type ReactNode } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useId, useMemo, type KeyboardEvent, type CSSProperties, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api, QuestionMutationError, type UserQuestion, type ConversationState } from '../api';
 import { useRegisterFocusScope, useFocusScope } from '../hooks/useFocusScope';
@@ -18,8 +18,8 @@ type Operation = { kind: 'answer'; payload: ReturnType<typeof answerPayload> } |
 type Submission = { kind: 'editing' } | { kind: 'sending'; operation: Operation }
   | { kind: 'uncertain'; operation: Operation; checked: boolean; message: string }
   | { kind: 'resolved'; operation: Operation; message: string };
-const previewComponents = {
-  pre: ({children}: {children?: ReactNode}) => <pre tabIndex={0} role="region" aria-label="Preview code" onKeyDown={event => {
+const previewComponents = (previewOpen: boolean) => ({
+  pre: ({children}: {children?: ReactNode}) => <pre tabIndex={previewOpen ? 0 : -1} role="region" aria-label="Preview code" onKeyDown={event => {
     if (event.altKey || event.ctrlKey || event.metaKey || event.currentTarget.scrollWidth <= event.currentTarget.clientWidth) return;
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault(); event.stopPropagation();
@@ -27,7 +27,8 @@ const previewComponents = {
     if (event.key === 'Home' || event.key === 'End') element.scrollTo({left: event.key === 'Home' ? 0 : element.scrollWidth});
     else element.scrollBy({left: event.key === 'ArrowRight' ? 40 : -40});
   }}>{children}</pre>,
-};
+});
+const questionIdentity = (question: UserQuestion, index: number) => question.id ?? `q${index + 1}`;
 
 export function QuestionPanel(props: QuestionPanelProps) {
   if (props.readOnly) return <section className="question-panel question-panel--readonly" aria-label="Questions (read only)">
@@ -35,6 +36,9 @@ export function QuestionPanel(props: QuestionPanelProps) {
       <ReactMarkdown>{question.question}</ReactMarkdown><ul>{question.options.map(option => <li key={option.label}>
         <strong>{option.label}</strong>{option.description && <p>{option.description}</p>}{option.preview && !question.multiSelect && <pre>{option.preview}</pre>}
       </li>)}</ul></section>)}
+  </section>;
+  if (props.questions.length === 0) return <section className="question-panel question-panel--invalid" aria-label="Questions unavailable">
+    <strong>No questions are available for this request.</strong>
   </section>;
   return <ActiveQuestionPanel key={`${props.conversationId}:${props.requestId}`} {...props} />;
 }
@@ -66,7 +70,8 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
   const [expanded, setExpanded] = useState(false);
   const [bounds, setBounds] = useState({ width: 1000, height: 700, previewFits: true });
   const question = questions[step];
-  const draft = drafts[step];
+  const draft = drafts[step]!;
+  const markdownPreviewComponents = useMemo(() => previewComponents(draft.previewOpen), [draft.previewOpen]);
   const locked = submission.kind !== 'editing';
   const allAnswered = questions.every((q, i) => isAnswered(q, drafts[i]!));
   const last = step === questions.length - 1;
@@ -262,7 +267,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
     }}>
     <header className="question-context"><strong>{questions.length > 1 ? `Question ${step + 1} of ${questions.length} · ` : ''}{question.header}</strong>
       {bounds.width >= 480 && <button type="button" disabled={locked} onClick={() => setExpanded(value => !value)}>{expanded ? 'Restore conversation' : 'Expand questions'}</button>}
-      {questions.length > 1 && <nav aria-label="Questions">{questions.map((q, i) => <button type="button" key={q.question} disabled={locked}
+      {questions.length > 1 && <nav aria-label="Questions">{questions.map((q, i) => <button type="button" key={questionIdentity(q, i)} disabled={locked}
         aria-current={step === i ? 'step' : undefined} aria-label={`${q.header}, ${isAnswered(q, drafts[i]!) ? 'answered' : 'unanswered'}`} onClick={() => setStep(i)}>
         {isAnswered(q, drafts[i]!) ? '✓ ' : ''}{q.header}</button>)}</nav>}
     </header>
@@ -303,7 +308,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
           </fieldset>
           {previewMode && <section ref={previewRef} className={`question-preview-pane${bounds.previewFits ? ' question-preview-pane--sticky' : ''}`} aria-label="Selected option preview">
             <h3 tabIndex={-1}>Preview{choice ? ` — ${choice.label}` : otherSelected ? ' — Other' : ''}</h3>
-            {preview ? <><div ref={previewTextRef} className={`question-preview-text${draft.previewOpen ? '' : ' question-preview-text--collapsed'}`}><ReactMarkdown components={previewComponents}>{preview}</ReactMarkdown></div>
+            {preview ? <><div ref={previewTextRef} className={`question-preview-text${draft.previewOpen ? '' : ' question-preview-text--collapsed'}`}><ReactMarkdown components={markdownPreviewComponents}>{preview}</ReactMarkdown></div>
               {previewOverflow && <button ref={previewDisclosureRef} type="button" disabled={locked} onClick={() => update(value => ({ ...value, previewOpen: !value.previewOpen }))} aria-expanded={draft.previewOpen}>{draft.previewOpen ? 'Show less' : 'Show full preview'}</button>}</>
               : <p>{otherSelected ? 'Your custom answer will be sent.' : choice ? 'No preview for this option.' : 'Choose an option to view its preview.'}</p>}
           </section>}
