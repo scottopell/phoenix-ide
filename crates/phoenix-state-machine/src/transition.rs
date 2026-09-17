@@ -5570,7 +5570,7 @@ mod tests {
     #[test]
     fn coordinator_ask_user_question_rejects_other_sentinel_label_before_waiting() {
         let result =
-            coordinator_invalid_option_label_result("__other__", "coordinator-auq-sentinel")
+            coordinator_invalid_option_label_result(" __other__ ", "coordinator-auq-sentinel")
                 .expect("reserved sentinel label returns a tool error");
 
         assert_invalid_auq_label_result(
@@ -5586,6 +5586,38 @@ mod tests {
             .expect("blank option label returns a tool error");
 
         assert_invalid_auq_label_result(&result, "empty option label", "blank option label");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_whitespace_other_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result(" Other ", "coordinator-auq-other-spaced")
+                .expect("reserved display label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `Other`",
+            "reserved display label",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_label_over_five_words_before_waiting() {
+        let result = coordinator_invalid_option_label_result(
+            "one two three four five six",
+            "coordinator-auq-long-label",
+        )
+        .expect("long option label returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "exceeds 5 words", "long option label");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_long_header_before_waiting() {
+        let result = coordinator_invalid_header_result("TooLongHeader")
+            .expect("long header returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "header exceeds 12 characters", "long header");
     }
 
     fn coordinator_invalid_option_label_result(
@@ -5637,6 +5669,58 @@ mod tests {
                 end_turn: false,
                 usage: Usage::default(),
                 request_id: request_id.into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_header_result(
+        header: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-long-header",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": header,
+                            "options": [{ "label": "A" }, { "label": "B" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-long-header",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: header.to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-long-header".into(),
             },
         )
     }

@@ -138,9 +138,10 @@ impl AskUserQuestionInput {
     /// # Errors
     ///
     /// Returns a human-readable tool error when the question count is outside
-    /// 1-4, a question has outside 2-4 options, question text is duplicated, an
-    /// option label is empty or duplicated within a question, or an option uses
-    /// a UI-reserved label.
+    /// 1-4, question/header text is empty, a header exceeds 12 characters, a
+    /// question has outside 2-4 options, question text is duplicated, an option
+    /// label is empty, too long, or duplicated within a question, or an option
+    /// uses a UI-reserved label.
     pub fn validate(&self) -> Result<(), String> {
         if self.questions.is_empty() || self.questions.len() > 4 {
             return Err(format!(
@@ -152,6 +153,21 @@ impl AskUserQuestionInput {
         let mut question_texts = std::collections::HashSet::new();
         for (question_index, question) in self.questions.iter().enumerate() {
             let question_number = question_index + 1;
+            if question.question.trim().is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty question text"
+                ));
+            }
+            if question.header.trim().is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty header"
+                ));
+            }
+            if question.header.chars().count() > 12 {
+                return Err(format!(
+                    "ask_user_question question {question_number} header exceeds 12 characters"
+                ));
+            }
             if !question_texts.insert(question.question.as_str()) {
                 return Err(format!(
                     "ask_user_question question {question_number} duplicates question text `{}`",
@@ -167,18 +183,24 @@ impl AskUserQuestionInput {
 
             let mut option_labels = std::collections::HashSet::new();
             for option in &question.options {
-                if option.label.trim().is_empty() {
+                let label = option.label.trim();
+                if label.is_empty() {
                     return Err(format!(
                         "ask_user_question question {question_number} has an empty option label"
                     ));
                 }
-                if matches!(option.label.as_str(), "Other" | "__other__") {
+                let label_word_count = label.split_whitespace().count();
+                if label_word_count > 5 {
                     return Err(format!(
-                        "ask_user_question question {question_number} uses reserved option label `{}`",
-                        option.label
+                        "ask_user_question question {question_number} option label `{label}` exceeds 5 words"
                     ));
                 }
-                if !option_labels.insert(option.label.as_str()) {
+                if matches!(label, "Other" | "__other__") {
+                    return Err(format!(
+                        "ask_user_question question {question_number} uses reserved option label `{label}`"
+                    ));
+                }
+                if !option_labels.insert(label) {
                     return Err(format!(
                         "ask_user_question question {question_number} duplicates option label `{}`",
                         option.label

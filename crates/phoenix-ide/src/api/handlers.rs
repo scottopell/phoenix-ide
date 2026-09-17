@@ -5654,10 +5654,62 @@ async fn continue_conversation(
 
 #[derive(Deserialize)]
 struct RespondToQuestionPayload {
+    tool_use_id: String,
     answers: std::collections::HashMap<String, String>,
     #[serde(default)]
     annotations:
         Option<std::collections::HashMap<String, crate::state_machine::state::QuestionAnnotation>>,
+}
+
+#[derive(Deserialize)]
+struct DismissQuestionPayload {
+    tool_use_id: String,
+}
+
+fn validate_question_action_tool_use_id(expected: &str, supplied: &str) -> Result<(), AppError> {
+    if supplied != expected {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Question action does not match the current pending question",
+            "stale_question_action",
+        ))));
+    }
+    Ok(())
+}
+
+fn validate_question_answers(
+    questions: &[crate::state_machine::state::UserQuestion],
+    answers: &std::collections::HashMap<String, String>,
+) -> Result<(), AppError> {
+    if answers.len() != questions.len() {
+        return Err(AppError::BadRequest(
+            "Question response must answer every pending question exactly once".to_string(),
+        ));
+    }
+    for question in questions {
+        let answer = answers.get(&question.question).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "Question response is missing answer for `{}`",
+                question.question
+            ))
+        })?;
+        if answer.trim().is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "Question response answer for `{}` must not be blank",
+                question.question
+            )));
+        }
+    }
+    for supplied in answers.keys() {
+        if !questions
+            .iter()
+            .any(|question| question.question == *supplied)
+        {
+            return Err(AppError::BadRequest(format!(
+                "Question response contains unknown question `{supplied}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn respond_to_question(
@@ -5679,12 +5731,18 @@ async fn respond_to_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+    let ConvState::AwaitingUserResponse {
+        questions,
+        tool_use_id,
+    } = &conv.state
+    else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
-    }
+    };
+    validate_question_action_tool_use_id(tool_use_id, &req.tool_use_id)?;
+    validate_question_answers(questions, &req.answers)?;
 
     require_ordinary_mutation_admission(&state, &id, "question response").await?;
 
@@ -5706,6 +5764,7 @@ async fn respond_to_question(
 async fn dismiss_question(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Json(req): Json<DismissQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state
         .runtime
@@ -5721,12 +5780,13 @@ async fn dismiss_question(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+    let ConvState::AwaitingUserResponse { tool_use_id, .. } = &conv.state else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
-    }
+    };
+    validate_question_action_tool_use_id(tool_use_id, &req.tool_use_id)?;
 
     require_ordinary_mutation_admission(&state, &id, "question dismissal").await?;
 
@@ -12935,6 +12995,7 @@ pub(crate) mod hard_delete_cascade_tests {
             State(state.clone()),
             Path(coordinator.id.clone()),
             Json(RespondToQuestionPayload {
+                tool_use_id: "auq-coordinator-1".to_string(),
                 answers: std::collections::HashMap::from([(
                     "Which path?".to_string(),
                     "A".to_string(),
@@ -12965,6 +13026,7 @@ pub(crate) mod hard_delete_cascade_tests {
             State(state.clone()),
             Path(coordinator.id.clone()),
             Json(RespondToQuestionPayload {
+                tool_use_id: "auq-coordinator-1".to_string(),
                 answers: std::collections::HashMap::from([(
                     "Which path?".to_string(),
                     "B".to_string(),
@@ -13005,9 +13067,15 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("persist waiting coordinator state");
 
-        let Json(success) = dismiss_question(State(state.clone()), Path(coordinator.id.clone()))
-            .await
-            .expect("Coordinator dismissal uses ordinary AUQ admission");
+        let Json(success) = dismiss_question(
+            State(state.clone()),
+            Path(coordinator.id.clone()),
+            Json(DismissQuestionPayload {
+                tool_use_id: "auq-coordinator-dismiss".to_string(),
+            }),
+        )
+        .await
+        .expect("Coordinator dismissal uses ordinary AUQ admission");
         assert!(success.success);
 
         let conv = state
@@ -13016,6 +13084,181 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("load coordinator");
         assert!(matches!(conv.state, ConvState::Idle));
+    }
+
+    async fn coordinator_waiting_for_two_questions(state: &AppState, tool_use_id: &str) -> String {
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create coordinator");
+        state
+            .db
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![
+                        crate::state_machine::state::UserQuestion {
+                            question: "First?".to_string(),
+                            header: "First".to_string(),
+                            options: vec![],
+                            multi_select: false,
+                        },
+                        crate::state_machine::state::UserQuestion {
+                            question: "Second?".to_string(),
+                            header: "Second".to_string(),
+                            options: vec![],
+                            multi_select: false,
+                        },
+                    ],
+                    tool_use_id: tool_use_id.to_string(),
+                },
+            )
+            .await
+            .expect("persist waiting coordinator state");
+        coordinator.id
+    }
+
+    async fn assert_still_waiting_for_tool(
+        state: &AppState,
+        conversation_id: &str,
+        expected: &str,
+    ) {
+        let conv = state
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .expect("load conversation");
+        assert!(matches!(
+            conv.state,
+            ConvState::AwaitingUserResponse { ref tool_use_id, .. } if tool_use_id == expected
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_response_rejects_stale_tool_use_id_without_mutating_current_wait()
+    {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q2-tool").await;
+
+        let err = respond_to_question(
+            State(state.clone()),
+            Path(conversation_id.clone()),
+            Json(RespondToQuestionPayload {
+                tool_use_id: "q1-tool".to_string(),
+                answers: std::collections::HashMap::from([
+                    ("First?".to_string(), "A".to_string()),
+                    ("Second?".to_string(), "B".to_string()),
+                ]),
+                annotations: None,
+            }),
+        )
+        .await
+        .expect_err("stale answer tool_use_id must be rejected");
+
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "stale_question_action"),
+            other => panic!("expected stale question action conflict, got {other:?}"),
+        }
+        assert_still_waiting_for_tool(&state, &conversation_id, "q2-tool").await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_dismissal_rejects_stale_tool_use_id_without_mutating_current_wait(
+    ) {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q2-tool").await;
+
+        let err = dismiss_question(
+            State(state.clone()),
+            Path(conversation_id.clone()),
+            Json(DismissQuestionPayload {
+                tool_use_id: "q1-tool".to_string(),
+            }),
+        )
+        .await
+        .expect_err("stale dismissal tool_use_id must be rejected");
+
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "stale_question_action"),
+            other => panic!("expected stale question action conflict, got {other:?}"),
+        }
+        assert_still_waiting_for_tool(&state, &conversation_id, "q2-tool").await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_response_rejects_missing_empty_and_extra_answers_without_mutating_wait(
+    ) {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q-tool").await;
+
+        for (answers, expected) in [
+            (
+                std::collections::HashMap::from([("First?".to_string(), "A".to_string())]),
+                "every pending question",
+            ),
+            (
+                std::collections::HashMap::from([
+                    ("First?".to_string(), "A".to_string()),
+                    ("Second?".to_string(), "   ".to_string()),
+                ]),
+                "must not be blank",
+            ),
+            (
+                std::collections::HashMap::from([
+                    ("First?".to_string(), "A".to_string()),
+                    ("Second?".to_string(), "B".to_string()),
+                    ("Third?".to_string(), "C".to_string()),
+                ]),
+                "every pending question",
+            ),
+        ] {
+            let err = respond_to_question(
+                State(state.clone()),
+                Path(conversation_id.clone()),
+                Json(RespondToQuestionPayload {
+                    tool_use_id: "q-tool".to_string(),
+                    answers,
+                    annotations: None,
+                }),
+            )
+            .await
+            .expect_err("malformed answer map must be rejected");
+            match err {
+                AppError::BadRequest(message) => assert!(
+                    message.contains(expected),
+                    "expected bad request containing {expected:?}, got {message:?}"
+                ),
+                other => panic!("expected bad request, got {other:?}"),
+            }
+            assert_still_waiting_for_tool(&state, &conversation_id, "q-tool").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_response_accepts_complete_exact_multi_question_answers() {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q-tool").await;
+
+        let Json(success) = respond_to_question(
+            State(state.clone()),
+            Path(conversation_id.clone()),
+            Json(RespondToQuestionPayload {
+                tool_use_id: "q-tool".to_string(),
+                answers: std::collections::HashMap::from([
+                    ("First?".to_string(), "A".to_string()),
+                    ("Second?".to_string(), "B".to_string()),
+                ]),
+                annotations: None,
+            }),
+        )
+        .await
+        .expect("complete exact answer map should resume");
+        assert!(success.success);
+        wait_for_state_matching(&state, &conversation_id, |state| {
+            matches!(state, ConvState::Idle | ConvState::LlmRequesting { .. })
+        })
+        .await;
     }
 
     #[tokio::test]
