@@ -5,7 +5,10 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
-use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+use phoenix_core::domain::product_conversation::{
+    OrdinaryProductConversationLifecycle, ProductConversationId,
+    ProjectCoordinatorProfileWriteError,
+};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -20,13 +23,15 @@ use super::types::{
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView,
+    ProductConversationWorkIdentityView, ProjectCoordinatorProfileView,
+    ProjectCoordinatorProfileWriteRequest,
 };
 use super::AppState;
 use crate::db::{
     DbError, ProductConversationAggregate, ProductConversationHandoff,
     ProductConversationListProjection, ProductConversationSegment,
     ProductConversationSegmentCeiling, ProductConversationSource, ProductConversationSourceKind,
+    ProjectCoordinatorProfileWriteDbError, ProjectCoordinatorProfileWriteOutcome,
 };
 use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
@@ -128,6 +133,58 @@ pub async fn list_product_conversation_creations(
         product_creations: rows,
         next_cursor,
     }))
+}
+
+pub async fn put_project_coordinator_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ProjectCoordinatorProfileWriteRequest>,
+) -> Result<Json<Option<ProjectCoordinatorProfileView>>, AppError> {
+    let product_conversation_id = ProductConversationId::parse(&id)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let charter = request.enabled.then_some(request.charter.as_str());
+    match state
+        .db
+        .write_project_coordinator_profile(
+            &product_conversation_id,
+            charter,
+            request.expected_revision,
+        )
+        .await
+    {
+        Ok(ProjectCoordinatorProfileWriteOutcome::Saved(profile)) => {
+            Ok(Json(Some(ProjectCoordinatorProfileView {
+                charter: profile.charter,
+                revision: profile.revision,
+                updated_at_unix_micros: profile.updated_at_unix_micros,
+            })))
+        }
+        Ok(ProjectCoordinatorProfileWriteOutcome::Disabled) => Ok(Json(None)),
+        Err(ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::InvalidCharter,
+        )) => Err(AppError::BadRequest(
+            "charter must be at most 32768 UTF-8 bytes and contain no NUL".to_string(),
+        )),
+        Err(ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::NotOrdinary,
+        )) => Err(AppError::BadRequest(
+            "Project Coordinator profile requires an ordinary ProductConversation".to_string(),
+        )),
+        Err(ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::RevisionConflict,
+        )) => Err(AppError::Conflict(Box::new(
+            super::types::ConflictErrorResponse::new(
+                "Project Coordinator profile changed in another editor",
+                "project_coordinator_revision_conflict",
+            ),
+        ))),
+        Err(ProjectCoordinatorProfileWriteDbError::Database(error)) => {
+            tracing::error!(%error, "failed to persist Project Coordinator profile");
+            Err(AppError::Internal(
+                "failed to persist Project Coordinator profile".to_string(),
+            ))
+        }
+    }
 }
 
 pub async fn get_product_conversation(
@@ -325,10 +382,16 @@ async fn snapshot_view(
         .iter()
         .map(|segment| segment_view(segment, &messages, &boundary_message_ids))
         .collect();
+    let project_coordinator_profile =
+        project_coordinator_profile_view(state, aggregate.product_conversation.id()).await?;
     Ok(ProductConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
         close,
+        project_coordinator_eligible: matches!(
+            aggregate.product_conversation.kind(),
+            phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary
+        ),
 
         requested_transcript_row_id,
         canonical_root: transcript_row_view(&aggregate.root),
@@ -356,6 +419,7 @@ async fn snapshot_view(
                 .is_some(),
             &latest_id,
         ),
+        project_coordinator_profile,
         work_identity: work_identity(&aggregate),
         source,
         chain_qa_compatibility: (aggregate.segments.len() > 1).then(|| {
@@ -375,6 +439,22 @@ async fn snapshot_view(
         }),
         has_older,
     })
+}
+
+async fn project_coordinator_profile_view(
+    state: &AppState,
+    product_conversation_id: &ProductConversationId,
+) -> Result<Option<ProjectCoordinatorProfileView>, AppError> {
+    Ok(state
+        .db
+        .get_project_coordinator_profile(product_conversation_id)
+        .await
+        .map_err(db_to_app)?
+        .map(|profile| ProjectCoordinatorProfileView {
+            charter: profile.charter,
+            revision: profile.revision,
+            updated_at_unix_micros: profile.updated_at_unix_micros,
+        }))
 }
 
 type AggregatePageMessages =
@@ -791,6 +871,103 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    async fn put_profile(
+        state: &AppState,
+        product_conversation_id: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/api/product-conversations/{product_conversation_id}/project-coordinator-profile"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_coordinator_profile_api_saves_conflicts_clears_and_bounds() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation(
+                "profile-api",
+                "Profile API",
+                "/tmp",
+                true,
+                None,
+                Some("test"),
+            )
+            .await
+            .unwrap();
+        let product_id = conversation.product_conversation_id;
+
+        let saved = put_profile(
+            &state,
+            product_id.as_str(),
+            serde_json::json!({
+                "enabled": true,
+                "charter": "  exact charter\n",
+                "expected_revision": null
+            }),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(saved.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(saved["charter"], "  exact charter\n");
+        assert_eq!(saved["revision"], 1);
+
+        let conflict = put_profile(
+            &state,
+            product_id.as_str(),
+            serde_json::json!({
+                "enabled": true,
+                "charter": "stale",
+                "expected_revision": 0
+            }),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        for invalid in ["nul\0charter".to_string(), "é".repeat(16_385)] {
+            let bounded = put_profile(
+                &state,
+                product_id.as_str(),
+                serde_json::json!({
+                    "enabled": true,
+                    "charter": invalid,
+                    "expected_revision": 1
+                }),
+            )
+            .await;
+            assert_eq!(bounded.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let cleared = put_profile(
+            &state,
+            product_id.as_str(),
+            serde_json::json!({
+                "enabled": false,
+                "charter": "ignored on clear",
+                "expected_revision": 1
+            }),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared: serde_json::Value =
+            serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(cleared, serde_json::Value::Null);
+    }
 
     async fn create_completed_continuation(
         state: &AppState,

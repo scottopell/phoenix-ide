@@ -669,6 +669,93 @@ function RecallDisclosure({
   );
 }
 
+function ProjectCoordinatorSettings({
+  snapshot,
+  onSaved,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  onSaved: () => void;
+}) {
+  const profile = snapshot.project_coordinator_profile;
+  const [open, setOpen] = useState(false);
+  const [enabled, setEnabled] = useState(profile != null);
+  const [charter, setCharter] = useState(profile?.charter ?? '');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reset = useCallback(() => {
+    setEnabled(profile != null);
+    setCharter(profile?.charter ?? '');
+    setError(null);
+  }, [profile]);
+  const dirty = enabled !== (profile != null) || charter !== (profile?.charter ?? '');
+  const charterBytes = new TextEncoder().encode(charter).length;
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!dirty || saving || charterBytes > 32_768) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await api.putProjectCoordinatorProfile(snapshot.product_conversation_id, {
+        enabled,
+        charter,
+        expected_revision: profile?.revision ?? null,
+      });
+      setOpen(false);
+      onSaved();
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Failed to save Project Coordinator profile');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details
+      className="product-conversation-page__coordinator-settings"
+      open={open}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        setOpen(nextOpen);
+        if (nextOpen) reset();
+      }}
+    >
+      <summary>Coordinator {profile ? '✓' : '+'}</summary>
+      <form onSubmit={(event) => void save(event)}>
+        <label className="product-conversation-page__coordinator-toggle">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => setEnabled(event.target.checked)}
+            disabled={saving}
+          />
+          Use Project Coordinator guidance
+        </label>
+        <label htmlFor="project-coordinator-charter">Charter</label>
+        <textarea
+          id="project-coordinator-charter"
+          value={charter}
+          onChange={(event) => setCharter(event.target.value)}
+          disabled={!enabled || saving}
+          rows={8}
+          aria-describedby="project-coordinator-charter-help"
+        />
+        <p id="project-coordinator-charter-help">
+          Plain text loaded fresh for every turn. Not editable by assistant tools or chat. {charterBytes.toLocaleString()} / 32,768 bytes.
+        </p>
+        {charterBytes > 32_768 && <p role="alert">Charter exceeds 32,768 UTF-8 bytes.</p>}
+        {error && <p role="alert">{error}</p>}
+        <div className="product-conversation-page__coordinator-actions">
+          <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
+          <button type="submit" className="btn-primary" disabled={!dirty || saving || charterBytes > 32_768}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+    </details>
+  );
+}
+
 function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView['source']>): string {
   switch (source.relation) {
     case 'approved_task':
@@ -681,11 +768,13 @@ function ProductConversationHeader({
   productConversationId,
   messages,
   recallDisabled,
+  onCoordinatorProfileSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
+  onCoordinatorProfileSaved: () => void;
 }) {
   const source = snapshot.source;
   return (
@@ -715,6 +804,9 @@ function ProductConversationHeader({
             messages={messages}
             disabled={recallDisabled}
           />
+        )}
+        {snapshot.project_coordinator_eligible && (
+          <ProjectCoordinatorSettings snapshot={snapshot} onSaved={onCoordinatorProfileSaved} />
         )}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
@@ -1076,6 +1168,7 @@ function ProductConversationPageInner() {
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
+        onCoordinatorProfileSaved={() => setSnapshotRetry((retry) => retry + 1)}
       />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">

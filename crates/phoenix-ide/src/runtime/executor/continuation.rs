@@ -12,13 +12,16 @@ mod evaluation;
 
 pub(super) enum CompactionPolicy {
     Work,
+    ProjectCoordinator,
     Coordinator,
 }
 
 impl CompactionPolicy {
-    pub(super) fn for_coordinator(is_coordinator: bool) -> Self {
+    pub(super) fn for_profile(is_coordinator: bool, is_project_coordinator: bool) -> Self {
         if is_coordinator {
             Self::Coordinator
+        } else if is_project_coordinator {
+            Self::ProjectCoordinator
         } else {
             Self::Work
         }
@@ -26,7 +29,7 @@ impl CompactionPolicy {
 
     pub(super) fn system_prompt(&self) -> &'static str {
         match self {
-            Self::Work => CONTINUATION_SYSTEM_PROMPT,
+            Self::Work | Self::ProjectCoordinator => CONTINUATION_SYSTEM_PROMPT,
             Self::Coordinator => COORDINATOR_CONTINUATION_SYSTEM_PROMPT,
         }
     }
@@ -34,6 +37,13 @@ impl CompactionPolicy {
     pub(super) fn instruction(&self, rejected_tool_calls: &[ToolCall]) -> String {
         match self {
             Self::Work => build_continuation_prompt(rejected_tool_calls),
+            Self::ProjectCoordinator => {
+                let mut prompt = String::from(
+                    "Write a compact handoff for the next Project Coordinator context. Preserve the current mission; unresolved commitments and their owners; blockers and reactivation conditions; evidence and exact references; user corrections and authority limits; and the next concrete verification and stopping points. Distinguish requested, accepted, reported, and independently verified work. Preserve uncertainty when evidence conflicts. Record explicit retirement or supersession facts so completed work is not reopened. Do not reproduce or summarize the Project Coordinator charter: the next turn loads the current charter independently by ProductConversation identity. Forget repetitive history before unresolved commitments and do not invent completion, authority, evidence, or owners.",
+                );
+                append_rejected_tool_calls(&mut prompt, rejected_tool_calls);
+                prompt
+            }
             Self::Coordinator => {
                 let mut prompt = String::from(
                     "Write a handoff for the next Phoenix Coordinator, the user's primary interface \
@@ -60,15 +70,21 @@ impl CompactionPolicy {
                      for retrieving detail. Do not interpret a stream's absence from recent messages \
                      as completion. Do not invent commitments. Write directly to the next Coordinator.",
                 );
-                if !rejected_tool_calls.is_empty() {
-                    prompt.push_str("\n\nThese pending tool calls did not run; preserve their intended next actions:\n");
-                    for call in rejected_tool_calls {
-                        prompt.push_str(&render_rejected_tool_call(call));
-                        prompt.push('\n');
-                    }
-                }
+                append_rejected_tool_calls(&mut prompt, rejected_tool_calls);
                 prompt
             }
+        }
+    }
+}
+
+fn append_rejected_tool_calls(prompt: &mut String, rejected_tool_calls: &[ToolCall]) {
+    if !rejected_tool_calls.is_empty() {
+        prompt.push_str(
+            "\n\nThese pending tool calls did not run; preserve their intended next actions:\n",
+        );
+        for call in rejected_tool_calls {
+            prompt.push_str(&render_rejected_tool_call(call));
+            prompt.push('\n');
         }
     }
 }
@@ -168,6 +184,36 @@ mod tests {
     use crate::db::MessageType;
     use phoenix_llm::{ContentBlock, MessageRole};
     use proptest::prelude::*;
+
+    #[test]
+    fn project_coordinator_policy_is_role_appropriate_and_excludes_charter() {
+        let project = CompactionPolicy::for_profile(false, true).instruction(&[]);
+        assert!(project.contains("current mission"));
+        assert!(project.contains("unresolved commitments and their owners"));
+        assert!(project.contains("Do not reproduce or summarize the Project Coordinator charter"));
+        assert_eq!(
+            CompactionPolicy::for_profile(false, true).system_prompt(),
+            CONTINUATION_SYSTEM_PROMPT
+        );
+        assert!(!CompactionPolicy::for_profile(false, false)
+            .instruction(&[])
+            .contains("Project Coordinator charter"));
+    }
+
+    #[test]
+    fn project_coordinator_compaction_preserves_rejected_tool_intent() {
+        let call = ToolCall::new(
+            "call-1",
+            phoenix_core::domain::sm_state::ToolInput::Unknown {
+                name: "example".to_string(),
+                input: serde_json::json!({"scope": "bounded"}),
+            },
+        );
+        let prompt = CompactionPolicy::for_profile(false, true).instruction(&[call]);
+        assert!(prompt.contains("These pending tool calls did not run"));
+        assert!(prompt.contains("example"));
+        assert!(prompt.contains("bounded"));
+    }
 
     fn user(text: &str) -> LlmMessage {
         LlmMessage {

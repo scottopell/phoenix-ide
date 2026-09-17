@@ -63,6 +63,8 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-product-alpha',
     close: null,
+    project_coordinator_eligible: true,
+    project_coordinator_profile: null,
     canonical_route: '/product-conversations/pc-product-alpha',
     requested_transcript_row_id: 'row-work',
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },
