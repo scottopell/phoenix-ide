@@ -66,6 +66,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
+| [055](055_project-coordinator-is-an-ordinary-productconversation-profile.md) | Project Coordinator is an ordinary ProductConversation profile | Accepted | REQ-PCO-001 through REQ-PCO-007; `ProductConversation`, continuation compaction, provider prompt composition |
 
 ## For agents: which decisions bind your task
 
@@ -92,6 +93,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying an ordinary ProductConversation's Project Coordinator profile, charter authority, human mutation boundary, or coordination compaction | 055, then 049, 045, 031, and 026 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -159,6 +161,7 @@ ADR-000 (adopt spEARS v2 for new work)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
+              ├── ADR-055 (Project Coordinator is an ordinary ProductConversation profile)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)

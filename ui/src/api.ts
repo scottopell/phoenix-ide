@@ -1781,6 +1781,31 @@ export const api = {
     return resp.json();
   },
 
+  async putProjectCoordinatorProfile(
+    productConversationId: string,
+    request: { enabled: boolean; charter: string; expected_revision: number | null },
+  ): Promise<ProductConversationSnapshotViewType['project_coordinator_profile']> {
+    const resp = await fetch(
+      `/api/product-conversations/${encodeURIComponent(productConversationId)}/project-coordinator-profile`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+    if (!resp.ok) {
+      let detail = 'Failed to save Project Coordinator profile';
+      try {
+        const body = await resp.json() as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // Preserve the stable fallback for a non-JSON failure response.
+      }
+      throw new ApiResponseError(detail, resp.status);
+    }
+    return resp.json();
+  },
+
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
     if (!resp.ok) {

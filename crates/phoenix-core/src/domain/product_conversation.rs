@@ -271,6 +271,36 @@ impl ProductConversationKind {
     }
 }
 
+pub const PROJECT_COORDINATOR_CHARTER_MAX_BYTES: usize = 32_768;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCoordinatorProfile {
+    pub charter: String,
+    pub revision: i64,
+    pub updated_at_unix_micros: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCoordinatorProfileWriteError {
+    InvalidCharter,
+    NotOrdinary,
+    RevisionConflict,
+}
+
+impl fmt::Display for ProjectCoordinatorProfileWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCharter => f.write_str("project coordinator charter is invalid"),
+            Self::NotOrdinary => {
+                f.write_str("project coordinator profile requires an ordinary ProductConversation")
+            }
+            Self::RevisionConflict => f.write_str("project coordinator profile revision conflict"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectCoordinatorProfileWriteError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

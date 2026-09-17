@@ -515,6 +515,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
+    Migration {
+        version: 101,
+        name: "persist_project_coordinator_profiles",
+        sql: MIGRATION_101,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -713,6 +718,60 @@ FOR EACH ROW WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'automatic continuation admission requires eligible opted-in context exhaustion');
+END;
+";
+
+const MIGRATION_101: &str = r"
+CREATE TABLE product_conversation_coordinator_profile_revisions (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
+    last_write_token TEXT NOT NULL CHECK (typeof(last_write_token) = 'text' AND length(last_write_token) > 0),
+    UNIQUE (product_conversation_id, revision)
+);
+
+CREATE TABLE product_conversation_coordinator_profiles (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL,
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision > 0),
+    charter TEXT NOT NULL
+        CHECK (typeof(charter) = 'text'
+               AND instr(charter, char(0)) = 0
+               AND length(CAST(charter AS BLOB)) <= 32768),
+    updated_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    FOREIGN KEY (product_conversation_id, revision)
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id, revision)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM product_conversations
+    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+
+CREATE TRIGGER product_conversations_preserve_profile_ordinary_kind
+BEFORE UPDATE OF kind ON product_conversations
+FOR EACH ROW WHEN NEW.kind != 'ordinary' AND EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation with Project Coordinator profile must remain ordinary');
+END;
+
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM product_conversations
+    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
 END;
 ";
 
@@ -15230,7 +15289,8 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_project_coordinator_profiles')",
         )
         .execute(&pool)
         .await
@@ -16123,7 +16183,8 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_project_coordinator_profiles')",
         )
         .execute(pool)
         .await

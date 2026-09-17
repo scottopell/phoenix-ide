@@ -10,6 +10,8 @@ mod message_attachments;
 mod migrations;
 mod product_creation;
 pub use product_creation::*;
+mod project_coordinator_profile;
+pub use project_coordinator_profile::*;
 mod prompt_projection;
 pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
