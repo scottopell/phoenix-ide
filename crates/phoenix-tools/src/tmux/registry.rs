@@ -3526,13 +3526,14 @@ pub async fn spawn_session(
     spawn_session_owned(socket_path, config_path, cwd, false).await
 }
 
-async fn spawn_session_owned(
+fn tmux_new_session_args(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
     contain_test_spawn: bool,
-) -> Result<(), TmuxError> {
-    let mut tmux_args = vec![
+    server_token: &str,
+) -> Vec<String> {
+    let mut args = vec![
         "-f".to_string(),
         config_path.to_string_lossy().into_owned(),
         "-S".to_string(),
@@ -3544,16 +3545,32 @@ async fn spawn_session_owned(
         "-s".to_string(),
         TMUX_DEFAULT_SESSION.to_string(),
     ];
-    let server_token = uuid::Uuid::new_v4().to_string();
     if contain_test_spawn {
-        tmux_args.extend([
+        args.extend([
             ";".to_string(),
             "set-environment".to_string(),
             "-g".to_string(),
             SERVER_TOKEN_VAR.to_string(),
-            server_token.clone(),
+            server_token.to_owned(),
         ]);
     }
+    args
+}
+
+async fn spawn_session_owned(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    contain_test_spawn: bool,
+) -> Result<(), TmuxError> {
+    let server_token = uuid::Uuid::new_v4().to_string();
+    let tmux_args = tmux_new_session_args(
+        socket_path,
+        config_path,
+        cwd,
+        contain_test_spawn,
+        &server_token,
+    );
     let (mut cmd, creator_handoff) =
         tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.

@@ -7792,12 +7792,51 @@ mod scope_liveness_tests {
             .tmux_registry()
             .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
             .await;
+        let old_socket = std::fs::metadata(socket).unwrap();
+        let old_server_pid = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &socket.to_string_lossy(),
+                "display-message",
+                "-p",
+                "#{pid}",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(old_server_pid.status.success());
+        let old_server_pid = String::from_utf8(old_server_pid.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let old_server = phoenix_core::process_identity::current_process_identity(old_server_pid)
+            .expect("capture old tmux server identity");
         let output = tokio::process::Command::new("tmux")
             .args(["-S", &socket.to_string_lossy(), "kill-server"])
             .output()
             .await
             .unwrap();
         assert!(output.status.success(), "kill stale server: {output:?}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while phoenix_core::process_identity::process_identity_matches(old_server) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exact stale tmux server remained after successful kill-server"
+            );
+            tokio::task::yield_now().await;
+        }
+        if let Ok(observed) = std::fs::metadata(socket) {
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::dev(&observed),
+                std::os::unix::fs::MetadataExt::dev(&old_socket)
+            );
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::ino(&observed),
+                std::os::unix::fs::MetadataExt::ino(&old_socket)
+            );
+            std::fs::remove_file(socket).unwrap();
+        }
         let replacement = manager
             .tmux_registry()
             .ensure_live(

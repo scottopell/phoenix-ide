@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use phoenix_core::process_identity::ProcessIdentity;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,13 +24,14 @@ import fcntl
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 root = Path(sys.argv[1])
 parent = int(sys.argv[2])
+control_root = Path(tempfile.mkdtemp(prefix="ptw-", dir=root.parent))
 owned = []
 
 class ProcBsdInfo(ctypes.Structure):
@@ -96,20 +97,14 @@ def identity_state(identity):
         return "mismatched"
     if observed[1]:
         return "absent"
+    if token is None:
+        return "owned"
     token_bytes = f"PHOENIX_TMUX_SERVER_TOKEN={token}".encode()
     token_present = any(
         value == token_bytes or value == token_bytes.decode()
         for value in observed[2]
     )
     return "owned" if token_present else "mismatched"
-
-def signal_exact(identity, signum):
-    if identity_state(identity) != "owned":
-        return
-    try:
-        os.kill(identity[0], signum)
-    except ProcessLookupError:
-        return
 
 def publish_response(path, value):
     pending = path.with_name(f".pending-{path.name}")
@@ -156,21 +151,33 @@ def register(request):
             raise RuntimeError("tmux process identity or server token did not match registration")
         identities = [
             (int(server_pid), birth(int(server_pid)), token),
-            (int(pane_pid), birth(int(pane_pid)), token),
+            (int(pane_pid), birth(int(pane_pid)), None),
         ]
         if any(started is None for _, started, _ in identities):
             raise RuntimeError("process birth identity was unavailable")
         if identities[0][1] != expected_server_birth or identities[1][1] != expected_pane_birth:
             raise RuntimeError("process birth identity did not match registration")
         socket_stat = socket.stat()
-        owned.append((socket, socket_stat.st_dev, socket_stat.st_ino, tuple(identities)))
-        publish_response(acknowledged, "\t".join([
-            expected_server, expected_server_birth, expected_pane, expected_pane_birth
-        ]))
+        control = control_root / f"{len(owned)}.sock"
+        os.link(socket, control)
+        owned.append((socket, socket_stat.st_dev, socket_stat.st_ino, control, tuple(identities)))
+        try:
+            publish_response(acknowledged, "\t".join([
+                expected_server, expected_server_birth, expected_pane, expected_pane_birth
+            ]))
+        except OSError:
+            return False
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
-        publish_response(rejected, str(error))
+        try:
+            publish_response(rejected, str(error))
+        except OSError:
+            return False
     finally:
-        request.unlink(missing_ok=True)
+        try:
+            request.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
 
 (root / ".armed").touch()
 heartbeat = root / ".parent-heartbeat"
@@ -178,7 +185,12 @@ while not (root / ".cleanup-request").exists():
     if not root.exists():
         break
     for request in root.glob(".register-*"):
-        register(request)
+        if not register(request):
+            break
+    else:
+        request = None
+    if request is not None:
+        break
     if parent == 1:
         try:
             if time.time() - heartbeat.stat().st_mtime > 0.5:
@@ -193,23 +205,40 @@ try:
 except FileNotFoundError:
     pass
 
-for _, _, _, processes in owned:
-    for identity in processes:
-        signal_exact(identity, signal.SIGTERM)
+termination_failed = False
+for _, _, _, control, processes in owned:
+    states = [identity_state(identity) for identity in processes]
+    if all(state == "absent" for state in states):
+        continue
+    if not all(state == "owned" for state in states):
+        termination_failed = True
+        continue
+    try:
+        killed = subprocess.run(
+            ["tmux", "-S", str(control), "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=0.5,
+        )
+        if killed.returncode != 0:
+            termination_failed = True
+    except (OSError, subprocess.TimeoutExpired):
+        termination_failed = True
 
 quiet = 0
-for attempt in range(50):
+for _ in range(50):
     states = [
         identity_state(identity)
-        for _, _, _, processes in owned
+        for _, _, _, _, processes in owned
         for identity in processes
     ]
-    unconfirmed = any(state != "absent" for state in states)
-    if attempt == 20:
-        for _, _, _, processes in owned:
-            for identity in processes:
-                signal_exact(identity, signal.SIGKILL)
-    registered_sockets = {socket: (device, inode, processes) for socket, device, inode, processes in owned}
+    unconfirmed = termination_failed or any(state != "absent" for state in states)
+    registered_sockets = {
+        socket: (device, inode, processes)
+        for socket, device, inode, _, processes in owned
+    }
     for socket in root.glob("*.sock"):
         if socket.is_symlink():
             socket.unlink(missing_ok=True)
@@ -278,8 +307,10 @@ for attempt in range(50):
     if quiet >= 5:
         if root.exists():
             shutil.rmtree(root)
+        shutil.rmtree(control_root)
         sys.exit(0)
     time.sleep(0.1)
+print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
 sys.exit(1)
 "##;
 
@@ -509,17 +540,53 @@ impl Drop for RegistrationArtifacts {
     }
 }
 
+fn bounded_output(mut command: Command, operation: &str) -> io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let process_group = i32::try_from(child.id())
+                .map_err(|error| io::Error::other(format!("invalid probe pid: {error}")))?;
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+            let output = child.wait_with_output()?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{operation} exceeded 500ms: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub(crate) fn register_owned_server(
     socket: &Path,
     expected_token: &str,
 ) -> io::Result<TestServerProcesses> {
-    let observed = Command::new("tmux")
+    let mut identity_command = Command::new("tmux");
+    identity_command
         .arg("-S")
         .arg(socket)
         .args(["display-message", "-p", "#{pid}|#{pane_pid}"])
         .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .output()?;
+        .stdin(Stdio::null());
+    let observed = bounded_output(identity_command, "tmux process identity probe")?;
     if !observed.status.success() {
         return Err(io::Error::other(
             "failed to query exact tmux test process identities",
@@ -528,13 +595,14 @@ pub(crate) fn register_owned_server(
     let observed = String::from_utf8(observed.stdout)
         .map_err(|error| io::Error::other(format!("invalid tmux identity output: {error}")))?;
     let (server_pid, pane_pid) = parse_process_ids(&observed)?;
-    let token = Command::new("tmux")
+    let mut token_command = Command::new("tmux");
+    token_command
         .arg("-S")
         .arg(socket)
         .args(["show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"])
         .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .output()?;
+        .stdin(Stdio::null());
+    let token = bounded_output(token_command, "tmux server token probe")?;
     if !token.status.success() {
         return Err(io::Error::other(
             "tmux test server-global token was unavailable",
@@ -753,6 +821,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_output_kills_a_stalled_probe() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; sleep 30"]);
+        let started = Instant::now();
+        let error = bounded_output(command, "stalled fixture probe").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     fn spawn_server_with_processes(
         owner: &TestTmuxServerOwner,
         name: &str,
@@ -968,6 +1046,28 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_uses_incarnation_bound_socket_without_numeric_pid_signals() {
+        assert!(!WATCHDOG_PROGRAM.contains("os.kill(identity[0]"));
+        assert!(WATCHDOG_PROGRAM.contains("os.link(socket, control)"));
+        assert!(WATCHDOG_PROGRAM.contains("[\"tmux\", \"-S\", str(control), \"kill-server\"]"));
+    }
+
+    #[test]
+    fn pane_identity_is_bound_to_authenticated_server_without_requiring_late_token() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "(int(server_pid), birth(int(server_pid)), token),\n            (int(pane_pid), birth(int(pane_pid)), None),"
+        ));
+        assert!(WATCHDOG_PROGRAM.contains("if token is None:\n        return \"owned\""));
+    }
+
+    #[test]
+    fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "if all(state == \"absent\" for state in states):\n        continue\n    if not all(state == \"owned\" for state in states):\n        termination_failed = True"
+        ));
+    }
+
+    #[test]
     fn missing_root_cleanup_kills_registered_server_and_pane() {
         if which::which("tmux").is_err() {
             return;
@@ -980,6 +1080,20 @@ mod tests {
         assert!(panic.is_err(), "lost cleanup handoff must remain visible");
         assert_exact_processes_gone(processes);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn root_loss_during_acknowledgment_retains_owned_processes_for_cleanup() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let (socket, processes) = spawn_server_with_processes(&owner, "ack-root-loss");
+        fs::remove_file(&socket).unwrap();
+        fs::remove_dir_all(owner.path()).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(panic.is_err(), "lost cleanup handoff must remain visible");
+        assert_exact_processes_gone(processes);
     }
 
     #[test]
