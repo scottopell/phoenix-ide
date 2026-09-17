@@ -5503,6 +5503,20 @@ async fn continue_conversation(
             DbError::ContinuationPrecondition(msg) => AppError::Conflict(Box::new(
                 ConflictErrorResponse::new(msg, "continuation_not_allowed"),
             )),
+            DbError::CloseAdmissionFenced(_) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(
+                    "continuation is not allowed while the ProductConversation has an active Close obligation",
+                    "continuation_not_allowed",
+                ),
+            )),
+            DbError::ProductConversationUnavailable(product_conversation_id) => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    format!(
+                        "ProductConversation {product_conversation_id} is unavailable because it is in History"
+                    ),
+                    "continuation_not_allowed",
+                )))
+            }
             other => AppError::Internal(other.to_string()),
         })?;
 

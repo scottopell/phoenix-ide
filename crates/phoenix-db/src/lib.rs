@@ -7733,6 +7733,7 @@ impl Database {
         // transaction guard drops and SQLite rolls back.
         let mut tx = self.pool.begin().await?;
 
+        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
@@ -22777,6 +22778,68 @@ mod tests {
             "only parent + single continuation should be listed; got: {:?}",
             all.iter().map(|c| &c.id).collect::<Vec<_>>(),
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_refuses_parent_with_active_close_obligation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-close-fenced",
+            "parent-close-fenced",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        db.begin_close_foundation(
+            &parent.product_conversation_id,
+            &TranscriptConversationId::parse(parent.id.clone()).unwrap(),
+            "continue-close-fence",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.continue_conversation(&parent.id).await,
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
+        assert!(db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_refuses_history_product_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "parent-history",
+            "parent-history",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(parent.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.continue_conversation(&parent.id).await,
+            Err(DbError::ProductConversationUnavailable(id)) if id == parent.product_conversation_id
+        ));
+        assert!(db
+            .get_conversation(&parent.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
     }
 
     /// Parent not in `ContextExhausted` state: transaction does not run;

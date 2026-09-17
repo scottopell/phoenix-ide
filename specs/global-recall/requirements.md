@@ -140,7 +140,8 @@ AND SHALL NOT infer a default repository or cwd
 AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
 WHEN the user authorizes continuation of an existing ordinary conversation
-THE Coordinator MAY inspect its authoritative transcript state and invoke the supported idempotent `POST /api/conversations/{id}/continue` through explicitly WorkScope-targeted Bash
+AND the explicitly WorkScope-targeted Bash context already has usable authenticated server transport
+THE Coordinator MAY inspect its authoritative transcript state and invoke the supported idempotent `POST /api/conversations/{id}/continue`
 AND SHALL invoke it only when `conversation.state.type == "context_exhausted"`
 AND SHALL reconcile an existing continuation before retrying an uncertain request
 AND SHALL preserve and report the returned successor identity, including when status is `dispatch_failed`, and reconcile `already_exists` or the returned successor before retrying
@@ -148,7 +149,9 @@ AND SHALL recognize that the endpoint may create only the successor transcript w
 
 THE Coordinator SHALL NOT create unrelated or new-work conversations, perform arbitrary lifecycle mutation, or monitor in the background
 
-THE SYSTEM MAY provide exactly one cross-conversation mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
+THE SYSTEM MAY provide exactly one cross-conversation message mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
+
+The separately specified continuation exception is not a cross-conversation message mutation capability and SHALL remain limited to the existing ProductConversation's successor transcript
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
