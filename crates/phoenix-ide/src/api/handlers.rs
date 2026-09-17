@@ -5472,6 +5472,14 @@ fn existing_continuation_status(
     }
 }
 
+fn continuation_message_id(
+    message_id: String,
+) -> Result<phoenix_workflow::ClientTurnKey, AppError> {
+    phoenix_workflow::ClientTurnKey::new(message_id).ok_or_else(|| {
+        AppError::BadRequest("Continuation message_id must not be empty.".to_string())
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn continue_conversation(
     State(state): State<AppState>,
@@ -5485,6 +5493,7 @@ async fn continue_conversation(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
+    let _message_id = continuation_message_id(req.message_id.clone())?;
 
     let (outcome, intent) = state
         .runtime
@@ -17777,6 +17786,24 @@ mod wake_handler_tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
         assert_eq!(second.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod continuation_admission_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_message_id_rejects_empty_client_turn_key() {
+        assert!(matches!(
+            continuation_message_id(String::new()),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn continuation_message_id_accepts_client_turn_key() {
+        assert!(continuation_message_id("client-turn-1".to_string()).is_ok());
     }
 }
 

@@ -7773,6 +7773,7 @@ impl Database {
         };
         if reserved.rows_affected() == 0 {
             drop(tx);
+            drop(conn);
             let refetched = self.get_conversation(parent_id).await?;
             if let Some(existing_id) = refetched.continued_in_conv_id {
                 return Ok(ContinueOutcome::AlreadyContinued(
@@ -22735,7 +22736,7 @@ mod tests {
     /// the first (idempotent return) and does NOT create a second new conv.
     /// The parent's `continued_in_conv_id` is unchanged by the second call.
     #[tokio::test]
-    async fn test_continue_conversation_idempotent_double_continue() {
+    async fn max_one_pool_idempotent_continuation_releases_fallback_connection() {
         let db = Database::open_in_memory().await.unwrap();
         setup_exhausted_parent(
             &db,
@@ -22754,7 +22755,14 @@ mod tests {
             }
         };
 
-        let second = match db.continue_conversation("parent-double").await.unwrap() {
+        let second = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            db.continue_conversation("parent-double"),
+        )
+        .await
+        .expect("max-one pool fallback must not hang")
+        .unwrap()
+        {
             ContinueOutcome::AlreadyContinued(c) => c,
             other @ (ContinueOutcome::Created(_)
             | ContinueOutcome::ParentNotContextExhausted { .. }) => {
