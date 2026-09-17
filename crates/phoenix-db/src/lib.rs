@@ -7731,7 +7731,8 @@ impl Database {
 
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
 
         require_product_conversation_admission_tx(&mut tx, parent_id).await?;
         sqlx::query("PRAGMA defer_foreign_keys = ON")
@@ -22778,6 +22779,49 @@ mod tests {
             "only parent + single continuation should be listed; got: {:?}",
             all.iter().map(|c| &c.id).collect::<Vec<_>>(),
         );
+    }
+
+    #[tokio::test]
+    async fn close_and_continuation_serialize_to_typed_admission_fence() {
+        let (_dir, mut close_db, continuation_db) = open_test_db_pair().await;
+        let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
+        close_db.close_foundation_test_latch = Some(close_latch.clone());
+        let parent = setup_exhausted_parent(
+            &close_db,
+            "parent-close-race",
+            "parent-close-race",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let product_conversation_id = parent.product_conversation_id.clone();
+        let parent_id = parent.id.clone();
+
+        let close_entered = close_latch.transaction_entered.notified();
+        let close = tokio::spawn(async move {
+            close_db
+                .begin_close_foundation(
+                    &product_conversation_id,
+                    &TranscriptConversationId::parse(parent_id).unwrap(),
+                    "close-vs-continuation",
+                )
+                .await
+        });
+        close_entered.await;
+
+        let continuation_parent_id = parent.id.clone();
+        let continuation = tokio::spawn(async move {
+            continuation_db
+                .continue_conversation(&continuation_parent_id)
+                .await
+        });
+        close_latch.release_transaction.notify_waiters();
+        close.await.unwrap().unwrap();
+
+        assert!(matches!(
+            continuation.await.unwrap(),
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
     }
 
     #[tokio::test]
