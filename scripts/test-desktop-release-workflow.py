@@ -5,7 +5,9 @@ workflow = Path('.github/workflows/release.yml').read_text()
 required_fragments = [
     "if: github.ref == 'refs/heads/main'",
     'permissions:\n      contents: write',
-    'Manual dispatch may retry an existing exact tag but cannot create $TAG.',
+    'RETRY_TAG: ${{ inputs.tag }}',
+    'Retrying $TAG from its immutable main commit $TAG_COMMIT.',
+    'git merge-base --is-ancestor "$TAG_COMMIT" origin/main',
     'commit: ${{ steps.ver.outputs.commit }}',
     'ref: ${{ needs.gate.outputs.commit }}',
     'environment: macos-release-signing',
@@ -52,6 +54,7 @@ for forbidden in [
     'MACOS_DEVELOPER_ID_CERT_SHA256',
     'build-macos-desktop:',
     'ref: ${{ needs.gate.outputs.tag }}',
+    'Manual dispatch may retry an existing exact tag but cannot create $TAG.',
     '--clobber',
     'com.apple.security.app-sandbox',
 ]:

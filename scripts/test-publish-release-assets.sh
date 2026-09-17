@@ -233,8 +233,8 @@ publish
 assert_published_exact
 grep -F -- '--draft' "$FAKE_STATE/gh.log" >/dev/null
 grep -F -- '--hostname uploads.github.com --method POST' "$FAKE_STATE/gh.log" >/dev/null
-if grep -F -- '--method DELETE' "$FAKE_STATE/gh.log" >/dev/null; then
-  echo "draft recovery must not delete releases or assets" >&2
+if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log" >/dev/null; then
+  echo "draft recovery must not delete the release" >&2
   exit 1
 fi
 
@@ -249,8 +249,9 @@ assert_draft
 unset FAKE_UPLOAD_FAIL_AFTER
 publish
 assert_published_exact
-if grep -F -- '--method DELETE' "$FAKE_STATE/gh.log" >/dev/null; then
-  echo "partial draft recovery must not delete prior state" >&2
+grep -F -- '--method DELETE repos/owner/repo/releases/assets/' "$FAKE_STATE/gh.log" >/dev/null
+if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log" >/dev/null; then
+  echo "partial draft recovery must not delete the release" >&2
   exit 1
 fi
 

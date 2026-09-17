@@ -7,7 +7,7 @@
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
-enum NotaryState { pending | submitted | stapled | validated | failed }
+enum NotaryState { pending | submitted | accepted | stapled | validated | failed }
 enum PublicationState { idle | inaccessible | uploading | verified | public | failed }
 enum FailureDomain { none | tag_gate | build | signing | notarization | publication | configuration }
 
@@ -58,8 +58,10 @@ entity ArchitecturePair {
     transitions notarization {
         pending -> submitted
         pending -> failed
-        submitted -> stapled
+        submitted -> accepted
         submitted -> failed
+        accepted -> stapled
+        accepted -> failed
         stapled -> validated
         stapled -> failed
         validated -> failed
@@ -184,9 +186,15 @@ rule NotarizationRequiresVerifiedApp {
     ensures: pair.notarization = submitted
 }
 
+rule AcceptedNotarizationRequiresAppleAcceptance {
+    when: NotarizationAccepted(pair)
+    requires: pair.notarization = submitted
+    ensures: pair.notarization = accepted
+}
+
 rule StaplingRequiresAcceptedNotarization {
     when: NotarizationStapled(pair)
-    requires: pair.notarization = submitted
+    requires: pair.notarization = accepted
     ensures: pair.notarization = stapled
 }
 

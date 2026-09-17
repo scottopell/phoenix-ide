@@ -12,7 +12,7 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 | REQ-DESKTOP-REL-004 | The release matrix uses matching Apple Silicon and Intel runners; packaging verifies the helper architecture. |
 | REQ-DESKTOP-REL-005 | Publish enumerates eight payload assets, creates `SHA256SUMS`, and verifies exact draft and public names plus GitHub-reported SHA-256 digests. |
 | REQ-DESKTOP-REL-006 | `test-package-desktop-release.sh` covers unsigned shell orchestration with tool doubles. A real unsigned Release packaging run on macOS remains required during validation. |
-| REQ-DESKTOP-REL-007 | `publish-release-assets.sh` creates or resumes a private exact-tag draft, accepts only a digest-verified subset, uploads missing assets without deleting prior release state, verifies the complete draft, and only then makes it public. An inexact public release fails closed without replacement. |
+| REQ-DESKTOP-REL-007 | `publish-release-assets.sh` creates or resumes a private exact-tag draft, verifies it remains private before each mutation, replaces timestamp-dependent draft assets, verifies the complete exact set, and only then makes it public. It never deletes the release itself; an inexact public release fails closed without replacement. |
 | REQ-DESKTOP-REL-008 | The release gate rejects unrepresentable bundle versions before tag creation; packaging passes and verifies the resolved marketing and project versions. |
 
 ## Proposed protected configuration
