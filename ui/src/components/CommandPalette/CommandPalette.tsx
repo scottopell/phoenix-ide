@@ -64,7 +64,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
     [conversations],
   );
   const productConversationIdsKey = useMemo(
-    () => productConversations.map(row => `${row.product_conversation_id}:${row.updated_at}:${row.presentation.display_name}`).join(','),
+    () => productConversations.map(row => `${row.product_conversation_id}:${row.updated_at}:${row.presentation.display_name}:${row.close_action.availability}`).join(','),
     [productConversations],
   );
 
@@ -127,7 +127,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
       createBuiltInActions({
         navigate,
         currentSlug: currentSlug ?? activeProduct?.canonical_root.slug ?? null,
-        archiveCurrent: currentSlug || activeProduct?.ordinary_lifecycle === 'open'
+        archiveCurrent: currentSlug || activeProduct?.close_action.availability === 'available'
           ? (() => {
               const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute)
@@ -136,7 +136,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
                   : undefined);
               const targetId = conv?.id ?? activeProduct?.canonical_root.transcript_row_id;
               const isWritable = activeProduct
-                ? activeProduct.ordinary_lifecycle === 'open'
+                ? activeProduct.close_action.availability === 'available'
                 : conv?.archived !== true;
               const chainMembers = conv && !conversations.some(candidate => candidate.id === conv.id)
                 ? [...conversations, conv]

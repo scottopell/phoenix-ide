@@ -34,6 +34,7 @@ import {
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
   registerCoordinatorForNotifications,
+  subscribeProductConversationListRevision,
   useNotificationClickNavigationBridge,
   setActiveNotificationConversationSlug,
 } from '../notifications';
@@ -147,7 +148,12 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       .catch(() => {});
     void refresh();
     const interval = window.setInterval(refresh, 5_000);
-    return () => { cancelled = true; window.clearInterval(interval); };
+    const unsubscribe = subscribeProductConversationListRevision(() => { void refresh(); });
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   notifyProductConversationListMayHaveChanged,
   subscribeCloseSnapshotChanged,
+  subscribeProductConversationSnapshotChanged,
 } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -65,6 +66,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     title: `Root ${id}`,
   },
   ordinary_lifecycle: 'open',
+  close_action: { availability: 'available' },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
@@ -191,6 +193,11 @@ describe('Sidebar — ProductConversation navigation', () => {
       latest_transcript_row_id: 'latest-continuation-row',
     });
     apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+    apiMock.renameProductConversation.mockResolvedValue({
+      ...row,
+      canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
+      presentation: { kind: 'state', display_name: 'Renamed Product Title', presentation_mode: 'idle' },
+    });
 
     const { getByRole, container } = render(
       <MemoryRouter initialEntries={['/product-conversations/pc-continued']}>
@@ -232,7 +239,10 @@ describe('Sidebar — ProductConversation navigation', () => {
 
   it('does not expose product conversation actions for history rows', async () => {
     apiMock.listProductConversations.mockResolvedValue({
-      product_conversations: [makeProductConversation('pc-history', { ordinary_lifecycle: 'history' })],
+      product_conversations: [makeProductConversation('pc-history', {
+        ordinary_lifecycle: 'history',
+        close_action: { availability: 'unavailable', reason: 'history' },
+      })],
     });
 
     const { queryByRole, container } = render(
@@ -244,6 +254,34 @@ describe('Sidebar — ProductConversation navigation', () => {
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
     expect(queryByRole('button', { name: /Rename product conversation/ })).toBeNull();
     expect(queryByRole('button', { name: /Close product conversation/ })).toBeNull();
+  });
+
+  it('publishes the successful authoritative title to the active aggregate snapshot', async () => {
+    const renamed = makeProductConversation('pc-rename', {
+      canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'New Product' },
+    });
+    apiMock.renameProductConversation.mockResolvedValueOnce(renamed);
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-rename', {
+        canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'Old Product' },
+      })],
+    });
+    const snapshotListener = vi.fn();
+    const unsubscribe = subscribeProductConversationSnapshotChanged('pc-rename', snapshotListener);
+
+    const { getByRole, findByRole, findByText } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-rename']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-rename" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await findByRole('button', { name: /Rename product conversation Old Product/ }));
+    fireEvent.change(getByRole('textbox'), { target: { value: 'New Product' } });
+    fireEvent.click(getByRole('button', { name: 'Rename' }));
+
+    expect(await findByText('New Product')).toBeInTheDocument();
+    expect(snapshotListener).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 
   it('keeps product rename dialog open and unchanged on conflict', async () => {

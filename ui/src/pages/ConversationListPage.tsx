@@ -32,6 +32,7 @@ import { effectiveVisibleConversationCount } from './conversationListCount';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
 } from '../notifications';
 
@@ -131,6 +132,9 @@ export function ConversationListPage() {
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+  const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
   const { credentialStatus } = useModels();
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -304,6 +308,34 @@ export function ConversationListPage() {
     }
   };
 
+  const handleProductRename = async (newName: string) => {
+    if (!productRenameTarget) return;
+    try {
+      const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      setProductConversations((rows) => rows.map((row) =>
+        row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
+      notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+      setProductRenameTarget(null);
+      setProductRenameError(undefined);
+    } catch (err) {
+      setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
+    }
+  };
+
+  const handleProductClose = async () => {
+    if (!productCloseTarget) return;
+    try {
+      await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+      setProductCloseTarget(null);
+      setProductListRevision((revision) => revision + 1);
+    } catch (err) {
+      if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        setProductCloseTarget(null);
+      }
+      console.error('Failed to close product conversation:', err);
+    }
+  };
+
   const handleToggleArchived = useCallback(() => {
     saveScrollPosition();
     setShowArchived((prev) => !prev);
@@ -412,6 +444,11 @@ export function ConversationListPage() {
               onRename={handleSetRenameTarget}
               onConversationClick={handleConversationClick}
               onProductConversationClick={(row) => navigate(row.canonical_route)}
+              onProductConversationRename={(row) => {
+                setProductRenameError(undefined);
+                setProductRenameTarget(row);
+              }}
+              onProductConversationClose={setProductCloseTarget}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(
@@ -439,6 +476,28 @@ export function ConversationListPage() {
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ConfirmDialog
+        visible={productCloseTarget !== null}
+        title="Close Product Conversation"
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will move the entire product conversation to read-only History and stop its active work.`}
+        confirmText="Close"
+        danger
+        onConfirm={handleProductClose}
+        onCancel={() => setProductCloseTarget(null)}
+      />
+      <RenameDialog
+        visible={productRenameTarget !== null}
+        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
+        error={productRenameError}
+        onRename={handleProductRename}
+        normalizeInput={(value) => value}
+        isValidName={(value) => value.trim().length > 0}
+        helpText="Enter a title"
+        onCancel={() => {
+          setProductRenameTarget(null);
+          setProductRenameError(undefined);
+        }}
       />
       <RenameDialog
         visible={renameTarget !== null}
