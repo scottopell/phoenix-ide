@@ -12884,6 +12884,140 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(discoverable.candidates.is_empty());
     }
 
+    async fn wait_for_state_matching(
+        state: &AppState,
+        id: &str,
+        matches: impl Fn(&ConvState) -> bool,
+    ) -> ConvState {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let conv = state
+                    .db
+                    .get_conversation(id)
+                    .await
+                    .expect("load conversation");
+                if matches(&conv.state) {
+                    return conv.state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("state transition must complete")
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_response_rehydrates_waiting_state_and_resumes_once() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create coordinator");
+        state
+            .db
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![crate::state_machine::state::UserQuestion {
+                        question: "Which path?".to_string(),
+                        header: "Choice".to_string(),
+                        options: vec![],
+                        multi_select: false,
+                    }],
+                    tool_use_id: "auq-coordinator-1".to_string(),
+                },
+            )
+            .await
+            .expect("persist waiting coordinator state");
+
+        let Json(success) = respond_to_question(
+            State(state.clone()),
+            Path(coordinator.id.clone()),
+            Json(RespondToQuestionPayload {
+                answers: std::collections::HashMap::from([(
+                    "Which path?".to_string(),
+                    "A".to_string(),
+                )]),
+                annotations: None,
+            }),
+        )
+        .await
+        .expect("Coordinator answers use ordinary AUQ admission");
+        assert!(success.success);
+
+        wait_for_state_matching(&state, &coordinator.id, |state| {
+            matches!(state, ConvState::Idle | ConvState::LlmRequesting { .. })
+        })
+        .await;
+        assert!(state
+            .db
+            .get_messages(&coordinator.id)
+            .await
+            .expect("load messages")
+            .iter()
+            .any(|message| matches!(
+                &message.content,
+                MessageContent::User(content) if content.text.contains("Which path?")
+            )));
+
+        let replay_error = respond_to_question(
+            State(state.clone()),
+            Path(coordinator.id.clone()),
+            Json(RespondToQuestionPayload {
+                answers: std::collections::HashMap::from([(
+                    "Which path?".to_string(),
+                    "B".to_string(),
+                )]),
+                annotations: None,
+            }),
+        )
+        .await
+        .expect_err("accepted answer must not be replayed");
+        match replay_error {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "wrong_state"),
+            other => panic!("expected stale-answer conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_dismissal_is_admitted_after_restart_rehydration() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create coordinator");
+        state
+            .db
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![crate::state_machine::state::UserQuestion {
+                        question: "Proceed?".to_string(),
+                        header: "Gate".to_string(),
+                        options: vec![],
+                        multi_select: false,
+                    }],
+                    tool_use_id: "auq-coordinator-dismiss".to_string(),
+                },
+            )
+            .await
+            .expect("persist waiting coordinator state");
+
+        let Json(success) = dismiss_question(State(state.clone()), Path(coordinator.id.clone()))
+            .await
+            .expect("Coordinator dismissal uses ordinary AUQ admission");
+        assert!(success.success);
+
+        let conv = state
+            .db
+            .get_conversation(&coordinator.id)
+            .await
+            .expect("load coordinator");
+        assert!(matches!(conv.state, ConvState::Idle));
+    }
+
     #[tokio::test]
     async fn cancel_rejects_awaiting_continuation_without_changing_state() {
         let state = make_test_state().await;

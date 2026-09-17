@@ -5315,6 +5315,113 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_ask_user_question_enters_existing_awaiting_state() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmResponse {
+                content: vec![
+                    ContentBlock::text("I need direction"),
+                    ContentBlock::tool_use(
+                        "auq-coordinator-1",
+                        "ask_user_question",
+                        serde_json::json!({
+                            "questions": [{
+                                "question": "Which path?",
+                                "header": "Choice",
+                                "options": [{
+                                    "label": "A",
+                                    "description": "Path A",
+                                    "preview": "Do A"
+                                }],
+                                "multiSelect": false
+                            }]
+                        }),
+                    ),
+                ],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-1",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![QuestionOption {
+                                label: "A".to_string(),
+                                description: Some("Path A".to_string()),
+                                preview: Some("Do A".to_string()),
+                            }],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq".into(),
+            },
+        )
+        .expect("Coordinator AUQ uses existing parent interception");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingUserResponse { ref tool_use_id, .. }
+                if tool_use_id == "auq-coordinator-1"
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_answer_resumes_existing_llm_flow() {
+        use crate::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which path?".to_string(),
+                header: "Choice".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "auq-coordinator-1".to_string(),
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which path?".to_string(), "A".to_string());
+
+        let result = transition(
+            &state,
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::UserQuestionResponse {
+                answers,
+                annotations: None,
+            },
+        )
+        .expect("Coordinator AUQ answer uses existing response transition");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
     fn test_parent_text_only_response_still_goes_idle() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
