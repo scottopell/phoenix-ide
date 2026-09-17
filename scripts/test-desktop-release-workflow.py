@@ -8,6 +8,9 @@ required_fragments = [
     'RETRY_TAG: ${{ inputs.tag }}',
     'Retrying $TAG from its immutable main commit $TAG_COMMIT.',
     'git merge-base --is-ancestor "$TAG_COMMIT" origin/main',
+    'validate_bundle_version "$VERSION"',
+    'bash scripts/verify-published-release.sh',
+    'echo "release=false" >> "$GITHUB_OUTPUT"',
     'commit: ${{ steps.ver.outputs.commit }}',
     'ref: ${{ needs.gate.outputs.commit }}',
     'environment: macos-release-signing',
@@ -88,6 +91,7 @@ for line in macos_workflow.splitlines():
 for fragment in [
     'macos/Phoenix/scripts/test-package-desktop-release.sh',
     'scripts/test-publish-release-assets.sh',
+    'scripts/test-verify-published-release.sh',
     'scripts/test-desktop-release-workflow.py',
 ]:
     if fragment not in macos_workflow:
