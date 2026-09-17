@@ -26,6 +26,9 @@ AND auto-focus the primary interactive element of that scope
 WHEN the interactive panel is dismissed
 THE SYSTEM SHALL pop the focus scope
 AND restore focus to the element that was focused before the scope was pushed
+UNLESS its feature contract specifies a completion destination such as the
+conversation composer, in which case that destination SHALL receive focus only
+while the completing request still owns the visible interaction
 
 **Rationale:** Developers expect that keyboard input goes to the thing they're
 interacting with. When arrow keys in a question panel also scroll the sidebar,
@@ -102,6 +105,12 @@ THE SYSTEM SHALL move focus to that affordance's primary input without
 requiring an extra click
 AND closing that affordance SHALL restore focus to the element that owned focus
 within the enclosing scope before the affordance opened
+
+WHEN native choice selection reveals an associated editor
+THE SYSTEM SHALL preserve focus on the choice control if its feature contract
+provides native Tab entry into the editor
+AND SHALL NOT steal radio arrow-navigation focus merely because the editor
+became visible
 
 **Rationale:** If the user has to click into a panel before keyboard works, the
 keyboard flow never starts. Auto-focus is the critical gate that determines
@@ -181,7 +190,19 @@ No separate documentation lookup needed.
 
 IF an interactive panel is the topmost focus scope
 THE SYSTEM SHALL NOT allow navigation keys (arrows, Tab, Enter, Space) to
-affect components outside that scope
+trigger shortcut handlers in components outside that scope
+
+WHERE the topmost scope contains native form controls
+THE SYSTEM SHALL preserve their native focus traversal, selection, and editing
+behavior while preventing lower-scope shortcut activation
+AND SHALL NOT interpret native Tab traversal as a lower-scope shortcut leak
+
+WHERE the topmost scope is AskUserQuestion
+THE SYSTEM SHALL use native Tab/Shift+Tab traversal, radio arrow selection, and
+checkbox Space toggling
+AND SHALL NOT intercept Tab to advance questions or Enter to submit implicitly
+AND SHALL apply the explicit send, notes, Escape, and IME rules in
+[Ask User Question](../ask-user-question/requirements.md#req-auq-010-accessible-native-interaction)
 
 **Rationale:** Key leak is the specific bug that triggered this spec. Arrow
 keys in the QuestionPanel also navigated the sidebar conversation list. When

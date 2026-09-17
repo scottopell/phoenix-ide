@@ -22,6 +22,28 @@ export class ApiResponseError extends Error {
   }
 }
 
+export class QuestionMutationError extends Error {
+  readonly noMutation = true;
+  constructor(message: string, readonly code: 'question_request_invalid' | 'question_request_stale') {
+    super(message);
+    this.name = 'QuestionMutationError';
+  }
+}
+
+async function questionMutationResult(resp: Response): Promise<{ success: boolean }> {
+  if (!resp.ok) {
+    const err = await resp.json();
+    if ((resp.status === 400 && err.error_type === 'question_request_invalid') ||
+        (resp.status === 409 && err.error_type === 'question_request_stale')) {
+      throw new QuestionMutationError(err.error, err.error_type);
+    }
+    throw new Error(err.error || 'Could not confirm the question operation');
+  }
+  const result = await resp.json();
+  if (result.success !== true) throw new Error('Could not confirm the question operation');
+  return result;
+}
+
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
 // are typed against the Rust-generated wire shapes in `./generated/sse`
 // via `v.GenericSchema<unknown, T>`. The `Sse*Data` names re-exported
@@ -500,6 +522,7 @@ export interface SubAgentResult {
 }
 
 export interface UserQuestion {
+  id?: string;
   question: string;
   header: string;
   options: QuestionOption[];
@@ -533,7 +556,7 @@ export type ConversationState =
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
-  | { type: 'awaiting_user_response'; questions: UserQuestion[] }
+  | { type: 'awaiting_user_response'; request_id: string; tool_use_id: string; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
   | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
@@ -1663,6 +1686,12 @@ export const api = {
     return (await resp.json()).conversation;
   },
 
+  async getConversationStatus(id: string): Promise<{ conversation: Conversation; agent_working: boolean; presentation_mode: string }> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/status`);
+    if (!resp.ok) throw new Error('Failed to get conversation status');
+    return resp.json();
+  },
+
   async getConversation(id: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
     const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
     if (!resp.ok) {
@@ -2501,24 +2530,25 @@ export const api = {
 
   async respondToQuestion(
     convId: string,
+    requestId: string,
     answers: Record<string, string>,
     annotations?: Record<string, { notes?: string; preview?: string }>,
   ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers, annotations }),
+      body: JSON.stringify({ request_id: requestId, answers, annotations }),
     });
-    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to respond to question'); }
-    return resp.json();
+    return questionMutationResult(resp);
   },
 
-  async dismissQuestion(convId: string): Promise<{ success: boolean }> {
+  async dismissQuestion(convId: string, requestId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/dismiss-question`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId }),
     });
-    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss question'); }
-    return resp.json();
+    return questionMutationResult(resp);
   },
 
   async dismissError(convId: string): Promise<{ success: boolean }> {

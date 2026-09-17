@@ -64,14 +64,22 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
+| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted; identity lineage superseded by ADR-054 | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
+| [054](054_question-incarnations-and-durable-dismissal-resumption.md) | Question incarnations and durable dismissal resumption | Accepted | REQ-AUQ-004/007/011/012, REQ-COMP-006 |
 
 ## For agents: which decisions bind your task
+
+Question answer semantics, responsive question layout, native AUQ keyboard
+navigation, and question mutation protocol changes are governed by
+[ADR-053](053_question-interactions-bind-explicit-answers-to-request-identity.md)
+and [ADR-054](054_question-incarnations-and-durable-dismissal-resumption.md).
 
 Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Changing question answer UX, responsive layout, or request mutation identity | 054, 053, 050, 034 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -121,7 +129,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
-      │   └── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   └── ADR-053 (Question interactions bind explicit answers to request identity)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)

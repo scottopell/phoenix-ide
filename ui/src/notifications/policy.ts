@@ -135,19 +135,23 @@ function eventTypeEnabled(type: NotificationEventType, settings: NotificationSet
 
 // A `context_exhausted` conversation that has already continued elsewhere is
 // no longer actionable, so it is not notification-worthy.
+function conversationAtState(conversation: Conversation, state: ConversationState): Conversation {
+  return { ...conversation, state };
+}
+
 export function eventForState(state: ConversationState, conversation: Conversation): PolicyNotificationEvent | null {
   switch (state.type) {
     case 'awaiting_task_approval':
-      return { type: 'task_approval_needed', title: 'Task approval needed', conversation };
+      return { type: 'task_approval_needed', title: 'Task approval needed', conversation: conversationAtState(conversation, state) };
     case 'awaiting_user_response':
-      return { type: 'question_asked', title: 'Question asked', conversation };
+      return { type: 'question_asked', title: 'Question asked', conversation: conversationAtState(conversation, state) };
     case 'context_exhausted':
       if (conversation.continued_in_conv_id) return null;
-      return { type: 'agent_error', title: 'Agent error', conversation };
+      return { type: 'agent_error', title: 'Agent error', conversation: conversationAtState(conversation, state) };
     case 'error':
     case 'recoverable_continuation_failure':
     case 'creation_failed':
-      return { type: 'agent_error', title: 'Agent error', conversation };
+      return { type: 'agent_error', title: 'Agent error', conversation: conversationAtState(conversation, state) };
     default:
       return null;
   }
@@ -158,6 +162,9 @@ export function eventForState(state: ConversationState, conversation: Conversati
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
   if (event.type === 'agent_finished') return null;
+  if (event.type === 'question_asked' && event.conversation.state?.type === 'awaiting_user_response') {
+    return `${event.conversation.id}:${event.type}:${event.conversation.state.request_id}`;
+  }
   if (event.conversation.state?.type === 'recoverable_continuation_failure') {
     const state = event.conversation.state;
     return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;

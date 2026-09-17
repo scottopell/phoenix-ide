@@ -94,6 +94,11 @@ enum AuthoritativeEffect {
     PersistToolResults {
         results: Vec<ToolResult>,
     },
+    CommitQuestionRequest {
+        request_id: String,
+        message_id: String,
+        resolution: crate::state_machine::effect::QuestionResolution,
+    },
     PersistHiddenSystemMarker {
         marker: &'static str,
         message_id: String,
@@ -256,6 +261,15 @@ impl ClassifiedEffect {
                     results,
                 }))
             }
+            Effect::CommitQuestionRequest {
+                request_id,
+                message_id,
+                resolution,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::CommitQuestionRequest {
+                request_id,
+                message_id,
+                resolution,
+            })),
             Effect::PersistHiddenSystemMarker { marker, message_id } => {
                 Self::Authoritative(Box::new(AuthoritativeEffect::PersistHiddenSystemMarker {
                     marker,
@@ -2838,6 +2852,14 @@ where
         &mut self,
         event: Event,
     ) -> Result<AcknowledgedEventOutcome, String> {
+        if let Event::UserQuestionResponse { request_id, .. }
+        | Event::UserQuestionDismissed { request_id } = &event
+        {
+            if !crate::state_machine::transition::accepts_question_request(&self.state, request_id)
+            {
+                return Ok(AcknowledgedEventOutcome::QuestionRejected);
+            }
+        }
         if !matches!(&event, Event::SteeringQueueChanged) {
             self.process_event(event).await?;
             return Ok(
@@ -3211,12 +3233,16 @@ where
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-        if is_direct_turn_adoption {
+        let commits_question = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::CommitQuestionRequest { .. }));
+        if !commits_question && is_direct_turn_adoption {
             self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
             });
-        } else {
+        } else if !commits_question {
             let state_changed = result.new_state != old_state;
             let retry_has_durable_fact = matches!(
                 self.terminal_settlement_attempt,
@@ -3350,23 +3376,21 @@ where
         // (or after) the LLM task reading the DB; if the in-flight LLM then
         // returned a no-tool response, the conversation would settle to Idle
         // with the steers persisted but unanswered.
-        // An error dismissal (DismissError) enters Idle but is the user
-        // clearing a banner, not a turn completing, so it must not drain the
-        // steering queue. It is identified by the hidden marker it persists —
-        // keyed on that effect, not on the source state, so the exclusion stays
-        // correct if another `Error -> Idle` edge (that *should* drain) is ever
-        // added. Mirrors specs/steering-messages DrainOnIdleEntry's guard.
-        let is_error_dismissal = result.effects.iter().any(|e| {
+        let is_question_or_error_dismissal = result.effects.iter().any(|e| {
             matches!(
                 e,
-                Effect::PersistHiddenSystemMarker { marker, .. }
-                    if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
-            )
+                Effect::CommitQuestionRequest {
+                    resolution: crate::state_machine::effect::QuestionResolution::Dismissed,
+                    ..
+                }
+            ) || matches!(e, Effect::PersistHiddenSystemMarker { marker, .. }
+                if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER)
         });
         let steering_drain = if terminal_direct_turn_transition {
             None
         } else {
-            Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
+            Box::pin(self.prepare_steering_drain(&old_state, is_question_or_error_dismissal))
+                .await?
         };
         let mut terminal_unit_admission = None;
         let terminal_state_has_notify = terminal_direct_turn_transition
@@ -3736,7 +3760,8 @@ where
 
         if terminal_direct_turn_transition {
             if let Some((drain_event, projection_guard)) =
-                Box::pin(self.prepare_steering_drain(&old_state, false)).await?
+                Box::pin(self.prepare_steering_drain(&old_state, is_question_or_error_dismissal))
+                    .await?
             {
                 Box::pin(self.process_event(drain_event)).await?;
                 drop(projection_guard);
@@ -3905,6 +3930,14 @@ where
     async fn prepare_immediate_steering_drain(
         &mut self,
     ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        if matches!(self.state, ConvState::Idle)
+            && self
+                .storage
+                .question_dismissal_paused(&self.context.conversation_id)
+                .await?
+        {
+            return Ok(None);
+        }
         if self
             .storage
             .load_active_direct_turn(&self.context.conversation_id)
@@ -3979,9 +4012,9 @@ where
     async fn prepare_steering_drain(
         &mut self,
         old_state: &ConvState,
-        is_error_dismissal: bool,
+        is_question_or_error_dismissal: bool,
     ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
-        if !self.is_steering_drain_hook(old_state, is_error_dismissal) {
+        if !self.is_steering_drain_hook(old_state, is_question_or_error_dismissal) {
             return Ok(None);
         }
         if self
@@ -4010,12 +4043,16 @@ where
         };
 
         Ok(self
-            .maybe_drain_steering_queue(old_state, is_error_dismissal)
+            .maybe_drain_steering_queue(old_state, is_question_or_error_dismissal)
             .map(|event| (event, projection_guard)))
     }
 
-    fn is_steering_drain_hook(&self, old_state: &ConvState, is_error_dismissal: bool) -> bool {
-        if self.context.is_sub_agent || is_error_dismissal {
+    fn is_steering_drain_hook(
+        &self,
+        old_state: &ConvState,
+        is_question_or_error_dismissal: bool,
+    ) -> bool {
+        if self.context.is_sub_agent || is_question_or_error_dismissal {
             return false;
         }
 
@@ -4276,7 +4313,7 @@ where
     fn maybe_drain_steering_queue(
         &mut self,
         old_state: &ConvState,
-        is_error_dismissal: bool,
+        is_question_or_error_dismissal: bool,
     ) -> Option<Event> {
         let entering_idle =
             !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
@@ -4288,7 +4325,7 @@ where
                     | ConvState::CancellingSubAgents { .. }
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
-        if !self.is_steering_drain_hook(old_state, is_error_dismissal)
+        if !self.is_steering_drain_hook(old_state, is_question_or_error_dismissal)
             || self.steering_queue.is_empty()
         {
             return None;
@@ -6159,6 +6196,15 @@ where
                 Ok(None)
             }
 
+            AuthoritativeEffect::CommitQuestionRequest {
+                request_id,
+                message_id,
+                resolution,
+            } => {
+                Box::pin(self.commit_question_request(request_id, message_id, resolution, admitted))
+                    .await
+            }
+
             AuthoritativeEffect::PersistHiddenSystemMarker { marker, message_id } => {
                 let seq = self.broadcast_tx.next_seq();
                 let content = MessageContent::system(marker);
@@ -6300,6 +6346,126 @@ where
                     .await
             }
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn commit_question_request(
+        &mut self,
+        request_id: String,
+        message_id: String,
+        resolution: crate::state_machine::effect::QuestionResolution,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        use crate::state_machine::effect::QuestionResolution;
+        let (completed_state, content, display_data) = match resolution {
+            QuestionResolution::Answer { text } => (
+                ConvState::LlmRequesting { attempt: 1 },
+                MessageContent::user(text),
+                None,
+            ),
+            QuestionResolution::Dismissed => (
+                ConvState::Idle,
+                MessageContent::system(
+                    crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER,
+                ),
+                Some(serde_json::json!({ "hidden": true })),
+            ),
+        };
+        let updated_at = Utc::now();
+        let message = crate::db::Message {
+            message_id,
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id: self.broadcast_tx.next_seq(),
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data: None,
+            created_at: updated_at,
+        };
+        let terminal = self
+            .active_direct_turn
+            .as_deref()
+            .zip(self.pending_direct_turn_terminal.as_deref())
+            .map(
+                |(turn, terminal)| crate::runtime::traits::ActiveDirectTurnSettlement {
+                    conversation_id: self.context.conversation_id.clone(),
+                    turn: turn.clone(),
+                    terminal: terminal.clone(),
+                    state: completed_state.clone(),
+                    state_updated_at: updated_at,
+                },
+            );
+        let storage = self.storage.clone();
+        let command_message = message.clone();
+        let command_state = completed_state.clone();
+        let command_terminal = terminal.clone();
+        let boundary_admission = admitted.transfer();
+        let boundary_owner = tokio::spawn(async move {
+            let outcome = if let Some(settlement) = &command_terminal {
+                storage
+                    .settle_question_direct_turn(settlement, &request_id, &command_message)
+                    .await
+            } else {
+                storage
+                    .commit_question_response(
+                        &command_message.conversation_id,
+                        &request_id,
+                        &command_message,
+                        &command_state,
+                        updated_at,
+                    )
+                    .await
+            };
+            if matches!(
+                outcome,
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                boundary_admission.close("question_commit");
+            }
+            (outcome, boundary_admission)
+        });
+        let mut owner_guard = AuthorityBoundaryConsumerGuard {
+            fence: Some(self.fatal_local_authority_fence.clone()),
+        };
+        let (outcome, boundary_admission) = boundary_owner.await.map_err(|error| {
+            tracing::error!(?error, "question authority boundary owner disappeared");
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:question_boundary_disappeared".to_string()
+        })?;
+        *admitted = boundary_admission;
+        owner_guard.disarm();
+        match outcome {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::Committed,
+            ) => {}
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::Rejected,
+            ) => {
+                self.creation_settlement_disposition =
+                    CreationSettlementDisposition::StaleAuthority;
+                return Ok(None);
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::NotCommitted(error),
+            ) => return Err(error),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:question_commit".to_string());
+            }
+        }
+        if terminal.is_some() {
+            self.active_direct_turn = None;
+            self.pending_direct_turn_terminal = None;
+            self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
+            self.direct_turn_cancellation_initiated = false;
+        }
+        let old_state = self.state.clone();
+        self.install_live_state(completed_state, updated_at, true)?;
+        self.manage_deadline(&old_state);
+        self.settle_turn_span();
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(message);
+        Ok(None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -18050,6 +18216,375 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_all_messages(conversation_id).len(), 0);
         assert!(rt.llm_task_handle.is_some());
         rt.llm_task_handle.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn question_mutations_unclassified_authority_closes_admission_without_retry_or_publication(
+    ) {
+        for dismiss in [false, true] {
+            let id = "question-unclassified";
+            let pending = ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "pending".into(),
+                request_id: "pending".into(),
+            };
+            let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+            storage
+                .update_state(id, &pending, Utc::now())
+                .await
+                .unwrap();
+            let turn = crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(77),
+                generation: 0,
+            };
+            storage.set_active_direct_turn(Some(turn.clone()));
+            rt.active_direct_turn = Some(Box::new(turn));
+            storage.set_question_commit_unclassified(true);
+            let mut published = rt.broadcast_tx.subscribe();
+            let event = if dismiss {
+                Event::UserQuestionDismissed {
+                    request_id: "pending".into(),
+                }
+            } else {
+                Event::UserQuestionResponse {
+                    request_id: "pending".into(),
+                    answers: std::collections::HashMap::new(),
+                    annotations: None,
+                }
+            };
+            let error = rt.process_acknowledged_event(event).await.unwrap_err();
+            assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+            assert!(rt.fatal_local_authority_fence.is_closed());
+            assert!(rt.admit_authoritative_effect().is_err());
+            assert!(rt.terminal_transition_retry.is_none());
+            assert!(rt.llm_task_handle.is_none());
+            assert_eq!(rt.state, pending);
+            assert!(storage.get_all_messages(id).is_empty());
+            while let Ok(event) = published.try_recv() {
+                assert!(!matches!(
+                    event,
+                    SseEvent::StateChange { .. } | SseEvent::Message { .. }
+                ));
+            }
+            storage.set_question_commit_unclassified(false);
+            assert!(rt
+                .process_acknowledged_event(Event::UserQuestionDismissed {
+                    request_id: "pending".into()
+                })
+                .await
+                .is_err());
+            assert!(storage.get_all_messages(id).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn question_mutations_stale_persisted_identity_retires_without_effects() {
+        let id = "question-persisted-race";
+        let old = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "old".into(),
+            request_id: "old".into(),
+        };
+        let current = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "new".into(),
+            request_id: "new".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(id, old, vec![]);
+        storage
+            .update_state(id, &current, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.process_acknowledged_event(Event::UserQuestionResponse {
+                request_id: "old".into(),
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            })
+            .await
+            .unwrap(),
+            AcknowledgedEventOutcome::StaleAuthority
+        );
+        assert_eq!(storage.get_state(id).await.unwrap(), current);
+        assert!(storage.get_all_messages(id).is_empty());
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn question_mutations_failed_commit_keeps_answer_and_state_unpublished() {
+        for fail_state in [false, true] {
+            let id = "question-atomic-failure";
+            let pending = ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "original".into(),
+                request_id: "original".into(),
+            };
+            let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+            storage
+                .update_state(id, &pending, Utc::now())
+                .await
+                .unwrap();
+            let mut published = rt.broadcast_tx.subscribe();
+            storage.set_fail_message_add(!fail_state);
+            storage.set_fail_state_update(fail_state);
+            let answer = Event::UserQuestionResponse {
+                request_id: "original".into(),
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            };
+            assert!(rt.process_acknowledged_event(answer.clone()).await.is_err());
+            assert_eq!(rt.state, pending);
+            assert_eq!(storage.get_state(id).await.unwrap(), pending);
+            assert!(storage.get_all_messages(id).is_empty());
+            assert!(rt.llm_task_handle.is_none());
+            while let Ok(event) = published.try_recv() {
+                assert!(
+                    !matches!(
+                        event,
+                        SseEvent::StateChange { .. } | SseEvent::Message { .. }
+                    ),
+                    "failed commit must not publish an answer or consumed state"
+                );
+            }
+            storage.set_fail_message_add(false);
+            storage.set_fail_state_update(false);
+            assert_eq!(
+                rt.process_acknowledged_event(answer).await.unwrap(),
+                AcknowledgedEventOutcome::Settled
+            );
+            assert_eq!(storage.get_all_messages(id).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn question_mutations_dismissal_retains_admission_through_terminal_publications() {
+        let id = "question-dismiss-publication-owners";
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "provider-id".into(),
+            request_id: "request-id".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+        storage
+            .update_state(id, &pending, Utc::now())
+            .await
+            .unwrap();
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(77),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        let mut published = rt.broadcast_tx.subscribe();
+        let (reservation, _) = rt
+            .broadcast_tx
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1)
+            .unwrap();
+
+        assert_eq!(
+            rt.process_acknowledged_event(Event::UserQuestionDismissed {
+                request_id: "request-id".into(),
+            })
+            .await
+            .unwrap(),
+            AcknowledgedEventOutcome::Settled
+        );
+        assert!(published.try_recv().is_err());
+        assert_eq!(rt.fatal_local_authority_fence.owner_count(), 2);
+        rt.fatal_local_authority_fence
+            .close("test_terminal_publications");
+        assert!(rt.admit_authoritative_effect().is_err());
+
+        drop(reservation);
+        assert!(matches!(
+            published.try_recv().unwrap(),
+            SseEvent::Message { .. }
+        ));
+        assert!(matches!(
+            published.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+        assert!(published.try_recv().is_err());
+        assert_eq!(rt.fatal_local_authority_fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn question_mutations_dismissal_does_not_drain_queued_steering() {
+        use crate::runtime::traits::MessageStore;
+        let id = "question-dismiss-queued";
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "original".into(),
+            request_id: "original".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            id,
+            pending.clone(),
+            vec![mk_entry("queued", "Earlier steering")],
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(77),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        storage
+            .update_state(id, &pending, Utc::now())
+            .await
+            .unwrap();
+        let dismiss = Event::UserQuestionDismissed {
+            request_id: "original".into(),
+        };
+        assert_eq!(
+            rt.process_acknowledged_event(dismiss).await.unwrap(),
+            AcknowledgedEventOutcome::Settled
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(storage.get_state(id).await.unwrap(), ConvState::Idle);
+        assert_eq!(storage.get_all_messages(id).len(), 1);
+        assert_eq!(rt.steering_queue.len(), 1);
+        assert_eq!(storage.load_steering_entries(id).await.unwrap().len(), 1);
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(storage.load_active_direct_turn(id).await.unwrap().is_none());
+        let queue = storage.load_steering_entries(id).await.unwrap();
+        let (mut restarted, _) = build_runtime_with_state_and_queue(id, ConvState::Idle, queue);
+        restarted.storage = storage.clone();
+        assert_eq!(
+            restarted.commit_startup_steering_queue().await.unwrap(),
+            StartupSteeringDrainOutcome::NotNeeded
+        );
+        restarted
+            .process_acknowledged_event(Event::SteeringQueueChanged)
+            .await
+            .unwrap();
+        assert_eq!(storage.get_all_messages(id).len(), 1);
+        assert!(restarted.llm_task_handle.is_none());
+        assert_eq!(restarted.steering_queue.len(), 1);
+        rt.process_acknowledged_event(Event::UserMessage {
+            text: "Continue with this explicit message".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "explicit".into(),
+            user_agent: None,
+            skill_invocation: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.llm_task_handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn question_mutations_acknowledge_answer_and_resume_only_once() {
+        let id = "question-answer-once";
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![crate::state_machine::state::UserQuestion {
+                id: None,
+                question: "Choice?".into(),
+                header: "Choice".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "original".into(),
+            request_id: "original".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+        storage
+            .update_state(id, &pending, Utc::now())
+            .await
+            .unwrap();
+        let mut requests = rt.llm_client.subscribe_request_count();
+        let answer = Event::UserQuestionResponse {
+            request_id: "original".into(),
+            answers: [("Choice?".to_string(), "custom\nanswer".to_string())].into(),
+            annotations: None,
+        };
+        assert_eq!(
+            rt.process_acknowledged_event(answer.clone()).await.unwrap(),
+            AcknowledgedEventOutcome::Settled
+        );
+        assert_eq!(
+            storage.get_state(id).await.unwrap(),
+            ConvState::LlmRequesting { attempt: 1 }
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            requests.wait_for(|count| *count == 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let messages = storage.get_all_messages(id);
+        assert_eq!(messages.len(), 1);
+        assert!(serde_json::to_string(&messages[0].content)
+            .unwrap()
+            .contains("custom\\nanswer"));
+        assert_eq!(
+            rt.process_acknowledged_event(answer).await.unwrap(),
+            AcknowledgedEventOutcome::QuestionRejected
+        );
+        assert_eq!(storage.get_all_messages(id).len(), 1);
+        assert_eq!(rt.llm_client.recorded_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn question_mutations_recheck_live_identity_before_any_effect() {
+        let id = "question-identity";
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "next-question".into(),
+            request_id: "next-question".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+        storage
+            .update_state(id, &pending, Utc::now())
+            .await
+            .unwrap();
+        for event in [
+            Event::UserQuestionResponse {
+                request_id: "old-question".into(),
+                answers: std::collections::HashMap::new(),
+                annotations: None,
+            },
+            Event::UserQuestionDismissed {
+                request_id: "old-question".into(),
+            },
+        ] {
+            assert_eq!(
+                rt.process_acknowledged_event(event).await.unwrap(),
+                AcknowledgedEventOutcome::QuestionRejected
+            );
+            assert_eq!(rt.state, pending);
+            assert_eq!(storage.get_state(id).await.unwrap(), pending);
+            assert!(storage.get_all_messages(id).is_empty());
+            assert!(rt.llm_task_handle.is_none());
+        }
+        let dismiss = Event::UserQuestionDismissed {
+            request_id: "next-question".into(),
+        };
+        assert_eq!(
+            rt.process_acknowledged_event(dismiss.clone())
+                .await
+                .unwrap(),
+            AcknowledgedEventOutcome::Settled
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        let messages = storage.get_all_messages(id).len();
+        assert_eq!(
+            rt.process_acknowledged_event(dismiss).await.unwrap(),
+            AcknowledgedEventOutcome::QuestionRejected
+        );
+        assert_eq!(storage.get_all_messages(id).len(), messages);
+        assert!(rt.llm_task_handle.is_none());
     }
 
     #[tokio::test]

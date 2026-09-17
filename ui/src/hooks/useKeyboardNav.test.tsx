@@ -1,10 +1,3 @@
-// SIDE-03: Escape in context menu navigates away
-//
-// The global keyboard handler (useGlobalKeyboardShortcuts) navigates to /
-// when Escape is pressed on a /c/ path. It does not check whether a context
-// menu, modal, or popover is open. Pressing Escape while a context menu is
-// open should close the menu WITHOUT triggering navigation.
-
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -66,5 +59,48 @@ describe('SIDE-03: global keyboard shortcut ownership', () => {
     expect(dispatchSpy.mock.calls.some(([event]) => event.type === 'toggle-shortcut-help')).toBe(false);
     dialog.remove();
     dispatchSpy.mockRestore();
+  });
+
+  it.each(['radio', 'checkbox'])('opens shortcut help from a focused %s without changing its selection', type => {
+    renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
+    const input = document.createElement('input');
+    input.type = type;
+    input.checked = true;
+    document.body.appendChild(input);
+    input.focus();
+    const onHelp = vi.fn();
+    window.addEventListener('toggle-shortcut-help', onHelp);
+    try {
+      act(() => {
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true, cancelable: true }));
+      });
+      expect(onHelp).toHaveBeenCalledOnce();
+      expect(input).toHaveFocus();
+      expect(input.checked).toBe(true);
+      expect(mockNavigate).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('toggle-shortcut-help', onHelp);
+      input.remove();
+    }
+  });
+
+  it.each(['text', 'search'])('keeps question marks in a focused %s editor', type => {
+    renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
+    const input = document.createElement('input');
+    input.type = type;
+    document.body.appendChild(input);
+    input.focus();
+    const onHelp = vi.fn();
+    window.addEventListener('toggle-shortcut-help', onHelp);
+    const key = new KeyboardEvent('keydown', { key: '?', bubbles: true, cancelable: true });
+    try {
+      act(() => { input.dispatchEvent(key); });
+      expect(onHelp).not.toHaveBeenCalled();
+      expect(key.defaultPrevented).toBe(false);
+      expect(input).toHaveFocus();
+    } finally {
+      window.removeEventListener('toggle-shortcut-help', onHelp);
+      input.remove();
+    }
   });
 });

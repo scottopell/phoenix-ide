@@ -42,6 +42,12 @@ pub enum PersistError {
     ResultCountMismatch { tool_uses: usize, results: usize },
 }
 
+#[derive(Debug, Clone)]
+pub enum QuestionResolution {
+    Answer { text: String },
+    Dismissed,
+}
+
 /// Transcript payload owned by one steering-drain commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteeringDrainMessage {
@@ -208,6 +214,12 @@ pub enum Effect {
     /// Retained for sub-agent result persistence; normal tool rounds use `PersistCheckpoint`.
     #[allow(dead_code)]
     PersistToolResults { results: Vec<ToolResult> },
+
+    CommitQuestionRequest {
+        request_id: String,
+        message_id: String,
+        resolution: QuestionResolution,
+    },
 
     /// Persist a UI-hidden system marker.
     ///

@@ -30,6 +30,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
   const originalGetConversation = api.getConversation;
+  const originalGetConversationStatus = api.getConversationStatus;
   const originalResolveCoordinatorRoute = api.resolveCoordinatorRoute;
   const originalListConversations = api.listConversations;
   const originalListArchivedConversations = api.listArchivedConversations;
@@ -107,6 +108,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   api.getConversationRoute = async () => route;
   api.getConversationRouteBySlug = async () => route;
+  api.getConversationStatus = async id => {
+    const {conversation, agent_working, presentation_mode} = await api.getConversation(id);
+    return {conversation, agent_working, presentation_mode};
+  };
   api.getConversation = async () => ({
     conversation,
     messages,
@@ -154,6 +159,17 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith('/api/telemetry/conversation-open')) {
       return new Response(null, { status: 204 });
+    }
+    const questionResponse = url.endsWith(`/api/conversations/${conversation.id}/respond`);
+    const questionDismissal = url.endsWith(`/api/conversations/${conversation.id}/dismiss-question`);
+    if ((questionResponse || questionDismissal) && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { request_id?: string };
+      if (conversation.state?.type !== 'awaiting_user_response' || body.request_id !== conversation.state.request_id) {
+        return Response.json({error:'This fixture question is no longer pending.',error_type:'question_request_stale'}, {status:409});
+      }
+      record('QuestionResponse', String(init.body));
+      conversation.state = questionDismissal ? {type:'idle'} : {type:'llm_requesting',attempt:1};
+      return Response.json({success:true});
     }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
       const body = JSON.parse(String(init.body)) as { text?: string };
@@ -280,6 +296,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getConversationRoute = originalGetConversationRoute;
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
     api.getConversation = originalGetConversation;
+    api.getConversationStatus = originalGetConversationStatus;
     api.resolveCoordinatorRoute = originalResolveCoordinatorRoute;
     api.listConversations = originalListConversations;
     api.listArchivedConversations = originalListArchivedConversations;

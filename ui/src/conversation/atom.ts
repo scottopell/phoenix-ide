@@ -79,6 +79,8 @@ export interface ConversationAtom {
   conversation: Conversation | null;
   phase: ConversationState;
   phaseLastAppliedEventSeq: number;
+  questionStatusPhaseFenceEventSeq: number;
+  consumedQuestionRequestIds: readonly string[];
   conversationLastAppliedEventSeq: number;
   messages: Message[];
   /** Durable server-authoritative messages awaiting steering delivery. */
@@ -358,6 +360,7 @@ export type SSEAction =
       phase: ConversationState;
       expectedConversationId: string;
     }
+  | { type: 'question_phase_change'; phase: ConversationState; stateUpdatedAt: number | null; expectedConversationId: string; requestId: string; phaseFreshnessEventSeq: number }
   // Client-originated optimistic conversation update (e.g. model swap confirmation).
   | {
       type: 'local_conversation_update';
@@ -392,6 +395,7 @@ export type SSEAction =
       transcriptCoverage?: 'tail' | 'complete';
       eventCursorFloor?: number;
       snapshotStartedAtEventSeq: number;
+      snapshotStartedAtPhase: ConversationState;
     }
   | {
       type: 'set_system_prompt';
@@ -405,6 +409,8 @@ export function createInitialAtom(): ConversationAtom {
     conversation: null,
     phase: { type: 'idle' },
     phaseLastAppliedEventSeq: 0,
+    questionStatusPhaseFenceEventSeq: 0,
+    consumedQuestionRequestIds: [],
     conversationLastAppliedEventSeq: 0,
     messages: [],
     steeringMessages: [],
@@ -747,6 +753,9 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_state_change': {
       const phase =
         action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
+      if (phase.type === 'awaiting_user_response' && atom.consumedQuestionRequestIds.includes(phase.request_id)) {
+        return atom;
+      }
       return {
         ...atom,
         phase,
@@ -1327,6 +1336,8 @@ export function conversationReducer(
         conversation: p.conversation,
         phase: p.phase,
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
+        questionStatusPhaseFenceEventSeq: 0,
+        consumedQuestionRequestIds: [],
         conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
         streamIncarnation: p.streamIncarnation,
@@ -1476,6 +1487,18 @@ export function conversationReducer(
       // correctly resets the heartbeat — "any observed traffic = alive."
       return { ...atom, lastSseEventAt: Date.now() };
 
+    case 'question_phase_change':
+      if (action.expectedConversationId !== atom.conversationId || atom.phase.type !== 'awaiting_user_response' || atom.phase.request_id !== action.requestId) return atom;
+      return {
+        ...atom,
+        phase: action.phase,
+        phaseStateUpdatedAt: action.stateUpdatedAt,
+        questionStatusPhaseFenceEventSeq: Math.max(atom.questionStatusPhaseFenceEventSeq, action.phaseFreshnessEventSeq),
+        consumedQuestionRequestIds: atom.consumedQuestionRequestIds.includes(action.requestId)
+          ? atom.consumedQuestionRequestIds
+          : [...atom.consumedQuestionRequestIds, action.requestId],
+      };
+
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
       // Optimistic client-side phase update — does NOT bump lastAppliedEventSeq.
@@ -1541,8 +1564,12 @@ export function conversationReducer(
         conversationId: action.conversationId,
         conversation,
         messages,
-        phase: atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
+        phase:
+          atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq || (atom.phase !== action.snapshotStartedAtPhase && atom.questionStatusPhaseFenceEventSeq >= action.snapshotStartedAtEventSeq)
+            ? atom.phase
+            : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
+        questionStatusPhaseFenceEventSeq: atom.questionStatusPhaseFenceEventSeq,
         pendingMessagePatches: Object.fromEntries(
           Object.entries(atom.pendingMessagePatches).filter(
             ([, pending]) => latestMessagePatchEventSeq(pending) > action.snapshotStartedAtEventSeq,

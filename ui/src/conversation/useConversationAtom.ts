@@ -62,6 +62,7 @@ export type ConversationPageView = Pick<
   | 'toolExecutingStartedAt'
   | 'phaseStateUpdatedAt'
   | 'phaseLastAppliedEventSeq'
+  | 'consumedQuestionRequestIds'
   | 'firstByteRequestId'
   | 'turnRetryContext'
   | 'transcriptGeneration'
@@ -80,6 +81,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'toolExecutingStartedAt',
   'phaseStateUpdatedAt',
   'phaseLastAppliedEventSeq',
+  'consumedQuestionRequestIds',
   'firstByteRequestId',
   'turnRetryContext',
   'transcriptGeneration',
@@ -130,6 +132,7 @@ export function useConversationView(
       toolExecutingStartedAt: a.toolExecutingStartedAt,
       phaseStateUpdatedAt: a.phaseStateUpdatedAt,
       phaseLastAppliedEventSeq: a.phaseLastAppliedEventSeq,
+      consumedQuestionRequestIds: a.consumedQuestionRequestIds,
       firstByteRequestId: a.firstByteRequestId,
       turnRetryContext: a.turnRetryContext,
       transcriptGeneration: a.transcriptGeneration,

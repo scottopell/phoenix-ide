@@ -28,6 +28,23 @@ enum APIError: Error, LocalizedError {
         }
     }
 
+    var isStaleQuestionRejection: Bool {
+        guard case .http(409, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return false }
+        return payload["error_type"]?.stringValue == "question_request_stale"
+    }
+
+    var isDefinitiveQuestionRejection: Bool {
+        guard case .http(let status, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return false }
+        return (status == 400 && payload["error_type"]?.stringValue == "question_request_invalid")
+            || (status == 409 && payload["error_type"]?.stringValue == "question_request_stale")
+    }
+
     var isTransport: Bool {
         if case .transport = self { return true }
         return false
@@ -179,7 +196,8 @@ struct PhoenixAPI: Sendable {
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    init?(baseURL: URL, password: String?, allowSelfSigned: Bool,
+          configuration: URLSessionConfiguration = .default) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
             return nil
         }
@@ -189,7 +207,7 @@ struct PhoenixAPI: Sendable {
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate
 
-        let config = URLSessionConfiguration.default
+        let config = configuration
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
@@ -279,6 +297,10 @@ struct PhoenixAPI: Sendable {
 
     func listProductConversations() async throws -> ProductConversationListResponse {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
+    }
+
+    func getConversationStatus(id: String) async throws -> ConversationStatusResponse {
+        try await get("api/conversations/\(id)/status", as: ConversationStatusResponse.self)
     }
 
     func getConversation(id: String, afterSequence: Int64 = 0) async throws
@@ -430,19 +452,26 @@ struct PhoenixAPI: Sendable {
     // Question response (awaiting_user_response): the server 409s when the
     // conversation isn't in that state — e.g. answered from another client.
 
-    func respondToQuestion(conversationId: String, answers: [String: String]) async throws {
-        struct SuccessResponse: Codable { var success: Bool? }
-        _ = try await post(
-            "api/conversations/\(conversationId)/respond",
-            body: ["answers": answers],
-            as: SuccessResponse.self)
+    private struct QuestionMutationResponse: Codable { let success: Bool? }
+
+    private func requireQuestionMutationSuccess(_ response: QuestionMutationResponse) throws {
+        guard response.success == true else {
+            throw APIError.decoding(underlying: DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Question mutation response did not confirm success")))
+        }
     }
 
-    func dismissQuestion(conversationId: String) async throws {
-        struct SuccessResponse: Codable { var success: Bool? }
-        _ = try await post(
-            "api/conversations/\(conversationId)/dismiss-question", body: [:],
-            as: SuccessResponse.self)
+    func respondToQuestion(conversationId: String, requestId: String, answers: [String: String]) async throws {
+        try requireQuestionMutationSuccess(try await post(
+            "api/conversations/\(conversationId)/respond",
+            body: ["request_id": requestId, "answers": answers],
+            as: QuestionMutationResponse.self))
+    }
+
+    func dismissQuestion(conversationId: String, requestId: String) async throws {
+        try requireQuestionMutationSuccess(try await post(
+            "api/conversations/\(conversationId)/dismiss-question", body: ["request_id": requestId],
+            as: QuestionMutationResponse.self))
     }
 
     /// Get-or-create the fleet Coordinator's writable transcript row. The

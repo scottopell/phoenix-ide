@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 797664f11cb7e8f9290ddab527002e696e114631bc34df9044a2faee026e77e8 # shrinks to summary = "", event = UserQuestionResponse { tool_use_id: "tool-auq-1", answers: {"A": "A"}, annotations: None }

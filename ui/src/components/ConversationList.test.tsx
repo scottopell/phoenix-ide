@@ -1174,7 +1174,7 @@ describe('Mobile conversation list redesign', () => {
   it('shows a visible needs-reply status label in mobile metadata', () => {
     const conv = makeConv('needs-reply', 'needs-reply', {
       presentation_mode: 'needs_action',
-      state: { type: 'awaiting_user_response', questions: [] },
+      state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     });
 
     const { container } = render(

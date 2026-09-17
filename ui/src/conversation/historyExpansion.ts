@@ -1,3 +1,5 @@
+import type { ConversationState } from '../api';
+
 export type HistoryView = {
   conversationId: string;
   generation: number;
@@ -17,11 +19,41 @@ export type ActiveHistoryRequest = {
   token: number;
   view: HistoryView;
   snapshotStartedAtEventSeq: number;
+  snapshotStartedAtPhase: ConversationState;
   intent: HistoryIntent;
 };
 
+export type PendingHistoryRequest = Omit<ActiveHistoryRequest, 'snapshotStartedAtEventSeq'> & {
+  snapshotStartedAtEventSeq: number | null;
+};
+
+export function historyRequestHasCursor(request: PendingHistoryRequest): request is ActiveHistoryRequest {
+  return request.snapshotStartedAtEventSeq !== null;
+}
+
+export function historyHasAuthoritativeTranscriptGeneration(transcriptGeneration: number | null): transcriptGeneration is number {
+  return transcriptGeneration !== null;
+}
+
 export function historyMergeEventCursorFloor(request: ActiveHistoryRequest): number {
   return request.snapshotStartedAtEventSeq;
+}
+
+export function historyResponseMatchesCurrentRequest(
+  request: ActiveHistoryRequest,
+  latestStartedRequestToken: number,
+  currentView: HistoryView,
+  authoritativeTranscriptGeneration: number,
+  responseConversationId: string,
+  responseTranscriptGeneration: number,
+): boolean {
+  return request.token === latestStartedRequestToken
+    && responseConversationId === request.view.conversationId
+    && currentView.conversationId === request.view.conversationId
+    && currentView.generation === request.view.generation
+    && currentView.transcriptGeneration === request.view.transcriptGeneration
+    && authoritativeTranscriptGeneration === request.view.transcriptGeneration
+    && responseTranscriptGeneration === request.view.transcriptGeneration;
 }
 
 export type HistoryCommandToken = number;

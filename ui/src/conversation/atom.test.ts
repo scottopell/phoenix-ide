@@ -563,6 +563,7 @@ describe('conversationReducer', () => {
         messages: [delivered],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 0,
       });
 
@@ -1081,6 +1082,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 500,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 100,
       });
 
@@ -2335,6 +2337,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         transcriptGeneration: 1,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 10,
       });
 
@@ -2363,6 +2366,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 2,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 1,
       });
 
@@ -2389,6 +2393,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 2,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 1,
       });
 
@@ -2412,6 +2417,7 @@ describe('conversationReducer', () => {
         phase: { type: 'llm_requesting', attempt: 1 },
         contextWindow: { used: 0 },
         eventCursorFloor: 10,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 10,
       });
 
@@ -2436,6 +2442,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 12,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 11,
       });
 
@@ -2461,6 +2468,7 @@ describe('conversationReducer', () => {
         messages: [staleRestMessage],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 6,
       });
 
@@ -2487,6 +2495,7 @@ describe('conversationReducer', () => {
         messages: [restMessage],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 8,
       });
 
@@ -2515,6 +2524,7 @@ describe('conversationReducer', () => {
         messages: [target],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 8,
       });
 
@@ -2549,6 +2559,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 6,
+        snapshotStartedAtPhase: atomAfterLiveUpdate.phase,
         snapshotStartedAtEventSeq: 6,
       });
 
@@ -2573,6 +2584,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         transcriptGeneration: 8,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 0,
       });
 
@@ -2598,6 +2610,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         transcriptGeneration: 8,
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 0,
       });
 
@@ -2624,6 +2637,7 @@ describe('conversationReducer', () => {
         contextWindow: { used: 0 },
         transcriptGeneration: 8,
         transcriptCoverage: 'tail',
+        snapshotStartedAtPhase: atom.phase,
         snapshotStartedAtEventSeq: 0,
       });
 
@@ -2812,4 +2826,82 @@ it('applies replaceable bash progress without advancing the replay sequence floo
   });
   expect(atom.lastAppliedEventSeq).toBe(5);
   expect(atom.eventGap).toBeNull();
+});
+
+describe('request-bound question callbacks', () => {
+  it('keeps a consumed question closed when pre-answer history returns without SSE', () => {
+    const pending: ConversationAtom = {...createInitialAtom(),conversationId:'conv-1',conversation:testConversation,phase:{type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},lastAppliedEventSeq:12};
+    const phaseAtRequestStart = pending.phase;
+    const resolved = conversationReducer(pending,{type:'question_phase_change',expectedConversationId:'conv-1',requestId:'question-1',phase:{type:'llm_requesting',attempt:1},stateUpdatedAt:1234,phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
+    const merged = conversationReducer(resolved,{
+      type:'merge_conversation_data',conversationId:'conv-1',conversation:testConversation,
+      messages:[makeMessage(1)],phase:phaseAtRequestStart,contextWindow:{used:0},
+      snapshotStartedAtEventSeq:12,snapshotStartedAtPhase:phaseAtRequestStart,
+    });
+    expect(merged.phase).toBe(resolved.phase);
+    expect(merged.phaseStateUpdatedAt).toBe(1234);
+    expect(merged.phaseLastAppliedEventSeq).toBe(pending.phaseLastAppliedEventSeq);
+    expect(merged.questionStatusPhaseFenceEventSeq).toBe(pending.lastAppliedEventSeq);
+    expect(merged.lastAppliedEventSeq).toBe(12);
+    expect(merged.messages).toHaveLength(1);
+    const newer = conversationReducer(merged,{
+      type:'merge_conversation_data',conversationId:'conv-1',conversation:testConversation,
+      messages:[],phase:{type:'idle'},contextWindow:{used:0},
+      snapshotStartedAtEventSeq:13,snapshotStartedAtPhase:merged.phase,
+    });
+    expect(newer.phase.type).toBe('idle');
+  });
+
+  it('keeps a consumed question closed when its original SSE state arrives late', () => {
+    const pending: ConversationAtom = {...createInitialAtom(),conversationId:'conv-1',conversation:testConversation,phase:{type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},lastAppliedEventSeq:12};
+    const resolved = conversationReducer(pending,{type:'question_phase_change',expectedConversationId:'conv-1',requestId:'question-1',phase:{type:'llm_requesting',attempt:1},stateUpdatedAt:1234,phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
+    const afterLateSse = conversationReducer(resolved, {
+      type: 'sse_state_change',
+      sequenceId: 13,
+      phase: {type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},
+      stateUpdatedAt: 1200,
+    });
+
+    expect(afterLateSse.phase).toBe(resolved.phase);
+    expect(afterLateSse.lastAppliedEventSeq).toBe(13);
+  });
+
+  it('adopts authoritative history phase when the snapshot cursor equals the phase event cursor', () => {
+    const phaseAtRequestStart = { type: 'idle' } as const;
+    const equalCursor: ConversationAtom = {
+      ...createInitialAtom(),
+      conversationId: 'conv-1',
+      conversation: testConversation,
+      phase: phaseAtRequestStart,
+      phaseLastAppliedEventSeq: 12,
+      lastAppliedEventSeq: 12,
+    };
+
+    const merged = conversationReducer(equalCursor, {
+      type: 'merge_conversation_data',
+      conversationId: 'conv-1',
+      conversation: testConversation,
+      messages: [makeMessage(1)],
+      phase: { type: 'llm_requesting', attempt: 1 },
+      contextWindow: { used: 0 },
+      snapshotStartedAtEventSeq: 12,
+      snapshotStartedAtPhase: phaseAtRequestStart,
+    });
+
+    expect(merged.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    expect(merged.phaseLastAppliedEventSeq).toBe(12);
+  });
+
+  const pending: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1', phase: {type: 'awaiting_user_response', request_id: 'new-request', tool_use_id: 'new-request', questions: []}, lastAppliedEventSeq: 12 };
+  it('ignores an old callback after the next question arrives', () => {
+    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'old-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq})).toBe(pending);
+  });
+  it('ignores a callback from a different conversation', () => {
+    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'other-conv',requestId:'new-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq})).toBe(pending);
+  });
+  it('updates only the matching pending request without advancing stream sequence', () => {
+    const next = conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'new-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
+    expect(next.phase.type).toBe('idle'); expect(next.lastAppliedEventSeq).toBe(12);
+    expect(next.phaseStateUpdatedAt).toBe(1234);
+  });
 });

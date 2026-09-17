@@ -57,14 +57,14 @@ function run(state: NotificationPolicyState, events: NotificationPolicyEvent[], 
 describe('notification policy reducer', () => {
   it('does not deliver until settings have loaded', () => {
     const { effects } = run(initialPolicyState(), [
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
     ]);
     expect(effects).toHaveLength(0);
   });
 
   it('emits a show effect once settings are loaded', () => {
     const { effects } = run(loadedState(), [
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
     ]);
     expect(effects).toHaveLength(1);
     expect(effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Question asked', tag: 'question_asked:conv-1' });
@@ -87,29 +87,45 @@ describe('notification policy reducer', () => {
   it('suppresses (and dedupes) when focused on the triggering conversation', () => {
     const focused = env({ visible: true, hasFocus: true, activeSlug: 'conv-a' });
     const first = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       focused);
     expect(first.effects).toHaveLength(0);
     // Focus-suppressed delivery still records attention so catch-up won't refire.
-    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
+    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked:test-question');
   });
 
   it('suppresses when focused by stable conversation id', () => {
     const focused = env({ visible: true, hasFocus: true, activeSlug: 'conv-1' });
     const first = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       focused);
     expect(first.effects).toHaveLength(0);
-    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
+    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked:test-question');
   });
 
   it('queues a permission cue without consuming dedupe when permission is default', () => {
     const result = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       env({ permission: 'default' }));
     expect(result.effects).toHaveLength(0);
     expect(result.state.permissionCuePending).toBe(true);
     expect(result.state.attentionSeenByConversationId.has('conv-1')).toBe(false);
+  });
+
+  it('notifies a later question with a fresh request identity after working state', () => {
+    const first = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'question-a', tool_use_id: 'tool-a', questions: [] } },
+      env());
+    const working = notificationPolicyReducer(first.state,
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'awaiting_user_response', request_id: 'question-a', tool_use_id: 'tool-a', questions: [] }, nextState: { type: 'llm_requesting', attempt: 1 } },
+      env({ now: 2 }));
+    const second = notificationPolicyReducer(working.state,
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'llm_requesting', attempt: 1 }, nextState: { type: 'awaiting_user_response', request_id: 'question-b', tool_use_id: 'tool-b', questions: [] } },
+      env({ now: 3 }));
+
+    expect(first.effects).toHaveLength(1);
+    expect(second.effects).toHaveLength(1);
+    expect(second.effects[0]).toMatchObject({ attentionKey: 'conv-1:question_asked:question-b' });
   });
 
   it('gates agent_finished on the long-task threshold', () => {
@@ -226,9 +242,9 @@ describe('notification policy reducer', () => {
   });
 
   it('catch-up dedupes against a prior live delivery for the same blocking state', () => {
-    const blocked = conversation({ state: { type: 'awaiting_user_response', questions: [] } });
+    const blocked = conversation({ state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } });
     const live = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_state_changed', conversation: blocked, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: blocked, previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       env());
     expect(live.effects).toHaveLength(1);
     const catchup = notificationPolicyReducer(live.state, { type: 'catchup_scan', conversations: [blocked] }, env());
@@ -276,7 +292,7 @@ describe('notification policy reducer', () => {
 
   it('seeding a snapshot remembers busy state without delivering', () => {
     const result = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_snapshot_seeded', conversation: conversation(), state: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_snapshot_seeded', conversation: conversation(), state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       env());
     expect(result.effects).toHaveLength(0);
     expect(result.state.attentionSeenByConversationId.has('conv-1')).toBe(false);
@@ -284,11 +300,11 @@ describe('notification policy reducer', () => {
 
   it('rolls back the dedupe mark when browser construction fails', () => {
     const delivered = notificationPolicyReducer(loadedState(),
-      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } },
       env());
-    expect(delivered.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
+    expect(delivered.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked:test-question');
     const rolledBack = notificationPolicyReducer(delivered.state,
-      { type: 'notification_delivery_failed', conversationId: 'conv-1', attentionKey: 'conv-1:question_asked' },
+      { type: 'notification_delivery_failed', conversationId: 'conv-1', attentionKey: 'conv-1:question_asked:test-question' },
       env());
     expect(rolledBack.state.attentionSeenByConversationId.has('conv-1')).toBe(false);
   });

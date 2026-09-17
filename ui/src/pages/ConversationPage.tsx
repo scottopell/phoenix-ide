@@ -20,10 +20,12 @@ import {
 } from './conversationRouteFocus';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
-  historyMergeEventCursorFloor,
+  historyResponseMatchesCurrentRequest,
+  historyHasAuthoritativeTranscriptGeneration,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
+  type PendingHistoryRequest,
   type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
@@ -794,6 +796,7 @@ function ConversationPageContent({
     onValidatedSteeringQueued: (messageId) => {
       reconcileAuthoritative([messageId]);
     },
+    isConsumedQuestionRequest: (requestId) => atomRef.current.consumedQuestionRequestIds.includes(requestId),
   });
 
   const isOffline =
@@ -838,6 +841,7 @@ function ConversationPageContent({
     void (async () => {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
+        const snapshotStartedAtPhase = atomRef.current.phase;
         const settledResults = await Promise.allSettled(
           Array.from({ length: Math.ceil(accepted.length / 100) }, (_, index) => {
             const chunk = accepted.slice(index * 100, (index + 1) * 100);
@@ -882,6 +886,7 @@ function ConversationPageContent({
             }),
             transcriptCoverage: current.transcriptCoverage,
             snapshotStartedAtEventSeq,
+            snapshotStartedAtPhase,
           });
           reconcileAuthoritative(persisted.map((entry) => entry.message_id));
         }
@@ -1016,32 +1021,58 @@ function ConversationPageContent({
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
-    const request = {
+    const request: PendingHistoryRequest = {
       token: ++historyRequestTokenRef.current,
       view: historyExpansion.view,
       snapshotStartedAtEventSeq: eventCursorRef.current,
+      snapshotStartedAtPhase: atomRef.current.phase,
       intent,
     };
-    const requestTranscriptGeneration = request.view.transcriptGeneration;
+    const maybeRequestStartedAtEventSeq = request.snapshotStartedAtEventSeq;
+    if (maybeRequestStartedAtEventSeq === null) {
+      dispatchHistoryExpansion({
+        type: 'history_failed',
+        requestToken: request.token,
+        view: request.view,
+        transcriptGeneration: request.view.transcriptGeneration,
+        message: 'Cannot load earlier history until the live event cursor is available',
+      });
+      return;
+    }
+    const requestStartedAtEventSeq: number = maybeRequestStartedAtEventSeq;
+    const activeRequest = { ...request, snapshotStartedAtEventSeq: requestStartedAtEventSeq };
+    const requestTranscriptGeneration = activeRequest.view.transcriptGeneration;
 
-    dispatchHistoryExpansion({ type: 'request_started', request });
+    dispatchHistoryExpansion({ type: 'request_started', request: activeRequest });
     try {
       const route = await resolveConversationRoute(slug);
       const result = await getConversationByResolvedId(route);
       const currentView = historyViewRef.current;
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
-      const requestIsCurrent = result.conversation.id === request.view.conversationId
-        && currentView.conversationId === request.view.conversationId
-        && currentView.generation === request.view.generation
-        && currentView.transcriptGeneration === request.view.transcriptGeneration
-        && authoritativeTranscriptGeneration === request.view.transcriptGeneration
-        && responseTranscriptGeneration === request.view.transcriptGeneration;
+      if (!historyHasAuthoritativeTranscriptGeneration(authoritativeTranscriptGeneration)) {
+        dispatchHistoryExpansion({
+          type: 'history_failed',
+          requestToken: activeRequest.token,
+          view: activeRequest.view,
+          transcriptGeneration: requestTranscriptGeneration,
+          message: 'Conversation changed while loading earlier history',
+        });
+        return;
+      }
+      const requestIsCurrent = historyResponseMatchesCurrentRequest(
+        activeRequest,
+        historyRequestTokenRef.current,
+        currentView,
+        authoritativeTranscriptGeneration,
+        result.conversation.id,
+        responseTranscriptGeneration,
+      );
       if (!requestIsCurrent) {
         dispatchHistoryExpansion({
           type: 'history_failed',
-          requestToken: request.token,
-          view: request.view,
+          requestToken: activeRequest.token,
+          view: activeRequest.view,
           transcriptGeneration: requestTranscriptGeneration,
           message: 'Conversation changed while loading earlier history',
         });
@@ -1049,7 +1080,7 @@ function ConversationPageContent({
       }
       dispatch({
         type: 'merge_conversation_data',
-        conversationId: request.view.conversationId,
+        conversationId: activeRequest.view.conversationId,
         conversation: result.conversation,
         messages: result.messages,
         phase: result.conversation.state
@@ -1060,17 +1091,18 @@ function ConversationPageContent({
         contextWindow: { used: result.context_window_size || 0 },
         transcriptGeneration: responseTranscriptGeneration,
         transcriptCoverage: 'complete',
-        eventCursorFloor: historyMergeEventCursorFloor(request),
-        snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
+        eventCursorFloor: requestStartedAtEventSeq,
+        snapshotStartedAtEventSeq: requestStartedAtEventSeq,
+        snapshotStartedAtPhase: activeRequest.snapshotStartedAtPhase,
       });
       dispatchHistoryExpansion({
         type: 'history_loaded',
-        requestToken: request.token,
-        view: request.view,
-        targetPresent: request.intent.kind !== 'deep_link'
+        requestToken: activeRequest.token,
+        view: activeRequest.view,
+        targetPresent: activeRequest.intent.kind !== 'deep_link'
           || findHistoricalUnitIndexByMessageId(
             buildHistoricalUnits({ messages: result.messages, pendingMessages: [] }).historicalUnits,
-            request.intent.targetMessageId,
+            activeRequest.intent.targetMessageId,
           ) >= 0,
         commandToken: ++historyCommandTokenRef.current,
       });
@@ -1078,8 +1110,8 @@ function ConversationPageContent({
       console.warn('Failed to load earlier conversation history:', err);
       dispatchHistoryExpansion({
         type: 'history_failed',
-        requestToken: request.token,
-        view: request.view,
+        requestToken: activeRequest.token,
+        view: activeRequest.view,
         transcriptGeneration: requestTranscriptGeneration,
         message: err instanceof Error ? err.message : 'Failed to load earlier history',
       });
@@ -1781,6 +1813,16 @@ function ConversationPageContent({
     && ordinaryComposerEligible
     && (convStateForChildren.type !== 'error'
       || (convStateForChildren.error?.can_user_resume ?? false));
+
+  const previousQuestionOwner = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousQuestionOwner.current;
+    previousQuestionOwner.current = convStateForChildren.type === 'awaiting_user_response' ? conversation?.id ?? null : null;
+    if (previous && previous === conversation?.id && convStateForChildren.type !== 'awaiting_user_response'
+      && writableComposerMounted && (activeScope === null || activeScope === 'question-panel' || activeScope === 'question-dismiss')) {
+      setFocusToken(value => value + 1);
+    }
+  }, [conversation?.id, convStateForChildren.type, writableComposerMounted, activeScope]);
 
   useEffect(() => {
     if (!onProjectionChange) return;
@@ -2539,12 +2581,12 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
+          requestId={convStateForChildren.request_id}
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
-          onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
-          onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
+          onResolved={(phase, stateUpdatedAt) => dispatch({ type: 'question_phase_change', phase, stateUpdatedAt, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id, phaseFreshnessEventSeq: eventCursorRef.current })}
         />
       ) : mutationEnabled && ordinaryComposerEligible ? (
         <>

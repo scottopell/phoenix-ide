@@ -1,37 +1,60 @@
-# Ask User Question Tool - Executive Summary
+# Ask User Question Tool — Executive Summary
 
 ## Requirements Summary
 
-The ask_user_question tool enables LLM agents to pause execution and ask the
-user 1-4 structured multiple-choice questions when multiple valid approaches
-exist. Users select from predefined options or provide free-text answers. For
-questions comparing concrete artifacts (code, config), options can include rich
-previews displayed side-by-side. Users can add notes to their selections for
-additional context. Responses are delivered back to the agent as a formatted
-tool result. The tool is excluded from sub-agents, which operate autonomously.
+AskUserQuestion pauses a parent conversation for one to four decisions. Users
+select choices, include a custom answer, and qualify any answer with notes.
+Responsive layouts preserve reading context and reachable actions. Native form
+controls separate selection, keyboard focus, and explicit sending. Responses and
+dismissals belong to a specific pending tool request; uncertainty retains the
+submitted operation without silently substituting another draft.
 
 ## Technical Summary
 
-Follows the `AwaitingTaskApproval` state machine pattern: executor intercepts
-the tool call, emits `AskUserQuestionPending`, state machine transitions to
-`AwaitingUserResponse`, SSE notifies the UI, user responds via
-`POST /conversations/{id}/respond`, `UserQuestionResponse` event resumes
-execution. Input validation enforces question/option count constraints and
-uniqueness. The tool is registered with `defer_loading: true` for tool search
-on supporting models. Tool result format is a human-readable string including
-selected labels, preview content, and user notes.
+Pending questions now carry a server-generated `request_id` independently of
+provider `tool_use_id`. Web, CLI, native iOS, API admission, runtime events, and
+atomic SQLite consumption use the incarnation identity. Migration 098 preserves
+pending questions while assigning missing identities. Legacy dismissed conversations
+retain FIFO eligibility when their queue is nonempty; empty queues gain pause
+ownership. A durable pause row for new dismissals holds queued steering until acceptance of
+a new explicit user message; deferred objective delivery cannot release it.
+The next drain delivers queued inputs FIFO with one LLM dispatch. Local SQLite
+question commands use exact outcome classification and the existing fail-stop
+boundary. Browser behavior follows [ADR-053](../adrs/053_question-interactions-bind-explicit-answers-to-request-identity.md);
+[ADR-054](../adrs/054_question-incarnations-and-durable-dismissal-resumption.md)
+refines request identity and dismissal resumption ownership. Web and native
+clients fetch authoritative conversation state after confirmed success or stale
+rejection; a failed refresh keeps the resolved question closed and offers a
+status check without another mutation. Native iOS receives protocol adaptation,
+not the browser visual redesign. The legacy `design.md` remains historical and is
+not the redesign authority.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
-|-------------|--------|-------|
-| **REQ-AUQ-001:** Structured Question Presentation | ✅ Complete | `src/tools/ask_user_question.rs`, `AwaitingUserResponse` state, `QuestionPanel.tsx` |
-| **REQ-AUQ-002:** Rich Option Previews | ✅ Complete | Side-by-side `question-preview-layout` in `QuestionPanel.tsx`/`.css` |
-| **REQ-AUQ-003:** Flexible Response Collection | ✅ Complete | `OTHER_SENTINEL`, `otherTexts`, `multiSelections`, notes/annotations |
-| **REQ-AUQ-004:** Response Delivery to Agent | ✅ Complete | `POST /api/conversations/:id/respond`, `UserQuestionResponse` event |
-| **REQ-AUQ-005:** Prevent Ambiguous Question Responses | ✅ Complete | Schema constraints in tool; `AwaitingUserResponse` blocks `UserMessage` in `transition.rs` |
-| **REQ-AUQ-006:** Parent Conversation Availability | ✅ Complete | Excluded from sub-agent `ToolRegistry` in `src/tools.rs` |
-| **REQ-AUQ-007:** Real-Time Waiting Feedback | ✅ Complete | `awaiting_user_response` in `ConversationState` SSE union in `ui/src/api.ts` |
-| **REQ-AUQ-008:** Low-Overhead Tool Availability | ✅ Complete | `defer_loading() -> bool { true }` in `ask_user_question.rs` |
+| --- | --- | --- |
+| REQ-AUQ-001: Structured Question Presentation | Implemented | Unanswered initialization; explicit native selection, navigation, and send |
+| REQ-AUQ-002: Rich Option Previews | Implemented | Selected-only preview, absent/Other states, rendered-line disclosure, stationary narrow choices |
+| REQ-AUQ-003: Flexible Response Collection | Implemented | Retained custom drafts, explicit inclusion, universal notes, exact payload tests |
+| REQ-AUQ-004: Response Delivery to Agent | Implemented | Atomic response consumption; durable dismissal pause; explicit resumption drains FIFO |
+| REQ-AUQ-005: Prevent Ambiguous Question Responses | Complete | Tool question/option count and uniqueness validation exists |
+| REQ-AUQ-006: Parent Conversation Availability | Complete | Tool registry excludes sub-agent invocation |
+| REQ-AUQ-007: Real-Time Waiting Feedback | Implemented | Pending identity across web, CLI, iOS; status and errors reflect operation outcome |
+| REQ-AUQ-008: Low-Overhead Tool Availability | Complete | Tool supports deferred discovery |
+| REQ-AUQ-009: Responsive Reading and Reachable Actions | Implemented; device qualification pending | 160 Chromium/WebKit journeys; real product shell, eight viewport sizes, 2×/4× equivalent reflow; physical keyboard/manual zoom gate in task 10006 |
+| REQ-AUQ-010: Accessible Native Interaction | Implemented; AT qualification pending | Native controls, concise accessible names, scoped shortcuts, modal isolation; VoiceOver/TalkBack gate in task 10006 |
+| REQ-AUQ-011: Request-Bound Responses and Dismissal | Implemented | Admission/transition checks, fresh incarnation identity, forward migration, request-scoped callbacks, all-client tests |
+| REQ-AUQ-012: Truthful Sending and Uncertain Outcomes | Implemented | Frozen retries, malformed-status protection, duplicate/partial-persistence regressions |
+| REQ-AUQ-013: Draft Lifetime and Request Isolation | Implemented | Mounted same-request draft retention; different identity resets, including identical text |
 
-**Progress:** 8 of 8 complete
+**Progress:** All 13 requirements implemented. Task 10005 owns implementation;
+task 10006 owns remaining physical-device/assistive-technology release qualification.
+
+## Validation gate
+
+The approved proposal's viewport, browser, keyboard, screen-reader, and runtime
+matrix is the release gate. Fixture checks alone do not establish integration or
+real-device behavior. Mark untested required platforms as qualification gaps.
+The design and implementation audits are complete. Automated evidence and the
+remaining manual qualification limits are recorded in
+[implementation validation](../../docs/proposals/ask-user-question-validation.md).

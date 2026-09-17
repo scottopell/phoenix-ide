@@ -428,24 +428,164 @@ final class ConversationSession {
     /// The action currently being executed, or nil. Views use this to
     /// disable controls and show progress — approval buttons especially
     /// must not double-fire.
+    enum QuestionAttemptPhase: Equatable {
+        case sending
+        case needsStatusCheck(String)
+        case checkedPending
+        case checking
+        case resolvedWaitingForStream
+        case resolvedNeedsStatusCheck(String)
+
+        var canCheckStatus: Bool {
+            switch self {
+            case .needsStatusCheck, .checkedPending, .resolvedNeedsStatusCheck: return true
+            case .sending, .checking, .resolvedWaitingForStream: return false
+            }
+        }
+
+        var canRetry: Bool { self == .checkedPending }
+
+        func observingStreamState(_ state: ConversationState) -> Self {
+            if state.questionStatusIsUnverifiable && self == .checkedPending {
+                return .needsStatusCheck("Question status is incomplete. Update Phoenix and check status again.")
+            }
+            return self
+        }
+
+        static func reconcile(
+            conversationId: String,
+            requestId: String,
+            result: Result<Conversation, Error>
+        ) -> Self {
+            guard case .success(let snapshot) = result else {
+                return .needsStatusCheck("Could not check question status. Check status again when connected.")
+            }
+            guard snapshot.id == conversationId else {
+                return .needsStatusCheck("Could not verify this conversation's question status. Check status again.")
+            }
+            let state = ConversationState.parse(snapshot.state)
+            if state.questionStatusIsUnverifiable {
+                return .needsStatusCheck("Question status is incomplete. Update Phoenix and check status again.")
+            }
+            if case .awaitingUserResponse(let currentId, _) = state, currentId == requestId {
+                return .checkedPending
+            }
+            return .resolvedWaitingForStream
+        }
+    }
     private struct ActionAttempt {
         let action: ConversationAction
         let originState: ConversationState?
         let token: UUID
+        var phase: QuestionAttemptPhase = .sending
     }
     private var actionAttempt: ActionAttempt?
+    private var consumedQuestionRequestIds: Set<String> = []
     var actionInFlight: ConversationAction? { actionAttempt?.action }
+
+    var questionResolvedWaitingForStream: Bool {
+        switch actionAttempt?.phase {
+        case .resolvedWaitingForStream, .resolvedNeedsStatusCheck: return true
+        default: return false
+        }
+    }
+
+    var uncertainQuestionMessage: String? {
+        guard let attempt = actionAttempt, attempt.action.questionRequestId != nil else { return nil }
+        switch attempt.phase {
+        case .sending: return nil
+        case .needsStatusCheck(let message), .resolvedNeedsStatusCheck(let message): return message
+        case .checkedPending: return "Your original action may still be processing. Retry sends only the same answer or dismissal."
+        case .checking: return "Checking question status…"
+        case .resolvedWaitingForStream: return "This question is no longer awaiting an answer. Refreshing…"
+        }
+    }
+
+    var canRetryQuestionOperation: Bool {
+        guard let attempt = actionAttempt, attempt.action.questionRequestId != nil else { return false }
+        return connectivity.isOnline && attempt.phase.canRetry
+    }
+
+    var canCheckQuestionStatus: Bool {
+        guard let attempt = actionAttempt, attempt.action.questionRequestId != nil else { return false }
+        return connectivity.isOnline && attempt.phase.canCheckStatus
+    }
+
+    func retryQuestionOperation() {
+        guard canRetryQuestionOperation, let attempt = actionAttempt else { return }
+        actionAttempt?.phase = .sending
+        executeAction(attempt.action, token: attempt.token, previouslyUncertain: true)
+    }
+
+    @discardableResult
+    func checkQuestionStatus() -> Task<Void, Never>? {
+        guard canCheckQuestionStatus, let attempt = actionAttempt else { return nil }
+        let knownResolved = questionResolvedWaitingForStream
+        actionAttempt?.phase = knownResolved ? .resolvedWaitingForStream : .checking
+        return Task { await reconcileQuestionOperation(attempt, knownResolved: knownResolved) }
+    }
+
+    private func reconcileQuestionOperation(_ attempt: ActionAttempt, knownResolved: Bool) async {
+        guard let requestId = attempt.action.questionRequestId else { return }
+        let result: Result<ConversationStatusResponse, Error>
+        do {
+            result = .success(try await api.getConversationStatus(id: conversationId))
+        } catch {
+            result = .failure(error)
+        }
+        guard actionAttempt?.token == attempt.token else { return }
+        let phase = QuestionAttemptPhase.reconcile(
+            conversationId: conversationId, requestId: requestId, result: result.map(\.conversation))
+        if phase == .resolvedWaitingForStream, case .success(let snapshot) = result {
+            adoptQuestionStatus(snapshot)
+        } else if knownResolved {
+            actionAttempt?.phase = .resolvedNeedsStatusCheck(
+                "This question is no longer awaiting an answer. Could not refresh conversation status. Check status again.")
+        } else {
+            actionAttempt?.phase = phase
+        }
+        streamTask?.cancel()
+        streamTask = nil
+        connection = .idle
+        resumeLiveTasks()
+    }
+
+    private func adoptQuestionStatus(_ snapshot: ConversationStatusResponse) {
+        let mode = snapshot.presentation_mode ?? snapshot.conversation.presentation_mode
+        var updated = snapshot.conversation
+        // Transcript generation changes only when its corresponding transcript is applied.
+        updated.transcript_generation = transcriptGeneration
+        updated.presentation_mode = mode
+        if let mode { updated.requires_action = mode == "needs_action" }
+        conversation = updated
+        presentationMode = mode
+        agentWorking = snapshot.agent_working ?? (mode == "working")
+        clearResolvedActionIfStateAdvanced(currentState: typedState)
+        persistSnapshot()
+        onConversationUpdate?(updated)
+    }
+
+    private func resolveQuestionOperation(token: UUID) async {
+        guard let attempt = actionAttempt, attempt.token == token else { return }
+        actionAttempt?.phase = .resolvedWaitingForStream
+        await reconcileQuestionOperation(attempt, knownResolved: true)
+    }
 
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
-    func perform(_ action: ConversationAction) {
-        guard acceptsConversationActions, actionAttempt == nil else { return }
+    @discardableResult
+    func perform(_ action: ConversationAction) -> Task<Void, Never>? {
+        guard acceptsConversationActions, actionAttempt == nil else { return nil }
+        if let requestId = action.questionRequestId {
+            guard case .awaitingUserResponse(let currentId, _) = typedState,
+                  currentId == requestId else { return nil }
+        }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
-                return
+                return nil
             }
         case .outboxed:
             break  // never blocked on connectivity by definition
@@ -453,8 +593,13 @@ final class ConversationSession {
         let token = UUID()
         actionAttempt = ActionAttempt(
             action: action,
-            originState: typedState,
+            originState: action.questionRequestId == nil ? typedState : nil,
             token: token)
+        return executeAction(action, token: token, previouslyUncertain: false)
+    }
+
+    @discardableResult
+    private func executeAction(_ action: ConversationAction, token: UUID, previouslyUncertain: Bool) -> Task<Void, Never> {
         Task {
             do {
                 switch action {
@@ -470,14 +615,31 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
-                case .respondToQuestions(let answers):
+                case .respondToQuestions(let requestId, let answers):
                     try await api.respondToQuestion(
-                        conversationId: conversationId, answers: answers)
-                case .dismissQuestion:
-                    try await api.dismissQuestion(conversationId: conversationId)
+                        conversationId: conversationId, requestId: requestId, answers: answers)
+                case .dismissQuestion(let requestId):
+                    try await api.dismissQuestion(conversationId: conversationId, requestId: requestId)
+                }
+                guard actionAttempt?.token == token else { return }
+                if let requestId = action.questionRequestId {
+                    consumedQuestionRequestIds.insert(requestId)
+                    await resolveQuestionOperation(token: token)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }
+                if let requestId = action.questionRequestId,
+                   (error as? APIError)?.isStaleQuestionRejection == true {
+                    consumedQuestionRequestIds.insert(requestId)
+                    await resolveQuestionOperation(token: token)
+                    return
+                }
+                if action.questionRequestId != nil,
+                   Self.questionFailureRemainsUncertain(error, previouslyUncertain: previouslyUncertain) {
+                    actionAttempt?.phase = .needsStatusCheck("Could not confirm the action. Check status before continuing.")
+                    checkQuestionStatus()
+                    return
+                }
                 if case .cancel = action {
                     cancelNeedsAgentDoneFallback = false
                 }
@@ -486,6 +648,10 @@ final class ConversationSession {
                     ?? error.localizedDescription
             }
         }
+    }
+
+    nonisolated static func questionFailureRemainsUncertain(_ error: Error, previouslyUncertain: Bool) -> Bool {
+        previouslyUncertain || (error as? APIError)?.isDefinitiveQuestionRejection != true
     }
 
     func clearErrorToast() {
@@ -730,7 +896,11 @@ final class ConversationSession {
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
+            if case .awaitingUserResponse(let requestId, _) = ConversationState.parse(state), consumedQuestionRequestIds.contains(requestId) {
+                return
+            }
             cancelNeedsAgentDoneFallback = false
+
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
@@ -938,6 +1108,9 @@ final class ConversationSession {
             actionAttempt = nil
             return
         }
+        if attempt.action.questionRequestId != nil {
+            actionAttempt?.phase = attempt.phase.observingStreamState(currentState)
+        }
     }
 
     nonisolated static func actionStillAwaitsOriginalState(
@@ -945,6 +1118,11 @@ final class ConversationSession {
         origin: ConversationState?,
         current: ConversationState
     ) -> Bool {
+        if let requestId = action.questionRequestId {
+            if current.questionStatusIsUnverifiable { return true }
+            guard case .awaitingUserResponse(let currentId, _) = current else { return false }
+            return currentId == requestId
+        }
         switch action {
         case .cancel:
             return current.isCancellable

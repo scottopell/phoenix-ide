@@ -2,6 +2,12 @@
 
 ## Current reality
 
+AskUserQuestion callers require the server-generated pending `request_id`;
+provider `tool_use_id` does not authorize mutation. Missing identity receives an
+actionable no-mutation error. Migration 097 preserves pending questions while
+assigning missing durable incarnations; browser, CLI, and native protocol checks
+cover the coordinated change.
+
 Phoenix supports forward SQLite migrations, but compatibility guarantees have not previously had one project-wide authority. Some feature tests and implementations therefore provide stronger cross-version behavior than a named product requirement demands.
 
 Production deployment restores the previous binary, configuration, environment, and service state after failed activation. It does not restore a matching database, so its existing outcome is runtime-artifact rollback. The release-update UI still describes that outcome as the previous release being “restored and verified,” which overstates the database guarantee. Phoenix also still accepts an older release candidate without proving that its paired database backup was restored. Phoenix does not provide a general automatic database rollback subsystem. Manual version rollback is offline: stop Phoenix, restore the database backup paired with the target binary, then start that binary. Task 44016 owns the deployment rejection boundary and truthful rollback messaging.
@@ -19,6 +25,7 @@ Internal SQLite timestamps use mixed representations. New or changed internal ti
 | REQ-COMP-003 | Foundation acceptance covers manual offline paired restore, but production deployment can still launch an older candidate without proving that restore occurred, and the UI overstates runtime-artifact rollback. Enforcement and truthful messaging are tracked in task 44016. |
 | REQ-COMP-004 | Single managed-runtime ownership and offline replacement are defined; no live replacement or mixed-version sharing protocol is supported. Operator guidance and stale fencing machinery require follow-up audit. |
 | REQ-COMP-005 | Policy applies to newly introduced or structurally changed internal timestamp columns. Unchanged historical timestamp columns are outside this initial convergence rule. |
+| REQ-COMP-006 | Implemented: web, CLI, and native iOS require originating question identity. Admission/transition rejection, atomic consumption, and missing-identity reload/update guidance have regression coverage. |
 
 ## Next work
 

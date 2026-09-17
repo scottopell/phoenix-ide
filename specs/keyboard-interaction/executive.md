@@ -27,20 +27,24 @@ shortcuts use modifier keys and are never blocked by panel-level handlers.
 
 ## Status Summary
 
+The approved AUQ redesign implements native traversal, explicit sending,
+request-scoped completion focus, and nested Escape behavior. Automated browser
+and component checks pass; task 10006 retains physical-device and screen-reader qualification.
+
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-KB-001:** Layered Focus Scoping | ✅ Complete | `FocusScopeContext` in `ui/src/hooks/useFocusScope.tsx` manages push/pop ordering for topmost scopes |
+| **REQ-KB-001:** Layered Focus Scoping | Implemented | AUQ restoration follows authoritative resolution; late callbacks cannot focus a newer request |
 | **REQ-KB-002:** Global Shortcuts Pass Through | ✅ Complete | `useGlobalKeyboardShortcuts` keeps global commands available across scope-local handlers |
 | **REQ-KB-002A:** Topmost Eligible Shortcut Ownership | ✅ Complete | Viewer-local `Cmd/Ctrl+F` routing checks `activeScope` and ignores obscured lower layers via `useViewerFindKeyboardShortcut` |
 | **REQ-KB-003:** Scope-Local Key Consumption | ✅ Complete | Panel-local `onKeyDown` handlers consume owned keys so lower scopes do not react |
-| **REQ-KB-004:** Auto-Focus on Panel Appearance | ✅ Complete | Question-panel and viewer-find affordances move focus into their primary control on open |
+| **REQ-KB-004:** Auto-Focus on Panel Appearance | Implemented | Native radio selection reveals Other without stealing focus; explicit pointer/Edit entry focuses the editor |
 | **REQ-KB-004A:** Repeated Shortcut Refocus | ✅ Complete | Re-pressing `Cmd/Ctrl+F` refocuses/selects the existing find query instead of opening another bar |
 | **REQ-KB-005:** Escape Key Behavior | ✅ Complete | Escape hierarchy remains sub-context -> confirm if unsaved -> dismiss -> navigate; viewer find closes before its enclosing viewer |
 | **REQ-KB-006:** Shortcut Help Panel | ✅ Complete | `?` key opens `ShortcutHelpPanel` |
 | **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Shortcut-bearing controls expose their key hints in tooltips or labels |
-| **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ✅ Complete | Lower-priority keyboard navigation stays gated behind the active scope |
+| **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | Implemented | Native Tab/radio defaults preserved; lower-scope shortcuts blocked; help/palette handoff tested |
 
-**Progress:** 10 of 10 complete
+**Progress:** All 10 requirements implemented; AUQ assistive-technology qualification remains in task 10006.
 
 ## Cross-Spec References
 

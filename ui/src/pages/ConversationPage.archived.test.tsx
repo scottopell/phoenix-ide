@@ -349,6 +349,27 @@ describe('ConversationPage message viewer layout', () => {
 });
 
 describe('ConversationPage route focus', () => {
+  it('restores composer focus when SSE resolves questions before the HTTP callback', async () => {
+    const {store} = renderPage(makeConversation());
+    await screen.findByRole('textbox');
+    act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:1,phase:{type:'awaiting_user_response',request_id: 'first-question', tool_use_id:'first-question',questions:[{header:'Pick',question:'Choose?',multiSelect:false,options:[{label:'A'},{label:'B'}]}]},stateUpdatedAt:Date.now()+1}));
+    await screen.findByRole('radio',{name:'A'});
+    act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:2,phase:{type:'idle'},stateUpdatedAt:Date.now()+2}));
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(()=>expect(textbox).toHaveFocus());
+  });
+  it('keeps a newer question focused when an earlier callback arrives', async () => {
+    const {store} = renderPage(makeConversation());
+    await screen.findByRole('textbox');
+    const questions=[{header:'Pick',question:'Choose?',multiSelect:false,options:[{label:'A'},{label:'B'}]}];
+    act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:1,phase:{type:'awaiting_user_response',request_id: 'first-question', tool_use_id:'first-question',questions},stateUpdatedAt:Date.now()+1}));
+    await screen.findByRole('radio',{name:'A'});
+    act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:2,phase:{type:'awaiting_user_response',request_id: 'second-question', tool_use_id:'second-question',questions},stateUpdatedAt:Date.now()+2}));
+    act(() => store.dispatch(slug,{type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:slug,requestId:'first-question',phase:{type:'idle'},phaseFreshnessEventSeq:1}));
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.getByRole('radio',{name:'A'})).toHaveFocus();
+  });
+
   it('focuses the composer when a live conversation route becomes ready', async () => {
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
@@ -367,7 +388,7 @@ describe('ConversationPage route focus', () => {
     anchor.focus();
 
     renderPage(makeConversation({
-      state: { type: 'awaiting_user_response', questions: [] },
+      state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     }));
 
     await screen.findByTestId('message-history');
