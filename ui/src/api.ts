@@ -80,6 +80,8 @@ export type { ResourceSample } from './generated/ResourceSample';
 export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
+export type { ProductConversationCloseActionView } from './generated/ProductConversationCloseActionView';
+export type { ProductConversationCloseUnavailableReasonView } from './generated/ProductConversationCloseUnavailableReasonView';
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
@@ -2124,6 +2126,9 @@ export const api = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409 && typeof err.error_type === 'string') {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
       throw new Error(err.error || 'Failed to rename product conversation');
     }
     return resp.json();

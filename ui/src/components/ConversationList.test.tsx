@@ -156,6 +156,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     title: `Root ${id}`,
   },
   ordinary_lifecycle: 'open',
+  close_action: { availability: 'available' },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
@@ -456,6 +457,35 @@ describe('ConversationList — product conversations', () => {
     expect(getByText('Archived Root')).toBeInTheDocument();
     expect(historyRow).toHaveTextContent('Completed');
     expect(historyRow).not.toHaveTextContent('Retained history');
+  });
+
+  it('uses server-authoritative Close availability without inferring from lifecycle or presentation', () => {
+    const close = vi.fn();
+    const blocked = makeProductConversation('pc-blocked', {
+      close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' },
+      presentation: { kind: 'state', display_name: 'Blocked', presentation_mode: 'idle' },
+    });
+    const available = makeProductConversation('pc-available', {
+      close_action: { availability: 'available' },
+      presentation: { kind: 'needs_action', display_name: 'Needs action' },
+    });
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[blocked, available]}
+          onProductConversationClose={close}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(getByRole('button', {
+      name: /Close product conversation Root pc-blocked\. Resolve the pending task approval before closing/,
+    })).toBeDisabled();
+    fireEvent.click(getByRole('button', { name: 'Close product conversation Root pc-available' }));
+    expect(close).toHaveBeenCalledWith(available);
   });
 
   it('renders History working directory from archived member rows', () => {

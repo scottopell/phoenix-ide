@@ -15,6 +15,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
 } from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
@@ -273,7 +274,10 @@ export function Sidebar({
   const handleProductRename = useCallback(async (newName: string) => {
     if (!productRenameTarget) return;
     try {
-      await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      setProductConversations((rows) => rows.map((row) =>
+        row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
+      notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
       setProductRenameTarget(null);
       setProductRenameError(undefined);
       onConversationCreated();
@@ -539,7 +543,7 @@ export function Sidebar({
       <ConfirmDialog
         visible={productCloseTarget !== null}
         title="Close Product Conversation"
-        message={`Close "${productCloseTarget?.presentation.display_name}"? This will close the full product conversation.`}
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will move the entire product conversation to read-only History and stop its active work.`}
         confirmText="Close"
         danger
         onConfirm={handleProductClose}

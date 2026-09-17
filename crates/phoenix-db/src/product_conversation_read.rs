@@ -5,7 +5,7 @@ use phoenix_core::domain::product_conversation::{
 };
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
-use sqlx::{Executor, Row, SqliteConnection};
+use sqlx::{Connection, Executor, Row, SqliteConnection};
 use tracing::Instrument;
 
 use crate::{Database, DbError, DbResult, MessageContent, MessageType};
@@ -26,6 +26,21 @@ pub struct ProductConversationAggregate {
     pub source: Option<ProductConversationSource>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationCloseAvailability {
+    Available,
+    Unavailable(ProductConversationCloseUnavailableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationCloseUnavailableReason {
+    History,
+    ActiveCloseAttempt,
+    AwaitingTaskApproval,
+    AwaitingContinuation,
+    HandedOffWithoutContinuation,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationListProjection {
     pub product_conversation_id: ProductConversationId,
@@ -36,6 +51,7 @@ pub struct ProductConversationListProjection {
     pub latest_transcript_row_id: String,
     pub latest_state: crate::ConvState,
     pub latest_continued_in_conv_id: Option<String>,
+    pub close_availability: ProductConversationCloseAvailability,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -207,6 +223,60 @@ fn message_content_from_row(
     MessageContent::from_stored_json(message_type, content).map_err(DbError::Serialization)
 }
 
+fn list_projection_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<ProductConversationListProjection> {
+    let product_conversation_id = row
+        .try_get::<String, _>("product_conversation_id")?
+        .parse::<ProductConversationId>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
+    let lifecycle =
+        OrdinaryProductConversationLifecycle::from_db_str(&lifecycle).ok_or_else(|| {
+            DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+        })?;
+    let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let close_availability = if lifecycle == OrdinaryProductConversationLifecycle::History {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::History,
+        )
+    } else if row.try_get::<bool, _>("has_awaiting_task_approval")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
+        )
+    } else if row.try_get::<bool, _>("has_awaiting_continuation")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::AwaitingContinuation,
+        )
+    } else if matches!(&latest_state, crate::ConvState::HandedOff { .. }) {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation,
+        )
+    } else if row.try_get::<bool, _>("has_active_close_attempt")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
+        )
+    } else {
+        ProductConversationCloseAvailability::Available
+    };
+    Ok(ProductConversationListProjection {
+        product_conversation_id,
+        lifecycle,
+        root_transcript_row_id: row.try_get("root_transcript_row_id")?,
+        root_slug: row.try_get("root_slug")?,
+        root_title: row.try_get("root_title")?,
+        latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
+        latest_state,
+        latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
+        close_availability,
+        updated_at: row
+            .try_get::<String, _>("updated_at")?
+            .parse::<DateTime<Utc>>()
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+    })
+}
+
 fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> DbResult<String> {
     let content = serde_json::from_str(&row.try_get::<String, _>(content_column)?)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -300,18 +370,32 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
     /// and a database or decode error when persisted aggregate data is invalid.
     pub async fn set_ordinary_product_conversation_title(
         &self,
         reference: &str,
         title: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<ProductConversationId> {
         let now = chrono::Utc::now();
         let mut connection = self.pool.acquire().await?;
-        connection.execute("BEGIN").await?;
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
         let result = async {
             let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut connection, reference).await?;
+                Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
+            let lifecycle: String = sqlx::query_scalar(
+                "SELECT ordinary_lifecycle FROM product_conversations
+                 WHERE id = ?1 AND kind = 'ordinary'",
+            )
+            .bind(resolved.product_conversation_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(reference.to_string()))?;
+            if lifecycle != OrdinaryProductConversationLifecycle::Open.as_str() {
+                return Err(DbError::ProductConversationUnavailable(
+                    resolved.product_conversation_id,
+                ));
+            }
             let row = sqlx::query(
                 "SELECT root.id
                  FROM conversations root
@@ -328,7 +412,7 @@ impl Database {
                  LIMIT 1",
             )
             .bind(resolved.product_conversation_id.as_str())
-            .fetch_optional(&mut *connection)
+            .fetch_optional(&mut *transaction)
             .await?;
             let Some(row) = row else {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
@@ -339,21 +423,21 @@ impl Database {
                     .bind(title)
                     .bind(now.to_rfc3339())
                     .bind(root_id)
-                    .execute(&mut *connection)
+                    .execute(&mut *transaction)
                     .await?;
             if result.rows_affected() == 0 {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             }
-            Ok::<(), DbError>(())
+            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
         }
         .await;
         match result {
-            Ok(()) => {
-                connection.execute("COMMIT").await?;
-                Ok(())
+            Ok(product_conversation_id) => {
+                transaction.commit().await?;
+                Ok(product_conversation_id)
             }
             Err(error) => {
-                let _ = connection.execute("ROLLBACK").await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -409,7 +493,9 @@ impl Database {
                         ROW_NUMBER() OVER (PARTITION BY product_conversation_id ORDER BY ordinal DESC) AS latest_rank
                  FROM transcript
              ), activity AS (
-                 SELECT transcript.product_conversation_id, MAX(conversation.updated_at) AS updated_at
+                 SELECT transcript.product_conversation_id, MAX(conversation.updated_at) AS updated_at,
+                        MAX(conversation.state_kind = 'awaiting_task_approval') AS has_awaiting_task_approval,
+                        MAX(conversation.state_kind = 'awaiting_continuation') AS has_awaiting_continuation
                  FROM transcript JOIN conversations conversation ON conversation.id = transcript.id
                  GROUP BY transcript.product_conversation_id
              )
@@ -417,7 +503,13 @@ impl Database {
                     root.id AS root_transcript_row_id, root.slug AS root_slug, root.title AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
-                    activity.updated_at
+                    activity.updated_at, activity.has_awaiting_task_approval,
+                    activity.has_awaiting_continuation,
+                    EXISTS (
+                        SELECT 1 FROM close_obligations obligation
+                        WHERE obligation.product_conversation_id = product.id
+                          AND obligation.phase <> 'completed'
+                    ) AS has_active_close_attempt
              FROM product_conversations product
              JOIN ranked root_ranked ON root_ranked.product_conversation_id = product.id AND root_ranked.root_rank = 1
              JOIN ranked latest_ranked ON latest_ranked.product_conversation_id = product.id AND latest_ranked.latest_rank = 1
@@ -429,35 +521,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let product_conversation_id = row
-                    .try_get::<String, _>("product_conversation_id")?
-                    .parse::<ProductConversationId>()
-                    .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
-                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
-                    .ok_or_else(|| {
-                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
-                    })?;
-                let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?;
-                Ok(ProductConversationListProjection {
-                    product_conversation_id,
-                    lifecycle,
-                    root_transcript_row_id: row.try_get("root_transcript_row_id")?,
-                    root_slug: row.try_get("root_slug")?,
-                    root_title: row.try_get("root_title")?,
-                    latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
-                    latest_state,
-                    latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
-                    updated_at: row
-                        .try_get::<String, _>("updated_at")?
-                        .parse::<DateTime<Utc>>()
-                        .map_err(|error| DbError::Serialization(error.to_string()))?,
-                })
-            })
-            .collect()
+        rows.iter().map(list_projection_from_row).collect()
     }
 
     /// Reads one ordinary aggregate from its durable product identity.
@@ -1540,6 +1604,134 @@ mod tests {
             projection.lifecycle,
             OrdinaryProductConversationLifecycle::History
         );
+    }
+
+    #[tokio::test]
+    async fn list_projects_close_availability_from_close_preconditions() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "close-availability",
+                "close-availability",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.close_availability,
+            ProductConversationCloseAvailability::Available
+        );
+
+        db.update_conversation_state(
+            &conversation.id,
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "continue".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.close_availability,
+            ProductConversationCloseAvailability::Unavailable(
+                ProductConversationCloseUnavailableReason::AwaitingContinuation,
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_task_approval_as_a_typed_close_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("close-approval", "close-approval", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &conversation.id,
+            &ConvState::AwaitingTaskApproval {
+                task_file: "tasks/00001-p1-ready--close.md".to_string(),
+                title: "Close".to_string(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "plan".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.close_availability,
+            ProductConversationCloseAvailability::Unavailable(
+                ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_history_without_mutating_title() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("rename-history", "rename-history", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Original' WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.set_ordinary_product_conversation_title(&conversation.id, "Changed").await,
+            Err(DbError::ProductConversationUnavailable(id))
+                if id == conversation.product_conversation_id
+        ));
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM conversations WHERE id = ?1")
+                .bind(&conversation.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(title.as_deref(), Some("Original"));
     }
 
     #[tokio::test]

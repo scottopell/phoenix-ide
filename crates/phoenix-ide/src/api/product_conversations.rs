@@ -12,8 +12,9 @@ use tracing::Instrument;
 use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseActionView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationClosePhaseView,
+    ProductConversationCloseResidualView, ProductConversationCloseUnavailableReasonView,
     ProductConversationCloseView, ProductConversationCreationAllowedActionView,
     ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
     ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
@@ -24,7 +25,8 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{
-    DbError, ProductConversationAggregate, ProductConversationHandoff,
+    DbError, ProductConversationAggregate, ProductConversationCloseAvailability,
+    ProductConversationCloseUnavailableReason, ProductConversationHandoff,
     ProductConversationListProjection, ProductConversationSegment,
     ProductConversationSegmentCeiling, ProductConversationSource, ProductConversationSourceKind,
 };
@@ -52,17 +54,20 @@ pub async fn rename_product_conversation(
     Json(req): Json<RenameProductConversationRequest>,
 ) -> Result<Json<ProductConversationListRow>, AppError> {
     let title = normalize_product_conversation_title(&req.title)?;
-    state
+    let product_conversation_id = state
         .db
         .set_ordinary_product_conversation_title(&reference, &title)
         .await
         .map_err(db_to_app)?;
-    let aggregate = state
+    let projection = state
         .db
-        .read_ordinary_product_conversation_snapshot(&reference, None, None, 1)
+        .list_ordinary_product_conversation_projections()
         .await
-        .map_err(db_to_app)?;
-    Ok(Json(list_row_from_aggregate(&aggregate.aggregate)))
+        .map_err(db_to_app)?
+        .into_iter()
+        .find(|projection| projection.product_conversation_id == product_conversation_id)
+        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
+    Ok(Json(list_row(&projection)))
 }
 
 fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
@@ -304,6 +309,7 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
             title: projection.root_title.clone(),
         },
         ordinary_lifecycle: lifecycle_view(projection.lifecycle),
+        close_action: close_action_view(projection.close_availability),
         latest_transcript_row_id: projection.latest_transcript_row_id.clone(),
         updated_at: projection.updated_at.to_rfc3339(),
         presentation: presentation(
@@ -316,30 +322,33 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
     }
 }
 
-fn list_row_from_aggregate(aggregate: &ProductConversationAggregate) -> ProductConversationListRow {
-    let latest = aggregate.segments.last().expect("aggregate has segment");
-    let lifecycle = aggregate
-        .product_conversation
-        .ordinary_lifecycle()
-        .expect("ordinary aggregate read returned Coordinator");
-    ProductConversationListRow {
-        product_conversation_id: aggregate.product_conversation.id().to_string(),
-        canonical_route: canonical_route(aggregate),
-        canonical_root: transcript_row_view(&aggregate.root),
-        ordinary_lifecycle: lifecycle_view(lifecycle),
-        latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
-        updated_at: aggregate.updated_at.to_rfc3339(),
-        presentation: presentation(
-            aggregate.root.conversation.title.as_deref(),
-            aggregate.root.conversation.slug.as_deref(),
-            &latest.transcript_row.conversation.state,
-            latest
-                .transcript_row
-                .conversation
-                .continued_in_conv_id
-                .is_some(),
-            &aggregate.latest_transcript_row_id,
-        ),
+fn close_action_view(
+    availability: ProductConversationCloseAvailability,
+) -> ProductConversationCloseActionView {
+    match availability {
+        ProductConversationCloseAvailability::Available => {
+            ProductConversationCloseActionView::Available
+        }
+        ProductConversationCloseAvailability::Unavailable(reason) => {
+            let reason = match reason {
+                ProductConversationCloseUnavailableReason::History => {
+                    ProductConversationCloseUnavailableReasonView::History
+                }
+                ProductConversationCloseUnavailableReason::ActiveCloseAttempt => {
+                    ProductConversationCloseUnavailableReasonView::ActiveCloseAttempt
+                }
+                ProductConversationCloseUnavailableReason::AwaitingTaskApproval => {
+                    ProductConversationCloseUnavailableReasonView::AwaitingTaskApproval
+                }
+                ProductConversationCloseUnavailableReason::AwaitingContinuation => {
+                    ProductConversationCloseUnavailableReasonView::AwaitingContinuation
+                }
+                ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation => {
+                    ProductConversationCloseUnavailableReasonView::HandedOffWithoutContinuation
+                }
+            };
+            ProductConversationCloseActionView::Unavailable { reason }
+        }
     }
 }
 
@@ -836,6 +845,12 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!("ProductConversation {id} is read-only in History"),
+                "product_conversation_not_open",
+            )))
+        }
         error => AppError::Internal(error.to_string()),
     }
 }
@@ -935,6 +950,12 @@ mod tests {
             .find(|row| row["latest_transcript_row_id"] == reference)
             .unwrap();
         assert_eq!(listed["ordinary_lifecycle"], expected);
+        if expected == "open" {
+            assert_eq!(listed["close_action"]["availability"], "available");
+        } else {
+            assert_eq!(listed["close_action"]["availability"], "unavailable");
+            assert_eq!(listed["close_action"]["reason"], "history");
+        }
 
         let snapshot = create_router(state.clone())
             .oneshot(
@@ -1478,6 +1499,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_history_returns_typed_conflict() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("history-title", "history-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/product-conversations/{}/title",
+                        root.product_conversation_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Changed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_type"], "product_conversation_not_open");
+    }
+
+    #[tokio::test]
     async fn one_row_aggregate_has_no_chain_qa_compatibility_or_writable_exhausted_leaf() {
         let state = make_test_state().await;
         let root = state
@@ -1953,6 +2011,11 @@ mod tests {
                 &root.conv_mode,
                 phoenix_core::llm_language::LlmLanguage::default(),
                 root.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();

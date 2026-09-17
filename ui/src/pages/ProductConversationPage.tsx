@@ -25,7 +25,7 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { subscribeCloseSnapshotChanged } from '../notifications';
+import { subscribeCloseSnapshotChanged, subscribeProductConversationSnapshotChanged } from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
@@ -843,6 +843,14 @@ function ProductConversationPageInner() {
       cancelled = true;
     };
   }, [productConversationId, snapshotRetry]);
+
+  useEffect(() => {
+    if (!productConversationId) return;
+    return subscribeProductConversationSnapshotChanged(
+      productConversationId,
+      () => setSnapshotRetry((retry) => retry + 1),
+    );
+  }, [productConversationId]);
 
   useEffect(() => {
     const notificationIds = new Set([

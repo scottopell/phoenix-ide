@@ -4,7 +4,7 @@ import { useRegisterFocusScope } from '../hooks/useFocusScope';
 interface RenameDialogProps {
   visible: boolean;
   currentName: string;
-  onRename: (newName: string) => void;
+  onRename: (newName: string) => void | Promise<void>;
   onGenerate?: () => Promise<void>;
   onCancel: () => void;
   error: string | undefined;
@@ -52,12 +52,17 @@ export function RenameDialog({
     if (!generating) onCancel();
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (generating) return;
     const trimmed = name.trim();
     if (trimmed && trimmed !== currentName) {
-      onRename(trimmed);
+      setGenerating(true);
+      try {
+        await onRename(trimmed);
+      } finally {
+        setGenerating(false);
+      }
     }
   };
 

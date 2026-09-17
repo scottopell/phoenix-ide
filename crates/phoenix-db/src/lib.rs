@@ -54,9 +54,11 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
-    ProductConversationAggregate, ProductConversationHandoff, ProductConversationListProjection,
-    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSnapshotRead,
-    ProductConversationSource, ProductConversationSourceKind, ProductConversationTranscriptRow,
+    ProductConversationAggregate, ProductConversationCloseAvailability,
+    ProductConversationCloseUnavailableReason, ProductConversationHandoff,
+    ProductConversationListProjection, ProductConversationSegment,
+    ProductConversationSegmentCeiling, ProductConversationSnapshotRead, ProductConversationSource,
+    ProductConversationSourceKind, ProductConversationTranscriptRow,
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
