@@ -3844,6 +3844,45 @@ mod tests {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
     }
 
+    async fn wait_for_exact_process_absence(identity: ProcessIdentity) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_identity_matches(identity) {
+            assert!(tokio::time::Instant::now() < deadline);
+            // test-timing-allow: outer bound observes exact kernel process identity disappearance.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_authenticated_replacement(socket_path: &Path) -> (String, ProcessIdentity) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(Some(token)) = read_server_token_until(socket_path, deadline).await {
+                if let Some(identity) =
+                    exact_server_process_identity_until(socket_path, &token, deadline).await
+                {
+                    if let Ok(output) = run_tmux_quiet_output(
+                        socket_path,
+                        &["display-message", "-p", "#{pid}|#{window_id}"],
+                    )
+                    .await
+                    {
+                        let shape = String::from_utf8(output.stdout).ok().and_then(|value| {
+                            value.trim().split_once('|').map(|parts| {
+                                (parts.0.parse::<u32>().ok(), parts.1.starts_with('@'))
+                            })
+                        });
+                        if output.status.success() && shape == Some((Some(identity.pid), true)) {
+                            return (token, identity);
+                        }
+                    }
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            // test-timing-allow: outer bound observes authenticated PID/token/window readiness.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[test]
     fn socket_path_for_worktree_is_deterministic() {
         let dir = PathBuf::from("/x/y");
@@ -5600,13 +5639,43 @@ mod tests {
             .unwrap();
         let socket_path = first.read().await.socket_path.clone();
         let stale_token = first.read().await.server_token.clone();
+        let stale_identity = exact_server_process_identity_until(
+            &socket_path,
+            &stale_token,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("capture authenticated stale server identity");
+        let stale_metadata = std::fs::metadata(&socket_path).unwrap();
         kill_socket(&socket_path).await;
+        wait_for_exact_process_absence(stale_identity).await;
+        if let Ok(observed) = std::fs::metadata(&socket_path) {
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::dev(&observed),
+                std::os::unix::fs::MetadataExt::dev(&stale_metadata)
+            );
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::ino(&observed),
+                std::os::unix::fs::MetadataExt::ino(&stale_metadata)
+            );
+            std::fs::remove_file(&socket_path).unwrap();
+        }
+
+        spawn_session_owned(
+            &socket_path,
+            &owner.path().join(SERVER_CONFIG_FILENAME),
+            owner.path(),
+            Some(owner.control_root_path()),
+        )
+        .await
+        .unwrap();
+        let (replacement_token, _) = wait_for_authenticated_replacement(&socket_path).await;
 
         let replacement = reg
             .ensure_live(&scope, owner.path(), None, None)
             .await
             .unwrap();
-        let replacement_token = replacement.read().await.server_token.clone();
+        assert_eq!(replacement.read().await.server_token, replacement_token);
         let output = run_tmux_quiet_output(
             &socket_path,
             &[
