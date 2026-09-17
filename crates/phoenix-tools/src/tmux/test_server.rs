@@ -39,6 +39,7 @@ identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
 cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
+adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
 provisional = []
 
 class ProcBsdInfo(ctypes.Structure):
@@ -272,7 +273,12 @@ def spawn_owned(request):
         adopt = control_root / adopt_name
         if adopt.parent != control_root:
             raise RuntimeError("adoption marker is not an exact child of control root")
-        provisional.append((socket, control, tuple(identities), adopt, acknowledged,
+        adopted = request.with_name(request.name.replace(".spawn-", ".adopted-", 1))
+        adoption_rejected = request.with_name(
+            request.name.replace(".spawn-", ".adoption-rejected-", 1)
+        )
+        provisional.append((socket, control, tuple(identities), adopt, adopted,
+                            adoption_rejected, acknowledged,
                             time.monotonic() + adoption_timeout))
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
@@ -383,25 +389,34 @@ while not (root / ".cleanup-request").exists():
         break
     now = time.monotonic()
     for item in list(provisional):
-        socket, control, identities, adopt, acknowledged, deadline = item
-        if adopt.exists():
+        (socket, control, identities, adopt, adopted, adoption_rejected,
+         acknowledged, deadline) = item
+        if adoption_hook:
+            subprocess.run(
+                [adoption_hook, str(adopt), "expired" if now >= deadline else "pending"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False, timeout=1.0,
+            )
+        if now < deadline and adopt.exists():
+            provisional.remove(item)
             adopt.unlink(missing_ok=True)
             acknowledged.unlink(missing_ok=True)
-            provisional.remove(item)
+            publish_response(adopted, "adopted")
         elif now >= deadline:
+            provisional.remove(item)
             record = exact_record(socket, control, identities)
             retired = record is not None and retire_record(
                 record, time.monotonic() + identity_timeout
             )
             if retired and remove_retired_control(record):
                 owned.remove(record)
+                publish_response(adoption_rejected, "lease expired; exact server retired")
             else:
                 publish_response(
-                    control_root / f".lease-failed-{acknowledged.name}",
-                    "exact provisional retirement could not be proven",
+                    adoption_rejected,
+                    "lease expired; exact provisional retirement could not be proven",
                 )
                 unconfirmed_obligations.append((socket, control))
-            provisional.remove(item)
     for request in control_root.glob(".retire-*"):
         if not retire(request):
             break
@@ -607,7 +622,14 @@ impl TestTmuxServerOwner {
         watchdog_path: Option<&Path>,
         identity_timeout: Option<Duration>,
     ) -> Self {
-        Self::new_with_watchdog_test_options(watchdog_path, identity_timeout, None, None)
+        Self::new_with_watchdog_test_options(
+            watchdog_path,
+            identity_timeout,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn new_with_watchdog_test_options(
@@ -615,6 +637,8 @@ impl TestTmuxServerOwner {
         identity_timeout: Option<Duration>,
         cleanup_timeout: Option<Duration>,
         quarantine_hook: Option<&Path>,
+        adoption_timeout: Option<Duration>,
+        adoption_hook: Option<&Path>,
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -664,6 +688,15 @@ impl TestTmuxServerOwner {
                 "PHOENIX_TMUX_CLEANUP_TIMEOUT",
                 timeout.as_secs_f64().to_string(),
             );
+        }
+        if let Some(timeout) = adoption_timeout {
+            command.env(
+                "PHOENIX_TMUX_ADOPTION_TIMEOUT",
+                timeout.as_secs_f64().to_string(),
+            );
+        }
+        if let Some(hook) = adoption_hook {
+            command.env("PHOENIX_TMUX_ADOPTION_HOOK", hook);
         }
         if let Some(hook) = quarantine_hook {
             command.env("PHOENIX_TMUX_QUARANTINE_HOOK", hook);
@@ -901,6 +934,8 @@ pub(crate) async fn spawn_owned_server(
     let acknowledged = control_root.join(format!(".registered-{nonce}"));
     let rejected = control_root.join(format!(".rejected-{nonce}"));
     let adopted = control_root.join(format!(".adopt-{nonce}"));
+    let adoption_acknowledged = control_root.join(format!(".adopted-{nonce}"));
+    let adoption_rejected = control_root.join(format!(".adoption-rejected-{nonce}"));
     let env_file = control_root.join(format!(".environment-{nonce}.json"));
     fs::write(
         &env_file,
@@ -933,11 +968,23 @@ pub(crate) async fn spawn_owned_server(
     )?;
     fs::rename(pending, request)?;
     let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+    let mut registered = None;
     loop {
-        if let Ok(value) = fs::read_to_string(&acknowledged) {
-            let processes = parse_acknowledged_processes(&value)?;
-            fs::write(&adopted, [])?;
-            return Ok(processes);
+        if registered.is_none() {
+            if let Ok(value) = fs::read_to_string(&acknowledged) {
+                registered = Some(parse_acknowledged_processes(&value)?);
+                fs::write(&adopted, [])?;
+            }
+        }
+        if adoption_acknowledged.exists() {
+            return registered.ok_or_else(|| {
+                io::Error::other("tmux watchdog acknowledged adoption before registration")
+            });
+        }
+        if let Ok(reason) = fs::read_to_string(&adoption_rejected) {
+            return Err(io::Error::other(format!(
+                "tmux watchdog rejected adoption: {reason}"
+            )));
         }
         if let Ok(reason) = fs::read_to_string(&rejected) {
             return Err(io::Error::other(format!(
@@ -947,7 +994,7 @@ pub(crate) async fn spawn_owned_server(
         if tokio::time::Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "tmux watchdog did not acknowledge spawn",
+                "tmux watchdog did not acknowledge spawn adoption",
             ));
         }
         tokio::task::yield_now().await;
@@ -1929,27 +1976,192 @@ mod tests {
         fs::remove_dir_all(control_root).unwrap();
     }
 
+    fn write_adoption_environment(control_root: &Path, name: &str, token: &str) {
+        fs::write(
+            control_root.join(name),
+            serde_json::to_vec(&vec![
+                ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+                ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn adoption_wins_at_serialized_boundary_and_server_remains_stable() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("adopt-pending");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nif [ \"$2\" = pending ]; then : > \"$1\"; fi\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(1)),
+            Some(&hook),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        write_adoption_environment(&control_root, "accept-env.json", "accept-token");
+        fs::write(
+            control_root.join(".spawn-accept"),
+            format!(
+                "accept.sock\taccept.sock\t{}\t{}\taccept-token\taccept-env.json\t.adopt-accept",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".registered-accept").exists(),
+            "provisional acceptance registration",
+        );
+        let processes = parse_acknowledged_processes(
+            &fs::read_to_string(control_root.join(".registered-accept")).unwrap(),
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".adopted-accept").exists(),
+            "watchdog adoption acknowledgement",
+        );
+
+        assert!(!control_root.join(".adoption-rejected-accept").exists());
+        assert!(phoenix_core::process_identity::process_identity_matches(
+            processes.server
+        ));
+        assert_eq!(
+            probe_sync(&control_root.join("accept.sock")),
+            ProbeResult::Live
+        );
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_adoption_ack_never_publishes() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let entered = hook_dir.path().join("entered");
+        let hook = hook_dir.path().join("block-adoption");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\n: > '{}'\n/bin/sleep 0.4\n", entered.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+            Some(&hook),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("cancel-adoption.sock");
+        let control = control_root.join("cancel-adoption.sock");
+        let config = root.join("config");
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            (
+                "PHOENIX_TMUX_SERVER_TOKEN".to_owned(),
+                "cancel-adoption-token".to_owned(),
+            ),
+        ];
+        let task = tokio::spawn({
+            let socket = socket.clone();
+            let control = control.clone();
+            let root = root.clone();
+            async move {
+                spawn_owned_server(
+                    &socket,
+                    &control,
+                    &config,
+                    &root,
+                    "cancel-adoption-token",
+                    &environment,
+                )
+                .await
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !entered.exists() && !task.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "watchdog adoption hook was not reached"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "spawn waiter completed before cancellation"
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !socket.exists(),
+            "cancelled waiter must not publish visible socket"
+        );
+        wait_until(
+            || {
+                fs::read_dir(&control_root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".adopted-")
+                })
+            },
+            "watchdog ownership transition after waiter cancellation",
+        );
+        owner.shutdown();
+        assert!(!root.exists());
+        assert!(!control_root.exists());
+    }
+
     #[tokio::test]
     async fn acknowledged_but_unadopted_spawn_expires_and_is_retired() {
         if which::which("tmux").is_err() {
             return;
         }
-        let owner = TestTmuxServerOwner::new();
-        let root = owner.path().to_path_buf();
-        let control_root = owner.control_root_path().to_path_buf();
-        let env_file = control_root.join("lease-env.json");
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("late-adopt");
         fs::write(
-            &env_file,
-            serde_json::to_vec(&vec![
-                ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
-                (
-                    "PHOENIX_TMUX_SERVER_TOKEN".to_owned(),
-                    "lease-token".to_owned(),
-                ),
-            ])
-            .unwrap(),
+            &hook,
+            "#!/bin/sh\nif [ \"$2\" = expired ]; then : > \"$1\"; fi\n",
         )
         .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::ZERO),
+            Some(&hook),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        write_adoption_environment(&control_root, "lease-env.json", "lease-token");
         fs::write(
             control_root.join(".spawn-lease"),
             format!(
@@ -1967,6 +2179,11 @@ mod tests {
             &fs::read_to_string(control_root.join(".registered-lease")).unwrap(),
         )
         .unwrap();
+        wait_until(
+            || control_root.join(".adoption-rejected-lease").exists(),
+            "lease-expiry retirement decision",
+        );
+        assert!(!control_root.join(".adopted-lease").exists());
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         while phoenix_core::process_identity::process_identity_matches(processes.server)
             || phoenix_core::process_identity::process_identity_matches(processes.pane)
@@ -2012,8 +2229,14 @@ mod tests {
             "#!/bin/sh\nrm -f \"$1\"\npython3 - \"$1\" <<'PY'\nimport socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.close()\nPY\n",
         );
         fs::rename(hook_dir.path().join("tmux"), &hook).unwrap();
-        let owner =
-            TestTmuxServerOwner::new_with_watchdog_test_options(None, None, None, Some(&hook));
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            Some(&hook),
+            None,
+            None,
+        );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
         let socket = root.join("final-swap.sock");
@@ -2047,6 +2270,8 @@ mod tests {
             None,
             None,
             Some(Duration::from_millis(1)),
+            None,
+            None,
             None,
         );
         let root = owner.path().to_path_buf();
