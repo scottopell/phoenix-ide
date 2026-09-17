@@ -493,7 +493,7 @@ def register(request):
 heartbeat = root / ".parent-heartbeat"
 while not (root / ".cleanup-request").exists():
     for request in control_root.glob(".spawn-*"):
-        if not spawn_owned(request):
+        if (root / ".cleanup-request").exists() or not spawn_owned(request):
             break
     else:
         request = None
@@ -552,11 +552,15 @@ while not (root / ".cleanup-request").exists():
          published, publication_cancelled, publication_acknowledged,
          acknowledged, deadline) = item
         if adoption_hook:
-            subprocess.run(
-                [adoption_hook, str(adopt), "expired" if now >= deadline else "pending"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, check=False, timeout=1.0,
-            )
+            try:
+                subprocess.run(
+                    [adoption_hook, str(adopt), "expired" if now >= deadline else "pending"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False, timeout=1.0,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                retain_obligation(socket, control)
+                break
         if now < deadline and adopt.exists():
             try:
                 adopt.unlink()
@@ -614,34 +618,26 @@ except FileNotFoundError:
 
 if cleanup_deadline is None:
     cleanup_deadline = time.monotonic() + cleanup_timeout
-for _, device, inode, control, processes in owned:
+for index, record in enumerate(owned):
     if time.monotonic() >= cleanup_deadline:
         break
+    socket, device, inode, control, processes = record
     try:
-        expected_token = tmux_format_literal(processes[0][2])
-    except RuntimeError:
-        continue
-    states = [identity_state(identity) for identity in processes]
-    server_state, pane_state = states
-    if server_state == "absent" and pane_state == "absent":
-        continue
-    if server_state != "owned" or pane_state not in ("owned", "absent"):
-        continue
-    try:
-        control_stat = control.stat()
-        if control_stat.st_dev != device or control_stat.st_ino != inode:
+        observed_server, pane_pids = query_control_processes(control, cleanup_deadline)
+        if observed_server != processes[0][0]:
             continue
-        expected_server = processes[0][0]
-        killed = subprocess.run(
-            ["tmux", "-S", str(control), "if-shell", "-F",
-             f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
-             "kill-server", ""],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=remaining_timeout(cleanup_deadline),
-        )
+        known_pids = {identity[0] for identity in processes}
+        expanded = list(processes)
+        for pane_pid in pane_pids:
+            if pane_pid not in known_pids:
+                started = birth(pane_pid)
+                if started is None:
+                    raise RuntimeError("late pane birth identity was unavailable")
+                expanded.append((pane_pid, started, None))
+                known_pids.add(pane_pid)
+        record = (socket, device, inode, control, tuple(expanded))
+        owned[index] = record
+        retire_record(record, cleanup_deadline)
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         pass
 
@@ -668,6 +664,9 @@ while time.monotonic() < cleanup_deadline:
             continue
         registered = registered_sockets.get(socket)
         if registered is not None:
+            if socket in preserved_visible_paths:
+                unconfirmed = True
+                continue
             device, inode, control, processes = registered
             states = [identity_state(identity) for identity in processes]
             try:
@@ -699,6 +698,7 @@ while time.monotonic() < cleanup_deadline:
                     except OSError:
                         pass
                     unconfirmed = True
+                    preserved_visible_paths.add(socket)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -2951,6 +2951,42 @@ mod tests {
     }
 
     #[test]
+    fn final_cleanup_reenumerates_late_panes_before_retirement() {
+        let cleanup = WATCHDOG_PROGRAM
+            .find("for index, record in enumerate(owned):")
+            .unwrap();
+        let enumerate = WATCHDOG_PROGRAM
+            .get(cleanup..)
+            .unwrap()
+            .find("observed_server, pane_pids = query_control_processes(control, cleanup_deadline)")
+            .unwrap();
+        let expand = WATCHDOG_PROGRAM
+            .get(cleanup..)
+            .unwrap()
+            .find("expanded.append((pane_pid, started, None))")
+            .unwrap();
+        let retire = WATCHDOG_PROGRAM
+            .get(cleanup..)
+            .unwrap()
+            .find("retire_record(record, cleanup_deadline)")
+            .unwrap();
+        assert!(enumerate < expand && expand < retire);
+    }
+
+    #[test]
+    fn cleanup_request_stops_spawn_batch_before_next_spawn() {
+        assert!(WATCHDOG_PROGRAM
+            .contains("if (root / \".cleanup-request\").exists() or not spawn_owned(request):"));
+    }
+
+    #[test]
+    fn adoption_hook_failure_retains_obligation_and_enters_cleanup() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "except (OSError, subprocess.TimeoutExpired):\n                retain_obligation(socket, control)\n                break"
+        ));
+    }
+
+    #[test]
     fn authenticated_server_with_absent_original_pane_is_retired() {
         if which::which("tmux").is_err() {
             return;
@@ -3076,9 +3112,12 @@ mod tests {
 
     #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
+        assert!(WATCHDOG_PROGRAM
+            .contains("if all(state == \"absent\" for state in states):\n        return True"));
         assert!(WATCHDOG_PROGRAM.contains(
-            "if server_state == \"absent\" and pane_state == \"absent\":\n        continue\n    if server_state != \"owned\" or pane_state not in (\"owned\", \"absent\"):\n        continue"
+            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):\n        return False"
         ));
+        assert!(WATCHDOG_PROGRAM.contains("retire_record(record, cleanup_deadline)"));
     }
 
     #[test]
