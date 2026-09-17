@@ -610,7 +610,9 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: aggregateMembersById) }
     var snapshotsByConversationId: Set<String>
     var aggregateMembersById: [String: Set<String>]
+    var persistedMemberDiscoveryOverride: PersistedMemberDiscovery?
     var onPendingOutboxOwnerTranscriptRowIds: (() async -> Set<String>)?
+    fileprivate var persistedMemberDiscoveryGate: AsyncCandidateGate?
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
     var persistHardDeleteFenceResult = true
     private(set) var persistedHardDeleteFences: [PersistedHardDeleteFence] = []
@@ -624,6 +626,31 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         self.snapshotsByConversationId = snapshotsByConversationId
         self.aggregateMembersById = aggregateMembersById
         self.outboxStore = InMemoryOutboxStore(contentsByConversationId: contentsByConversationId, owners: owners)
+    }
+
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        if let persistedMemberDiscoveryGate {
+            await persistedMemberDiscoveryGate.markEntered()
+            await persistedMemberDiscoveryGate.awaitRelease()
+        }
+        if let persistedMemberDiscoveryOverride { return persistedMemberDiscoveryOverride }
+        return await superPersistedMemberDiscovery(aggregateId: aggregateId, scope: scope)
+    }
+
+    private func superPersistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        let members = persistedConversationIds(aggregateId: aggregateId, scope: scope)
+        let owners = await pendingOutboxOwners(scope: scope)
+        return .init(
+            currentAuthorityMemberIds: members,
+            persistedOutboxOwnerIds: Set(owners.compactMap {
+                $0.aggregateAuthority == aggregateId ? $0.transcriptRowId : nil
+            }))
     }
 
     func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
@@ -2450,6 +2477,37 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionHardDeleteRemovesCurrentScopeOutboxOnlyMember() async {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1", "row-outbox"],
+            contentsByConversationId: [
+                "row-1": .entries([]),
+                "row-outbox": .entries([makePendingOutboxEntry(conversationId: "row-outbox")]),
+            ])
+        store.persistedMemberDiscoveryOverride = .init(
+            currentAuthorityMemberIds: [],
+            persistedOutboxOwnerIds: ["row-outbox"])
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        let session = try! XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+
+        session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await session.awaitHardDeleteReportForTesting()
+        await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
+
+        if case .missing = store.inspectOutbox(conversationId: "row-outbox").state {
+        } else {
+            XCTFail("expected outbox-only member removal")
+        }
+    }
+
     func testHardDeleteFenceFailureLeavesAuthoritativeStateAndOutboxIntact() async throws {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-1"],
@@ -2938,6 +2996,21 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.listStore.aggregateId(forTranscriptRowId: "row-1"), "pc-old")
     }
 
+    func testLoadedDetailResolvesFreshWritableSuccessorToAggregateAuthority() {
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel()
+        model.replaceAPIForTesting(api)
+        model.productConversationDetailModel(
+            for: "pc-1", initialTranscriptRowId: "row-1"
+        ).applyForTesting(testProductConversationSnapshot())
+
+        let session = model.session(for: "row-2")
+
+        XCTAssertEqual(session?.aggregateAuthorityIdentity, "pc-1")
+    }
+
     func testFirstSuccessorInitPreservesCanonicalAggregateProjectionMetadata() async throws {
         let baseDirectory = isolatedDiskDirectory()
         let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
@@ -3048,6 +3121,69 @@ final class AppModelProductConversationTests: XCTestCase {
             model.closeUnavailableExplanation(for: legacy),
             "Close is unavailable until conversation type is confirmed.")
 
+    }
+
+    func testArchiveRejectsStaleAPIAfterPersistedMemberDiscovery() async {
+        let store = MutableTestConversationPersistenceStore(contentsByConversationId: [:])
+        let discoveryGate = AsyncCandidateGate()
+        let oldProbe = SendProbe()
+        let (oldAPI, oldRegistration) = makeHTTPAPI(probe: oldProbe, host: "archive-old.invalid")
+        defer { TestURLProtocol.uninstall(host: "archive-old.invalid", owner: oldRegistration) }
+        let newProbe = SendProbe()
+        let (newAPI, newRegistration) = makeHTTPAPI(probe: newProbe, host: "archive-new.invalid")
+        defer { TestURLProtocol.uninstall(host: "archive-new.invalid", owner: newRegistration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(oldAPI)
+        model.connectivity.setOnlineForTesting(true)
+        let conversation = conversation(id: "row-1", aggregateId: "pc-1")
+        model.listStore.upsert(conversation)
+        model.productConversationDetailModel(
+            for: "pc-1", initialTranscriptRowId: "row-1"
+        ).applyForTesting(testSingleSegmentProductConversationSnapshot())
+
+        store.persistedMemberDiscoveryGate = discoveryGate
+
+        let archive = Task { @MainActor in await model.archive(conversationId: "row-1") }
+        await discoveryGate.waitForEntry()
+        model.replaceAPIForTesting(newAPI)
+        await discoveryGate.release()
+
+        let archived = await archive.value
+        XCTAssertFalse(archived)
+        XCTAssertTrue(oldProbe.archivePostPaths.isEmpty)
+        XCTAssertTrue(newProbe.archivePostPaths.isEmpty)
+        XCTAssertEqual(model.lastActionError, "Conversation settings changed before archiving. Try again.")
+    }
+
+    func testArchiveBlocksWhenOutboxOnlyMemberHasVisibleEntries() async {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-latest", "row-outbox"],
+            contentsByConversationId: [
+                "row-latest": .entries([]),
+                "row-outbox": .entries([makePendingOutboxEntry(conversationId: "row-outbox")]),
+            ])
+        store.persistedMemberDiscoveryOverride = .init(
+            currentAuthorityMemberIds: [],
+            persistedOutboxOwnerIds: ["row-outbox"])
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        let latest = conversation(id: "row-latest", aggregateId: "pc-1")
+        model.listStore.upsert(latest)
+        model.productConversationDetailModel(
+            for: "pc-1", initialTranscriptRowId: "row-latest"
+        ).applyForTesting(testSingleSegmentProductConversationSnapshot())
+
+        let archived = await model.archive(conversationId: "row-latest")
+
+        XCTAssertFalse(archived)
+        XCTAssertTrue(probe.archivePostPaths.isEmpty)
+        XCTAssertEqual(
+            model.lastActionError,
+            "This conversation has queued or unconfirmed messages. Retry or discard them before archiving.")
     }
 
     func testArchiveBlocksWhenPredecessorMemberHasVisibleOutbox() async {
