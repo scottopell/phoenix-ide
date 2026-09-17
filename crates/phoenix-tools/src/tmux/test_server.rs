@@ -529,7 +529,7 @@ while not (root / ".cleanup-request").exists():
                 published.unlink(missing_ok=True)
                 adopted_pending_publication.remove(item)
                 publish_response(publication_acknowledged, "published")
-            except OSError:
+            except (OSError, subprocess.TimeoutExpired):
                 retire_registered(socket, control, identities)
                 retain_obligation(socket, control)
                 try:
@@ -2630,6 +2630,13 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn publication_hook_timeout_routes_through_exact_retirement() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "except (OSError, subprocess.TimeoutExpired):\n                retire_registered(socket, control, identities)\n                retain_obligation(socket, control)"
+        ));
     }
 
     #[tokio::test]
