@@ -2539,6 +2539,7 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
+          key={convStateForChildren.tool_use_id ?? ''}
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           toolUseId={convStateForChildren.tool_use_id ?? ''}
