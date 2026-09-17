@@ -34,6 +34,7 @@ parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 owned = []
 unconfirmed_obligations = []
+identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -112,10 +113,17 @@ def publish_response(path, value):
     pending.write_text(value)
     os.replace(pending, path)
 
-def query_control_processes(control):
+def remaining_timeout(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("tmux identity registration deadline expired")
+    return min(0.5, remaining)
+
+def query_control_processes(control, deadline):
     observed = subprocess.run(
         ["tmux", "-S", str(control), "display-message", "-p", "#{pid}|#{pane_pid}"],
-        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True,
+        timeout=remaining_timeout(deadline),
     )
     if observed.returncode != 0:
         raise RuntimeError("tmux identity query failed")
@@ -128,14 +136,15 @@ def query_control_processes(control):
         raise RuntimeError("tmux identity output was malformed")
     return int(server_pid), int(pane_pid)
 
-def observe_control(control, expected_token):
+def observe_control(control, expected_token, deadline):
     last_error = RuntimeError("tmux identity query did not run")
-    for attempt in range(50):
+    while time.monotonic() < deadline:
         try:
-            server_pid, pane_pid = query_control_processes(control)
+            server_pid, pane_pid = query_control_processes(control, deadline)
             token_result = subprocess.run(
                 ["tmux", "-S", str(control), "show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"],
-                stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+                stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True,
+                timeout=remaining_timeout(deadline),
             )
             token = token_result.stdout.strip().partition("=")[2]
             if token_result.returncode != 0 or token != expected_token:
@@ -149,9 +158,22 @@ def observe_control(control, expected_token):
             return identities
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             last_error = error
-            if attempt + 1 < 50:
-                time.sleep(0.1)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
     raise RuntimeError(f"tmux processes never became ready: {last_error}")
+
+def record_owned(socket, device, inode, control, identities):
+    conflicts = [
+        record for record in owned
+        if record[0] == socket or record[3] == control
+    ]
+    if any(identity_state(identity) != "absent"
+           for _, _, _, _, processes in conflicts for identity in processes):
+        raise RuntimeError("live tmux ownership record already exists")
+    for record in conflicts:
+        owned.remove(record)
+    owned.append((socket, device, inode, control, tuple(identities)))
 
 def spawn_owned(request):
     rejected = request.with_name(request.name.replace(".spawn-", ".rejected-", 1))
@@ -174,9 +196,9 @@ def spawn_owned(request):
         )
         if spawned.returncode != 0:
             raise RuntimeError(f"tmux spawn failed: {spawned.stderr}")
-        identities = observe_control(control, token)
+        identities = observe_control(control, token, time.monotonic() + identity_timeout)
         control_stat = control.stat()
-        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
+        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
         unconfirmed_obligations.remove(obligation)
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
@@ -209,10 +231,10 @@ def register(request):
         if (socket.parent != root or control.parent != control_root
                 or control.is_symlink() or not control.is_socket()):
             raise RuntimeError("registration control is not an exact child of the owned control root")
-        identities = observe_control(control, expected_token)
+        identities = observe_control(control, expected_token, time.monotonic() + identity_timeout)
         server_pid, pane_pid = str(identities[0][0]), str(identities[1][0])
         control_stat = control.stat()
-        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
+        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
         try:
             publish_response(acknowledged, "\t".join([
                 server_pid, identities[0][1], pane_pid, identities[1][1]
@@ -297,8 +319,8 @@ for _ in range(50):
     ]
     unconfirmed_state = any(state != "absent" for state in states) or bool(unconfirmed_obligations)
     registered_sockets = {
-        socket: (device, inode, processes)
-        for socket, device, inode, _, processes in owned
+        socket: (device, inode, control, processes)
+        for socket, device, inode, control, processes in owned
     }
     for socket in root.glob("*.sock"):
         if socket.is_symlink():
@@ -308,14 +330,16 @@ for _ in range(50):
             continue
         registered = registered_sockets.get(socket)
         if registered is not None:
-            device, inode, processes = registered
+            device, inode, control, processes = registered
             states = [identity_state(identity) for identity in processes]
             try:
                 socket_stat = socket.stat()
+                control_stat = control.stat()
             except OSError:
                 unconfirmed = True
                 continue
-            if socket_stat.st_dev != device or socket_stat.st_ino != inode:
+            if (socket_stat.st_dev != device or socket_stat.st_ino != inode
+                    or control_stat.st_dev != device or control_stat.st_ino != inode):
                 unconfirmed = True
                 continue
             if all(state == "absent" for state in states):
@@ -404,6 +428,13 @@ impl TestTmuxServerOwner {
     }
 
     fn new_with_watchdog_path(watchdog_path: Option<&Path>) -> Self {
+        Self::new_with_watchdog_options(watchdog_path, None)
+    }
+
+    fn new_with_watchdog_options(
+        watchdog_path: Option<&Path>,
+        identity_timeout: Option<Duration>,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
             .tempdir_in("/private/tmp")
@@ -441,6 +472,12 @@ impl TestTmuxServerOwner {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(timeout) = identity_timeout {
+            command.env(
+                "PHOENIX_TMUX_IDENTITY_TIMEOUT",
+                timeout.as_secs_f64().to_string(),
+            );
+        }
         if let Some(path) = watchdog_path {
             let inherited_path = std::env::var_os("PATH").unwrap_or_default();
             let mut paths = vec![path.to_path_buf()];
@@ -1055,15 +1092,78 @@ mod tests {
 
     #[test]
     fn contained_spawn_retries_until_process_identity_is_ready() {
-        assert!(WATCHDOG_PROGRAM.contains("for attempt in range(50):"));
-        assert!(WATCHDOG_PROGRAM.contains("time.sleep(0.1)"));
+        assert!(WATCHDOG_PROGRAM.contains("while time.monotonic() < deadline:"));
+        assert!(WATCHDOG_PROGRAM.contains("time.sleep(min(0.1, remaining))"));
         assert!(WATCHDOG_PROGRAM.contains("tmux processes never became ready"));
+    }
+
+    #[test]
+    fn identity_registration_uses_one_deadline_shorter_than_owner_handoff() {
+        assert!(WATCHDOG_PROGRAM.contains("timeout=remaining_timeout(deadline)"));
+        assert!(WATCHDOG_PROGRAM
+            .contains("observe_control(control, token, time.monotonic() + identity_timeout)"));
+        assert!(CLEANUP_TIMEOUT > Duration::from_secs(6));
+    }
+
+    #[test]
+    fn slow_identity_probes_share_one_absolute_deadline() {
+        let fake_bin = TempDir::new().unwrap();
+        write_tmux_wrapper(
+            fake_bin.path(),
+            "#!/bin/sh\ncase \"$*\" in *new-session*) : > \"$2\"; exit 0;; esac\n/bin/sleep 0.18\nexit 1\n",
+        );
+        let owner = TestTmuxServerOwner::new_with_watchdog_options(
+            Some(fake_bin.path()),
+            Some(Duration::from_millis(250)),
+        );
+        let control_root = owner.control_root_path().to_path_buf();
+        let root = owner.path().to_path_buf();
+        let env_file = control_root.join("slow-env.json");
+        fs::write(
+            &env_file,
+            serde_json::to_vec(&vec![(
+                "PATH".to_owned(),
+                fake_bin.path().to_string_lossy().into_owned(),
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        fs::write(
+            control_root.join(".spawn-slow"),
+            format!(
+                "slow.sock\tslow.sock\t{}\t{}\ttoken\tslow-env.json",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".rejected-slow").exists(),
+            "deadline-bounded rejection",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "identity registration exceeded one short absolute deadline: {:?}",
+            started.elapsed()
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(panic.is_err());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_owned_records_require_explicit_prior_absence_before_replacement() {
+        assert!(WATCHDOG_PROGRAM.contains("if any(identity_state(identity) != \"absent\""));
+        assert!(WATCHDOG_PROGRAM.contains("for record in conflicts:\n        owned.remove(record)"));
+        assert_eq!(WATCHDOG_PROGRAM.matches("owned.append(").count(), 1);
     }
 
     #[test]
     fn successful_identity_reconciliation_removes_the_spawn_obligation() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "identities = observe_control(control, token)\n        control_stat = control.stat()\n        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))\n        unconfirmed_obligations.remove(obligation)"
+            "identities = observe_control(control, token, time.monotonic() + identity_timeout)\n        control_stat = control.stat()\n        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)\n        unconfirmed_obligations.remove(obligation)"
         ));
     }
 
@@ -1368,6 +1468,58 @@ mod tests {
             .unwrap()
             .success());
         assert_exact_processes_gone(processes);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn intact_control_anchor_permits_exact_dead_visible_socket_unlink() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let socket = owner.path().join("dead-visible.sock");
+        let control = owner.control_root_path().join("dead-visible.sock");
+        let (_, processes) = spawn_server_with_processes(&owner, "dead-visible");
+        assert!(Command::new("tmux")
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_exact_processes_gone(processes);
+        assert!(socket.exists());
+        assert!(control.exists());
+
+        owner.shutdown();
+
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn missing_original_control_anchor_preserves_visible_replacement() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("missing-anchor.sock");
+        let (socket, processes) = spawn_server_with_processes(&owner, "missing-anchor");
+        assert!(Command::new("tmux")
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_exact_processes_gone(processes);
+        fs::remove_file(&control).ok();
+        fs::remove_file(&socket).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err(), "missing control anchor must fail closed");
+        assert!(socket.exists(), "visible replacement must remain untouched");
+        drop(replacement);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
     }
