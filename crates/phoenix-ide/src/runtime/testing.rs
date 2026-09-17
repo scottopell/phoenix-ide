@@ -946,6 +946,17 @@ impl InMemoryStorage {
             .collect()
     }
 
+    pub fn approved_task_authority(
+        &self,
+        conv_id: &str,
+    ) -> Option<phoenix_core::task_handoff::ApprovedTaskSnapshot> {
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+    }
+
     pub fn queue_complete_creation_job_result(
         &self,
         result: Result<crate::db::CreationCasOutcome, String>,
@@ -2021,17 +2032,11 @@ impl StateStore for InMemoryStorage {
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        let mut authorities = self.approved_task_authorities.lock().unwrap();
-        match authorities.get(conv_id) {
-            Some(existing) if existing != &snapshot => {
-                Err("approved task conflicts with the committed objective".to_string())
-            }
-            Some(_) => Ok(()),
-            None => {
-                authorities.insert(conv_id.to_string(), snapshot);
-                Ok(())
-            }
-        }
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), snapshot);
+        Ok(())
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {

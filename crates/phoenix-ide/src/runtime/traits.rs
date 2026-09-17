@@ -2207,14 +2207,15 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec());
-        if let Some(tools) = self.writing_tools.clone() {
-            registry = registry
-                .try_with_writing_conversation_tools(tools)
-                .expect("fresh Work registry has no global writing capabilities");
-        }
+        let registry = match self.writing_tools.clone() {
+            Some(tools) => {
+                ToolRegistry::git_backed_writing_parent(self.agent_catalog.to_vec(), tools)
+                    .expect("fresh Git-backed writing registry has no global writing capabilities")
+            }
+            None => ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task(),
+        };
         self.swap_registry(registry);
-        tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
+        tracing::info!("Tool registry upgraded to Git-backed writing mode");
     }
 }
 
@@ -2247,7 +2248,7 @@ mod tool_registry_executor_tests {
     }
 
     #[tokio::test]
-    async fn explore_upgrade_preserves_host_bound_writing_tools() {
+    async fn explore_upgrade_preserves_writing_tools_and_propose_task() {
         let executor = ToolRegistryExecutor::builtin_only(
             ToolRegistry::explore(
                 "tasks",
@@ -2281,6 +2282,11 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "propose_task"));
     }
 }
 

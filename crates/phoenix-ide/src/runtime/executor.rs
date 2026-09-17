@@ -8353,6 +8353,80 @@ where
         Ok(())
     }
 
+    fn is_approved_explore_follow_up(&self) -> bool {
+        matches!(
+            self.context.mode_context.as_ref(),
+            Some(ModeContext::Explore { .. })
+        ) && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
+    }
+
+    async fn approve_follow_up_in_existing_scope(
+        &mut self,
+        task_file: &str,
+        title: &str,
+        priority: crate::task_source::Priority,
+        plan: &str,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), String> {
+        let cwd = self.context.filesystem_root().to_path_buf();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
+        let task_file_owned = task_file.to_string();
+        let title_owned = title.to_string();
+        let plan_owned = plan.to_string();
+        let blocking_admission = admitted.reborrow();
+        let reviewed =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                persist_fresh_approved_task_artifact_blocking(
+                    &cwd,
+                    &tasks_dir_name,
+                    &task_file_owned,
+                    &title_owned,
+                    priority,
+                    &plan_owned,
+                )
+            })
+            .await
+            .map_err(|error| format!("Follow-up task approval join error: {error}"))??;
+        self.storage
+            .persist_approved_task_authority(
+                &self.context.conversation_id,
+                &TaskApprovalHandoffData {
+                    task_id: reviewed.task_id,
+                    task_title: reviewed.task_title,
+                    title: title.to_string(),
+                    priority,
+                    plan: plan.to_string(),
+                    task_file: reviewed.task_file,
+                    artifact_body: reviewed.artifact_body,
+                },
+            )
+            .await?;
+
+        let approval_msg = format!(
+            "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
+            self.context.filesystem_root().display(),
+        );
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
+        let seq = self.broadcast_tx.next_seq();
+        let msg = self
+            .storage
+            .add_message_with_seq(
+                &msg_id,
+                &self.context.conversation_id,
+                seq,
+                &content,
+                None,
+                None,
+            )
+            .await?;
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(msg);
+        Ok(())
+    }
+
     /// REQ-BED-028: Execute git operations for task approval.
     ///
     /// Sequence: parse on-disk task file -> create worktree (or promote early one) ->
@@ -8369,6 +8443,11 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        if self.is_approved_explore_follow_up() {
+            return self
+                .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
+                .await;
+        }
         if matches!(
             self.context.mode_context.as_ref(),
             Some(ModeContext::DetachedApprovedTask { .. })
@@ -8476,10 +8555,9 @@ where
                 );
 
                 // Persist as a user message so the LLM sees the approval + plan context.
-                // The propose_task tool_use/result get stripped from history (tool not in
-                // Work registry), so this message carries the plan forward. Must be the
-                // last message before the next LLM call to avoid ending on an assistant
-                // message (Anthropic rejects trailing assistant as "prefill").
+                // This must be the last message before the next LLM call to avoid ending
+                // on an assistant message (Anthropic rejects trailing assistant as
+                // "prefill").
                 let branch_msg = format!(
                     "Task approved. You are on branch {} in {}.\n\n\
                      ## Approved plan: {}\n\n\
@@ -15112,6 +15190,115 @@ mod authoritative_user_message_effect_tests {
             );
             assert!(rt.direct_turn_materialization_aborted);
         }
+    }
+}
+
+#[cfg(test)]
+mod approved_explore_follow_up_tests {
+    use super::test_git_helpers::{add_worktree, init_repo};
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn follow_up_approval_preserves_existing_branch_and_replaces_objective() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up",
+            "task-72003-existing",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+
+        let mut context = ConvContext::new(
+            "approved-explore-follow-up",
+            worktree.clone(),
+            "test-model",
+            200_000,
+        );
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
+        context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+        context.work_scope_worktree = Some(worktree.clone());
+
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .persist_approved_task_authority(
+                "approved-explore-follow-up",
+                &TaskApprovalHandoffData {
+                    task_id: "72003".to_string(),
+                    task_title: "Existing task".to_string(),
+                    title: "Existing task".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: "# Existing task\n".to_string(),
+                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
+                    artifact_body: "# Existing task\n".to_string(),
+                },
+            )
+            .await
+            .expect("existing approved objective");
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let event_tx = mpsc::channel::<Event>(1).0;
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: task_file.to_string(),
+                title: "Follow up".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: plan.to_string(),
+            },
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        let branch_before = run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect("follow-up approval");
+
+        let promoted_task_file = "tasks/72004-p1-in-progress--follow-up.md";
+        assert!(!worktree.join(task_file).exists());
+        assert!(worktree.join(promoted_task_file).exists());
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before,
+            "follow-up approval must not replace or promote the existing branch"
+        );
+        run_git(&worktree, &["diff", "--exit-code", "HEAD", "--", "tasks"])
+            .expect("approved follow-up artifact must be committed");
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let replacement = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("replacement objective");
+        assert_eq!(replacement.task_id, "72004");
+        assert_eq!(replacement.task_file, promoted_task_file);
     }
 }
 
