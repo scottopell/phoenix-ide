@@ -1084,6 +1084,8 @@ mod tests {
         }
         let owner = TestTmuxServerOwner::new();
         let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("replacement.sock");
         let (socket, processes) = spawn_server_with_processes(&owner, "replacement");
         fs::remove_file(&socket).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -1098,7 +1100,10 @@ mod tests {
         assert!(root.exists(), "failed cleanup must preserve its exact root");
 
         drop(replacement);
+        assert_ne!(probe_sync(&control), ProbeResult::Live);
+        assert_exact_processes_gone(processes);
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
