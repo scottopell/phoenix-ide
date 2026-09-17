@@ -526,6 +526,62 @@ CHECK (
 );
 
 DROP TRIGGER consume_continuation_dispatch_intent;
+DROP TRIGGER IF EXISTS completed_continuation_handoffs_validate_insert;
+DROP TRIGGER IF EXISTS completed_continuation_handoffs_immutable;
+CREATE TABLE completed_continuation_handoffs_with_authority (
+    predecessor_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT UNIQUE NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    continuation_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    accepted_successor_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    opening_authority TEXT NOT NULL
+        CHECK (opening_authority IN ('user_authorized_instruction', 'generated_predecessor_context'))
+);
+INSERT INTO completed_continuation_handoffs_with_authority (
+    predecessor_conversation_id, successor_conversation_id,
+    continuation_message_id, accepted_successor_message_id, opening_authority
+)
+SELECT predecessor_conversation_id, successor_conversation_id,
+       continuation_message_id, accepted_successor_message_id,
+       'user_authorized_instruction'
+FROM completed_continuation_handoffs;
+DROP TABLE completed_continuation_handoffs;
+ALTER TABLE completed_continuation_handoffs_with_authority
+RENAME TO completed_continuation_handoffs;
+
+CREATE TRIGGER completed_continuation_handoffs_validate_insert
+BEFORE INSERT ON completed_continuation_handoffs
+FOR EACH ROW WHEN
+    NEW.predecessor_conversation_id = NEW.successor_conversation_id
+    OR NOT EXISTS (
+        SELECT 1 FROM conversations predecessor
+        WHERE predecessor.id = NEW.predecessor_conversation_id
+          AND predecessor.continued_in_conv_id = NEW.successor_conversation_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages continuation
+        WHERE continuation.message_id = NEW.continuation_message_id
+          AND continuation.conversation_id = NEW.predecessor_conversation_id
+          AND continuation.message_type = 'continuation'
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages accepted
+        WHERE accepted.message_id = NEW.accepted_successor_message_id
+          AND accepted.conversation_id = NEW.successor_conversation_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff relation mismatch');
+END;
+
+CREATE TRIGGER completed_continuation_handoffs_immutable
+BEFORE UPDATE ON completed_continuation_handoffs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff is immutable');
+END;
 
 CREATE TABLE continuation_dispatch_intents_with_authority (
     parent_conversation_id TEXT PRIMARY KEY NOT NULL
@@ -550,6 +606,15 @@ DROP TABLE continuation_dispatch_intents;
 ALTER TABLE continuation_dispatch_intents_with_authority
 RENAME TO continuation_dispatch_intents;
 
+CREATE TRIGGER continuation_dispatch_intents_immutable_identity
+BEFORE UPDATE OF parent_conversation_id, successor_conversation_id,
+                 message_id, handoff, opening_authority
+ON continuation_dispatch_intents
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'continuation dispatch intent identity is immutable');
+END;
+
 CREATE TRIGGER consume_continuation_dispatch_intent
 AFTER INSERT ON messages
 WHEN EXISTS (
@@ -561,10 +626,10 @@ WHEN EXISTS (
 BEGIN
     INSERT INTO completed_continuation_handoffs (
         predecessor_conversation_id, successor_conversation_id,
-        continuation_message_id, accepted_successor_message_id
+        continuation_message_id, accepted_successor_message_id, opening_authority
     )
     SELECT intent.parent_conversation_id, intent.successor_conversation_id,
-           continuation.message_id, NEW.message_id
+           continuation.message_id, NEW.message_id, intent.opening_authority
     FROM continuation_dispatch_intents intent
     JOIN messages continuation
       ON continuation.conversation_id = intent.parent_conversation_id
@@ -588,7 +653,7 @@ CREATE TABLE automatic_continuation_admissions (
         REFERENCES product_conversations(id) ON DELETE CASCADE,
     summary_message_id TEXT UNIQUE NOT NULL
         REFERENCES messages(message_id) ON DELETE RESTRICT,
-    operation_id TEXT UNIQUE NOT NULL CHECK (length(trim(operation_id)) > 0),
+    operation_id TEXT NOT NULL CHECK (length(trim(operation_id)) > 0),
     first_message_id TEXT UNIQUE NOT NULL CHECK (length(trim(first_message_id)) > 0),
     opening_authority TEXT NOT NULL DEFAULT 'generated_predecessor_context'
         CHECK (opening_authority = 'generated_predecessor_context'),
@@ -607,6 +672,16 @@ CREATE TABLE automatic_continuation_admissions (
     CHECK ((phase = 'failed') = (last_error IS NOT NULL)),
     UNIQUE (predecessor_conversation_id, product_conversation_id)
 );
+
+CREATE TRIGGER automatic_continuation_admissions_immutable_identity
+BEFORE UPDATE OF predecessor_conversation_id, product_conversation_id,
+                 summary_message_id, operation_id, first_message_id,
+                 opening_authority, admitted_at_unix_micros
+ON automatic_continuation_admissions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'automatic continuation admission identity is immutable');
+END;
 
 CREATE TRIGGER automatic_continuation_admissions_validate_insert
 BEFORE INSERT ON automatic_continuation_admissions
@@ -10397,6 +10472,12 @@ mod tests {
              CREATE TABLE close_obligations (
                  product_conversation_id TEXT NOT NULL,
                  phase TEXT NOT NULL
+             );
+             CREATE TABLE completed_continuation_handoffs (
+                 predecessor_conversation_id TEXT PRIMARY KEY NOT NULL,
+                 successor_conversation_id TEXT UNIQUE NOT NULL,
+                 continuation_message_id TEXT UNIQUE NOT NULL,
+                 accepted_successor_message_id TEXT UNIQUE NOT NULL
              );",
         )
         .execute(&pool)
@@ -10449,6 +10530,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(authority, "user_authorized_instruction");
+        let mutable_authority = sqlx::query(
+            "UPDATE continuation_dispatch_intents
+             SET opening_authority = 'generated_predecessor_context'
+             WHERE parent_conversation_id = 'parent'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mutable_authority.is_err());
         let authority_default: Option<String> = sqlx::query(
             "SELECT dflt_value FROM pragma_table_info('continuation_dispatch_intents')
              WHERE name = 'opening_authority'",

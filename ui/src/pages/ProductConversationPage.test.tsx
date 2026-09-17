@@ -730,6 +730,7 @@ describe('ProductConversationPage', () => {
             successor_transcript_row_id: 'row-2',
             continuation_message_id: 'continuation-request',
             accepted_successor_message_id: 'accepted-successor',
+            opening_authority: 'user_authorized_instruction',
             summary: 'Completed handoff',
           },
         },

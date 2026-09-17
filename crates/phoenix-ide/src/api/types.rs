@@ -431,6 +431,7 @@ pub enum ProductConversationHandoffView {
         successor_transcript_row_id: String,
         continuation_message_id: String,
         accepted_successor_message_id: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
         summary: String,
     },
     Historical {

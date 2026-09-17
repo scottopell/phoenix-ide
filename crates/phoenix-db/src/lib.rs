@@ -596,6 +596,7 @@ pub struct NewContinuationDispatchIntent {
     pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
+    pub opening_authority: ContinuationOpeningAuthority,
 }
 
 impl NewContinuationDispatchIntent {
@@ -609,6 +610,17 @@ impl NewContinuationDispatchIntent {
             message_id,
             handoff,
             user_agent,
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        }
+    }
+
+    #[must_use]
+    pub fn generated_predecessor_context(message_id: ClientTurnKey, handoff: String) -> Self {
+        Self {
+            message_id,
+            handoff,
+            user_agent: None,
+            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
         }
     }
 }
@@ -8147,13 +8159,14 @@ impl Database {
                 "INSERT INTO continuation_dispatch_intents (
                      parent_conversation_id, successor_conversation_id, message_id,
                      handoff, user_agent, opening_authority, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'user_authorized_instruction', ?6)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(parent_id)
             .bind(&new_id)
             .bind(intent.message_id.as_str())
             .bind(&intent.handoff)
             .bind(intent.user_agent.as_deref())
+            .bind(intent.opening_authority.as_str())
             .bind(&now_str)
             .execute(&mut *tx)
             .await?;
@@ -17824,8 +17837,9 @@ mod tests {
     async fn continuation_commit_admits_automatic_work_only_when_preference_was_enabled() {
         let db = Database::open_in_memory().await.unwrap();
         for (conversation_id, operation_id, enabled) in [
-            ("auto-off", "operation-off", false),
-            ("auto-on", "operation-on", true),
+            ("auto-off", "shared-operation", false),
+            ("auto-on", "shared-operation", true),
+            ("auto-on-second", "shared-operation", true),
         ] {
             db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
                 .await
@@ -17858,7 +17872,7 @@ mod tests {
             let summary = format!("exact summary for {conversation_id}  \n");
             let content = MessageContent::continuation(&summary);
             let message = Message {
-                message_id: format!("continuation-{operation_id}"),
+                message_id: format!("continuation-{conversation_id}"),
                 conversation_id: conversation_id.to_string(),
                 sequence_id: 1,
                 message_type: content.message_type(),
@@ -17909,8 +17923,8 @@ mod tests {
             .unwrap()
             .expect("enabled aggregate admits automatic continuation atomically");
         assert_eq!(admitted.predecessor_conversation_id, "auto-on");
-        assert_eq!(admitted.operation_id, "operation-on");
-        assert_eq!(admitted.summary_message_id, "continuation-operation-on");
+        assert_eq!(admitted.operation_id, "shared-operation");
+        assert_eq!(admitted.summary_message_id, "continuation-auto-on");
         assert_eq!(
             admitted.opening_authority,
             ContinuationOpeningAuthority::GeneratedPredecessorContext
@@ -17923,6 +17937,19 @@ mod tests {
             admitted.updated_at_unix_micros,
             admitted.admitted_at_unix_micros
         );
+        let immutable_authority = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET opening_authority = 'user_authorized_instruction'
+             WHERE predecessor_conversation_id = 'auto-on'",
+        )
+        .execute(&db.pool)
+        .await;
+        assert!(immutable_authority.is_err());
+        assert!(db
+            .automatic_continuation_admission("auto-on-second")
+            .await
+            .unwrap()
+            .is_some());
 
         let auto_on_product = admitted.product_conversation_id.clone();
         db.set_auto_continue_on_context_exhaustion(
@@ -17939,7 +17966,7 @@ mod tests {
         assert_eq!(
             db.commit_continuation(
                 "auto-on",
-                "operation-on",
+                "shared-operation",
                 &db.get_messages("auto-on").await.unwrap()[0],
                 &ConvState::ContextExhausted {
                     summary: "exact summary for auto-on  \n".to_string(),
@@ -17952,12 +17979,12 @@ mod tests {
         );
         let admission_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM automatic_continuation_admissions
-             WHERE predecessor_conversation_id = 'auto-on'",
+             WHERE operation_id = 'shared-operation'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(admission_count, 1);
+        assert_eq!(admission_count, 2);
     }
 
     #[tokio::test]
@@ -23069,6 +23096,69 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn generated_context_authority_survives_dispatch_settlement() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "generated-authority-parent",
+            "generated-authority-parent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let content = MessageContent::continuation("exact generated context");
+        db.add_message(
+            "generated-summary",
+            "generated-authority-parent",
+            &content,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (outcome, intent) = db
+            .continue_conversation_with_intent(
+                "generated-authority-parent",
+                NewContinuationDispatchIntent::generated_predecessor_context(
+                    ClientTurnKey::try_from("generated-opening").unwrap(),
+                    "exact generated context".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        let successor = match outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!("expected Created, already continued to {}", conversation.id)
+            }
+            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("expected Created, parent state was {state_variant}")
+            }
+        };
+        assert_eq!(
+            intent.unwrap().opening_authority,
+            ContinuationOpeningAuthority::GeneratedPredecessorContext
+        );
+        let opening = MessageContent::User(UserContent::new("exact generated context"));
+        db.add_message("generated-opening", &successor.id, &opening, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .continuation_dispatch_intent("generated-authority-parent")
+            .await
+            .unwrap()
+            .is_none());
+        let authority: String = sqlx::query_scalar(
+            "SELECT opening_authority FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = 'generated-authority-parent'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(authority, "generated_predecessor_context");
     }
 
     #[tokio::test]

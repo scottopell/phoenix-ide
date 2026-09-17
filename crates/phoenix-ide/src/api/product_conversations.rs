@@ -481,6 +481,7 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
             successor_transcript_row_id,
             continuation_message_id,
             accepted_successor_message_id,
+            opening_authority,
             summary,
             ..
         } => ProductConversationHandoffView::Completed {
@@ -488,6 +489,7 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
             successor_transcript_row_id: successor_transcript_row_id.clone(),
             continuation_message_id: continuation_message_id.clone(),
             accepted_successor_message_id: accepted_successor_message_id.clone(),
+            opening_authority: *opening_authority,
             summary: summary.clone(),
         },
         ProductConversationHandoff::Historical {

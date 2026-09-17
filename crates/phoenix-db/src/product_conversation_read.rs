@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::product_conversation::{
-    OrdinaryProductConversationLifecycle, ProductConversation, ProductConversationId,
-    ProductConversationKind,
+    ContinuationOpeningAuthority, OrdinaryProductConversationLifecycle, ProductConversation,
+    ProductConversationId, ProductConversationKind,
 };
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
@@ -89,6 +89,7 @@ pub enum ProductConversationHandoff {
         successor_transcript_row_id: String,
         continuation_message_id: String,
         accepted_successor_message_id: String,
+        opening_authority: ContinuationOpeningAuthority,
         summary: String,
         accepted_is_duplicate_summary: bool,
     },
@@ -770,6 +771,7 @@ impl Database {
     ) -> DbResult<Option<ProductConversationHandoff>> {
         let completed = sqlx::query(
             "SELECT handoff.continuation_message_id, handoff.accepted_successor_message_id,
+                    handoff.opening_authority,
                     continuation.content AS continuation_content,
                     accepted.message_type AS accepted_message_type,
                     accepted.content AS accepted_content
@@ -798,6 +800,12 @@ impl Database {
                 successor_transcript_row_id: successor.to_string(),
                 continuation_message_id: row.try_get("continuation_message_id")?,
                 accepted_successor_message_id: row.try_get("accepted_successor_message_id")?,
+                opening_authority: ContinuationOpeningAuthority::from_db_str(
+                    &row.try_get::<String, _>("opening_authority")?,
+                )
+                .ok_or_else(|| {
+                    DbError::Serialization("unknown continuation opening authority".to_string())
+                })?,
                 summary,
                 accepted_is_duplicate_summary,
             }));
@@ -1289,15 +1297,16 @@ mod tests {
                 continuation_message_id,
                 accepted_successor_message_id,
                 summary,
+                opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
                 accepted_is_duplicate_summary: false,
                 ..
             } if continuation_message_id == "boundary"
                 && accepted_successor_message_id == "opening"
                 && summary == "exact handoff"
         ));
-        let completed: (String, String, String, String) = sqlx::query_as(
+        let completed: (String, String, String, String, String) = sqlx::query_as(
             "SELECT predecessor_conversation_id, successor_conversation_id,
-                    continuation_message_id, accepted_successor_message_id
+                    continuation_message_id, accepted_successor_message_id, opening_authority
              FROM completed_continuation_handoffs",
         )
         .fetch_one(db.pool())
@@ -1309,7 +1318,8 @@ mod tests {
                 root.id,
                 successor.id,
                 "boundary".to_string(),
-                "opening".to_string()
+                "opening".to_string(),
+                "user_authorized_instruction".to_string()
             )
         );
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM continuation_dispatch_intents")

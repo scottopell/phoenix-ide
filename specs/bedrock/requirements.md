@@ -760,7 +760,7 @@ AND SHALL offer an explicit safe retry or fallback through the shared manual con
 WHEN the user reviews a context-exhausted conversation with no successor
 THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
 AND SHALL offer distinct actions to:
-  - create a successor and submit the generated handoff unchanged as its first user message
+  - create a successor and submit the generated handoff unchanged as its first manually user-authorized opening message
   - edit a separate browser-local handoff draft before creating and starting the successor
   - copy the generated handoff without creating a successor
 AND SHALL NOT present worktree cleanup or abandon controls on the handoff surface
