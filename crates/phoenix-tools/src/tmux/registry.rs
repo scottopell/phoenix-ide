@@ -5497,7 +5497,7 @@ mod tests {
             None,
             None,
             (Some(Duration::ZERO), None),
-            (None, None, None),
+            (None, None, None, None),
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
