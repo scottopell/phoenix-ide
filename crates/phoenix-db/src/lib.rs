@@ -1247,19 +1247,11 @@ pub(crate) struct CloseFoundationTestLatch {
 
 #[cfg(test)]
 #[derive(Debug)]
-struct ContinuationImmediateTestLatch {
-    immediate_attempted: tokio::sync::Notify,
-    pre_reservation_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
-}
-
-#[cfg(test)]
-impl ContinuationImmediateTestLatch {
-    fn new() -> Self {
-        Self {
-            immediate_attempted: tokio::sync::Notify::new(),
-            pre_reservation_barrier: None,
-        }
-    }
+enum ContinuationTestHook {
+    PreReservationBarrier(std::sync::Arc<tokio::sync::Barrier>),
+    ContendedBeginImmediate {
+        attempted: std::sync::Arc<tokio::sync::Notify>,
+    },
 }
 
 #[cfg(test)]
@@ -1363,7 +1355,7 @@ pub struct Database {
     #[cfg(test)]
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
-    continuation_immediate_test_latch: Option<std::sync::Arc<ContinuationImmediateTestLatch>>,
+    continuation_test_hook: Option<std::sync::Arc<ContinuationTestHook>>,
     #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
     #[cfg(test)]
@@ -1386,7 +1378,7 @@ impl Clone for Database {
             #[cfg(test)]
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
             #[cfg(test)]
-            continuation_immediate_test_latch: self.continuation_immediate_test_latch.clone(),
+            continuation_test_hook: self.continuation_test_hook.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
@@ -1623,7 +1615,7 @@ impl Database {
             #[cfg(test)]
             close_foundation_test_latch: None,
             #[cfg(test)]
-            continuation_immediate_test_latch: None,
+            continuation_test_hook: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
             #[cfg(test)]
@@ -7737,10 +7729,10 @@ impl Database {
         }
 
         #[cfg(test)]
-        if let Some(latch) = &self.continuation_immediate_test_latch {
-            if let Some(barrier) = &latch.pre_reservation_barrier {
-                barrier.wait().await;
-            }
+        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
+            self.continuation_test_hook.as_deref()
+        {
+            barrier.wait().await;
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
@@ -7774,10 +7766,12 @@ impl Database {
         #[cfg(test)]
         let mut begin_immediate = begin_immediate;
         #[cfg(test)]
-        if let Some(latch) = &self.continuation_immediate_test_latch {
+        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
+            self.continuation_test_hook.as_deref()
+        {
             std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
                 std::task::Poll::Pending => {
-                    latch.immediate_attempted.notify_waiters();
+                    attempted.notify_waiters();
                     std::task::Poll::Ready(())
                 }
                 std::task::Poll::Ready(_) => {
@@ -22810,9 +22804,9 @@ mod tests {
     async fn max_one_pool_idempotent_continuation_releases_fallback_connection() {
         let mut db = Database::open_in_memory().await.unwrap();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
-        let mut latch = ContinuationImmediateTestLatch::new();
-        latch.pre_reservation_barrier = Some(barrier.clone());
-        db.continuation_immediate_test_latch = Some(std::sync::Arc::new(latch));
+        db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::PreReservationBarrier(barrier.clone()),
+        ));
         setup_exhausted_parent(
             &db,
             "parent-double",
@@ -22884,9 +22878,13 @@ mod tests {
     async fn close_and_continuation_serialize_to_typed_admission_fence() {
         let (_dir, mut close_db, mut continuation_db) = open_test_db_pair().await;
         let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
-        let continuation_latch = std::sync::Arc::new(ContinuationImmediateTestLatch::new());
+        let continuation_immediate_attempted = std::sync::Arc::new(tokio::sync::Notify::new());
         close_db.close_foundation_test_latch = Some(close_latch.clone());
-        continuation_db.continuation_immediate_test_latch = Some(continuation_latch.clone());
+        continuation_db.continuation_test_hook = Some(std::sync::Arc::new(
+            ContinuationTestHook::ContendedBeginImmediate {
+                attempted: continuation_immediate_attempted.clone(),
+            },
+        ));
         let parent = setup_exhausted_parent(
             &close_db,
             "parent-close-race",
@@ -22910,7 +22908,7 @@ mod tests {
         });
         close_entered.await;
 
-        let continuation_immediate_attempted = continuation_latch.immediate_attempted.notified();
+        let continuation_immediate_attempted = continuation_immediate_attempted.notified();
         let continuation_parent_id = parent.id.clone();
         let continuation = tokio::spawn(async move {
             continuation_db
