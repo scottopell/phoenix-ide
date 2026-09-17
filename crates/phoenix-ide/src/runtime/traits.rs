@@ -564,6 +564,12 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        None
+    }
+
     /// Frozen model IDs advertised by the conversation's `spawn_agents`
     /// schema. Spawn-time validation uses this same snapshot so schema and
     /// executor acceptance cannot drift if the live registry changes.
@@ -2061,6 +2067,7 @@ pub struct ToolRegistryExecutor {
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     model_ids: Arc<[String]>,
     writing_tools: Option<WritingConversationTools>,
+    coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
 impl ToolRegistryExecutor {
@@ -2077,6 +2084,7 @@ impl ToolRegistryExecutor {
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
     }
 
@@ -2095,7 +2103,17 @@ impl ToolRegistryExecutor {
             agent_catalog,
             model_ids,
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_coordinator_skill_catalog(
+        mut self,
+        catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Self {
+        self.coordinator_skill_catalog = catalog;
+        self
     }
 
     #[must_use]
@@ -2145,6 +2163,12 @@ impl ToolExecutor for ToolRegistryExecutor {
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
         self.definitions_for_language(crate::llm_language::LlmLanguage::default())
             .await
+    }
+
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        self.coordinator_skill_catalog.clone()
     }
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {

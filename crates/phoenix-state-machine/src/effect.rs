@@ -413,7 +413,6 @@ impl Effect {
                 tool_use_id: tool_use_id.clone(),
                 content: output.into(),
                 is_error,
-                origin: phoenix_core::domain::db_schema::ToolContentOrigin::Ordinary,
                 images,
             }),
             display_data,

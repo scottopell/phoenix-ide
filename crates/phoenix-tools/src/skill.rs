@@ -10,13 +10,22 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
-pub(super) struct AuthenticatedBuiltin;
+pub(super) struct TrustedInstructions {
+    output: String,
+}
+
+impl TrustedInstructions {
+    pub(super) fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub(super) fn replace_output(&mut self, output: String) {
+        self.output = output;
+    }
+}
 
 fn trusted_builtin_instructions(output: String) -> ToolOutput {
-    ToolOutput::TrustedInstructions {
-        output,
-        _authority: AuthenticatedBuiltin,
-    }
+    ToolOutput::TrustedInstructions(TrustedInstructions { output })
 }
 
 /// Tool that lets the LLM invoke a discovered skill by name.
@@ -28,24 +37,26 @@ fn trusted_builtin_instructions(output: String) -> ToolOutput {
 /// the user is issuing a directive. See REQ-SK-002 in specs/skills/.
 pub struct SkillTool {
     audience: phoenix_skills::SkillAudience,
-    builtin_dir: Option<std::path::PathBuf>,
+    coordinator_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
         Self {
             audience: phoenix_skills::SkillAudience::Conversation,
-            builtin_dir: None,
+            coordinator_catalog: None,
         }
     }
 }
 
 impl SkillTool {
     #[must_use]
-    pub const fn for_global_coordinator() -> Self {
+    pub fn for_global_coordinator(
+        catalog: phoenix_skills::AuthenticatedCoordinatorSkillCatalog,
+    ) -> Self {
         Self {
             audience: phoenix_skills::SkillAudience::GlobalCoordinator,
-            builtin_dir: None,
+            coordinator_catalog: Some(catalog),
         }
     }
 }
@@ -101,14 +112,12 @@ impl Tool for SkillTool {
                     phoenix_skills::SkillAudience::Conversation,
                 )
             }
-            phoenix_skills::SkillAudience::GlobalCoordinator => {
-                let default_dir = phoenix_skills::builtin::default_extract_dir();
-                let builtin_dir = self.builtin_dir.as_deref().or(default_dir.as_deref());
-                phoenix_skills::discover_builtin_skills_for_audience(
-                    builtin_dir,
-                    phoenix_skills::SkillAudience::GlobalCoordinator,
-                )
-            }
+            phoenix_skills::SkillAudience::GlobalCoordinator => self
+                .coordinator_catalog
+                .as_ref()
+                .expect("Coordinator SkillTool requires authenticated catalog")
+                .skills()
+                .to_vec(),
         };
         let result = match self.audience {
             phoenix_skills::SkillAudience::Conversation => {
@@ -116,7 +125,12 @@ impl Tool for SkillTool {
                     .map(|invocation| invocation.body)
             }
             phoenix_skills::SkillAudience::GlobalCoordinator => {
-                phoenix_skills::invoke_trusted_coordinator_builtin(skill_name, &skills)
+                phoenix_skills::invoke_trusted_coordinator_builtin(
+                    skill_name,
+                    self.coordinator_catalog
+                        .as_ref()
+                        .expect("Coordinator SkillTool requires authenticated catalog"),
+                )
             }
         };
         match (self.audience, result) {
@@ -168,10 +182,10 @@ mod tests {
     async fn coordinator_skill_returns_authenticated_embedded_instructions() {
         let temp = TempDir::new().unwrap();
         phoenix_skills::builtin::extract_to(temp.path()).unwrap();
-        let tool = SkillTool {
-            audience: phoenix_skills::SkillAudience::GlobalCoordinator,
-            builtin_dir: Some(temp.path().to_path_buf()),
-        };
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
         let result = tool
             .run(
                 json!({"skill_name": "phoenix-api"}),
@@ -182,17 +196,19 @@ mod tests {
         assert!(result.is_success());
         assert!(result.output().contains("<trusted_builtin_skill"));
         assert!(result.output().contains("Embedded reference"));
-        assert!(result.output().contains("ContextExhausted"));
+        assert!(result
+            .output()
+            .contains("Supported Phoenix HTTP API reference"));
     }
 
     #[tokio::test]
     async fn coordinator_skill_rejects_arguments_before_authenticated_invocation() {
         let temp = TempDir::new().unwrap();
         phoenix_skills::builtin::extract_to(temp.path()).unwrap();
-        let tool = SkillTool {
-            audience: phoenix_skills::SkillAudience::GlobalCoordinator,
-            builtin_dir: Some(temp.path().to_path_buf()),
-        };
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
 
         let result = tool
             .run(
@@ -207,7 +223,12 @@ mod tests {
 
     #[test]
     fn coordinator_skill_schema_omits_arguments_and_filesystem_claims() {
-        let tool = SkillTool::for_global_coordinator();
+        let temp = TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
         assert!(tool.input_schema()["properties"].get("args").is_none());
         assert!(!tool.description().contains(".claude/skills"));
     }

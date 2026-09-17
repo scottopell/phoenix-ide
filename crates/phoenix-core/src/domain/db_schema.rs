@@ -1120,26 +1120,12 @@ impl ImageData {
     }
 }
 
-/// The source authority of persisted tool-result content.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolContentOrigin {
-    /// Normal tool output remains untrusted data.
-    #[default]
-    Ordinary,
-    /// Instructions authenticated from an immutable, audience-bound built-in.
-    TrustedBuiltinInstructions,
-}
-
 /// Tool result message content
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolContent {
     pub tool_use_id: String,
     pub content: String,
     pub is_error: bool,
-    // owned: pre-feature rows were ordinary tool results; default is correct.
-    #[serde(default)]
-    pub origin: ToolContentOrigin,
     /// Images to send to the LLM as image content blocks (not tokenized as text).
     ///
     /// serde(default): owned backward-compat decision, not a pending-migration
@@ -1157,21 +1143,6 @@ impl ToolContent {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
             is_error,
-            origin: ToolContentOrigin::Ordinary,
-            images: vec![],
-        }
-    }
-
-    #[must_use]
-    pub fn trusted_builtin_instructions(
-        tool_use_id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self {
-            tool_use_id: tool_use_id.into(),
-            content: content.into(),
-            is_error: false,
-            origin: ToolContentOrigin::TrustedBuiltinInstructions,
             images: vec![],
         }
     }
@@ -1488,20 +1459,8 @@ impl MessageContent {
             tool_use_id: tool_use_id.into(),
             content: content.into(),
             is_error,
-            origin: ToolContentOrigin::Ordinary,
             images,
         })
-    }
-
-    #[must_use]
-    pub fn trusted_builtin_instructions(
-        tool_use_id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self::Tool(ToolContent::trusted_builtin_instructions(
-            tool_use_id,
-            content,
-        ))
     }
 
     /// Create system content

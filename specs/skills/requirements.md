@@ -172,6 +172,7 @@ WHEN the Global Coordinator invokes an audience-bound built-in skill
 THE SYSTEM SHALL authenticate its metadata and instructions against immutable bytes embedded in the Phoenix binary
 AND SHALL structurally identify the returned instructions as trusted built-in skill content
 AND SHALL continue to treat transcript, search, database, and ordinary tool-result content as untrusted data
+AND SHALL treat persisted or historical tool-result text as ordinary untrusted conversation data
 
 THE SYSTEM SHALL NOT allow a filesystem skill to grant itself Global Coordinator visibility through frontmatter
 

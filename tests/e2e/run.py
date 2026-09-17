@@ -1332,6 +1332,8 @@ async def _new_conv_until_first_byte_async(base_url: str, text: str, timeout: fl
                         async with aconnect_sse(client, "GET", stream_url) as source:
                             source.response.raise_for_status()
                             async for event in source.aiter_sse():
+                                if event.event == "ping":
+                                    continue
                                 event_data = json.loads(event.data)
                                 if _is_llm_first_byte_witness(event.event, event_data):
                                     response = await create_task
@@ -1761,6 +1763,7 @@ class StartupRetryTests(unittest.TestCase):
 
 class StreamReadinessTests(unittest.TestCase):
     def test_llm_first_byte_witness_accepts_top_level_and_init_replay(self):
+        self.assertFalse(_is_llm_first_byte_witness("ping", "ping"))
         self.assertTrue(_is_llm_first_byte_witness("llm_first_byte", {}))
         self.assertTrue(
             _is_llm_first_byte_witness(

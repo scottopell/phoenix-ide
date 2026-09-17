@@ -5080,10 +5080,18 @@ impl RuntimeManager {
                         self.db.clone(),
                         self.clone(),
                     ));
+                let coordinator_catalog =
+                    crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
+                        crate::skills::builtin::default_extract_dir().as_deref(),
+                    );
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(
+                        crate::coordinator_tools::tools(service, send_chat),
+                        coordinator_catalog.clone(),
+                    ),
                     agent_catalog.clone(),
                 )
+                .with_coordinator_skill_catalog(coordinator_catalog)
             } else {
                 let global_read = crate::api::global_read::GlobalReadService::new(
                     self.db.clone(),

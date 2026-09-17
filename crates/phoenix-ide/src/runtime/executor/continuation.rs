@@ -210,7 +210,7 @@ mod tests {
             phoenix_core::llm_language::LlmLanguage::PhoenixNative,
             Some(temp.path()),
         );
-        assert!(prompt.contains("Use documented Phoenix APIs through scoped Bash"));
+        assert!(prompt.contains("Documented Phoenix API operations through scoped Bash"));
         assert!(prompt.contains("phoenix-api"));
         assert!(!prompt.contains("cannot create conversations"));
         assert!(!prompt.contains("NEVER call Phoenix HTTP API through Bash"));

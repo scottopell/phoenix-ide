@@ -31,6 +31,24 @@ pub enum SkillAudience {
     GlobalCoordinator,
 }
 
+/// A non-empty authenticated catalog available to the Global Coordinator.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedCoordinatorSkillCatalog(Vec<SkillMetadata>);
+
+impl AuthenticatedCoordinatorSkillCatalog {
+    #[must_use]
+    pub fn discover(builtin_dir: Option<&Path>) -> Option<Self> {
+        let skills =
+            discover_builtin_skills_for_audience(builtin_dir, SkillAudience::GlobalCoordinator);
+        (!skills.is_empty()).then_some(Self(skills))
+    }
+
+    #[must_use]
+    pub fn skills(&self) -> &[SkillMetadata] {
+        &self.0
+    }
+}
+
 impl SkillAudience {
     fn parse(value: &str) -> Option<Self> {
         match value {
@@ -539,6 +557,14 @@ fn discover_all_skills_with_options(
     skills
 }
 
+fn format_skill_expansion(skill_dir: &str, raw_content: &str, arguments: Option<&str>) -> String {
+    let body = strip_frontmatter(raw_content);
+    let body_with_dir = format!("Base directory for this skill: {skill_dir}\n\n{body}");
+    arguments.map_or(body_with_dir.clone(), |args| {
+        substitute_arguments(&body_with_dir, args)
+    })
+}
+
 /// Invoke a skill by name: look up in pre-discovered skills, read SKILL.md,
 /// strip frontmatter, prepend base directory, substitute arguments.
 ///
@@ -582,15 +608,8 @@ pub fn invoke_skill(
             .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?,
     };
 
-    // REQ-SK-001: Strip YAML frontmatter
-    let body = strip_frontmatter(&raw_content);
-
-    // REQ-SK-003: Prepend base directory so the LLM can read companion files.
     let skill_dir = skill.skill_dir();
-    let body_with_dir = format!("Base directory for this skill: {skill_dir}\n\n{body}");
-
-    // REQ-SK-004: Argument substitution
-    let final_body = substitute_arguments(&body_with_dir, arguments);
+    let final_body = format_skill_expansion(&skill_dir, &raw_content, Some(arguments));
 
     Ok(SkillInvocation {
         name: skill_name.to_string(),
@@ -610,8 +629,9 @@ pub fn invoke_skill(
 /// is not an authenticated built-in, or is absent from the embedded assets.
 pub fn invoke_trusted_coordinator_builtin(
     skill_name: &str,
-    skills: &[SkillMetadata],
+    catalog: &AuthenticatedCoordinatorSkillCatalog,
 ) -> Result<String, String> {
+    let skills = catalog.skills();
     let audience_catalog = skills
         .iter()
         .filter(|skill| skill.audience == SkillAudience::GlobalCoordinator)
@@ -642,7 +662,7 @@ pub fn invoke_trusted_coordinator_builtin(
     }
     let raw_content = builtin::embedded_skill(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
-    let mut content = strip_frontmatter(&raw_content);
+    let mut content = format_skill_expansion(&skill.skill_dir(), &raw_content, None);
     content.push_str("\n\nAll authenticated companion references are included below; do not read the mutable extraction cache.");
     let assets = builtin::embedded_skill_assets(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
@@ -1326,10 +1346,8 @@ mod tests {
         assert!(tampered.is_empty());
 
         builtin::extract_to(&extract_dir).unwrap();
-        let authenticated = discover_builtin_skills_for_audience(
-            Some(&extract_dir),
-            SkillAudience::GlobalCoordinator,
-        );
+        let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
+            .expect("authenticated coordinator catalog");
         std::fs::write(&extracted, "forged after discovery").unwrap();
         let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &authenticated).unwrap();
         assert!(trusted.contains("<trusted_builtin_skill"));
