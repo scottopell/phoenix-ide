@@ -8,19 +8,31 @@ on:
     paths:
       - "macos/Phoenix/**"
       - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/build.rs"
+      - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/publish-release-assets.sh"
+      - "scripts/test-desktop-release-workflow.py"
+      - "scripts/test-publish-release-assets.sh"
   push:
     branches: [main]
     paths:
       - "macos/Phoenix/**"
       - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/build.rs"
+      - "crates/phoenix-ide/Cargo.toml"
       - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/publish-release-assets.sh"
+      - "scripts/test-desktop-release-workflow.py"
+      - "scripts/test-publish-release-assets.sh"
 
 concurrency:
   group: macos-app-${{ github.ref }}
@@ -31,11 +43,53 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Test typed macOS core
         run: swift test --package-path macos/Phoenix
-      - name: Run sidecar packaging regression shell test
-        run: macos/Phoenix/scripts/test-package-sidecar.sh
+      - name: Test sidecar and desktop release packaging contracts
+        run: |
+          macos/Phoenix/scripts/test-package-sidecar.sh
+          macos/Phoenix/scripts/test-package-desktop-release.sh
+          scripts/test-publish-release-assets.sh
+          python3 scripts/test-desktop-release-workflow.py
+      - name: Build a real unsigned Release package
+        run: |
+          version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          full_commit=$(git rev-parse HEAD)
+          short_commit=$(git rev-parse --short=12 HEAD)
+          host_arch=$(uname -m)
+          case "$host_arch" in
+            arm64) target=aarch64-apple-darwin ;;
+            x86_64) target=x86_64-apple-darwin ;;
+            *) echo "unsupported macOS runner architecture: $host_arch" >&2; exit 1 ;;
+          esac
+          cat > "$RUNNER_TEMP/phoenix_fixture.c" <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          int main(int argc, char **argv) {
+            if (argc == 2 && strcmp(argv[1], "--build-identity") == 0) {
+              printf("{\"version\":\"@VERSION@\",\"git_sha\":\"@GIT_SHA@\"}\n");
+              return 0;
+            }
+            return 0;
+          }
+          EOF
+          python3 - "$RUNNER_TEMP/phoenix_fixture.c" "$version" "$short_commit" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          source = path.read_text().replace("@VERSION@", sys.argv[2]).replace("@GIT_SHA@", sys.argv[3])
+          path.write_text(source)
+          PY
+          clang -arch "$host_arch" "$RUNNER_TEMP/phoenix_fixture.c" -o "$RUNNER_TEMP/phoenix_ide"
+          macos/Phoenix/scripts/package-desktop-release.sh \
+            --unsigned-test \
+            "$RUNNER_TEMP/phoenix_ide" \
+            "$target" \
+            "v$version" \
+            "$full_commit" \
+            "$RUNNER_TEMP/unsigned-package"
+          test -f "$RUNNER_TEMP/unsigned-package/Phoenix-macos-$target-v$version.zip"
       - name: Build attached-capable Debug app
         run: |
           xcodebuild \
