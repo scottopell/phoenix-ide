@@ -33,10 +33,13 @@ import uuid
 root = Path(sys.argv[1])
 parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
+root_stat = root.stat()
+root_identity = (root_stat.st_dev, root_stat.st_ino)
 owned = []
 retained_controls = {}
 unconfirmed_obligations = []
 cleanup_deadline = None
+cleanup_failed = False
 identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
 publication_timeout = float(os.environ.get("PHOENIX_TMUX_PUBLICATION_TIMEOUT", "1.0"))
@@ -175,6 +178,13 @@ def observe_control(control, expected_token, deadline):
                 time.sleep(min(0.1, remaining))
     raise RuntimeError(f"tmux processes never became ready: {last_error}")
 
+def original_root_exists():
+    try:
+        current = root.stat()
+        return (current.st_dev, current.st_ino) == root_identity
+    except OSError:
+        return False
+
 def reserve_spawn(socket, control):
     if any(existing_socket == socket or existing_control == control
            for existing_socket, existing_control in unconfirmed_obligations):
@@ -201,8 +211,17 @@ def record_owned(socket, device, inode, control, identities):
     for record in conflicts:
         owned.remove(record)
     processes = tuple(identities)
+    previous = retained_controls.get(control.name)
+    if previous is not None:
+        (control_root / previous[3]).unlink(missing_ok=True)
+    anchor = control_root / f".control-anchor-{uuid.uuid4()}"
+    os.link(control, anchor)
+    anchor_stat = anchor.stat()
+    if anchor_stat.st_dev != device or anchor_stat.st_ino != inode:
+        anchor.unlink(missing_ok=True)
+        raise RuntimeError("tmux control anchor identity did not match")
     owned.append((socket, device, inode, control, processes))
-    retained_controls[control.name] = (device, inode, processes)
+    retained_controls[control.name] = (device, inode, processes, anchor.name)
 
 def exact_record(socket, control, identities):
     expected = tuple(identities)
@@ -430,6 +449,7 @@ def retire_registered(socket, control, identities):
     return True
 
 def retire(request):
+    global cleanup_failed
     rejected = request.with_name(
         request.name.replace(".retire-request-", ".retire-rejected-", 1)
     )
@@ -457,7 +477,11 @@ def retire(request):
         except OSError:
             return False
     finally:
-        request.unlink(missing_ok=True)
+        try:
+            request.unlink(missing_ok=True)
+        except OSError:
+            cleanup_failed = True
+            return False
     return True
 
 def register(request):
@@ -494,7 +518,7 @@ def register(request):
 
 (root / ".armed").touch()
 heartbeat = root / ".parent-heartbeat"
-while not (root / ".cleanup-request").exists():
+while original_root_exists() and not (root / ".cleanup-request").exists():
     for request in control_root.glob(".spawn-*"):
         if (root / ".cleanup-request").exists() or not spawn_owned(request):
             break
@@ -614,10 +638,11 @@ while not (root / ".cleanup-request").exists():
     elif os.getppid() != parent:
         break
     time.sleep(0.05)
-try:
-    (root / ".cleanup-ack").touch()
-except FileNotFoundError:
-    pass
+if original_root_exists():
+    try:
+        (root / ".cleanup-ack").touch()
+    except FileNotFoundError:
+        pass
 
 if cleanup_deadline is None:
     cleanup_deadline = time.monotonic() + cleanup_timeout
@@ -653,22 +678,27 @@ def remove_authenticated_control_root():
     except OSError:
         return False
     expected = dict(retained_controls)
+    anchor_names = {record[3] for record in expected.values()}
     authenticated = True
     try:
         for entry in quarantine.iterdir():
+            if entry.name in anchor_names:
+                continue
             registered = expected.get(entry.name)
             if registered is None:
                 if entry.is_socket() or entry.is_symlink():
                     authenticated = False
                     break
                 continue
-            device, inode, processes = registered
+            device, inode, processes, anchor_name = registered
             try:
                 entry_stat = entry.stat()
+                anchor_stat = (quarantine / anchor_name).stat()
             except OSError:
                 authenticated = False
                 break
             if (entry_stat.st_dev != device or entry_stat.st_ino != inode
+                    or anchor_stat.st_dev != device or anchor_stat.st_ino != inode
                     or any(identity_state(identity) != "absent" for identity in processes)):
                 authenticated = False
                 break
@@ -686,7 +716,8 @@ def remove_authenticated_control_root():
 
 quiet = 0
 while time.monotonic() < cleanup_deadline:
-    unconfirmed = False
+    root_replaced = not original_root_exists()
+    unconfirmed = root_replaced or cleanup_failed
     states = [
         identity_state(identity)
         for _, _, _, _, processes in owned
@@ -699,7 +730,7 @@ while time.monotonic() < cleanup_deadline:
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
     }
-    for socket in root.glob("*.sock"):
+    for socket in (() if root_replaced else root.glob("*.sock")):
         if socket.is_symlink():
             socket.unlink(missing_ok=True)
             continue
@@ -795,8 +826,10 @@ while time.monotonic() < cleanup_deadline:
             quiet = 0
             time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
             continue
-        if root.exists():
+        if original_root_exists():
             shutil.rmtree(root)
+        else:
+            sys.exit(1)
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
@@ -1836,8 +1869,9 @@ mod tests {
 
     #[test]
     fn per_iteration_probe_uncertainty_blocks_quiet_success() {
-        assert!(WATCHDOG_PROGRAM
-            .contains("while time.monotonic() < cleanup_deadline:\n    unconfirmed = False"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "while time.monotonic() < cleanup_deadline:\n    root_replaced = not original_root_exists()\n    unconfirmed = root_replaced or cleanup_failed"
+        ));
         assert!(WATCHDOG_PROGRAM.contains(
             "not unconfirmed_state and not unconfirmed and not sockets and not creators"
         ));
@@ -2377,6 +2411,82 @@ mod tests {
 
         assert_exact_processes_gone(&first);
         assert_exact_processes_gone(&second);
+    }
+
+    #[test]
+    fn final_control_cleanup_requires_a_durable_hard_link_anchor() {
+        let record = WATCHDOG_PROGRAM.find("os.link(control, anchor)").unwrap();
+        let authenticate = WATCHDOG_PROGRAM
+            .find("anchor_stat = (quarantine / anchor_name).stat()")
+            .unwrap();
+        let remove = WATCHDOG_PROGRAM.find("shutil.rmtree(quarantine)").unwrap();
+        assert!(record < authenticate && authenticate < remove);
+    }
+
+    #[test]
+    fn directory_retirement_marker_enters_global_cleanup_without_abandoning_records() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (_, first) = spawn_server_with_processes(&owner, "directory-marker-first");
+        let (_, second) = spawn_server_with_processes(&owner, "directory-marker-second");
+        fs::create_dir(control_root.join(".retire-request-directory")).unwrap();
+        wait_until(
+            || control_root.join(".retire-rejected-directory").exists(),
+            "directory retirement marker rejection",
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "marker removal failure must report cleanup failure"
+        );
+        assert_exact_processes_gone(&first);
+        assert_exact_processes_gone(&second);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn replacement_socket_root_is_preserved_without_touching_its_socket() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let mut owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let moved_root = root.with_file_name(format!(
+            "{}-original",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&root, &moved_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement_socket = root.join("replacement.sock");
+        let replacement = std::os::unix::net::UnixListener::bind(&replacement_socket).unwrap();
+
+        let error = owner
+            .finish(true)
+            .expect_err("replacement root must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("watchdog reported cleanup failure"));
+        assert!(
+            replacement_socket.exists(),
+            "replacement socket was removed"
+        );
+        assert_eq!(
+            replacement.local_addr().unwrap().as_pathname(),
+            Some(replacement_socket.as_path())
+        );
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(moved_root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
