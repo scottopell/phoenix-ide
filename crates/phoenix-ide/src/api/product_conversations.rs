@@ -810,11 +810,11 @@ mod tests {
             .db
             .continue_conversation_with_intent(
                 &root.id,
-                crate::db::NewContinuationDispatchIntent {
-                    message_id: ClientTurnKey::try_from(opening_message_id.to_string()).unwrap(),
-                    handoff: "accepted opening handoff".to_string(),
-                    user_agent: None,
-                },
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from(opening_message_id.to_string()).unwrap(),
+                    "accepted opening handoff".to_string(),
+                    None,
+                ),
             )
             .await
             .unwrap();

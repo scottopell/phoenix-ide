@@ -129,6 +129,43 @@ impl ContinuationOpeningAuthority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AutomaticContinuationPhase {
+    Admitted,
+    SuccessorReserved,
+    OwnershipTransferred,
+    DispatchAccepted,
+    MessageSettled,
+    Failed,
+}
+
+impl AutomaticContinuationPhase {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::SuccessorReserved => "successor_reserved",
+            Self::OwnershipTransferred => "ownership_transferred",
+            Self::DispatchAccepted => "dispatch_accepted",
+            Self::MessageSettled => "message_settled",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "admitted" => Self::Admitted,
+            "successor_reserved" => Self::SuccessorReserved,
+            "ownership_transferred" => Self::OwnershipTransferred,
+            "dispatch_accepted" => Self::DispatchAccepted,
+            "message_settled" => Self::MessageSettled,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrdinaryProductConversationLifecycle {
@@ -259,10 +296,20 @@ mod tests {
             ContinuationOpeningAuthority::GeneratedPredecessorContext.as_str(),
             "generated_predecessor_context"
         );
+        assert_eq!(ContinuationOpeningAuthority::from_db_str("unknown"), None);
+    }
+
+    #[test]
+    fn automatic_continuation_phase_rejects_unknown_storage_values() {
         assert_eq!(
-            ContinuationOpeningAuthority::from_db_str("unknown"),
-            None
+            AutomaticContinuationPhase::from_db_str("admitted"),
+            Some(AutomaticContinuationPhase::Admitted)
         );
+        assert_eq!(
+            AutomaticContinuationPhase::MessageSettled.as_str(),
+            "message_settled"
+        );
+        assert_eq!(AutomaticContinuationPhase::from_db_str("unknown"), None);
     }
 
     #[test]

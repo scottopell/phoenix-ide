@@ -1222,11 +1222,11 @@ mod tests {
         let (outcome, _) = db
             .continue_conversation_with_intent(
                 &root.id,
-                NewContinuationDispatchIntent {
-                    message_id: ClientTurnKey::try_from("opening").unwrap(),
-                    handoff: "accepted opening handoff".to_string(),
-                    user_agent: None,
-                },
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("opening").unwrap(),
+                    "accepted opening handoff".to_string(),
+                    None,
+                ),
             )
             .await
             .unwrap();
