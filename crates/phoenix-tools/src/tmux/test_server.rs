@@ -257,7 +257,7 @@ def record_owned(socket, device, inode, control, identities):
         )
         if injected.returncode != 0:
             raise OSError("injected control anchor failure")
-    anchor = control_root / f".control-anchor-{uuid.uuid4()}"
+    anchor = control.parent / f".control-anchor-{uuid.uuid4()}"
     os.link(control, anchor)
     anchor_stat = anchor.stat()
     if anchor_stat.st_dev != device or anchor_stat.st_ino != inode:
@@ -532,20 +532,42 @@ def retire_registered(socket, control, identities):
         retired = remove_retired_control(record)
     try:
         control_anchor.unlink()
+    except FileNotFoundError:
+        pass
     except OSError:
         retired = False
     if not retired:
         return False
-    preserved_visible_paths.add(socket)
+    retained_controls.pop(control.name, None)
+    control_anchor.unlink(missing_ok=True)
+    for anchor in control_root.glob(".control-anchor-*"):
+        try:
+            anchor_stat = anchor.stat()
+            if anchor_stat.st_dev == record[1] and anchor_stat.st_ino == record[2]:
+                anchor.unlink()
+        except FileNotFoundError:
+            pass
+    owned.remove(record)
+    if visible_replacement:
+        preserved_visible_paths.add(socket)
     provisional[:] = [
         item for item in provisional
         if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
     ]
-    adopted_pending_publication[:] = [
+    matching_publications = [
         item for item in adopted_pending_publication
-        if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
+        if item[0] == socket and item[1] == control and tuple(item[2]) == expected
     ]
-    owned.remove(record)
+    adopted_pending_publication[:] = [
+        item for item in adopted_pending_publication if item not in matching_publications
+    ]
+    for item in matching_publications:
+        nonce = item[4].name.removeprefix(".publication-cancelled-")
+        for path in (*item[3:7], control_root / f".registered-{nonce}",
+                     control_root / f".adopted-{nonce}",
+                     control_root / f".publication-committed-{nonce}"):
+            path.unlink(missing_ok=True)
+
     unconfirmed_obligations[:] = [
         obligation for obligation in unconfirmed_obligations
         if obligation[0] != socket or obligation[1] != control
@@ -572,7 +594,10 @@ def retire(request):
             (int(fields[index]), fields[index + 1], None)
             for index in range(5, len(fields), 2)
         )
-        if not retire_registered(socket, control, identities):
+        retired = retire_registered(socket, control, identities)
+        if not retired and all(identity_state(identity) == "absent" for identity in identities):
+            retired = True
+        if not retired:
             raise RuntimeError("exact owned spawn retirement could not be proven")
         publish_response(acknowledged, "retired")
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
@@ -600,11 +625,32 @@ def register(request):
         if (socket.parent != root or control.parent != control_root
                 or control.is_symlink() or not control.is_socket()):
             raise RuntimeError("registration control is not an exact child of the owned control root")
-        identities = observe_control(control, expected_token, time.monotonic() + identity_timeout)
-        if not original_control_root_exists():
-            raise RuntimeError("registration control root incarnation changed")
-        control_stat = control.stat()
-        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
+        registration_control = control_root.with_name(
+            f"{control_root.name}.registration-{uuid.uuid4()}"
+        )
+        os.link(control, registration_control)
+        try:
+            if not original_control_root_exists():
+                raise RuntimeError("registration control root incarnation changed")
+            identities = observe_control(
+                registration_control, expected_token, time.monotonic() + adoption_timeout
+            )
+            control_stat = registration_control.stat()
+            record_owned(
+                socket, control_stat.st_dev, control_stat.st_ino,
+                registration_control, identities
+            )
+            record = owned[-1]
+            retained = retained_controls.pop(registration_control.name)
+            external_anchor = registration_control.parent / retained[3]
+            durable_anchor = control_root / retained[3]
+            os.link(external_anchor, durable_anchor)
+            external_anchor.unlink()
+            record = (record[0], record[1], record[2], control, record[4])
+            owned[-1] = record
+            retained_controls[control.name] = retained
+        finally:
+            registration_control.unlink(missing_ok=True)
         try:
             publish_response(acknowledged, "\t".join(
                 str(value) for identity in identities for value in identity[:2]
@@ -649,10 +695,36 @@ while owner_alive():
                 )
             except OSError:
                 publish_valid = False
+        publication_committed = publication_acknowledged.with_name(
+            publication_acknowledged.name.replace(
+                ".publication-acknowledged-", ".publication-committed-", 1
+            )
+        )
+        if publication_committed.exists():
+            publication_committed.unlink()
+            publication_acknowledged.unlink(missing_ok=True)
+            publication_cancelled.unlink(missing_ok=True)
+            adopted_pending_publication.remove(item)
+            continue
         if publication_cancelled.exists():
-            if not retire_registered(socket, control, identities):
+            retired = retire_registered(socket, control, identities)
+            if not retired and all(identity_state(identity) == "absent" for identity in identities):
+                retired = True
+            if not retired:
                 retain_obligation(socket, control)
-        elif publish_valid:
+                continue
+            try:
+                publish_response(adoption_rejected, "publication cancelled; exact retirement completed")
+            except OSError:
+                pass
+            publication_cancelled.unlink(missing_ok=True)
+            publication_acknowledged.unlink(missing_ok=True)
+            if item in adopted_pending_publication:
+                adopted_pending_publication.remove(item)
+            continue
+        if publication_acknowledged.exists() and not published.exists():
+            continue
+        if publish_valid:
             try:
                 if publication_hook:
                     subprocess.run(
@@ -662,11 +734,22 @@ while owner_alive():
                     )
                 published.unlink(missing_ok=True)
                 if publication_cancelled.exists():
-                    if not retire_registered(socket, control, identities):
+                    retired = retire_registered(socket, control, identities)
+                    if not retired and all(identity_state(identity) == "absent" for identity in identities):
+                        retired = True
+                    if not retired:
                         retain_obligation(socket, control)
+                        continue
+                    try:
+                        publish_response(adoption_rejected, "publication cancelled; exact retirement completed")
+                    except OSError:
+                        pass
+                    publication_cancelled.unlink(missing_ok=True)
+                    publication_acknowledged.unlink(missing_ok=True)
+                    if item in adopted_pending_publication:
+                        adopted_pending_publication.remove(item)
                     continue
                 publish_response(publication_acknowledged, "published")
-                adopted_pending_publication.remove(item)
             except (OSError, subprocess.TimeoutExpired):
                 retire_registered(socket, control, identities)
                 retain_obligation(socket, control)
@@ -677,14 +760,19 @@ while owner_alive():
                     )
                 except OSError:
                     pass
-        elif published.exists() or now >= deadline:
-            if retire_registered(socket, control, identities):
-                try:
-                    publish_response(adoption_rejected, "publication failed; exact server retired")
-                except OSError:
-                    pass
-            else:
+                adopted_pending_publication.remove(item)
+        else:
+            retired = retire_registered(socket, control, identities)
+            if not retired and all(identity_state(identity) == "absent" for identity in identities):
+                retired = True
+            if not retired:
                 retain_obligation(socket, control)
+            try:
+                publish_response(adoption_rejected, "publication failed; exact retirement completed")
+            except OSError:
+                pass
+            if item in adopted_pending_publication:
+                adopted_pending_publication.remove(item)
     for item in list(provisional):
         (socket, control, identities, adopt, adopted, adoption_rejected,
          published, publication_cancelled, publication_acknowledged,
@@ -1377,6 +1465,14 @@ fn write_server_environment(path: &Path, server_env: &[(String, String)]) -> io:
     )
 }
 
+fn publication_paths(control_root: &Path, nonce: uuid::Uuid) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        control_root.join(format!(".published-{nonce}")),
+        control_root.join(format!(".publication-cancelled-{nonce}")),
+        control_root.join(format!(".publication-acknowledged-{nonce}")),
+    )
+}
+
 fn atomic_ack_matches(path: &Path, expected: &str) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
         && fs::read_to_string(path).is_ok_and(|value| value == expected)
@@ -1388,6 +1484,7 @@ pub(crate) struct AdoptedTestServer {
     published: PathBuf,
     publication_acknowledged: PathBuf,
     publication_cancelled: PathBuf,
+    publication_committed: PathBuf,
     adoption_rejected: PathBuf,
     committed: bool,
 }
@@ -1406,6 +1503,7 @@ impl AdoptedTestServer {
         published: PathBuf,
         publication_acknowledged: PathBuf,
         publication_cancelled: PathBuf,
+        publication_committed: PathBuf,
         adoption_rejected: PathBuf,
     ) -> Self {
         Self {
@@ -1414,6 +1512,7 @@ impl AdoptedTestServer {
             publication_acknowledged,
             publication_cancelled,
             adoption_rejected,
+            publication_committed,
             committed: false,
         }
     }
@@ -1422,14 +1521,16 @@ impl AdoptedTestServer {
         fs::write(&self.published, [])?;
         let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
         loop {
-            if atomic_ack_matches(&self.publication_acknowledged, "published") {
-                self.committed = true;
-                return Ok(self.processes.clone());
-            }
             if let Ok(reason) = fs::read_to_string(&self.adoption_rejected) {
+                self.committed = true;
                 return Err(io::Error::other(format!(
                     "tmux watchdog rejected publication: {reason}"
                 )));
+            }
+            if atomic_ack_matches(&self.publication_acknowledged, "published") {
+                fs::write(&self.publication_committed, [])?;
+                self.committed = true;
+                return Ok(self.processes.clone());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
@@ -1494,9 +1595,9 @@ pub(crate) async fn spawn_owned_server(
     let adopted = control_root.join(format!(".adopt-{nonce}"));
     let adoption_acknowledged = control_root.join(format!(".adopted-{nonce}"));
     let adoption_rejected = control_root.join(format!(".adoption-rejected-{nonce}"));
-    let published = control_root.join(format!(".published-{nonce}"));
-    let publication_cancelled = control_root.join(format!(".publication-cancelled-{nonce}"));
-    let publication_acknowledged = control_root.join(format!(".publication-acknowledged-{nonce}"));
+    let (published, publication_cancelled, publication_acknowledged) =
+        publication_paths(control_root, nonce);
+    let publication_committed = control_root.join(format!(".publication-committed-{nonce}"));
     let env_file = control_root.join(format!(".environment-{nonce}.json"));
     write_server_environment(&env_file, server_env)?;
     let _artifacts = RegistrationArtifacts {
@@ -1543,6 +1644,7 @@ pub(crate) async fn spawn_owned_server(
                 published,
                 publication_acknowledged,
                 publication_cancelled,
+                publication_committed,
                 adoption_rejected,
             ));
         }
@@ -2419,13 +2521,30 @@ mod tests {
     }
 
     #[test]
+    fn registration_admission_binds_original_control_endpoint() {
+        let bind = WATCHDOG_PROGRAM
+            .find("os.link(control, registration_control)")
+            .unwrap();
+        let authenticate = WATCHDOG_PROGRAM
+            .match_indices("if not original_control_root_exists()")
+            .map(|(offset, _)| offset)
+            .find(|offset| *offset > bind)
+            .unwrap();
+        let observe = WATCHDOG_PROGRAM
+            .find("identities = observe_control(\n                registration_control")
+            .unwrap();
+        let record = WATCHDOG_PROGRAM
+            .find("control_stat = registration_control.stat()")
+            .unwrap();
+        assert!(bind < authenticate && authenticate < observe && observe < record);
+    }
+
+    #[test]
     fn replacement_control_root_registration_is_not_dequeued() {
         assert!(WATCHDOG_PROGRAM.contains(
             "for request in control_root.glob(\".register-*\"):\n        if not owner_alive() or not register(request):"
         ));
-        assert!(WATCHDOG_PROGRAM.contains(
-            "if not original_control_root_exists():\n            raise RuntimeError(\"registration control root incarnation changed\")"
-        ));
+        assert!(WATCHDOG_PROGRAM.contains("os.link(control, registration_control)"));
     }
 
     #[test]
@@ -3150,7 +3269,11 @@ mod tests {
         let quarantine = WATCHDOG_PROGRAM
             .find("os.replace(control_root, quarantine)")
             .unwrap();
-        let authenticate = WATCHDOG_PROGRAM.find("!= control_root_identity").unwrap();
+        let authenticate = WATCHDOG_PROGRAM
+            .match_indices("!= control_root_identity")
+            .map(|(offset, _)| offset)
+            .find(|offset| *offset > quarantine)
+            .unwrap();
         assert!(capture < quarantine && quarantine < authenticate);
     }
 
@@ -3654,6 +3777,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abort_after_publication_ack_before_commit_retires_visible_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let acknowledged = hook_dir.path().join("acknowledged");
+        let hook = hook_dir.path().join("ack-publication");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n: > \"$2\"\n: > '{}'\n/bin/sleep 0.4\n",
+                acknowledged.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, None),
+            None,
+            None,
+            None,
+            (Some(Duration::from_secs(2)), Some(&hook)),
+            (None, None, None, None),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("abort-after-ack.sock");
+        let control = control_root.join("abort-after-ack.sock");
+        let token = "abort-after-ack-token";
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+        ];
+        let adopted = spawn_owned_server(
+            &socket,
+            &control,
+            &root.join("config"),
+            &root,
+            token,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let processes = adopted.processes.clone();
+        fs::hard_link(&control, &socket).unwrap();
+        let task = tokio::spawn(adopted.commit_publication());
+        while !acknowledged.exists() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        wait_until(
+            || !phoenix_core::process_identity::process_identity_matches(processes.server),
+            "post-ack publication cancellation retirement",
+        );
+
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert_exact_processes_gone(&processes);
+        assert!(!socket.exists());
+        if cleanup.is_err() {
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            if control_root.exists() {
+                fs::remove_dir_all(&control_root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_during_publication_hook_retires_visible_server() {
         if which::which("tmux").is_err() {
             return;
@@ -3710,10 +3907,18 @@ mod tests {
             "publication cancellation retirement",
         );
 
-        owner.shutdown();
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
 
         assert_exact_processes_gone(&processes);
         assert!(!socket.exists());
+        if cleanup.is_err() {
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            if control_root.exists() {
+                fs::remove_dir_all(&control_root).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -3807,7 +4012,15 @@ mod tests {
             },
             "watchdog ownership transition after waiter cancellation",
         );
-        owner.shutdown();
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        if cleanup.is_err() {
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            if control_root.exists() {
+                fs::remove_dir_all(&control_root).unwrap();
+            }
+        }
         assert!(!root.exists());
         assert!(!control_root.exists());
     }
