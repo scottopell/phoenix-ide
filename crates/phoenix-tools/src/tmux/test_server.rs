@@ -35,6 +35,8 @@ parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 root_stat = root.stat()
 root_identity = (root_stat.st_dev, root_stat.st_ino)
+control_root_stat = control_root.stat()
+control_root_identity = (control_root_stat.st_dev, control_root_stat.st_ino)
 owned = []
 retained_controls = {}
 unconfirmed_obligations = []
@@ -44,6 +46,7 @@ identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
 publication_timeout = float(os.environ.get("PHOENIX_TMUX_PUBLICATION_TIMEOUT", "1.0"))
 cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
+heartbeat_stale = 0.5
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
 adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
 publication_hook = os.environ.get("PHOENIX_TMUX_PUBLICATION_HOOK")
@@ -185,6 +188,20 @@ def original_root_exists():
     except OSError:
         return False
 
+def original_control_root_exists():
+    try:
+        current = control_root.stat()
+        return (current.st_dev, current.st_ino) == control_root_identity
+    except OSError:
+        return False
+
+def owner_alive():
+    if not original_root_exists() or (root / ".cleanup-request").exists():
+        return False
+    if heartbeat.exists():
+        return time.time() - heartbeat.stat().st_mtime <= heartbeat_stale
+    return os.getppid() == parent
+
 def reserve_spawn(socket, control):
     if any(existing_socket == socket or existing_control == control
            for existing_socket, existing_control in unconfirmed_obligations):
@@ -208,8 +225,14 @@ def record_owned(socket, device, inode, control, identities):
     if any(identity_state(identity) != "absent"
            for _, _, _, _, processes in conflicts for identity in processes):
         raise RuntimeError("live tmux ownership record already exists")
-    for record in conflicts:
-        owned.remove(record)
+    if conflicts:
+        provisional[:] = [item for item in provisional if item[0] != socket and item[1] != control]
+        adopted_pending_publication[:] = [
+            item for item in adopted_pending_publication
+            if item[0] != socket and item[1] != control
+        ]
+        for record in conflicts:
+            owned.remove(record)
     processes = tuple(identities)
     previous = retained_controls.get(control.name)
     if previous is not None:
@@ -518,9 +541,9 @@ def register(request):
 
 (root / ".armed").touch()
 heartbeat = root / ".parent-heartbeat"
-while original_root_exists() and not (root / ".cleanup-request").exists():
+while owner_alive():
     for request in control_root.glob(".spawn-*"):
-        if (root / ".cleanup-request").exists() or not spawn_owned(request):
+        if not owner_alive() or not spawn_owned(request):
             break
     else:
         request = None
@@ -631,7 +654,7 @@ while original_root_exists() and not (root / ".cleanup-request").exists():
         break
     if parent == 1:
         try:
-            if time.time() - heartbeat.stat().st_mtime > 0.5:
+            if time.time() - heartbeat.stat().st_mtime > heartbeat_stale:
                 break
         except FileNotFoundError:
             break
@@ -673,8 +696,15 @@ def remove_authenticated_control_root():
     if not control_root.exists():
         return True
     quarantine = control_root.with_name(f"{control_root.name}.retired-{uuid.uuid4()}")
+    if not original_control_root_exists():
+        return False
     try:
         os.replace(control_root, quarantine)
+        moved_root_stat = quarantine.stat()
+        if (moved_root_stat.st_dev, moved_root_stat.st_ino) != control_root_identity:
+            if not control_root.exists():
+                os.replace(quarantine, control_root)
+            return False
     except OSError:
         return False
     expected = dict(retained_controls)
@@ -781,31 +811,36 @@ while time.monotonic() < cleanup_deadline:
         if socket in preserved_visible_paths:
             unconfirmed = True
             continue
+        quarantine = root / f".unregistered-{uuid.uuid4()}"
         try:
+            socket_stat = socket.stat()
+            os.replace(socket, quarantine)
+            quarantined_stat = quarantine.stat()
+            if (quarantined_stat.st_dev, quarantined_stat.st_ino) != (socket_stat.st_dev, socket_stat.st_ino):
+                raise RuntimeError("unregistered socket identity changed during quarantine")
             probe = subprocess.run(
-                ["tmux", "-S", str(socket), "list-sessions"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+                ["tmux", "-S", str(quarantine), "list-sessions"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False,
                 timeout=remaining_timeout(cleanup_deadline),
             )
-            if probe.returncode == 0:
-                killed = subprocess.run(
-                    ["tmux", "-S", str(socket), "kill-server"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=remaining_timeout(cleanup_deadline),
-                )
-                if killed.returncode == 0:
-                    socket.unlink(missing_ok=True)
-                else:
-                    unconfirmed = True
-            else:
-                unconfirmed = True
+            if probe.returncode != 0:
+                raise RuntimeError("unregistered socket probe was unverifiable")
+            killed = subprocess.run(
+                ["tmux", "-S", str(quarantine), "kill-server"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False,
+                timeout=remaining_timeout(cleanup_deadline),
+            )
+            if killed.returncode != 0:
+                raise RuntimeError("unregistered server kill failed")
+            quarantine.unlink(missing_ok=True)
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            try:
+                if quarantine.exists() and not socket.exists():
+                    os.replace(quarantine, socket)
+            except OSError:
+                pass
             unconfirmed = True
     sockets = any(path.is_socket() for path in root.glob("*.sock"))
     creators = False
@@ -826,9 +861,21 @@ while time.monotonic() < cleanup_deadline:
             quiet = 0
             time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
             continue
-        if original_root_exists():
-            shutil.rmtree(root)
-        else:
+        root_quarantine = root.with_name(f"{root.name}.retired-{uuid.uuid4()}")
+        try:
+            os.replace(root, root_quarantine)
+            moved_root_stat = root_quarantine.stat()
+            if (moved_root_stat.st_dev, moved_root_stat.st_ino) != root_identity:
+                if not root.exists():
+                    os.replace(root_quarantine, root)
+                sys.exit(1)
+            shutil.rmtree(root_quarantine)
+        except OSError:
+            try:
+                if root_quarantine.exists() and not root.exists():
+                    os.replace(root_quarantine, root)
+            except OSError:
+                pass
             sys.exit(1)
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
@@ -1173,6 +1220,11 @@ fn write_server_environment(path: &Path, server_env: &[(String, String)]) -> io:
     )
 }
 
+fn atomic_ack_matches(path: &Path, expected: &str) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && fs::read_to_string(path).is_ok_and(|value| value == expected)
+}
+
 #[derive(Debug)]
 pub(crate) struct AdoptedTestServer {
     pub(crate) processes: TestServerProcesses,
@@ -1213,7 +1265,7 @@ impl AdoptedTestServer {
         fs::write(&self.published, [])?;
         let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
         loop {
-            if self.publication_acknowledged.exists() {
+            if atomic_ack_matches(&self.publication_acknowledged, "published") {
                 self.committed = true;
                 return Ok(self.processes.clone());
             }
@@ -1325,7 +1377,7 @@ pub(crate) async fn spawn_owned_server(
                 fs::write(&adopted, [])?;
             }
         }
-        if adoption_acknowledged.exists() {
+        if atomic_ack_matches(&adoption_acknowledged, "adopted") {
             let processes = registered.ok_or_else(|| {
                 io::Error::other("tmux watchdog acknowledged adoption before registration")
             })?;
@@ -1850,7 +1902,11 @@ mod tests {
     #[test]
     fn duplicate_owned_records_require_explicit_prior_absence_before_replacement() {
         assert!(WATCHDOG_PROGRAM.contains("if any(identity_state(identity) != \"absent\""));
-        assert!(WATCHDOG_PROGRAM.contains("for record in conflicts:\n        owned.remove(record)"));
+        assert!(
+            WATCHDOG_PROGRAM.contains("for record in conflicts:\n            owned.remove(record)")
+        );
+        assert!(WATCHDOG_PROGRAM.contains("provisional[:] ="));
+        assert!(WATCHDOG_PROGRAM.contains("adopted_pending_publication[:] ="));
         assert_eq!(WATCHDOG_PROGRAM.matches("owned.append(").count(), 1);
     }
 
@@ -2411,6 +2467,73 @@ mod tests {
 
         assert_exact_processes_gone(&first);
         assert_exact_processes_gone(&second);
+    }
+
+    #[test]
+    fn spawn_batch_rechecks_parent_liveness_before_each_dequeue() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "for request in control_root.glob(\".spawn-*\"):\n        if not owner_alive() or not spawn_owned(request):"
+        ));
+    }
+
+    #[test]
+    fn final_control_cleanup_authenticates_control_root_incarnation() {
+        let capture = WATCHDOG_PROGRAM.find("control_root_identity = (").unwrap();
+        let quarantine = WATCHDOG_PROGRAM
+            .find("os.replace(control_root, quarantine)")
+            .unwrap();
+        let authenticate = WATCHDOG_PROGRAM.find("!= control_root_identity").unwrap();
+        assert!(capture < quarantine && quarantine < authenticate);
+    }
+
+    #[test]
+    fn unregistered_sweep_binds_probe_and_kill_to_quarantined_endpoint() {
+        let quarantine = WATCHDOG_PROGRAM
+            .find("os.replace(socket, quarantine)")
+            .unwrap();
+        let probe = WATCHDOG_PROGRAM
+            .find("[\"tmux\", \"-S\", str(quarantine), \"list-sessions\"]")
+            .unwrap();
+        let kill = WATCHDOG_PROGRAM
+            .find("[\"tmux\", \"-S\", str(quarantine), \"kill-server\"]")
+            .unwrap();
+        assert!(quarantine < probe && probe < kill);
+    }
+
+    #[test]
+    fn final_socket_root_deletion_authenticates_atomic_quarantine() {
+        let quarantine = WATCHDOG_PROGRAM
+            .find("os.replace(root, root_quarantine)")
+            .unwrap();
+        let authenticate = WATCHDOG_PROGRAM.find("!= root_identity").unwrap();
+        let remove = WATCHDOG_PROGRAM
+            .find("shutil.rmtree(root_quarantine)")
+            .unwrap();
+        assert!(quarantine < authenticate && authenticate < remove);
+    }
+
+    #[test]
+    fn forged_acknowledgments_do_not_commit_waiters() {
+        let dir = TempDir::new().unwrap();
+        let forged = dir.path().join("forged");
+        fs::write(&forged, "forged").unwrap();
+        assert!(!atomic_ack_matches(&forged, "published"));
+        fs::remove_file(&forged).unwrap();
+        fs::create_dir(&forged).unwrap();
+        assert!(!atomic_ack_matches(&forged, "adopted"));
+        fs::remove_dir(&forged).unwrap();
+        fs::write(&forged, "published").unwrap();
+        assert!(atomic_ack_matches(&forged, "published"));
+    }
+
+    #[test]
+    fn absent_record_replacement_reconciles_all_matching_lifecycle_state() {
+        let conflict = WATCHDOG_PROGRAM.find("if conflicts:").unwrap();
+        let lifecycle = WATCHDOG_PROGRAM.get(conflict..).unwrap();
+        let provisional = lifecycle.find("provisional[:] =").unwrap();
+        let publication = lifecycle.find("adopted_pending_publication[:] =").unwrap();
+        let owned = lifecycle.find("owned.remove(record)").unwrap();
+        assert!(provisional < publication && publication < owned);
     }
 
     #[test]
@@ -3198,8 +3321,9 @@ mod tests {
 
     #[test]
     fn cleanup_request_stops_spawn_batch_before_next_spawn() {
-        assert!(WATCHDOG_PROGRAM
-            .contains("if (root / \".cleanup-request\").exists() or not spawn_owned(request):"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "for request in control_root.glob(\".spawn-*\"):\n        if not owner_alive() or not spawn_owned(request):"
+        ));
     }
 
     #[test]
