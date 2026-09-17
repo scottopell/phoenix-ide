@@ -1867,6 +1867,12 @@ where
     turn_trigger: super::TurnTriggerSlot,
 }
 
+#[derive(Debug)]
+enum FollowUpApprovalError {
+    BeforeAuthority(String),
+    AfterAuthority(String),
+}
+
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -8367,7 +8373,7 @@ where
         priority: crate::task_source::Priority,
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<(), String> {
+    ) -> Result<(), FollowUpApprovalError> {
         let cwd = self.context.filesystem_root().to_path_buf();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let task_file_owned = task_file.to_string();
@@ -8386,7 +8392,13 @@ where
                 )
             })
             .await
-            .map_err(|error| format!("Follow-up task approval join error: {error}"))??;
+            .map_err(|error| {
+                FollowUpApprovalError::BeforeAuthority(format!(
+                    "Follow-up task approval join error: {error}"
+                ))
+            })?
+            .map_err(FollowUpApprovalError::BeforeAuthority)?;
+
         self.storage
             .persist_approved_task_authority(
                 &self.context.conversation_id,
@@ -8400,7 +8412,8 @@ where
                     artifact_body: reviewed.artifact_body,
                 },
             )
-            .await?;
+            .await
+            .map_err(FollowUpApprovalError::BeforeAuthority)?;
 
         let approval_msg = format!(
             "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
@@ -8419,7 +8432,8 @@ where
                 None,
                 None,
             )
-            .await?;
+            .await
+            .map_err(FollowUpApprovalError::AfterAuthority)?;
         let _ = self
             .broadcast_tx
             .admitted_publication(admitted)
@@ -8505,13 +8519,16 @@ where
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
                 .await;
-            if let Err(error) = result {
-                self.restore_retryable_task_approval(
-                    task_file, title, priority, plan, &error, admitted,
-                )?;
-                return Err(error);
-            }
-            return Ok(());
+            return match result {
+                Ok(()) => Ok(()),
+                Err(FollowUpApprovalError::BeforeAuthority(error)) => {
+                    self.restore_retryable_task_approval(
+                        task_file, title, priority, plan, &error, admitted,
+                    )?;
+                    Err(error)
+                }
+                Err(FollowUpApprovalError::AfterAuthority(error)) => Err(error),
+            };
         }
         if matches!(
             self.context.mode_context.as_ref(),
@@ -8921,30 +8938,43 @@ fn reread_reviewed_task_handoff_snapshot(
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, String> {
-    let path = cwd.join(task_file);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-            let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-                format!("Failed to read reviewed task file '{task_file}': {error}")
-            })?;
-            let promoted = path.with_file_name(format!(
-                "{}-{}-in-progress--{}.md",
-                parsed.id, parsed.priority, parsed.slug
-            ));
-            std::fs::read_to_string(promoted)
-                .map_err(|_| format!("Failed to read reviewed task file '{task_file}': {error}"))?
-        }
-        Err(error) => {
-            return Err(format!(
-                "Failed to read reviewed task file '{task_file}': {error}"
-            ))
-        }
+    let proposed_path = cwd.join(task_file);
+    let path = if proposed_path.exists() {
+        proposed_path
+    } else {
+        let filename = proposed_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+            format!("Failed to read reviewed task file '{task_file}': file not found")
+        })?;
+        proposed_path.with_file_name(format!(
+            "{}-{}-in-progress--{}.md",
+            parsed.id, parsed.priority, parsed.slug
+        ))
     };
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Reviewed task file '{task_file}' must remain a regular file. Reject and re-approve the replacement artifact."
+        ));
+    }
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve reviewed task file '{task_file}': {error}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve the working directory: {error}"))?;
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(format!(
+            "Reviewed task file '{task_file}' resolves outside the working directory. Reject and re-approve the replacement artifact."
+        ));
+    }
+    let body = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
     if body != expected_plan {
         return Err(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
@@ -15314,6 +15344,32 @@ mod approved_explore_follow_up_tests {
             event_tx,
             broadcast_tx,
         )
+    }
+
+    #[test]
+    fn reread_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n";
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), plan).unwrap();
+        symlink(outside.path(), cwd.path().join(task_file)).unwrap();
+
+        let error = reread_reviewed_task_handoff_snapshot(
+            cwd.path(),
+            cwd.path(),
+            "tasks",
+            task_file,
+            "Follow up",
+            crate::task_source::Priority::P1,
+            plan,
+        )
+        .expect_err("symlink replacement must be rejected");
+
+        assert!(error.contains("must remain a regular file"));
     }
 
     #[tokio::test]
