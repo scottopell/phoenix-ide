@@ -143,9 +143,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
 
   useEffect(() => {
     let cancelled = false;
-    const refresh = () => api.listProductConversations()
-      .then((response) => { if (!cancelled) setProductConversations(response.product_conversations); })
-      .catch(() => {});
+    let generation = 0;
+    const refresh = () => {
+      const requestGeneration = ++generation;
+      return api.listProductConversations()
+        .then((response) => {
+          if (!cancelled && requestGeneration === generation) {
+            setProductConversations(response.product_conversations);
+          }
+        })
+        .catch(() => {});
+    };
     void refresh();
     const interval = window.setInterval(refresh, 5_000);
     const unsubscribe = subscribeProductConversationListRevision(() => { void refresh(); });
