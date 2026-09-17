@@ -51,6 +51,7 @@ jobs:
           macos/Phoenix/scripts/test-package-sidecar.sh
           macos/Phoenix/scripts/test-package-desktop-release.sh
           scripts/test-publish-release-assets.sh
+          scripts/test-verify-published-release.sh
           python3 scripts/test-desktop-release-workflow.py
       - name: Build a real unsigned Release package
         run: |
