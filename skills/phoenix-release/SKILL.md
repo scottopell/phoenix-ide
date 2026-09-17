@@ -43,16 +43,16 @@ You do *not* hand-craft or push a tag. A tag pushed by a human is the historical
 
 ## Step 3 — Merge the PR, wait for the build, verify the release
 
-Merge the bump PR (any merge strategy is fine — the workflow tags whatever `main` HEAD is after the merge, so the tag lands on `main` regardless). The merge fires `.github/workflows/release.yml`, which tags `vX.Y.Z` and builds → ~7 minutes on the typical history.
+Merge the bump PR only after the user separately authorizes release publication. The workflow tags the resulting `main` commit, builds the standalone and desktop artifacts, verifies the private draft, and then publishes it.
 
 ```bash
 gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId') --exit-status
 gh release view vX.Y.Z --json url,assets -q '{url, assets: [.assets[].name]}'
 ```
 
-Expect status `success` and seven assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; and `SHA256SUMS` covering all six binaries. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all eight payload assets. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
-If the build fails, do not retry blindly. Open the run, read the failed step, fix the underlying issue, and merge a fix. Because the tag is created only when a *new* version reaches `main`, a re-run of the same version is a no-op (the gate sees the tag already exists); ship the fix as the next patch version instead. Never `--force` a tag.
+If the build fails, do not retry blindly. Open the run and fix the underlying issue. A manual dispatch may retry only when the existing version tag still points at that exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
 
 ## Step 4 — Draft polished release notes via sub-agent
 
@@ -107,6 +107,6 @@ Print the URL back to the user. Done.
 - `phoenix-deployment` — deploying a built release to production (separate from publishing it on GitHub).
 - `phoenix-development` — `./dev.py up/check` etc., used during the optional pre-release sanity build.
 
-## Open follow-ups
+## Direct-distribution boundary
 
-- No checksum file or macOS/aarch64 binary is produced. If multi-arch builds matter, that's a workflow expansion, not a process gap.
+The release workflow produces Developer ID signed and notarized direct-distribution ZIPs. It does not produce a Mac App Store package, DMG, installer, Sparkle feed, or desktop updater. Protected signing/notarization configuration and clean-host acceptance remain release-readiness gates outside this skill.
