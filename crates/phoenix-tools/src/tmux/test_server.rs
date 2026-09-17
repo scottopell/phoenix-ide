@@ -273,12 +273,12 @@ for _, device, inode, control, processes in owned:
         continue
     try:
         control_stat = control.stat()
-        observed_server, _ = query_control_processes(control)
-        if (control_stat.st_dev != device or control_stat.st_ino != inode
-                or observed_server != processes[0][0]):
+        if control_stat.st_dev != device or control_stat.st_ino != inode:
             continue
+        expected_server = processes[0][0]
         killed = subprocess.run(
-            ["tmux", "-S", str(control), "kill-server"],
+            ["tmux", "-S", str(control), "if-shell", "-F",
+             f"#{{==:#{{pid}},{expected_server}}}", "kill-server", ""],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1197,18 +1197,111 @@ mod tests {
         assert_exact_processes_gone(second_processes);
     }
 
+    fn write_tmux_wrapper(fake_bin: &Path, program: &str) {
+        let fake_tmux = fake_bin.join("tmux");
+        fs::write(&fake_tmux, program).unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(fake_tmux, permissions).unwrap();
+    }
+
+    #[test]
+    fn matching_control_endpoint_accepts_one_incarnation_bound_cleanup_request() {
+        let Ok(real_tmux) = which::which("tmux") else {
+            return;
+        };
+        let fake_bin = TempDir::new().unwrap();
+        let accepted = fake_bin.path().join("accepted");
+        write_tmux_wrapper(
+            fake_bin.path(),
+            &format!(
+                "#!/bin/sh\nif [ \"$3\" = if-shell ]; then printf '%s\\n' \"$*\" >> '{}'; fi\nexec '{}' \"$@\"\n",
+                accepted.display(),
+                real_tmux.display()
+            ),
+        );
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let (_, processes) = spawn_server_with_processes(&owner, "accepted-cleanup");
+
+        owner.shutdown();
+
+        assert_exact_processes_gone(processes);
+        let requests = fs::read_to_string(accepted).unwrap();
+        assert_eq!(requests.lines().count(), 1);
+        assert!(requests.contains(&format!(
+            "if-shell -F #{{==:#{{pid}},{}}} kill-server",
+            processes.server.pid
+        )));
+    }
+
+    #[test]
+    fn replacement_control_endpoint_rejects_incarnation_bound_cleanup_request() {
+        let Ok(real_tmux) = which::which("tmux") else {
+            return;
+        };
+        let fake_bin = TempDir::new().unwrap();
+        let replaced = fake_bin.path().join("replaced");
+        write_tmux_wrapper(
+            fake_bin.path(),
+            &format!(
+                "#!/bin/sh\nif [ \"$3\" = if-shell ] && [ ! -e '{}' ]; then\n  rm -f \"$2\"\n  '{}' -S \"$2\" new-session -d -s replacement 'sleep 300'\n  : > '{}'\nfi\nexec '{}' \"$@\"\n",
+                replaced.display(),
+                real_tmux.display(),
+                replaced.display(),
+                real_tmux.display()
+            ),
+        );
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("replacement-after-check.sock");
+        let control = control_root.join("replacement-after-check.sock");
+        let (_, processes) = spawn_server_with_processes(&owner, "replacement-after-check");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(
+            panic.is_err(),
+            "surviving owned server must fail cleanup closed"
+        );
+        assert!(
+            replaced.exists(),
+            "wrapper did not replace the accepted endpoint"
+        );
+        assert_eq!(probe_sync(&control), ProbeResult::Live);
+        assert!(
+            phoenix_core::process_identity::process_identity_matches(processes.server),
+            "owned server should remain available at its other hard link"
+        );
+        assert!(Command::new(&real_tmux)
+            .args(["-S", &control.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new(real_tmux)
+            .args(["-S", &socket.to_string_lossy(), "kill-server"])
+            .status()
+            .unwrap()
+            .success());
+        assert_exact_processes_gone(processes);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
     #[test]
     fn cleanup_uses_incarnation_bound_socket_without_numeric_pid_signals() {
         assert!(!WATCHDOG_PROGRAM.contains("os.kill(identity[0]"));
         assert!(!WATCHDOG_PROGRAM.contains("os.link(socket, control)"));
-        assert!(WATCHDOG_PROGRAM.contains("[\"tmux\", \"-S\", str(control), \"kill-server\"]"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "[\"tmux\", \"-S\", str(control), \"if-shell\", \"-F\",\n             f\"#{{==:#{{pid}},{expected_server}}}\", \"kill-server\", \"\"]"
+        ));
     }
 
     #[test]
-    fn cleanup_revalidates_control_inode_and_authenticated_identity_before_kill() {
+    fn cleanup_revalidates_control_inode_before_incarnation_bound_kill() {
         assert!(WATCHDOG_PROGRAM.contains("control_stat.st_dev"));
         assert!(WATCHDOG_PROGRAM.contains("control_stat.st_ino"));
-        assert!(WATCHDOG_PROGRAM.contains("observed_server, _ = query_control_processes(control)"));
+        assert!(!WATCHDOG_PROGRAM.contains("observed_server, _ = query_control_processes(control)"));
     }
 
     #[test]
