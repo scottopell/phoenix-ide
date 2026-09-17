@@ -126,14 +126,24 @@ for name, digest in expected.items():
 PY
 }
 
-verify_draft_subset_and_list_missing() {
+assert_private_release() {
   local metadata=$1
-  local missing=$2
-  "$PYTHON3" - "$expected_digests" "$metadata" "$missing" <<'PY'
+  "$PYTHON3" - "$metadata" <<'PY'
 import json
 import sys
 from pathlib import Path
+release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not release.get("draft"):
+    raise SystemExit("error: release became public before exact verification")
+PY
+}
 
+verify_complete_private_release() {
+  local metadata=$1
+  "$PYTHON3" - "$expected_digests" "$metadata" <<'PY'
+import json
+import sys
+from pathlib import Path
 expected = {}
 for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     name, digest = line.split("\t", 1)
@@ -143,15 +153,8 @@ if not release.get("draft"):
     raise SystemExit("error: release became public before exact verification")
 assets = release.get("assets", [])
 actual = {asset.get("name"): asset.get("digest") for asset in assets}
-if len(actual) != len(assets) or not set(actual).issubset(expected):
-    raise SystemExit("error: draft contains duplicate or unexpected assets")
-for name, digest in actual.items():
-    if digest != expected[name]:
-        raise SystemExit(f"error: draft digest mismatch for {name}")
-Path(sys.argv[3]).write_text(
-    "".join(f"{name}\n" for name in sorted(set(expected) - set(actual))),
-    encoding="utf-8",
-)
+if len(actual) != len(assets) or actual != expected:
+    raise SystemExit("error: private release asset names or digests are not exact")
 PY
 }
 
@@ -206,25 +209,30 @@ fi
 
 release_id=$(jq -er '.id' <<<"$metadata")
 metadata_file="$work/draft.json"
-missing_file="$work/missing-assets"
 release_metadata_by_id "$release_id" >"$metadata_file"
-verify_draft_subset_and_list_missing "$metadata_file" "$missing_file"
-while IFS= read -r name; do
-  [[ -n "$name" ]] || continue
+assert_private_release "$metadata_file"
+while IFS= read -r asset_id; do
+  [[ -n "$asset_id" ]] || continue
   verify_tag
   release_metadata_by_id "$release_id" >"$metadata_file"
-  verify_draft_subset_and_list_missing "$metadata_file" "$missing_file.current"
-  grep -Fx "$name" "$missing_file.current" >/dev/null || {
-    echo "error: draft changed while preparing $name" >&2
+  assert_private_release "$metadata_file"
+  jq -e --argjson id "$asset_id" '.assets[] | select(.id == $id)' "$metadata_file" >/dev/null || {
+    echo "error: private release changed while removing asset $asset_id" >&2
     exit 1
   }
-  upload_asset_to_draft "$release_id" "$(asset_path_by_name "$name")"
-done <"$missing_file"
+  gh api --method DELETE "repos/$repo/releases/assets/$asset_id" >/dev/null
+done < <(jq -r '.assets[]?.id' "$metadata_file")
+
+for path in "${assets[@]}"; do
+  verify_tag
+  release_metadata_by_id "$release_id" >"$metadata_file"
+  assert_private_release "$metadata_file"
+  upload_asset_to_draft "$release_id" "$path"
+done
 
 verify_tag
 release_metadata_by_id "$release_id" >"$metadata_file"
-verify_draft_subset_and_list_missing "$metadata_file" "$missing_file"
-[[ ! -s "$missing_file" ]] || { echo "error: draft remains incomplete" >&2; exit 1; }
+verify_complete_private_release "$metadata_file"
 gh api --method PATCH "repos/$repo/releases/$release_id" -F draft=false >/dev/null
 verify_release_assets false
 verify_tag

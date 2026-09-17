@@ -17,8 +17,13 @@ on:
     branches: [main]
     paths:
       - 'crates/phoenix-ide/Cargo.toml'
-  # Manual re-trigger (e.g. to retry a failed build for the current version).
-  workflow_dispatch: {}
+  # Manual retry is bound to an existing immutable stable tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to retry (for example v1.2.3)
+        required: true
+        type: string
 
 jobs:
   # Resolve the version from Cargo.toml and, if it has not been released yet,
@@ -40,7 +45,31 @@ jobs:
 
       - name: Resolve version, tag if new
         id: ver
+        env:
+          RETRY_TAG: ${{ inputs.tag }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]]; then
+            TAG=$RETRY_TAG
+            printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+              echo "Manual retry requires an existing stable vX.Y.Z tag: $TAG" >&2
+              exit 1
+            }
+            git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
+              echo "Manual dispatch cannot create missing tag $TAG" >&2
+              exit 1
+            }
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+            git merge-base --is-ancestor "$TAG_COMMIT" origin/main || {
+              echo "Tagged commit $TAG_COMMIT is not on main" >&2
+              exit 1
+            }
+            echo "Retrying $TAG from its immutable main commit $TAG_COMMIT."
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           VERSION=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           [ -n "$VERSION" ] || { echo "Could not read version from crates/phoenix-ide/Cargo.toml"; exit 1; }
           printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
@@ -66,11 +95,6 @@ jobs:
               echo "release=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-              echo "Manual dispatch may retry an existing exact tag but cannot create $TAG."
-              echo "release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
             echo "Tagging $(git rev-parse --short HEAD) as $TAG"
             # Annotated tags need a committer identity; the runner has none.
             git config user.name  "github-actions[bot]"
