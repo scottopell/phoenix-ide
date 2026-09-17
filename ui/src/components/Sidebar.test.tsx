@@ -237,6 +237,28 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.archiveConversation).not.toHaveBeenCalled();
   });
 
+  it('closes single-row products through the ordinary conversation endpoint', async () => {
+    apiMock.archiveConversation.mockResolvedValue({ ok: true });
+    const row = makeProductConversation('pc-single', {
+      canonical_root: { transcript_row_id: 'single-row', slug: 'single', title: 'Single Product' },
+      latest_transcript_row_id: 'single-row',
+    });
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-single']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-single" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-single"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Close product conversation Single Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledWith('single-row'));
+    expect(apiMock.archiveChain).not.toHaveBeenCalled();
+  });
+
   it('does not expose product conversation actions for history rows', async () => {
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [makeProductConversation('pc-history', {

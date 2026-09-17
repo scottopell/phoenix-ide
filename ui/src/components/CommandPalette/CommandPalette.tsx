@@ -146,7 +146,9 @@ export function CommandPalette({ conversations, productConversations = [], activ
               if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
-                  if (chainRootId != null) {
+                  if (activeProduct && activeProduct.canonical_root.transcript_row_id === activeProduct.latest_transcript_row_id) {
+                    await api.archiveConversation(targetId);
+                  } else if (chainRootId != null) {
                     await api.archiveChain(chainRootId);
                   } else {
                     await api.archiveConversation(targetId);
