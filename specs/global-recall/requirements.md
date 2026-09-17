@@ -139,6 +139,15 @@ AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or c
 AND SHALL NOT infer a default repository or cwd
 AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
+WHEN the user authorizes continuation of an existing ordinary conversation
+THE Coordinator MAY inspect its authoritative transcript state and invoke the supported idempotent `POST /api/conversations/{id}/continue` through explicitly WorkScope-targeted Bash
+AND SHALL invoke it only when `conversation.state.type == "context_exhausted"`
+AND SHALL reconcile an existing continuation before retrying an uncertain request
+AND SHALL report the accepted successor identity; that endpoint may create only the successor transcript within the existing ProductConversation
+AND SHALL verify the effective prompt in a fresh continuation or session after deployment
+
+THE Coordinator SHALL NOT create unrelated or new-work conversations, perform arbitrary lifecycle mutation, or monitor in the background
+
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
