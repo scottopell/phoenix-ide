@@ -1106,9 +1106,15 @@ pub struct ForkProposalListResponse {
     pub proposals: Vec<ForkProposalSummary>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum CloseRecoveryMethod {
+    #[serde(rename = "POST")]
+    Post,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CloseRecoveryAction {
-    pub method: String,
+    pub method: CloseRecoveryMethod,
     pub path: String,
 }
 
@@ -1174,7 +1180,7 @@ impl ConflictErrorResponse {
         let attempt_id = attempt_id.into();
         let active_transcript_id = active_transcript_id.into();
         self.recovery_action = Some(CloseRecoveryAction {
-            method: "POST".to_string(),
+            method: CloseRecoveryMethod::Post,
             path: format!("/api/conversations/{active_transcript_id}/close/retry-retirement"),
         });
         self.attempt_id = Some(attempt_id);

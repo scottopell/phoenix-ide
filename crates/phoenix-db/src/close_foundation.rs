@@ -3166,6 +3166,124 @@ impl Database {
         Ok(replacement_snapshot)
     }
 
+    /// Re-admits a legacy retry generation left partial by the cleanup-plan FK787 defect.
+    ///
+    /// The transaction recognizes only the exported historical relational shape and
+    /// serializes the phase change with concurrent retries. Retirement must still
+    /// validate live resource identity before cleanup.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when persistence fails or the retained evidence is malformed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn resume_legacy_fk787_close_retirement_generation(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<Option<CloseObligation>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        let Some(snapshot) = obligation.snapshot() else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        if obligation.phase() != ClosePhase::AwaitingRetirementInspection {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let resumable: bool = sqlx::query_scalar(
+            "SELECT
+                 EXISTS (
+                     SELECT 1 FROM close_attempt_scopes
+                     WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL
+                 )
+             AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id=?1) =
+                 (SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id=?1)
+             AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id=?1) =
+                 (SELECT COUNT(*) FROM close_retirement_resources
+                  WHERE attempt_id=?1 AND inspection_generation=?2
+                    AND inspection_fingerprint=?3)
+             AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id=?1) =
+                 (SELECT COUNT(*) FROM close_retirement_inventories
+                  WHERE attempt_id=?1 AND inspection_generation=?2
+                    AND inspection_fingerprint=?3 AND sealed=1)
+             AND NOT EXISTS (
+                 SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id=?1 AND inspection_generation=?2
+                   AND inspection_fingerprint=?3
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM close_worktree_cleanup_plans
+                 WHERE attempt_id=?1 AND inspection_generation=?2
+                   AND inspection_fingerprint=?3
+             )
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id=?1
+                   AND target.captured_worktree_identity IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_retirement_resources residual
+                       WHERE residual.attempt_id=target.attempt_id
+                         AND residual.scope=target.scope
+                         AND residual.inspection_generation=?2
+                         AND residual.inspection_fingerprint=?3
+                         AND residual.resource_kind='worktree'
+                         AND residual.identity_kind='worktree'
+                         AND residual.identity_codec='worktree_id_v1'
+                         AND residual.identity_value=target.captured_worktree_identity
+                         AND residual.proof_kind='residual'
+                         AND residual.residual_reason='manual_repair_required'
+                         AND residual.detail LIKE '%(code: 787) FOREIGN KEY constraint failed%'
+                   )
+             )
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id=?1
+                   AND target.captured_worktree_identity IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_worktree_cleanup_plans plan
+                       JOIN close_retirement_resource_dispatches dispatch
+                         ON dispatch.attempt_id=plan.attempt_id
+                        AND dispatch.scope=plan.scope
+                        AND dispatch.inspection_generation=plan.inspection_generation
+                        AND dispatch.inspection_fingerprint=plan.inspection_fingerprint
+                        AND dispatch.resource_kind=plan.resource_kind
+                        AND dispatch.identity_kind=plan.identity_kind
+                        AND dispatch.identity_codec=plan.identity_codec
+                        AND dispatch.identity_value=plan.identity_value
+                       WHERE plan.attempt_id=target.attempt_id
+                         AND plan.scope=target.scope
+                         AND plan.resource_kind='worktree'
+                         AND plan.identity_kind='worktree'
+                         AND plan.identity_codec='worktree_id_v1'
+                         AND plan.identity_value=target.captured_worktree_identity
+                         AND (plan.inspection_generation<>?2
+                              OR plan.inspection_fingerprint<>?3)
+                   )
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !resumable {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(Some(obligation))
+    }
+
     /// Reports whether every captured scope has a sealed inventory for the active snapshot.
     pub async fn close_retirement_inventory_is_complete(&self, attempt_id: &str) -> DbResult<bool> {
         let status = sqlx::query(
@@ -4676,7 +4794,7 @@ impl Database {
             && persisted.4 == request.resource.identity().codec();
         if persisted != requested && !reuses_same_attempt_retirement {
             return Err(close_precondition(format!(
-                "attempt {} retirement evidence replay differs from persisted evidence",
+                "attempt {} retirement evidence replay differs from persisted evidence: persisted={persisted:?}, requested={requested:?}",
                 request.attempt_id
             )));
         }

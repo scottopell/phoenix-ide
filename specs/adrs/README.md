@@ -68,6 +68,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
 | [056](056_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md) | Close retirement persists writer authority and atomically adopts retry evidence | Accepted | REQ-WL-002b/002c, REQ-BED-029, REQ-API-006; `AmbientWriterEvidenceRow`, `RetainedCleanupEvidenceAdoption` |
+| [057](057_legacy-fk787-close-retries-use-typed-runtime-reconciliation.md) | Legacy FK787 Close retries use typed runtime reconciliation | Accepted | REQ-WL-002b; Close retirement compatibility |
 
 ## For agents: which decisions bind your task
 
@@ -152,6 +153,8 @@ ADR-000 (adopt spEARS v2 for new work)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
       │           └── ADR-051 (Predecessor recall is bound to the executing transcript)
+      ├── ADR-057 (Legacy FK787 Close retries use typed runtime reconciliation)
+      │   └── narrows ADR-054 under ADR-034 for one persisted compatibility shape
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)

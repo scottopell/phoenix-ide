@@ -525,6 +525,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_typed_close_repair_cause",
         sql: MIGRATION_101,
     },
+    Migration {
+        version: 102,
+        name: "settled_close_participant_allows_legacy_member_delete",
+        sql: MIGRATION_102,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -10575,6 +10580,55 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
+const MIGRATION_102: &str = r"
+DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
+DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
+
+CREATE TRIGGER close_attempt_members_reject_delete_after_topology_seal
+BEFORE DELETE ON close_attempt_members
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.topology_sealed = 1
+      AND obligation.phase <> 'completed'
+) AND NOT EXISTS (
+    SELECT 1 FROM close_attempt_participants participant
+    WHERE participant.attempt_id = OLD.attempt_id
+      AND participant.conversation_id = OLD.conversation_id
+      AND participant.settlement_state = 'deleted'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured close topology is sealed');
+END;
+
+CREATE TRIGGER close_attempt_members_preserve_target_scope_on_delete
+BEFORE DELETE ON close_attempt_members
+FOR EACH ROW
+WHEN OLD.captured_work_scope_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'completed'
+) AND EXISTS (
+    SELECT 1 FROM close_attempt_scopes target
+    WHERE target.attempt_id = OLD.attempt_id AND target.scope = OLD.captured_work_scope_id
+) AND NOT EXISTS (
+    SELECT 1 FROM close_attempt_members member
+    WHERE member.attempt_id = OLD.attempt_id
+      AND member.captured_work_scope_id = OLD.captured_work_scope_id
+      AND member.conversation_id <> OLD.conversation_id
+) AND NOT EXISTS (
+    SELECT 1 FROM close_attempt_participants participant
+    WHERE participant.attempt_id = OLD.attempt_id
+      AND participant.conversation_id = OLD.conversation_id
+      AND participant.settlement_state = 'deleted'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured member scope is targeted by close attempt');
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17164,9 +17218,80 @@ mod tests {
         .unwrap());
     }
 
+    #[tokio::test]
+    async fn migration_101_allows_only_settled_legacy_member_delete() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, phase TEXT NOT NULL, topology_sealed INTEGER NOT NULL
+             );
+             CREATE TABLE close_attempt_scopes (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL,
+                 PRIMARY KEY (attempt_id, scope)
+             );
+             CREATE TABLE close_attempt_participants (
+                 attempt_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                 settlement_state TEXT NOT NULL,
+                 PRIMARY KEY (attempt_id, conversation_id)
+             );
+             CREATE TABLE close_attempt_members (
+                 attempt_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                 captured_work_scope_id TEXT,
+                 PRIMARY KEY (attempt_id, conversation_id)
+             );
+             INSERT INTO close_obligations VALUES ('attempt', 'retirement_requested', 1);
+             INSERT INTO close_attempt_scopes VALUES ('attempt', 'scope');
+             INSERT INTO close_attempt_participants VALUES ('attempt', 'conversation', 'live');
+             INSERT INTO close_attempt_members VALUES ('attempt', 'conversation', 'scope');
+             CREATE TRIGGER close_attempt_members_reject_delete_after_topology_seal
+             BEFORE DELETE ON close_attempt_members BEGIN SELECT RAISE(ABORT, 'old guard'); END;
+             CREATE TRIGGER close_attempt_members_preserve_target_scope_on_delete
+             BEFORE DELETE ON close_attempt_members BEGIN SELECT RAISE(ABORT, 'old scope guard'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+        let live_delete = sqlx::query(
+            "DELETE FROM close_attempt_members
+             WHERE attempt_id='attempt' AND conversation_id='conversation'",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("live participant legacy membership must remain sealed");
+        assert!(live_delete
+            .to_string()
+            .contains("captured member scope is targeted by close attempt"));
+
+        sqlx::query(
+            "UPDATE close_attempt_participants SET settlement_state='deleted'
+             WHERE attempt_id='attempt' AND conversation_id='conversation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deleted = sqlx::query(
+            "DELETE FROM close_attempt_members
+             WHERE attempt_id='attempt' AND conversation_id='conversation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+        let preserved_scope: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_scopes
+             WHERE attempt_id='attempt' AND scope='scope'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_scope, 1);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_098_normalizes_typed_close_repair_causes() {
+    async fn migration_100_normalizes_typed_close_repair_causes() {
         let pool = test_pool().await;
         sqlx::query(
             "CREATE TABLE close_obligations (
@@ -17177,7 +17302,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
 
         sqlx::query(
             "INSERT INTO close_obligations (attempt_id, phase)

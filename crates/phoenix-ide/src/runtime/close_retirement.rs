@@ -158,6 +158,22 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
         continue_clean_retirement: bool,
     ) -> Result<CloseRetirementSnapshot, String> {
+        if continue_clean_retirement {
+            if let Some(resumed) = self
+                .db()
+                .resume_legacy_fk787_close_retirement_generation(&attempt_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let snapshot = resumed.snapshot().cloned().ok_or_else(|| {
+                    "resumed Close retirement has no inspection snapshot".to_string()
+                })?;
+                self.retire_close_runtime_resources(attempt_id)
+                    .await
+                    .map_err(String::from)?;
+                return Ok(snapshot);
+            }
+        }
         let prior_obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
@@ -3892,7 +3908,25 @@ fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvi
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => match quarantine_has_namespace_cwd(path)?
+            {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    quarantine_has_writable_mappings(path)
+                }
+            },
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
     inspect_ambient_writer_until_quiescent(
         AmbientWriterObservationPolicy::production(),
@@ -4451,6 +4485,95 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                    .expect("vnode path info fits i32"),
+            )
+        };
+        if bytes
+            != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                .expect("vnode path info size fits i32")
+        {
+            let error = std::io::Error::last_os_error();
+            if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                continue;
+            }
+            return Err(format!(
+                "cannot inspect process {pid} working directory: {error}"
+            ));
+        }
+        let info = unsafe { info.assume_init() };
+        let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
+        let cwd = unsafe { CStr::from_ptr(cwd_bytes.as_ptr()) };
+        let cwd_path = Path::new(std::ffi::OsStr::from_bytes(cwd.to_bytes()));
+        if !path_is_within(cwd_path, &canonical) {
+            continue;
+        }
+        let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+            return Err(format!(
+                "cannot prove process {pid} working-directory owner identity"
+            ));
+        };
+        let Some(before_executable) = macos_process_executable(pid)? else {
+            return Err(format!(
+                "cannot prove process {pid} working-directory executable identity"
+            ));
+        };
+        let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)? else {
+            return Err(format!(
+                "cannot reprove process {pid} working-directory owner identity"
+            ));
+        };
+        let Some(after_executable) = macos_process_executable(pid)? else {
+            return Err(format!(
+                "cannot reprove process {pid} working-directory executable identity"
+            ));
+        };
+        if after_uid != uid {
+            return Err("matching writer identity changed during inspection".to_string());
+        }
+        if !revalidated_writer_identity(
+            &before_incarnation,
+            &before_executable,
+            true,
+            &after_incarnation,
+            &after_executable,
+        )? {
+            continue;
+        }
+        return Ok(ExternalWriterEvidence::PositiveWriterFound(
+            AmbientWriterEvidence {
+                detector: AmbientWriterDetector::MacosProcPidinfo,
+                process_id: i64::from(pid),
+                process_incarnation: before_incarnation,
+                executable: before_executable,
+                matched_path: GitPathIdentity::from_bytes(cwd.to_bytes().to_vec()),
+                match_kind: AmbientWriterMatchKind::NamespaceDirectory,
+                access_mode: AmbientWriterAccessMode::NamespaceWrite,
+            },
+        ));
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
@@ -5171,7 +5294,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     let pids = macos_all_pids().map_err(|error| {
         format!("cannot enumerate processes for descriptor inspection: {error}")
     })?;
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+    'processes: for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
             let mut descriptors = vec![
@@ -5195,7 +5318,13 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 )
             };
             if descriptor_bytes <= 0 {
-                break Vec::new();
+                let error = std::io::Error::last_os_error();
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                    continue 'processes;
+                }
+                return Err(format!(
+                    "cannot enumerate process {pid} descriptors: {error}"
+                ));
             }
             let descriptor_bytes =
                 usize::try_from(descriptor_bytes).expect("positive descriptor byte count");

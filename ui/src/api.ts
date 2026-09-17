@@ -952,6 +952,7 @@ export interface ConflictErrorDetail {
       | "observe_ambient_writer"
       | "read_process_incarnation"
       | "read_process_executable"
+      | "read_working_directory"
       | "read_mappings"
       | "enumerate_descriptors"
       | "enumerate_descriptor"
