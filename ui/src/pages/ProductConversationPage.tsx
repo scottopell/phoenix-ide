@@ -674,17 +674,19 @@ function ProjectCoordinatorSettings({
   onSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
-  onSaved: () => void;
+  onSaved: (profile: ProductConversationSnapshotView['project_coordinator_profile']) => void;
 }) {
   const profile = snapshot.project_coordinator_profile;
   const [open, setOpen] = useState(false);
   const [enabled, setEnabled] = useState(profile != null);
   const [charter, setCharter] = useState(profile?.charter ?? '');
+  const [baseRevision, setBaseRevision] = useState<number | null>(profile?.revision ?? null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const reset = useCallback(() => {
     setEnabled(profile != null);
     setCharter(profile?.charter ?? '');
+    setBaseRevision(profile?.revision ?? null);
     setError(null);
   }, [profile]);
   const dirty = enabled !== (profile != null) || charter !== (profile?.charter ?? '');
@@ -696,13 +698,13 @@ function ProjectCoordinatorSettings({
     setSaving(true);
     setError(null);
     try {
-      await api.putProjectCoordinatorProfile(snapshot.product_conversation_id, {
+      const savedProfile = await api.putProjectCoordinatorProfile(snapshot.product_conversation_id, {
         enabled,
         charter,
-        expected_revision: profile?.revision ?? null,
+        expected_revision: baseRevision,
       });
+      onSaved(savedProfile);
       setOpen(false);
-      onSaved();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Failed to save Project Coordinator profile');
     } finally {
@@ -774,7 +776,7 @@ function ProductConversationHeader({
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
-  onCoordinatorProfileSaved: () => void;
+  onCoordinatorProfileSaved: (profile: ProductConversationSnapshotView['project_coordinator_profile']) => void;
 }) {
   const source = snapshot.source;
   return (
@@ -1168,7 +1170,10 @@ function ProductConversationPageInner() {
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
-        onCoordinatorProfileSaved={() => setSnapshotRetry((retry) => retry + 1)}
+        onCoordinatorProfileSaved={(profile) => {
+          setSnapshot((current) => current ? { ...current, project_coordinator_profile: profile } : current);
+          setSnapshotRetry((retry) => retry + 1);
+        }}
       />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">

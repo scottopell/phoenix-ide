@@ -142,6 +142,9 @@ pub async fn put_project_coordinator_profile(
 ) -> Result<Json<Option<ProjectCoordinatorProfileView>>, AppError> {
     let product_conversation_id = ProductConversationId::parse(&id)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let _admitted = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
     let charter = request.enabled.then_some(request.charter.as_str());
     match state
         .db
@@ -154,9 +157,9 @@ pub async fn put_project_coordinator_profile(
     {
         Ok(ProjectCoordinatorProfileWriteOutcome::Saved(profile)) => {
             Ok(Json(Some(ProjectCoordinatorProfileView {
-                charter: profile.charter,
-                revision: profile.revision,
-                updated_at_unix_micros: profile.updated_at_unix_micros,
+                charter: profile.charter().to_string(),
+                revision: profile.revision(),
+                updated_at_unix_micros: profile.updated_at_unix_micros(),
             })))
         }
         Ok(ProjectCoordinatorProfileWriteOutcome::Disabled) => Ok(Json(None)),
@@ -178,6 +181,19 @@ pub async fn put_project_coordinator_profile(
                 "project_coordinator_revision_conflict",
             ),
         ))),
+        Err(ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::InvalidProfile,
+        )) => Err(AppError::Internal(
+            "persisted Project Coordinator profile was invalid".to_string(),
+        )),
+        Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit) => {
+            state
+                .runtime
+                .signal_fatal_local_authority("project_coordinator_profile_commit_classification");
+            Err(AppError::Internal(
+                "Project Coordinator profile commit outcome was unclassifiable".to_string(),
+            ))
+        }
         Err(ProjectCoordinatorProfileWriteDbError::Database(error)) => {
             tracing::error!(%error, "failed to persist Project Coordinator profile");
             Err(AppError::Internal(
@@ -451,9 +467,9 @@ async fn project_coordinator_profile_view(
         .await
         .map_err(db_to_app)?
         .map(|profile| ProjectCoordinatorProfileView {
-            charter: profile.charter,
-            revision: profile.revision,
-            updated_at_unix_micros: profile.updated_at_unix_micros,
+            charter: profile.charter().to_string(),
+            revision: profile.revision(),
+            updated_at_unix_micros: profile.updated_at_unix_micros(),
         }))
 }
 

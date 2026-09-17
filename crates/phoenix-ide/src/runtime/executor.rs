@@ -6970,7 +6970,7 @@ where
         let mut system = vec![SystemContent::cached(&system_prompt)];
         if let Some(profile) = project_coordinator_profile {
             system.push(SystemContent::new(
-                crate::system_prompt::project_coordinator_charter_block(&profile.charter),
+                crate::system_prompt::project_coordinator_charter_block(profile.charter()),
             ));
         }
         if is_coordinator {
@@ -11948,11 +11948,12 @@ mod dispatch_context_budget_tests {
         let storage = Arc::new(InMemoryStorage::new());
         storage.set_project_coordinator_profile(
             conv_id,
-            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile {
-                charter: "current charter".to_string(),
-                revision: 2,
-                updated_at_unix_micros: 3,
-            },
+            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile::new(
+                "current charter".to_string(),
+                2,
+                3,
+            )
+            .unwrap(),
         );
         assert_eq!(
             crate::runtime::traits::MessageStore::get_project_coordinator_profile(
@@ -11962,7 +11963,7 @@ mod dispatch_context_budget_tests {
             .await
             .unwrap()
             .unwrap()
-            .charter,
+            .charter(),
             "current charter"
         );
         storage
