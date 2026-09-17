@@ -3133,18 +3133,21 @@ pub async fn cascade_tmux_on_delete(
 /// the Phoenix process environment, which would leak server secrets (LLM API
 /// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
 /// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn set_tmux_server_env(cmd: &mut tokio::process::Command, server_token: &str) {
+fn tmux_server_env(server_token: &str) -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
-    cmd.env_clear();
     let launch_uuid = uuid::Uuid::new_v4().to_string();
-    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(
-        &shell,
-        &launch_uuid,
+    let mut env = phoenix_terminal::spawn::build_env_for_tmux(&shell, &launch_uuid);
+    env.push((
+        COMPANION_VERSION_VAR.to_owned(),
+        COMPANION_ENV_VERSION.to_owned(),
     ));
-    // Stamp the companion version so a later reuse can tell a current server
-    // (no-op) from a pre-feature/older one that needs a refresh.
-    cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
-    cmd.env(SERVER_TOKEN_VAR, server_token);
+    env.push((SERVER_TOKEN_VAR.to_owned(), server_token.to_owned()));
+    env
+}
+
+fn set_tmux_server_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
+    cmd.env_clear();
+    cmd.envs(env.iter().cloned());
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -3682,6 +3685,7 @@ async fn watchdog_owned_spawn(
     config_path: &Path,
     cwd: &Path,
     server_token: &str,
+    server_env: &[(String, String)],
 ) -> Result<(), TmuxError> {
     let processes = super::test_server::spawn_owned_server(
         socket_path,
@@ -3689,6 +3693,7 @@ async fn watchdog_owned_spawn(
         config_path,
         cwd,
         server_token,
+        server_env,
     )
     .await
     .map_err(|error| TmuxError::SpawnFailed {
@@ -3752,10 +3757,19 @@ async fn spawn_session_owned(
     test_control_root: Option<&Path>,
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
+    let server_env = tmux_server_env(&server_token);
     let control_socket = test_control_socket(test_control_root)?;
     #[cfg(any(test, feature = "test-support"))]
     if let Some(control_socket) = control_socket.as_deref() {
-        watchdog_owned_spawn(socket_path, control_socket, config_path, cwd, &server_token).await?;
+        watchdog_owned_spawn(
+            socket_path,
+            control_socket,
+            config_path,
+            cwd,
+            &server_token,
+            &server_env,
+        )
+        .await?;
         return Ok(());
     }
     let launch_socket = control_socket.as_deref().unwrap_or(socket_path);
@@ -3777,7 +3791,7 @@ async fn spawn_session_owned(
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd, &server_token);
+    set_tmux_server_env(&mut cmd, &server_env);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -5392,6 +5406,52 @@ mod tests {
             output.status.success(),
             "replacement server must survive stale permit retirement"
         );
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn contained_spawn_uses_exact_production_pane_environment() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("env-contract");
+        let registry = owner.registry();
+        let handle = registry
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .unwrap();
+        let socket = handle.read().await.socket_path.clone();
+        let token = handle.read().await.server_token.clone();
+        let expected = tmux_server_env(&token)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let output = run_tmux_quiet_output(&socket, &["show-environment", "-g"])
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let observed = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<_, _>>();
+        for key in [
+            "TERM",
+            "COLORTERM",
+            "USER",
+            "LANG",
+            "PATH",
+            "SHELL",
+            "PHOENIX_API_URL",
+            "PHOENIX_SUGGEST_TOKEN",
+            COMPANION_VERSION_VAR,
+            SERVER_TOKEN_VAR,
+        ] {
+            if let Some(expected) = expected.get(key) {
+                assert_eq!(observed.get(key), Some(expected), "environment key {key}");
+            }
+        }
         owner.shutdown();
     }
 

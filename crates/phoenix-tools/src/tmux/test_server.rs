@@ -21,6 +21,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WATCHDOG_PROGRAM: &str = r##"
 import ctypes
 import fcntl
+import json
 import os
 from pathlib import Path
 import shutil
@@ -32,6 +33,7 @@ root = Path(sys.argv[1])
 parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 owned = []
+unconfirmed_obligations = []
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -110,7 +112,7 @@ def publish_response(path, value):
     pending.write_text(value)
     os.replace(pending, path)
 
-def observe_control(control, expected_token):
+def query_control_processes(control):
     observed = subprocess.run(
         ["tmux", "-S", str(control), "display-message", "-p", "#{pid}|#{pane_pid}"],
         stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
@@ -118,52 +120,68 @@ def observe_control(control, expected_token):
     if observed.returncode != 0:
         raise RuntimeError("tmux identity query failed")
     process_fields = observed.stdout.removesuffix("\n").split("|")
+    if len(process_fields) != 2:
+        raise RuntimeError("tmux identity output was malformed")
     server_pid, pane_pid = process_fields
     if (not server_pid.isascii() or not server_pid.isdecimal()
             or not pane_pid.isascii() or not pane_pid.isdecimal()):
         raise RuntimeError("tmux identity output was malformed")
-    token_result = subprocess.run(
-        ["tmux", "-S", str(control), "show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"],
-        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
-    )
-    token = token_result.stdout.strip().partition("=")[2]
-    if token_result.returncode != 0 or token != expected_token:
-        raise RuntimeError("tmux server token did not match registration")
-    identities = [
-        (int(server_pid), birth(int(server_pid)), token),
-        (int(pane_pid), birth(int(pane_pid)), None),
-    ]
-    if any(started is None for _, started, _ in identities):
-        raise RuntimeError("process birth identity was unavailable")
-    return identities
+    return int(server_pid), int(pane_pid)
+
+def observe_control(control, expected_token):
+    last_error = RuntimeError("tmux identity query did not run")
+    for attempt in range(50):
+        try:
+            server_pid, pane_pid = query_control_processes(control)
+            token_result = subprocess.run(
+                ["tmux", "-S", str(control), "show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"],
+                stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
+            )
+            token = token_result.stdout.strip().partition("=")[2]
+            if token_result.returncode != 0 or token != expected_token:
+                raise RuntimeError("tmux server token did not match registration")
+            identities = [
+                (server_pid, birth(server_pid), token),
+                (pane_pid, birth(pane_pid), None),
+            ]
+            if any(started is None for _, started, _ in identities):
+                raise RuntimeError("process birth identity was unavailable")
+            return identities
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            last_error = error
+            if attempt + 1 < 50:
+                time.sleep(0.1)
+    raise RuntimeError(f"tmux processes never became ready: {last_error}")
 
 def spawn_owned(request):
     rejected = request.with_name(request.name.replace(".spawn-", ".rejected-", 1))
     acknowledged = request.with_name(request.name.replace(".spawn-", ".registered-", 1))
     control = None
     try:
-        socket_name, control_name, config, cwd, token = request.read_text().split("\t")
+        socket_name, control_name, config, cwd, token, env_path = request.read_text().split("\t")
         socket = root / socket_name
         control = control_root / control_name
         if socket.parent != root or control.parent != control_root or control.exists():
             raise RuntimeError("spawn paths are not unused exact children of owned roots")
+        environment = dict(json.loads((control_root / env_path).read_text()))
+        obligation = (socket, control)
+        unconfirmed_obligations.append(obligation)
         spawned = subprocess.run(
             ["tmux", "-f", config, "-S", str(control), "new-session", "-d", "-c", cwd,
              "-s", "main", ";", "set-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN", token],
             stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True, timeout=0.5,
-            env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
-                 "SHELL": os.environ.get("SHELL", "/bin/bash"),
-                 "PHOENIX_TMUX_SERVER_TOKEN": token},
+            env=environment,
         )
         if spawned.returncode != 0:
             raise RuntimeError(f"tmux spawn failed: {spawned.stderr}")
         identities = observe_control(control, token)
         control_stat = control.stat()
         owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
+        unconfirmed_obligations.remove(obligation)
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
         ))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as error:
         if control is not None and control.exists():
             try:
                 subprocess.run(["tmux", "-S", str(control), "kill-server"], timeout=0.5)
@@ -255,10 +273,9 @@ for _, device, inode, control, processes in owned:
         continue
     try:
         control_stat = control.stat()
-        token = processes[0][2]
-        observed = observe_control(control, token)
+        observed_server, _ = query_control_processes(control)
         if (control_stat.st_dev != device or control_stat.st_ino != inode
-                or observed[0][:2] != processes[0][:2]):
+                or observed_server != processes[0][0]):
             continue
         killed = subprocess.run(
             ["tmux", "-S", str(control), "kill-server"],
@@ -278,7 +295,10 @@ for _ in range(50):
         for _, _, _, _, processes in owned
         for identity in processes
     ]
-    unconfirmed = any(state != "absent" for state in states)
+    unresolved_controls = [
+        control for _, control in unconfirmed_obligations if control.exists()
+    ]
+    unconfirmed_state = any(state != "absent" for state in states) or bool(unresolved_controls)
     registered_sockets = {
         socket: (device, inode, processes)
         for socket, device, inode, _, processes in owned
@@ -347,7 +367,7 @@ for _ in range(50):
                     creators = True
         except OSError:
             creators = True
-    quiet = quiet + 1 if not unconfirmed and not sockets and not creators else 0
+    quiet = quiet + 1 if not unconfirmed_state and not sockets and not creators else 0
     if quiet >= 5:
         if root.exists():
             shutil.rmtree(root)
@@ -606,7 +626,7 @@ fn parse_process_ids(output: &str) -> io::Result<(&str, &str)> {
 }
 
 struct RegistrationArtifacts {
-    paths: [PathBuf; 6],
+    paths: Vec<PathBuf>,
 }
 
 impl Drop for RegistrationArtifacts {
@@ -630,6 +650,7 @@ pub(crate) async fn spawn_owned_server(
     config_path: &Path,
     cwd: &Path,
     token: &str,
+    server_env: &[(String, String)],
 ) -> io::Result<TestServerProcesses> {
     let control_root = control_socket
         .parent()
@@ -655,22 +676,32 @@ pub(crate) async fn spawn_owned_server(
     let pending = control_root.join(format!(".pending-spawn-{nonce}"));
     let acknowledged = control_root.join(format!(".registered-{nonce}"));
     let rejected = control_root.join(format!(".rejected-{nonce}"));
+    let env_file = control_root.join(format!(".environment-{nonce}.json"));
+    fs::write(
+        &env_file,
+        serde_json::to_vec(server_env).map_err(io::Error::other)?,
+    )?;
     let _artifacts = RegistrationArtifacts {
-        paths: [
+        paths: vec![
             pending.clone(),
             request.clone(),
             acknowledged.clone(),
             rejected.clone(),
             control_root.join(format!(".pending-registered-{nonce}")),
             control_root.join(format!(".pending-rejected-{nonce}")),
+            env_file.clone(),
         ],
     };
     fs::write(
         &pending,
         format!(
-            "{socket_name}\t{control_name}\t{}\t{}\t{token}",
+            "{socket_name}\t{control_name}\t{}\t{}\t{token}\t{}",
             protocol_field(config_path, "config path")?,
-            protocol_field(cwd, "cwd")?
+            protocol_field(cwd, "cwd")?,
+            protocol_field(
+                Path::new(env_file.file_name().expect("env file has name")),
+                "env file",
+            )?
         ),
     )?;
     fs::rename(pending, request)?;
@@ -742,7 +773,7 @@ pub(crate) fn register_owned_server(
     let pending_acknowledged = control_root.join(format!(".pending-registered-{nonce}"));
     let pending_rejected = control_root.join(format!(".pending-rejected-{nonce}"));
     let _artifacts = RegistrationArtifacts {
-        paths: [
+        paths: vec![
             pending.clone(),
             request.clone(),
             acknowledged.clone(),
@@ -1007,6 +1038,32 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_uses_immutable_process_token_after_global_token_mutation() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let (socket, processes) = spawn_server_with_processes(&owner, "mutated-global-token");
+        let status = Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args(["set-environment", "-gu", "PHOENIX_TMUX_SERVER_TOKEN"])
+            .env_remove("TMUX")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[test]
+    fn contained_spawn_retries_until_process_identity_is_ready() {
+        assert!(WATCHDOG_PROGRAM.contains("for attempt in range(50):"));
+        assert!(WATCHDOG_PROGRAM.contains("time.sleep(0.1)"));
+        assert!(WATCHDOG_PROGRAM.contains("tmux processes never became ready"));
+    }
+
+    #[test]
     fn unlinked_socket_cleanup_kills_registered_server_and_pane() {
         if which::which("tmux").is_err() {
             return;
@@ -1042,6 +1099,50 @@ mod tests {
 
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_spawn_obligation_preserves_roots_and_prevents_false_success() {
+        let fake_bin = TempDir::new().unwrap();
+        let fake_tmux = fake_bin.path().join("tmux");
+        fs::write(
+            &fake_tmux,
+            "#!/bin/sh\ncase \"$*\" in *new-session*) : > \"$4\"; /bin/sleep 2;; *kill-server*) /bin/sleep 2;; esac\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let control = control_root.join("unconfirmed.sock");
+        let env_file = control_root.join("env.json");
+        fs::write(
+            &env_file,
+            serde_json::to_vec(&vec![(
+                "PATH".to_owned(),
+                fake_bin.path().to_string_lossy().into_owned(),
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            control_root.join(".spawn-unconfirmed"),
+            format!(
+                "unconfirmed.sock\tunconfirmed.sock\t{}\t{}\ttoken\tenv.json",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(|| control.exists(), "unconfirmed control endpoint");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(panic.is_err());
+        assert!(root.exists());
+        assert!(control_root.exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
     }
 
     #[test]
@@ -1107,13 +1208,13 @@ mod tests {
     fn cleanup_revalidates_control_inode_and_authenticated_identity_before_kill() {
         assert!(WATCHDOG_PROGRAM.contains("control_stat.st_dev"));
         assert!(WATCHDOG_PROGRAM.contains("control_stat.st_ino"));
-        assert!(WATCHDOG_PROGRAM.contains("observe_control(control, token)"));
+        assert!(WATCHDOG_PROGRAM.contains("observed_server, _ = query_control_processes(control)"));
     }
 
     #[test]
     fn pane_identity_is_bound_to_authenticated_server_without_requiring_late_token() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "(int(server_pid), birth(int(server_pid)), token),\n        (int(pane_pid), birth(int(pane_pid)), None),"
+            "(server_pid, birth(server_pid), token),\n                (pane_pid, birth(pane_pid), None),"
         ));
         assert!(WATCHDOG_PROGRAM.contains("if token is None:\n        return \"owned\""));
     }
@@ -1466,12 +1567,27 @@ finally:
             let control_root = owner.control_root_path().to_path_buf();
             let control = control_root.join("creator-death.sock");
             let token = uuid::Uuid::new_v4().to_string();
+            let env_file = control_root.join("creator-death-env.json");
+            fs::write(
+                &env_file,
+                serde_json::to_vec(&vec![
+                    ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+                    ("HOME".to_owned(), std::env::var("HOME").unwrap_or_default()),
+                    (
+                        "SHELL".to_owned(),
+                        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned()),
+                    ),
+                    ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.clone()),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
             let pending = control_root.join(".pending-spawn-creator-death");
             let request = control_root.join(".spawn-creator-death");
             fs::write(
                 &pending,
                 format!(
-                    "creator-death.sock\tcreator-death.sock\t{}\t{}\t{token}",
+                    "creator-death.sock\tcreator-death.sock\t{}\t{}\t{token}\tcreator-death-env.json",
                     owner.path().join("_phoenix.tmux.conf").display(),
                     owner.path().display()
                 ),
