@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use phoenix_core::process_identity::ProcessIdentity;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,12 +26,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 root = Path(sys.argv[1])
 parent = int(sys.argv[2])
-control_root = Path(tempfile.mkdtemp(prefix="ptw-", dir=root.parent))
+control_root = Path(sys.argv[3])
 owned = []
 
 class ProcBsdInfo(ctypes.Structure):
@@ -116,12 +115,14 @@ def register(request):
     acknowledged = request.with_name(request.name.replace(".register-", ".registered-", 1))
     try:
         fields = request.read_text().split("\t")
-        socket_name, expected_token, expected_server, expected_server_birth, expected_pane, expected_pane_birth = fields
+        socket_name, control_name, expected_token = fields
         socket = root / socket_name
-        if socket.parent != root or socket.is_symlink() or not socket.is_socket():
-            raise RuntimeError("registration socket is not an exact child of the owned root")
+        control = control_root / control_name
+        if (socket.parent != root or control.parent != control_root
+                or control.is_symlink() or not control.is_socket()):
+            raise RuntimeError("registration control is not an exact child of the owned control root")
         observed = subprocess.run(
-            ["tmux", "-S", str(socket), "display-message", "-p",
+            ["tmux", "-S", str(control), "display-message", "-p",
              "#{pid}|#{pane_pid}"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -137,7 +138,7 @@ def register(request):
                 or not pane_pid.isascii() or not pane_pid.isdecimal()):
             raise RuntimeError("tmux identity output was malformed")
         token_result = subprocess.run(
-            ["tmux", "-S", str(socket), "show-environment", "-g",
+            ["tmux", "-S", str(control), "show-environment", "-g",
              "PHOENIX_TMUX_SERVER_TOKEN"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -146,24 +147,19 @@ def register(request):
             timeout=0.5,
         )
         token = token_result.stdout.strip().partition("=")[2]
-        if (token_result.returncode != 0 or token != expected_token
-                or server_pid != expected_server or pane_pid != expected_pane):
-            raise RuntimeError("tmux process identity or server token did not match registration")
+        if token_result.returncode != 0 or token != expected_token:
+            raise RuntimeError("tmux server token did not match registration")
         identities = [
             (int(server_pid), birth(int(server_pid)), token),
             (int(pane_pid), birth(int(pane_pid)), None),
         ]
         if any(started is None for _, started, _ in identities):
             raise RuntimeError("process birth identity was unavailable")
-        if identities[0][1] != expected_server_birth or identities[1][1] != expected_pane_birth:
-            raise RuntimeError("process birth identity did not match registration")
-        socket_stat = socket.stat()
-        control = control_root / f"{len(owned)}.sock"
-        os.link(socket, control)
-        owned.append((socket, socket_stat.st_dev, socket_stat.st_ino, control, tuple(identities)))
+        control_stat = control.stat()
+        owned.append((socket, control_stat.st_dev, control_stat.st_ino, control, tuple(identities)))
         try:
             publish_response(acknowledged, "\t".join([
-                expected_server, expected_server_birth, expected_pane, expected_pane_birth
+                server_pid, identities[0][1], pane_pid, identities[1][1]
             ]))
         except OSError:
             return False
@@ -182,14 +178,14 @@ def register(request):
 (root / ".armed").touch()
 heartbeat = root / ".parent-heartbeat"
 while not (root / ".cleanup-request").exists():
-    if not root.exists():
-        break
-    for request in root.glob(".register-*"):
+    for request in control_root.glob(".register-*"):
         if not register(request):
             break
     else:
         request = None
     if request is not None:
+        break
+    if not root.exists():
         break
     if parent == 1:
         try:
@@ -208,9 +204,10 @@ except FileNotFoundError:
 termination_failed = False
 for _, _, _, control, processes in owned:
     states = [identity_state(identity) for identity in processes]
-    if all(state == "absent" for state in states):
+    server_state, pane_state = states
+    if server_state == "absent" and pane_state == "absent":
         continue
-    if not all(state == "owned" for state in states):
+    if server_state != "owned" or pane_state not in ("owned", "absent"):
         termination_failed = True
         continue
     try:
@@ -307,7 +304,8 @@ for _ in range(50):
     if quiet >= 5:
         if root.exists():
             shutil.rmtree(root)
-        shutil.rmtree(control_root)
+        if control_root.exists():
+            shutil.rmtree(control_root)
         sys.exit(0)
     time.sleep(0.1)
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
@@ -317,6 +315,7 @@ sys.exit(1)
 /// Owns real tmux servers created by tests, including after abrupt runner death.
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
+    control_root: Option<TempDir>,
     watchdog: Option<Child>,
     heartbeat_stop: Arc<AtomicBool>,
     heartbeat: Option<thread::JoinHandle<()>>,
@@ -347,6 +346,14 @@ impl TestTmuxServerOwner {
             .or_else(|_| tempfile::Builder::new().prefix("ptt-").tempdir_in("/tmp"))
             .expect("create short isolated tmux test root");
         let canonical_root = root.path().canonicalize().expect("canonicalize test root");
+        let control_root = tempfile::Builder::new()
+            .prefix("ptw-")
+            .tempdir_in(canonical_root.parent().expect("test root has parent"))
+            .expect("create tmux test control root");
+        let canonical_control_root = control_root
+            .path()
+            .canonicalize()
+            .expect("canonicalize test control root");
         let private_tmp = Path::new("/private/tmp")
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from("/private/tmp"));
@@ -366,6 +373,7 @@ impl TestTmuxServerOwner {
             .args(["-c", WATCHDOG_PROGRAM])
             .arg(&canonical_root)
             .arg(parent_pid)
+            .arg(&canonical_control_root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -402,6 +410,7 @@ impl TestTmuxServerOwner {
 
         Self {
             root: Some(root),
+            control_root: Some(control_root),
             watchdog: Some(watchdog),
             heartbeat_stop,
             heartbeat: Some(heartbeat),
@@ -421,7 +430,8 @@ impl TestTmuxServerOwner {
     /// Creates a registry whose servers are confined to this owner's root.
     #[must_use]
     pub fn registry(&self) -> TmuxRegistry {
-        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf()).with_test_spawn_containment()
+        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf())
+            .with_test_spawn_containment(self.control_root_path().to_path_buf())
     }
 
     #[cfg(test)]
@@ -430,7 +440,14 @@ impl TestTmuxServerOwner {
         sink: Option<super::registry::TmuxLifecycleSink>,
     ) -> TmuxRegistry {
         TmuxRegistry::with_socket_dir_binary_and_sink(self.socket_dir().to_path_buf(), true, sink)
-            .with_test_spawn_containment()
+            .with_test_spawn_containment(self.control_root_path().to_path_buf())
+    }
+
+    pub(crate) fn control_root_path(&self) -> &Path {
+        self.control_root
+            .as_ref()
+            .expect("owner control root is live")
+            .path()
     }
 
     /// Kills and verifies all exact servers under the owned root.
@@ -445,6 +462,10 @@ impl TestTmuxServerOwner {
 
     fn finish(&mut self, graceful: bool) -> io::Result<()> {
         let root = self.root.take().expect("owner root is live");
+        let control_root = self
+            .control_root
+            .take()
+            .expect("owner control root is live");
         let mut watchdog = self.watchdog.take().expect("watchdog is live");
         let root_path = root.path().to_path_buf();
         self.heartbeat_stop.store(true, Ordering::Release);
@@ -468,7 +489,14 @@ impl TestTmuxServerOwner {
             Ok(())
         });
         if result.is_err() {
-            let _ = root.keep();
+            let retained_root = root.keep();
+            let retained_control = control_root.keep();
+            return Err(io::Error::other(format!(
+                "{}; retained root: {}; retained control root: {}",
+                result.expect_err("result is error"),
+                retained_root.display(),
+                retained_control.display()
+            )));
         }
         result
     }
@@ -502,12 +530,14 @@ fn verify_no_live_servers(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TestServerProcesses {
     pub(crate) server: ProcessIdentity,
     pub(crate) pane: ProcessIdentity,
 }
 
+#[cfg(test)]
 fn parse_process_ids(output: &str) -> io::Result<(&str, &str)> {
     let output = output.strip_suffix('\n').ok_or_else(|| {
         io::Error::other("tmux test process identity output lacked its line terminator")
@@ -540,116 +570,29 @@ impl Drop for RegistrationArtifacts {
     }
 }
 
-fn bounded_output(mut command: Command, operation: &str) -> io::Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-        if Instant::now() >= deadline {
-            let process_group = i32::try_from(child.id())
-                .map_err(|error| io::Error::other(format!("invalid probe pid: {error}")))?;
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-            let output = child.wait_with_output()?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "{operation} exceeded 500ms: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 pub(crate) fn register_owned_server(
     socket: &Path,
+    control_socket: &Path,
     expected_token: &str,
 ) -> io::Result<TestServerProcesses> {
-    let mut identity_command = Command::new("tmux");
-    identity_command
-        .arg("-S")
-        .arg(socket)
-        .args(["display-message", "-p", "#{pid}|#{pane_pid}"])
-        .env_remove("TMUX")
-        .stdin(Stdio::null());
-    let observed = bounded_output(identity_command, "tmux process identity probe")?;
-    if !observed.status.success() {
-        return Err(io::Error::other(
-            "failed to query exact tmux test process identities",
-        ));
-    }
-    let observed = String::from_utf8(observed.stdout)
-        .map_err(|error| io::Error::other(format!("invalid tmux identity output: {error}")))?;
-    let (server_pid, pane_pid) = parse_process_ids(&observed)?;
-    let mut token_command = Command::new("tmux");
-    token_command
-        .arg("-S")
-        .arg(socket)
-        .args(["show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"])
-        .env_remove("TMUX")
-        .stdin(Stdio::null());
-    let token = bounded_output(token_command, "tmux server token probe")?;
-    if !token.status.success() {
-        return Err(io::Error::other(
-            "tmux test server-global token was unavailable",
-        ));
-    }
-    let token = String::from_utf8(token.stdout)
-        .map_err(|error| io::Error::other(format!("invalid tmux token output: {error}")))?;
-    if token.trim().strip_prefix("PHOENIX_TMUX_SERVER_TOKEN=") != Some(expected_token) {
-        return Err(io::Error::other(
-            "tmux test process token was not authenticated",
-        ));
-    }
-    let identity = |value: &str| {
-        let pid = value
-            .parse::<u32>()
-            .map_err(|error| io::Error::other(format!("invalid tmux process pid: {error}")))?;
-        phoenix_core::process_identity::current_process_identity(pid)
-            .ok_or_else(|| io::Error::other("tmux process birth identity was unavailable"))
-    };
-    let processes = TestServerProcesses {
-        server: identity(server_pid)?,
-        pane: identity(pane_pid)?,
-    };
-
-    publish_registration(socket, expected_token, processes)?;
-    Ok(processes)
-}
-
-fn publish_registration(
-    socket: &Path,
-    expected_token: &str,
-    processes: TestServerProcesses,
-) -> io::Result<()> {
-    let root = socket
-        .parent()
-        .ok_or_else(|| io::Error::other("tmux test socket has no owner root"))?;
     let socket_name = socket
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("tmux test socket name is not UTF-8"))?;
+    let control_root = control_socket
+        .parent()
+        .ok_or_else(|| io::Error::other("tmux test control socket has no root"))?;
+    let control_name = control_socket
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("tmux test control socket name is not UTF-8"))?;
     let nonce = uuid::Uuid::new_v4();
-    let request = root.join(format!(".register-{nonce}"));
-    let pending = root.join(format!(".pending-registration-{nonce}"));
-    let acknowledged = root.join(format!(".registered-{nonce}"));
-    let rejected = root.join(format!(".rejected-{nonce}"));
-    let pending_acknowledged = root.join(format!(".pending-registered-{nonce}"));
-    let pending_rejected = root.join(format!(".pending-rejected-{nonce}"));
+    let request = control_root.join(format!(".register-{nonce}"));
+    let pending = control_root.join(format!(".pending-registration-{nonce}"));
+    let acknowledged = control_root.join(format!(".registered-{nonce}"));
+    let rejected = control_root.join(format!(".rejected-{nonce}"));
+    let pending_acknowledged = control_root.join(format!(".pending-registered-{nonce}"));
+    let pending_rejected = control_root.join(format!(".pending-rejected-{nonce}"));
     let _artifacts = RegistrationArtifacts {
         paths: [
             pending.clone(),
@@ -662,13 +605,7 @@ fn publish_registration(
     };
     fs::write(
         &pending,
-        format!(
-            "{socket_name}\t{expected_token}\t{}\t{}\t{}\t{}",
-            processes.server.pid,
-            processes.server.start_time,
-            processes.pane.pid,
-            processes.pane.start_time
-        ),
+        format!("{socket_name}\t{control_name}\t{expected_token}"),
     )?;
     fs::rename(pending, &request)?;
 
@@ -700,12 +637,7 @@ fn publish_registration(
                     start_time: parse(fields[3])?,
                 },
             };
-            if acknowledged.server != processes.server || acknowledged.pane != processes.pane {
-                return Err(io::Error::other(
-                    "tmux watchdog acknowledged different process identities",
-                ));
-            }
-            return Ok(());
+            return Ok(acknowledged);
         }
         if let Ok(reason) = fs::read_to_string(&rejected) {
             return Err(io::Error::other(format!(
@@ -821,26 +753,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bounded_output_kills_a_stalled_probe() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "trap '' TERM; sleep 30"]);
-        let started = Instant::now();
-        let error = bounded_output(command, "stalled fixture probe").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
     fn spawn_server_with_processes(
         owner: &TestTmuxServerOwner,
         name: &str,
     ) -> (PathBuf, TestServerProcesses) {
         let socket = owner.path().join(format!("{name}.sock"));
+        let control = owner.control_root_path().join(format!("{name}.sock"));
         let server_token = uuid::Uuid::new_v4().to_string();
         let status = Command::new("tmux")
             .args([
                 "-S",
-                &socket.to_string_lossy(),
+                &control.to_string_lossy(),
                 "new-session",
                 "-d",
                 "-s",
@@ -857,8 +780,9 @@ mod tests {
             .status()
             .expect("launch disposable tmux test server");
         assert!(status.success());
-        assert_eq!(probe_sync(&socket), ProbeResult::Live);
-        let processes = register_owned_server(&socket, &server_token)
+        fs::hard_link(&control, &socket).expect("publish disposable tmux socket");
+        assert_eq!(probe_sync(&control), ProbeResult::Live);
+        let processes = register_owned_server(&socket, &control, &server_token)
             .expect("register exact disposable server");
         (socket, processes)
     }
@@ -899,43 +823,18 @@ mod tests {
         let sentinel = owner.path().join("unrelated-registration-note");
         fs::write(&sentinel, "keep").unwrap();
         let (_, processes) = spawn_server_with_processes(&owner, "handshake");
-        assert_no_registration_artifacts(owner.path());
+        assert_no_registration_artifacts(owner.control_root_path());
 
         let socket = owner.path().join("handshake.sock");
-        let token = read_server_global_token(&socket);
-        let rejected_processes = TestServerProcesses {
-            server: ProcessIdentity {
-                start_time: processes.server.start_time + 1,
-                ..processes.server
-            },
-            pane: processes.pane,
-        };
-        let error = publish_registration(&socket, &token, rejected_processes)
-            .expect_err("mismatched authenticated birth identity must be rejected");
+        let control = owner.control_root_path().join("handshake.sock");
+        let error = register_owned_server(&socket, &control, "deliberately-wrong-token")
+            .expect_err("wrong authenticated token must be rejected");
         assert!(error.to_string().contains("rejected process ownership"));
-        assert_no_registration_artifacts(owner.path());
+        assert_no_registration_artifacts(owner.control_root_path());
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
 
         owner.shutdown();
         assert_exact_processes_gone(processes);
-    }
-
-    fn read_server_global_token(socket: &Path) -> String {
-        let output = Command::new("tmux")
-            .arg("-S")
-            .arg(socket)
-            .args(["show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"])
-            .env_remove("TMUX")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .strip_prefix("PHOENIX_TMUX_SERVER_TOKEN=")
-            .unwrap()
-            .strip_suffix('\n')
-            .unwrap()
-            .to_owned()
     }
 
     fn assert_no_registration_artifacts(root: &Path) {
@@ -1023,6 +922,35 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_returns_inspectable_control_root_for_reclamation() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let (socket, processes) = spawn_server_with_processes(&owner, "retained-control");
+        fs::remove_file(&socket).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()))
+            .expect_err("replacement must preserve failure evidence");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("cleanup panic has text");
+        assert!(message.contains(&format!(
+            "retained control root: {}",
+            control_root.display()
+        )));
+        assert!(control_root.exists());
+        assert_exact_processes_gone(processes);
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
     fn cleanup_does_not_kill_another_test_owners_server() {
         if which::which("tmux").is_err() {
             return;
@@ -1048,7 +976,7 @@ mod tests {
     #[test]
     fn cleanup_uses_incarnation_bound_socket_without_numeric_pid_signals() {
         assert!(!WATCHDOG_PROGRAM.contains("os.kill(identity[0]"));
-        assert!(WATCHDOG_PROGRAM.contains("os.link(socket, control)"));
+        assert!(!WATCHDOG_PROGRAM.contains("os.link(socket, control)"));
         assert!(WATCHDOG_PROGRAM.contains("[\"tmux\", \"-S\", str(control), \"kill-server\"]"));
     }
 
@@ -1061,9 +989,108 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_server_with_absent_original_pane_is_retired() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let (socket, processes) = spawn_server_with_processes(&owner, "pane-absent");
+        assert!(Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args([
+                "new-window",
+                "-d",
+                "-t",
+                "main",
+                "-n",
+                "survivor",
+                "sleep 300"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let panes = Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args(["list-panes", "-a", "-F", "#{pane_pid}|#{pane_id}"])
+            .output()
+            .unwrap();
+        assert!(panes.status.success());
+        let panes = String::from_utf8(panes.stdout).unwrap();
+        let pane_id = panes
+            .lines()
+            .find_map(|line| {
+                let (pid, pane_id) = line.split_once('|')?;
+                (pid.parse::<u32>().ok()? == processes.pane.pid).then_some(pane_id)
+            })
+            .expect("registered pane remains addressable");
+        assert!(Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args(["kill-pane", "-t", pane_id])
+            .status()
+            .unwrap()
+            .success());
+        wait_until(
+            || !phoenix_core::process_identity::process_identity_matches(processes.pane),
+            "original pane exit",
+        );
+        owner.shutdown();
+        assert_exact_processes_gone(processes);
+    }
+
+    #[test]
+    fn control_endpoint_authenticates_identity_after_visible_socket_replacement() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let socket = owner.path().join("pre-registration-replacement.sock");
+        let control = owner
+            .control_root_path()
+            .join("pre-registration-replacement.sock");
+        let token = uuid::Uuid::new_v4().to_string();
+        assert!(Command::new("tmux")
+            .args([
+                "-S",
+                &control.to_string_lossy(),
+                "new-session",
+                "-d",
+                "-s",
+                "main",
+                "sleep 300",
+                ";",
+                "set-environment",
+                "-g",
+                "PHOENIX_TMUX_SERVER_TOKEN",
+                &token,
+            ])
+            .env_remove("TMUX")
+            .env("PHOENIX_TMUX_SERVER_TOKEN", &token)
+            .status()
+            .unwrap()
+            .success());
+        let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let processes = register_owned_server(&socket, &control, &token).unwrap();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        assert!(
+            panic.is_err(),
+            "visible replacement must remain fail-closed"
+        );
+        assert_exact_processes_gone(processes);
+        assert!(socket.exists(), "unrelated visible replacement was removed");
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "if all(state == \"absent\" for state in states):\n        continue\n    if not all(state == \"owned\" for state in states):\n        termination_failed = True"
+            "if server_state == \"absent\" and pane_state == \"absent\":\n        continue\n    if server_state != \"owned\" or pane_state not in (\"owned\", \"absent\"):\n        termination_failed = True"
         ));
     }
 

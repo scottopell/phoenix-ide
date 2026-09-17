@@ -772,7 +772,7 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
-    contain_test_spawns: bool,
+    test_spawn_control_root: Option<PathBuf>,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
     #[cfg(test)]
@@ -816,7 +816,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            contain_test_spawns: false,
+            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -876,7 +876,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            contain_test_spawns: false,
+            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -907,7 +907,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
-            contain_test_spawns: false,
+            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -922,8 +922,8 @@ impl TmuxRegistry {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_test_spawn_containment(mut self) -> Self {
-        self.contain_test_spawns = true;
+    pub(crate) fn with_test_spawn_containment(mut self, control_root: PathBuf) -> Self {
+        self.test_spawn_control_root = Some(control_root);
         self
     }
 
@@ -1019,7 +1019,7 @@ impl TmuxRegistry {
             socket_path,
             &self.config_path(),
             cwd,
-            self.contain_test_spawns,
+            self.test_spawn_control_root.as_deref(),
         )
         .await
     }
@@ -3523,11 +3523,11 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    spawn_session_owned(socket_path, config_path, cwd, false).await
+    spawn_session_owned(socket_path, config_path, cwd, None).await
 }
 
 fn tmux_new_session_args(
-    socket_path: &Path,
+    launch_socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
     contain_test_spawn: bool,
@@ -3537,7 +3537,7 @@ fn tmux_new_session_args(
         "-f".to_string(),
         config_path.to_string_lossy().into_owned(),
         "-S".to_string(),
-        socket_path.to_string_lossy().into_owned(),
+        launch_socket_path.to_string_lossy().into_owned(),
         "new-session".to_string(),
         "-d".to_string(),
         "-c".to_string(),
@@ -3557,22 +3557,73 @@ fn tmux_new_session_args(
     args
 }
 
+#[cfg(any(test, feature = "test-support"))]
+async fn retire_failed_test_spawn(control_socket: &Path) {
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::process::Command::new("tmux")
+            .arg("-S")
+            .arg(control_socket)
+            .arg("kill-server")
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+async fn publish_and_register_test_spawn(
+    socket_path: &Path,
+    control_socket: &Path,
+    server_token: &str,
+) -> Result<(), TmuxError> {
+    if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
+        retire_failed_test_spawn(control_socket).await;
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to publish contained tmux socket: {error}"),
+        });
+    }
+    if let Err(error) =
+        super::test_server::register_owned_server(socket_path, control_socket, server_token)
+    {
+        retire_failed_test_spawn(control_socket).await;
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to register exact test-owned processes: {error}"),
+        });
+    }
+    Ok(())
+}
+
 async fn spawn_session_owned(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
-    contain_test_spawn: bool,
+    test_control_root: Option<&Path>,
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
+    let control_socket = test_control_root
+        .map(|root| root.join(format!("{}.sock", uuid::Uuid::new_v4().as_simple())));
+    let launch_socket = control_socket.as_deref().unwrap_or(socket_path);
+    if let Some(control_root) = test_control_root {
+        std::fs::create_dir_all(control_root).map_err(|error| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to prepare test control root: {error}"),
+        })?;
+    }
     let tmux_args = tmux_new_session_args(
-        socket_path,
+        launch_socket,
         config_path,
         cwd,
-        contain_test_spawn,
+        test_control_root.is_some(),
         &server_token,
     );
     let (mut cmd, creator_handoff) =
-        tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
+        tmux_spawn_command(socket_path, &tmux_args, test_control_root.is_some());
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
     // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
     // than inheriting Phoenix's env, which would leak server secrets into every
@@ -3623,7 +3674,7 @@ async fn spawn_session_owned(
                 "-f",
                 &config_path.to_string_lossy(),
                 "-S",
-                &socket_path.to_string_lossy(),
+                &launch_socket.to_string_lossy(),
                 "list-panes",
                 "-t",
                 TMUX_DEFAULT_SESSION,
@@ -3639,15 +3690,12 @@ async fn spawn_session_owned(
                 reason: format!("failed to probe pane readiness: {e}"),
             })?;
         if panes.status.success() && !panes.stdout.is_empty() {
-            if contain_test_spawn {
-                #[cfg(any(test, feature = "test-support"))]
-                super::test_server::register_owned_server(socket_path, &server_token).map_err(
-                    |error| TmuxError::SpawnFailed {
-                        socket_path: socket_path.to_path_buf(),
-                        reason: format!("failed to register exact test-owned processes: {error}"),
-                    },
-                )?;
-                #[cfg(not(any(test, feature = "test-support")))]
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(control_socket) = control_socket.as_deref() {
+                publish_and_register_test_spawn(socket_path, control_socket, &server_token).await?;
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            if control_socket.is_some() {
                 unreachable!("test spawn containment is unavailable in production builds");
             }
             return Ok(());
@@ -5202,14 +5250,58 @@ mod tests {
         owner.shutdown();
     }
 
+    #[tokio::test]
+    async fn post_spawn_visible_publication_failure_retires_through_control_socket() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let socket = owner.path().join("publication-conflict.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error = spawn_session_owned(
+            &socket,
+            &owner.path().join(SERVER_CONFIG_FILENAME),
+            owner.path(),
+            Some(owner.control_root_path()),
+        )
+        .await
+        .expect_err("visible publication conflict must fail spawn");
+        assert!(error
+            .to_string()
+            .contains("failed to publish contained tmux socket"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let live_control = std::fs::read_dir(owner.control_root_path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "sock")
+                })
+                .any(|path| crate::tmux::probe::probe_sync(&path) == ProbeResult::Live);
+            if !live_control {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        owner.shutdown();
+    }
+
     #[test]
     fn production_style_registry_ignores_owner_marker_for_spawn_dispatch() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".armed"), []).unwrap();
         let registry = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
-        assert!(!registry.contain_test_spawns);
-        let owned = registry.with_test_spawn_containment();
-        assert!(owned.contain_test_spawns);
+        assert!(registry.test_spawn_control_root.is_none());
+        let owned = registry.with_test_spawn_containment(PathBuf::from("/tmp/test-control"));
+        assert_eq!(
+            owned.test_spawn_control_root.as_deref(),
+            Some(Path::new("/tmp/test-control"))
+        );
     }
 
     #[tokio::test]
@@ -5599,7 +5691,7 @@ mod tests {
             &legacy_socket,
             &owner.path().join(SERVER_CONFIG_FILENAME),
             &legacy_worktree,
-            true,
+            Some(owner.control_root_path()),
         )
         .await
         .expect("bootstrap legacy persistent server");
