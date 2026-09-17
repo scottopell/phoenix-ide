@@ -138,8 +138,9 @@ impl AskUserQuestionInput {
     /// # Errors
     ///
     /// Returns a human-readable tool error when the question count is outside
-    /// 1-4, a question has outside 2-4 options, question text is duplicated, or
-    /// an option label is duplicated within a question.
+    /// 1-4, a question has outside 2-4 options, question text is duplicated, an
+    /// option label is duplicated within a question, or an option uses the
+    /// UI-reserved `Other` label.
     pub fn validate(&self) -> Result<(), String> {
         if self.questions.is_empty() || self.questions.len() > 4 {
             return Err(format!(
@@ -166,6 +167,11 @@ impl AskUserQuestionInput {
 
             let mut option_labels = std::collections::HashSet::new();
             for option in &question.options {
+                if option.label == "Other" {
+                    return Err(format!(
+                        "ask_user_question question {question_number} uses reserved option label `Other`"
+                    ));
+                }
                 if !option_labels.insert(option.label.as_str()) {
                     return Err(format!(
                         "ask_user_question question {question_number} duplicates option label `{}`",

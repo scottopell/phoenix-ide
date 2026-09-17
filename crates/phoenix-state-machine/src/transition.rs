@@ -5490,6 +5490,84 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_ask_user_question_rejects_reserved_other_label_before_waiting() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "auq-coordinator-other",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "Other" }, { "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-other",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "Other".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-other".into(),
+            },
+        )
+        .expect("reserved Other label returns a tool error");
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("reserved Other label persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains("reserved option label `Other`"),
+                "error should explain reserved Other label validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for reserved Other label, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn coordinator_ask_user_question_answer_resumes_existing_llm_flow() {
         use crate::state::UserQuestion;
 
