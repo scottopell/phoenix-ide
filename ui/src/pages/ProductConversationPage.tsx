@@ -845,12 +845,16 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshotRetry]);
 
   useEffect(() => {
-    if (!productConversationId) return;
-    return subscribeProductConversationSnapshotChanged(
+    const identities = new Set([
       productConversationId,
-      () => setSnapshotRetry((retry) => retry + 1),
-    );
-  }, [productConversationId]);
+      snapshot?.product_conversation_id,
+    ].filter((identity): identity is string => Boolean(identity)));
+    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    const unsubscribes = [...identities].map((identity) => (
+      subscribeProductConversationSnapshotChanged(identity, refresh)
+    ));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot?.product_conversation_id]);
 
   useEffect(() => {
     const notificationIds = new Set([

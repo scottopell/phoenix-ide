@@ -494,6 +494,7 @@ export function ConversationListPage() {
         normalizeInput={(value) => value}
         isValidName={(value) => value.trim().length > 0}
         helpText="Enter a title"
+        maxLength={200}
         onCancel={() => {
           setProductRenameTarget(null);
           setProductRenameError(undefined);
