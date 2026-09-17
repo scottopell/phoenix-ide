@@ -210,9 +210,9 @@ def owner_alive():
     except OSError:
         return False
 
-def reserve_spawn(socket, control):
+def reserve_spawn(socket, control, token):
     if any(existing_socket == socket or existing_control == control
-           for existing_socket, existing_control in unconfirmed_obligations):
+           for existing_socket, existing_control, _ in unconfirmed_obligations):
         raise RuntimeError("tmux spawn path already has an unresolved obligation")
     conflicts = [
         record for record in owned
@@ -221,7 +221,7 @@ def reserve_spawn(socket, control):
     if any(identity_state(identity) != "absent"
            for _, _, _, _, processes in conflicts for identity in processes):
         raise RuntimeError("live tmux ownership record already exists")
-    obligation = (socket, control)
+    obligation = (socket, control, token)
     unconfirmed_obligations.append(obligation)
     return obligation
 
@@ -377,7 +377,7 @@ def spawn_owned(request):
         if socket.parent != root or control.parent != control_root or control.exists():
             raise RuntimeError("spawn paths are not unused exact children of owned roots")
         environment = load_environment(control_root / env_path)
-        obligation = reserve_spawn(socket, control)
+        obligation = reserve_spawn(socket, control, token)
         spawned = subprocess.run(
             ["tmux", "-f", config, "-S", str(control), "new-session", "-d", "-c", cwd,
              "-s", "main", ";", "set-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN", token],
@@ -411,6 +411,19 @@ def spawn_owned(request):
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
         ))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        if control is not None and control.exists():
+            try:
+                identities = observe_control(control, token, time.monotonic() + identity_timeout)
+                control_stat = control.stat()
+                record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
+                unconfirmed_obligations.remove(obligation)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+                pass
+        try:
+            publish_response(rejected, str(error))
+        except OSError:
+            return False
     except EnvironmentError as error:
         cleanup_failed = True
         try:
@@ -473,9 +486,9 @@ def remove_retired_control(record):
         return False
 
 def retain_obligation(socket, control):
-    obligation = (socket, control)
-    if obligation not in unconfirmed_obligations:
-        unconfirmed_obligations.append(obligation)
+    if not any(existing_socket == socket and existing_control == control
+               for existing_socket, existing_control, _ in unconfirmed_obligations):
+        unconfirmed_obligations.append((socket, control, None))
 
 def retirement_deadline():
     global cleanup_deadline
@@ -533,9 +546,10 @@ def retire_registered(socket, control, identities):
         if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
     ]
     owned.remove(record)
-    obligation = (socket, control)
-    while obligation in unconfirmed_obligations:
-        unconfirmed_obligations.remove(obligation)
+    unconfirmed_obligations[:] = [
+        obligation for obligation in unconfirmed_obligations
+        if obligation[0] != socket or obligation[1] != control
+    ]
     return True
 
 def retire(request):
@@ -587,6 +601,8 @@ def register(request):
                 or control.is_symlink() or not control.is_socket()):
             raise RuntimeError("registration control is not an exact child of the owned control root")
         identities = observe_control(control, expected_token, time.monotonic() + identity_timeout)
+        if not original_control_root_exists():
+            raise RuntimeError("registration control root incarnation changed")
         control_stat = control.stat()
         record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
         try:
@@ -645,8 +661,12 @@ while owner_alive():
                         stderr=subprocess.DEVNULL, check=False, timeout=1.0,
                     )
                 published.unlink(missing_ok=True)
-                adopted_pending_publication.remove(item)
+                if publication_cancelled.exists():
+                    if not retire_registered(socket, control, identities):
+                        retain_obligation(socket, control)
+                    continue
                 publish_response(publication_acknowledged, "published")
+                adopted_pending_publication.remove(item)
             except (OSError, subprocess.TimeoutExpired):
                 retire_registered(socket, control, identities)
                 retain_obligation(socket, control)
@@ -712,7 +732,7 @@ while owner_alive():
     if request is not None:
         break
     for request in control_root.glob(".register-*"):
-        if not register(request):
+        if not owner_alive() or not register(request):
             break
     else:
         request = None
@@ -737,6 +757,17 @@ if original_root_exists():
 
 if cleanup_deadline is None:
     cleanup_deadline = time.monotonic() + cleanup_timeout
+for socket, control, token in list(unconfirmed_obligations):
+    if token is None or time.monotonic() >= cleanup_deadline:
+        continue
+    try:
+        identities = observe_control(control, token, cleanup_deadline)
+        control_stat = control.stat()
+        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
+        unconfirmed_obligations.remove((socket, control, token))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+        pass
+
 for index, record in enumerate(owned):
     if time.monotonic() >= cleanup_deadline:
         break
@@ -2103,12 +2134,12 @@ mod tests {
     #[test]
     fn spawn_path_is_reserved_before_tmux_starts() {
         let reservation = WATCHDOG_PROGRAM
-            .find("obligation = reserve_spawn(socket, control)")
+            .find("obligation = reserve_spawn(socket, control, token)")
             .unwrap();
         let spawn = WATCHDOG_PROGRAM.find("spawned = subprocess.run(").unwrap();
         assert!(reservation < spawn);
         assert!(WATCHDOG_PROGRAM
-            .contains("for existing_socket, existing_control in unconfirmed_obligations"));
+            .contains("for existing_socket, existing_control, _ in unconfirmed_obligations"));
     }
 
     #[tokio::test]
@@ -2355,6 +2386,46 @@ mod tests {
         let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(fake_tmux, permissions).unwrap();
+    }
+
+    #[test]
+    fn daemonized_spawn_timeout_is_recovered_by_reserved_token() {
+        let Ok(real_tmux) = which::which("tmux") else {
+            return;
+        };
+        let fake_bin = TempDir::new().unwrap();
+        write_tmux_wrapper(
+            fake_bin.path(),
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" new-session \"*) '{}' \"$@\"; sleep 2; exit 0;; esac\nexec '{}' \"$@\"\n",
+                real_tmux.display(),
+                real_tmux.display()
+            ),
+        );
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        write_adoption_environment(&control_root, "timeout-env.json", "timeout-token");
+        write_raw_spawn_request(&root, &control_root, "timeout", "timeout-env.json");
+        wait_until(
+            || control_root.join("timeout.sock").exists(),
+            "daemonized spawn control endpoint",
+        );
+
+        owner.shutdown();
+
+        assert!(!root.exists());
+        assert!(!control_root.exists());
+    }
+
+    #[test]
+    fn replacement_control_root_registration_is_not_dequeued() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "for request in control_root.glob(\".register-*\"):\n        if not owner_alive() or not register(request):"
+        ));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "if not original_control_root_exists():\n            raise RuntimeError(\"registration control root incarnation changed\")"
+        ));
     }
 
     #[test]
@@ -3580,6 +3651,69 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_publication_hook_retires_visible_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let entered = hook_dir.path().join("entered");
+        let hook = hook_dir.path().join("block-publication");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\n: > '{}'\n/bin/sleep 0.4\n", entered.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, None),
+            None,
+            None,
+            None,
+            (Some(Duration::from_secs(2)), Some(&hook)),
+            (None, None, None, None),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("cancel-publication.sock");
+        let control = control_root.join("cancel-publication.sock");
+        let token = "cancel-publication-token";
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+        ];
+        let adopted = spawn_owned_server(
+            &socket,
+            &control,
+            &root.join("config"),
+            &root,
+            token,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let processes = adopted.processes.clone();
+        fs::hard_link(&control, &socket).unwrap();
+        let task = tokio::spawn(adopted.commit_publication());
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        wait_until(
+            || !phoenix_core::process_identity::process_identity_matches(processes.server),
+            "publication cancellation retirement",
+        );
+
+        owner.shutdown();
+
+        assert_exact_processes_gone(&processes);
+        assert!(!socket.exists());
     }
 
     #[test]
