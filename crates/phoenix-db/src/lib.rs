@@ -17820,6 +17820,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn continuation_commit_admits_automatic_work_only_when_preference_was_enabled() {
         let db = Database::open_in_memory().await.unwrap();
         for (conversation_id, operation_id, enabled) in [

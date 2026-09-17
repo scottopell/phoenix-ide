@@ -10371,6 +10371,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_100_defaults_historical_aggregates_off_and_manual_intents_to_user_authority()
     {
         let pool = test_pool().await;
