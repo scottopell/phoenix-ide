@@ -49,7 +49,7 @@ use crate::state_machine::ConvState;
 /// — short enough that the value comfortably fits as a sidebar label and the
 /// chain page header without truncation, long enough that a reasonable label
 /// like "auth refactor — staged migration" is not rejected.
-const CHAIN_NAME_MAX_CHARS: usize = 200;
+pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Response/request shapes

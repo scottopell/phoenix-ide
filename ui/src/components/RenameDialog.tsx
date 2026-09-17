@@ -11,6 +11,7 @@ interface RenameDialogProps {
   normalizeInput?: (value: string) => string;
   isValidName?: (value: string) => boolean;
   helpText?: string;
+  maxLength?: number;
 }
 
 export function RenameDialog({
@@ -23,6 +24,7 @@ export function RenameDialog({
   normalizeInput = (value) => value.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
   isValidName = (value) => /^[a-z0-9-]+$/.test(value),
   helpText = 'Use lowercase letters, numbers, and hyphens only',
+  maxLength,
 }: RenameDialogProps) {
   const [name, setName] = useState(currentName);
   const [generating, setGenerating] = useState(false);
@@ -101,6 +103,7 @@ export function RenameDialog({
             placeholder="conversation-name"
             className="rename-input"
             disabled={generating}
+            maxLength={maxLength}
           />
           {error && <p className="error-text">{error}</p>}
           {!isValid && name.trim() && (

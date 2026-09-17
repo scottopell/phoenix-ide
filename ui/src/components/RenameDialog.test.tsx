@@ -99,6 +99,21 @@ describe('RenameDialog', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
   });
 
+  it('applies an optional input length bound', () => {
+    render(
+      <RenameDialog
+        visible
+        currentName="current-slug"
+        onRename={vi.fn()}
+        onCancel={vi.fn()}
+        error={undefined}
+        maxLength={200}
+      />,
+    );
+
+    expect(screen.getByRole('textbox')).toHaveAttribute('maxlength', '200');
+  });
+
   it('renders the AI generation button and shows in-flight state', async () => {
     let resolveGenerate!: () => void;
     const onGenerate = vi.fn(
