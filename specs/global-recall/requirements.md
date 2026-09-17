@@ -143,8 +143,8 @@ WHEN the user authorizes continuation of an existing ordinary conversation
 THE Coordinator MAY inspect its authoritative transcript state and invoke the supported idempotent `POST /api/conversations/{id}/continue` through explicitly WorkScope-targeted Bash
 AND SHALL invoke it only when `conversation.state.type == "context_exhausted"`
 AND SHALL reconcile an existing continuation before retrying an uncertain request
-AND SHALL report the accepted successor identity; that endpoint may create only the successor transcript within the existing ProductConversation
-AND SHALL verify the effective prompt in a fresh continuation or session after deployment
+AND SHALL preserve and report the returned successor identity, including when status is `dispatch_failed`, and reconcile `already_exists` or the returned successor before retrying
+AND SHALL recognize that the endpoint may create only the successor transcript within the existing ProductConversation
 
 THE Coordinator SHALL NOT create unrelated or new-work conversations, perform arbitrary lifecycle mutation, or monitor in the background
 
