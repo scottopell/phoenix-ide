@@ -5490,7 +5490,15 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let owner = TestTmuxServerOwner::new();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::ZERO),
+        );
         let socket = owner.path().join("publication-conflict.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let error = tokio::time::timeout(

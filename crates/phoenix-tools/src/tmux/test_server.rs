@@ -37,6 +37,7 @@ owned = []
 unconfirmed_obligations = []
 identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
+publication_timeout = float(os.environ.get("PHOENIX_TMUX_PUBLICATION_TIMEOUT", "1.0"))
 cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
 adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
@@ -346,6 +347,43 @@ def remove_retired_control(record):
     except OSError:
         return False
 
+def retain_obligation(socket, control):
+    obligation = (socket, control)
+    if obligation not in unconfirmed_obligations:
+        unconfirmed_obligations.append(obligation)
+
+def retire_registered(socket, control, identities):
+    expected = tuple(identities)
+    record = exact_record(socket, control, expected)
+    if record is None:
+        return False
+    if not retire_record(record, time.monotonic() + identity_timeout):
+        return False
+    try:
+        socket_stat = socket.stat()
+        visible_owned = socket_stat.st_dev == record[1] and socket_stat.st_ino == record[2]
+    except FileNotFoundError:
+        visible_owned = False
+    except OSError:
+        return False
+    if visible_owned and not remove_exact_visible(record):
+        return False
+    if not remove_retired_control(record):
+        return False
+    provisional[:] = [
+        item for item in provisional
+        if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
+    ]
+    adopted_pending_publication[:] = [
+        item for item in adopted_pending_publication
+        if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
+    ]
+    owned.remove(record)
+    obligation = (socket, control)
+    while obligation in unconfirmed_obligations:
+        unconfirmed_obligations.remove(obligation)
+    return True
+
 def retire(request):
     rejected = request.with_name(
         request.name.replace(".retire-request-", ".retire-rejected-", 1)
@@ -361,14 +399,8 @@ def retire(request):
         control = control_root / fields[1]
         expected_token = tmux_format_literal(fields[4])
         identities = ((int(fields[2]), fields[3], expected_token), (int(fields[5]), fields[6], None))
-        record = exact_record(socket, control, identities)
-        if record is None:
-            raise RuntimeError("retirement identity did not match an owned record")
-        if not retire_record(record, time.monotonic() + identity_timeout):
-            raise RuntimeError("exact owned record retirement could not be proven")
-        if not remove_retired_control(record):
-            raise RuntimeError("retired control endpoint could not be removed exactly")
-        owned.remove(record)
+        if not retire_registered(socket, control, identities):
+            raise RuntimeError("exact owned spawn retirement could not be proven")
         publish_response(acknowledged, "retired")
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
         try:
@@ -439,16 +471,8 @@ while not (root / ".cleanup-request").exists():
             except OSError:
                 publish_valid = False
         if publication_cancelled.exists():
-            adopted_pending_publication.remove(item)
-            retired = record is not None and retire_record(
-                record, time.monotonic() + identity_timeout
-            )
-            cleaned = (retired and remove_exact_visible(record)
-                       and remove_retired_control(record))
-            if cleaned:
-                owned.remove(record)
-            else:
-                unconfirmed_obligations.append((socket, control))
+            if not retire_registered(socket, control, identities):
+                retain_obligation(socket, control)
         elif publish_valid:
             try:
                 publish_response(publication_acknowledged, "published")
@@ -458,20 +482,13 @@ while not (root / ".cleanup-request").exists():
                 adopted_pending_publication.remove(item)
                 unconfirmed_obligations.append((socket, control))
         elif published.exists() or now >= deadline:
-            adopted_pending_publication.remove(item)
-            retired = record is not None and retire_record(
-                record, time.monotonic() + identity_timeout
-            )
-            cleaned = (retired and remove_exact_visible(record)
-                       and remove_retired_control(record))
-            if cleaned:
-                owned.remove(record)
+            if retire_registered(socket, control, identities):
                 try:
                     publish_response(adoption_rejected, "publication failed; exact server retired")
                 except OSError:
                     pass
             else:
-                unconfirmed_obligations.append((socket, control))
+                retain_obligation(socket, control)
     for item in list(provisional):
         (socket, control, identities, adopt, adopted, adoption_rejected,
          published, publication_cancelled, publication_acknowledged,
@@ -483,41 +500,27 @@ while not (root / ".cleanup-request").exists():
                 stderr=subprocess.DEVNULL, check=False, timeout=1.0,
             )
         if now < deadline and adopt.exists():
-            provisional.remove(item)
             try:
                 adopt.unlink()
                 publish_response(adopted, "adopted")
+                provisional.remove(item)
                 adopted_pending_publication.append((
                     socket, control, identities, published, publication_cancelled,
                     publication_acknowledged, adoption_rejected,
-                    time.monotonic() + adoption_timeout
+                    time.monotonic() + publication_timeout
                 ))
             except OSError:
-                record = exact_record(socket, control, identities)
-                retired = record is not None and retire_record(
-                    record, time.monotonic() + identity_timeout
-                )
-                cleaned = (retired and remove_exact_visible(record)
-                           and remove_retired_control(record))
-                if cleaned:
-                    owned.remove(record)
-                else:
-                    unconfirmed_obligations.append((socket, control))
+                if not retire_registered(socket, control, identities):
+                    retain_obligation(socket, control)
         elif now >= deadline:
-            provisional.remove(item)
-            record = exact_record(socket, control, identities)
-            retired = record is not None and retire_record(
-                record, time.monotonic() + identity_timeout
-            )
-            if retired and remove_retired_control(record):
-                owned.remove(record)
+            if retire_registered(socket, control, identities):
                 publish_response(adoption_rejected, "lease expired; exact server retired")
             else:
                 publish_response(
                     adoption_rejected,
                     "lease expired; exact provisional retirement could not be proven",
                 )
-                unconfirmed_obligations.append((socket, control))
+                retain_obligation(socket, control)
     for request in control_root.glob(".retire-request-*"):
         if not retire(request):
             break
@@ -703,6 +706,12 @@ impl Default for TestTmuxServerOwner {
     }
 }
 
+fn set_duration_env(command: &mut Command, name: &str, value: Option<Duration>) {
+    if let Some(value) = value {
+        command.env(name, value.as_secs_f64().to_string());
+    }
+}
+
 impl TestTmuxServerOwner {
     /// Creates an isolated short socket root and its detached cleanup watchdog.
     ///
@@ -730,16 +739,18 @@ impl TestTmuxServerOwner {
             None,
             None,
             None,
+            None,
         )
     }
 
-    fn new_with_watchdog_test_options(
+    pub(crate) fn new_with_watchdog_test_options(
         watchdog_path: Option<&Path>,
         identity_timeout: Option<Duration>,
         cleanup_timeout: Option<Duration>,
         quarantine_hook: Option<&Path>,
         adoption_timeout: Option<Duration>,
         adoption_hook: Option<&Path>,
+        publication_timeout: Option<Duration>,
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
@@ -778,24 +789,26 @@ impl TestTmuxServerOwner {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(timeout) = identity_timeout {
-            command.env(
-                "PHOENIX_TMUX_IDENTITY_TIMEOUT",
-                timeout.as_secs_f64().to_string(),
-            );
-        }
-        if let Some(timeout) = cleanup_timeout {
-            command.env(
-                "PHOENIX_TMUX_CLEANUP_TIMEOUT",
-                timeout.as_secs_f64().to_string(),
-            );
-        }
-        if let Some(timeout) = adoption_timeout {
-            command.env(
-                "PHOENIX_TMUX_ADOPTION_TIMEOUT",
-                timeout.as_secs_f64().to_string(),
-            );
-        }
+        set_duration_env(
+            &mut command,
+            "PHOENIX_TMUX_IDENTITY_TIMEOUT",
+            identity_timeout,
+        );
+        set_duration_env(
+            &mut command,
+            "PHOENIX_TMUX_CLEANUP_TIMEOUT",
+            cleanup_timeout,
+        );
+        set_duration_env(
+            &mut command,
+            "PHOENIX_TMUX_ADOPTION_TIMEOUT",
+            adoption_timeout,
+        );
+        set_duration_env(
+            &mut command,
+            "PHOENIX_TMUX_PUBLICATION_TIMEOUT",
+            publication_timeout,
+        );
         if let Some(hook) = adoption_hook {
             command.env("PHOENIX_TMUX_ADOPTION_HOOK", hook);
         }
@@ -2196,6 +2209,7 @@ mod tests {
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
+            None,
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2351,6 +2365,7 @@ mod tests {
             None,
             Some(Duration::from_secs(1)),
             Some(&hook),
+            None,
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2374,10 +2389,13 @@ mod tests {
         .unwrap();
         fs::write(control_root.join(".adopt-io-failure"), []).unwrap();
         wait_until(
-            || !phoenix_core::process_identity::process_identity_matches(processes.server),
-            "I/O failure exact retirement",
+            || {
+                !phoenix_core::process_identity::process_identity_matches(processes.server)
+                    && !root.join("io-failure.sock").exists()
+                    && !control_root.join("io-failure.sock").exists()
+            },
+            "I/O failure exact retirement and endpoint removal",
         );
-        assert!(!control_root.join("io-failure.sock").exists());
         fs::remove_dir_all(control_root.join(".adopted-io-failure")).unwrap();
         owner.shutdown();
     }
@@ -2405,6 +2423,7 @@ mod tests {
             None,
             Some(Duration::from_secs(2)),
             Some(&hook),
+            None,
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2492,6 +2511,7 @@ mod tests {
             None,
             Some(Duration::ZERO),
             Some(&hook),
+            None,
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2570,6 +2590,7 @@ mod tests {
             Some(&hook),
             None,
             None,
+            None,
         );
         let root = owner.path().to_path_buf();
         let control_root = owner.control_root_path().to_path_buf();
@@ -2604,6 +2625,7 @@ mod tests {
             None,
             None,
             Some(Duration::from_millis(1)),
+            None,
             None,
             None,
             None,
