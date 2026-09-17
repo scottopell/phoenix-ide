@@ -5568,6 +5568,113 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_ask_user_question_rejects_other_sentinel_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result("__other__", "coordinator-auq-sentinel")
+                .expect("reserved sentinel label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `__other__`",
+            "reserved sentinel label",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_blank_option_label_before_waiting() {
+        let result = coordinator_invalid_option_label_result("   ", "coordinator-auq-blank")
+            .expect("blank option label returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "empty option label", "blank option label");
+    }
+
+    fn coordinator_invalid_option_label_result(
+        label: &str,
+        request_id: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    request_id,
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": label }, { "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    request_id,
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: label.to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: request_id.into(),
+            },
+        )
+    }
+
+    fn assert_invalid_auq_label_result(
+        result: &TransitionResult,
+        expected_error: &str,
+        label_description: &str,
+    ) {
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("invalid label persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains(expected_error),
+                "error should explain {label_description} validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for {label_description}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn coordinator_ask_user_question_answer_resumes_existing_llm_flow() {
         use crate::state::UserQuestion;
 
