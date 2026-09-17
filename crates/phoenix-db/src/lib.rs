@@ -518,18 +518,20 @@ pub struct ConversationCreationMetadataUpdate {
     pub desired_base_branch: Option<Option<String>>,
 }
 
+use phoenix_workflow::ClientTurnKey;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuationDispatchIntent {
     pub parent_conversation_id: String,
     pub successor_conversation_id: String,
-    pub message_id: String,
+    pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewContinuationDispatchIntent {
-    pub message_id: String,
+    pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
 }
@@ -1242,6 +1244,21 @@ pub(crate) struct CloseFoundationTestLatch {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct ContinuationImmediateTestLatch {
+    immediate_attempted: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ContinuationImmediateTestLatch {
+    fn new() -> Self {
+        Self {
+            immediate_attempted: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 impl CloseFoundationTestLatch {
     pub(crate) fn new() -> Self {
         Self {
@@ -1342,6 +1359,8 @@ pub struct Database {
     #[cfg(test)]
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
+    continuation_immediate_test_latch: Option<std::sync::Arc<ContinuationImmediateTestLatch>>,
+    #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
@@ -1362,6 +1381,8 @@ impl Clone for Database {
             sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
             #[cfg(test)]
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
+            #[cfg(test)]
+            continuation_immediate_test_latch: self.continuation_immediate_test_latch.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
@@ -1597,6 +1618,8 @@ impl Database {
             sub_agent_creation_test_latch: None,
             #[cfg(test)]
             close_foundation_test_latch: None,
+            #[cfg(test)]
+            continuation_immediate_test_latch: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
             #[cfg(test)]
@@ -4315,13 +4338,17 @@ impl Database {
         .bind(parent_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|row| ContinuationDispatchIntent {
-            parent_conversation_id: row.get("parent_conversation_id"),
-            successor_conversation_id: row.get("successor_conversation_id"),
-            message_id: row.get("message_id"),
-            handoff: row.get("handoff"),
-            user_agent: row.get("user_agent"),
-        }))
+        row.map(|row| {
+            Ok(ContinuationDispatchIntent {
+                parent_conversation_id: row.get("parent_conversation_id"),
+                successor_conversation_id: row.get("successor_conversation_id"),
+                message_id: ClientTurnKey::try_from(row.get::<String, _>("message_id"))
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                handoff: row.get("handoff"),
+                user_agent: row.get("user_agent"),
+            })
+        })
+        .transpose()
     }
 
     /// Deletes a continuation intent after its message is durably represented elsewhere.
@@ -7732,6 +7759,10 @@ impl Database {
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
         let mut conn = self.pool.acquire().await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.continuation_immediate_test_latch {
+            latch.immediate_attempted.notify_waiters();
+        }
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
 
         require_product_conversation_admission_tx(&mut tx, parent_id).await?;
@@ -7882,7 +7913,7 @@ impl Database {
             )
             .bind(parent_id)
             .bind(&new_id)
-            .bind(&intent.message_id)
+            .bind(intent.message_id.as_str())
             .bind(&intent.handoff)
             .bind(intent.user_agent.as_deref())
             .bind(&now_str)
@@ -22478,7 +22509,7 @@ mod tests {
         .await;
 
         let requested = NewContinuationDispatchIntent {
-            message_id: "opening-message".to_string(),
+            message_id: ClientTurnKey::try_from("opening-message").unwrap(),
             handoff: "Exact edited handoff".to_string(),
             user_agent: Some("test-agent".to_string()),
         };
@@ -22495,7 +22526,7 @@ mod tests {
         };
         let intent = intent.expect("created successor must have an intent");
         assert_eq!(intent.successor_conversation_id, successor_id);
-        assert_eq!(intent.message_id, "opening-message");
+        assert_eq!(intent.message_id.as_str(), "opening-message");
         assert_eq!(intent.handoff, "Exact edited handoff");
 
         let content = MessageContent::User(UserContent::new("Exact edited handoff"));
@@ -22523,7 +22554,7 @@ mod tests {
         db.continue_conversation_with_intent(
             "parent-retry-intent",
             NewContinuationDispatchIntent {
-                message_id: "original-message".to_string(),
+                message_id: ClientTurnKey::try_from("original-message").unwrap(),
                 handoff: "Original handoff".to_string(),
                 user_agent: None,
             },
@@ -22535,7 +22566,7 @@ mod tests {
             .continue_conversation_with_intent(
                 "parent-retry-intent",
                 NewContinuationDispatchIntent {
-                    message_id: "different-message".to_string(),
+                    message_id: ClientTurnKey::try_from("different-message").unwrap(),
                     handoff: "Must not replace original".to_string(),
                     user_agent: None,
                 },
@@ -22544,7 +22575,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, ContinueOutcome::AlreadyContinued(_)));
         let intent = intent.unwrap();
-        assert_eq!(intent.message_id, "original-message");
+        assert_eq!(intent.message_id.as_str(), "original-message");
         assert_eq!(intent.handoff, "Original handoff");
     }
 
@@ -22791,9 +22822,11 @@ mod tests {
 
     #[tokio::test]
     async fn close_and_continuation_serialize_to_typed_admission_fence() {
-        let (_dir, mut close_db, continuation_db) = open_test_db_pair().await;
+        let (_dir, mut close_db, mut continuation_db) = open_test_db_pair().await;
         let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
+        let continuation_latch = std::sync::Arc::new(ContinuationImmediateTestLatch::new());
         close_db.close_foundation_test_latch = Some(close_latch.clone());
+        continuation_db.continuation_immediate_test_latch = Some(continuation_latch.clone());
         let parent = setup_exhausted_parent(
             &close_db,
             "parent-close-race",
@@ -22817,12 +22850,14 @@ mod tests {
         });
         close_entered.await;
 
+        let continuation_immediate_attempted = continuation_latch.immediate_attempted.notified();
         let continuation_parent_id = parent.id.clone();
         let continuation = tokio::spawn(async move {
             continuation_db
                 .continue_conversation(&continuation_parent_id)
                 .await
         });
+        continuation_immediate_attempted.await;
         close_latch.release_transaction.notify_waiters();
         close.await.unwrap().unwrap();
 

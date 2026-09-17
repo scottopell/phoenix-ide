@@ -5409,7 +5409,7 @@ async fn dispatch_continuation_handoff(
     .send(crate::send_chat_service::SendChatRequest {
         conversation_id: conversation_id.clone(),
         text: intent.handoff,
-        message_id: intent.message_id,
+        message_id: intent.message_id.as_str().to_string(),
         images: Vec::new(),
         files: Vec::new(),
         user_agent: intent.user_agent,
@@ -5493,7 +5493,7 @@ async fn continue_conversation(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
-    let _message_id = continuation_message_id(req.message_id.clone())?;
+    let message_id = continuation_message_id(req.message_id.clone())?;
 
     let (outcome, intent) = state
         .runtime
@@ -5501,7 +5501,7 @@ async fn continue_conversation(
         .continue_conversation_with_intent(
             &id,
             crate::db::NewContinuationDispatchIntent {
-                message_id: req.message_id,
+                message_id,
                 handoff: req.handoff,
                 user_agent: req.user_agent,
             },

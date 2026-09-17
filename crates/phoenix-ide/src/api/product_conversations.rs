@@ -788,6 +788,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+    use phoenix_workflow::ClientTurnKey;
 
     async fn create_completed_continuation(
         state: &AppState,
@@ -810,7 +811,7 @@ mod tests {
             .continue_conversation_with_intent(
                 &root.id,
                 crate::db::NewContinuationDispatchIntent {
-                    message_id: opening_message_id.to_string(),
+                    message_id: ClientTurnKey::try_from(opening_message_id.to_string()).unwrap(),
                     handoff: "accepted opening handoff".to_string(),
                     user_agent: None,
                 },
