@@ -65,20 +65,24 @@ transcript capability specified by REQ-RET-009 and ADR-051.
 | **REQ-RET-005:** Retrieval Backend Is Swappable | ✅ Complete | FTS5/BM25 behind the `MessageRetriever` trait; vector/hybrid drop in behind it |
 | **REQ-RET-006:** Results Carry Provenance | ✅ Complete | `RetrievedChunk` carries conversation/message/type/timestamp |
 | **REQ-RET-007:** Scope Is Applied In-Query, Not Post-Hoc | ✅ Complete | Scope is a query predicate so `top_k` is honored after scoping |
-| **REQ-RET-008:** Scope Is Host-Bound When Retrieval Is a Tool | ✅ Complete | Agent supplies query only; host fixes scope at tool construction (`chain_qa.rs` `qa_tools` / `execute_tool`) |
-| **REQ-RET-009:** Continuing Agents Can Discover and Inspect Predecessor Transcripts | ✅ Complete | Host-bound `previous_transcripts` list/search/read for ordinary parent agents; strict predecessor scope and continuation orientation |
+| **REQ-RET-008:** Scope Is Host-Bound When Retrieval Is a Tool | ✅ Complete | Shared opaque cursors identify scope, target, message, offset, and rendered freshness across global, Chain Q&A, and predecessor reads; cross-target/stale/numeric regressions and the full repository gate pass |
+| **REQ-RET-009:** Continuing Agents Can Discover and Inspect Predecessor Transcripts | ✅ Complete | List-only discovery and existing-name scoped search/read use scope-, target-, message-, and freshness-identifying opaque cursors; bounded paging measurements and the full repository gate pass |
 
 ## Predecessor Recall Delivery
 
-REQ-RET-009 is delivered by the `previous_transcripts` tool, a read-only
-host-bound capability for ordinary ProductConversation parent agents. The host
+REQ-RET-009 uses list-only `previous_transcripts` discovery plus the existing
+`search_conversations` and `read_conversation` tool names bound by the host to
+strict predecessors for ordinary ProductConversation parent agents. The host
 binds the ProductConversation and executing transcript, revalidates membership
 and continuation topology on each operation, and never lets model arguments pick
-an aggregate, workspace, source relation, or global scope. Restricted planning
-parents receive this predecessor capability without receiving global recall
-tools; write-capable parents keep their separately governed global tools.
+an aggregate, workspace, source relation, or global scope. Restricted planning and write-capable ordinary parents receive the same
+predecessor-scoped recall names. Global Coordinator retains separately
+constructed globally scoped search and read tools.
 
 Listing and reading are bounded and usable without a ready retrieval index.
+Read continuation uses one shared versioned opaque string cursor bound to host
+scope, target, persisted message identity, intra-message offset, and rendered
+source freshness. Numeric cursor calls fail with restart guidance.
 Search uses the shared `MessageRetriever` with a `Conversations` scope over the
 strict predecessor prefix before ranking and limiting, and reports index coverage
 problems as typed search-unavailable outcomes. Runtime reconstruction and
