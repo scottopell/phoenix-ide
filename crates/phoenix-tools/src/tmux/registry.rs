@@ -5639,14 +5639,44 @@ mod tests {
             .expect("first ensure_live should succeed");
         let socket_path = first.read().await.socket_path.clone();
         let first_token = first.read().await.server_token.clone();
+        let first_identity = exact_server_process_identity_until(
+            &socket_path,
+            &first_token,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("capture authenticated first server identity");
+        let first_metadata = std::fs::metadata(&socket_path).unwrap();
 
         kill_socket(&socket_path).await;
+        wait_for_exact_process_absence(first_identity).await;
+        if let Ok(observed) = std::fs::metadata(&socket_path) {
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::dev(&observed),
+                std::os::unix::fs::MetadataExt::dev(&first_metadata)
+            );
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::ino(&observed),
+                std::os::unix::fs::MetadataExt::ino(&first_metadata)
+            );
+            std::fs::remove_file(&socket_path).unwrap();
+        }
+        spawn_session_owned(
+            &socket_path,
+            &owner.path().join(SERVER_CONFIG_FILENAME),
+            owner.path(),
+            Some(owner.control_root_path()),
+        )
+        .await
+        .expect("start token-rotated replacement");
+        let (replacement_token, _) = wait_for_authenticated_replacement(&socket_path).await;
 
         let second = reg
             .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("respawn ensure_live should succeed");
         let second_token = second.read().await.server_token.clone();
+        assert_eq!(second_token, replacement_token);
 
         assert_ne!(
             first_token, second_token,
