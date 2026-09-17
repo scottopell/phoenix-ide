@@ -35,6 +35,7 @@ parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 owned = []
 unconfirmed_obligations = []
+cleanup_deadline = None
 identity_timeout = float(os.environ.get("PHOENIX_TMUX_IDENTITY_TIMEOUT", "6.0"))
 adoption_timeout = float(os.environ.get("PHOENIX_TMUX_ADOPTION_TIMEOUT", "1.0"))
 publication_timeout = float(os.environ.get("PHOENIX_TMUX_PUBLICATION_TIMEOUT", "1.0"))
@@ -130,27 +131,29 @@ def remaining_timeout(deadline):
     return min(0.5, remaining)
 
 def query_control_processes(control, deadline):
-    observed = subprocess.run(
-        ["tmux", "-S", str(control), "display-message", "-p", "#{pid}|#{pane_pid}"],
+    server = subprocess.run(
+        ["tmux", "-S", str(control), "display-message", "-p", "#{pid}"],
         stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True,
         timeout=remaining_timeout(deadline),
     )
-    if observed.returncode != 0:
-        raise RuntimeError("tmux identity query failed")
-    process_fields = observed.stdout.removesuffix("\n").split("|")
-    if len(process_fields) != 2:
+    panes = subprocess.run(
+        ["tmux", "-S", str(control), "list-panes", "-a", "-F", "#{pane_pid}"],
+        stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True,
+        timeout=remaining_timeout(deadline),
+    )
+    server_pid = server.stdout.removesuffix("\n")
+    pane_pids = panes.stdout.splitlines()
+    if (server.returncode != 0 or panes.returncode != 0 or not pane_pids
+            or not server_pid.isascii() or not server_pid.isdecimal()
+            or any(not pid.isascii() or not pid.isdecimal() for pid in pane_pids)):
         raise RuntimeError("tmux identity output was malformed")
-    server_pid, pane_pid = process_fields
-    if (not server_pid.isascii() or not server_pid.isdecimal()
-            or not pane_pid.isascii() or not pane_pid.isdecimal()):
-        raise RuntimeError("tmux identity output was malformed")
-    return int(server_pid), int(pane_pid)
+    return int(server_pid), tuple(dict.fromkeys(int(pid) for pid in pane_pids))
 
 def observe_control(control, expected_token, deadline):
     last_error = RuntimeError("tmux identity query did not run")
     while time.monotonic() < deadline:
         try:
-            server_pid, pane_pid = query_control_processes(control, deadline)
+            server_pid, pane_pids = query_control_processes(control, deadline)
             token_result = subprocess.run(
                 ["tmux", "-S", str(control), "show-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN"],
                 stdin=subprocess.DEVNULL, capture_output=True, check=False, text=True,
@@ -159,10 +162,8 @@ def observe_control(control, expected_token, deadline):
             token = token_result.stdout.strip().partition("=")[2]
             if token_result.returncode != 0 or token != expected_token:
                 raise RuntimeError("tmux server token did not match registration")
-            identities = [
-                (server_pid, birth(server_pid), token),
-                (pane_pid, birth(pane_pid), None),
-            ]
+            identities = [(server_pid, birth(server_pid), token)]
+            identities.extend((pane_pid, birth(pane_pid), None) for pane_pid in pane_pids)
             if any(started is None for _, started, _ in identities):
                 raise RuntimeError("process birth identity was unavailable")
             return identities
@@ -215,18 +216,30 @@ def tmux_format_literal(value):
     return value
 
 def retire_record(record, deadline):
-    _, device, inode, control, processes = record
+    _, device, inode, control, recorded_processes = record
+    processes = list(recorded_processes)
     expected_token = tmux_format_literal(processes[0][2])
     states = [identity_state(identity) for identity in processes]
     if all(state == "absent" for state in states):
         return True
-    if states[0] != "owned" or states[1] not in ("owned", "absent"):
+    if states[0] != "owned" or any(state not in ("owned", "absent") for state in states[1:]):
         return False
     try:
         control_stat = control.stat()
         if control_stat.st_dev != device or control_stat.st_ino != inode:
             return False
         expected_server = processes[0][0]
+        observed_server, pane_pids = query_control_processes(control, deadline)
+        if observed_server != expected_server:
+            return False
+        known_pids = {identity[0] for identity in processes}
+        for pane_pid in pane_pids:
+            if pane_pid not in known_pids:
+                started = birth(pane_pid)
+                if started is None:
+                    return False
+                processes.append((pane_pid, started, None))
+                known_pids.add(pane_pid)
         subprocess.run(
             ["tmux", "-S", str(control), "if-shell", "-F",
              f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
@@ -354,6 +367,13 @@ def retain_obligation(socket, control):
     if obligation not in unconfirmed_obligations:
         unconfirmed_obligations.append(obligation)
 
+def retirement_deadline():
+    global cleanup_deadline
+    now = time.monotonic()
+    if (root / ".cleanup-request").exists() and cleanup_deadline is None:
+        cleanup_deadline = now + cleanup_timeout
+    return min(now + identity_timeout, cleanup_deadline) if cleanup_deadline else now + identity_timeout
+
 def retire_registered(socket, control, identities):
     expected = tuple(identities)
     record = exact_record(socket, control, expected)
@@ -368,7 +388,7 @@ def retire_registered(socket, control, identities):
             return False
     except OSError:
         return False
-    retired = retire_record(record, time.monotonic() + identity_timeout)
+    retired = retire_record(record, retirement_deadline())
     try:
         socket_stat = socket.stat()
         visible_owned = socket_stat.st_dev == record[1] and socket_stat.st_ino == record[2]
@@ -415,12 +435,16 @@ def retire(request):
     )
     try:
         fields = request.read_text().split("\t")
-        if len(fields) != 7:
-            raise RuntimeError("retirement request was malformed")
         socket = root / fields[0]
         control = control_root / fields[1]
         expected_token = tmux_format_literal(fields[4])
-        identities = ((int(fields[2]), fields[3], expected_token), (int(fields[5]), fields[6], None))
+        if len(fields) < 7 or len(fields[5:]) % 2 != 0:
+            raise RuntimeError("retirement request was malformed")
+        identities = [(int(fields[2]), fields[3], expected_token)]
+        identities.extend(
+            (int(fields[index]), fields[index + 1], None)
+            for index in range(5, len(fields), 2)
+        )
         if not retire_registered(socket, control, identities):
             raise RuntimeError("exact owned spawn retirement could not be proven")
         publish_response(acknowledged, "retired")
@@ -445,13 +469,12 @@ def register(request):
                 or control.is_symlink() or not control.is_socket()):
             raise RuntimeError("registration control is not an exact child of the owned control root")
         identities = observe_control(control, expected_token, time.monotonic() + identity_timeout)
-        server_pid, pane_pid = str(identities[0][0]), str(identities[1][0])
         control_stat = control.stat()
         record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)
         try:
-            publish_response(acknowledged, "\t".join([
-                server_pid, identities[0][1], pane_pid, identities[1][1]
-            ]))
+            publish_response(acknowledged, "\t".join(
+                str(value) for identity in identities for value in identity[:2]
+            ))
         except OSError:
             return False
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
@@ -548,13 +571,16 @@ while not (root / ".cleanup-request").exists():
                 if not retire_registered(socket, control, identities):
                     retain_obligation(socket, control)
         elif now >= deadline:
-            if retire_registered(socket, control, identities):
-                publish_response(adoption_rejected, "lease expired; exact server retired")
-            else:
+            retired = retire_registered(socket, control, identities)
+            if not retired:
+                retain_obligation(socket, control)
+            try:
                 publish_response(
                     adoption_rejected,
+                    "lease expired; exact server retired" if retired else
                     "lease expired; exact provisional retirement could not be proven",
                 )
+            except OSError:
                 retain_obligation(socket, control)
     for request in control_root.glob(".retire-request-*"):
         if not retire(request):
@@ -586,7 +612,8 @@ try:
 except FileNotFoundError:
     pass
 
-cleanup_deadline = time.monotonic() + cleanup_timeout
+if cleanup_deadline is None:
+    cleanup_deadline = time.monotonic() + cleanup_timeout
 for _, device, inode, control, processes in owned:
     if time.monotonic() >= cleanup_deadline:
         break
@@ -1014,10 +1041,11 @@ fn verify_no_live_servers(root: &Path) -> io::Result<()> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TestServerProcesses {
     pub(crate) server: ProcessIdentity,
     pub(crate) pane: ProcessIdentity,
+    additional_panes: Vec<ProcessIdentity>,
 }
 
 #[cfg(test)]
@@ -1109,7 +1137,7 @@ impl AdoptedTestServer {
         loop {
             if self.publication_acknowledged.exists() {
                 self.committed = true;
-                return Ok(self.processes);
+                return Ok(self.processes.clone());
             }
             if let Ok(reason) = fs::read_to_string(&self.adoption_rejected) {
                 return Err(io::Error::other(format!(
@@ -1132,7 +1160,13 @@ impl AdoptedTestServer {
         control_socket: &Path,
         expected_token: &str,
     ) -> io::Result<()> {
-        retire_owned_server(socket, control_socket, self.processes, expected_token).await?;
+        retire_owned_server(
+            socket,
+            control_socket,
+            self.processes.clone(),
+            expected_token,
+        )
+        .await?;
         self.committed = true;
         Ok(())
     }
@@ -1277,13 +1311,22 @@ pub(crate) async fn retire_owned_server(
     let rejected = control_root.join(format!(".retire-rejected-{nonce}"));
     fs::write(
         &pending,
-        format!(
-            "{socket_name}\t{control_name}\t{}\t{}\t{expected_token}\t{}\t{}",
-            processes.server.pid,
-            processes.server.start_time,
-            processes.pane.pid,
-            processes.pane.start_time,
-        ),
+        std::iter::once(socket_name)
+            .chain(std::iter::once(control_name))
+            .chain([
+                processes.server.pid.to_string(),
+                processes.server.start_time.to_string(),
+                expected_token.to_owned(),
+            ])
+            .chain(
+                std::iter::once(processes.pane)
+                    .chain(processes.additional_panes.iter().copied())
+                    .flat_map(|identity| {
+                        [identity.pid.to_string(), identity.start_time.to_string()]
+                    }),
+            )
+            .collect::<Vec<_>>()
+            .join("\t"),
     )?;
     fs::rename(&pending, &request)?;
     let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
@@ -1308,7 +1351,7 @@ pub(crate) async fn retire_owned_server(
 
 fn parse_acknowledged_processes(value: &str) -> io::Result<TestServerProcesses> {
     let fields = value.split('\t').collect::<Vec<_>>();
-    if fields.len() != 4 {
+    if fields.len() < 4 || fields.len() % 2 != 0 {
         return Err(io::Error::other(
             "tmux watchdog returned malformed process identities",
         ));
@@ -1327,6 +1370,15 @@ fn parse_acknowledged_processes(value: &str) -> io::Result<TestServerProcesses> 
             pid: u32::try_from(parse(fields[2])?).map_err(io::Error::other)?,
             start_time: parse(fields[3])?,
         },
+        additional_panes: fields[4..]
+            .chunks_exact(2)
+            .map(|fields| {
+                Ok(ProcessIdentity {
+                    pid: u32::try_from(parse(fields[0])?).map_err(io::Error::other)?,
+                    start_time: parse(fields[1])?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?,
     })
 }
 
@@ -1546,7 +1598,7 @@ mod tests {
         assert_eq!(server_pid.parse::<u32>().unwrap(), processes.server.pid);
         assert_eq!(pane_pid.parse::<u32>().unwrap(), processes.pane.pid);
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
@@ -1569,7 +1621,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
 
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     fn assert_no_registration_artifacts(root: &Path) {
@@ -1614,7 +1666,7 @@ mod tests {
         let (socket, processes) = spawn_server_with_processes(&owner, "normal");
         owner.shutdown();
         assert!(!socket.exists(), "exact stale socket must be unlinked");
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(!root.exists());
     }
 
@@ -1649,7 +1701,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
     }
@@ -1791,7 +1843,7 @@ mod tests {
         let (socket, processes) = spawn_server_with_processes(&owner, "missing-socket");
         fs::remove_file(socket).unwrap();
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(!root.exists());
     }
 
@@ -1814,12 +1866,12 @@ mod tests {
             "replacement socket must fail cleanup closed"
         );
         assert!(socket.exists(), "replacement socket must not be unlinked");
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(root.exists(), "failed cleanup must preserve its exact root");
 
         drop(replacement);
         assert_ne!(probe_sync(&control), ProbeResult::Live);
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
     }
@@ -1966,7 +2018,7 @@ mod tests {
             control_root.display()
         )));
         assert!(control_root.exists());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
@@ -1982,7 +2034,7 @@ mod tests {
         let (_, first_processes) = spawn_server_with_processes(&first, "first");
         let (_, second_processes) = spawn_server_with_processes(&second, "second");
         first.shutdown();
-        assert_exact_processes_gone(first_processes);
+        assert_exact_processes_gone(&first_processes);
         assert!(
             phoenix_core::process_identity::process_identity_matches(second_processes.server),
             "cleanup must not signal a server outside its exact owner"
@@ -1992,7 +2044,7 @@ mod tests {
             "cleanup must not signal a pane outside its exact owner"
         );
         second.shutdown();
-        assert_exact_processes_gone(second_processes);
+        assert_exact_processes_gone(&second_processes);
     }
 
     fn write_tmux_wrapper(fake_bin: &Path, program: &str) {
@@ -2023,7 +2075,7 @@ mod tests {
 
         owner.shutdown();
 
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         let requests = fs::read_to_string(accepted).unwrap();
         assert_eq!(requests.lines().count(), 1);
         assert!(requests.contains(&format!(
@@ -2066,7 +2118,7 @@ mod tests {
         assert_eq!(probe_sync(&control), ProbeResult::Live);
         assert!(socket.exists());
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
@@ -2102,15 +2154,16 @@ mod tests {
         assert_eq!(probe_sync(&control), ProbeResult::Live);
         assert!(socket.exists());
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
     fn retirement_wire_and_lookup_include_expected_token() {
         assert!(WATCHDOG_PROGRAM.contains("expected_token = tmux_format_literal(fields[4])"));
         assert!(
-            WATCHDOG_PROGRAM.contains("identities = ((int(fields[2]), fields[3], expected_token),")
+            WATCHDOG_PROGRAM.contains("identities = [(int(fields[2]), fields[3], expected_token)]")
         );
+        assert!(WATCHDOG_PROGRAM.contains("for index in range(5, len(fields), 2)"));
         assert!(WATCHDOG_PROGRAM.contains("if tuple(record[4]) == expected:"));
     }
 
@@ -2163,7 +2216,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
     }
@@ -2182,7 +2235,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(socket.exists());
         assert!(control.exists());
 
@@ -2206,7 +2259,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         fs::remove_file(&control).ok();
         fs::remove_file(&socket).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2277,7 +2330,7 @@ mod tests {
             panic.is_err(),
             "protected replacement must fail cleanup closed"
         );
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert_eq!(probe_sync(&socket), ProbeResult::Live);
         assert!(Command::new("tmux")
             .args(["-S", &socket.to_string_lossy(), "kill-server"])
@@ -2359,7 +2412,7 @@ mod tests {
             ProbeResult::Live
         );
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[tokio::test]
@@ -2387,7 +2440,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cancelled_processes = adopted.processes;
+        let cancelled_processes = adopted.processes.clone();
 
         drop(adopted);
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
@@ -2439,7 +2492,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let processes = adopted.processes;
+        let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
 
         drop(adopted);
@@ -2553,7 +2606,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let processes = adopted.processes;
+        let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
 
         adopted
@@ -2569,7 +2622,7 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".publication-acknowledged-")));
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
         assert!(
             panic.is_err(),
@@ -2781,7 +2834,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
 
@@ -2832,7 +2885,7 @@ mod tests {
                 .status();
         }
         for captured in processes {
-            assert_exact_processes_gone(captured);
+            assert_exact_processes_gone(&captured);
         }
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
@@ -2855,11 +2908,46 @@ mod tests {
     }
 
     #[test]
-    fn pane_identity_is_bound_to_authenticated_server_without_requiring_late_token() {
+    fn pane_identities_are_bound_to_authenticated_server_without_requiring_late_tokens() {
         assert!(WATCHDOG_PROGRAM.contains(
-            "(server_pid, birth(server_pid), token),\n                (pane_pid, birth(pane_pid), None),"
+            "identities.extend((pane_pid, birth(pane_pid), None) for pane_pid in pane_pids)"
         ));
         assert!(WATCHDOG_PROGRAM.contains("if token is None:\n        return \"owned\""));
+    }
+
+    #[test]
+    fn retirement_captures_every_late_pane_before_killing_the_server() {
+        let enumerate = WATCHDOG_PROGRAM
+            .find("observed_server, pane_pids = query_control_processes(control, deadline)")
+            .unwrap();
+        let capture = WATCHDOG_PROGRAM
+            .find("processes.append((pane_pid, started, None))")
+            .unwrap();
+        let kill = WATCHDOG_PROGRAM.find("\"kill-server\", \"\"],").unwrap();
+        assert!(enumerate < capture && capture < kill);
+    }
+
+    #[test]
+    fn lease_expiry_response_failure_retains_cleanup_obligation() {
+        let lease_branch = WATCHDOG_PROGRAM.find("elif now >= deadline:").unwrap();
+        let lease_program = WATCHDOG_PROGRAM.get(lease_branch..).unwrap();
+        let response = lease_program
+            .find("publish_response(\n                    adoption_rejected,")
+            .unwrap();
+        let guard = lease_program
+            .find("except OSError:\n                retain_obligation(socket, control)")
+            .unwrap();
+        assert!(response < guard);
+    }
+
+    #[test]
+    fn pre_cleanup_retirements_share_the_owner_cleanup_deadline() {
+        assert!(WATCHDOG_PROGRAM
+            .contains("if (root / \".cleanup-request\").exists() and cleanup_deadline is None:"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "return min(now + identity_timeout, cleanup_deadline) if cleanup_deadline else now + identity_timeout"
+        ));
+        assert!(WATCHDOG_PROGRAM.contains("retire_record(record, retirement_deadline())"));
     }
 
     #[test]
@@ -2911,7 +2999,7 @@ mod tests {
             "original pane exit",
         );
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
@@ -2936,7 +3024,7 @@ mod tests {
             "natural server and pane exit",
         );
         owner.shutdown();
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
@@ -2979,7 +3067,7 @@ mod tests {
             panic.is_err(),
             "visible replacement must remain fail-closed"
         );
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(socket.exists(), "unrelated visible replacement was removed");
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
@@ -3004,7 +3092,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
         assert!(panic.is_err(), "lost cleanup handoff must remain visible");
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(!root.exists());
     }
 
@@ -3019,7 +3107,7 @@ mod tests {
         fs::remove_dir_all(owner.path()).unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
         assert!(panic.is_err(), "lost cleanup handoff must remain visible");
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
     #[test]
@@ -3092,7 +3180,7 @@ mod tests {
         .map(|paths| *paths)
         .expect("panic payload");
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(!root.exists());
     }
 
@@ -3113,7 +3201,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
         assert!(!root.exists());
     }
 
@@ -3314,6 +3402,7 @@ finally:
                 pid: paths.next().unwrap().parse().unwrap(),
                 start_time: paths.next().unwrap().parse().unwrap(),
             },
+            additional_panes: Vec::new(),
         };
         assert_eq!(probe_sync(&socket), ProbeResult::Live);
 
@@ -3328,14 +3417,17 @@ finally:
         assert_killed(status);
         wait_until(|| !root.exists(), "watchdog cleanup after forced death");
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
-        assert_exact_processes_gone(processes);
+        assert_exact_processes_gone(&processes);
     }
 
-    fn assert_exact_processes_gone(processes: TestServerProcesses) {
+    fn assert_exact_processes_gone(processes: &TestServerProcesses) {
         wait_until(
             || {
                 !phoenix_core::process_identity::process_identity_matches(processes.server)
                     && !phoenix_core::process_identity::process_identity_matches(processes.pane)
+                    && processes.additional_panes.iter().all(|identity| {
+                        !phoenix_core::process_identity::process_identity_matches(*identity)
+                    })
             },
             "exact tmux server and pane-shell exit",
         );
