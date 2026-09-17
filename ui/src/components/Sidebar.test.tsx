@@ -260,12 +260,17 @@ describe('Sidebar — ProductConversation navigation', () => {
     const renamed = makeProductConversation('pc-rename', {
       canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'New Product' },
     });
-    apiMock.renameProductConversation.mockResolvedValueOnce(renamed);
-    apiMock.listProductConversations.mockResolvedValue({
-      product_conversations: [makeProductConversation('pc-rename', {
-        canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'Old Product' },
-      })],
+    const original = makeProductConversation('pc-rename', {
+      canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'Old Product' },
     });
+    let serverRow = original;
+    apiMock.renameProductConversation.mockImplementationOnce(async () => {
+      serverRow = renamed;
+      return renamed;
+    });
+    apiMock.listProductConversations.mockImplementation(async () => ({
+      product_conversations: [serverRow],
+    }));
     const snapshotListener = vi.fn();
     const unsubscribe = subscribeProductConversationSnapshotChanged('pc-rename', snapshotListener);
 
