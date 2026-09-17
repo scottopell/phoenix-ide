@@ -325,7 +325,11 @@ export function ConversationListPage() {
   const handleProductClose = async () => {
     if (!productCloseTarget) return;
     try {
-      await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+      if (productCloseTarget.canonical_root.transcript_row_id === productCloseTarget.latest_transcript_row_id) {
+        await api.archiveConversation(productCloseTarget.canonical_root.transcript_row_id);
+      } else {
+        await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+      }
       setProductCloseTarget(null);
       setProductListRevision((revision) => revision + 1);
     } catch (err) {

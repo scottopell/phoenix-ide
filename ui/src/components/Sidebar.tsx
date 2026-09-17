@@ -322,7 +322,11 @@ export function Sidebar({
   const handleProductClose = useCallback(async () => {
     if (!productCloseTarget) return;
     try {
-      await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+      if (productCloseTarget.canonical_root.transcript_row_id === productCloseTarget.latest_transcript_row_id) {
+        await api.archiveConversation(productCloseTarget.canonical_root.transcript_row_id);
+      } else {
+        await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
+      }
       setProductCloseTarget(null);
       onConversationCreated();
       setProductConversationsRetry((revision) => revision + 1);
