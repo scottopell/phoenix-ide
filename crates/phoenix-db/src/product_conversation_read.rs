@@ -377,9 +377,9 @@ impl Database {
         reference: &str,
         title: &str,
     ) -> DbResult<ProductConversationId> {
-        let now = chrono::Utc::now();
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let now = chrono::Utc::now();
         let result = async {
             let resolved =
                 Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
