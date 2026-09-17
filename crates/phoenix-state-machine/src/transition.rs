@@ -5602,6 +5602,19 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_ask_user_question_rejects_case_variant_other_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result(" oThEr ", "coordinator-auq-other-case")
+                .expect("case-variant reserved display label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `oThEr`",
+            "case-variant reserved display label",
+        );
+    }
+
+    #[test]
     fn coordinator_ask_user_question_rejects_label_over_five_words_before_waiting() {
         let result = coordinator_invalid_option_label_result(
             "one two three four five six",
@@ -5618,6 +5631,38 @@ mod tests {
             .expect("long header returns a tool error");
 
         assert_invalid_auq_label_result(&result, "header exceeds 12 characters", "long header");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_question_over_five_words_before_waiting() {
+        let result = coordinator_invalid_question_text_result("one two three four five six")
+            .expect("long question text returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "exceeds 5 words", "long question text");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_duplicate_trimmed_question_text_before_waiting() {
+        let result = coordinator_duplicate_question_text_result()
+            .expect("duplicate trimmed question text returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "duplicates question text `Same?`",
+            "duplicate question text",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_blank_option_description_before_waiting() {
+        let result = coordinator_invalid_description_result("   ")
+            .expect("blank option description returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "has empty description",
+            "blank option description",
+        );
     }
 
     fn coordinator_invalid_option_label_result(
@@ -5721,6 +5766,169 @@ mod tests {
                 end_turn: false,
                 usage: Usage::default(),
                 request_id: "coordinator-auq-long-header".into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_question_text_result(
+        question: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-long-question",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": question,
+                            "header": "Choice",
+                            "options": [{ "label": "A" }, { "label": "B" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-long-question",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: question.to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-long-question".into(),
+            },
+        )
+    }
+
+    fn coordinator_duplicate_question_text_result() -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let options = || {
+            vec![
+                QuestionOption {
+                    label: "A".to_string(),
+                    description: Some("Alpha".to_string()),
+                    preview: None,
+                },
+                QuestionOption {
+                    label: "B".to_string(),
+                    description: Some("Beta".to_string()),
+                    preview: None,
+                },
+            ]
+        };
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-dup-question",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [
+                            { "question": "Same?", "header": "First", "options": [{ "label": "A", "description": "Alpha" }, { "label": "B", "description": "Beta" }], "multiSelect": false },
+                            { "question": " Same? ", "header": "Second", "options": [{ "label": "A", "description": "Alpha" }, { "label": "B", "description": "Beta" }], "multiSelect": false }
+                        ]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-dup-question",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![
+                            UserQuestion {
+                                question: "Same?".to_string(),
+                                header: "First".to_string(),
+                                options: options(),
+                                multi_select: false,
+                            },
+                            UserQuestion {
+                                question: " Same? ".to_string(),
+                                header: "Second".to_string(),
+                                options: options(),
+                                multi_select: false,
+                            },
+                        ],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-dup-question".into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_description_result(
+        description: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-blank-description",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "A", "description": description }, { "label": "B", "description": "Beta" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-blank-description",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: Some(description.to_string()),
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: Some("Beta".to_string()),
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-blank-description".into(),
             },
         )
     }

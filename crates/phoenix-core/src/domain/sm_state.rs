@@ -138,9 +138,10 @@ impl AskUserQuestionInput {
     /// # Errors
     ///
     /// Returns a human-readable tool error when the question count is outside
-    /// 1-4, question/header text is empty, a header exceeds 12 characters, a
-    /// question has outside 2-4 options, question text is duplicated, an option
-    /// label is empty, too long, or duplicated within a question, or an option
+    /// 1-4, question/header text is empty, question text exceeds 5 words, a
+    /// header exceeds 12 characters, a question has outside 2-4 options,
+    /// question text is duplicated, an option label is empty, too long, or
+    /// duplicated within a question, an option description is blank, or an option
     /// uses a UI-reserved label.
     pub fn validate(&self) -> Result<(), String> {
         if self.questions.is_empty() || self.questions.len() > 4 {
@@ -153,9 +154,16 @@ impl AskUserQuestionInput {
         let mut question_texts = std::collections::HashSet::new();
         for (question_index, question) in self.questions.iter().enumerate() {
             let question_number = question_index + 1;
-            if question.question.trim().is_empty() {
+            let question_text = question.question.trim();
+            if question_text.is_empty() {
                 return Err(format!(
                     "ask_user_question question {question_number} has empty question text"
+                ));
+            }
+            let question_word_count = question_text.split_whitespace().count();
+            if question_word_count > 5 {
+                return Err(format!(
+                    "ask_user_question question {question_number} text `{question_text}` exceeds 5 words"
                 ));
             }
             if question.header.trim().is_empty() {
@@ -168,10 +176,9 @@ impl AskUserQuestionInput {
                     "ask_user_question question {question_number} header exceeds 12 characters"
                 ));
             }
-            if !question_texts.insert(question.question.as_str()) {
+            if !question_texts.insert(question_text) {
                 return Err(format!(
-                    "ask_user_question question {question_number} duplicates question text `{}`",
-                    question.question
+                    "ask_user_question question {question_number} duplicates question text `{question_text}`"
                 ));
             }
             if question.options.len() < 2 || question.options.len() > 4 {
@@ -195,9 +202,18 @@ impl AskUserQuestionInput {
                         "ask_user_question question {question_number} option label `{label}` exceeds 5 words"
                     ));
                 }
-                if matches!(label, "Other" | "__other__") {
+                if matches!(label.to_ascii_lowercase().as_str(), "other" | "__other__") {
                     return Err(format!(
                         "ask_user_question question {question_number} uses reserved option label `{label}`"
+                    ));
+                }
+                if option
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.trim().is_empty())
+                {
+                    return Err(format!(
+                        "ask_user_question question {question_number} option label `{label}` has empty description"
                     ));
                 }
                 if !option_labels.insert(label) {

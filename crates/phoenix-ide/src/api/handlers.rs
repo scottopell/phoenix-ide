@@ -5667,6 +5667,11 @@ struct DismissQuestionPayload {
 }
 
 fn validate_question_action_tool_use_id(expected: &str, supplied: &str) -> Result<(), AppError> {
+    if supplied.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Question action tool_use_id must not be empty".to_string(),
+        ));
+    }
     if supplied != expected {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Question action does not match the current pending question",
@@ -13184,6 +13189,58 @@ pub(crate) mod hard_delete_cascade_tests {
             other => panic!("expected stale question action conflict, got {other:?}"),
         }
         assert_still_waiting_for_tool(&state, &conversation_id, "q2-tool").await;
+    }
+    #[tokio::test]
+    async fn coordinator_question_response_rejects_empty_tool_use_id_without_mutating_wait() {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q-tool").await;
+
+        let err = respond_to_question(
+            State(state.clone()),
+            Path(conversation_id.clone()),
+            Json(RespondToQuestionPayload {
+                tool_use_id: "   ".to_string(),
+                answers: std::collections::HashMap::from([
+                    ("First?".to_string(), "A".to_string()),
+                    ("Second?".to_string(), "B".to_string()),
+                ]),
+                annotations: None,
+            }),
+        )
+        .await
+        .expect_err("empty action tool_use_id must be rejected");
+
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("tool_use_id must not be empty"));
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
+        assert_still_waiting_for_tool(&state, &conversation_id, "q-tool").await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_question_dismissal_rejects_empty_tool_use_id_without_mutating_wait() {
+        let state = make_test_state().await;
+        let conversation_id = coordinator_waiting_for_two_questions(&state, "q-tool").await;
+
+        let err = dismiss_question(
+            State(state.clone()),
+            Path(conversation_id.clone()),
+            Json(DismissQuestionPayload {
+                tool_use_id: String::new(),
+            }),
+        )
+        .await
+        .expect_err("empty dismissal tool_use_id must be rejected");
+
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("tool_use_id must not be empty"));
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
+        assert_still_waiting_for_tool(&state, &conversation_id, "q-tool").await;
     }
 
     #[tokio::test]
