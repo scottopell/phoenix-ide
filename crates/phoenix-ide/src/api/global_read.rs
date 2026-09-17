@@ -1120,7 +1120,10 @@ fn decode_previous_list_cursor(
     };
     let parts: Vec<&str> = cursor.splitn(6, ':').collect();
     if parts.len() != 6 || parts[0] != "v1" {
-        return Err("cursor is not a previous_transcripts cursor".to_string());
+        return Err(
+            "unsupported previous_transcripts cursor version; restart this list without a cursor"
+                .to_string(),
+        );
     }
     if parts[1] != "list"
         || parts[2] != binding.product_conversation_id
@@ -1229,9 +1232,6 @@ fn decode_conversation_read_cursor(
     if &decoded.scope != expected_scope || decoded.target_conversation_id != expected_target {
         return Err("read_conversation cursor does not belong to this host scope and target; restart this read without a cursor".to_string());
     }
-    if decoded.message_sequence <= 0 {
-        return Err("read_conversation cursor message sequence is invalid; restart this read without a cursor".to_string());
-    }
     Ok(PreviousReadPosition {
         message_sequence: decoded.message_sequence,
         byte_offset: decoded.byte_offset,
@@ -1259,7 +1259,7 @@ async fn initial_read_target(
     conversation_id: &str,
     cursor: &PreviousReadPosition,
 ) -> Result<Option<Vec<crate::db::Message>>, PreviousReadError> {
-    if cursor.message_sequence <= 0 {
+    if cursor.message_id.is_none() {
         return Ok(None);
     }
     db.get_message_range(
@@ -1291,14 +1291,17 @@ async fn render_message_page_bounded_as(
     let mut encoded_content_bytes = 0usize;
     let mut page_start = None;
     let mut next_cursor = None;
-    let mut after_sequence = 0;
-    let mut cursor_pending = cursor.message_sequence > 0;
+    let mut after_sequence = None;
+    let mut cursor_pending = cursor.message_id.is_some();
     let mut target_only = initial_read_target(db, &conv.id, &cursor).await?;
     loop {
         let messages = if let Some(messages) = target_only.take() {
             messages
-        } else {
+        } else if let Some(after_sequence) = after_sequence {
             db.get_messages_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
+                .await?
+        } else {
+            db.get_messages_first_limited(&conv.id, READ_MESSAGE_BATCH)
                 .await?
         };
         #[cfg(test)]
@@ -1312,7 +1315,7 @@ async fn render_message_page_bounded_as(
             break;
         }
         for message in messages {
-            after_sequence = message.sequence_id;
+            after_sequence = Some(message.sequence_id);
             if cursor_pending && message.sequence_id != cursor.message_sequence {
                 return Err(PreviousReadError::InvalidCursor(
                     "read cursor message is absent from the transcript".to_string(),
@@ -1485,14 +1488,23 @@ fn render_global_read_page(
     conv: &Conversation,
     page: BoundedMessagePage,
 ) -> Result<String, String> {
-    let mut output = format!(
-        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n{}",
-        conv.id,
+    let title = truncate_utf8_bytes(
         conv.title
             .as_deref()
             .or(conv.slug.as_deref())
             .unwrap_or(&conv.id),
-        conversation_href(conv),
+        PREVIOUS_TITLE_BYTES,
+    );
+    let link_target = conv.slug.as_deref().unwrap_or(&conv.id);
+    let link = format!(
+        "/c/{}",
+        truncate_utf8_bytes(link_target, PREVIOUS_TITLE_BYTES)
+    );
+    let mut output = format!(
+        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n{}",
+        truncate_utf8_bytes(&conv.id, PREVIOUS_TITLE_BYTES),
+        title,
+        link,
         conv.updated_at,
         page.content,
     );
@@ -1503,6 +1515,12 @@ fn render_global_read_page(
             "\n[… more content; call read_conversation again with cursor={cursor}]"
         )
         .map_err(|error| error.to_string())?;
+    }
+    if output.len() > PREVIOUS_TOOL_RESULT_BYTES {
+        return Err(
+            "read_conversation result metadata exceeded the host byte ceiling; use a conversation with bounded metadata"
+                .to_string(),
+        );
     }
     Ok(output)
 }
@@ -1560,7 +1578,16 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
     };
-    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+    let link_target = conv.slug.as_deref().unwrap_or(&conv.id);
+    let base = format!(
+        "/c/{}",
+        truncate_utf8_bytes(link_target, PREVIOUS_TITLE_BYTES)
+    );
+    let href = if message_type_has_rendered_anchor(message.message_type) {
+        format!("{base}#message-{}", message.message_id)
+    } else {
+        base
+    };
     format!(
         "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
         role,
@@ -2089,7 +2116,7 @@ mod tests {
         split_fragment, ConversationReadCursorScope, GlobalMessageTargetError, GlobalReadService,
         PreviousReadPosition, PreviousTranscriptReadStart, PreviousTranscriptsBinding,
         PreviousTranscriptsOutput, PreviousTranscriptsRequest, PREVIOUS_READ_CONTENT_JSON_BYTES,
-        PREVIOUS_TOOL_RESULT_BYTES,
+        PREVIOUS_TITLE_BYTES, PREVIOUS_TOOL_RESULT_BYTES,
     };
     use std::sync::Arc;
 
@@ -2340,6 +2367,76 @@ mod tests {
             pred_c.id,
         );
         (service, binding)
+    }
+
+    #[tokio::test]
+    async fn bounded_read_includes_and_continues_sequence_zero_message() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("sequence-zero", "sequence-zero", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "zero-message",
+            "sequence-zero",
+            0,
+            &crate::db::MessageContent::user(
+                "zero evidence ".repeat(PREVIOUS_READ_CONTENT_JSON_BYTES),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let retriever = db.fts_retriever();
+        let service = GlobalReadService::new(db, Arc::new(retriever));
+
+        let first = service
+            .read_conversation("sequence-zero", None)
+            .await
+            .unwrap();
+        assert!(first.contains("zero evidence"));
+        let cursor = first
+            .split("cursor=")
+            .nth(1)
+            .and_then(|value| value.strip_suffix("]"))
+            .expect("sequence-zero continuation cursor");
+        let continued = service
+            .read_conversation("sequence-zero", Some(cursor))
+            .await
+            .unwrap();
+
+        assert!(continued.contains("zero evidence"));
+    }
+
+    #[tokio::test]
+    async fn chain_read_bounds_wrapper_metadata() {
+        let (service, _) = predecessor_service().await;
+        sqlx::query("UPDATE conversations SET title = ?1, slug = ?2 WHERE id = 'pred-a'")
+            .bind("t".repeat(PREVIOUS_TOOL_RESULT_BYTES))
+            .bind("s".repeat(PREVIOUS_TOOL_RESULT_BYTES))
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+
+        let output = service
+            .read_chain_conversation("pred-a", "pred-a", None)
+            .await
+            .unwrap();
+
+        assert!(output.len() <= PREVIOUS_TOOL_RESULT_BYTES);
+        assert!(!output.contains(&"t".repeat(PREVIOUS_TITLE_BYTES + 1)));
+        assert!(!output.contains(&"s".repeat(PREVIOUS_TITLE_BYTES + 1)));
+    }
+
+    #[test]
+    fn unsupported_previous_list_cursor_directs_restart_without_cursor() {
+        let binding = PreviousTranscriptsBinding::new("product".into(), "current".into());
+
+        let error =
+            super::decode_previous_list_cursor(&binding, Some("v2:list:opaque")).unwrap_err();
+
+        assert!(error.contains("unsupported"));
+        assert!(error.contains("restart this list without a cursor"));
     }
 
     #[tokio::test]
