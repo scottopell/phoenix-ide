@@ -3687,7 +3687,7 @@ async fn watchdog_owned_spawn(
     server_token: &str,
     server_env: &[(String, String)],
 ) -> Result<(), TmuxError> {
-    let processes = super::test_server::spawn_owned_server(
+    let adopted = super::test_server::spawn_owned_server(
         socket_path,
         control_socket,
         config_path,
@@ -3701,13 +3701,9 @@ async fn watchdog_owned_spawn(
         reason: format!("watchdog-owned tmux spawn failed: {error}"),
     })?;
     if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
-        if let Err(retire_error) = super::test_server::retire_owned_server(
-            socket_path,
-            control_socket,
-            processes,
-            server_token,
-        )
-        .await
+        if let Err(retire_error) = adopted
+            .retire(socket_path, control_socket, server_token)
+            .await
         {
             tracing::error!(
                 socket = %socket_path.display(),
@@ -3721,6 +3717,13 @@ async fn watchdog_owned_spawn(
             reason: format!("failed to publish contained tmux socket: {error}"),
         });
     }
+    let processes = adopted
+        .commit_publication()
+        .await
+        .map_err(|error| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("watchdog publication handshake failed: {error}"),
+        })?;
     debug_assert!(processes.server.pid > 0 && processes.pane.pid > 0);
     Ok(())
 }

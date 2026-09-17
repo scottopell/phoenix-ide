@@ -41,6 +41,7 @@ cleanup_timeout = float(os.environ.get("PHOENIX_TMUX_CLEANUP_TIMEOUT", "6.5"))
 quarantine_hook = os.environ.get("PHOENIX_TMUX_QUARANTINE_HOOK")
 adoption_hook = os.environ.get("PHOENIX_TMUX_ADOPTION_HOOK")
 provisional = []
+adopted_pending_publication = []
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -277,8 +278,16 @@ def spawn_owned(request):
         adoption_rejected = request.with_name(
             request.name.replace(".spawn-", ".adoption-rejected-", 1)
         )
+        published = request.with_name(request.name.replace(".spawn-", ".published-", 1))
+        publication_cancelled = request.with_name(
+            request.name.replace(".spawn-", ".publication-cancelled-", 1)
+        )
+        publication_acknowledged = request.with_name(
+            request.name.replace(".spawn-", ".publication-acknowledged-", 1)
+        )
         provisional.append((socket, control, tuple(identities), adopt, adopted,
-                            adoption_rejected, acknowledged,
+                            adoption_rejected, published, publication_cancelled,
+                            publication_acknowledged, acknowledged,
                             time.monotonic() + adoption_timeout))
         publish_response(acknowledged, "\t".join(
             str(value) for identity in identities for value in identity[:2]
@@ -294,6 +303,28 @@ def spawn_owned(request):
         except OSError:
             pass
     return True
+
+def remove_exact_visible(record):
+    socket, device, inode, _, _ = record
+    if not socket.exists():
+        return True
+    quarantine = root / f".retired-visible-{uuid.uuid4()}"
+    try:
+        os.replace(socket, quarantine)
+        moved_stat = quarantine.stat()
+        if moved_stat.st_dev != device or moved_stat.st_ino != inode:
+            try:
+                if not socket.exists():
+                    os.replace(quarantine, socket)
+            except OSError:
+                pass
+            return False
+        quarantine.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 def remove_retired_control(record):
     _, device, inode, control, _ = record
@@ -316,8 +347,12 @@ def remove_retired_control(record):
         return False
 
 def retire(request):
-    rejected = request.with_name(request.name.replace(".retire-", ".retire-rejected-", 1))
-    acknowledged = request.with_name(request.name.replace(".retire-", ".retired-", 1))
+    rejected = request.with_name(
+        request.name.replace(".retire-request-", ".retire-rejected-", 1)
+    )
+    acknowledged = request.with_name(
+        request.name.replace(".retire-request-", ".retired-", 1)
+    )
     try:
         fields = request.read_text().split("\t")
         if len(fields) != 7:
@@ -388,8 +423,58 @@ while not (root / ".cleanup-request").exists():
     if request is not None:
         break
     now = time.monotonic()
+    for item in list(adopted_pending_publication):
+        (socket, control, identities, published, publication_cancelled,
+         publication_acknowledged, adoption_rejected, deadline) = item
+        record = exact_record(socket, control, identities)
+        publish_valid = False
+        if published.exists() and record is not None:
+            try:
+                socket_stat = socket.stat()
+                control_stat = control.stat()
+                publish_valid = (
+                    socket_stat.st_dev == record[1] and socket_stat.st_ino == record[2]
+                    and control_stat.st_dev == record[1] and control_stat.st_ino == record[2]
+                )
+            except OSError:
+                publish_valid = False
+        if publication_cancelled.exists():
+            adopted_pending_publication.remove(item)
+            retired = record is not None and retire_record(
+                record, time.monotonic() + identity_timeout
+            )
+            cleaned = (retired and remove_exact_visible(record)
+                       and remove_retired_control(record))
+            if cleaned:
+                owned.remove(record)
+            else:
+                unconfirmed_obligations.append((socket, control))
+        elif publish_valid:
+            try:
+                publish_response(publication_acknowledged, "published")
+                published.unlink(missing_ok=True)
+                adopted_pending_publication.remove(item)
+            except OSError:
+                adopted_pending_publication.remove(item)
+                unconfirmed_obligations.append((socket, control))
+        elif published.exists() or now >= deadline:
+            adopted_pending_publication.remove(item)
+            retired = record is not None and retire_record(
+                record, time.monotonic() + identity_timeout
+            )
+            cleaned = (retired and remove_exact_visible(record)
+                       and remove_retired_control(record))
+            if cleaned:
+                owned.remove(record)
+                try:
+                    publish_response(adoption_rejected, "publication failed; exact server retired")
+                except OSError:
+                    pass
+            else:
+                unconfirmed_obligations.append((socket, control))
     for item in list(provisional):
         (socket, control, identities, adopt, adopted, adoption_rejected,
+         published, publication_cancelled, publication_acknowledged,
          acknowledged, deadline) = item
         if adoption_hook:
             subprocess.run(
@@ -399,9 +484,25 @@ while not (root / ".cleanup-request").exists():
             )
         if now < deadline and adopt.exists():
             provisional.remove(item)
-            adopt.unlink(missing_ok=True)
-            acknowledged.unlink(missing_ok=True)
-            publish_response(adopted, "adopted")
+            try:
+                adopt.unlink()
+                publish_response(adopted, "adopted")
+                adopted_pending_publication.append((
+                    socket, control, identities, published, publication_cancelled,
+                    publication_acknowledged, adoption_rejected,
+                    time.monotonic() + adoption_timeout
+                ))
+            except OSError:
+                record = exact_record(socket, control, identities)
+                retired = record is not None and retire_record(
+                    record, time.monotonic() + identity_timeout
+                )
+                cleaned = (retired and remove_exact_visible(record)
+                           and remove_retired_control(record))
+                if cleaned:
+                    owned.remove(record)
+                else:
+                    unconfirmed_obligations.append((socket, control))
         elif now >= deadline:
             provisional.remove(item)
             record = exact_record(socket, control, identities)
@@ -417,7 +518,7 @@ while not (root / ".cleanup-request").exists():
                     "lease expired; exact provisional retirement could not be proven",
                 )
                 unconfirmed_obligations.append((socket, control))
-    for request in control_root.glob(".retire-*"):
+    for request in control_root.glob(".retire-request-*"):
         if not retire(request):
             break
     else:
@@ -901,6 +1002,84 @@ fn protocol_field(path: &Path, label: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(format!("{label} is not protocol-safe UTF-8")))
 }
 
+fn write_server_environment(path: &Path, server_env: &[(String, String)]) -> io::Result<()> {
+    fs::write(
+        path,
+        serde_json::to_vec(server_env).map_err(io::Error::other)?,
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct AdoptedTestServer {
+    pub(crate) processes: TestServerProcesses,
+    published: PathBuf,
+    publication_acknowledged: PathBuf,
+    publication_cancelled: PathBuf,
+    adoption_rejected: PathBuf,
+    committed: bool,
+}
+
+impl Drop for AdoptedTestServer {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::write(&self.publication_cancelled, []);
+        }
+    }
+}
+
+impl AdoptedTestServer {
+    fn new(
+        processes: TestServerProcesses,
+        published: PathBuf,
+        publication_acknowledged: PathBuf,
+        publication_cancelled: PathBuf,
+        adoption_rejected: PathBuf,
+    ) -> Self {
+        Self {
+            processes,
+            published,
+            publication_acknowledged,
+            publication_cancelled,
+            adoption_rejected,
+            committed: false,
+        }
+    }
+
+    pub(crate) async fn commit_publication(mut self) -> io::Result<TestServerProcesses> {
+        fs::write(&self.published, [])?;
+        let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+        loop {
+            if self.publication_acknowledged.exists() {
+                self.committed = true;
+                return Ok(self.processes);
+            }
+            if let Ok(reason) = fs::read_to_string(&self.adoption_rejected) {
+                return Err(io::Error::other(format!(
+                    "tmux watchdog rejected publication: {reason}"
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tmux watchdog did not acknowledge visible publication",
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(crate) async fn retire(
+        mut self,
+        socket: &Path,
+        control_socket: &Path,
+        expected_token: &str,
+    ) -> io::Result<()> {
+        retire_owned_server(socket, control_socket, self.processes, expected_token).await?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
 pub(crate) async fn spawn_owned_server(
     socket: &Path,
     control_socket: &Path,
@@ -908,7 +1087,7 @@ pub(crate) async fn spawn_owned_server(
     cwd: &Path,
     token: &str,
     server_env: &[(String, String)],
-) -> io::Result<TestServerProcesses> {
+) -> io::Result<AdoptedTestServer> {
     let control_root = control_socket
         .parent()
         .ok_or_else(|| io::Error::other("tmux test control socket has no root"))?;
@@ -936,11 +1115,11 @@ pub(crate) async fn spawn_owned_server(
     let adopted = control_root.join(format!(".adopt-{nonce}"));
     let adoption_acknowledged = control_root.join(format!(".adopted-{nonce}"));
     let adoption_rejected = control_root.join(format!(".adoption-rejected-{nonce}"));
+    let published = control_root.join(format!(".published-{nonce}"));
+    let publication_cancelled = control_root.join(format!(".publication-cancelled-{nonce}"));
+    let publication_acknowledged = control_root.join(format!(".publication-acknowledged-{nonce}"));
     let env_file = control_root.join(format!(".environment-{nonce}.json"));
-    fs::write(
-        &env_file,
-        serde_json::to_vec(server_env).map_err(io::Error::other)?,
-    )?;
+    write_server_environment(&env_file, server_env)?;
     let _artifacts = RegistrationArtifacts {
         paths: vec![
             pending.clone(),
@@ -977,9 +1156,16 @@ pub(crate) async fn spawn_owned_server(
             }
         }
         if adoption_acknowledged.exists() {
-            return registered.ok_or_else(|| {
+            let processes = registered.ok_or_else(|| {
                 io::Error::other("tmux watchdog acknowledged adoption before registration")
-            });
+            })?;
+            return Ok(AdoptedTestServer::new(
+                processes,
+                published,
+                publication_acknowledged,
+                publication_cancelled,
+                adoption_rejected,
+            ));
         }
         if let Ok(reason) = fs::read_to_string(&adoption_rejected) {
             return Err(io::Error::other(format!(
@@ -1027,7 +1213,7 @@ pub(crate) async fn retire_owned_server(
         "control name",
     )?;
     let nonce = uuid::Uuid::new_v4();
-    let request = control_root.join(format!(".retire-{nonce}"));
+    let request = control_root.join(format!(".retire-request-{nonce}"));
     let pending = control_root.join(format!(".pending-retire-{nonce}"));
     let retired = control_root.join(format!(".retired-{nonce}"));
     let rejected = control_root.join(format!(".retire-rejected-{nonce}"));
@@ -1835,7 +2021,7 @@ mod tests {
         let control = owner.control_root_path().join("malformed-token.sock");
         let (_, processes) = spawn_server_with_processes(&owner, "malformed-token");
         fs::write(
-            owner.control_root_path().join(".retire-malformed"),
+            owner.control_root_path().join(".retire-request-malformed"),
             format!(
                 "malformed-token.sock\tmalformed-token.sock\t{}\t{}\tbad,token\t{}\t{}",
                 processes.server.pid,
@@ -2046,6 +2232,154 @@ mod tests {
         );
         owner.shutdown();
         assert_exact_processes_gone(processes);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_adoption_before_publication_retires_and_allows_respawn() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("cancel-before-publish.sock");
+        let control = control_root.join("cancel-before-publish.sock");
+        let token = "cancel-before-publish-token";
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+        ];
+        let adopted = spawn_owned_server(
+            &socket,
+            &control,
+            &root.join("config"),
+            &root,
+            token,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let cancelled_processes = adopted.processes;
+
+        drop(adopted);
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while phoenix_core::process_identity::process_identity_matches(cancelled_processes.server)
+            || socket.exists()
+            || control.exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled adopted server cleanup did not complete"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let registry = owner.registry();
+        let scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::parse("cancel-before-publish").unwrap(),
+        );
+        let replacement = registry
+            .ensure_live(&scope, &root, None, None)
+            .await
+            .expect("subsequent ensure_live must recover cancelled adoption");
+        assert_ne!(replacement.read().await.server_token, token);
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_visible_link_before_confirmation_removes_link_and_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        let socket = root.join("cancel-after-link.sock");
+        let control = control_root.join("cancel-after-link.sock");
+        let token = "cancel-after-link-token";
+        let environment = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("PHOENIX_TMUX_SERVER_TOKEN".to_owned(), token.to_owned()),
+        ];
+        let adopted = spawn_owned_server(
+            &socket,
+            &control,
+            &root.join("config"),
+            &root,
+            token,
+            &environment,
+        )
+        .await
+        .unwrap();
+        let processes = adopted.processes;
+        fs::hard_link(&control, &socket).unwrap();
+
+        drop(adopted);
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while phoenix_core::process_identity::process_identity_matches(processes.server)
+            || socket.exists()
+            || control.exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "linked cancelled server cleanup did not complete"
+            );
+            tokio::task::yield_now().await;
+        }
+        owner.shutdown();
+    }
+
+    #[test]
+    fn adoption_ack_io_failure_routes_exact_record_through_cleanup() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hook_dir = TempDir::new().unwrap();
+        let hook = hook_dir.path().join("block-adoption-ack");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nadopted=$(printf '%s' \"$1\" | sed 's/.adopt-/.adopted-/')\nmkdir -p \"$adopted\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(1)),
+            Some(&hook),
+        );
+        let root = owner.path().to_path_buf();
+        let control_root = owner.control_root_path().to_path_buf();
+        write_adoption_environment(&control_root, "io-failure-env.json", "io-failure-token");
+        fs::write(
+            control_root.join(".spawn-io-failure"),
+            format!(
+                "io-failure.sock\tio-failure.sock\t{}\t{}\tio-failure-token\tio-failure-env.json\t.adopt-io-failure",
+                root.join("config").display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        wait_until(
+            || control_root.join(".registered-io-failure").exists(),
+            "I/O failure provisional registration",
+        );
+        let processes = parse_acknowledged_processes(
+            &fs::read_to_string(control_root.join(".registered-io-failure")).unwrap(),
+        )
+        .unwrap();
+        fs::write(control_root.join(".adopt-io-failure"), []).unwrap();
+        wait_until(
+            || !phoenix_core::process_identity::process_identity_matches(processes.server),
+            "I/O failure exact retirement",
+        );
+        assert!(!control_root.join("io-failure.sock").exists());
+        fs::remove_dir_all(control_root.join(".adopted-io-failure")).unwrap();
+        owner.shutdown();
     }
 
     #[tokio::test]
