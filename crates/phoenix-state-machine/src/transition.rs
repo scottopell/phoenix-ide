@@ -2531,6 +2531,28 @@ pub fn transition_parent(
                     }
                 };
 
+                if let Err(err) = input.validate() {
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
+                            "ask_user_question produces exactly one tool_use and one result",
+                        );
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
                 let tool_result = ToolResult::success(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
@@ -5337,6 +5359,10 @@ mod tests {
                                     "label": "A",
                                     "description": "Path A",
                                     "preview": "Do A"
+                                }, {
+                                    "label": "B",
+                                    "description": "Path B",
+                                    "preview": "Do B"
                                 }],
                                 "multiSelect": false
                             }]
@@ -5349,11 +5375,18 @@ mod tests {
                         questions: vec![UserQuestion {
                             question: "Which path?".to_string(),
                             header: "Choice".to_string(),
-                            options: vec![QuestionOption {
-                                label: "A".to_string(),
-                                description: Some("Path A".to_string()),
-                                preview: Some("Do A".to_string()),
-                            }],
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: Some("Path A".to_string()),
+                                    preview: Some("Do A".to_string()),
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: Some("Path B".to_string()),
+                                    preview: Some("Do B".to_string()),
+                                },
+                            ],
                             multi_select: false,
                         }],
                         metadata: None,
@@ -5379,6 +5412,81 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_typed_invalid_options_before_waiting() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "auq-coordinator-invalid",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-invalid",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![QuestionOption {
+                                label: "A".to_string(),
+                                description: None,
+                                preview: None,
+                            }],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-invalid".into(),
+            },
+        )
+        .expect("typed but invalid AUQ returns a tool error");
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("invalid typed AUQ persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains("requires 2-4 options"),
+                "error should explain option count validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for invalid typed AUQ, got {other:?}")
+            }
+        }
     }
 
     #[test]

@@ -132,6 +132,53 @@ pub struct AskUserQuestionInput {
     pub metadata: Option<QuestionMetadata>,
 }
 
+impl AskUserQuestionInput {
+    /// Validates the `ask_user_question` ambiguity constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable tool error when the question count is outside
+    /// 1-4, a question has outside 2-4 options, question text is duplicated, or
+    /// an option label is duplicated within a question.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.questions.is_empty() || self.questions.len() > 4 {
+            return Err(format!(
+                "ask_user_question requires 1-4 questions; got {}",
+                self.questions.len()
+            ));
+        }
+
+        let mut question_texts = std::collections::HashSet::new();
+        for (question_index, question) in self.questions.iter().enumerate() {
+            let question_number = question_index + 1;
+            if !question_texts.insert(question.question.as_str()) {
+                return Err(format!(
+                    "ask_user_question question {question_number} duplicates question text `{}`",
+                    question.question
+                ));
+            }
+            if question.options.len() < 2 || question.options.len() > 4 {
+                return Err(format!(
+                    "ask_user_question question {question_number} requires 2-4 options; got {}",
+                    question.options.len()
+                ));
+            }
+
+            let mut option_labels = std::collections::HashSet::new();
+            for option in &question.options {
+                if !option_labels.insert(option.label.as_str()) {
+                    return Err(format!(
+                        "ask_user_question question {question_number} duplicates option label `{}`",
+                        option.label
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Optional metadata for an `ask_user_question` invocation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionMetadata {

@@ -1546,6 +1546,13 @@ mod tests {
         assert!(!coordinator.contains("patch"));
         assert!(!coordinator.contains("tmux_run"));
         assert!(!coordinator.contains("submit_result"));
+        let coordinator_definitions =
+            ToolRegistry::coordinator(vec![Arc::new(AskUserQuestionTool)]).definitions();
+        let coordinator_auq = coordinator_definitions
+            .iter()
+            .find(|definition| definition.name == "ask_user_question")
+            .expect("Coordinator registry includes AUQ");
+        assert!(coordinator_auq.defer_loading);
 
         // Sub-agent Explore with sandbox: read-only + sandboxed bash + submit.
         // no ask_user, no propose_task, no parent-terminal tools.
