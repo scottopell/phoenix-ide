@@ -18,6 +18,8 @@ pub enum ProjectCoordinatorProfileWriteDbError {
     Domain(#[from] ProjectCoordinatorProfileWriteError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error("Project Coordinator profile commit outcome is unclassifiable")]
+    AmbiguousCommit,
 }
 
 fn validate_charter(charter: &str) -> Result<(), ProjectCoordinatorProfileWriteError> {
@@ -25,6 +27,15 @@ fn validate_charter(charter: &str) -> Result<(), ProjectCoordinatorProfileWriteE
         return Err(ProjectCoordinatorProfileWriteError::InvalidCharter);
     }
     Ok(())
+}
+
+fn profile_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProjectCoordinatorProfile> {
+    ProjectCoordinatorProfile::new(
+        row.get("charter"),
+        row.get("revision"),
+        row.get("updated_at_unix_micros"),
+    )
+    .map_err(|error| crate::DbError::Serialization(error.to_string()))
 }
 
 impl Database {
@@ -45,11 +56,7 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|row| ProjectCoordinatorProfile {
-            charter: row.get("charter"),
-            revision: row.get("revision"),
-            updated_at_unix_micros: row.get("updated_at_unix_micros"),
-        }))
+        row.as_ref().map(profile_from_row).transpose()
     }
 
     /// Resolves a conversation segment through its stable `ProductConversation` identity.
@@ -71,11 +78,7 @@ impl Database {
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|row| ProjectCoordinatorProfile {
-            charter: row.get("charter"),
-            revision: row.get("revision"),
-            updated_at_unix_micros: row.get("updated_at_unix_micros"),
-        }))
+        row.as_ref().map(profile_from_row).transpose()
     }
 
     /// Creates, revision-fences, or removes the optional profile.
@@ -104,63 +107,115 @@ impl Database {
             return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
         }
 
-        let rows_affected = match (charter, expected_revision) {
-            (Some(charter), None) => {
-                sqlx::query(
-                    "INSERT INTO product_conversation_coordinator_profiles
-                     (product_conversation_id, charter, revision, updated_at_unix_micros)
-                 VALUES (?1, ?2, 1, ?3)
-                 ON CONFLICT(product_conversation_id) DO NOTHING",
-                )
-                .bind(product_conversation_id.as_str())
-                .bind(charter)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-            }
-            (Some(charter), Some(revision)) => {
-                sqlx::query(
-                    "UPDATE product_conversation_coordinator_profiles
-                 SET charter = ?2, revision = revision + 1, updated_at_unix_micros = ?3
-                 WHERE product_conversation_id = ?1 AND revision = ?4",
-                )
-                .bind(product_conversation_id.as_str())
-                .bind(charter)
-                .bind(now)
-                .bind(revision)
-                .execute(&mut *tx)
-                .await
-            }
-            (None, Some(revision)) => {
-                sqlx::query(
-                    "DELETE FROM product_conversation_coordinator_profiles
-                 WHERE product_conversation_id = ?1 AND revision = ?2",
-                )
-                .bind(product_conversation_id.as_str())
-                .bind(revision)
-                .execute(&mut *tx)
-                .await
-            }
-            (None, None) => {
-                return Err(ProjectCoordinatorProfileWriteError::RevisionConflict.into())
-            }
-        }?
-        .rows_affected();
-
-        if rows_affected != 1 {
+        let active_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profiles
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active_revision != expected_revision {
             return Err(ProjectCoordinatorProfileWriteError::RevisionConflict.into());
         }
-        tx.commit().await?;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision)
+             VALUES (?1, 1)
+             ON CONFLICT(product_conversation_id)
+             DO UPDATE SET revision = revision + 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let new_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
 
+        let outcome = if let Some(charter) = charter {
+            sqlx::query(
+                "INSERT INTO product_conversation_coordinator_profiles
+                         (product_conversation_id, charter, revision, updated_at_unix_micros)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(product_conversation_id) DO UPDATE SET
+                         charter = excluded.charter,
+                         revision = excluded.revision,
+                         updated_at_unix_micros = excluded.updated_at_unix_micros",
+            )
+            .bind(product_conversation_id.as_str())
+            .bind(charter)
+            .bind(new_revision)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            ProjectCoordinatorProfileWriteOutcome::Saved(ProjectCoordinatorProfile::new(
+                charter.to_string(),
+                new_revision,
+                now,
+            )?)
+        } else {
+            sqlx::query(
+                "DELETE FROM product_conversation_coordinator_profiles
+                 WHERE product_conversation_id = ?1",
+            )
+            .bind(product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            ProjectCoordinatorProfileWriteOutcome::Disabled
+        };
+
+        if tx.commit().await.is_err()
+            && !self
+                .project_coordinator_write_matches(
+                    product_conversation_id,
+                    charter,
+                    new_revision,
+                    now,
+                )
+                .await
+        {
+            return Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit);
+        }
+        Ok(outcome)
+    }
+
+    async fn project_coordinator_write_matches(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        charter: Option<&str>,
+        revision: i64,
+        updated_at_unix_micros: i64,
+    ) -> bool {
+        let persisted_revision: Result<Option<i64>, _> = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await;
+        if !matches!(persisted_revision, Ok(Some(value)) if value == revision) {
+            return false;
+        }
         match charter {
-            Some(charter) => Ok(ProjectCoordinatorProfileWriteOutcome::Saved(
-                ProjectCoordinatorProfile {
-                    charter: charter.to_string(),
-                    revision: expected_revision.map_or(1, |revision| revision + 1),
-                    updated_at_unix_micros: now,
-                },
-            )),
-            None => Ok(ProjectCoordinatorProfileWriteOutcome::Disabled),
+            Some(charter) => sqlx::query(
+                "SELECT 1 FROM product_conversation_coordinator_profiles
+                 WHERE product_conversation_id = ?1 AND charter = ?2
+                   AND revision = ?3 AND updated_at_unix_micros = ?4",
+            )
+            .bind(product_conversation_id.as_str())
+            .bind(charter)
+            .bind(revision)
+            .bind(updated_at_unix_micros)
+            .fetch_optional(&self.pool)
+            .await
+            .is_ok_and(|row| row.is_some()),
+            None => self
+                .get_project_coordinator_profile(product_conversation_id)
+                .await
+                .is_ok_and(|profile| profile.is_none()),
         }
     }
 }
@@ -199,17 +254,15 @@ mod tests {
             .expect("create profile");
         assert!(matches!(
             created,
-            ProjectCoordinatorProfileWriteOutcome::Saved(ProjectCoordinatorProfile {
-                revision: 1,
-                ..
-            })
+            ProjectCoordinatorProfileWriteOutcome::Saved(ref profile)
+                if profile.revision() == 1
         ));
         assert_eq!(
             db.get_project_coordinator_profile(&id)
                 .await
                 .expect("read profile")
                 .expect("profile")
-                .charter,
+                .charter(),
             charter
         );
 
@@ -231,7 +284,7 @@ mod tests {
                 .await
                 .expect("read profile")
                 .expect("profile")
-                .charter,
+                .charter(),
             "accepted"
         );
     }
@@ -290,8 +343,8 @@ mod tests {
             .await
             .expect("read profile")
             .expect("profile");
-        assert_eq!(profile.charter, "restart charter");
-        assert_eq!(profile.revision, 1);
+        assert_eq!(profile.charter(), "restart charter");
+        assert_eq!(profile.revision(), 1);
     }
 
     #[tokio::test]
@@ -326,8 +379,39 @@ mod tests {
             .await
             .expect("lookup")
             .expect("profile");
-        assert_eq!(profile.charter, "current charter");
-        assert_eq!(profile.revision, 2);
+        assert_eq!(profile.charter(), "current charter");
+        assert_eq!(profile.revision(), 2);
+    }
+
+    #[tokio::test]
+    async fn disable_and_reenable_never_reuse_revision() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-aba").await;
+        db.write_project_coordinator_profile(&id, Some("first"), None)
+            .await
+            .expect("enable");
+        db.write_project_coordinator_profile(&id, None, Some(1))
+            .await
+            .expect("disable");
+        let reenabled = db
+            .write_project_coordinator_profile(&id, Some("second"), None)
+            .await
+            .expect("reenable");
+        assert!(matches!(
+            reenabled,
+            ProjectCoordinatorProfileWriteOutcome::Saved(ref profile)
+                if profile.revision() == 3
+        ));
+        let stale = db
+            .write_project_coordinator_profile(&id, Some("stale"), Some(1))
+            .await
+            .expect_err("old incarnation must conflict");
+        assert!(matches!(
+            stale,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::RevisionConflict
+            )
+        ));
     }
 
     #[tokio::test]
@@ -351,8 +435,8 @@ mod tests {
             .await
             .expect("read profile")
             .expect("profile");
-        assert_eq!(stored.revision, 1);
-        assert!(stored.charter == "left" || stored.charter == "right");
+        assert_eq!(stored.revision(), 1);
+        assert!(stored.charter() == "left" || stored.charter() == "right");
     }
 
     #[tokio::test]

@@ -423,6 +423,39 @@ describe('ProductConversationPage', () => {
     expect(screen.getByLabelText('Charter')).toHaveValue('Unsaved charter');
   });
 
+  it('keeps the editor base revision when a refreshed snapshot arrives', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Opened charter',
+          revision: 4,
+          updated_at_unix_micros: 1,
+        },
+      }))
+      .mockResolvedValue(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Other editor charter',
+          revision: 5,
+          updated_at_unix_micros: 2,
+        },
+      }));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Dirty draft' } });
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
+      enabled: true,
+      charter: 'Dirty draft',
+      expected_revision: 4,
+    }));
+  });
+
   it('disables the profile using the current revision fence', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({

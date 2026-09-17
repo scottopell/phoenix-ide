@@ -199,11 +199,8 @@ pub trait MessageStore: Send + Sync {
 
     async fn get_project_coordinator_profile(
         &self,
-        _conv_id: &str,
-    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>
-    {
-        Ok(None)
-    }
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>;
 
     /// Load one transactionally consistent, fully hydrated durable prompt
     /// snapshot for a runtime-owned projection.
