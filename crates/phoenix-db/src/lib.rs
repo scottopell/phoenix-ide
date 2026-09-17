@@ -406,7 +406,7 @@ pub(crate) async fn commit_continuation_tx(
         conversation_id,
         operation_id,
         &message.message_id,
-        &state_updated_at.to_rfc3339(),
+        state_updated_at.timestamp_micros(),
     )
     .await?;
     Ok(ContinuationCommitOutcome::Applied)
@@ -417,14 +417,15 @@ async fn admit_automatic_continuation_tx(
     conversation_id: &str,
     operation_id: &str,
     summary_message_id: &str,
-    admitted_at: &str,
+    admitted_at_unix_micros: i64,
 ) -> DbResult<()> {
     let first_message_id = format!("automatic-continuation-{conversation_id}-{operation_id}");
     sqlx::query(
         "INSERT INTO automatic_continuation_admissions (
              predecessor_conversation_id, product_conversation_id, summary_message_id,
              operation_id, first_message_id, opening_authority, phase,
-             no_progress_attempts, last_error, admitted_at, updated_at
+             no_progress_attempts, last_error,
+             admitted_at_unix_micros, updated_at_unix_micros
          )
          SELECT conversation.id, conversation.product_conversation_id, ?2, ?3, ?4,
                 'generated_predecessor_context', 'admitted', 0, NULL, ?5, ?5
@@ -452,7 +453,7 @@ async fn admit_automatic_continuation_tx(
     .bind(summary_message_id)
     .bind(operation_id)
     .bind(first_message_id)
-    .bind(admitted_at)
+    .bind(admitted_at_unix_micros)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1283,6 +1284,8 @@ pub struct AutomaticContinuationAdmission {
     pub phase: AutomaticContinuationPhase,
     pub no_progress_attempts: u32,
     pub last_error: Option<String>,
+    pub admitted_at_unix_micros: i64,
+    pub updated_at_unix_micros: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6562,7 +6565,8 @@ impl Database {
         let row = sqlx::query(
             "SELECT product_conversation_id, summary_message_id, operation_id,
                     first_message_id, opening_authority, phase,
-                    no_progress_attempts, last_error
+                    no_progress_attempts, last_error,
+                    admitted_at_unix_micros, updated_at_unix_micros
              FROM automatic_continuation_admissions
              WHERE predecessor_conversation_id = ?1",
         )
@@ -6600,6 +6604,8 @@ impl Database {
                 ))
             })?,
             last_error: row.try_get("last_error")?,
+            admitted_at_unix_micros: row.try_get("admitted_at_unix_micros")?,
+            updated_at_unix_micros: row.try_get("updated_at_unix_micros")?,
         }))
     }
 
@@ -17911,6 +17917,11 @@ mod tests {
         assert_eq!(admitted.phase, AutomaticContinuationPhase::Admitted);
         assert_eq!(admitted.no_progress_attempts, 0);
         assert!(admitted.last_error.is_none());
+        assert!(admitted.admitted_at_unix_micros >= 0);
+        assert_eq!(
+            admitted.updated_at_unix_micros,
+            admitted.admitted_at_unix_micros
+        );
 
         let auto_on_product = admitted.product_conversation_id.clone();
         db.set_auto_continue_on_context_exhaustion(

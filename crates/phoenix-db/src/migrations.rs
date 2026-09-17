@@ -600,8 +600,10 @@ CREATE TABLE automatic_continuation_admissions (
     no_progress_attempts INTEGER NOT NULL DEFAULT 0
         CHECK (typeof(no_progress_attempts) = 'integer' AND no_progress_attempts >= 0),
     last_error TEXT,
-    admitted_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    admitted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(admitted_at_unix_micros) = 'integer' AND admitted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
     CHECK ((phase = 'failed') = (last_error IS NOT NULL)),
     UNIQUE (predecessor_conversation_id, product_conversation_id)
 );
@@ -10461,6 +10463,35 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(admission_count, 0);
+        let timestamp_columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, type FROM pragma_table_info('automatic_continuation_admissions')
+             WHERE name IN ('admitted_at_unix_micros', 'updated_at_unix_micros')
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            timestamp_columns,
+            vec![
+                ("admitted_at_unix_micros".to_string(), "INTEGER".to_string()),
+                ("updated_at_unix_micros".to_string(), "INTEGER".to_string()),
+            ]
+        );
+        let invalid_timestamp = sqlx::query(
+            "INSERT INTO automatic_continuation_admissions (
+                 predecessor_conversation_id, product_conversation_id, summary_message_id,
+                 operation_id, first_message_id, opening_authority, phase,
+                 no_progress_attempts, last_error,
+                 admitted_at_unix_micros, updated_at_unix_micros
+             ) VALUES (
+                 'parent', 'ordinary', 'missing-summary', 'operation', 'opening',
+                 'generated_predecessor_context', 'admitted', 0, NULL, -1, 0
+             )",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_timestamp.is_err());
         assert!(sqlx::query(
             "UPDATE product_conversations
              SET auto_continue_on_context_exhaustion = 2 WHERE id = 'ordinary'",
