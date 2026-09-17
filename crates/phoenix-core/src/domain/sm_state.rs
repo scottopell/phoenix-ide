@@ -138,8 +138,8 @@ impl AskUserQuestionInput {
     /// # Errors
     ///
     /// Returns a human-readable tool error when the question count is outside
-    /// 1-4, question/header text is empty, question text exceeds 5 words, a
-    /// header exceeds 12 characters, a question has outside 2-4 options,
+    /// 1-4, question/header text is empty, a header exceeds 12 characters, a
+    /// question has outside 2-4 options,
     /// question text is duplicated, an option label is empty, too long, or
     /// duplicated within a question, an option description is blank, or an option
     /// uses a UI-reserved label.
@@ -158,12 +158,6 @@ impl AskUserQuestionInput {
             if question_text.is_empty() {
                 return Err(format!(
                     "ask_user_question question {question_number} has empty question text"
-                ));
-            }
-            let question_word_count = question_text.split_whitespace().count();
-            if question_word_count > 5 {
-                return Err(format!(
-                    "ask_user_question question {question_number} text `{question_text}` exceeds 5 words"
                 ));
             }
             if question.header.trim().is_empty() {

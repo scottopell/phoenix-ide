@@ -57,6 +57,7 @@ final class ConversationStateTests: XCTestCase {
     func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
         {"type":"awaiting_user_response",
+         "tool_use_id":"tool-1",
          "questions":[{"question":"Which db?","header":"DB",
                        "options":[{"label":"sqlite","description":"file-backed"},
                                   {"label":"postgres","description":""}],
@@ -76,7 +77,7 @@ final class ConversationStateTests: XCTestCase {
                 UserQuestion(
                     question: "Which features?", header: "Feat",
                     options: [], multiSelect: true),
-            ]))
+            ], toolUseId: "tool-1"))
     }
 
     func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {
@@ -252,14 +253,27 @@ final class ConversationStateTests: XCTestCase {
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {
         let original = ConversationState.awaitingUserResponse(questions: [
             UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
-        ])
+        ], toolUseId: "tool-1")
         let followUp = ConversationState.awaitingUserResponse(questions: [
             UserQuestion(question: "Next?", header: "Two", options: [], multiSelect: false),
-        ])
-        let action = ConversationAction.respondToQuestions(answers: ["First?": "yes"])
+        ], toolUseId: "tool-2")
+        let action = ConversationAction.respondToQuestions(toolUseId: "tool-1", answers: ["First?": "yes"])
 
         XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: original))
+        XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: followUp))
+    }
+
+    func testQuestionActionUnlocksWhenOnlyToolIdentityChanges() {
+        let original = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "Repeat?", header: "One", options: [], multiSelect: false),
+        ], toolUseId: "tool-1")
+        let followUp = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "Repeat?", header: "One", options: [], multiSelect: false),
+        ], toolUseId: "tool-2")
+        let action = ConversationAction.respondToQuestions(toolUseId: "tool-1", answers: ["Repeat?": "yes"])
+
         XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: followUp))
     }
@@ -277,7 +291,7 @@ final class ConversationStateTests: XCTestCase {
                 .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
-            ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)
+            ConversationState.awaitingUserResponse(questions: [], toolUseId: "tool-1").acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
                 .acceptsChatMessage)

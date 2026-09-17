@@ -5634,11 +5634,15 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_ask_user_question_rejects_question_over_five_words_before_waiting() {
+    fn coordinator_ask_user_question_accepts_full_question_text_before_waiting() {
         let result = coordinator_invalid_question_text_result("one two three four five six")
-            .expect("long question text returns a tool error");
+            .expect("long question text remains valid full text");
 
-        assert_invalid_auq_label_result(&result, "exceeds 5 words", "long question text");
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingUserResponse { ref tool_use_id, .. }
+                if tool_use_id == "coordinator-auq-long-question"
+        ));
     }
 
     #[test]

@@ -27,9 +27,9 @@ enum ConversationAction: Equatable {
     case provideTaskFeedback(TaskFeedback)
     /// Answer the agent's questions (awaiting_user_response). Answers are
     /// keyed by question text, encoded per QuestionAnswers.
-    case respondToQuestions(answers: [String: String])
+    case respondToQuestions(toolUseId: String, answers: [String: String])
     /// Dismiss the questions without answering and return the conversation to idle.
-    case dismissQuestion
+    case dismissQuestion(toolUseId: String)
 
     var waitsForAuthoritativeStateChange: Bool {
         true
