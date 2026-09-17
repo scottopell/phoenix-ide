@@ -5344,7 +5344,20 @@ mod tests {
                 server_token: live.server_token.clone(),
             }
         };
+        let server_identity = exact_server_process_identity_until(
+            &persisted.socket_path,
+            &persisted.server_token,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("captured bootstrap server identity");
         kill_socket(&persisted.socket_path).await;
+        wait_for_exact_process_absence(server_identity).await;
+        std::fs::remove_file(&persisted.socket_path).expect("remove exited server socket");
+        assert_eq!(
+            probe(&persisted.socket_path).await.unwrap(),
+            ProbeResult::NoSocket
+        );
 
         let restarted = owner.registry();
         assert_eq!(

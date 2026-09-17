@@ -163,6 +163,21 @@ def observe_control(control, expected_token, deadline):
                 time.sleep(min(0.1, remaining))
     raise RuntimeError(f"tmux processes never became ready: {last_error}")
 
+def reserve_spawn(socket, control):
+    if any(existing_socket == socket or existing_control == control
+           for existing_socket, existing_control in unconfirmed_obligations):
+        raise RuntimeError("tmux spawn path already has an unresolved obligation")
+    conflicts = [
+        record for record in owned
+        if record[0] == socket or record[3] == control
+    ]
+    if any(identity_state(identity) != "absent"
+           for _, _, _, _, processes in conflicts for identity in processes):
+        raise RuntimeError("live tmux ownership record already exists")
+    obligation = (socket, control)
+    unconfirmed_obligations.append(obligation)
+    return obligation
+
 def record_owned(socket, device, inode, control, identities):
     conflicts = [
         record for record in owned
@@ -186,8 +201,7 @@ def spawn_owned(request):
         if socket.parent != root or control.parent != control_root or control.exists():
             raise RuntimeError("spawn paths are not unused exact children of owned roots")
         environment = dict(json.loads((control_root / env_path).read_text()))
-        obligation = (socket, control)
-        unconfirmed_obligations.append(obligation)
+        obligation = reserve_spawn(socket, control)
         spawned = subprocess.run(
             ["tmux", "-f", config, "-S", str(control), "new-session", "-d", "-c", cwd,
              "-s", "main", ";", "set-environment", "-g", "PHOENIX_TMUX_SERVER_TOKEN", token],
@@ -204,11 +218,6 @@ def spawn_owned(request):
             str(value) for identity in identities for value in identity[:2]
         ))
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as error:
-        if control is not None and control.exists():
-            try:
-                subprocess.run(["tmux", "-S", str(control), "kill-server"], timeout=0.5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
         try:
             publish_response(rejected, str(error))
         except OSError:
@@ -312,6 +321,7 @@ for _, device, inode, control, processes in owned:
 
 quiet = 0
 for _ in range(50):
+    unconfirmed = False
     states = [
         identity_state(identity)
         for _, _, _, _, processes in owned
@@ -388,7 +398,7 @@ for _ in range(50):
                     creators = True
         except OSError:
             creators = True
-    quiet = quiet + 1 if not unconfirmed_state and not sockets and not creators else 0
+    quiet = quiet + 1 if not unconfirmed_state and not unconfirmed and not sockets and not creators else 0
     if quiet >= 5:
         if root.exists():
             shutil.rmtree(root)
@@ -1165,6 +1175,55 @@ mod tests {
         assert!(WATCHDOG_PROGRAM.contains(
             "identities = observe_control(control, token, time.monotonic() + identity_timeout)\n        control_stat = control.stat()\n        record_owned(socket, control_stat.st_dev, control_stat.st_ino, control, identities)\n        unconfirmed_obligations.remove(obligation)"
         ));
+    }
+
+    #[test]
+    fn failed_spawn_never_kills_through_an_unauthenticated_control_path() {
+        assert!(!WATCHDOG_PROGRAM
+            .contains("subprocess.run([\"tmux\", \"-S\", str(control), \"kill-server\"]"));
+    }
+
+    #[test]
+    fn per_iteration_probe_uncertainty_blocks_quiet_success() {
+        assert!(WATCHDOG_PROGRAM.contains("for _ in range(50):\n    unconfirmed = False"));
+        assert!(WATCHDOG_PROGRAM.contains(
+            "not unconfirmed_state and not unconfirmed and not sockets and not creators"
+        ));
+    }
+
+    #[test]
+    fn spawn_path_is_reserved_before_tmux_starts() {
+        let reservation = WATCHDOG_PROGRAM
+            .find("obligation = reserve_spawn(socket, control)")
+            .unwrap();
+        let spawn = WATCHDOG_PROGRAM.find("spawned = subprocess.run(").unwrap();
+        assert!(reservation < spawn);
+        assert!(WATCHDOG_PROGRAM
+            .contains("for existing_socket, existing_control in unconfirmed_obligations"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registry_spawns_leave_no_unresolved_obligation() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::parse("duplicate-spawn").unwrap(),
+        );
+        let first = owner.registry();
+        let second = owner.registry();
+
+        let (first_result, second_result) = tokio::join!(
+            first.ensure_live(&scope, owner.path(), None, None),
+            second.ensure_live(&scope, owner.path(), None, None),
+        );
+
+        assert_eq!(
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+            1
+        );
+        owner.shutdown();
     }
 
     #[test]
