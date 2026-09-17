@@ -201,7 +201,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const displayTitle = productConversationDisplayTitle(row);
   const indicator = productConversationPresentationIndicator(row);
   const statusTitle = indicator.label;
-  const actionsEnabled = row.ordinary_lifecycle !== 'history';
+  const closeUnavailableReason = row.close_action.availability === 'unavailable'
+    ? ({
+        history: 'This conversation is already in History',
+        active_close_attempt: 'Close is already in progress',
+        awaiting_task_approval: 'Resolve the pending task approval before closing',
+        awaiting_continuation: 'Resolve the pending continuation before closing',
+        handed_off_without_continuation: 'Complete the continuation handoff before closing',
+      } as const)[row.close_action.reason]
+    : undefined;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -234,28 +242,42 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {actionsEnabled && (onProductConversationRename || onProductConversationClose) && (
+      {(onProductConversationRename || onProductConversationClose) && (
         <div className="conv-actions">
-          <button
-            type="button"
-            className="conv-action-btn"
-            disabled={!onProductConversationRename}
-            onClick={(event) => { event.stopPropagation(); onProductConversationRename?.(row); }}
-            aria-label={`Rename product conversation ${displayTitle}`}
-            title="Rename"
-          >
-            ✎
-          </button>
-          <button
-            type="button"
-            className="conv-action-btn danger"
-            disabled={!onProductConversationClose}
-            onClick={(event) => { event.stopPropagation(); onProductConversationClose?.(row); }}
-            aria-label={`Close product conversation ${displayTitle}`}
-            title="Close"
-          >
-            ×
-          </button>
+          {onProductConversationRename && row.ordinary_lifecycle !== 'history' && (
+            <button
+              type="button"
+              className="conv-action-btn"
+              onClick={(event) => { event.stopPropagation(); onProductConversationRename(row); }}
+              aria-label={`Rename product conversation ${displayTitle}`}
+              title="Rename"
+            >
+              ✎
+            </button>
+          )}
+          {onProductConversationClose && row.close_action.availability !== 'unavailable' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              onClick={(event) => { event.stopPropagation(); onProductConversationClose(row); }}
+              aria-label={`Close product conversation ${displayTitle}`}
+              title="Close"
+            >
+              ×
+            </button>
+          )}
+          {onProductConversationClose && row.close_action.availability === 'unavailable'
+            && row.close_action.reason !== 'history' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              disabled
+              aria-label={`Close product conversation ${displayTitle}. ${closeUnavailableReason}`}
+              title={closeUnavailableReason}
+            >
+              ×
+            </button>
+          )}
         </div>
       )}
     </li>

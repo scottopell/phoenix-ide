@@ -272,9 +272,31 @@ pub struct ProductConversationListRow {
     pub canonical_route: String,
     pub canonical_root: ProductConversationTranscriptRowView,
     pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub close_action: ProductConversationCloseActionView,
     pub latest_transcript_row_id: String,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseActionView {
+    Available,
+    Unavailable {
+        reason: ProductConversationCloseUnavailableReasonView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseUnavailableReasonView {
+    History,
+    ActiveCloseAttempt,
+    AwaitingTaskApproval,
+    AwaitingContinuation,
+    HandedOffWithoutContinuation,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

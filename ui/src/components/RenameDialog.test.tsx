@@ -65,6 +65,40 @@ describe('RenameDialog', () => {
     expect(onCancel).not.toHaveBeenCalled();
   });
 
+  it('prevents dismissing or duplicate submission while rename is in flight', async () => {
+    let resolveRename!: () => void;
+    const onRename = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveRename = resolve;
+      }),
+    );
+    const onCancel = vi.fn();
+    render(
+      <RenameDialog
+        visible
+        currentName="current-slug"
+        onRename={onRename}
+        onCancel={onCancel}
+        error={undefined}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: /^rename$/i }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(screen.getByText('Rename Conversation').closest('.modal-overlay')!);
+    fireEvent.submit(screen.getByRole('button', { name: /^rename$/i }).closest('form')!);
+
+    expect(onRename).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^rename$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeDisabled();
+
+    resolveRename();
+    await waitFor(() => expect(screen.getByRole('textbox')).not.toBeDisabled());
+  });
+
   it('renders the AI generation button and shows in-flight state', async () => {
     let resolveGenerate!: () => void;
     const onGenerate = vi.fn(

@@ -165,6 +165,31 @@ export function getProductConversationListRevision(): number {
   return productConversationListRevision;
 }
 
+const PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT = 'phoenix:product-conversation-snapshot-changed';
+
+type ProductConversationSnapshotChangedDetail = {
+  productConversationId: string;
+};
+
+export function notifyProductConversationSnapshotChanged(productConversationId: string): void {
+  window.dispatchEvent(new CustomEvent<ProductConversationSnapshotChangedDetail>(
+    PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT,
+    { detail: { productConversationId } },
+  ));
+}
+
+export function subscribeProductConversationSnapshotChanged(
+  productConversationId: string,
+  listener: () => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationSnapshotChangedDetail>).detail;
+    if (detail?.productConversationId === productConversationId) listener();
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT, handler);
+}
+
 const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
 
 export type CloseSnapshotInvalidationSource = 'close' | 'stream';
