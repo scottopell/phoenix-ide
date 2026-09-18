@@ -1034,13 +1034,21 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                         .get_close_obligation(obligation.attempt_id().as_str())
                         .await
                         .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
-                    let error_type = if current.phase() == ClosePhase::NeedsRepair {
-                        "close_retirement_needs_repair"
-                    } else {
-                        "close_inspection_failed"
-                    };
+                    if current.phase() == ClosePhase::NeedsRepair {
+                        let cause = state
+                            .db
+                            .close_needs_repair_cause(obligation.attempt_id())
+                            .await
+                            .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
+                        return Err(AppError::Conflict(Box::new(close_needs_repair_conflict(
+                            cause,
+                            obligation.attempt_id().as_str(),
+                            expected_latest_transcript.as_str(),
+                        ))));
+                    }
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error, error_type,
+                        error,
+                        "close_inspection_failed",
                     ))));
                 }
                 state

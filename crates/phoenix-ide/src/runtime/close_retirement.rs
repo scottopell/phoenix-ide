@@ -1725,7 +1725,7 @@ impl RuntimeManager {
                                         snapshot,
                                         &scope,
                                         target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
+                                        RetirementFailureReason::ResidualProcessAlive,
                                         &residual.detail,
                                     )
                                     .await;
@@ -4525,13 +4525,42 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 let Some(after_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
+                let mut revalidated = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+                let revalidated_bytes = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        PROC_PIDREGIONPATHINFO,
+                        info.region.address,
+                        revalidated.as_mut_ptr().cast(),
+                        i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                            .expect("region path info fits i32"),
+                    )
+                };
+                if revalidated_bytes
+                    != i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                        .expect("region path info size fits i32")
+                {
+                    continue;
+                }
+                let revalidated = unsafe { revalidated.assume_init() };
+                let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
+                let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
+                let mapping_still_matches = revalidated.region.address == info.region.address
+                    && revalidated.region.size == info.region.size
+                    && revalidated.region.protection & u32::try_from(libc::VM_PROT_WRITE).unwrap()
+                        != 0
+                    && matches!(
+                        revalidated.region.share_mode,
+                        SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
+                    )
+                    && revalidated_path.to_bytes() == mapped_path.to_bytes();
                 if after_uid != uid {
                     return Err("matching writer identity changed during inspection".to_string());
                 }
                 if !revalidated_writer_identity(
                     &before_incarnation,
                     &before_executable,
-                    true,
+                    mapping_still_matches,
                     &after_incarnation,
                     &after_executable,
                 )? {
@@ -5677,13 +5706,36 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 let Some(after_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
+                let mut revalidated = MaybeUninit::<VnodeFdInfoWithPath>::uninit();
+                let revalidated_bytes = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        descriptor.proc_fd,
+                        PROC_PIDFDVNODEPATHINFO,
+                        revalidated.as_mut_ptr().cast(),
+                        i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                            .expect("vnode info fits i32"),
+                    )
+                };
+                if revalidated_bytes
+                    != i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                        .expect("vnode info size fits i32")
+                {
+                    continue;
+                }
+                let revalidated = unsafe { revalidated.assume_init() };
+                let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
+                let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
+                let resource_still_matches = revalidated_path.to_bytes() == candidate.to_bytes()
+                    && macos_descriptor_access_mode(revalidated.file.open_flags)
+                        == macos_descriptor_access_mode(info.file.open_flags);
                 if after_uid != uid {
                     return Err("matching writer identity changed during inspection".to_string());
                 }
                 if !revalidated_writer_identity(
                     &before_incarnation,
                     &before_executable,
-                    true,
+                    resource_still_matches,
                     &after_incarnation,
                     &after_executable,
                 )? {

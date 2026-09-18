@@ -8828,6 +8828,21 @@ CREATE TABLE close_hard_delete_claims (
         REFERENCES product_conversations(id) ON DELETE CASCADE
 );
 
+CREATE TRIGGER close_hard_delete_claim_requires_empty_completed_aggregate
+BEFORE INSERT ON close_hard_delete_claims
+WHEN EXISTS (
+        SELECT 1 FROM conversations conversation
+        WHERE conversation.product_conversation_id = NEW.product_conversation_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_obligations obligation
+        WHERE obligation.product_conversation_id = NEW.product_conversation_id
+          AND obligation.phase <> 'completed'
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'hard-delete claim requires an empty aggregate with completed Close obligations');
+END;
+
 CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
 ON close_worktree_cleanup_plans (
     attempt_id, scope, inspection_generation, inspection_fingerprint,
@@ -9033,16 +9048,23 @@ BEGIN
     SELECT RAISE(ABORT, 'ambient writer match kind and access mode must form valid authority');
 END;
 
-CREATE TRIGGER close_ambient_writer_evidence_valid_authority_update
-BEFORE UPDATE OF match_kind, access_mode ON close_ambient_writer_evidence
-FOR EACH ROW
-WHEN NOT (
-    (NEW.match_kind = 'descriptor' AND NEW.access_mode IN ('write_only', 'read_write'))
-    OR (NEW.match_kind = 'mapping' AND NEW.access_mode = 'writable_shared_mapping')
-    OR (NEW.match_kind = 'namespace_directory' AND NEW.access_mode = 'namespace_write')
+CREATE TRIGGER close_ambient_writer_evidence_reject_update
+BEFORE UPDATE ON close_ambient_writer_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'ambient writer evidence is immutable');
+END;
+
+CREATE TRIGGER close_ambient_writer_evidence_reject_delete
+BEFORE DELETE ON close_ambient_writer_evidence
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN close_hard_delete_claims claim
+      ON claim.product_conversation_id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'ambient writer match kind and access mode must form valid authority');
+    SELECT RAISE(ABORT, 'ambient writer evidence can only be deleted with its Close aggregate');
 END;
 ";
 
@@ -17425,7 +17447,7 @@ mod tests {
         .expect_err("updates must preserve valid authority pairs");
         assert!(invalid_update
             .to_string()
-            .contains("match kind and access mode must form valid authority"));
+            .contains("ambient writer evidence is immutable"));
     }
 
     #[allow(clippy::too_many_lines)]

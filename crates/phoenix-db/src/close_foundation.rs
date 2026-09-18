@@ -3930,6 +3930,7 @@ impl Database {
     /// # Errors
     /// Returns a typed evidence-invariant error when the observation is incomplete or
     /// is not bound to the exact active retirement snapshot.
+    #[allow(clippy::too_many_lines)]
     pub async fn record_close_ambient_writer_evidence(
         &self,
         request: RecordCloseAmbientWriterEvidenceRequest,
@@ -3945,6 +3946,29 @@ impl Database {
             });
         }
         let identity = request.resource.identity();
+        let mut tx = self.pool.begin().await?;
+        let current: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT phase, inspection_generation, inspection_fingerprint
+             FROM close_obligations WHERE attempt_id=?1",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let current_matches = current
+            .as_ref()
+            .is_some_and(|(phase, generation, fingerprint)| {
+                phase == "needs_repair"
+                    && generation.as_deref() == Some(request.snapshot.generation())
+                    && fingerprint.as_deref() == Some(request.snapshot.fingerprint())
+            });
+        if !current_matches {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "ambient_writer_evidence_requires_active_repair_snapshot",
+                relation: "close_obligations+close_ambient_writer_evidence",
+                detail: "ambient-writer evidence does not match the active needs-repair snapshot"
+                    .to_string(),
+            });
+        }
         let now = Utc::now().timestamp_micros();
         sqlx::query(
             "INSERT INTO close_ambient_writer_evidence (
@@ -3981,7 +4005,7 @@ impl Database {
         .bind(request.evidence.authority.match_kind())
         .bind(request.evidence.authority.access_mode())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(classify_ambient_writer_insert_error)?;
         let exact_evidence_exists: bool = sqlx::query_scalar(
@@ -4014,7 +4038,7 @@ impl Database {
         .bind(request.evidence.matched_path.encode())
         .bind(request.evidence.authority.match_kind())
         .bind(request.evidence.authority.access_mode())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if !exact_evidence_exists {
             return Err(DbError::CloseEvidenceInvariant {
@@ -4023,6 +4047,7 @@ impl Database {
                 detail: "ambient-writer insert did not produce the exact authority row".to_string(),
             });
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -10364,6 +10389,16 @@ mod tests {
             vec![resource.clone()],
         )
         .await;
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            residual: resource.clone(),
+            reason: RetirementFailureReason::ResidualProcessAlive,
+            detail: "stable ambient writer".to_string(),
+            cause: None,
+        })
+        .await
+        .unwrap();
         let request = RecordCloseAmbientWriterEvidenceRequest {
             attempt_id: attempt_id.clone(),
             scope: scope.clone(),
