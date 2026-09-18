@@ -17446,7 +17446,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_100_normalizes_typed_close_repair_causes() {
+    async fn migration_101_normalizes_typed_close_repair_causes() {
         let pool = test_pool().await;
         sqlx::query(
             "CREATE TABLE close_obligations (

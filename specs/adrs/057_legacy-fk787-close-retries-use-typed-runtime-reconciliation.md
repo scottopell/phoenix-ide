@@ -1,4 +1,10 @@
+<<<<<<<< HEAD:specs/adrs/057_legacy-fk787-close-retries-use-typed-runtime-reconciliation.md
 # ADR-057: Legacy FK787 Close retries use typed runtime reconciliation
+|||||||| parent of b1bad7f1b (docs: reconcile close ADR numbering after rebase):specs/adrs/055_legacy-fk787-close-retries-use-typed-runtime-reconciliation.md
+# ADR-055: Legacy FK787 Close retries use typed runtime reconciliation
+========
+# ADR-056: Legacy FK787 Close retries use typed runtime reconciliation
+>>>>>>>> b1bad7f1b (docs: reconcile close ADR numbering after rebase):specs/adrs/056_legacy-fk787-close-retries-use-typed-runtime-reconciliation.md
 
 - **Status:** Accepted
 - **Date:** 2026-09-16
@@ -8,7 +14,7 @@
 
 A deployed Close retry could persist a fresh inspection generation before retirement continuation. If cleanup-plan persistence then failed with SQLite foreign-key code 787, repair routing persisted a `manual_repair_required` residual under that fresh generation. The obligation consequently pointed at a partial generation with inspection, sealed inventory, and residual evidence but no dispatch or cleanup plan, while the prior generation retained identity-exact dispatch and cleanup authority.
 
-Exact-inventory hardening prevents current code from producing that shape, but an already-persisted attempt cannot pass ordinary reinspection: repair inventory insertion is rejected because the obligation retains a non-null active snapshot. ADR-054 deliberately did not authorize automatic retry of an existing production attempt, so preserving this persisted state requires an explicit compatibility decision under ADR-034.
+Exact-inventory hardening prevents current code from producing that shape, but an already-persisted attempt cannot pass ordinary reinspection: repair inventory insertion is rejected because the obligation retains a non-null active snapshot. ADR-055 deliberately did not authorize automatic retry of an existing production attempt, so preserving this persisted state requires an explicit compatibility decision under ADR-034.
 
 A database migration cannot safely finish retirement because migrations cannot freshly validate the retained filesystem identity, administrative-directory incarnation, or ambient writers.
 
@@ -20,7 +26,7 @@ A database migration cannot safely finish retirement because migrations cannot f
 
 ## Decision
 
-Choose option 3, narrowly superseding ADR-054 only where its no-existing-production-attempt consequence conflicts with this explicit compatibility guarantee.
+Choose option 3, narrowly superseding ADR-055 only where its no-existing-production-attempt consequence conflicts with this explicit compatibility guarantee.
 
 Ordinary startup or user-authorized resume may atomically advance an `awaiting_retirement_inspection` attempt to `retirement_requested` only when every captured WorkScope has an active inspection and exactly one identity-matching `manual_repair_required` residual containing SQLite code 787, the active generation has sealed inventory but no dispatch or cleanup plan, and an older generation of the same attempt has identity-exact dispatch plus cleanup-plan authority for every captured worktree.
 
@@ -35,7 +41,7 @@ The reconciliation does not alter historical evidence. The ordinary retirement e
 
 ## References
 
-- ADR-034, ADR-054
+- ADR-034, ADR-055
 - `specs/compatibility/requirements.md`
 - `specs/work-lifecycle/requirements.md`
 - `specs/work-lifecycle/work-lifecycle.allium`
