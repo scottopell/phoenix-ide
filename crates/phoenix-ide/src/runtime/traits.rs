@@ -1069,6 +1069,12 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).definitions_for_language(language).await
     }
 
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        (**self).coordinator_skill_catalog()
+    }
+
     fn subagent_model_ids(&self) -> Arc<[String]> {
         (**self).subagent_model_ids()
     }

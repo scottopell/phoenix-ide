@@ -2828,6 +2828,10 @@ where
             self.retry_timer_handle = None;
         }
 
+        if matches!(outcome, EffectOutcome::Llm(LlmOutcome::Response { .. })) {
+            self.pending_trusted_tool_results.clear();
+        }
+
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
             tool_calls,
@@ -6883,7 +6887,7 @@ where
         )
         .await;
 
-        let trusted_results = std::mem::take(&mut self.pending_trusted_tool_results);
+        let trusted_results = self.pending_trusted_tool_results.clone();
         overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
