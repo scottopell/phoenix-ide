@@ -7688,16 +7688,18 @@ impl Database {
             .execute(&mut *tx)
             .await?;
 
-        let lifecycle = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        if matches!(lifecycle.as_deref(), Some("history")) {
-            return Err(DbError::ProductConversationUnavailable(
-                parent.product_conversation_id.clone(),
-            ));
+        if parent.continued_in_conv_id.is_none() {
+            let lifecycle = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+            )
+            .bind(parent.product_conversation_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if matches!(lifecycle.as_deref(), Some("history")) {
+                return Err(DbError::ProductConversationUnavailable(
+                    parent.product_conversation_id.clone(),
+                ));
+            }
         }
         sqlx::query(
             "INSERT INTO product_continuation_reservations (
