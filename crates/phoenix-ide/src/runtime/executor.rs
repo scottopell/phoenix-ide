@@ -8924,6 +8924,37 @@ impl std::fmt::Display for FollowUpArtifactError {
     }
 }
 
+fn compensate_follow_up_artifact_failure(
+    cwd: &Path,
+    original_relative: &str,
+    promoted_relative: &str,
+    original_path: &Path,
+    promoted_path: &Path,
+    error: String,
+) -> FollowUpArtifactError {
+    let reset = run_git(
+        cwd,
+        &[
+            "reset",
+            "--quiet",
+            "--",
+            original_relative,
+            promoted_relative,
+        ],
+    );
+    let rename = std::fs::rename(promoted_path, original_path).map_err(|rename_error| {
+        format!("failed to restore '{original_relative}' after '{error}': {rename_error}")
+    });
+    match (reset, rename) {
+        (Ok(_), Ok(())) => FollowUpArtifactError::BeforeGit(error),
+        (reset, rename) => FollowUpArtifactError::AfterGit(format!(
+            "{error}; task artifact compensation failed (index: {}; worktree: {})",
+            reset.err().unwrap_or_else(|| "restored".to_string()),
+            rename.err().unwrap_or_else(|| "restored".to_string()),
+        )),
+    }
+}
+
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -8947,6 +8978,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         expected_plan,
     )
     .map_err(FollowUpArtifactError::BeforeGit)?;
+    let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
     if detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
@@ -8965,15 +8997,34 @@ fn persist_fresh_approved_task_artifact_blocking(
             parsed.status,
             filename,
         )
-        .map_err(FollowUpArtifactError::AfterGit)?;
+        .map_err(FollowUpArtifactError::BeforeGit)?;
         if promoted != filename {
+            let promoted_relative = format!("{tasks_dir_name}/{promoted}");
+            promotion = Some((
+                task_file.to_string(),
+                promoted_relative.clone(),
+                cwd.join(task_file),
+                cwd.join(&promoted_relative),
+            ));
             let _ = run_git(cwd, &["add", "--", task_file]);
-            snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
+            snapshot.task_file = promoted_relative;
         }
     }
-    crate::git_ops::ensure_local_exclude_has_phoenix(cwd)
-        .map_err(FollowUpArtifactError::AfterGit)?;
-    run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(FollowUpArtifactError::AfterGit)?;
+    let compensate = |error: String| match &promotion {
+        Some((original_relative, promoted_relative, original_path, promoted_path)) => {
+            compensate_follow_up_artifact_failure(
+                cwd,
+                original_relative,
+                promoted_relative,
+                original_path,
+                promoted_path,
+                error,
+            )
+        }
+        None => FollowUpArtifactError::BeforeGit(error),
+    };
+    crate::git_ops::ensure_local_exclude_has_phoenix(cwd).map_err(&compensate)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(&compensate)?;
     let mut approved_paths = vec![snapshot.task_file.as_str()];
     if original_path_was_tracked && snapshot.task_file != task_file {
         approved_paths.push(task_file);
@@ -8985,9 +9036,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         let mut commit_args = vec!["commit", "--only", "-m", &commit_message, "--"];
         commit_args.extend(approved_paths.iter().copied());
         run_git(cwd, &commit_args).map_err(|error| {
-            FollowUpArtifactError::AfterGit(format!(
-                "Failed to commit approved task artifact: {error}"
-            ))
+            compensate(format!("Failed to commit approved task artifact: {error}"))
         })?;
     }
     Ok(snapshot)
