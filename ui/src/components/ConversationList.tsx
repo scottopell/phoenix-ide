@@ -201,14 +201,15 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   const displayTitle = productConversationDisplayTitle(row);
   const indicator = productConversationPresentationIndicator(row);
   const statusTitle = indicator.label;
-  const closeUnavailableReason = row.close_action.availability === 'unavailable'
+  const closeAction = row.lifecycle.state === 'open' ? row.lifecycle.close_action : null;
+  const closeUnavailableReason = closeAction?.availability === 'unavailable'
     ? ({
         history: 'This conversation is already in History',
         active_close_attempt: 'Close is already in progress',
         awaiting_task_approval: 'Resolve the pending task approval before closing',
         awaiting_continuation: 'Resolve the pending continuation before closing',
         handed_off_without_continuation: 'Complete the continuation handoff before closing',
-      } as const)[row.close_action.reason]
+      } as const)[closeAction.reason]
     : undefined;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
@@ -244,7 +245,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
       </button>
       {(onProductConversationRename || onProductConversationClose) && (
         <div className="conv-actions">
-          {onProductConversationRename && row.ordinary_lifecycle !== 'history' && (
+          {onProductConversationRename && row.lifecycle.state === 'open' && (
             <button
               type="button"
               className="conv-action-btn"
@@ -255,7 +256,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               ✎
             </button>
           )}
-          {onProductConversationClose && row.close_action.availability !== 'unavailable' && (
+          {onProductConversationClose && closeAction?.availability === 'available' && (
             <button
               type="button"
               className="conv-action-btn danger"
@@ -266,8 +267,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               ×
             </button>
           )}
-          {onProductConversationClose && row.close_action.availability === 'unavailable'
-            && row.close_action.reason !== 'history' && (
+          {onProductConversationClose && closeAction?.availability === 'unavailable' && (
             <button
               type="button"
               className="conv-action-btn danger"

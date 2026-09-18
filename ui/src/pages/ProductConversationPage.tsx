@@ -352,6 +352,7 @@ function countSnapshotMessages(snapshot: ProductConversationSnapshotView): numbe
 function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
   return {
     root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
+    product_conversation_id: snapshot.product_conversation_id,
     chain_name: null,
     display_name: snapshot.presentation.display_name,
     archived: snapshot.ordinary_lifecycle === 'history',

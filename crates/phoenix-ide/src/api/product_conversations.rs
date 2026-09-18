@@ -17,7 +17,8 @@ use super::types::{
     ProductConversationCloseResidualView, ProductConversationCloseUnavailableReasonView,
     ProductConversationCloseView, ProductConversationCreationAllowedActionView,
     ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
-    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationHandoffView, ProductConversationLifecycleView,
+    ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
@@ -314,8 +315,14 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
             slug: projection.root_slug.clone(),
             title: projection.root_title.clone(),
         },
-        ordinary_lifecycle: lifecycle_view(projection.lifecycle),
-        close_action: close_action_view(projection.close_availability),
+        lifecycle: match projection.lifecycle {
+            OrdinaryProductConversationLifecycle::Open => ProductConversationLifecycleView::Open {
+                close_action: close_action_view(projection.close_availability),
+            },
+            OrdinaryProductConversationLifecycle::History => {
+                ProductConversationLifecycleView::History
+            }
+        },
         latest_transcript_row_id: projection.latest_transcript_row_id.clone(),
         updated_at: projection.updated_at.to_rfc3339(),
         presentation: presentation(
@@ -955,12 +962,14 @@ mod tests {
             .iter()
             .find(|row| row["latest_transcript_row_id"] == reference)
             .unwrap();
-        assert_eq!(listed["ordinary_lifecycle"], expected);
+        assert_eq!(listed["lifecycle"]["state"], expected);
         if expected == "open" {
-            assert_eq!(listed["close_action"]["availability"], "available");
+            assert_eq!(
+                listed["lifecycle"]["close_action"]["availability"],
+                "available"
+            );
         } else {
-            assert_eq!(listed["close_action"]["availability"], "unavailable");
-            assert_eq!(listed["close_action"]["reason"], "history");
+            assert!(listed["lifecycle"].get("close_action").is_none());
         }
 
         let snapshot = create_router(state.clone())

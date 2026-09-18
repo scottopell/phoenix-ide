@@ -155,8 +155,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     slug: `root-${id}`,
     title: `Root ${id}`,
   },
-  ordinary_lifecycle: 'open',
-  close_action: { availability: 'available' },
+  lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
@@ -170,7 +169,7 @@ describe('ProductConversation presentation indicator', () => {
     ['working mode', makeProductConversation('working-mode', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } }), 'Working', 'working'],
     ['error mode', makeProductConversation('error-mode', { presentation: { kind: 'state', display_name: 'Error', presentation_mode: 'error' } }), 'Error', 'error'],
     ['done mode', makeProductConversation('done-mode', { presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }), 'Completed', 'terminal'],
-    ['history idle', makeProductConversation('history-idle', { ordinary_lifecycle: 'history', presentation: { kind: 'state', display_name: 'History', presentation_mode: 'idle' } }), 'History', 'terminal'],
+    ['history idle', makeProductConversation('history-idle', { lifecycle: { state: 'history' }, presentation: { kind: 'state', display_name: 'History', presentation_mode: 'idle' } }), 'History', 'terminal'],
   ])('%s maps to one authoritative indicator', (_name, row, label, dotClass) => {
     expect(productConversationPresentationIndicator(row)).toEqual({ label, ariaLabel: label, dotClass });
   });
@@ -416,7 +415,7 @@ describe('ConversationList — product conversations', () => {
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
     });
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' },
       presentation: { kind: 'state', display_name: 'Retained history', presentation_mode: 'done' },
     });
@@ -462,11 +461,11 @@ describe('ConversationList — product conversations', () => {
   it('uses server-authoritative Close availability without inferring from lifecycle or presentation', () => {
     const close = vi.fn();
     const blocked = makeProductConversation('pc-blocked', {
-      close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' },
+      lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
       presentation: { kind: 'state', display_name: 'Blocked', presentation_mode: 'idle' },
     });
     const available = makeProductConversation('pc-available', {
-      close_action: { availability: 'available' },
+      lifecycle: { state: 'open', close_action: { availability: 'available' } },
       presentation: { kind: 'needs_action', display_name: 'Needs action' },
     });
 
@@ -490,7 +489,7 @@ describe('ConversationList — product conversations', () => {
 
   it('renders History working directory from archived member rows', () => {
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       latest_transcript_row_id: 'archived-member',
       canonical_root: { transcript_row_id: 'archived-member', slug: 'archived-root', title: 'Archived Root' },
     });
