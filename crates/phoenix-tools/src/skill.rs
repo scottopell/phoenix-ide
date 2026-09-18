@@ -19,6 +19,10 @@ impl TrustedInstructions {
         &self.output
     }
 
+    pub fn into_output(self) -> String {
+        self.output
+    }
+
     pub(super) fn replace_output(&mut self, output: String) {
         self.output = output;
     }
