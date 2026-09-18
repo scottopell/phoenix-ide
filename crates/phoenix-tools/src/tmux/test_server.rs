@@ -204,11 +204,14 @@ def owner_alive():
             or (root / ".cleanup-request").exists()):
         return False
     try:
-        return time.time() - heartbeat.stat().st_mtime <= heartbeat_stale
+        heartbeat_age = time.time() - heartbeat.stat().st_mtime
     except FileNotFoundError:
         return False
     except OSError:
         return False
+    if os.getppid() == parent:
+        return True
+    return heartbeat_age <= heartbeat_stale
 
 def reserve_spawn(socket, control, token):
     if any(existing_socket == socket or existing_control == control
@@ -2892,6 +2895,13 @@ mod tests {
 
         assert_exact_processes_gone(&first);
         assert_exact_processes_gone(&second);
+    }
+
+    #[test]
+    fn live_parent_identity_outranks_a_delayed_heartbeat() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "heartbeat_age = time.time() - heartbeat.stat().st_mtime\n    except FileNotFoundError:\n        return False\n    except OSError:\n        return False\n    if os.getppid() == parent:\n        return True\n    return heartbeat_age <= heartbeat_stale"
+        ));
     }
 
     #[test]
