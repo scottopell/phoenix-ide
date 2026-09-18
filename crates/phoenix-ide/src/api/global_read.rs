@@ -323,6 +323,11 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
                 ..
             } if start.message_id.len() > PREVIOUS_TITLE_BYTES
         )
+        || matches!(
+            output,
+            PreviousTranscriptsOutput::SearchResults { results, .. }
+                if results.iter().any(|hit| hit.message_id.len() > PREVIOUS_TITLE_BYTES)
+        )
     {
         return Ok(json);
     }
@@ -810,7 +815,11 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                 transcript_ref: format!("@conv:{}", conv.id),
                 conversation_id: conv.id.clone(),
                 message_id: hit.message_id.clone(),
-                message_ref: format!("@conv:{}#message-{}", conv.id, hit.message_id),
+                message_ref: format!(
+                    "@conv:{}#message-{}",
+                    conv.id,
+                    percent_encode_url_component(&hit.message_id)
+                ),
                 href: previous_conversation_message_href(
                     conv,
                     Some((&hit.message_id, hit.message_type)),
@@ -1759,7 +1768,9 @@ async fn resolve_reference_impl(
         let (slug, fragment) = split_fragment(rest);
         let conv = load_conversation_by_slug_or_id(service, slug).await?;
         if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(service, conv, message_id, true).await;
+            let message_id =
+                percent_decode_url_component(message_id).map_err(AppError::BadRequest)?;
+            return resolve_message(service, conv, &message_id, true).await;
         }
         return Ok(resolve_conversation(conv, true));
     }

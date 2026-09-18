@@ -67,8 +67,18 @@ pub(crate) enum SendChatServiceError {
     Busy,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
+    #[error("message_id produces a persisted identity longer than 256 UTF-8 bytes")]
+    MessageIdTooLong,
     #[error("conversation is permanently unavailable in History")]
     HistoryUnavailable,
+}
+
+fn validate_persisted_message_id(req: &SendChatRequest) -> Result<(), SendChatServiceError> {
+    if req.conversation_id.len() + 1 + req.message_id.len() > 256 {
+        Err(SendChatServiceError::MessageIdTooLong)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -87,6 +97,7 @@ impl SendChatApplicationService {
         &self,
         req: SendChatRequest,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
+        validate_persisted_message_id(&req)?;
         let request_fingerprint = request_fingerprint(&req)?;
         let conversation = self
             .runtime
@@ -939,8 +950,8 @@ mod tests {
         lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
         map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
         persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
-        submitted_identity_from_request, DurableReplayOutcome, MessageExpansionPolicy,
-        SendChatOutcome, SendChatRequest, SendChatServiceError,
+        submitted_identity_from_request, validate_persisted_message_id, DurableReplayOutcome,
+        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
@@ -956,6 +967,19 @@ mod tests {
         AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
         ProcessIncarnation, Timestamp, TurnAuthorityId, TurnConflict, TurnOutcome,
     };
+
+    #[test]
+    fn persisted_message_identity_admission_counts_derived_utf8_bytes() {
+        let mut req = request();
+        req.message_id = "m".repeat(256 - req.conversation_id.len() - 1);
+        assert!(validate_persisted_message_id(&req).is_ok());
+
+        req.message_id.push('m');
+        assert!(matches!(
+            validate_persisted_message_id(&req),
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
+    }
 
     fn request() -> SendChatRequest {
         SendChatRequest {

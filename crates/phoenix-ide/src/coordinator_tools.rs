@@ -570,6 +570,7 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::IdempotencyConflict => "idempotency_conflict",
         SendChatServiceError::Busy => "conversation_busy",
         SendChatServiceError::CloseAdmissionFenced => "close_admission_fenced",
+        SendChatServiceError::MessageIdTooLong => "message_id_too_long",
         SendChatServiceError::HistoryUnavailable => "target_unavailable",
     }
 }
