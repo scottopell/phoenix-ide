@@ -2201,6 +2201,42 @@ async fn create_conversation(
     create_conversation_with_id(state, req, Vec::new()).await
 }
 
+fn creation_request_matches_job(
+    req: &CreateConversationRequest,
+    job: &crate::db::ConversationCreationJob,
+) -> bool {
+    let intent = &job.intent;
+    job.message_id.as_deref() == Some(req.message_id.as_str())
+        && intent.cwd == req.cwd
+        && intent.model.as_deref() == Some(req.model.as_str())
+        && intent.effort == req.effort
+        && intent.text == req.text
+        && intent.mode.as_deref() == req.mode.as_deref().filter(|mode| *mode != "direct")
+        && intent.base_branch == req.base_branch
+        && intent.checkout_ref == req.checkout_ref
+        && intent.seed_parent_id == req.seed_parent_id
+        && intent.seed_label == req.seed_label
+        && intent.images.len() == req.images.len()
+        && intent
+            .images
+            .iter()
+            .zip(&req.images)
+            .all(|(stored, submitted)| {
+                stored.data == submitted.data && stored.media_type == submitted.media_type
+            })
+        && intent.files.len() == req.files.len()
+        && intent
+            .files
+            .iter()
+            .zip(&req.files)
+            .all(|(stored, submitted)| {
+                stored.original_name == submitted.original_name
+                    && stored.media_type == submitted.media_type
+                    && stored.size_bytes == submitted.size_bytes
+                    && stored.stored_path == submitted.stored_path
+            })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn create_conversation_with_id(
     state: AppState,
@@ -2253,8 +2289,7 @@ async fn create_conversation_with_id(
             .ok()
             .flatten()
         {
-            let is_same_create =
-                existing_job.message_id.as_deref() == Some(req.message_id.as_str());
+            let is_same_create = creation_request_matches_job(&req, &existing_job);
             if !is_same_create {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "conversation_id already belongs to an existing conversation",
@@ -2288,6 +2323,12 @@ async fn create_conversation_with_id(
             .await
         {
             tracing::info!(message_id = %req.message_id, "Create request hit existing creation job message id");
+            if !creation_request_matches_job(&req, &existing_job) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "message_id already belongs to a different creation intent",
+                    "idempotency_conflict",
+                ))));
+            }
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
             state.runtime.kick_creation_worker();

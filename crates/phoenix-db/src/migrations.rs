@@ -518,9 +518,25 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 const MIGRATION_099: &str = r"
+CREATE TABLE legacy_oversized_creation_message_ids (
+    message_id TEXT PRIMARY KEY NOT NULL
+) STRICT;
+
+INSERT INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM conversation_creation_jobs
+WHERE message_id IS NOT NULL
+  AND length(CAST(message_id AS BLOB)) > 256;
+
 CREATE TRIGGER messages_bound_new_message_id_bytes
 BEFORE INSERT ON messages
-FOR EACH ROW WHEN length(CAST(NEW.message_id AS BLOB)) > 256
+FOR EACH ROW
+WHEN length(CAST(NEW.message_id AS BLOB)) > 256
+ AND NOT EXISTS (
+     SELECT 1
+     FROM legacy_oversized_creation_message_ids
+     WHERE message_id = NEW.message_id
+ )
 BEGIN
     SELECT RAISE(ABORT, 'message id exceeds 256 UTF-8 bytes');
 END;
@@ -10171,9 +10187,20 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE conversation_creation_jobs (message_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let legacy = "x".repeat(257);
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let admitted = "j".repeat(257);
+        sqlx::query("INSERT INTO conversation_creation_jobs (message_id) VALUES (?1)")
+            .bind(&admitted)
             .execute(&pool)
             .await
             .unwrap();
@@ -10192,6 +10219,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let error = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(format!("{}a", "é".repeat(128)))
             .execute(&pool)
