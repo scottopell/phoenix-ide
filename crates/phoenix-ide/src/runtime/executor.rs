@@ -627,25 +627,41 @@ fn trusted_tool_results(results: &[ToolResult]) -> Vec<(String, String)> {
 }
 
 fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[(String, String)]) {
-    for message in messages {
-        for block in &mut message.content {
-            if let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = block
-            {
-                if let Some((_, trusted)) = trusted_results
-                    .iter()
-                    .find(|(trusted_id, _)| trusted_id == tool_use_id)
-                {
-                    *content = format!(
-                        "<trusted_builtin_skill audience=\"global-coordinator\">{trusted}</trusted_builtin_skill>"
-                    );
-                }
-            }
+    for (trusted_id, trusted) in trusted_results {
+        if let Some(content) = messages.iter_mut().rev().find_map(|message| {
+            message
+                .content
+                .iter_mut()
+                .rev()
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == trusted_id => Some(content),
+                    _ => None,
+                })
+        }) {
+            *content = format!(
+                "<trusted_builtin_skill audience=\"global-coordinator\">{trusted}</trusted_builtin_skill>"
+            );
         }
     }
+}
+
+#[cfg(test)]
+fn count_trusted_envelopes(messages: &[LlmMessage]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { content, .. }
+                    if content.contains("<trusted_builtin_skill")
+            )
+        })
+        .count()
 }
 
 /// Await a tool task's oneshot outcome and forward it, generation-tagged, to
@@ -19087,6 +19103,52 @@ mod steer_drain_detector_tests {
             }],
             "typed images must not be dropped at checkpoint persistence"
         );
+    }
+
+    #[test]
+    fn trusted_overlay_targets_only_latest_reused_tool_id() {
+        use phoenix_llm::ContentBlock;
+
+        let mut messages = vec![
+            LlmMessage {
+                role: phoenix_llm::MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "reused".to_string(),
+                    content: "historical ordinary output".to_string(),
+                    is_error: false,
+                    images: vec![],
+                }],
+            },
+            LlmMessage {
+                role: phoenix_llm::MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "reused".to_string(),
+                    content: "current persisted placeholder".to_string(),
+                    is_error: false,
+                    images: vec![],
+                }],
+            },
+        ];
+
+        overlay_trusted_tool_results(
+            &mut messages,
+            &[(
+                "reused".to_string(),
+                "authenticated current output".to_string(),
+            )],
+        );
+
+        assert_eq!(count_trusted_envelopes(&messages), 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content == "historical ordinary output"
+        ));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content.contains("authenticated current output")
+        ));
     }
 
     #[tokio::test]
