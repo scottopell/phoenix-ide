@@ -17354,7 +17354,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
         let live_delete = sqlx::query(
             "DELETE FROM close_attempt_members
              WHERE attempt_id='attempt' AND conversation_id='conversation'",
@@ -17392,7 +17392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_102_rejects_invalid_ambient_writer_authority_pairs() {
+    async fn migration_103_rejects_invalid_ambient_writer_authority_pairs() {
         let pool = test_pool().await;
         sqlx::query(
             "CREATE TABLE close_ambient_writer_evidence (
@@ -17403,7 +17403,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_103).execute(&pool).await.unwrap();
 
         for (match_kind, access_mode) in [
             ("descriptor", "write_only"),
@@ -17457,7 +17457,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
 
         sqlx::query(
             "INSERT INTO close_obligations (attempt_id, phase)
