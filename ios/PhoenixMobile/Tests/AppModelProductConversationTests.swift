@@ -3208,7 +3208,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(probe.archivePostPaths.isEmpty)
     }
 
-    func testArchiveDoesNotCallConversationEndpointForContinuedAggregate() async {
+    func testArchiveContinuedAggregateUsesCanonicalChainEndpoint() async {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-root", "row-successor"],
             contentsByConversationId: [
@@ -3231,11 +3231,14 @@ final class AppModelProductConversationTests: XCTestCase {
             initialTranscriptRowId: "row-successor"
         ).applyForTesting(testProductConversationSnapshot())
 
+        let continued = try! XCTUnwrap(model.listStore.conversations.first)
+        XCTAssertNil(model.closeUnavailableExplanation(for: continued))
+
         let archived = await model.archive(conversationId: "row-successor")
 
-        XCTAssertFalse(archived)
-        XCTAssertTrue(probe.archivePostPaths.isEmpty)
-        XCTAssertEqual(model.lastActionError, "Close is unavailable for continued conversations.")
+        XCTAssertTrue(archived)
+        XCTAssertEqual(probe.archivePostPaths, ["/api/chains/row-1/archive"])
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
     }
 
     func testArchiveProceedsForSingleSegmentProductConversation() async {
