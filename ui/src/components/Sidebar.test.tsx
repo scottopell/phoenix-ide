@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   notifyProductConversationListMayHaveChanged,
   subscribeCloseSnapshotChanged,
+  subscribeProductConversationListRevision,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
@@ -18,6 +19,7 @@ const { apiMock } = vi.hoisted(() => ({
     getLocalServices: vi.fn(),
     archiveConversation: vi.fn(),
     archiveChain: vi.fn(),
+    closeProductConversation: vi.fn(),
     getChain: vi.fn(),
     deleteChain: vi.fn(),
     deleteConversation: vi.fn(),
@@ -180,6 +182,8 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     await waitFor(() => expect(getByRole('status')).toHaveTextContent('Showing cached conversations'));
     expect(container.querySelector('[data-id="cached-id"]')).not.toBeNull();
+    fireEvent.click(getByRole('button', { name: 'Conversation actions' }));
+    expect(container.querySelector('.conv-item-actions')?.textContent).not.toContain('Rename');
     fireEvent.click(getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull());
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
@@ -197,6 +201,8 @@ describe('Sidebar — ProductConversation navigation', () => {
       canonical_root: { ...row.canonical_root, title: 'Renamed Product Title' },
       presentation: { kind: 'state', display_name: 'Renamed Product Title', presentation_mode: 'idle' },
     });
+    const listRevisionListener = vi.fn();
+    const unsubscribe = subscribeProductConversationListRevision(listRevisionListener);
 
     const { getByRole, container } = render(
       <MemoryRouter initialEntries={['/product-conversations/pc-continued']}>
@@ -212,10 +218,12 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
     expect(apiMock.renameConversation).not.toHaveBeenCalled();
+    await waitFor(() => expect(listRevisionListener).toHaveBeenCalledTimes(1));
+    unsubscribe();
   });
 
   it('closes product conversations through the canonical root chain', async () => {
-    apiMock.archiveChain.mockResolvedValue(undefined);
+    apiMock.closeProductConversation.mockResolvedValue(undefined);
     const row = makeProductConversation('pc-continued', {
       canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
       latest_transcript_row_id: 'latest-continuation-row',
@@ -232,12 +240,11 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: /Close product conversation Old Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
-    await waitFor(() => expect(apiMock.archiveChain).toHaveBeenCalledWith('canonical-root-row'));
-    expect(apiMock.archiveConversation).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-continued'));
   });
 
   it('closes single-row products through the ordinary conversation endpoint', async () => {
-    apiMock.archiveConversation.mockResolvedValue({ ok: true });
+    apiMock.closeProductConversation.mockResolvedValue(undefined);
     const row = makeProductConversation('pc-single', {
       canonical_root: { transcript_row_id: 'single-row', slug: 'single', title: 'Single Product' },
       latest_transcript_row_id: 'single-row',
@@ -254,8 +261,32 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: /Close product conversation Single Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
-    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledWith('single-row'));
-    expect(apiMock.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-single'));
+  });
+
+  it('re-resolves close topology when a continuation appears during confirmation', async () => {
+    apiMock.closeProductConversation.mockResolvedValue(undefined);
+    const single = makeProductConversation('pc-race', {
+      canonical_root: { transcript_row_id: 'race-root', slug: 'race', title: 'Race Product' },
+      latest_transcript_row_id: 'race-root',
+    });
+    const continued = { ...single, latest_transcript_row_id: 'race-continuation' };
+    apiMock.listProductConversations
+      .mockResolvedValueOnce({ product_conversations: [single] })
+      .mockResolvedValueOnce({ product_conversations: [continued] })
+      .mockResolvedValue({ product_conversations: [] });
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-race']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-race" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-race"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Close product conversation Race Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-race'));
   });
 
   it('does not expose product conversation actions for history rows', async () => {
@@ -331,7 +362,7 @@ describe('Sidebar — ProductConversation navigation', () => {
   });
 
   it('clears the starter close target when durable product close reports a typed conflict', async () => {
-    apiMock.archiveChain.mockRejectedValueOnce(new ConflictError({
+    apiMock.closeProductConversation.mockRejectedValueOnce(new ConflictError({
       error: 'close loss confirmation required',
       error_type: 'close_loss_confirmation_required',
     }));
@@ -351,7 +382,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: /Close product conversation Close Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
-    await waitFor(() => expect(apiMock.archiveChain).toHaveBeenCalledWith('root-close-conflict'));
+    await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-close-conflict'));
     await waitFor(() => expect(queryByRole('dialog', { name: 'Close Product Conversation' })).toBeNull());
   });
 

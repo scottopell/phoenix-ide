@@ -2121,6 +2121,17 @@ export const api = {
     return resp.json();
   },
 
+  async closeProductConversation(reference: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/close`, {
+      method: 'POST',
+    });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
+    if (!resp.ok) throw new Error('Failed to close product conversation');
+  },
+
   async renameProductConversation(reference: string, title: string): Promise<ProductConversationListRowType> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/title`, {
       method: 'PATCH',
@@ -2657,6 +2668,10 @@ export const api = {
       body: JSON.stringify({ name }),
     });
     if (resp.status === 404) throw new Error('Chain not found');
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to set chain name');

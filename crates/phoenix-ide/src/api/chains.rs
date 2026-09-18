@@ -71,11 +71,7 @@ pub struct ChainView {
     pub product_conversation_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
-    /// `true` when the chain is archived. Chain archive is a write-cascade
-    /// across all members, so any member's `archived` flag is authoritative;
-    /// we read it off the root for clarity. Archive is a terminal lifecycle
-    /// transition — archived chain roots 404 on the chain route, so the UI
-    /// has no unarchive affordance.
+    /// `true` when the owning `ProductConversation` is in History.
     pub archived: bool,
     pub members: Vec<ChainMemberSummary>,
     pub qa_history: Vec<ChainQaRow>,
@@ -618,6 +614,12 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         .ok_or_else(|| AppError::Internal("chain validation passed but members empty".to_string()))?
         .clone();
 
+    let product_conversation = state
+        .db
+        .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+
     let qa_history = state
         .chain_qa
         .list_history(root_id)
@@ -636,7 +638,8 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         product_conversation_id: root_conv.product_conversation_id.to_string(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
-        archived: root_conv.archived,
+        archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
         members: summaries,
         qa_history,
         current_member_count,
@@ -736,6 +739,21 @@ fn resolve_display_name(root: &Conversation) -> String {
 fn db_to_app(e: DbError) -> AppError {
     match e {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!("ProductConversation {id} is read-only in History"),
+                "product_conversation_not_open",
+            )))
+        }
+        DbError::CloseAdmissionFenced(fence) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!(
+                    "ProductConversation {} has an active Close attempt {} in phase {:?}",
+                    fence.product_conversation_id, fence.attempt_id, fence.phase
+                ),
+                "close_admission_fenced",
+            )))
+        }
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -881,6 +899,10 @@ mod tests {
             members.push(db.get_conversation(id).await.map_err(db_to_app)?);
         }
         let root_conv = members.first().unwrap().clone();
+        let product_conversation = db
+            .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+            .await
+            .map_err(db_to_app)?;
         let qa_history = chain_qa
             .list_history(root_id)
             .await
@@ -895,7 +917,8 @@ mod tests {
             product_conversation_id: root_conv.product_conversation_id.to_string(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
-            archived: root_conv.archived,
+            archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
             members: summaries,
             qa_history,
             current_member_count,
@@ -966,6 +989,31 @@ mod tests {
         assert_eq!(view.current_member_count, 3);
         assert_eq!(view.current_total_messages, 3);
         assert!(view.qa_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_view_uses_product_lifecycle_when_legacy_archived_bit_drifts() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["history-a", "history-b"]).await;
+        let root = db.get_conversation("history-a").await.unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(db.fts_retriever()),
+        );
+        let view = build_view_for_test(&db, &chain_qa, "history-a")
+            .await
+            .unwrap();
+
+        assert!(view.archived);
     }
 
     /// REQ-CHN-008: the work identity is resolved from the chain's

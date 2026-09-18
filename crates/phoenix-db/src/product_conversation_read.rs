@@ -34,24 +34,30 @@ pub enum ProductConversationCloseAvailability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductConversationCloseUnavailableReason {
-    History,
     ActiveCloseAttempt,
     AwaitingTaskApproval,
     AwaitingContinuation,
     HandedOffWithoutContinuation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductConversationListLifecycle {
+    Open {
+        close_availability: ProductConversationCloseAvailability,
+    },
+    History,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationListProjection {
     pub product_conversation_id: ProductConversationId,
-    pub lifecycle: OrdinaryProductConversationLifecycle,
+    pub lifecycle: ProductConversationListLifecycle,
     pub root_transcript_row_id: String,
     pub root_slug: Option<String>,
     pub root_title: Option<String>,
     pub latest_transcript_row_id: String,
     pub latest_state: crate::ConvState,
     pub latest_continued_in_conv_id: Option<String>,
-    pub close_availability: ProductConversationCloseAvailability,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -237,11 +243,7 @@ fn list_projection_from_row(
         })?;
     let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let close_availability = if lifecycle == OrdinaryProductConversationLifecycle::History {
-        ProductConversationCloseAvailability::Unavailable(
-            ProductConversationCloseUnavailableReason::History,
-        )
-    } else if row.try_get::<bool, _>("has_awaiting_task_approval")? {
+    let close_availability = if row.try_get::<bool, _>("has_awaiting_task_approval")? {
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
         )
@@ -260,6 +262,12 @@ fn list_projection_from_row(
     } else {
         ProductConversationCloseAvailability::Available
     };
+    let lifecycle = match lifecycle {
+        OrdinaryProductConversationLifecycle::Open => {
+            ProductConversationListLifecycle::Open { close_availability }
+        }
+        OrdinaryProductConversationLifecycle::History => ProductConversationListLifecycle::History,
+    };
     Ok(ProductConversationListProjection {
         product_conversation_id,
         lifecycle,
@@ -269,7 +277,6 @@ fn list_projection_from_row(
         latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
         latest_state,
         latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
-        close_availability,
         updated_at: row
             .try_get::<String, _>("updated_at")?
             .parse::<DateTime<Utc>>()
@@ -407,19 +414,11 @@ impl Database {
         let result = async {
             let resolved =
                 Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
-            let lifecycle: String = sqlx::query_scalar(
-                "SELECT ordinary_lifecycle FROM product_conversations
-                 WHERE id = ?1 AND kind = 'ordinary'",
+            crate::close_foundation::require_product_conversation_admission_tx(
+                &mut transaction,
+                &resolved.requested_transcript_row_id,
             )
-            .bind(resolved.product_conversation_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or_else(|| DbError::ConversationNotFound(reference.to_string()))?;
-            if lifecycle != OrdinaryProductConversationLifecycle::Open.as_str() {
-                return Err(DbError::ProductConversationUnavailable(
-                    resolved.product_conversation_id,
-                ));
-            }
+            .await?;
             let row = sqlx::query(
                 "SELECT root.id
                  FROM conversations root
@@ -1613,7 +1612,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             projection.lifecycle,
-            OrdinaryProductConversationLifecycle::Open
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
         );
 
         sqlx::query(
@@ -1641,7 +1642,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             projection.lifecycle,
-            OrdinaryProductConversationLifecycle::History
+            ProductConversationListLifecycle::History
         );
     }
 
@@ -1670,8 +1671,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            projection.close_availability,
-            ProductConversationCloseAvailability::Available
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
         );
 
         db.update_conversation_state(
@@ -1696,10 +1699,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            projection.close_availability,
-            ProductConversationCloseAvailability::Unavailable(
-                ProductConversationCloseUnavailableReason::AwaitingContinuation,
-            ),
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Unavailable(
+                    ProductConversationCloseUnavailableReason::AwaitingContinuation,
+                ),
+            },
         );
     }
 
@@ -1732,10 +1737,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            projection.close_availability,
-            ProductConversationCloseAvailability::Unavailable(
-                ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
-            ),
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Unavailable(
+                    ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
+                ),
+            },
         );
     }
 

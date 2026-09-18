@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   openFile: vi.fn(),
   archiveConversation: vi.fn(),
   archiveChain: vi.fn(),
+  closeProductConversation: vi.fn(),
+  listProductConversations: vi.fn(),
 }));
 
 vi.mock('../../api', async (importOriginal) => {
@@ -28,6 +30,8 @@ vi.mock('../../api', async (importOriginal) => {
       searchConversationContent: mocks.searchConversationContent,
       archiveConversation: mocks.archiveConversation,
       archiveChain: mocks.archiveChain,
+      closeProductConversation: mocks.closeProductConversation,
+      listProductConversations: mocks.listProductConversations,
     },
   };
 });
@@ -85,12 +89,16 @@ function renderPalette(
 }
 
 beforeEach(() => {
+  mocks.listProductConversations.mockReset();
+  mocks.listProductConversations.mockResolvedValue({ product_conversations: [] });
   mocks.searchConversationFiles.mockReset();
   mocks.searchConversationCode.mockReset();
   mocks.searchConversationContent.mockReset();
   mocks.openFile.mockReset();
   mocks.archiveConversation.mockReset();
   mocks.archiveChain.mockReset();
+  mocks.closeProductConversation.mockReset();
+  mocks.closeProductConversation.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -174,8 +182,7 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
-    expect(mocks.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.closeProductConversation).toHaveBeenCalledWith('product-1'));
   });
 
   it('uses the canonical chain root when drift hides continuation members', async () => {
@@ -202,8 +209,7 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('root-id'));
-    expect(mocks.archiveConversation).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.closeProductConversation).toHaveBeenCalledWith('product-id'));
   });
 
   it('does not offer Close when the server-authoritative action projection blocks it', () => {
