@@ -1300,6 +1300,10 @@ pub struct AutomaticContinuationAdmission {
     pub updated_at_unix_micros: i64,
 }
 
+impl AutomaticContinuationAdmission {
+    pub const MAX_NO_PROGRESS_ATTEMPTS: u32 = 5;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupParentAction {
     Reconcile,
@@ -6619,6 +6623,163 @@ impl Database {
             admitted_at_unix_micros: row.try_get("admitted_at_unix_micros")?,
             updated_at_unix_micros: row.try_get("updated_at_unix_micros")?,
         }))
+    }
+
+    /// Return whether the predecessor's continuation opening has settled durably.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn has_completed_continuation_handoff(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM completed_continuation_handoffs
+                 WHERE predecessor_conversation_id = ?1
+             )",
+        )
+        .bind(predecessor_conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    /// List automatic continuation obligations that still require reconciliation.
+    ///
+    /// # Errors
+    /// Returns an error when persisted admission fields are invalid or cannot be read.
+    pub async fn pending_automatic_continuation_admissions(
+        &self,
+    ) -> DbResult<Vec<AutomaticContinuationAdmission>> {
+        let predecessors: Vec<String> = sqlx::query_scalar(
+            "SELECT predecessor_conversation_id
+             FROM automatic_continuation_admissions
+             WHERE phase NOT IN ('message_settled', 'failed')
+             ORDER BY admitted_at_unix_micros, predecessor_conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut admissions = Vec::with_capacity(predecessors.len());
+        for predecessor in predecessors {
+            if let Some(admission) = self.automatic_continuation_admission(&predecessor).await? {
+                admissions.push(admission);
+            }
+        }
+        Ok(admissions)
+    }
+
+    /// Advance an automatic continuation after one durable progress boundary.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or the update fails.
+    pub async fn advance_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+        phase: AutomaticContinuationPhase,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = ?2, no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?3
+             WHERE predecessor_conversation_id = ?1
+               AND (
+                   (phase = 'admitted' AND ?2 = 'successor_reserved')
+                   OR (phase = 'successor_reserved' AND ?2 = 'ownership_transferred')
+                   OR (phase = 'ownership_transferred' AND ?2 = 'dispatch_accepted')
+                   OR (phase = 'dispatch_accepted' AND ?2 = 'message_settled')
+               )",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(phase.as_str())
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record one automatic-continuation attempt that made no durable progress.
+    ///
+    /// The admission opens its breaker at the bounded attempt cap.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or the update fails.
+    pub async fn record_automatic_continuation_no_progress(
+        &self,
+        predecessor_conversation_id: &str,
+        error: &str,
+    ) -> DbResult<AutomaticContinuationPhase> {
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET no_progress_attempts = no_progress_attempts + 1,
+                 phase = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN 'failed'
+                     ELSE phase
+                 END,
+                 last_error = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN ?3
+                     ELSE NULL
+                 END,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'failed')
+             RETURNING no_progress_attempts",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(i64::from(
+            AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS,
+        ))
+        .bind(error)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(attempts) = attempts else {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        };
+        if attempts >= i64::from(AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS) {
+            Ok(AutomaticContinuationPhase::Failed)
+        } else {
+            Ok(self
+                .automatic_continuation_admission(predecessor_conversation_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::ConversationNotFound(predecessor_conversation_id.to_string())
+                })?
+                .phase)
+        }
+    }
+
+    /// Explicitly re-open one failed automatic continuation with its accepted identity intact.
+    ///
+    /// # Errors
+    /// Returns an error when no failed admission was updated.
+    pub async fn retry_failed_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = 'admitted', no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?2
+             WHERE predecessor_conversation_id = ?1 AND phase = 'failed'",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Atomically commit a generated continuation summary when the persisted
