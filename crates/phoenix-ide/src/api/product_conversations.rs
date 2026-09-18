@@ -94,19 +94,9 @@ pub async fn get_product_conversation_automatic_continuation(
         .resolve_ordinary_product_conversation(&reference)
         .await
         .map_err(db_to_app)?;
-    let aggregate = state
-        .db
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+    automatic_continuation_view(&state, resolved.product_conversation_id, false)
         .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(
-        &state,
-        resolved.product_conversation_id,
-        aggregate.latest_transcript_row_id,
-        false,
-    )
-    .await
-    .map(Json)
+        .map(Json)
 }
 
 pub async fn put_product_conversation_automatic_continuation(
@@ -127,19 +117,9 @@ pub async fn put_product_conversation_automatic_continuation(
         )
         .await
         .map_err(db_to_app)?;
-    let aggregate = state
-        .db
-        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+    automatic_continuation_view(&state, resolved.product_conversation_id, false)
         .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(
-        &state,
-        resolved.product_conversation_id,
-        aggregate.latest_transcript_row_id,
-        false,
-    )
-    .await
-    .map(Json)
+        .map(Json)
 }
 
 pub async fn get_coordinator_automatic_continuation(
@@ -168,14 +148,9 @@ pub async fn put_coordinator_automatic_continuation(
         )
         .await
         .map_err(db_to_app)?;
-    automatic_continuation_view(
-        &state,
-        coordinator.product_conversation_id,
-        coordinator.id,
-        true,
-    )
-    .await
-    .map(Json)
+    automatic_continuation_view(&state, coordinator.product_conversation_id, true)
+        .await
+        .map(Json)
 }
 
 async fn coordinator_automatic_continuation_view(
@@ -187,13 +162,7 @@ async fn coordinator_automatic_continuation_view(
         .get_conversation(&coordinator_id)
         .await
         .map_err(db_to_app)?;
-    automatic_continuation_view(
-        state,
-        coordinator.product_conversation_id,
-        coordinator.id,
-        true,
-    )
-    .await
+    automatic_continuation_view(state, coordinator.product_conversation_id, true).await
 }
 
 async fn coordinator_conversation_id(state: &AppState) -> Result<String, AppError> {
@@ -208,7 +177,6 @@ async fn coordinator_conversation_id(state: &AppState) -> Result<String, AppErro
 async fn automatic_continuation_view(
     state: &AppState,
     product_conversation_id: ProductConversationId,
-    latest_transcript_row_id: String,
     coordinator: bool,
 ) -> Result<AutomaticContinuationView, AppError> {
     let preference = state
@@ -218,7 +186,7 @@ async fn automatic_continuation_view(
         .map_err(db_to_app)?;
     let admission = state
         .db
-        .automatic_continuation_admission(&latest_transcript_row_id)
+        .latest_automatic_continuation_admission(&product_conversation_id)
         .await
         .map_err(db_to_app)?
         .map(|admission| AutomaticContinuationAdmissionView {
@@ -1265,6 +1233,116 @@ mod tests {
             accepted["allowed_actions"],
             serde_json::json!(["cancel", "delete"])
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn automatic_continuation_api_is_prospective_and_projects_predecessor_admission() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("auto-api", "auto-api", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reference = root.product_conversation_id.to_string();
+        let uri = format!("/api/product-conversations/{reference}/automatic-continuation");
+
+        let initial = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial: serde_json::Value =
+            serde_json::from_slice(&to_bytes(initial.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(initial["aggregate"]["kind"], "ordinary");
+        assert_eq!(initial["auto_continue_on_context_exhaustion"], false);
+        assert!(initial["admission"].is_null());
+
+        let enabled = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"auto_continue_on_context_exhaustion":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert!(state
+            .db
+            .automatic_continuation_admission(&root.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "auto-api-operation".to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let content = MessageContent::continuation("persisted API handoff");
+        let message = crate::db::Message {
+            message_id: "auto-api-summary".to_string(),
+            conversation_id: root.id.clone(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        state
+            .db
+            .commit_continuation(
+                &root.id,
+                "auto-api-operation",
+                &message,
+                &ConvState::ContextExhausted {
+                    summary: "persisted API handoff".to_string(),
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .continue_conversation_with_intent(
+                &root.id,
+                crate::db::NewContinuationDispatchIntent::generated_predecessor_context(
+                    ClientTurnKey::try_from("auto-api-opening").unwrap(),
+                    "persisted API handoff".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let projected = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(projected.status(), StatusCode::OK);
+        let projected: serde_json::Value =
+            serde_json::from_slice(&to_bytes(projected.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            projected["admission"]["predecessor_transcript_row_id"],
+            root.id
+        );
+        assert_eq!(projected["admission"]["phase"], "admitted");
     }
 
     #[tokio::test]
