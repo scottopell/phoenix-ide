@@ -548,8 +548,12 @@ def retire_registered(socket, control, identities):
         except FileNotFoundError:
             pass
     owned.remove(record)
-    if visible_replacement:
-        preserved_visible_paths.add(socket)
+    try:
+        final_socket_stat = socket.stat()
+        if (final_socket_stat.st_dev, final_socket_stat.st_ino) != (record[1], record[2]):
+            preserved_visible_paths.add(socket)
+    except FileNotFoundError:
+        pass
     provisional[:] = [
         item for item in provisional
         if not (item[0] == socket and item[1] == control and tuple(item[2]) == expected)
@@ -628,6 +632,7 @@ def register(request):
         registration_control = control_root.with_name(
             f"{control_root.name}.registration-{uuid.uuid4()}"
         )
+        previous = retained_controls.get(control.name)
         os.link(control, registration_control)
         try:
             if not original_control_root_exists():
@@ -649,6 +654,15 @@ def register(request):
             record = (record[0], record[1], record[2], control, record[4])
             owned[-1] = record
             retained_controls[control.name] = retained
+            if previous is not None and previous[3] is not None:
+                previous_anchor = control_root / previous[3]
+                try:
+                    previous_stat = previous_anchor.stat()
+                    if previous_stat.st_dev != previous[0] or previous_stat.st_ino != previous[1]:
+                        raise RuntimeError("previous retained control anchor changed identity")
+                    previous_anchor.unlink()
+                except FileNotFoundError:
+                    pass
         finally:
             registration_control.unlink(missing_ok=True)
         try:
@@ -700,7 +714,13 @@ while owner_alive():
                 ".publication-acknowledged-", ".publication-committed-", 1
             )
         )
-        if publication_committed.exists():
+        try:
+            commit_valid = (publication_committed.is_file()
+                            and not publication_committed.is_symlink()
+                            and publication_committed.read_text() == "committed")
+        except OSError:
+            commit_valid = False
+        if commit_valid:
             publication_committed.unlink()
             publication_acknowledged.unlink(missing_ok=True)
             publication_cancelled.unlink(missing_ok=True)
@@ -761,7 +781,7 @@ while owner_alive():
                 except OSError:
                     pass
                 adopted_pending_publication.remove(item)
-        else:
+        elif now >= deadline or published.exists():
             retired = retire_registered(socket, control, identities)
             if not retired and all(identity_state(identity) == "absent" for identity in identities):
                 retired = True
@@ -1066,19 +1086,19 @@ while time.monotonic() < cleanup_deadline:
             continue
         root_quarantine = root.with_name(f"{root.name}.retired-{uuid.uuid4()}")
         try:
-            if root_quarantine_hook:
-                subprocess.run(
-                    [root_quarantine_hook, str(root)],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, check=False,
-                    timeout=remaining_timeout(cleanup_deadline),
-                )
             os.replace(root, root_quarantine)
             moved_root_stat = root_quarantine.stat()
             if (moved_root_stat.st_dev, moved_root_stat.st_ino) != root_identity:
                 if not root.exists():
                     os.replace(root_quarantine, root)
                 sys.exit(1)
+            if root_quarantine_hook:
+                subprocess.run(
+                    [root_quarantine_hook, str(root_quarantine)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                    timeout=remaining_timeout(cleanup_deadline),
+                )
             reconciled = True
             for entry in root_quarantine.iterdir():
                 if entry.is_symlink():
@@ -1528,7 +1548,7 @@ impl AdoptedTestServer {
                 )));
             }
             if atomic_ack_matches(&self.publication_acknowledged, "published") {
-                fs::write(&self.publication_committed, [])?;
+                fs::write(&self.publication_committed, b"committed")?;
                 self.committed = true;
                 return Ok(self.processes.clone());
             }
@@ -3007,7 +3027,7 @@ mod tests {
             .find("retained_controls[control.name] = (device, inode, processes, None)")
             .expect("replacement control identity is retained");
         let previous_anchor = WATCHDOG_PROGRAM
-            .find("(control_root / previous[3]).unlink(missing_ok=True)")
+            .find("previous_anchor.unlink()")
             .expect("previous anchor is removed");
         assert!(append < previous_anchor && retain < previous_anchor);
     }
@@ -3774,6 +3794,18 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(control_root).unwrap();
+    }
+
+    #[test]
+    fn malformed_publication_commit_marker_is_not_accepted() {
+        assert!(WATCHDOG_PROGRAM.contains("publication_committed.is_file()"));
+        assert!(WATCHDOG_PROGRAM.contains("not publication_committed.is_symlink()"));
+        assert!(WATCHDOG_PROGRAM.contains("publication_committed.read_text() == \"committed\""));
+    }
+
+    #[test]
+    fn publication_waits_for_deadline_before_missing_marker_retirement() {
+        assert!(WATCHDOG_PROGRAM.contains("elif now >= deadline or published.exists():"));
     }
 
     #[tokio::test]
