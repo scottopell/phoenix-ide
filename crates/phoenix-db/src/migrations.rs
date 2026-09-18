@@ -528,6 +528,14 @@ FROM conversation_creation_jobs
 WHERE message_id IS NOT NULL
   AND length(CAST(message_id AS BLOB)) > 256;
 
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
+FROM durable_turns
+WHERE length(CAST(
+    COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
+    AS BLOB
+)) > 256;
+
 CREATE TRIGGER messages_bound_new_message_id_bytes
 BEFORE INSERT ON messages
 FOR EACH ROW
@@ -10191,6 +10199,16 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "CREATE TABLE durable_turns (
+                conversation_id TEXT NOT NULL,
+                client_turn_key TEXT NOT NULL,
+                canonical_message_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let legacy = "x".repeat(257);
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&legacy)
@@ -10204,6 +10222,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+
+        let turn_conversation = "c".repeat(250);
+        let turn_key = "turn-key";
+        let admitted_turn = format!("{turn_conversation}:{turn_key}");
+        sqlx::query(
+            "INSERT INTO durable_turns (conversation_id, client_turn_key, canonical_message_id)
+             VALUES (?1, ?2, NULL)",
+        )
+        .bind(&turn_conversation)
+        .bind(turn_key)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
 
@@ -10221,6 +10252,11 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&admitted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_turn)
             .execute(&pool)
             .await
             .unwrap();
