@@ -4901,7 +4901,7 @@ fn linux_process_state(process: &Path) -> Result<Option<char>, LinuxScannerError
                 &error,
             ) {
                 LinuxScannerError::ProcessDisappeared => Ok(None),
-                error => Err(error),
+                error @ LinuxScannerError::Indeterminate { .. } => Err(error),
             }
         }
     };
