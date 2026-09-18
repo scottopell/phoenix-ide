@@ -6631,6 +6631,30 @@ impl Database {
         }))
     }
 
+    /// Return the newest automatic-continuation admission for one stable aggregate.
+    ///
+    /// # Errors
+    /// Returns an error when the query or admission decoding fails.
+    pub async fn latest_automatic_continuation_admission(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<AutomaticContinuationAdmission>> {
+        let predecessor: Option<String> = sqlx::query_scalar(
+            "SELECT predecessor_conversation_id
+             FROM automatic_continuation_admissions
+             WHERE product_conversation_id = ?1
+             ORDER BY admitted_at_unix_micros DESC, predecessor_conversation_id DESC
+             LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        match predecessor {
+            Some(predecessor) => self.automatic_continuation_admission(&predecessor).await,
+            None => Ok(None),
+        }
+    }
+
     /// Return whether the predecessor's continuation opening has settled durably.
     ///
     /// # Errors
@@ -18249,6 +18273,17 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let second_product = db
+            .get_conversation("auto-on-second")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let latest = db
+            .latest_automatic_continuation_admission(&second_product)
+            .await
+            .unwrap()
+            .expect("stable aggregate lookup returns its admission");
+        assert_eq!(latest.predecessor_conversation_id, "auto-on-second");
 
         let auto_on_product = admitted.product_conversation_id.clone();
         db.set_auto_continue_on_context_exhaustion(
@@ -18353,7 +18388,11 @@ mod tests {
                 assert_eq!(phase, AutomaticContinuationPhase::Failed);
             }
         }
-        assert!(db.pending_automatic_continuation_admissions().await.unwrap().is_empty());
+        assert!(db
+            .pending_automatic_continuation_admissions()
+            .await
+            .unwrap()
+            .is_empty());
         db.retry_failed_automatic_continuation("breaker-parent")
             .await
             .unwrap();
