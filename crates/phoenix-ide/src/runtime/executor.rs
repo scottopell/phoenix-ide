@@ -8972,6 +8972,7 @@ fn compensate_follow_up_artifact_failure(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -9062,8 +9063,27 @@ fn persist_fresh_approved_task_artifact_blocking(
         run_git(cwd, &commit_args).map_err(|error| {
             compensate(format!("Failed to commit approved task artifact: {error}"))
         })?;
-        let reviewed_blob = run_git(cwd, &["hash-object", "--", &snapshot.task_file])
-            .map_err(FollowUpArtifactError::AfterGit)?;
+        let mut hash = std::process::Command::new("git")
+            .arg("hash-object")
+            .arg("--stdin")
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
+        std::io::Write::write_all(
+            &mut hash.stdin.take().expect("hash-object stdin"),
+            snapshot.artifact_body.as_bytes(),
+        )
+        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
+        let reviewed_blob = String::from_utf8(
+            hash.wait_with_output()
+                .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
+                .stdout,
+        )
+        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
+        .trim()
+        .to_string();
         let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{}", snapshot.task_file)])
             .map_err(FollowUpArtifactError::AfterGit)?;
         if committed_blob != reviewed_blob {

@@ -7400,11 +7400,12 @@ impl Database {
             insert_message_tx(&mut tx, approval_message).await?;
             let state_json = serde_json::to_string(state).unwrap();
             sqlx::query(
-                "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4",
+                "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
             )
             .bind(state_json)
             .bind(conv_state_kind(state))
             .bind(state_updated_at.to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
