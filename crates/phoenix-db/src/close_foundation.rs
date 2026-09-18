@@ -3745,6 +3745,48 @@ type AdoptableWorktreeCleanupPlanColumns = (
     Option<String>,
 );
 
+fn worktree_cleanup_plan_from_columns(
+    columns: &WorktreeCleanupPlanColumns,
+) -> DbResult<CloseWorktreeCleanupPlan> {
+    let final_tombstone = match (
+        columns.3.as_deref(),
+        columns.4.as_deref(),
+        columns.5.as_deref(),
+        columns.6.as_deref(),
+    ) {
+        (None, None, None, None) => None,
+        (Some(codec), Some(value), Some(device), Some(inode)) => {
+            Some(CloseWorktreeFinalTombstone {
+                root: decode_host_path(codec, value)?,
+                device: device
+                    .parse()
+                    .map_err(|_| close_precondition("invalid final tombstone device"))?,
+                inode: inode
+                    .parse()
+                    .map_err(|_| close_precondition("invalid final tombstone inode"))?,
+                object_device: columns
+                    .7
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| close_precondition("invalid final tombstone object device"))?,
+                object_inode: columns
+                    .8
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| close_precondition("invalid final tombstone object inode"))?,
+            })
+        }
+        _ => return Err(close_precondition("incomplete final tombstone binding")),
+    };
+    Ok(CloseWorktreeCleanupPlan {
+        administrative_dir: decode_host_path(&columns.0, &columns.1)?,
+        administrative_dir_incarnation: columns.2.clone(),
+        final_tombstone,
+    })
+}
+
 fn classify_ambient_writer_insert_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
         if database_error.is_foreign_key_violation() || database_error.is_check_violation() {
@@ -4350,19 +4392,20 @@ impl Database {
                 });
             }
         }
+        let adopted_columns: WorktreeCleanupPlanColumns = (
+            source.2.clone(),
+            source.3.clone(),
+            source.4.clone(),
+            source.5.clone(),
+            source.6.clone(),
+            source.7.clone(),
+            source.8.clone(),
+            source.9.clone(),
+            source.10.clone(),
+        );
+        let adopted_plan = worktree_cleanup_plan_from_columns(&adopted_columns)?;
         tx.commit().await?;
-        self.close_worktree_cleanup_plan(
-            &request.attempt_id,
-            &request.scope,
-            &request.target_snapshot,
-            &request.resource,
-        )
-        .await?
-        .ok_or_else(|| DbError::CloseEvidenceInvariant {
-            invariant: "adopted_cleanup_plan_must_exist",
-            relation: "close_worktree_cleanup_plans",
-            detail: "transaction committed without an exact target plan".to_string(),
-        })
+        Ok(adopted_plan)
     }
 
     /// Durably binds the validated Git administrative directory to an exact
@@ -4636,57 +4679,7 @@ impl Database {
         .await?;
         match rows.as_slice() {
             [] => Ok(None),
-            [(
-                codec,
-                value,
-                incarnation,
-                tombstone_codec,
-                tombstone_value,
-                tombstone_device,
-                tombstone_inode,
-                object_device,
-                object_inode,
-            )] => {
-                let final_tombstone = match (
-                    tombstone_codec.as_deref(),
-                    tombstone_value.as_deref(),
-                    tombstone_device.as_deref(),
-                    tombstone_inode.as_deref(),
-                ) {
-                    (None, None, None, None) => None,
-                    (Some(tombstone_codec), Some(tombstone_value), Some(device), Some(inode)) => {
-                        Some(CloseWorktreeFinalTombstone {
-                            root: decode_host_path(tombstone_codec, tombstone_value)?,
-                            device: device.parse().map_err(|_| {
-                                close_precondition("invalid final tombstone device")
-                            })?,
-                            inode: inode
-                                .parse()
-                                .map_err(|_| close_precondition("invalid final tombstone inode"))?,
-                            object_device: object_device
-                                .as_deref()
-                                .map(str::parse)
-                                .transpose()
-                                .map_err(|_| {
-                                    close_precondition("invalid final tombstone object device")
-                                })?,
-                            object_inode: object_inode
-                                .as_deref()
-                                .map(str::parse)
-                                .transpose()
-                                .map_err(|_| {
-                                    close_precondition("invalid final tombstone object inode")
-                                })?,
-                        })
-                    }
-                    _ => return Err(close_precondition("incomplete final tombstone binding")),
-                };
-                Ok(Some(CloseWorktreeCleanupPlan {
-                    administrative_dir: decode_host_path(codec, value)?,
-                    administrative_dir_incarnation: incarnation.clone(),
-                    final_tombstone,
-                }))
-            }
+            [columns] => worktree_cleanup_plan_from_columns(columns).map(Some),
             _ => Err(close_precondition(
                 "exact worktree cleanup authority has conflicting plans",
             )),
