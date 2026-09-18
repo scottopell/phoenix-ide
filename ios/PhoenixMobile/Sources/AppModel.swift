@@ -1481,6 +1481,10 @@ final class AppModel {
 
     func replaceAPIForTesting(_ api: PhoenixAPI) {
         cancelPersistedOutboxDrainAuthority()
+        sessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        drainSessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        sessions.removeAll()
+        drainSessions.removeAll()
         self.api = api
         coordinatorConversationId = coordinatorIdentityStore.load(persistenceScope: api.configurationIdentity.persistenceScope)?.conversationId
         finishStartupHydration()

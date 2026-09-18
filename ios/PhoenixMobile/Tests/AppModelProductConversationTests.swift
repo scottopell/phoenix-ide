@@ -3123,6 +3123,23 @@ final class AppModelProductConversationTests: XCTestCase {
 
     }
 
+    func testReplacingAPIRevokesExistingSessionsBeforeInstallingNewAuthority() {
+        let oldProbe = SendProbe()
+        let (oldAPI, oldRegistration) = makeHTTPAPI(probe: oldProbe, host: "replacement-old.invalid")
+        defer { TestURLProtocol.uninstall(host: "replacement-old.invalid", owner: oldRegistration) }
+        let newProbe = SendProbe()
+        let (newAPI, newRegistration) = makeHTTPAPI(probe: newProbe, host: "replacement-new.invalid")
+        defer { TestURLProtocol.uninstall(host: "replacement-new.invalid", owner: newRegistration) }
+        let model = makeModel()
+        model.replaceAPIForTesting(oldAPI)
+
+        XCTAssertNotNil(model.session(for: "row-1"))
+
+        model.replaceAPIForTesting(newAPI)
+
+        XCTAssertNil(model.existingSession(for: "row-1"))
+    }
+
     func testArchiveRejectsStaleAPIAfterPersistedMemberDiscovery() async {
         let store = MutableTestConversationPersistenceStore(contentsByConversationId: [:])
         let discoveryGate = AsyncCandidateGate()
