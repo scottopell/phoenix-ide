@@ -1291,6 +1291,11 @@ impl RuntimeManager {
                         .map_err(|error| error.to_string())?
                         && existing_cleanup_plan.is_none()
                     {
+                        let common_git_dir = exact_worktree_common_git_dir(&quarantine_path)?;
+                        let observed_administrative_dir =
+                            exact_worktree_administrative_dir(&quarantine_path, &common_git_dir)?;
+                        let observed_administrative_dir_incarnation =
+                            observe_administrative_dir_incarnation(&observed_administrative_dir)?;
                         let adopted = self
                             .db()
                             .adopt_close_worktree_cleanup_plan(
@@ -1299,6 +1304,8 @@ impl RuntimeManager {
                                     scope: scope.clone(),
                                     target_snapshot: snapshot.clone(),
                                     resource: target.resource.clone(),
+                                    observed_administrative_dir,
+                                    observed_administrative_dir_incarnation,
                                 },
                             )
                             .await
@@ -1865,7 +1872,10 @@ impl RuntimeManager {
     where
         E: From<String>,
     {
-        self.route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, None)
+        let detail = detail.into();
+        let cause = AmbientWriterIndeterminateDiagnostic::from_marker(&detail)
+            .map(|diagnostic| diagnostic.durable_cause());
+        self.route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, cause)
             .await
     }
 
@@ -2837,6 +2847,43 @@ impl AmbientWriterIndeterminateDiagnostic {
     pub(crate) fn from_marker(message: &str) -> Option<Self> {
         let marker = "ambient_writer_indeterminate:";
         serde_json::from_str(message.get(message.find(marker)? + marker.len()..)?).ok()
+    }
+
+    fn durable_cause(&self) -> CloseNeedsRepairCause {
+        CloseNeedsRepairCause::ambient_writer_indeterminate(
+            serde_json::to_value(self.detector)
+                .expect("diagnostic detector serialization is total")
+                .as_str()
+                .expect("diagnostic detector serializes as a string"),
+            serde_json::to_value(self.operation)
+                .expect("diagnostic operation serialization is total")
+                .as_str()
+                .expect("diagnostic operation serializes as a string"),
+            serde_json::to_value(self.error_kind)
+                .expect("diagnostic error kind serialization is total")
+                .as_str()
+                .expect("diagnostic error kind serializes as a string"),
+        )
+        .expect("diagnostic identifiers are non-empty")
+    }
+
+    pub(crate) fn from_durable_cause(
+        cause: &crate::db::AmbientWriterIndeterminateCause,
+    ) -> Option<Self> {
+        Some(Self {
+            detector: serde_json::from_value(serde_json::Value::String(
+                cause.detector().to_string(),
+            ))
+            .ok()?,
+            operation: serde_json::from_value(serde_json::Value::String(
+                cause.operation().to_string(),
+            ))
+            .ok()?,
+            error_kind: serde_json::from_value(serde_json::Value::String(
+                cause.error_kind().to_string(),
+            ))
+            .ok()?,
+        })
     }
 }
 

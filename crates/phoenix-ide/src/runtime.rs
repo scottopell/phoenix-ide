@@ -8332,6 +8332,8 @@ mod scope_liveness_tests {
                     ),
                 )
                 .unwrap(),
+                observed_administrative_dir: repository.path().join("source-admin"),
+                observed_administrative_dir_incarnation: "source-admin-incarnation".to_string(),
             })
             .await
             .unwrap();

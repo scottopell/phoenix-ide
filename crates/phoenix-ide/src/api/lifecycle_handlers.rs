@@ -3,7 +3,7 @@
 
 use super::handlers::AppError;
 use super::types::{
-    CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
+    CancelCloseBeforeRetirementRequest, CloseFailedEvidence, ConfirmCloseLossRetirementRequest,
     ConfirmCloseStopWorkRequest, ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse,
     ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest,
     RetryCloseRetirementRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
@@ -669,8 +669,13 @@ fn close_retirement_conflict_for_phase(
     if close_phase_allows_retry_guidance(phase) {
         response = response.with_close_recovery(attempt_id, active_transcript_id);
     }
-    response.failed_invariant = invariant;
-    response.failed_relation = relation;
+    response.failed_evidence =
+        invariant
+            .zip(relation)
+            .map(|(failed_invariant, failed_relation)| CloseFailedEvidence {
+                failed_invariant,
+                failed_relation,
+            });
     response.ambient_writer_indeterminate = diagnostic;
     response
 }
@@ -835,6 +840,11 @@ fn close_needs_repair_conflict(
                 invariant: cause.invariant().to_string(),
                 relation: cause.relation().to_string(),
             }
+        }
+        Some(phoenix_db::CloseNeedsRepairCause::AmbientWriterIndeterminate(cause)) => {
+            let diagnostic = crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic::from_durable_cause(&cause)
+                .expect("database constrains durable ambient-writer diagnostic identifiers");
+            CloseRetirementError::Message(diagnostic.marker())
         }
         None => CloseRetirementError::Message(
             "Close retirement needs repair. Open the active transcript and retry the exact attempt."

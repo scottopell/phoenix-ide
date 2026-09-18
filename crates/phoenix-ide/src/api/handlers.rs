@@ -14207,13 +14207,17 @@ pub(crate) mod hard_delete_cascade_tests {
                 conflict.active_transcript_id.as_deref(),
                 Some(root.id.as_str())
             );
+            let failed_evidence = conflict
+                .failed_evidence
+                .as_ref()
+                .expect("evidence conflict must preserve its paired identifiers");
             assert_eq!(
-                conflict.failed_invariant.as_deref(),
-                Some("target_dispatch_must_match_sealed_inventory")
+                failed_evidence.failed_invariant,
+                "target_dispatch_must_match_sealed_inventory"
             );
             assert_eq!(
-                conflict.failed_relation.as_deref(),
-                Some("close_retirement_resource_dispatches")
+                failed_evidence.failed_relation,
+                "close_retirement_resource_dispatches"
             );
         }
     }

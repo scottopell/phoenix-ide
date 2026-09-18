@@ -734,8 +734,41 @@ impl CloseEvidenceInvariantCause {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AmbientWriterIndeterminateCause {
+    detector: NonEmptyString,
+    operation: NonEmptyString,
+    error_kind: NonEmptyString,
+}
+
+impl AmbientWriterIndeterminateCause {
+    fn new(detector: String, operation: String, error_kind: String) -> Result<Self, &'static str> {
+        Ok(Self {
+            detector: NonEmptyString::new(detector)?,
+            operation: NonEmptyString::new(operation)?,
+            error_kind: NonEmptyString::new(error_kind)?,
+        })
+    }
+
+    #[must_use]
+    pub fn detector(&self) -> &str {
+        self.detector.as_str()
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        self.operation.as_str()
+    }
+
+    #[must_use]
+    pub fn error_kind(&self) -> &str {
+        self.error_kind.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum CloseNeedsRepairCause {
     EvidenceInvariant(CloseEvidenceInvariantCause),
+    AmbientWriterIndeterminate(AmbientWriterIndeterminateCause),
 }
 
 impl CloseNeedsRepairCause {
@@ -751,6 +784,24 @@ impl CloseNeedsRepairCause {
             invariant.into(),
             relation.into(),
         )?))
+    }
+
+    /// Constructs one complete durable ambient-writer indeterminate diagnostic.
+    ///
+    /// # Errors
+    /// Returns an error when any diagnostic identifier is empty.
+    pub fn ambient_writer_indeterminate(
+        detector: impl Into<String>,
+        operation: impl Into<String>,
+        error_kind: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        Ok(Self::AmbientWriterIndeterminate(
+            AmbientWriterIndeterminateCause::new(
+                detector.into(),
+                operation.into(),
+                error_kind.into(),
+            )?,
+        ))
     }
 }
 
@@ -788,6 +839,8 @@ pub struct AdoptCloseWorktreeCleanupPlanRequest {
     pub scope: WorkScopeId,
     pub target_snapshot: CloseRetirementSnapshot,
     pub resource: RetiredResourceIdentity,
+    pub observed_administrative_dir: std::path::PathBuf,
+    pub observed_administrative_dir_incarnation: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2934,25 +2987,36 @@ impl Database {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<Option<CloseNeedsRepairCause>> {
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT cause_kind, invariant, relation
+        let evidence: Option<(String, String)> = sqlx::query_as(
+            "SELECT invariant, relation
              FROM close_needs_repair_causes WHERE attempt_id=?1",
         )
         .bind(attempt_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(
-            |(cause_kind, invariant, relation)| match cause_kind.as_str() {
-                "evidence_invariant" => {
-                    CloseNeedsRepairCause::evidence_invariant(invariant, relation)
-                        .map_err(|error| DbError::Serialization(error.to_string()))
-                }
-                other => Err(DbError::Serialization(format!(
-                    "unknown Close needs-repair cause {other}"
-                ))),
-            },
+        let ambient: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT detector, operation, error_kind
+             FROM close_ambient_writer_indeterminate_causes WHERE attempt_id=?1",
         )
-        .transpose()
+        .bind(attempt_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        match (evidence, ambient) {
+            (Some((invariant, relation)), None) => {
+                CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+                    .map(Some)
+                    .map_err(|error| DbError::Serialization(error.to_string()))
+            }
+            (None, Some((detector, operation, error_kind))) => {
+                CloseNeedsRepairCause::ambient_writer_indeterminate(detector, operation, error_kind)
+                    .map(Some)
+                    .map_err(|error| DbError::Serialization(error.to_string()))
+            }
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(DbError::Serialization(
+                "Close attempt has conflicting needs-repair causes".to_string(),
+            )),
+        }
     }
 
     /// Returns a pre-quarantine worktree snapshot mismatch to fresh inspection.
@@ -3462,6 +3526,12 @@ async fn route_close_attempt_to_repair_tx(
     match &request.cause {
         Some(CloseNeedsRepairCause::EvidenceInvariant(cause)) => {
             sqlx::query(
+                "DELETE FROM close_ambient_writer_indeterminate_causes WHERE attempt_id=?1",
+            )
+            .bind(request.attempt_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
                 "INSERT INTO close_needs_repair_causes (
                      attempt_id, cause_kind, invariant, relation, recorded_at_unix_micros
                  ) VALUES (?1, 'evidence_invariant', ?2, ?3, ?4)
@@ -3478,11 +3548,40 @@ async fn route_close_attempt_to_repair_tx(
             .execute(&mut **tx)
             .await?;
         }
+        Some(CloseNeedsRepairCause::AmbientWriterIndeterminate(cause)) => {
+            sqlx::query("DELETE FROM close_needs_repair_causes WHERE attempt_id=?1")
+                .bind(request.attempt_id.as_str())
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO close_ambient_writer_indeterminate_causes (
+                     attempt_id, detector, operation, error_kind, recorded_at_unix_micros
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(attempt_id) DO UPDATE SET
+                     detector=excluded.detector,
+                     operation=excluded.operation,
+                     error_kind=excluded.error_kind,
+                     recorded_at_unix_micros=excluded.recorded_at_unix_micros",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(cause.detector())
+            .bind(cause.operation())
+            .bind(cause.error_kind())
+            .bind(Utc::now().timestamp_micros())
+            .execute(&mut **tx)
+            .await?;
+        }
         None => {
             sqlx::query("DELETE FROM close_needs_repair_causes WHERE attempt_id=?1")
                 .bind(request.attempt_id.as_str())
                 .execute(&mut **tx)
                 .await?;
+            sqlx::query(
+                "DELETE FROM close_ambient_writer_indeterminate_causes WHERE attempt_id=?1",
+            )
+            .bind(request.attempt_id.as_str())
+            .execute(&mut **tx)
+            .await?;
         }
     }
     Ok(())
@@ -3657,6 +3756,29 @@ fn classify_ambient_writer_insert_error(error: sqlx::Error) -> DbError {
         }
     }
     DbError::Sqlx(error)
+}
+
+fn classify_close_adoption_insert_error(
+    error: sqlx::Error,
+    invariant: &'static str,
+    relation: &'static str,
+) -> DbError {
+    let is_constraint = if let sqlx::Error::Database(database_error) = &error {
+        database_error.is_foreign_key_violation()
+            || database_error.is_check_violation()
+            || database_error.code().as_deref() == Some("1811")
+    } else {
+        false
+    };
+    if is_constraint {
+        DbError::CloseEvidenceInvariant {
+            invariant,
+            relation,
+            detail: error.to_string(),
+        }
+    } else {
+        DbError::Sqlx(error)
+    }
 }
 
 impl Database {
@@ -3868,6 +3990,8 @@ impl Database {
             });
         }
         let identity = request.resource.identity();
+        let observed_administrative_dir_value =
+            encode_host_path(&request.observed_administrative_dir);
         let existing_lineage: Option<(String, String)> = sqlx::query_as(
             "SELECT source_inspection_generation, source_inspection_fingerprint
              FROM close_worktree_cleanup_adoptions
@@ -3887,6 +4011,37 @@ impl Database {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((source_generation, source_fingerprint)) = existing_lineage {
+            let target_matches_observation: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM close_worktree_cleanup_plans
+                     WHERE attempt_id=?1 AND scope=?2
+                       AND inspection_generation=?3 AND inspection_fingerprint=?4
+                       AND resource_kind=?5 AND identity_kind=?6
+                       AND identity_codec=?7 AND identity_value=?8
+                       AND administrative_dir_codec='hex_path_v1'
+                       AND administrative_dir_value=?9
+                       AND administrative_dir_incarnation=?10
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .bind(&observed_administrative_dir_value)
+            .bind(&request.observed_administrative_dir_incarnation)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !target_matches_observation {
+                return Err(DbError::CloseEvidenceInvariant {
+                    invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
+                    relation: "close_worktree_cleanup_plans",
+                    detail: "existing adopted cleanup plan does not match the freshly observed administrative directory".to_string(),
+                });
+            }
             let lineage_is_exact: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                      SELECT 1
@@ -3995,6 +4150,17 @@ impl Database {
                 detail: "found no compatible source plans".to_string(),
             });
         };
+        if source.2 != "hex_path_v1"
+            || source.3 != observed_administrative_dir_value
+            || source.4 != request.observed_administrative_dir_incarnation
+        {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "adopted_cleanup_plan_requires_fresh_administrative_identity",
+                relation: "close_worktree_cleanup_plans",
+                detail: "prior cleanup plan does not match the freshly observed administrative directory"
+                    .to_string(),
+            });
+        }
         let dispatched_at_us = Utc::now().timestamp_micros();
         let dispatch = sqlx::query(
             "INSERT INTO close_retirement_resource_dispatches (
@@ -4014,10 +4180,12 @@ impl Database {
         .bind(dispatched_at_us)
         .execute(&mut *tx)
         .await
-        .map_err(|error| DbError::CloseEvidenceInvariant {
-            invariant: "target_dispatch_must_match_sealed_inventory",
-            relation: "close_retirement_resource_dispatches",
-            detail: error.to_string(),
+        .map_err(|error| {
+            classify_close_adoption_insert_error(
+                error,
+                "target_dispatch_must_match_sealed_inventory",
+                "close_retirement_resource_dispatches",
+            )
         })?;
         if dispatch.rows_affected() == 0 {
             let exists: bool = sqlx::query_scalar(
@@ -4076,10 +4244,12 @@ impl Database {
         .bind(&source.10)
         .execute(&mut *tx)
         .await
-        .map_err(|error| DbError::CloseEvidenceInvariant {
-            invariant: "cleanup_plan_requires_generation_matched_dispatch",
-            relation: "close_worktree_cleanup_plans",
-            detail: error.to_string(),
+        .map_err(|error| {
+            classify_close_adoption_insert_error(
+                error,
+                "cleanup_plan_requires_generation_matched_dispatch",
+                "close_worktree_cleanup_plans",
+            )
         })?;
         if plan_insert.rows_affected() == 0 {
             let target: WorktreeCleanupPlanColumns = sqlx::query_as(
@@ -4145,10 +4315,12 @@ impl Database {
         .bind(dispatched_at_us)
         .execute(&mut *tx)
         .await
-        .map_err(|error| DbError::CloseEvidenceInvariant {
-            invariant: "cleanup_adoption_records_source_and_target_generation",
-            relation: "close_worktree_cleanup_adoptions",
-            detail: error.to_string(),
+        .map_err(|error| {
+            classify_close_adoption_insert_error(
+                error,
+                "cleanup_adoption_records_source_and_target_generation",
+                "close_worktree_cleanup_adoptions",
+            )
         })?;
         if lineage_insert.rows_affected() == 0 {
             let existing_source: Option<(String, String)> = sqlx::query_as(
@@ -7467,6 +7639,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn typed_close_repair_cause_persists_replaces_clears_retries_and_cascades() {
         let db = Database::open_in_memory().await.unwrap();
@@ -7525,6 +7698,20 @@ mod tests {
         assert_eq!(
             db.close_needs_repair_cause(&attempt_id).await.unwrap(),
             Some(first)
+        );
+
+        let ambient = CloseNeedsRepairCause::ambient_writer_indeterminate(
+            "linux_procfs",
+            "enumerate_processes",
+            "permission_denied",
+        )
+        .unwrap();
+        db.route_close_attempt_to_repair(request(Some(ambient.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            Some(ambient)
         );
 
         let replacement = CloseNeedsRepairCause::evidence_invariant(
@@ -10309,6 +10496,8 @@ mod tests {
             scope: scope.clone(),
             target_snapshot: authorized_target_snapshot.clone(),
             resource: resource.clone(),
+            observed_administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/adopted"),
+            observed_administrative_dir_incarnation: "admin-adopt-v1".to_string(),
         };
         let adopted = db
             .adopt_close_worktree_cleanup_plan(request.clone())
@@ -10407,6 +10596,8 @@ mod tests {
             scope: &WorkScopeId,
             resource: &RetiredResourceIdentity,
             generation: &str,
+            observed_administrative_dir: &str,
+            observed_administrative_dir_incarnation: &str,
         ) -> (CloseRetirementSnapshot, CloseWorktreeCleanupPlan) {
             db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
                 attempt_id: attempt_id.clone(),
@@ -10447,6 +10638,9 @@ mod tests {
                 scope: scope.clone(),
                 target_snapshot: snapshot.clone(),
                 resource: resource.clone(),
+                observed_administrative_dir: std::path::PathBuf::from(observed_administrative_dir),
+                observed_administrative_dir_incarnation: observed_administrative_dir_incarnation
+                    .to_string(),
             };
             let plan = db
                 .adopt_close_worktree_cleanup_plan(request.clone())
@@ -10511,8 +10705,16 @@ mod tests {
         })
         .await
         .unwrap();
-        let (snapshot_b, plan_b) =
-            rotate_and_adopt(&db, &attempt_id, &scope, &resource, "generation-b").await;
+        let (snapshot_b, plan_b) = rotate_and_adopt(
+            &db,
+            &attempt_id,
+            &scope,
+            &resource,
+            "generation-b",
+            "/tmp/git/worktrees/newest",
+            "admin-chain-v2",
+        )
+        .await;
         assert_eq!(plan_b.final_tombstone, None);
         assert_eq!(
             plan_b.administrative_dir,
@@ -10547,8 +10749,16 @@ mod tests {
         .await
         .unwrap();
 
-        let (snapshot_c, plan_c) =
-            rotate_and_adopt(&db, &attempt_id, &scope, &resource, "generation-c").await;
+        let (snapshot_c, plan_c) = rotate_and_adopt(
+            &db,
+            &attempt_id,
+            &scope,
+            &resource,
+            "generation-c",
+            "/tmp/git/worktrees/newest",
+            "admin-chain-v2",
+        )
+        .await;
         assert_eq!(
             plan_c.final_tombstone,
             Some(CloseWorktreeFinalTombstone {
@@ -10634,6 +10844,10 @@ mod tests {
                 scope: scope.clone(),
                 target_snapshot: snapshot.clone(),
                 resource: resource.clone(),
+                observed_administrative_dir: std::path::PathBuf::from(
+                    "/tmp/git/worktrees/adopt-missing",
+                ),
+                observed_administrative_dir_incarnation: "admin-adopt-missing-v1".to_string(),
             })
             .await
             .unwrap_err();

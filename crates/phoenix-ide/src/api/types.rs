@@ -1118,6 +1118,12 @@ pub struct CloseRecoveryAction {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CloseFailedEvidence {
+    pub failed_invariant: String,
+    pub failed_relation: String,
+}
+
 /// 409 Conflict error with typed `error_type` for frontend dispatch
 #[derive(Debug, Serialize)]
 pub struct ConflictErrorResponse {
@@ -1144,10 +1150,8 @@ pub struct ConflictErrorResponse {
     pub active_transcript_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_action: Option<CloseRecoveryAction>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failed_invariant: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failed_relation: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub failed_evidence: Option<CloseFailedEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient_writer_indeterminate:
         Option<crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic>,
@@ -1165,8 +1169,7 @@ impl ConflictErrorResponse {
             attempt_id: None,
             active_transcript_id: None,
             recovery_action: None,
-            failed_invariant: None,
-            failed_relation: None,
+            failed_evidence: None,
             ambient_writer_indeterminate: None,
         }
     }

@@ -535,6 +535,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce_close_ambient_writer_authority_pairs",
         sql: MIGRATION_103,
     },
+    Migration {
+        version: 104,
+        name: "persist_close_ambient_writer_indeterminate_cause",
+        sql: MIGRATION_104,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -9041,6 +9046,36 @@ BEGIN
 END;
 ";
 
+const MIGRATION_103: &str = r"
+CREATE TABLE close_ambient_writer_indeterminate_causes (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    detector TEXT NOT NULL CHECK (length(trim(detector)) > 0),
+    operation TEXT NOT NULL CHECK (length(trim(operation)) > 0),
+    error_kind TEXT NOT NULL CHECK (length(trim(error_kind)) > 0),
+    recorded_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
+);
+
+CREATE TRIGGER close_ambient_writer_indeterminate_cause_phase_changed
+AFTER UPDATE OF phase ON close_obligations
+WHEN OLD.phase <> NEW.phase
+BEGIN
+    DELETE FROM close_ambient_writer_indeterminate_causes WHERE attempt_id = NEW.attempt_id;
+END;
+
+CREATE TRIGGER close_ambient_writer_indeterminate_cause_requires_phase
+BEFORE INSERT ON close_ambient_writer_indeterminate_causes
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase = 'needs_repair'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ambient writer indeterminate cause requires needs_repair phase');
+END;
+";
+
 const MIGRATION_100: &str = r"
 >>>>>>> 137fe86cc (fix: close remaining retirement recovery gaps)
 CREATE TABLE close_needs_repair_causes (
@@ -10622,7 +10657,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_103: &str = r"
+const MIGRATION_104: &str = r"
 DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
 DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
 
