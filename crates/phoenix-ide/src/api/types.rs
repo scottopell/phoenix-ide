@@ -280,6 +280,7 @@ pub struct ProductConversationListRow {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProjectCoordinatorProfileView {
+    pub enabled: bool,
     pub charter: String,
     pub revision: i64,
     pub updated_at_unix_micros: i64,
@@ -289,7 +290,7 @@ pub struct ProjectCoordinatorProfileView {
 pub struct ProjectCoordinatorProfileWriteRequest {
     pub enabled: bool,
     pub charter: String,
-    pub expected_revision: Option<i64>,
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

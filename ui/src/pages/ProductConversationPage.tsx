@@ -678,18 +678,18 @@ function ProjectCoordinatorSettings({
 }) {
   const profile = snapshot.project_coordinator_profile;
   const [open, setOpen] = useState(false);
-  const [enabled, setEnabled] = useState(profile != null);
+  const [enabled, setEnabled] = useState(profile?.enabled ?? false);
   const [charter, setCharter] = useState(profile?.charter ?? '');
-  const [baseRevision, setBaseRevision] = useState<number | null>(profile?.revision ?? null);
+  const [baseRevision, setBaseRevision] = useState(profile?.revision ?? 0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const reset = useCallback(() => {
-    setEnabled(profile != null);
+    setEnabled(profile?.enabled ?? false);
     setCharter(profile?.charter ?? '');
-    setBaseRevision(profile?.revision ?? null);
+    setBaseRevision(profile?.revision ?? 0);
     setError(null);
   }, [profile]);
-  const dirty = enabled !== (profile != null) || charter !== (profile?.charter ?? '');
+  const dirty = enabled !== (profile?.enabled ?? false) || charter !== (profile?.charter ?? '');
   const charterBytes = new TextEncoder().encode(charter).length;
 
   const save = async (event: FormEvent) => {
@@ -722,7 +722,7 @@ function ProjectCoordinatorSettings({
         if (nextOpen) reset();
       }}
     >
-      <summary>Coordinator {profile ? '✓' : '+'}</summary>
+      <summary>Coordinator {profile?.enabled ? '✓' : '+'}</summary>
       <form onSubmit={(event) => void save(event)}>
         <label className="product-conversation-page__coordinator-toggle">
           <input

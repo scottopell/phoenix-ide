@@ -81,6 +81,25 @@ impl Database {
         row.as_ref().map(profile_from_row).transpose()
     }
 
+    /// Reads the retained revision even when the profile is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the revision query cannot complete.
+    pub async fn get_project_coordinator_profile_revision(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0))
+    }
+
     /// Creates, revision-fences, or removes the optional profile.
     ///
     /// # Errors
@@ -91,7 +110,7 @@ impl Database {
         &self,
         product_conversation_id: &ProductConversationId,
         charter: Option<&str>,
-        expected_revision: Option<i64>,
+        expected_revision: i64,
     ) -> Result<ProjectCoordinatorProfileWriteOutcome, ProjectCoordinatorProfileWriteDbError> {
         if let Some(charter) = charter {
             validate_charter(charter)?;
@@ -107,14 +126,15 @@ impl Database {
             return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
         }
 
-        let active_revision: Option<i64> = sqlx::query_scalar(
-            "SELECT revision FROM product_conversation_coordinator_profiles
+        let retained_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
              WHERE product_conversation_id = ?1",
         )
         .bind(product_conversation_id.as_str())
         .fetch_optional(&mut *tx)
-        .await?;
-        if active_revision != expected_revision {
+        .await?
+        .unwrap_or(0);
+        if retained_revision != expected_revision {
             return Err(ProjectCoordinatorProfileWriteError::RevisionConflict.into());
         }
         sqlx::query(
@@ -249,7 +269,7 @@ mod tests {
         let id = ordinary(&db, "pc-project-coordinator-round-trip").await;
         let charter = "  preserve whitespace\nsecond line  ";
         let created = db
-            .write_project_coordinator_profile(&id, Some(charter), None)
+            .write_project_coordinator_profile(&id, Some(charter), 0)
             .await
             .expect("create profile");
         assert!(matches!(
@@ -266,11 +286,11 @@ mod tests {
             charter
         );
 
-        db.write_project_coordinator_profile(&id, Some("accepted"), Some(1))
+        db.write_project_coordinator_profile(&id, Some("accepted"), 1)
             .await
             .expect("current save");
         let stale = db
-            .write_project_coordinator_profile(&id, Some("stale"), Some(1))
+            .write_project_coordinator_profile(&id, Some("stale"), 1)
             .await
             .expect_err("stale save must conflict");
         assert!(matches!(
@@ -295,7 +315,7 @@ mod tests {
         let id = ordinary(&db, "pc-project-coordinator-bounds").await;
         for invalid in ["nul\0charter".to_string(), "é".repeat(16_385)] {
             let error = db
-                .write_project_coordinator_profile(&id, Some(&invalid), None)
+                .write_project_coordinator_profile(&id, Some(&invalid), 0)
                 .await
                 .expect_err("invalid charter");
             assert!(matches!(
@@ -305,10 +325,10 @@ mod tests {
                 )
             ));
         }
-        db.write_project_coordinator_profile(&id, Some("enabled"), None)
+        db.write_project_coordinator_profile(&id, Some("enabled"), 0)
             .await
             .expect("enable");
-        db.write_project_coordinator_profile(&id, None, Some(1))
+        db.write_project_coordinator_profile(&id, None, 1)
             .await
             .expect("disable");
         assert_eq!(
@@ -329,7 +349,7 @@ mod tests {
             .await
             .expect("numbered migrations");
         let id = ordinary(&db, "pc-project-coordinator-restart").await;
-        db.write_project_coordinator_profile(&id, Some("restart charter"), None)
+        db.write_project_coordinator_profile(&id, Some("restart charter"), 0)
             .await
             .expect("profile");
         db.pool.close().await;
@@ -367,10 +387,10 @@ mod tests {
         .await
         .expect("product identity");
         let id = ProductConversationId::parse(product_id).expect("valid identity");
-        db.write_project_coordinator_profile(&id, Some("stale charter"), None)
+        db.write_project_coordinator_profile(&id, Some("stale charter"), 0)
             .await
             .expect("profile");
-        db.write_project_coordinator_profile(&id, Some("current charter"), Some(1))
+        db.write_project_coordinator_profile(&id, Some("current charter"), 1)
             .await
             .expect("profile edit");
 
@@ -387,14 +407,24 @@ mod tests {
     async fn disable_and_reenable_never_reuse_revision() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-aba").await;
-        db.write_project_coordinator_profile(&id, Some("first"), None)
+        db.write_project_coordinator_profile(&id, Some("first"), 0)
             .await
             .expect("enable");
-        db.write_project_coordinator_profile(&id, None, Some(1))
+        db.write_project_coordinator_profile(&id, None, 1)
             .await
             .expect("disable");
+        let stale_disabled = db
+            .write_project_coordinator_profile(&id, Some("stale disabled editor"), 0)
+            .await
+            .expect_err("disabled stale base must conflict");
+        assert!(matches!(
+            stale_disabled,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::RevisionConflict
+            )
+        ));
         let reenabled = db
-            .write_project_coordinator_profile(&id, Some("second"), None)
+            .write_project_coordinator_profile(&id, Some("second"), 2)
             .await
             .expect("reenable");
         assert!(matches!(
@@ -403,7 +433,7 @@ mod tests {
                 if profile.revision() == 3
         ));
         let stale = db
-            .write_project_coordinator_profile(&id, Some("stale"), Some(1))
+            .write_project_coordinator_profile(&id, Some("stale"), 1)
             .await
             .expect_err("old incarnation must conflict");
         assert!(matches!(
@@ -419,8 +449,8 @@ mod tests {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-concurrent").await;
         let (left, right) = tokio::join!(
-            db.write_project_coordinator_profile(&id, Some("left"), None),
-            db.write_project_coordinator_profile(&id, Some("right"), None),
+            db.write_project_coordinator_profile(&id, Some("left"), 0),
+            db.write_project_coordinator_profile(&id, Some("right"), 0),
         );
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
         let conflict = if left.is_err() { left } else { right }.expect_err("one conflict");
@@ -443,7 +473,7 @@ mod tests {
     async fn profiled_product_conversation_cannot_be_retyped_as_global() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-kind-fence").await;
-        db.write_project_coordinator_profile(&id, Some("charter"), None)
+        db.write_project_coordinator_profile(&id, Some("charter"), 0)
             .await
             .expect("profile");
         let error = sqlx::query(
@@ -465,7 +495,7 @@ mod tests {
         let db = Database::open_in_memory().await.expect("database");
         let id = product_conversation(&db, "pc-global-coordinator", "coordinator").await;
         let error = db
-            .write_project_coordinator_profile(&id, Some("not allowed"), None)
+            .write_project_coordinator_profile(&id, Some("not allowed"), 0)
             .await
             .expect_err("global profile must be rejected");
         assert!(matches!(

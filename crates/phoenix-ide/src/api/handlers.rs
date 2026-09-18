@@ -4107,7 +4107,7 @@ async fn get_system_prompt(
     } else {
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
-    let system_prompt = if is_coordinator {
+    let mut system_prompt = if is_coordinator {
         crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
@@ -4124,6 +4124,21 @@ async fn get_system_prompt(
             explore_bash,
         )
     };
+
+    if !is_coordinator && !is_sub_agent {
+        if let Some(profile) = state
+            .runtime
+            .db()
+            .get_project_coordinator_profile_for_conversation(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            system_prompt = crate::system_prompt::inspected_project_coordinator_prompt(
+                &system_prompt,
+                profile.charter(),
+            );
+        }
+    }
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }

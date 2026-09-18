@@ -1786,7 +1786,7 @@ export const api = {
 
   async putProjectCoordinatorProfile(
     productConversationId: string,
-    request: { enabled: boolean; charter: string; expected_revision: number | null },
+    request: { enabled: boolean; charter: string; expected_revision: number },
   ): Promise<ProductConversationSnapshotViewType['project_coordinator_profile']> {
     const resp = await fetch(
       `/api/product-conversations/${encodeURIComponent(productConversationId)}/project-coordinator-profile`,

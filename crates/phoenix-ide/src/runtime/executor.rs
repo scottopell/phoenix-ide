@@ -6951,8 +6951,7 @@ where
                 .await?
         };
         if project_coordinator_profile.is_some() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(crate::system_prompt::PROJECT_COORDINATOR_GUIDANCE);
+            crate::system_prompt::append_project_coordinator_guidance(&mut system_prompt);
         }
         if has_approved_task_write_authority {
             system_prompt.push_str(
