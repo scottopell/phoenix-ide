@@ -168,9 +168,13 @@ function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
 }
 
-function invalidRequestError(message: string): ConversationState {
-  const error = getErrorPresentation('invalid_request')!;
-  return { type: 'error', message, error_kind: error.kind, error };
+function invalidStateError(message: string): ConversationState {
+  return {
+    type: 'error',
+    message,
+    error_kind: 'invalid_request',
+    error: { kind: 'invalid_request', can_auto_retry: false, can_user_resume: false },
+  };
 }
 
 function serverError(message: string): ConversationState {
@@ -229,7 +233,7 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'seeded_llm_requesting': {
       const seed = obj['seed_message_id'];
       if (typeof seed !== 'string' || seed.trim() === '') {
-        return invalidRequestError('Invalid seeded request state: missing seed message');
+        return invalidStateError('Invalid seeded request state: missing seed message');
       }
       return {
         type: 'seeded_llm_requesting',
@@ -289,7 +293,7 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'handed_off': {
       const successor = obj['successor_conv_id'];
       if (typeof successor !== 'string' || successor.trim() === '') {
-        return invalidRequestError('Invalid handed-off state: missing successor conversation');
+        return invalidStateError('Invalid handed-off state: missing successor conversation');
       }
       return { type: 'handed_off', successor_conv_id: successor };
     }
@@ -320,7 +324,7 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);
-      return invalidRequestError(`Unknown state: ${String(type)}`);
+      return invalidStateError(`Unknown state: ${String(type)}`);
   }
 }
 

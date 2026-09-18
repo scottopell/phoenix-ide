@@ -21,10 +21,10 @@ enum ConversationErrorKind: String, Equatable {
     var isUserResumable: Bool {
         switch self {
         case .auth, .rateLimit, .usageLimitReached, .network,
-             .promptRejected, .invalidResponse, .serverError,
+             .promptRejected, .invalidRequest, .invalidResponse, .serverError,
              .serverOverloaded, .timedOut:
             return true
-        case .invalidRequest, .cancelled, .subAgentError, .contextExhausted,
+        case .cancelled, .subAgentError, .contextExhausted,
              .turnLimitExhausted, .contentFilter, .unknown:
             return false
         }

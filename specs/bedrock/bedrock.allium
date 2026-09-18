@@ -2314,8 +2314,8 @@ rule ModeChangeNotification {
 --
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,
---       prompt_rejected, invalid_response, server_error, server_overloaded,
---       and timed_out. False exactly for invalid_request, cancelled,
+--       prompt_rejected, invalid_request, invalid_response, server_error,
+--       server_overloaded, and timed_out. False exactly for cancelled,
 --       sub_agent_error, context_exhausted, turn_limit_exhausted, and
 --       content_filter.
 --

@@ -803,9 +803,9 @@ impl ErrorKind {
             | Self::ServerOverloaded
             | Self::UsageLimitReached
             | Self::TimedOut
+            | Self::InvalidRequest
             | Self::PromptRejected => UserResumePolicy::Resumable,
-            Self::InvalidRequest
-            | Self::Cancelled
+            Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
             | Self::TurnLimitExhausted
@@ -1961,7 +1961,7 @@ mod error_kind_tests {
             (
                 InvalidRequest,
                 AutoRetryPolicy::NoAutoRetry,
-                UserResumePolicy::NotResumable,
+                UserResumePolicy::Resumable,
             ),
             (
                 PromptRejected,

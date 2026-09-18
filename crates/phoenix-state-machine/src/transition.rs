@@ -3349,6 +3349,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::ContentFiltered { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::ContentFilter,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::PromptRejected { message } => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -6318,10 +6328,61 @@ mod tests {
     }
 
     #[test]
+    fn persisted_invalid_request_accepts_manual_recovery_without_replaying_tools() {
+        let state: ConvState = serde_json::from_str(
+            r#"{"type":"error","message":"Bad request (400): The access_programs parameter is not enabled for this organization.","error_kind":"invalid_request"}"#,
+        )
+        .unwrap();
+        assert!(check_user_message_acceptable(&state).is_ok());
+
+        let resumed = transition(
+            &state,
+            &test_context(),
+            Event::UserMessage {
+                text: "continue".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "recovery-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            resumed.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert_eq!(
+            resumed
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::RequestLlm))
+                .count(),
+            1
+        );
+        assert!(!resumed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ExecuteTool { .. })));
+
+        let dismissed = transition(&state, &test_context(), Event::DismissError).unwrap();
+        assert_eq!(dismissed.new_state, ConvState::Idle);
+        assert!(dismissed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(!dismissed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
     fn non_resumable_error_rejects_a_hidden_chat_post() {
         let state = ConvState::Error {
-            message: "malformed request".to_string(),
-            error_kind: ErrorKind::InvalidRequest,
+            message: "content filtered".to_string(),
+            error_kind: ErrorKind::ContentFilter,
             resets_at: None,
         };
 
@@ -6658,11 +6719,9 @@ mod tests {
 
     #[test]
     fn dismiss_error_from_non_resumable_error_is_invalid() {
-        // A non-resumable error (InvalidRequest) must NOT be dismissable to
-        // Idle — that would reopen the resume path the policy denies.
         let state = ConvState::Error {
-            message: "bad request".to_string(),
-            error_kind: ErrorKind::InvalidRequest,
+            message: "content filtered".to_string(),
+            error_kind: ErrorKind::ContentFilter,
             resets_at: None,
         };
         let err = transition(&state, &test_context(), Event::DismissError)

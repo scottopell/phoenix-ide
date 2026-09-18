@@ -11487,7 +11487,10 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             message: error.message,
             recovery_in_progress: error.recovery_in_progress,
         },
-        LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
+        LlmErrorKind::InvalidRequest => LlmOutcome::RequestRejected {
+            message: error.message,
+        },
+        LlmErrorKind::ContentFilter => LlmOutcome::ContentFiltered {
             message: error.message,
         },
         LlmErrorKind::PromptRejected => LlmOutcome::PromptRejected {
@@ -11751,14 +11754,60 @@ mod error_mapping_tests {
 
     #[test]
     fn test_invalid_response_outcome_is_not_request_rejected() {
-        // RequestRejected is terminal/non-resumable; InvalidResponse must take
-        // the retryable outcome path instead.
+        // InvalidResponse must take the automatically retryable outcome path.
         let outcome =
             llm_error_to_outcome(phoenix_llm::LlmError::invalid_response("garbled SSE event"));
         assert!(
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn provider_rejection_outcomes_preserve_distinct_recovery_policies() {
+        use crate::state_machine::transition::{check_user_message_acceptable, handle_outcome};
+
+        let context = crate::state_machine::ConvContext::new(
+            "rejection-policy",
+            std::path::PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+        );
+        for (provider_kind, expected_kind, can_resume) in [
+            (
+                LlmErrorKind::ContentFilter,
+                crate::db::ErrorKind::ContentFilter,
+                false,
+            ),
+            (
+                LlmErrorKind::InvalidRequest,
+                crate::db::ErrorKind::InvalidRequest,
+                true,
+            ),
+        ] {
+            let result = handle_outcome(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &context,
+                EffectOutcome::Llm(llm_error_to_outcome(phoenix_llm::LlmError::new(
+                    provider_kind,
+                    "provider rejected request",
+                ))),
+            )
+            .unwrap();
+            let ConvState::Error { error_kind, .. } = &result.new_state else {
+                panic!(
+                    "provider rejection did not stop in Error: {:?}",
+                    result.new_state
+                );
+            };
+            assert_eq!(*error_kind, expected_kind);
+            assert!(!error_kind.is_auto_retryable());
+            assert_eq!(error_kind.is_user_resumable(), can_resume);
+            assert_eq!(
+                check_user_message_acceptable(&result.new_state).is_ok(),
+                can_resume
+            );
+        }
     }
 
     #[test]
