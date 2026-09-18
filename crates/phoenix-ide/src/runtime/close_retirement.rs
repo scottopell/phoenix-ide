@@ -4940,7 +4940,14 @@ fn linux_read_leaf_after_capture<T>(
     match read() {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if linux_process_incarnation_after_capture(process, captured_incarnation)?.is_none()
+            if matches!(
+                operation,
+                AmbientWriterDiagnosticOperation::EnumerateDescriptor
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorTarget
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorMetadata
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode
+            ) || linux_process_incarnation_after_capture(process, captured_incarnation)?
+                .is_none()
                 || linux_process_state(process)
                     .map_err(LinuxScannerError::into_marker)?
                     .is_none_or(|state| state == 'Z')

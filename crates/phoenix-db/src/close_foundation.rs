@@ -742,25 +742,31 @@ pub struct AmbientWriterIndeterminateCause {
 
 impl AmbientWriterIndeterminateCause {
     fn new(detector: String, operation: String, error_kind: String) -> Result<Self, &'static str> {
-        if !matches!(detector.as_str(), "linux_procfs" | "macos_libproc") {
+        if !matches!(
+            detector.as_str(),
+            "native_process_inventory" | "macos_proc_pidinfo" | "linux_procfs"
+        ) {
             return Err("invalid ambient-writer detector");
         }
         if !matches!(
             operation.as_str(),
             "observe_ambient_writer"
                 | "read_process_incarnation"
-                | "read_process_credentials"
                 | "read_process_executable"
                 | "read_working_directory"
                 | "read_mappings"
-                | "read_descriptors"
-                | "enumerate_processes"
+                | "read_process_credentials"
+                | "enumerate_descriptors"
+                | "enumerate_descriptor"
+                | "read_descriptor_target"
+                | "read_descriptor_metadata"
+                | "read_descriptor_access_mode"
         ) {
             return Err("invalid ambient-writer operation");
         }
         if !matches!(
             error_kind.as_str(),
-            "permission_denied" | "invalid_data" | "io_error"
+            "permission_denied" | "not_found" | "invalid_data" | "indeterminate" | "other"
         ) {
             return Err("invalid ambient-writer error kind");
         }
@@ -7728,7 +7734,7 @@ mod tests {
 
         let ambient = CloseNeedsRepairCause::ambient_writer_indeterminate(
             "linux_procfs",
-            "enumerate_processes",
+            "enumerate_descriptors",
             "permission_denied",
         )
         .unwrap();

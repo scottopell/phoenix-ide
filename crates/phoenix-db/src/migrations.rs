@@ -9050,14 +9050,17 @@ const MIGRATION_103: &str = r"
 CREATE TABLE close_ambient_writer_indeterminate_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
-    detector TEXT NOT NULL CHECK (detector IN ('linux_procfs', 'macos_libproc')),
+    detector TEXT NOT NULL CHECK (detector IN (
+        'native_process_inventory', 'macos_proc_pidinfo', 'linux_procfs'
+    )),
     operation TEXT NOT NULL CHECK (operation IN (
-        'observe_ambient_writer', 'read_process_incarnation', 'read_process_credentials',
-        'read_process_executable', 'read_working_directory', 'read_mappings',
-        'read_descriptors', 'enumerate_processes'
+        'observe_ambient_writer', 'read_process_incarnation', 'read_process_executable',
+        'read_working_directory', 'read_mappings', 'read_process_credentials',
+        'enumerate_descriptors', 'enumerate_descriptor', 'read_descriptor_target',
+        'read_descriptor_metadata', 'read_descriptor_access_mode'
     )),
     error_kind TEXT NOT NULL CHECK (error_kind IN (
-        'permission_denied', 'invalid_data', 'io_error'
+        'permission_denied', 'not_found', 'invalid_data', 'indeterminate', 'other'
     )),
     recorded_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
