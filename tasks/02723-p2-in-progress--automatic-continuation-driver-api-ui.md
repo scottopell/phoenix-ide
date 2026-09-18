@@ -1,5 +1,0 @@
-# Complete automatic context continuation orchestration and controls
-
-Build on task 06002's durable default-OFF preference, atomic admission, and typed opening provenance. Drive only already-admitted automatic operations through the existing manual continuation reservation/ownership-transfer/dispatch/settlement path; add restart recovery, bounded admission-local no-progress breaker, exact generated-context provider projection, aggregate API for ordinary ProductConversation and Global Coordinator, and the explicit per-aggregate UI control/status/failure recovery.
-
-Preserve prospective consent: enabling an already-exhausted row creates or wakes nothing. Preserve OFF manual parity, exactly-one manual/automatic race behavior, queued steering/deferred work/WorkScope inheritance, and persisted authority through settlement. Do not create a parallel continuation workflow or duplicate handoff text. Follow `specs/bedrock/requirements.md`, `specs/bedrock/bedrock.allium`, REQ-API-029, REQ-CONV-024, and ADR-054.
