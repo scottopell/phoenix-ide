@@ -214,7 +214,10 @@ pub async fn submit_chain_question(
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
 }
 
-/// `PATCH /api/chains/:rootId/name`
+/// Compatibility route for `PATCH /api/chains/:rootId/name`.
+///
+/// Non-empty names update the `ProductConversation` root title authority. A null or
+/// whitespace-only name clears only the legacy override so normal title fallback applies.
 pub async fn set_chain_name(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -228,14 +231,19 @@ pub async fn set_chain_name(
     // to a single state rather than persisting invisible names.
     let normalized = normalize_chain_name(req.name.as_deref())?;
 
-    state
-        .db
-        .set_chain_name(&root_id, normalized.as_deref())
-        .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+    if let Some(title) = normalized.as_deref() {
+        state
+            .db
+            .set_ordinary_product_conversation_title(&root_id, title)
+            .await
+            .map_err(db_to_app)?;
+    } else {
+        state
+            .db
+            .set_chain_name(&root_id, None)
+            .await
+            .map_err(db_to_app)?;
+    }
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
@@ -244,10 +252,9 @@ pub async fn set_chain_name(
 /// `POST /api/chains/:rootId/regenerate-name` (REQ-CHN-010).
 ///
 /// Derives a prose display name by summarizing the first user message of each
-/// chain member (in chain order) via a cheap LLM, then persists it as the
-/// chain's `chain_name` override on the root — the same write path the typed
-/// PATCH uses. Takes no request body; the chain root id in the path is the only
-/// input.
+/// chain member (in chain order) via a cheap LLM, then updates the
+/// `ProductConversation` root title through the same authority as the typed PATCH.
+/// Takes no request body; the chain root id in the path is the only input.
 ///
 /// Status choices:
 /// - `<2` members or non-root: 404 via [`validate_chain_root`], matching every
@@ -337,12 +344,14 @@ pub async fn regenerate_chain_name(
 
     state
         .db
-        .set_chain_name(&root_id, normalized.as_deref())
+        .set_ordinary_product_conversation_title(
+            &root_id,
+            normalized
+                .as_deref()
+                .expect("empty generated name rejected"),
+        )
         .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+        .map_err(db_to_app)?;
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
