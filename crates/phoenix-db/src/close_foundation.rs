@@ -3649,6 +3649,19 @@ type AdoptableWorktreeCleanupPlanColumns = (
     Option<String>,
 );
 
+fn classify_ambient_writer_insert_error(error: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(database_error) = &error {
+        if database_error.is_foreign_key_violation() || database_error.is_check_violation() {
+            return DbError::CloseEvidenceInvariant {
+                invariant: "positive_writer_must_reference_expected_worktree",
+                relation: "close_ambient_writer_evidence",
+                detail: error.to_string(),
+            };
+        }
+    }
+    DbError::Sqlx(error)
+}
+
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
@@ -3780,11 +3793,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|error| DbError::CloseEvidenceInvariant {
-            invariant: "positive_writer_must_reference_expected_worktree",
-            relation: "close_ambient_writer_evidence",
-            detail: error.to_string(),
-        })?;
+        .map_err(classify_ambient_writer_insert_error)?;
         let exact_evidence_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM close_ambient_writer_evidence
