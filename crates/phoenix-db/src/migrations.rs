@@ -536,6 +536,11 @@ WHERE length(CAST(
     AS BLOB
 )) > 256;
 
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM steering_messages
+WHERE length(CAST(message_id AS BLOB)) > 256;
+
 CREATE TRIGGER messages_bound_new_message_id_bytes
 BEFORE INSERT ON messages
 FOR EACH ROW
@@ -10209,6 +10214,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let legacy = "x".repeat(257);
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&legacy)
@@ -10236,6 +10245,13 @@ mod tests {
         .await
         .unwrap();
 
+        let admitted_steering = "s".repeat(257);
+        sqlx::query("INSERT INTO steering_messages (message_id) VALUES (?1)")
+            .bind(&admitted_steering)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
 
         assert_eq!(
@@ -10257,6 +10273,11 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&admitted_turn)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_steering)
             .execute(&pool)
             .await
             .unwrap();
