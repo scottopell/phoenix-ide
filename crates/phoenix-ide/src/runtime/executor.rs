@@ -584,7 +584,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             images: convert(images),
         },
         ToolOutput::TrustedInstructions(instructions) => ToolOutcome::TrustedInstructions {
-            output: cap_tool_output_text(instructions.output()),
+            output: cap_tool_output_text(instructions.into_output()),
         },
         ToolOutput::Error {
             output,

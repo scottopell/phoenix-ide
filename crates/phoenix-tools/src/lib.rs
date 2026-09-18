@@ -316,10 +316,7 @@ impl ToolOutput {
     /// Whether the tool reported success.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(
-            self,
-            Self::Success { .. } | Self::TrustedInstructions(_)
-        )
+        matches!(self, Self::Success { .. } | Self::TrustedInstructions(_))
     }
 
     /// The tool's textual output — success payload or error message.
