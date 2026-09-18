@@ -604,7 +604,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
             PreviousReadPosition {
                 message_sequence: message.sequence_id,
                 byte_offset: 0,
-                message_id: Some(message.message_id),
+                message_id: Some(identity_sha256(&message.message_id)),
                 rendered_sha256: Some(rendered_sha256(&rendered)),
             }
         } else {
@@ -890,10 +890,14 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         PreviousTranscriptsOutput::ReadPage {
             transcript: previous_summary(conv, ordinal, ordinal + 1 == predecessors.len()),
-            starts_at: page.start.map(|start| PreviousTranscriptReadStart {
-                message_ref: format!("@conv:{}#message-{}", conv.id, start.message_id),
-                message_id: start.message_id,
-                byte_offset: start.byte_offset,
+            starts_at: page.start.and_then(|start| {
+                (start.message_id.len() <= PREVIOUS_TITLE_BYTES).then(|| {
+                    PreviousTranscriptReadStart {
+                        message_ref: format!("@conv:{}#message-{}", conv.id, start.message_id),
+                        message_id: start.message_id,
+                        byte_offset: start.byte_offset,
+                    }
+                })
             }),
             content: page.content,
             next_cursor,
@@ -2469,6 +2473,55 @@ mod tests {
 
         assert!(error.contains("unsupported"));
         assert!(error.contains("restart this list without a cursor"));
+    }
+
+    #[tokio::test]
+    async fn global_message_fragment_uses_digested_cursor_identity() {
+        let (service, _) = predecessor_service().await;
+
+        let output = service
+            .read_conversation("@conv:pred-a#message-a-msg", None)
+            .await
+            .unwrap();
+
+        assert!(output.contains("alpha only predecessor evidence"));
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_omits_unbounded_start_provenance_but_keeps_cursor() {
+        let (service, binding) = predecessor_service().await;
+        let long_id = "m".repeat(PREVIOUS_TOOL_RESULT_BYTES);
+        sqlx::query("UPDATE messages SET message_id = ?1 WHERE message_id = 'a-msg'")
+            .bind(&long_id)
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = ?2")
+            .bind(
+                serde_json::to_string(&crate::db::MessageContent::user(
+                    "large evidence ".repeat(PREVIOUS_READ_CONTENT_JSON_BYTES),
+                ))
+                .unwrap(),
+            )
+            .bind(&long_id)
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+
+        let output = service
+            .read_predecessor_conversation(&binding, "pred-a", None)
+            .await;
+        let PreviousTranscriptsOutput::ReadPage {
+            starts_at,
+            next_cursor,
+            ..
+        } = output
+        else {
+            panic!("long message id must remain readable");
+        };
+
+        assert!(starts_at.is_none());
+        assert!(next_cursor.is_some());
     }
 
     #[tokio::test]
