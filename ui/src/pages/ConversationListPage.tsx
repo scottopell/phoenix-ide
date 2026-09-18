@@ -326,22 +326,10 @@ export function ConversationListPage() {
     if (!productCloseTarget) return;
     try {
       const rootId = productCloseTarget.canonical_root.transcript_row_id;
-      const singleRow = rootId === productCloseTarget.latest_transcript_row_id;
-      if (isOnline) {
-        if (singleRow) {
-          await api.archiveConversation(rootId);
-        } else {
-          await api.archiveChain(rootId);
-        }
+      if (rootId === productCloseTarget.latest_transcript_row_id) {
+        await api.archiveConversation(rootId);
       } else {
-        await queueOperation({
-          type: singleRow ? 'archive' : 'archive_chain',
-          conversationId: rootId,
-          payload: {},
-          createdAt: new Date(),
-          retryCount: 0,
-          status: 'pending',
-        });
+        await api.archiveChain(rootId);
       }
       setProductCloseTarget(null);
       setProductListRevision((revision) => revision + 1);
@@ -465,7 +453,7 @@ export function ConversationListPage() {
                 setProductRenameError(undefined);
                 setProductRenameTarget(row);
               }}
-              onProductConversationClose={setProductCloseTarget}
+              {...(isOnline ? { onProductConversationClose: setProductCloseTarget } : {})}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(

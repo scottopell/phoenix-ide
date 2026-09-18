@@ -219,6 +219,7 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_inspection_failed',
     'close_retirement_needs_repair',
     'stale_close_inspection',
+    'close_start_failed',
   ].includes(error.detail.error_type)) return false;
   notifyCloseSnapshotChanged(conversationId);
   notifyProductConversationListMayHaveChanged();
