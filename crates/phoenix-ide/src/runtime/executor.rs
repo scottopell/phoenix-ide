@@ -1869,8 +1869,8 @@ where
 
 #[derive(Debug)]
 enum FollowUpApprovalError {
-    BeforeAuthority(String),
-    AfterAuthority(String),
+    BeforeGit(String),
+    AuthorityLost(String),
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -8366,55 +8366,14 @@ where
         ) && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
     }
 
-    async fn approve_follow_up_in_existing_scope(
+    async fn publish_follow_up_approval(
         &mut self,
-        task_file: &str,
+        task_title: String,
         title: &str,
         priority: crate::task_source::Priority,
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<(), FollowUpApprovalError> {
-        let cwd = self.context.filesystem_root().to_path_buf();
-        let tasks_dir_name = self.context.tasks_dir_name.clone();
-        let task_file_owned = task_file.to_string();
-        let title_owned = title.to_string();
-        let plan_owned = plan.to_string();
-        let blocking_admission = admitted.reborrow();
-        let reviewed =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                persist_fresh_approved_task_artifact_blocking(
-                    &cwd,
-                    &tasks_dir_name,
-                    &task_file_owned,
-                    &title_owned,
-                    priority,
-                    &plan_owned,
-                )
-            })
-            .await
-            .map_err(|error| {
-                FollowUpApprovalError::BeforeAuthority(format!(
-                    "Follow-up task approval join error: {error}"
-                ))
-            })?
-            .map_err(FollowUpApprovalError::BeforeAuthority)?;
-
-        self.storage
-            .persist_approved_task_authority(
-                &self.context.conversation_id,
-                &TaskApprovalHandoffData {
-                    task_id: reviewed.task_id,
-                    task_title: reviewed.task_title.clone(),
-                    title: title.to_string(),
-                    priority,
-                    plan: plan.to_string(),
-                    task_file: reviewed.task_file,
-                    artifact_body: reviewed.artifact_body,
-                },
-            )
-            .await
-            .map_err(FollowUpApprovalError::BeforeAuthority)?;
-
+    ) {
         let approval_msg = format!(
             "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
             self.context.filesystem_root().display(),
@@ -8422,7 +8381,7 @@ where
         let msg_id = uuid::Uuid::new_v4().to_string();
         let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
         let seq = self.broadcast_tx.next_seq();
-        let msg = self
+        match self
             .storage
             .add_message_with_seq(
                 &msg_id,
@@ -8433,12 +8392,17 @@ where
                 None,
             )
             .await
-            .map_err(FollowUpApprovalError::AfterAuthority)?;
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .persisted_message(msg);
-        let task_title = reviewed.task_title;
+        {
+            Ok(msg) => {
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "approved follow-up authority committed without approval message projection");
+            }
+        }
         let _ = self
             .broadcast_tx
             .admitted_publication(admitted)
@@ -8461,6 +8425,69 @@ where
                     archived: None,
                 },
             });
+    }
+
+    async fn approve_follow_up_in_existing_scope(
+        &mut self,
+        task_file: &str,
+        title: &str,
+        priority: crate::task_source::Priority,
+        plan: &str,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), FollowUpApprovalError> {
+        reread_reviewed_task_handoff_snapshot(
+            self.context.filesystem_root(),
+            self.context.filesystem_root(),
+            &self.context.tasks_dir_name,
+            task_file,
+            title,
+            priority,
+            plan,
+        )
+        .map_err(FollowUpApprovalError::BeforeGit)?;
+        let cwd = self.context.filesystem_root().to_path_buf();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
+        let task_file_owned = task_file.to_string();
+        let title_owned = title.to_string();
+        let plan_owned = plan.to_string();
+        let blocking_admission = admitted.reborrow();
+        let reviewed =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                persist_fresh_approved_task_artifact_blocking(
+                    &cwd,
+                    &tasks_dir_name,
+                    &task_file_owned,
+                    &title_owned,
+                    priority,
+                    &plan_owned,
+                )
+            })
+            .await
+            .map_err(|error| {
+                FollowUpApprovalError::AuthorityLost(format!(
+                    "Follow-up task approval join error after Git admission: {error}"
+                ))
+            })?
+            .map_err(FollowUpApprovalError::AuthorityLost)?;
+
+        self.storage
+            .persist_approved_task_authority(
+                &self.context.conversation_id,
+                &TaskApprovalHandoffData {
+                    task_id: reviewed.task_id,
+                    task_title: reviewed.task_title.clone(),
+                    title: title.to_string(),
+                    priority,
+                    plan: plan.to_string(),
+                    task_file: task_file.to_string(),
+                    artifact_body: reviewed.artifact_body,
+                },
+            )
+            .await
+            .map_err(FollowUpApprovalError::AuthorityLost)?;
+
+        self.publish_follow_up_approval(reviewed.task_title, title, priority, plan, admitted)
+            .await;
         Ok(())
     }
 
@@ -8521,13 +8548,15 @@ where
                 .await;
             return match result {
                 Ok(()) => Ok(()),
-                Err(FollowUpApprovalError::BeforeAuthority(error)) => {
+                Err(FollowUpApprovalError::BeforeGit(error)) => {
                     self.restore_retryable_task_approval(
                         task_file, title, priority, plan, &error, admitted,
                     )?;
                     Err(error)
                 }
-                Err(FollowUpApprovalError::AfterAuthority(error)) => Err(error),
+                Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
+                )),
             };
         }
         if matches!(
@@ -8911,7 +8940,7 @@ fn persist_fresh_approved_task_artifact_blocking(
             snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
         }
     }
-    ensure_gitignore_has_phoenix(cwd)?;
+    crate::git_ops::ensure_local_exclude_has_phoenix(cwd)?;
     run_git(cwd, &["add", "--", &snapshot.task_file])?;
     let mut approved_paths = vec![snapshot.task_file.as_str()];
     if original_path_was_tracked && snapshot.task_file != task_file {
@@ -15495,7 +15524,7 @@ mod approved_explore_follow_up_tests {
             .approved_task_authority("approved-explore-follow-up")
             .expect("replacement objective");
         assert_eq!(replacement.task_id, "72004");
-        assert_eq!(replacement.task_file, promoted_task_file);
+        assert_eq!(replacement.task_file, task_file);
         assert!(
             std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
                 event,
