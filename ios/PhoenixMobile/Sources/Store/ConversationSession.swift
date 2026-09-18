@@ -667,7 +667,7 @@ final class ConversationSession {
     /// same idempotent delivery.
     @discardableResult
     func send(text: String, images: [ImagePayload] = []) async -> Bool {
-        guard !isHardDeleted else { return false }
+        guard !isHardDeleted, !isHardDeletePending else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
@@ -1374,7 +1374,6 @@ final class ConversationSession {
 
     private func handleHardDeletion() {
         guard !isHardDeleted, !isHardDeletePending else { return }
-        invalidateOutboxAuthority()
         invalidateLiveWork()
         streamTask?.cancel()
         streamTask = nil
