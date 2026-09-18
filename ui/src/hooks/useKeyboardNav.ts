@@ -92,13 +92,14 @@ export function useKeyboardNav(options: KeyboardNavOptions = {}) {
     (e: KeyboardEvent) => {
       if (!enabled || hasActiveScope) return;
 
-      // Don't handle if user is typing in an input/textarea
-      const target = e.target as HTMLElement;
-      const isInput = target.tagName === 'INPUT' || 
-                      target.tagName === 'TEXTAREA' || 
-                      target.isContentEditable;
-      
-      if (isInput) return;
+      const target = e.target;
+      const isInteractive = target instanceof HTMLElement && (
+        target.matches(
+          'input, textarea, button, select, a[href], [contenteditable="true"], [role="button"]',
+        ) || target.isContentEditable
+      );
+
+      if (isInteractive) return;
 
       switch (e.key) {
         case 'j':
