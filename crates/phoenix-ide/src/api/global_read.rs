@@ -890,14 +890,17 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         PreviousTranscriptsOutput::ReadPage {
             transcript: previous_summary(conv, ordinal, ordinal + 1 == predecessors.len()),
-            starts_at: page.start.and_then(|start| {
-                (start.message_id.len() <= PREVIOUS_TITLE_BYTES).then(|| {
-                    PreviousTranscriptReadStart {
-                        message_ref: format!("@conv:{}#message-{}", conv.id, start.message_id),
-                        message_id: start.message_id,
-                        byte_offset: start.byte_offset,
-                    }
-                })
+            starts_at: page.start.map(|start| {
+                let message_id = if start.message_id.len() <= PREVIOUS_TITLE_BYTES {
+                    start.message_id
+                } else {
+                    format!("sha256:{}", identity_sha256(&start.message_id))
+                };
+                PreviousTranscriptReadStart {
+                    message_ref: format!("@conv:{}#message-{message_id}", conv.id),
+                    message_id,
+                    byte_offset: start.byte_offset,
+                }
             }),
             content: page.content,
             next_cursor,
@@ -1547,6 +1550,21 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
         .unwrap_or(false)
 }
 
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
 fn conversation_href(conv: &Conversation) -> String {
     format!("/c/{}", conv.slug.as_deref().unwrap_or(&conv.id))
 }
@@ -1555,7 +1573,10 @@ fn conversation_message_href(conv: &Conversation, message: Option<(&str, Message
     let base = conversation_href(conv);
     match message {
         Some((message_id, message_type)) if message_type_has_rendered_anchor(message_type) => {
-            format!("{base}#message-{message_id}")
+            format!(
+                "{base}#message-{}",
+                percent_encode_url_component(message_id)
+            )
         }
         _ => base,
     }
@@ -1568,7 +1589,10 @@ fn previous_conversation_message_href(
     let base = format!("/c/{}", conv.id);
     match message {
         Some((message_id, message_type)) if message_type_has_rendered_anchor(message_type) => {
-            format!("{base}#message-{message_id}")
+            format!(
+                "{base}#message-{}",
+                percent_encode_url_component(message_id)
+            )
         }
         _ => base,
     }
@@ -2475,6 +2499,14 @@ mod tests {
         assert!(error.contains("restart this list without a cursor"));
     }
 
+    #[test]
+    fn message_fragment_identity_percent_encodes_reserved_bytes() {
+        assert_eq!(
+            super::percent_encode_url_component("foo)bar baz"),
+            "foo%29bar%20baz"
+        );
+    }
+
     #[tokio::test]
     async fn global_message_fragment_uses_digested_cursor_identity() {
         let (service, _) = predecessor_service().await;
@@ -2488,7 +2520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_read_omits_unbounded_start_provenance_but_keeps_cursor() {
+    async fn predecessor_read_bounds_start_provenance_and_keeps_identity() {
         let (service, binding) = predecessor_service().await;
         let long_id = "m".repeat(PREVIOUS_TOOL_RESULT_BYTES);
         sqlx::query("UPDATE messages SET message_id = ?1 WHERE message_id = 'a-msg'")
@@ -2520,7 +2552,9 @@ mod tests {
             panic!("long message id must remain readable");
         };
 
-        assert!(starts_at.is_none());
+        let starts_at = starts_at.expect("bounded provenance");
+        assert!(starts_at.message_id.starts_with("sha256:"));
+        assert!(starts_at.message_ref.contains(&starts_at.message_id));
         assert!(next_cursor.is_some());
     }
 
