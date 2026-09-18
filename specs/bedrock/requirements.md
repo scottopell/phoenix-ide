@@ -1085,12 +1085,17 @@ THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single datab
   - the continuation inherits the same `work_scope_id`
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
-WHEN a continuation successor row is newly created
+WHEN the user manually creates a continuation successor row
 THE SYSTEM SHALL atomically create that successor row, link it through `continued_in_conv_id`,
   persist the exact continuation boundary summary on the predecessor, and accept the user-selected
-  handoff text as the successor row's first user message
-AND SHALL use a client-generated message identifier for idempotent acceptance of that first user message
-AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's first user message
+  handoff text as the successor row's first user-authorized message
+AND SHALL use a client-generated message identifier for idempotent acceptance of that first user-authorized message
+AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's first user-authorized message
+
+WHEN admitted automatic work creates a continuation successor row
+THE SYSTEM SHALL use the same atomic successor and `continued_in_conv_id` operation
+AND SHALL accept the predecessor's exact persisted continuation boundary summary with the admission's deterministic opening identity
+AND SHALL persist that opening as generated predecessor context rather than as a user message or user-authorized instruction
 
 WHEN a parent conversation already has a continuation
 THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation
