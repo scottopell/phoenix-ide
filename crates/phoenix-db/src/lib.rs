@@ -18157,6 +18157,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_continuation_breaker_is_bounded_and_explicit_retry_preserves_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("breaker-parent", "breaker-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_id = db
+            .get_conversation("breaker-parent")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.set_auto_continue_on_context_exhaustion(
+            &product_id,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        let operation_id = "breaker-operation";
+        db.update_conversation_state(
+            "breaker-parent",
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let summary = "breaker summary".to_string();
+        let content = MessageContent::continuation(&summary);
+        let message = Message {
+            message_id: "breaker-summary".to_string(),
+            conversation_id: "breaker-parent".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.commit_continuation(
+            "breaker-parent",
+            operation_id,
+            &message,
+            &ConvState::ContextExhausted { summary },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let original = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        for attempt in 1..=AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+            let phase = db
+                .record_automatic_continuation_no_progress("breaker-parent", "runtime unavailable")
+                .await
+                .unwrap();
+            if attempt < AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+                assert_eq!(phase, AutomaticContinuationPhase::Admitted);
+            } else {
+                assert_eq!(phase, AutomaticContinuationPhase::Failed);
+            }
+        }
+        assert!(db.pending_automatic_continuation_admissions().await.unwrap().is_empty());
+        db.retry_failed_automatic_continuation("breaker-parent")
+            .await
+            .unwrap();
+        let retried = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.phase, AutomaticContinuationPhase::Admitted);
+        assert_eq!(retried.no_progress_attempts, 0);
+        assert!(retried.last_error.is_none());
+        assert_eq!(retried.summary_message_id, original.summary_message_id);
+        assert_eq!(retried.first_message_id, original.first_message_id);
+        assert_eq!(retried.opening_authority, original.opening_authority);
+    }
+
+    #[tokio::test]
     async fn coordinator_continuation_commit_admits_automatic_work() {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
