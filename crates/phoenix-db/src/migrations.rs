@@ -510,7 +510,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_invalid_continuation_dispatch_intents",
         sql: MIGRATION_098,
     },
+    Migration {
+        version: 99,
+        name: "bound_new_message_ids",
+        sql: MIGRATION_099,
+    },
 ];
+
+const MIGRATION_099: &str = r"
+CREATE TRIGGER messages_bound_new_message_id_bytes
+BEFORE INSERT ON messages
+FOR EACH ROW WHEN length(CAST(NEW.message_id AS BLOB)) > 256
+BEGIN
+    SELECT RAISE(ABORT, 'message id exceeds 256 UTF-8 bytes');
+END;
+";
 
 const MIGRATION_098: &str = r"
 DELETE FROM continuation_dispatch_intents
@@ -10149,6 +10163,44 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn migration_099_preserves_legacy_ids_and_bounds_new_utf8_bytes() {
+        let pool = test_pool().await;
+        sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = "x".repeat(257);
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT message_id FROM messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            legacy
+        );
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind("é".repeat(128))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(format!("{}a", "é".repeat(128)))
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("message id exceeds 256 UTF-8 bytes"));
+    }
 
     #[tokio::test]
     async fn migration_098_retires_shipped_empty_continuation_intent_without_losing_successor() {
