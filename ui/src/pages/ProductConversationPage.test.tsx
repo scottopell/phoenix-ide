@@ -408,6 +408,45 @@ describe('ProductConversationPage', () => {
     }));
   });
 
+  it('does not let a pre-save snapshot response overwrite the saved profile', async () => {
+    const { api } = await import('../api');
+    let resolveStaleSnapshot!: (snapshot: ProductConversationSnapshotView) => void;
+    const staleSnapshot = new Promise<ProductConversationSnapshotView>((resolve) => {
+      resolveStaleSnapshot = resolve;
+    });
+    const savedProfile = {
+      enabled: true,
+      charter: 'Saved charter',
+      revision: 1,
+      updated_at_unix_micros: 2,
+    };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockReturnValueOnce(staleSnapshot)
+      .mockRejectedValueOnce(new Error('post-save refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue(savedProfile);
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedProfile.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      resolveStaleSnapshot(makeSnapshot());
+      await staleSnapshot;
+    });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
+  });
+
   it('retains unsaved charter text and surfaces save failure', async () => {
     const { api } = await import('../api');
     vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('Profile changed elsewhere'));

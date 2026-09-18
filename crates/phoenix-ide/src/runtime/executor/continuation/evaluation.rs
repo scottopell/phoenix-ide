@@ -135,7 +135,8 @@ async fn live_three_compaction_comparison() {
         };
         let mut seed = INITIAL.to_string();
         for round in 0..3 {
-            let mut instruction = policy.instruction(&[]);
+            let mut instruction =
+                policy.instruction(&[], phoenix_core::llm_language::LlmLanguage::default());
             let recent = recent(round);
             let rendered_count = recent.len() + 1;
             if arm == "C_coordinator_protected" {

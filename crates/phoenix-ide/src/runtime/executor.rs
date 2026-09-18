@@ -8176,7 +8176,8 @@ where
         };
         let policy =
             CompactionPolicy::for_profile(self.context.is_coordinator, is_project_coordinator);
-        let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
+        let mut continuation_prompt =
+            policy.instruction(&rejected_tool_calls, self.context.llm_language);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
