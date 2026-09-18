@@ -323,13 +323,30 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
                 ..
             } if start.message_id.len() > PREVIOUS_TITLE_BYTES
         )
-        || matches!(
-            output,
-            PreviousTranscriptsOutput::SearchResults { results, .. }
-                if results.iter().any(|hit| hit.message_id.len() > PREVIOUS_TITLE_BYTES)
-        )
     {
         return Ok(json);
+    }
+    if let PreviousTranscriptsOutput::SearchResults {
+        results,
+        index_fresh,
+    } = output
+    {
+        let mut retained = Vec::new();
+        for hit in results {
+            retained.push(hit);
+            let candidate = PreviousTranscriptsOutput::SearchResults {
+                results: retained.iter().map(|hit| (*hit).clone()).collect(),
+                index_fresh: *index_fresh,
+            };
+            if serde_json::to_string_pretty(&candidate)?.len() > PREVIOUS_TOOL_RESULT_BYTES {
+                retained.pop();
+                break;
+            }
+        }
+        return serde_json::to_string_pretty(&PreviousTranscriptsOutput::SearchResults {
+            results: retained.into_iter().cloned().collect(),
+            index_fresh: *index_fresh,
+        });
     }
     serde_json::to_string_pretty(&PreviousTranscriptsOutput::ResultTruncated {
         reason_code: "serialized_result_too_large",
@@ -357,7 +374,7 @@ pub(crate) struct PreviousTranscriptReadStart {
     byte_offset: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct PreviousTranscriptSearchHit {
     transcript_ref: String,
     conversation_id: String,
@@ -371,7 +388,7 @@ pub(crate) struct PreviousTranscriptSearchHit {
     relevance_score: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct PreviousTranscriptChunkRef {
     ordinal: u32,
     char_range: Option<(usize, usize)>,
