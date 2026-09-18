@@ -8,7 +8,6 @@ import { ConversationListPage } from './ConversationListPage';
 const pageMocks = vi.hoisted(() => ({
   refresh: vi.fn().mockResolvedValue(undefined),
   isOnline: true,
-  queueOperation: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../api', async () => {
@@ -43,7 +42,7 @@ vi.mock('../hooks/useAppMachine', () => ({
     isReady: true,
     initError: null,
     pendingOpsCount: 0,
-    queueOperation: pageMocks.queueOperation,
+    queueOperation: vi.fn(),
   }),
 }));
 
@@ -88,7 +87,6 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.clearAllMocks();
     pageMocks.refresh.mockResolvedValue(undefined);
     pageMocks.isOnline = true;
-    pageMocks.queueOperation.mockResolvedValue(undefined);
     vi.mocked(api.codexLoginPreflight).mockResolvedValue({} as never);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
@@ -112,19 +110,12 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(await screen.findByText('Renamed on Mobile')).toBeInTheDocument();
   });
 
-  it('queues continued product Close when the mobile page is offline', async () => {
+  it('does not offer ProductConversation Close while the mobile page is offline', async () => {
     pageMocks.isOnline = false;
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
-    touchActivate(await screen.findByRole('button', { name: 'Close product conversation Mobile Product' }));
-    touchActivate(screen.getByRole('button', { name: 'Close' }));
-
-    await waitFor(() => expect(pageMocks.queueOperation).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'archive_chain',
-      conversationId: 'root-mobile',
-    })));
-    expect(api.archiveConversation).not.toHaveBeenCalled();
-    expect(api.archiveChain).not.toHaveBeenCalled();
+    expect(await screen.findByText('Mobile Product')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Close product conversation Mobile Product' })).toBeNull();
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {
