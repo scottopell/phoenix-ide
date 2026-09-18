@@ -22,10 +22,6 @@ impl TrustedInstructions {
     pub fn into_output(self) -> String {
         self.output
     }
-
-    pub(super) fn replace_output(&mut self, output: String) {
-        self.output = output;
-    }
 }
 
 fn trusted_builtin_instructions(output: String) -> ToolOutput {
@@ -69,6 +65,9 @@ impl SkillTool {
 impl Tool for SkillTool {
     fn name(&self) -> &'static str {
         "skill"
+    }
+    fn clearable(&self) -> bool {
+        self.audience == phoenix_skills::SkillAudience::GlobalCoordinator
     }
 
     fn description(&self) -> String {
@@ -198,7 +197,7 @@ mod tests {
             .await;
 
         assert!(result.is_success());
-        assert!(result.output().contains("<trusted_builtin_skill"));
+        assert!(!result.output().contains("<trusted_builtin_skill"));
         assert!(result.output().contains("Embedded reference"));
         assert!(result
             .output()

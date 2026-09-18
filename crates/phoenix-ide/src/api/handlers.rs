@@ -4103,7 +4103,13 @@ async fn get_system_prompt(
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
     let system_prompt = if is_coordinator {
-        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language, None)
+        let coordinator_catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
+            crate::skills::builtin::default_extract_dir().as_deref(),
+        );
+        crate::system_prompt::build_coordinator_system_prompt(
+            conversation.llm_language,
+            coordinator_catalog.as_ref(),
+        )
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)

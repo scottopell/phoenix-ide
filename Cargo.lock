@@ -3016,6 +3016,7 @@ dependencies = [
  "phoenix-core",
  "rust-embed",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
