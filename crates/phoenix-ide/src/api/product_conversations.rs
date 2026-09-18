@@ -140,6 +140,20 @@ pub async fn put_project_coordinator_profile(
     Path(id): Path<String>,
     Json(request): Json<ProjectCoordinatorProfileWriteRequest>,
 ) -> Result<Json<Option<ProjectCoordinatorProfileView>>, AppError> {
+    tokio::spawn(write_project_coordinator_profile(state, id, request))
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "Project Coordinator profile write task failed: {error}"
+            ))
+        })?
+}
+
+async fn write_project_coordinator_profile(
+    state: AppState,
+    id: String,
+    request: ProjectCoordinatorProfileWriteRequest,
+) -> Result<Json<Option<ProjectCoordinatorProfileView>>, AppError> {
     let product_conversation_id = ProductConversationId::parse(&id)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let _admitted = state.runtime.acquire_local_authority_pass().map_err(|()| {

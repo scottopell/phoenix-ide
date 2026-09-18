@@ -6946,9 +6946,25 @@ where
         let project_coordinator_profile = if is_coordinator || is_sub_agent {
             None
         } else {
-            self.storage
+            match self
+                .storage
                 .get_project_coordinator_profile(&self.context.conversation_id)
-                .await?
+                .await
+            {
+                Ok(profile) => profile,
+                Err(error) => {
+                    let _ = llm_tx.send(LlmOutcome::NetworkError {
+                        message: format!("failed to load Project Coordinator profile: {error}"),
+                    });
+                    self.llm_task_handle = Some(tokio::spawn(async {}));
+                    tokio::spawn(forward_llm_outcome(
+                        llm_rx,
+                        dispatch_generation,
+                        llm_outcome_tx,
+                    ));
+                    return Ok(None);
+                }
+            }
         };
         if project_coordinator_profile.is_some() {
             crate::system_prompt::append_project_coordinator_guidance(
@@ -8144,13 +8160,20 @@ where
                 }));
             }
         };
-        let is_project_coordinator = !self.context.is_coordinator
-            && !self.context.is_sub_agent
-            && self
-                .storage
-                .get_project_coordinator_profile(&conv_id)
-                .await?
-                .is_some();
+        let is_project_coordinator = if self.context.is_coordinator || self.context.is_sub_agent {
+            false
+        } else {
+            match self.storage.get_project_coordinator_profile(&conv_id).await {
+                Ok(profile) => profile.is_some(),
+                Err(error) => {
+                    return Ok(Some(Event::ContinuationFailed {
+                        operation_id,
+                        error: format!("failed to load Project Coordinator profile: {error}"),
+                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                    }));
+                }
+            }
+        };
         let policy =
             CompactionPolicy::for_profile(self.context.is_coordinator, is_project_coordinator);
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
