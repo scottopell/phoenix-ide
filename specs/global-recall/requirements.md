@@ -115,19 +115,16 @@ THE SYSTEM SHALL reject the entire operation before mutating any chain member
 
 ### REQ-GR-007: Bound Phoenix-Wide Agent Capabilities
 
-WHILE a write-capable ordinary ProductConversation or the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, and singular cross-conversation messaging
+WHILE the singleton Global Coordinator is answering a user request
+THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, singular cross-conversation messaging, global reference resolution, and unsandboxed Bash
 
-WHILE a restricted planning conversation or sub-agent is running
+WHILE an ordinary ProductConversation, restricted planning conversation, or sub-agent is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 THE ordinary-parent predecessor capability defined by
 `../conversation-retrieval/requirements.md` REQ-RET-009 SHALL remain separate
-from Phoenix-wide capabilities: restricted planning parents may inspect their
-own predecessors through that bound capability without receiving global tools
-
-WHILE the singleton Global Coordinator is answering a user request
-THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
+from Phoenix-wide capabilities: ordinary parents may inspect only their own
+predecessor transcripts through that host-bound capability without receiving global tools
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
 
