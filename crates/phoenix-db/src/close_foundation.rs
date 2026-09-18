@@ -3015,33 +3015,34 @@ impl Database {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<Option<CloseNeedsRepairCause>> {
-        let evidence: Option<(String, String)> = sqlx::query_as(
-            "SELECT invariant, relation
-             FROM close_needs_repair_causes WHERE attempt_id=?1",
-        )
-        .bind(attempt_id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        let ambient: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT detector, operation, error_kind
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT 'evidence_invariant', invariant, relation, NULL
+             FROM close_needs_repair_causes WHERE attempt_id=?1
+             UNION ALL
+             SELECT 'ambient_writer_indeterminate', detector, operation, error_kind
              FROM close_ambient_writer_indeterminate_causes WHERE attempt_id=?1",
         )
         .bind(attempt_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        match (evidence, ambient) {
-            (Some((invariant, relation)), None) => {
+        match rows.as_slice() {
+            [] => Ok(None),
+            [(kind, invariant, relation, None)] if kind == "evidence_invariant" => {
                 CloseNeedsRepairCause::evidence_invariant(invariant, relation)
                     .map(Some)
                     .map_err(|error| DbError::Serialization(error.to_string()))
             }
-            (None, Some((detector, operation, error_kind))) => {
+            [(kind, detector, operation, Some(error_kind))]
+                if kind == "ambient_writer_indeterminate" =>
+            {
                 CloseNeedsRepairCause::ambient_writer_indeterminate(detector, operation, error_kind)
                     .map(Some)
                     .map_err(|error| DbError::Serialization(error.to_string()))
             }
-            (None, None) => Ok(None),
-            (Some(_), Some(_)) => Err(DbError::Serialization(
+            [_] => Err(DbError::Serialization(
+                "Close attempt has an invalid needs-repair cause".to_string(),
+            )),
+            _ => Err(DbError::Serialization(
                 "Close attempt has conflicting needs-repair causes".to_string(),
             )),
         }

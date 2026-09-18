@@ -630,13 +630,18 @@ async fn close_retirement_conflict(
     error: CloseRetirementError,
     attempt_id: &str,
     active_transcript_id: &str,
-) -> ConflictErrorResponse {
+) -> Result<ConflictErrorResponse, AppError> {
     let phase = db
         .get_close_obligation(attempt_id)
         .await
-        .ok()
-        .map(|obligation| obligation.phase());
-    close_retirement_conflict_for_phase(error, attempt_id, active_transcript_id, phase)
+        .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?
+        .phase();
+    Ok(close_retirement_conflict_for_phase(
+        error,
+        attempt_id,
+        active_transcript_id,
+        Some(phase),
+    ))
 }
 
 fn close_retirement_conflict_for_phase(
@@ -794,7 +799,7 @@ pub(crate) async fn retry_close_retirement(
                 .map_err(AppError::Internal)?;
         }
         return Err(AppError::Conflict(Box::new(
-            close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await,
+            close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await?,
         )));
     }
     let authoritative = state
@@ -1063,7 +1068,7 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                             obligation.attempt_id().as_str(),
                             expected_latest_transcript.as_str(),
                         )
-                        .await,
+                        .await?,
                     )));
                 }
                 return Ok(());
