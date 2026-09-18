@@ -261,6 +261,7 @@ pub(crate) enum PreviousTranscriptsOutput {
     SearchResults {
         results: Vec<PreviousTranscriptSearchHit>,
         index_fresh: bool,
+        truncated: bool,
     },
     ReadPage {
         transcript: PreviousTranscriptSummary,
@@ -329,6 +330,7 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
     if let PreviousTranscriptsOutput::SearchResults {
         results,
         index_fresh,
+        ..
     } = output
     {
         let mut retained = Vec::new();
@@ -337,15 +339,20 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
             let candidate = PreviousTranscriptsOutput::SearchResults {
                 results: retained.iter().map(|hit| (*hit).clone()).collect(),
                 index_fresh: *index_fresh,
+                truncated: retained.len() < results.len(),
             };
             if serde_json::to_string_pretty(&candidate)?.len() > PREVIOUS_TOOL_RESULT_BYTES {
-                retained.pop();
+                if retained.len() > 1 || hit.message_id.len() <= PREVIOUS_TITLE_BYTES {
+                    retained.pop();
+                }
                 break;
             }
         }
+        let retained_len = retained.len();
         return serde_json::to_string_pretty(&PreviousTranscriptsOutput::SearchResults {
             results: retained.into_iter().cloned().collect(),
             index_fresh: *index_fresh,
+            truncated: retained_len < results.len(),
         });
     }
     serde_json::to_string_pretty(&PreviousTranscriptsOutput::ResultTruncated {
@@ -854,6 +861,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         PreviousTranscriptsOutput::SearchResults {
             results,
             index_fresh,
+            truncated: false,
         }
     }
 
