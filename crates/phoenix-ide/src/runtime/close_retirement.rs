@@ -2755,6 +2755,7 @@ pub(crate) enum AmbientWriterDiagnosticOperation {
     ReadProcessExecutable,
     ReadWorkingDirectory,
     ReadMappings,
+    ReadProcessCredentials,
     EnumerateDescriptors,
     EnumerateDescriptor,
     ReadDescriptorTarget,
@@ -4613,13 +4614,14 @@ impl LinuxProcessEffectiveUid {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxProcessOwner {
     Inspectable,
+    DifferentUser,
     Vanished,
 }
 
 #[cfg(target_os = "linux")]
 fn linux_process_owner(
     process: &std::fs::DirEntry,
-    _effective_uid: libc::uid_t,
+    effective_uid: libc::uid_t,
     inventory: &str,
 ) -> Result<LinuxProcessOwner, String> {
     let status = match std::fs::read_to_string(process.path().join("status")) {
@@ -4634,14 +4636,18 @@ fn linux_process_owner(
             ));
         }
     };
-    LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
+    let process_uid = LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
         format!(
             "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
             process.file_name().to_string_lossy()
         )
     })?;
 
-    Ok(LinuxProcessOwner::Inspectable)
+    Ok(if process_uid.0 == effective_uid {
+        LinuxProcessOwner::Inspectable
+    } else {
+        LinuxProcessOwner::DifferentUser
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -5088,7 +5094,7 @@ fn linux_indeterminate(
     .marker()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn diagnostic_error_kind(error: &std::io::Error) -> AmbientWriterDiagnosticErrorKind {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => AmbientWriterDiagnosticErrorKind::PermissionDenied,
@@ -5096,6 +5102,19 @@ fn diagnostic_error_kind(error: &std::io::Error) -> AmbientWriterDiagnosticError
         std::io::ErrorKind::InvalidData => AmbientWriterDiagnosticErrorKind::InvalidData,
         _ => AmbientWriterDiagnosticErrorKind::Other,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_inventory_diagnostic(
+    operation: AmbientWriterDiagnosticOperation,
+    error: &std::io::Error,
+) -> String {
+    AmbientWriterIndeterminateDiagnostic {
+        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+        operation,
+        error_kind: diagnostic_error_kind(error),
+    }
+    .marker()
 }
 
 #[cfg(target_os = "linux")]
@@ -5266,6 +5285,43 @@ fn macos_process_executable(pid: i32) -> Result<Option<GitPathIdentity>, String>
     Ok(Some(GitPathIdentity::from_bytes(executable)))
 }
 
+#[cfg(target_os = "macos")]
+fn macos_process_is_relevant(pid: i32, effective_uid: libc::uid_t) -> Result<bool, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    // SAFETY: proc_pidinfo initializes the declared C structure on success.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("process info fits i32"),
+        )
+    };
+    if bytes <= 0 {
+        let error = std::io::Error::last_os_error();
+        if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+            return Ok(false);
+        }
+        return Err(macos_inventory_diagnostic(
+            AmbientWriterDiagnosticOperation::ReadProcessCredentials,
+            &error,
+        ));
+    }
+    let bytes = usize::try_from(bytes).expect("positive process info byte count");
+    if bytes < size_of::<libc::proc_bsdinfo>() {
+        return Err(macos_inventory_diagnostic(
+            AmbientWriterDiagnosticOperation::ReadProcessCredentials,
+            &std::io::Error::from(std::io::ErrorKind::InvalidData),
+        ));
+    }
+    // SAFETY: the exact structure size was reported initialized above.
+    let info = unsafe { info.assume_init() };
+    Ok(info.pbi_uid == effective_uid)
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(target_os = "macos")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
@@ -5288,6 +5344,8 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     }
 
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
@@ -5295,6 +5353,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
         format!("cannot enumerate processes for descriptor inspection: {error}")
     })?;
     'processes: for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        if !macos_process_is_relevant(pid, effective_uid)? {
+            continue;
+        }
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
             let mut descriptors = vec![
@@ -5322,8 +5383,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
                     continue 'processes;
                 }
-                return Err(format!(
-                    "cannot enumerate process {pid} descriptors: {error}"
+                return Err(macos_inventory_diagnostic(
+                    AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+                    &error,
                 ));
             }
             let descriptor_bytes =
@@ -5362,9 +5424,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
                     continue;
                 }
-                return Err(format!(
-                    "cannot inspect process {pid} vnode descriptor {}: {error}",
-                    descriptor.proc_fd
+                return Err(macos_inventory_diagnostic(
+                    AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+                    &error,
                 ));
             }
             // SAFETY: the exact structure size was reported as initialized above.
@@ -7980,7 +8042,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cross_uid_process_inventory_remains_inspectable() {
+    fn cross_uid_process_inventory_is_outside_inspection_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let process = temp.path().join("4242");
         std::fs::create_dir(&process).unwrap();
@@ -7992,7 +8054,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::linux_process_owner(&entry, 501, "descriptor").unwrap(),
-            super::LinuxProcessOwner::Inspectable,
+            super::LinuxProcessOwner::DifferentUser,
         );
     }
 
@@ -8099,6 +8161,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("process incarnation"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_inventory_failure_preserves_typed_diagnostic() {
+        let marker = super::macos_inventory_diagnostic(
+            super::AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic::from_marker(&marker).unwrap();
+        assert_eq!(
+            diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::MacosProcPidinfo
+        );
+        assert_eq!(
+            diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadDescriptorMetadata
+        );
+        assert_eq!(
+            diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::PermissionDenied
+        );
     }
 
     #[allow(clippy::items_after_statements)]

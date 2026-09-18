@@ -108,6 +108,7 @@ enum AmbientPathMatchKind {
     | current_working_directory
     | process_root
     | executable_text
+    | namespace_directory
 }
 
 enum DescriptorAccessMode {
@@ -115,6 +116,7 @@ enum DescriptorAccessMode {
     | write_only
     | read_write
     | writable_shared_mapping
+    | namespace_write
 }
 
 enum AmbientReferenceClassification {

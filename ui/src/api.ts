@@ -2395,6 +2395,10 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ attempt_id: attemptId }),
     });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
       throw new ApiResponseError(err.error ?? 'Failed to retry Close retirement', resp.status, err.error_type);
