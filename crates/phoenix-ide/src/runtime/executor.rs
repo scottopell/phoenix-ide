@@ -8400,7 +8400,7 @@ where
                     .persisted_message(msg);
             }
             Err(error) => {
-                tracing::warn!(%error, "approved follow-up authority committed without approval message projection");
+                panic!("approved follow-up authority committed without approval message projection: {error}");
             }
         }
         let _ = self
@@ -8468,7 +8468,12 @@ where
                     "Follow-up task approval join error after Git admission: {error}"
                 ))
             })?
-            .map_err(FollowUpApprovalError::AuthorityLost)?;
+            .map_err(|error| match error {
+                FollowUpArtifactError::BeforeGit(error) => FollowUpApprovalError::BeforeGit(error),
+                FollowUpArtifactError::AfterGit(error) => {
+                    FollowUpApprovalError::AuthorityLost(error)
+                }
+            })?;
 
         self.storage
             .persist_approved_task_authority(
@@ -8900,6 +8905,21 @@ struct ReviewedTaskHandoffSnapshot {
     artifact_body: String,
 }
 
+#[derive(Debug)]
+enum FollowUpArtifactError {
+    BeforeGit(String),
+    AfterGit(String),
+}
+
+impl std::fmt::Display for FollowUpArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::BeforeGit(message) | Self::AfterGit(message) => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -8907,7 +8927,7 @@ fn persist_fresh_approved_task_artifact_blocking(
     expected_title: &str,
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, String> {
+) -> Result<ReviewedTaskHandoffSnapshot, FollowUpArtifactError> {
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -8921,27 +8941,35 @@ fn persist_fresh_approved_task_artifact_blocking(
         expected_title,
         expected_priority,
         expected_plan,
-    )?;
+    )
+    .map_err(FollowUpArtifactError::BeforeGit)?;
     if detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-        let parsed = taskmd_core::filename::parse_filename(filename)
-            .ok_or_else(|| format!("invalid taskmd filename: '{filename}'"))?;
+            .ok_or_else(|| {
+                FollowUpArtifactError::BeforeGit(format!(
+                    "task_file has no filename component: '{task_file}'"
+                ))
+            })?;
+        let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+            FollowUpArtifactError::BeforeGit(format!("invalid taskmd filename: '{filename}'"))
+        })?;
         let promoted = promote_task_status_to_in_progress(
             &cwd.join(tasks_dir_name),
             &parsed.id,
             parsed.status,
             filename,
-        )?;
+        )
+        .map_err(FollowUpArtifactError::AfterGit)?;
         if promoted != filename {
             let _ = run_git(cwd, &["add", "--", task_file]);
             snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
         }
     }
-    crate::git_ops::ensure_local_exclude_has_phoenix(cwd)?;
-    run_git(cwd, &["add", "--", &snapshot.task_file])?;
+    crate::git_ops::ensure_local_exclude_has_phoenix(cwd)
+        .map_err(FollowUpArtifactError::AfterGit)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(FollowUpArtifactError::AfterGit)?;
     let mut approved_paths = vec![snapshot.task_file.as_str()];
     if original_path_was_tracked && snapshot.task_file != task_file {
         approved_paths.push(task_file);
@@ -8952,8 +8980,11 @@ fn persist_fresh_approved_task_artifact_blocking(
         let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
         let mut commit_args = vec!["commit", "--only", "-m", &commit_message, "--"];
         commit_args.extend(approved_paths.iter().copied());
-        run_git(cwd, &commit_args)
-            .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
+        run_git(cwd, &commit_args).map_err(|error| {
+            FollowUpArtifactError::AfterGit(format!(
+                "Failed to commit approved task artifact: {error}"
+            ))
+        })?;
     }
     Ok(snapshot)
 }
@@ -8967,22 +8998,7 @@ fn reread_reviewed_task_handoff_snapshot(
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, String> {
-    let proposed_path = cwd.join(task_file);
-    let path = if proposed_path.exists() {
-        proposed_path
-    } else {
-        let filename = proposed_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-        let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-            format!("Failed to read reviewed task file '{task_file}': file not found")
-        })?;
-        proposed_path.with_file_name(format!(
-            "{}-{}-in-progress--{}.md",
-            parsed.id, parsed.priority, parsed.slug
-        ))
-    };
+    let path = cwd.join(task_file);
     let metadata = path
         .symlink_metadata()
         .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
