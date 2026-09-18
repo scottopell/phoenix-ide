@@ -907,17 +907,22 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                     message: "message-fragment reads cannot be combined with a cursor; continue with the transcript id and the returned cursor".to_string(),
                 };
             }
-            let message = match self.db.get_message_by_id(message_id).await {
-                Ok(message) if message.conversation_id == conv.id => message,
-                Ok(_) => {
+            let message = match self
+                .db
+                .get_message_by_id_in_conversation(&conv.id, message_id)
+                .await
+            {
+                Ok(message) => message,
+                Err(crate::db::DbError::MessageNotFound(_)) => {
                     return PreviousTranscriptsOutput::InvalidTarget {
-                        message: "message does not belong to the requested predecessor transcript"
+                        message: "message was not found in the requested predecessor transcript"
                             .to_string(),
                     }
                 }
                 Err(error) => {
-                    return PreviousTranscriptsOutput::InvalidTarget {
-                        message: format!("message not found: {error}"),
+                    return PreviousTranscriptsOutput::Unavailable {
+                        reason_code: "message_read_failed",
+                        message: format!("failed to read predecessor message: {error}"),
                     }
                 }
             };

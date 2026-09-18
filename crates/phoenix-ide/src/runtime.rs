@@ -5102,53 +5102,47 @@ impl RuntimeManager {
                     global_read.clone(),
                     previous_binding.clone(),
                 );
-                let send_chat =
-                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                        self.db.clone(),
-                        self.clone(),
-                    ));
-                let writing_tools = crate::coordinator_tools::predecessor_writing_tools(
-                    global_read.clone(),
-                    send_chat,
-                    previous_binding,
-                );
-                let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
-                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
+                let registry = match conv.conv_mode {
+                    ConvMode::Explore { .. } if approved_task_objective.is_some() => {
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                    }
+                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                         ToolRegistry::explore(
                             &context.tasks_dir_name,
                             agent_catalog.to_vec(),
                             ExploreToolPolicy::from_platform(&self.platform),
-                        ),
-                        Some(writing_tools),
-                    ),
-                    ConvMode::Direct => (
-                        ToolRegistry::direct(agent_catalog.to_vec())
-                            .try_with_writing_conversation_tools(writing_tools)?,
-                        None,
-                    ),
+                        )
+                    }
+                    ConvMode::Direct => {
+                        // Full tool suite for Direct mode. `propose_task` (the
+                        // fork proposal) is offered only when the working dir is
+                        // inside a git repo — a fork cuts from the repository's
+                        // default branch (REQ-PROJ-036).
+                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
+                        let registry =
+                            if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
+                                .is_some()
+                            {
+                                registry.with_propose_task()
+                            } else {
+                                registry
+                            };
+                        registry
+                    }
                     ConvMode::Work { .. }
                     | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
+                    | ConvMode::DetachedApprovedTask { .. } => {
+                        // Full tool suite plus `propose_task` (non-blocking fork
+                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
+                        // history, so the tool is always offered.
+                        ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
+                    }
                 };
                 ToolRegistryExecutor::with_mcp(
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
                 )
-                .with_writing_tools(upgrade_writing_tools)
                 .with_host_bound_tools(host_bound_tools)
             }
         };

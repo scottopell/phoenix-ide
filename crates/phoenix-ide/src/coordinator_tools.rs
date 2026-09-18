@@ -20,18 +20,6 @@ fn global_writing_tools(
     writing_tools_for_scope(service, send_chat, ConversationRecallScope::Global)
 }
 
-pub(crate) fn predecessor_writing_tools(
-    service: GlobalReadService,
-    send_chat: Arc<SendChatApplicationService>,
-    binding: PreviousTranscriptsBinding,
-) -> WritingConversationTools {
-    writing_tools_for_scope(
-        service,
-        send_chat,
-        ConversationRecallScope::StrictPredecessors(binding),
-    )
-}
-
 fn writing_tools_for_scope(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
