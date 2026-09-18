@@ -113,20 +113,19 @@ rule ScanBuiltinExtractDir {
 }
 
 rule DiscoverCoordinatorBuiltin {
-    when: CoordinatorBuiltinCatalogRequested(builtin_dir)
+    when: CoordinatorBuiltinCatalogRequested(runtime)
 
-    ensures: for skill in builtins(builtin_dir)
-             where skill.audience = "global-coordinator"
-             and extracted_bytes(skill) = embedded_bytes(skill):
+    ensures: for skill in embedded_builtins
+             where skill.audience = "global-coordinator":
         skill in coordinator_catalog
-    ensures: for skill in builtins(builtin_dir)
-             where skill.audience != "global-coordinator"
-             or extracted_bytes(skill) != embedded_bytes(skill):
+    ensures: for skill in embedded_builtins
+             where skill.audience != "global-coordinator":
         skill not in coordinator_catalog
 
     @guidance
-        -- Coordinator discovery scans only Phoenix's extracted built-ins. It
-        -- does not scan repository or user filesystem skill directories.
+        -- Coordinator discovery parses immutable bytes embedded in the binary.
+        -- It does not depend on the extraction cache and does not scan
+        -- repository or user filesystem skill directories.
 }
 
 rule InvokeCoordinatorBuiltin {
