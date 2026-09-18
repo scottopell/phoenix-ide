@@ -951,6 +951,7 @@ export interface ConflictErrorDetail {
     operation:
       | "observe_ambient_writer"
       | "read_process_incarnation"
+      | "read_process_credentials"
       | "read_process_executable"
       | "read_working_directory"
       | "read_mappings"

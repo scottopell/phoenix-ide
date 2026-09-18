@@ -4891,6 +4891,31 @@ fn linux_process_incarnation(process: &Path) -> Result<String, LinuxScannerError
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_state(process: &Path) -> Result<Option<char>, LinuxScannerError> {
+    let stat = match std::fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat,
+        Err(error) => {
+            return match LinuxScannerError::from_process_io(
+                process,
+                AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+                &error,
+            ) {
+                LinuxScannerError::ProcessDisappeared => Ok(None),
+                error => Err(error),
+            }
+        }
+    };
+    stat.rfind(") ")
+        .and_then(|index| stat.get(index + 2..))
+        .and_then(|after_command| after_command.split_ascii_whitespace().next())
+        .and_then(|state| state.chars().next())
+        .map(Some)
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })
+}
+
+#[cfg(target_os = "linux")]
 fn linux_process_incarnation_after_capture(
     process: &Path,
     captured_incarnation: &str,
@@ -4912,10 +4937,14 @@ fn linux_read_leaf_after_capture<T>(
     match read() {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if linux_process_incarnation_after_capture(process, captured_incarnation)?.is_some() {
-                Err(linux_inventory_diagnostic(operation, &error))
-            } else {
+            if linux_process_incarnation_after_capture(process, captured_incarnation)?.is_none()
+                || linux_process_state(process)
+                    .map_err(LinuxScannerError::into_marker)?
+                    .is_none_or(|state| state == 'Z')
+            {
                 Ok(None)
+            } else {
+                Err(linux_inventory_diagnostic(operation, &error))
             }
         }
         Err(error) => Err(linux_inventory_diagnostic(operation, &error)),

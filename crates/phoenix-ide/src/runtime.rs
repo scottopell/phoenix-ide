@@ -3244,7 +3244,11 @@ impl RuntimeManager {
     fn close_retirement_is_startup_admitted(
         phase: phoenix_core::domain::close::ClosePhase,
     ) -> bool {
-        phase == phoenix_core::domain::close::ClosePhase::RetirementRequested
+        matches!(
+            phase,
+            phoenix_core::domain::close::ClosePhase::NeedsRepair
+                | phoenix_core::domain::close::ClosePhase::RetirementRequested
+        )
     }
 
     pub async fn resume_pending_close_runtime_retirements(
@@ -7664,8 +7668,8 @@ mod scope_liveness_tests {
     }
 
     #[test]
-    fn startup_requires_explicit_operator_admission_for_needs_repair() {
-        assert!(!RuntimeManager::close_retirement_is_startup_admitted(
+    fn startup_recovers_needs_repair_through_exact_attempt_retry() {
+        assert!(RuntimeManager::close_retirement_is_startup_admitted(
             phoenix_core::domain::close::ClosePhase::NeedsRepair,
         ));
         assert!(RuntimeManager::close_retirement_is_startup_admitted(
@@ -8304,36 +8308,45 @@ mod scope_liveness_tests {
             .capture_close_retirement_inventory(attempt_id.clone(), retry_snapshot.clone())
             .await
             .unwrap();
+        let resource = phoenix_core::domain::close::RetiredResourceIdentity::parse(
+            phoenix_core::domain::close::RetiredResourceKind::Worktree,
+            phoenix_core::domain::close::LossItemIdentity::Worktree(
+                match manager
+                    .db()
+                    .list_close_attempt_scopes(attempt_id.as_str())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|candidate| candidate.scope == scope)
+                    .unwrap()
+                    .captured_worktree
+                    .unwrap()
+                {
+                    CapturedWorktreeIdentity::Resolved(identity) => identity,
+                    CapturedWorktreeIdentity::Unresolved { .. } => {
+                        panic!("test worktree identity must resolve")
+                    }
+                },
+            ),
+        )
+        .unwrap();
+        let cleanup_plan = manager
+            .db()
+            .close_worktree_cleanup_plan(&attempt_id, &scope, &original_snapshot, &resource)
+            .await
+            .unwrap()
+            .unwrap();
         manager
             .db()
             .adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
                 attempt_id: attempt_id.clone(),
                 scope: scope.clone(),
                 target_snapshot: retry_snapshot.clone(),
-                resource: phoenix_core::domain::close::RetiredResourceIdentity::parse(
-                    phoenix_core::domain::close::RetiredResourceKind::Worktree,
-                    phoenix_core::domain::close::LossItemIdentity::Worktree(
-                        match manager
-                            .db()
-                            .list_close_attempt_scopes(attempt_id.as_str())
-                            .await
-                            .unwrap()
-                            .into_iter()
-                            .find(|candidate| candidate.scope == scope)
-                            .unwrap()
-                            .captured_worktree
-                            .unwrap()
-                        {
-                            CapturedWorktreeIdentity::Resolved(identity) => identity,
-                            CapturedWorktreeIdentity::Unresolved { .. } => {
-                                panic!("test worktree identity must resolve")
-                            }
-                        },
-                    ),
-                )
-                .unwrap(),
-                observed_administrative_dir: repository.path().join("source-admin"),
-                observed_administrative_dir_incarnation: "source-admin-incarnation".to_string(),
+                resource,
+                observed_administrative_dir: cleanup_plan.administrative_dir.clone(),
+                observed_administrative_dir_incarnation: cleanup_plan
+                    .administrative_dir_incarnation
+                    .clone(),
             })
             .await
             .unwrap();
