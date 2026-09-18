@@ -6951,7 +6951,10 @@ where
                 .await?
         };
         if project_coordinator_profile.is_some() {
-            crate::system_prompt::append_project_coordinator_guidance(&mut system_prompt);
+            crate::system_prompt::append_project_coordinator_guidance(
+                &mut system_prompt,
+                self.context.llm_language,
+            );
         }
         if has_approved_task_write_authority {
             system_prompt.push_str(
@@ -6969,7 +6972,10 @@ where
         let mut system = vec![SystemContent::cached(&system_prompt)];
         if let Some(profile) = project_coordinator_profile {
             system.push(SystemContent::new(
-                crate::system_prompt::project_coordinator_charter_block(profile.charter()),
+                crate::system_prompt::project_coordinator_charter_block(
+                    profile.charter(),
+                    self.context.llm_language,
+                ),
             ));
         }
         if is_coordinator {
@@ -8139,6 +8145,7 @@ where
             }
         };
         let is_project_coordinator = !self.context.is_coordinator
+            && !self.context.is_sub_agent
             && self
                 .storage
                 .get_project_coordinator_profile(&conv_id)
