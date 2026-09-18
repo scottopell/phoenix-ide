@@ -9030,12 +9030,7 @@ CREATE TABLE close_ambient_writer_evidence (
 );
 ";
 
-<<<<<<< HEAD
-const MIGRATION_101: &str = r"
-||||||| parent of 137fe86cc (fix: close remaining retirement recovery gaps)
-const MIGRATION_100: &str = r"
-=======
-const MIGRATION_102: &str = r"
+const MIGRATION_103: &str = r"
 CREATE TRIGGER close_ambient_writer_evidence_valid_authority_insert
 BEFORE INSERT ON close_ambient_writer_evidence
 FOR EACH ROW
@@ -9068,7 +9063,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_103: &str = r"
+const MIGRATION_104: &str = r"
 CREATE TABLE close_ambient_writer_indeterminate_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
@@ -9107,8 +9102,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_100: &str = r"
->>>>>>> 137fe86cc (fix: close remaining retirement recovery gaps)
+const MIGRATION_101: &str = r"
 CREATE TABLE close_needs_repair_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
@@ -10688,7 +10682,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_104: &str = r"
+const MIGRATION_102: &str = r"
 DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
 DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
 
