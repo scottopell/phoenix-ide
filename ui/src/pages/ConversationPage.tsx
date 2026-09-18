@@ -395,6 +395,7 @@ function ConversationPageContent({
   const [deletingConversation, setDeletingConversation] = useState(false);
   const historyGenerationRef = useRef(0);
   const historyRequestTokenRef = useRef(0);
+  const systemPromptRequestRef = useRef(0);
   const historyCommandTokenRef = useRef(0);
   const historyViewRef = useRef({ conversationId: '', generation: 0, transcriptGeneration: 0 });
   const [historyExpansion, dispatchHistoryExpansion] = useReducer(
@@ -1162,10 +1163,23 @@ function ConversationPageContent({
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
     if (!conversationId) return;
+    const requestGeneration = ++systemPromptRequestRef.current;
     api
       .getSystemPrompt(conversationId)
-      .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId }))
-      .catch((err) => console.warn('Failed to load system prompt:', err));
+      .then((sp) => {
+        if (systemPromptRequestRef.current !== requestGeneration) return;
+        dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId });
+      })
+      .catch((err) => {
+        if (systemPromptRequestRef.current === requestGeneration) {
+          console.warn('Failed to load system prompt:', err);
+        }
+      });
+    return () => {
+      if (systemPromptRequestRef.current === requestGeneration) {
+        systemPromptRequestRef.current += 1;
+      }
+    };
   }, [conversationId, dispatch, systemPromptRevision]);
 
   // availableModels is populated by the shared useModels() poller above.

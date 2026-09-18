@@ -697,7 +697,7 @@ function ProjectCoordinatorSettings({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (!dirty || saving || charterBytes > 32_768) return;
+    if (!dirty || saving || (enabled && charterBytes > 32_768)) return;
     setSaving(true);
     setError(null);
     try {
@@ -752,7 +752,7 @@ function ProjectCoordinatorSettings({
         {error && <p role="alert">{error}</p>}
         <div className="product-conversation-page__coordinator-actions">
           <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
-          <button type="submit" className="btn-primary" disabled={!dirty || saving || charterBytes > 32_768}>
+          <button type="submit" className="btn-primary" disabled={!dirty || saving || (enabled && charterBytes > 32_768)}>
             {saving ? 'Saving…' : 'Save'}
           </button>
         </div>
@@ -1177,6 +1177,7 @@ function ProductConversationPageInner() {
         messages={messages}
         recallDisabled={!liveControlsEnabled}
         onCoordinatorProfileSaved={(savedProductConversationId, profile) => {
+          paginationRequestRef.current += 1;
           setOwnedSnapshot((current) => (
             current?.productConversationId === savedProductConversationId
               ? { ...current, value: { ...current.value, project_coordinator_profile: profile } }
