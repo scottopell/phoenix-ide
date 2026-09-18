@@ -1836,9 +1836,6 @@ final class AppModel {
         else {
             return "Open the conversation before closing it."
         }
-        guard snapshot.segments.count == 1 else {
-            return "Close is unavailable for continued conversations."
-        }
         return nil
     }
 
@@ -1861,14 +1858,20 @@ final class AppModel {
             ?? productConversationDetails.first(where: {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
+        let chainRootId: String?
         if let aggregateId {
             guard let detail = productConversationDetails[aggregateId],
                   detail.closeCardinalityKnown,
-                  detail.snapshot?.segments.count == 1
+                  let snapshot = detail.snapshot
             else {
-                lastActionError = "Close is unavailable for continued conversations."
+                lastActionError = "Open the conversation before closing it."
                 return false
             }
+            chainRootId = snapshot.segments.count > 1
+                ? snapshot.canonical_root.transcript_row_id
+                : nil
+        } else {
+            chainRootId = nil
         }
         let archiveConversationId = aggregateId.flatMap { aggregate in
             productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
@@ -1917,7 +1920,11 @@ final class AppModel {
             if !archived { session.endArchiving() }
         }
         do {
-            try await api.archive(conversationId: archiveConversationId)
+            if let chainRootId {
+                try await api.archiveChain(rootId: chainRootId)
+            } else {
+                try await api.archive(conversationId: archiveConversationId)
+            }
             archived = true
             session.stop()
             await session.clearCachedSnapshotAndWait()
