@@ -377,6 +377,30 @@ impl Database {
         reference: &str,
         title: &str,
     ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_title_authority(reference, Some(title))
+            .await
+    }
+
+    /// Clears the legacy name override while preserving the aggregate title.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn clear_ordinary_product_conversation_legacy_title(
+        &self,
+        reference: &str,
+    ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_title_authority(reference, None)
+            .await
+    }
+
+    async fn mutate_ordinary_product_conversation_title_authority(
+        &self,
+        reference: &str,
+        title: Option<&str>,
+    ) -> DbResult<ProductConversationId> {
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
         let now = chrono::Utc::now();
@@ -418,16 +442,28 @@ impl Database {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             };
             let root_id: String = row.try_get("id")?;
-            let result = sqlx::query(
-                "UPDATE conversations
+            let result = if let Some(title) = title {
+                sqlx::query(
+                    "UPDATE conversations
                      SET title = ?1, chain_name = NULL, updated_at = ?2
                      WHERE id = ?3",
-            )
-            .bind(title)
-            .bind(now.to_rfc3339())
-            .bind(root_id)
-            .execute(&mut *transaction)
-            .await?;
+                )
+                .bind(title)
+                .bind(now.to_rfc3339())
+                .bind(&root_id)
+                .execute(&mut *transaction)
+                .await?
+            } else {
+                sqlx::query(
+                    "UPDATE conversations
+                     SET chain_name = NULL, updated_at = ?1
+                     WHERE id = ?2",
+                )
+                .bind(now.to_rfc3339())
+                .bind(&root_id)
+                .execute(&mut *transaction)
+                .await?
+            };
             if result.rows_affected() == 0 {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             }
@@ -1710,11 +1746,13 @@ mod tests {
             .create_conversation("rename-history", "rename-history", "/tmp", true, None, None)
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET title = 'Original' WHERE id = ?1")
-            .bind(&conversation.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET title = 'Original', chain_name = 'Legacy' WHERE id = ?1",
+        )
+        .bind(&conversation.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
         )
@@ -1728,13 +1766,28 @@ mod tests {
             Err(DbError::ProductConversationUnavailable(id))
                 if id == conversation.product_conversation_id
         ));
-        let title: Option<String> =
-            sqlx::query_scalar("SELECT title FROM conversations WHERE id = ?1")
-                .bind(&conversation.id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(title.as_deref(), Some("Original"));
+        assert!(matches!(
+            db.clear_ordinary_product_conversation_legacy_title(&conversation.id).await,
+            Err(DbError::ProductConversationUnavailable(id))
+                if id == conversation.product_conversation_id
+        ));
+        let row = sqlx::query("SELECT title, chain_name FROM conversations WHERE id = ?1")
+            .bind(&conversation.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            row.try_get::<Option<String>, _>("title")
+                .unwrap()
+                .as_deref(),
+            Some("Original")
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("chain_name")
+                .unwrap()
+                .as_deref(),
+            Some("Legacy")
+        );
     }
 
     #[tokio::test]
