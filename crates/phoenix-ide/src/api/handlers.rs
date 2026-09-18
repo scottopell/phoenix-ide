@@ -2201,44 +2201,82 @@ async fn create_conversation(
     create_conversation_with_id(state, req, Vec::new()).await
 }
 
-fn creation_request_matches_job(
-    req: &CreateConversationRequest,
-    job: &crate::db::ConversationCreationJob,
-) -> bool {
-    let intent = &job.intent;
-    job.message_id.as_deref() == Some(req.message_id.as_str())
-        && intent.cwd == req.cwd
-        && intent.model.as_deref() == Some(req.model.as_str())
-        && intent.effort == req.effort
-        && intent.text == req.text
-        && intent.mode.as_deref() == req.mode.as_deref().filter(|mode| *mode != "direct")
-        && intent.base_branch == req.base_branch
-        && intent.checkout_ref == req.checkout_ref
-        && intent.seed_parent_id == req.seed_parent_id
-        && intent.seed_label == req.seed_label
-        && intent.images.len() == req.images.len()
-        && intent
-            .images
-            .iter()
-            .zip(&req.images)
-            .all(|(stored, submitted)| {
-                stored.data == submitted.data && stored.media_type == submitted.media_type
-            })
-        && intent.files.len() == req.files.len()
-        && intent
-            .files
-            .iter()
-            .zip(&req.files)
-            .all(|(stored, submitted)| {
-                stored.original_name == submitted.original_name
-                    && stored.media_type == submitted.media_type
-                    && stored.size_bytes == submitted.size_bytes
-                    && stored.stored_path == submitted.stored_path
-            })
+fn creation_request_matches_job<'a>(
+    req: &'a CreateConversationRequest,
+    raw_files: &'a [RawAttachmentPart],
+    job: &'a crate::db::ConversationCreationJob,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        let intent = &job.intent;
+        job.message_id.as_deref() == Some(req.message_id.as_str())
+            && intent.cwd == req.cwd
+            && intent
+                .model
+                .as_deref()
+                .is_none_or(|model| model == req.model)
+            && intent
+                .effort
+                .as_ref()
+                .is_none_or(|effort| Some(effort) == req.effort.as_ref())
+            && intent.text == req.text
+            && intent.mode.as_deref() == req.mode.as_deref().filter(|mode| *mode != "direct")
+            && intent.base_branch == req.base_branch
+            && intent.checkout_ref == req.checkout_ref
+            && intent.seed_parent_id == req.seed_parent_id
+            && intent.seed_label == req.seed_label
+            && intent.images.len() == req.images.len()
+            && intent
+                .images
+                .iter()
+                .zip(&req.images)
+                .all(|(stored, submitted)| {
+                    stored.data == submitted.data && stored.media_type == submitted.media_type
+                })
+            && intent.files.len() == req.files.len() + raw_files.len()
+            && intent
+                .files
+                .iter()
+                .take(req.files.len())
+                .zip(&req.files)
+                .all(|(stored, submitted)| {
+                    stored.original_name == submitted.original_name
+                        && stored.media_type == submitted.media_type
+                        && stored.size_bytes == submitted.size_bytes
+                        && stored.stored_path == submitted.stored_path
+                })
+            && futures::future::join_all(
+                intent
+                    .files
+                    .iter()
+                    .skip(req.files.len())
+                    .zip(raw_files)
+                    .map(|(stored, submitted)| async move {
+                        stored.original_name == submitted.original_name
+                            && stored.media_type == submitted.media_type
+                            && stored.size_bytes == submitted.bytes.len() as u64
+                            && tokio::fs::read(&stored.stored_path)
+                                .await
+                                .is_ok_and(|bytes| bytes == submitted.bytes)
+                    }),
+            )
+            .await
+            .into_iter()
+            .all(|matches| matches)
+    })
+}
+
+fn create_conversation_with_id(
+    state: AppState,
+    req: CreateConversationRequest,
+    raw_files: Vec<RawAttachmentPart>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Json<ConversationResponse>, AppError>> + Send>,
+> {
+    Box::pin(create_conversation_with_id_inner(state, req, raw_files))
 }
 
 #[allow(clippy::too_many_lines)]
-async fn create_conversation_with_id(
+async fn create_conversation_with_id_inner(
     state: AppState,
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
@@ -2289,7 +2327,8 @@ async fn create_conversation_with_id(
             .ok()
             .flatten()
         {
-            let is_same_create = creation_request_matches_job(&req, &existing_job);
+            let is_same_create =
+                creation_request_matches_job(&req, &raw_files, &existing_job).await;
             if !is_same_create {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "conversation_id already belongs to an existing conversation",
@@ -2323,7 +2362,7 @@ async fn create_conversation_with_id(
             .await
         {
             tracing::info!(message_id = %req.message_id, "Create request hit existing creation job message id");
-            if !creation_request_matches_job(&req, &existing_job) {
+            if !creation_request_matches_job(&req, &raw_files, &existing_job).await {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "message_id already belongs to a different creation intent",
                     "idempotency_conflict",
@@ -9069,6 +9108,7 @@ mod conversation_cwd_validation_tests {
         let mut req = create_request(tmp.path().to_string_lossy().to_string());
         req.conversation_id = Some(conv_id.clone());
         req.message_id = "msg-existing-shell".to_string();
+        req.text = "retry".to_string();
         req.mode = Some("branch".to_string());
         req.base_branch = Some("does-not-exist".to_string());
 
