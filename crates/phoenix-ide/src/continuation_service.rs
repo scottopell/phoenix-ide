@@ -121,7 +121,7 @@ impl ContinuationApplicationService {
                     images: Vec::new(),
                     files: Vec::new(),
                     user_agent: intent.user_agent,
-                    expansion_policy: MessageExpansionPolicy::LiteralText,
+                    expansion_policy: MessageExpansionPolicy::GeneratedPredecessorContext,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -144,6 +144,13 @@ impl ContinuationApplicationService {
         admission: &AutomaticContinuationAdmission,
         target: AutomaticContinuationPhase,
     ) -> Result<(), String> {
+        let current = self
+            .runtime
+            .db()
+            .automatic_continuation_admission(&admission.predecessor_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "automatic continuation admission is missing".to_string())?;
         let phases = [
             AutomaticContinuationPhase::Admitted,
             AutomaticContinuationPhase::SuccessorReserved,
@@ -153,7 +160,7 @@ impl ContinuationApplicationService {
         ];
         let current_index = phases
             .iter()
-            .position(|phase| *phase == admission.phase)
+            .position(|phase| *phase == current.phase)
             .ok_or_else(|| "automatic admission is not progressable".to_string())?;
         let target_index = phases
             .iter()

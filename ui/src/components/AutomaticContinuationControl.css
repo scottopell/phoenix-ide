@@ -1,0 +1,102 @@
+.automatic-continuation {
+  position: relative;
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.automatic-continuation > summary {
+  padding: 2px 0;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.automatic-continuation__on {
+  color: var(--accent-green, #5fbf83);
+}
+
+.automatic-continuation__phase {
+  color: var(--text-muted);
+}
+
+.automatic-continuation__panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(420px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 24%);
+}
+
+.automatic-continuation__toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-weight: 600;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.automatic-continuation__toggle input {
+  margin-top: 2px;
+}
+
+.automatic-continuation__help {
+  margin: 8px 0;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.automatic-continuation__admission {
+  padding: 8px;
+  line-height: 1.4;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.automatic-continuation__admission--failed {
+  border-color: var(--accent-red);
+}
+
+.automatic-continuation__failure {
+  margin-top: 4px;
+  color: var(--accent-red);
+}
+
+.automatic-continuation__feedback {
+  min-height: 18px;
+  margin-top: 6px;
+  color: var(--text-muted);
+}
+
+.automatic-continuation__feedback[role="alert"] {
+  color: var(--accent-red);
+}
+
+.automatic-continuation__feedback button {
+  margin-left: 8px;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+@media (width <= 640px) {
+  .automatic-continuation__panel {
+    position: fixed;
+    top: 52px;
+    right: 8px;
+    left: 8px;
+    width: auto;
+  }
+}

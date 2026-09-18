@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
@@ -9,6 +9,8 @@ const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
+    getCoordinatorAutomaticContinuation: vi.fn(),
+    updateCoordinatorAutomaticContinuation: vi.fn(),
   },
 }));
 
@@ -70,6 +72,16 @@ describe('CoordinatorPage', () => {
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
+    apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
+      aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
+      auto_continue_on_context_exhaustion: false,
+      admission: null,
+    });
+    apiMock.updateCoordinatorAutomaticContinuation.mockResolvedValue({
+      aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
+      auto_continue_on_context_exhaustion: true,
+      admission: null,
+    });
   });
 
   it('mounts only the shared conversation runtime with the briefing action', async () => {
@@ -85,6 +97,20 @@ describe('CoordinatorPage', () => {
     expect(screen.queryByRole('navigation', { name: 'Coordinator sections' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Coordinator work')).not.toBeInTheDocument();
     expect(screen.queryByText('Current work context is attached to each Coordinator message.')).not.toBeInTheDocument();
+  });
+
+  it('loads and immediately persists the Global Coordinator automatic-continuation toggle', async () => {
+    renderPage();
+
+    const control = await screen.findByTestId('automatic-continuation-control');
+    fireEvent.click(control.querySelector('summary')!);
+    const checkbox = screen.getByRole('checkbox', { name: 'Always accept generated handoffs and continue' });
+    expect(checkbox).not.toBeChecked();
+    expect(apiMock.getCoordinatorAutomaticContinuation).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(apiMock.updateCoordinatorAutomaticContinuation).toHaveBeenCalledWith(true));
+    expect(await screen.findByText('Saved')).toBeInTheDocument();
   });
 
   it('marks bootstrap loading and errors for overlay placement', async () => {

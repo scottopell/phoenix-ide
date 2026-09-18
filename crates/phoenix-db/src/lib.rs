@@ -6662,8 +6662,16 @@ impl Database {
             "SELECT predecessor_conversation_id
              FROM automatic_continuation_admissions
              WHERE phase NOT IN ('message_settled', 'failed')
+               AND updated_at_unix_micros <= ?1 - CASE no_progress_attempts
+                   WHEN 0 THEN 0
+                   WHEN 1 THEN 5000000
+                   WHEN 2 THEN 10000000
+                   WHEN 3 THEN 20000000
+                   ELSE 40000000
+               END
              ORDER BY admitted_at_unix_micros, predecessor_conversation_id",
         )
+        .bind(Utc::now().timestamp_micros())
         .fetch_all(&self.pool)
         .await?;
         let mut admissions = Vec::with_capacity(predecessors.len());
