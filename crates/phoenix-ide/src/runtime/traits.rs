@@ -452,6 +452,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
@@ -976,11 +977,18 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
-            .persist_approved_task_authority_and_state(conv_id, approval, state, state_updated_at)
+            .persist_approved_task_authority_and_state(
+                conv_id,
+                approval,
+                approval_message,
+                state,
+                state_updated_at,
+            )
             .await
     }
 
@@ -1944,11 +1952,18 @@ impl StateStore for DatabaseStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
-            .persist_approved_task_authority_and_state(conv_id, approval, state, state_updated_at)
+            .persist_approved_task_authority_and_state(
+                conv_id,
+                approval,
+                approval_message,
+                state,
+                state_updated_at,
+            )
             .await
             .map_err(|e| e.to_string())
     }

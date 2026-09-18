@@ -2056,11 +2056,18 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         self.persist_approved_task_authority(conv_id, approval)
             .await?;
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(approval_message.clone());
         self.update_state(conv_id, state, state_updated_at).await
     }
 

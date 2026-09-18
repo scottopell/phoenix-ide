@@ -3412,8 +3412,7 @@ where
                         if self.has_existing_write_scope()
                 );
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
-                    && (state_committed || approval_commits_state)
-                    && matches!(self.state, ConvState::AwaitingTaskApproval { .. });
+                    && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
                     effect,
                     Effect::PersistState
@@ -8398,70 +8397,7 @@ where
             && self.context.work_scope_worktree.is_some()
     }
 
-    async fn publish_follow_up_approval(
-        &mut self,
-        task_title: String,
-        title: &str,
-        priority: crate::task_source::Priority,
-        plan: &str,
-        admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<(), String> {
-        let approval_msg = format!(
-            "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
-            self.context.filesystem_root().display(),
-        );
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-        let seq = self.broadcast_tx.next_seq();
-        match self
-            .storage
-            .add_message_with_seq(
-                &msg_id,
-                &self.context.conversation_id,
-                seq,
-                &content,
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(msg) => {
-                let _ = self
-                    .broadcast_tx
-                    .admitted_publication(admitted)
-                    .persisted_message(msg);
-            }
-            Err(error) => {
-                return Err(format!(
-                    "approved follow-up authority committed without approval message projection: {error}"
-                ));
-            }
-        }
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .event(|seq| SseEvent::ConversationUpdate {
-                sequence_id: seq,
-                update: crate::runtime::ConversationMetadataUpdate {
-                    slug: None,
-                    title: None,
-                    cwd: None,
-                    project_id: None,
-                    project_name: None,
-                    updated_at: None,
-                    branch_name: None,
-                    worktree_path: None,
-                    conv_mode_label: None,
-                    base_branch: None,
-                    task_title: Some(task_title),
-                    work_scope_key: None,
-                    model: None,
-                    archived: None,
-                },
-            });
-        Ok(())
-    }
-
+    #[allow(clippy::too_many_lines)]
     async fn approve_follow_up_in_existing_scope(
         &mut self,
         task_file: &str,
@@ -8510,6 +8446,23 @@ where
                 }
             })?;
 
+        let approval_msg = format!(
+            "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
+            self.context.filesystem_root().display(),
+        );
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
+        let seq = self.broadcast_tx.next_seq();
+        let message = crate::db::Message {
+            message_id: msg_id,
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id: seq,
+            message_type: crate::db::MessageType::User,
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
         self.storage
             .persist_approved_task_authority_and_state(
                 &self.context.conversation_id,
@@ -8522,15 +8475,40 @@ where
                     task_file: task_file.to_string(),
                     artifact_body: reviewed.artifact_body,
                 },
+                &message,
                 &self.state,
                 self.state_updated_at,
             )
             .await
             .map_err(FollowUpApprovalError::AuthorityLost)?;
 
-        self.publish_follow_up_approval(reviewed.task_title, title, priority, plan, admitted)
-            .await
-            .map_err(FollowUpApprovalError::AuthorityLost)?;
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(message);
+        let task_title = reviewed.task_title;
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|sequence_id| SseEvent::ConversationUpdate {
+                sequence_id,
+                update: crate::runtime::ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: Some(task_title),
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                },
+            });
         Ok(())
     }
 

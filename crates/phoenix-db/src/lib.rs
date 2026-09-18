@@ -7316,13 +7316,14 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         self.persist_approved_task_authority_inner(
             conversation_id,
             approval,
-            Some((state, state_updated_at)),
+            Some((approval_message, state, state_updated_at)),
         )
         .await
     }
@@ -7331,7 +7332,7 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        state: Option<(&ConvState, DateTime<Utc>)>,
+        settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
     ) -> DbResult<()> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
@@ -7395,7 +7396,8 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
-        if let Some((state, state_updated_at)) = state {
+        if let Some((approval_message, state, state_updated_at)) = settlement {
+            insert_message_tx(&mut tx, approval_message).await?;
             let state_json = serde_json::to_string(state).unwrap();
             sqlx::query(
                 "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4",
