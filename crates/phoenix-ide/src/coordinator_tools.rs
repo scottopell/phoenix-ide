@@ -117,6 +117,14 @@ impl Tool for PreviousTranscripts {
     }
 
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        if input
+            .get("cursor")
+            .is_some_and(|cursor| !cursor.is_string())
+        {
+            return ToolOutput::error(
+                "unsupported previous_transcripts cursor type; restart this list without a cursor",
+            );
+        }
         let request: PreviousTranscriptsRequest = match serde_json::from_value(input) {
             Ok(request) => request,
             Err(error) => {
@@ -686,6 +694,24 @@ mod tests {
             "query": "needle"
         }))
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn previous_transcripts_rejects_numeric_cursor_with_restart_guidance() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let tool = PreviousTranscripts {
+            service,
+            binding: PreviousTranscriptsBinding::new("product".to_string(), "current".to_string()),
+        };
+
+        let output = tool.run(json!({ "cursor": 7 }), context("current")).await;
+        let ToolOutput::Error { output, .. } = output else {
+            panic!("numeric cursor must fail");
+        };
+
+        assert!(output.contains("unsupported previous_transcripts cursor type"));
+        assert!(output.contains("restart this list without a cursor"));
     }
 
     #[tokio::test]
