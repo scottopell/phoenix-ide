@@ -649,6 +649,7 @@ fn close_retirement_conflict_for_phase(
         CloseRetirementError::EvidenceInvariant {
             invariant,
             relation,
+            ..
         } => (
             "Close retirement evidence is inconsistent; retry cannot continue safely.".to_string(),
             Some(invariant.clone()),
@@ -768,15 +769,24 @@ pub(crate) async fn retry_close_retirement(
             .await
             .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
         if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
-            let scope = state
-                .db
-                .list_close_attempt_scopes(retried.attempt_id().as_str())
-                .await
-                .map_err(|route_error| AppError::Internal(route_error.to_string()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
-                .scope;
+            let scope = match &error {
+                CloseRetirementError::EvidenceInvariant {
+                    scope: Some(scope), ..
+                } => scope.clone(),
+                _ => {
+                    state
+                        .db
+                        .list_close_attempt_scopes(retried.attempt_id().as_str())
+                        .await
+                        .map_err(|route_error| AppError::Internal(route_error.to_string()))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            AppError::Internal("Close retry has no captured scope".to_string())
+                        })?
+                        .scope
+                }
+            };
             state
                 .runtime
                 .persist_close_error_repair(retried.attempt_id(), &scope, &error)
@@ -813,6 +823,7 @@ fn close_needs_repair_conflict(
     let error = match cause {
         Some(phoenix_db::CloseNeedsRepairCause::EvidenceInvariant(cause)) => {
             CloseRetirementError::EvidenceInvariant {
+                scope: None,
                 invariant: cause.invariant().to_string(),
                 relation: cause.relation().to_string(),
             }
@@ -1198,6 +1209,7 @@ mod tests {
     #[test]
     fn evidence_invariant_conflict_advertises_retry_only_from_needs_repair() {
         let error = || CloseRetirementError::EvidenceInvariant {
+            scope: None,
             invariant: "target_dispatch_must_match_sealed_inventory".to_string(),
             relation: "close_retirement_resource_dispatches".to_string(),
         };

@@ -543,7 +543,14 @@ export function WorkControlBar({
   }, [actionablePrs, associatedPrs]);
 
   const surfaceCloseConflict = async (err: unknown, fallback: string): Promise<boolean> => {
-    const code = err instanceof Error && 'code' in err && typeof err.code === 'string' ? err.code : undefined;
+    const detail = err instanceof Error && 'detail' in err && typeof err.detail === 'object'
+      ? err.detail
+      : null;
+    const code = detail && 'error_type' in detail && typeof detail.error_type === 'string'
+      ? detail.error_type
+      : err instanceof Error && 'code' in err && typeof err.code === 'string'
+        ? err.code
+        : undefined;
     if (
       code === 'close_loss_confirmation_required'
       || code === 'close_inspection_failed'

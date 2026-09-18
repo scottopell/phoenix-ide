@@ -1315,6 +1315,7 @@ impl RuntimeManager {
                             Err(CloseRetirementError::EvidenceInvariant {
                                 invariant,
                                 relation,
+                                ..
                             }) if route_adoption_invariant_to_repair => {
                                 self.route_close_evidence_invariant_to_repair::<
                                     (),
@@ -1323,6 +1324,7 @@ impl RuntimeManager {
                                 .await
                                 .expect_err("repair routing returns a typed failure");
                                 return Err(CloseRetirementError::EvidenceInvariant {
+                                    scope: Some(scope.clone()),
                                     invariant,
                                     relation,
                                 });
@@ -1918,6 +1920,7 @@ impl RuntimeManager {
             CloseRetirementError::EvidenceInvariant {
                 invariant,
                 relation,
+                ..
             } => {
                 let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
                     .expect("typed Close evidence identifiers are non-blank");
@@ -2934,7 +2937,11 @@ pub(crate) enum CloseRetirementError {
     #[error("{0}")]
     Message(String),
     #[error("Close evidence invariant {invariant} failed in {relation}")]
-    EvidenceInvariant { invariant: String, relation: String },
+    EvidenceInvariant {
+        scope: Option<WorkScopeId>,
+        invariant: String,
+        relation: String,
+    },
 }
 
 impl From<String> for CloseRetirementError {
@@ -2956,6 +2963,7 @@ fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementEr
             relation,
             ..
         } => CloseRetirementError::EvidenceInvariant {
+            scope: None,
             invariant: invariant.to_string(),
             relation: relation.to_string(),
         },
