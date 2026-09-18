@@ -89,12 +89,15 @@ pub async fn get_product_conversation_automatic_continuation(
     State(state): State<AppState>,
     Path(reference): Path<String>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
-    let resolved = state
+    let product_conversation_id = reference
+        .parse::<ProductConversationId>()
+        .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
+    state
         .db
-        .resolve_ordinary_product_conversation(&reference)
+        .get_ordinary_product_conversation(&product_conversation_id)
         .await
         .map_err(db_to_app)?;
-    automatic_continuation_view(&state, resolved.product_conversation_id, false)
+    automatic_continuation_view(&state, product_conversation_id, false)
         .await
         .map(Json)
 }
@@ -104,20 +107,23 @@ pub async fn put_product_conversation_automatic_continuation(
     Path(reference): Path<String>,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
-    let resolved = state
+    let product_conversation_id = reference
+        .parse::<ProductConversationId>()
+        .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
+    state
         .db
-        .resolve_ordinary_product_conversation(&reference)
+        .get_ordinary_product_conversation(&product_conversation_id)
         .await
         .map_err(db_to_app)?;
     state
         .db
         .set_auto_continue_on_context_exhaustion(
-            &resolved.product_conversation_id,
+            &product_conversation_id,
             AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
         )
         .await
         .map_err(db_to_app)?;
-    automatic_continuation_view(&state, resolved.product_conversation_id, false)
+    automatic_continuation_view(&state, product_conversation_id, false)
         .await
         .map(Json)
 }
@@ -1236,6 +1242,37 @@ mod tests {
             accepted["allowed_actions"],
             serde_json::json!(["cancel", "delete"])
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_continuation_settings_reject_transcript_row_references() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("auto-route-row", "auto-route", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let uri = "/api/product-conversations/auto-route-row/automatic-continuation";
+
+        let get = create_router(state.clone())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+        let put = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"auto_continue_on_context_exhaustion":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

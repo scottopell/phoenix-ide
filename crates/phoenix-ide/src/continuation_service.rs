@@ -12,6 +12,13 @@ use crate::send_chat_service::{
     MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
 };
 
+fn winning_intent_is_automatic(
+    admission: &AutomaticContinuationAdmission,
+    intent: &crate::db::ContinuationDispatchIntent,
+) -> bool {
+    intent.message_id == admission.first_message_id
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryPlan {
     reserve_successor: bool,
@@ -99,12 +106,12 @@ impl ContinuationApplicationService {
             let summary = self
                 .runtime
                 .db()
-                .get_messages(&admission.predecessor_conversation_id)
+                .get_message_by_id_in_conversation(
+                    &admission.predecessor_conversation_id,
+                    &admission.summary_message_id,
+                )
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|message| message.message_id == admission.summary_message_id)
-                .ok_or_else(|| "automatic continuation summary is missing".to_string())?;
+                .map_err(|error| error.to_string())?;
             let MessageContent::Continuation(summary_content) = summary.content else {
                 return Err("automatic continuation summary has the wrong message type".to_string());
             };
@@ -141,16 +148,7 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "automatic continuation dispatch intent is missing".to_string())?;
-        if intent.message_id != admission.first_message_id
-            || intent.opening_authority != ContinuationOpeningAuthority::GeneratedPredecessorContext
-        {
-            self.runtime
-                .db()
-                .supersede_automatic_continuation(&admission.predecessor_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            return Ok(());
-        }
+        let automatic_intent = winning_intent_is_automatic(admission, &intent);
         let successor = self
             .runtime
             .db()
@@ -177,11 +175,46 @@ impl ContinuationApplicationService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-            self.advance_current(
-                &admission.predecessor_conversation_id,
-                AutomaticContinuationPhase::OwnershipTransferred,
-            )
-            .await?;
+            if automatic_intent {
+                self.advance_current(
+                    &admission.predecessor_conversation_id,
+                    AutomaticContinuationPhase::OwnershipTransferred,
+                )
+                .await?;
+            }
+        }
+
+        if !automatic_intent {
+            self.runtime
+                .get_or_create(&successor.id)
+                .await
+                .map_err(|error| error.clone())?;
+            let outcome =
+                SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
+                    .send(SendChatRequest {
+                        conversation_id: successor.id,
+                        text: intent.handoff,
+                        message_id: intent.message_id.as_str().to_string(),
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        user_agent: intent.user_agent,
+                        expansion_policy: MessageExpansionPolicy::LiteralText,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            match outcome {
+                SendChatOutcome::Delivered
+                | SendChatOutcome::AlreadyPersisted
+                | SendChatOutcome::QueuedAsSteering => {
+                    self.runtime
+                        .db()
+                        .supersede_automatic_continuation(&admission.predecessor_conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                SendChatOutcome::Rejected { message, .. } => return Err(message),
+            }
         }
 
         if plan.dispatch_opening {
@@ -214,7 +247,7 @@ impl ContinuationApplicationService {
                 SendChatOutcome::Delivered
                 | SendChatOutcome::AlreadyPersisted
                 | SendChatOutcome::QueuedAsSteering => {
-                    if current.phase == AutomaticContinuationPhase::OwnershipTransferred {
+                    if current.phase != AutomaticContinuationPhase::DispatchAccepted {
                         self.advance_current(
                             &admission.predecessor_conversation_id,
                             AutomaticContinuationPhase::DispatchAccepted,
@@ -323,9 +356,8 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
                         warn!(predecessor = %admission.predecessor_conversation_id, %error, "automatic continuation made no durable progress");
                         if let Err(record_error) = runtime
                             .db()
-                            .record_automatic_continuation_no_progress(
-                                &admission.predecessor_conversation_id,
-                                &error,
+                            .reconcile_or_record_automatic_continuation_no_progress(
+                                &admission, &error,
                             )
                             .await
                         {
@@ -349,6 +381,36 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_manual_loser_with_automatic_message_identity_does_not_supersede() {
+        let admission = AutomaticContinuationAdmission {
+            predecessor_conversation_id: "parent".to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::new(),
+            summary_message_id: "summary".to_string(),
+            operation_id: "operation".to_string(),
+            first_message_id: phoenix_workflow::ClientTurnKey::try_from("automatic-opening")
+                .unwrap(),
+            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            phase: AutomaticContinuationPhase::Admitted,
+            resume_phase: AutomaticContinuationPhase::Admitted,
+            no_progress_attempts: 0,
+            last_error: None,
+            admitted_at_unix_micros: 1,
+            updated_at_unix_micros: 1,
+        };
+        let intent = crate::db::ContinuationDispatchIntent {
+            parent_conversation_id: "parent".to_string(),
+            successor_conversation_id: "successor".to_string(),
+            message_id: admission.first_message_id.clone(),
+            handoff: "summary".to_string(),
+            user_agent: None,
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        };
+
+        assert!(winning_intent_is_automatic(&admission, &intent));
+    }
 
     #[test]
     fn recovery_plan_resumes_after_each_durable_phase_without_repeating_it() {

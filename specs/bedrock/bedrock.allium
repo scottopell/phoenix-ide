@@ -1408,6 +1408,7 @@ rule ManualContinuationWinnerSupersedesAutomaticAdmission {
             conversation.continued_in_conv_id,
             admission.first_message_id,
             admission.continuation_summary_message_id)
+        requires: committed_successor_opening_message_id(conversation) != admission.first_message_id
         ensures: admission.phase = superseded
         ensures: not SafeManualContinuationRetryOffered(admission)
 }

@@ -91,27 +91,10 @@ export type { ProductConversationCreationRecoveryRow } from './generated/Product
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
 
 export type { AutomaticContinuationAdmissionPhaseView as AutomaticContinuationAdmissionPhase } from './generated/AutomaticContinuationAdmissionPhaseView';
-import type { AutomaticContinuationAdmissionPhaseView as AutomaticContinuationAdmissionPhase } from './generated/AutomaticContinuationAdmissionPhaseView';
-
-export interface AutomaticContinuationAdmission {
-  predecessor_transcript_row_id: string;
-  phase: AutomaticContinuationAdmissionPhase;
-  no_progress_attempts: number;
-  actionable_failure: {
-    message: string;
-    first_message_id: string;
-  } | null;
-}
-
-export type AutomaticContinuationAggregate =
-  | { kind: 'ordinary'; product_conversation_id: string }
-  | { kind: 'coordinator'; product_conversation_id: string };
-
-export interface AutomaticContinuationView {
-  aggregate: AutomaticContinuationAggregate;
-  auto_continue_on_context_exhaustion: boolean;
-  admission: AutomaticContinuationAdmission | null;
-}
+export type { AutomaticContinuationAdmissionView as AutomaticContinuationAdmission } from './generated/AutomaticContinuationAdmissionView';
+export type { AutomaticContinuationAggregateView as AutomaticContinuationAggregate } from './generated/AutomaticContinuationAggregateView';
+export type { AutomaticContinuationView } from './generated/AutomaticContinuationView';
+import type { AutomaticContinuationView } from './generated/AutomaticContinuationView';
 
 export interface ConversationContentSearchHit {
   conversation_id: string;

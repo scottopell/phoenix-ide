@@ -24,6 +24,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   useEffect(() => {
     if (fixtureData) return;
     setLoading(true);
+    setResolvedCoordinatorId(null);
     let cancelled = false;
     api.ensureGlobalCoordinator()
       .then((coordinator) => {
@@ -38,8 +39,11 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
               if (cancelled) return;
-              if (coordinator_id) setResolvedCoordinatorId(slug);
-              else navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              if (coordinator_id === slug && slug === coordinator.conversation.id) {
+                setResolvedCoordinatorId(coordinator_id);
+              } else {
+                navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              }
             })
             .catch(() => {
               if (!cancelled) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
@@ -61,7 +65,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
-      {!loading && !error && resolvedCoordinatorId && (
+      {!loading && !error && resolvedCoordinatorId && slug === resolvedCoordinatorId && (
         <div className="coordinator-page__automatic-continuation">
           <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
         </div>

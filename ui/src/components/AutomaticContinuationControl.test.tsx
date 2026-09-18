@@ -9,6 +9,7 @@ const { apiMock } = vi.hoisted(() => ({
     updateProductConversationAutomaticContinuation: vi.fn(),
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
+    continueConversation: vi.fn(),
   },
 }));
 
@@ -207,6 +208,35 @@ describe('AutomaticContinuationControl', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Successor dispatch could not be accepted.');
   });
 
+  it('retries a failed admission through the predecessor operation with the persisted message identity', async () => {
+    apiMock.getProductConversationAutomaticContinuation.mockResolvedValueOnce(view({
+      admission: {
+        predecessor_transcript_row_id: 'row-exhausted',
+        phase: 'failed',
+        no_progress_attempts: 5,
+        actionable_failure: {
+          message: 'Dispatch failed.',
+          first_message_id: 'automatic-first-message',
+        },
+      },
+    }));
+    apiMock.continueConversation.mockResolvedValueOnce({
+      conversation_id: 'row-successor',
+      status: 'already_exists',
+    });
+    render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-1' }} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry generated handoff' }));
+    await waitFor(() => expect(apiMock.continueConversation).toHaveBeenCalledWith(
+      'row-exhausted',
+      {
+        handoff: 'Retry persisted generated handoff',
+        message_id: 'automatic-first-message',
+      },
+    ));
+    expect(await screen.findByText('Generated handoff retry accepted')).toBeInTheDocument();
+  });
+
   it('shows failed admission status with manual generated-handoff recovery guidance', async () => {
     apiMock.getProductConversationAutomaticContinuation.mockResolvedValueOnce(view({
       auto_continue_on_context_exhaustion: true,
@@ -226,7 +256,8 @@ describe('AutomaticContinuationControl', () => {
     const alert = await screen.findByRole('alert');
     expect(control).toHaveAttribute('open');
     expect(alert).toHaveTextContent('Successor dispatch could not be accepted.');
-    expect(alert).toHaveTextContent('existing Continue control on the generated handoff');
+    expect(alert).toHaveTextContent('same persisted generated handoff and message identity');
+    expect(screen.getByRole('button', { name: 'Retry generated handoff' })).toBeEnabled();
     expect(alert).toHaveTextContent('remains enabled for future exhaustions');
     expect(screen.getByText(/5 no-progress attempts/)).toBeInTheDocument();
   });
