@@ -27,7 +27,7 @@ export function productConversationPresentationIndicator(row: ProductConversatio
     case 'done':
       return { label: 'Completed', dotClass: 'terminal', ariaLabel: 'Completed' };
     default:
-      return row.ordinary_lifecycle === 'history'
+      return row.lifecycle.state === 'history'
         ? { label: 'History', dotClass: 'terminal', ariaLabel: 'History' }
         : { label: 'Open', dotClass: 'idle', ariaLabel: 'Open' };
   }

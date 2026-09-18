@@ -68,6 +68,7 @@ pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ChainView {
     pub root_conv_id: String,
+    pub product_conversation_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
     /// `true` when the chain is archived. Chain archive is a write-cascade
@@ -632,6 +633,7 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
 
     Ok(ChainView {
         root_conv_id: root_conv.id.clone(),
+        product_conversation_id: root_conv.product_conversation_id.to_string(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
         archived: root_conv.archived,
@@ -890,6 +892,7 @@ mod tests {
         let work_identity = resolve_work_identity(&members);
         Ok(ChainView {
             root_conv_id: root_conv.id.clone(),
+            product_conversation_id: root_conv.product_conversation_id.to_string(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
             archived: root_conv.archived,

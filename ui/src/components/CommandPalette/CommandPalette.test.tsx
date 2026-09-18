@@ -135,7 +135,7 @@ describe('CommandPalette lifecycle availability', () => {
               product_conversation_id: 'product-1',
               canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'open', close_action: { availability: 'available' },
+              lifecycle: { state: 'open', close_action: { availability: 'available' } },
               latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
@@ -160,7 +160,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'latest-id', slug: 'latest', title: null },
-              ordinary_lifecycle: 'open', close_action: { availability: 'available' }, latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}
@@ -188,7 +188,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-id', canonical_route: '/product-conversations/product-id',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'open', close_action: { availability: 'available' }, latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}
@@ -216,8 +216,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'open',
-              close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' },
+              lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
               latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
@@ -242,7 +241,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'history', close_action: { availability: 'unavailable', reason: 'history' }, latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'history' }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}

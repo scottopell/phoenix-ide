@@ -267,6 +267,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
 function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   return {
     root_conv_id: 'root-chain',
+    product_conversation_id: 'pc-1',
     chain_name: null,
     display_name: 'Product Alpha',
     archived: false,

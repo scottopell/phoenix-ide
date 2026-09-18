@@ -188,8 +188,8 @@ export function Sidebar({
     };
   }, [scheduleProductRefresh]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
-  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
-  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
+  const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
   const scopedActiveCount = openProductConversations.length;
   const scopedArchivedCount = archivedProductConversations.length;
 

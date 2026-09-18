@@ -127,6 +127,7 @@ const makeQa = (
 
 const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   root_conv_id: ROOT_ID,
+  product_conversation_id: 'pc-chain',
   chain_name: 'auth refactor',
   display_name: 'auth refactor',
   archived: false,
