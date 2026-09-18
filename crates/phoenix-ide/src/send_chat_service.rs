@@ -97,7 +97,6 @@ impl SendChatApplicationService {
         &self,
         req: SendChatRequest,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
-        validate_persisted_message_id(&req)?;
         let request_fingerprint = request_fingerprint(&req)?;
         let conversation = self
             .runtime
@@ -128,6 +127,7 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
+        validate_persisted_message_id(&req)?;
         let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
 
         // The pre-lock lookup is only a fast path. A concurrent request with
