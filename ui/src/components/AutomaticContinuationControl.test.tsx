@@ -28,7 +28,7 @@ function view(overrides: Partial<AutomaticContinuationView> = {}): AutomaticCont
 
 async function openControl() {
   fireEvent.click(await screen.findByText(/Auto-continue/));
-  return screen.findByRole('checkbox', { name: 'Always accept generated handoffs and continue' });
+  return screen.findByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
 }
 
 describe('AutomaticContinuationControl', () => {
@@ -53,8 +53,9 @@ describe('AutomaticContinuationControl', () => {
     const checkbox = await openControl();
     expect(checkbox).not.toBeChecked();
     expect(apiMock.getProductConversationAutomaticContinuation).toHaveBeenCalledWith('pc/1');
-    expect(screen.getByText(/Applies only the next time this conversation reaches context exhaustion/)).toBeInTheDocument();
-    expect(screen.getByText(/will not continue an already-exhausted conversation/)).toBeInTheDocument();
+    expect(screen.getByText(/Applies only to future entries into context exhaustion/)).toBeInTheDocument();
+    expect(screen.getByText(/does not start or resume an already-exhausted conversation/)).toBeInTheDocument();
+    expect(screen.getByText(/or cancel continuation work already admitted/)).toBeInTheDocument();
 
     fireEvent.click(checkbox);
     expect(screen.getByText('Saving…')).toBeInTheDocument();
@@ -117,8 +118,9 @@ describe('AutomaticContinuationControl', () => {
     }));
     render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-1' }} />);
 
-    await openControl();
-    const alert = screen.getByRole('alert');
+    const control = await screen.findByTestId('automatic-continuation-control');
+    const alert = await screen.findByRole('alert');
+    expect(control).toHaveAttribute('open');
     expect(alert).toHaveTextContent('Successor dispatch could not be accepted.');
     expect(alert).toHaveTextContent('existing Continue control on the generated handoff');
     expect(alert).toHaveTextContent('remains enabled for future exhaustions');

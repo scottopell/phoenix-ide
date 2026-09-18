@@ -79,11 +79,17 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const enabled = view?.auto_continue_on_context_exhaustion ?? false;
   const admission = view?.admission ?? null;
   const phaseLabel = admission ? PHASE_LABELS[admission.phase] : null;
+  const failedAdmission = admission?.phase === 'failed' ? admission : null;
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+
+  useEffect(() => {
+    if (failedAdmission?.actionable_failure) detailsRef.current?.setAttribute('open', '');
+  }, [failedAdmission?.actionable_failure]);
 
   return (
-    <details className="automatic-continuation" data-testid="automatic-continuation-control">
+    <details ref={detailsRef} className="automatic-continuation" data-testid="automatic-continuation-control">
       <summary>
-        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{enabled ? 'On' : 'Off'}</span>
+        Auto-continue <span className={enabled ? 'automatic-continuation__on' : ''}>{loading ? '…' : enabled ? 'On' : 'Off'}</span>
         {admission && <span className="automatic-continuation__phase"> · {phaseLabel}</span>}
       </summary>
       <div className="automatic-continuation__panel">
@@ -94,10 +100,10 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
             disabled={loading || saving || view === null}
             onChange={(event) => void save(event.currentTarget.checked)}
           />
-          <span>Always accept generated handoffs and continue</span>
+          <span>Automatically accept future generated handoffs and continue</span>
         </label>
         <p className="automatic-continuation__help">
-          Applies only the next time this conversation reaches context exhaustion. Enabling it now will not continue an already-exhausted conversation.
+          Applies only to future entries into context exhaustion. Changing this setting does not start or resume an already-exhausted conversation, or cancel continuation work already admitted.
         </p>
         {admission && (
           <div className={`automatic-continuation__admission automatic-continuation__admission--${admission.phase}`}>
@@ -108,9 +114,9 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
             {admission.no_progress_attempts > 0 && (
               <span> · {admission.no_progress_attempts} no-progress {admission.no_progress_attempts === 1 ? 'attempt' : 'attempts'}</span>
             )}
-            {admission.phase === 'failed' && admission.actionable_failure && (
+            {failedAdmission?.actionable_failure && (
               <div role="alert" className="automatic-continuation__failure">
-                <span>{admission.actionable_failure.message}</span>
+                <span>{failedAdmission.actionable_failure.message}</span>
                 <span> Retry safely with the existing Continue control on the generated handoff. Automatic continuation remains enabled for future exhaustions.</span>
               </div>
             )}
