@@ -4159,6 +4159,9 @@ fn linux_writable_shared_mapping_path(
     let _device = fields.next();
     let _inode = fields.next();
     let mapped_path = fields.next().unwrap_or_default().trim_start();
+    if mapped_path.as_bytes().ends_with(b" (deleted)") {
+        return Ok(None);
+    }
     if permissions.as_bytes().get(1) != Some(&b'w') || permissions.as_bytes().get(3) != Some(&b's')
     {
         return Ok(None);
@@ -8809,6 +8812,20 @@ mod tests {
             Path::new("/bin/stable"),
         )
         .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_writable_shared_mapping_is_not_live_path_authority() {
+        let mapping = "7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/quarantine/file (deleted)";
+        assert_eq!(
+            super::linux_writable_shared_mapping_path(
+                mapping,
+                std::path::Path::new("/tmp/quarantine"),
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
