@@ -1085,10 +1085,25 @@ impl ToolRegistry {
         Ok(self)
     }
 
-    /// Add `propose_task` to a writing-mode registry (Work, Branch, or
-    /// Direct-in-a-git-repo), where it serves as the non-blocking fork
-    /// proposal (REQ-PROJ-033/036). Unlike Explore, the writing modes keep
-    /// their full unrestricted `patch`; `propose_task` is added on top.
+    /// Create the full-write registry for a Git-backed parent conversation,
+    /// including the `propose_task` capability (REQ-PROJ-033/036).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied conversation tools conflict with a
+    /// built-in tool name.
+    pub fn git_backed_writing_parent(
+        agents: Vec<phoenix_agents::AgentDefinition>,
+        tools: WritingConversationTools,
+    ) -> Result<Self, String> {
+        Self::direct(agents)
+            .with_propose_task()
+            .try_with_writing_conversation_tools(tools)
+    }
+
+    /// Add `propose_task` to a Git-backed parent registry. The full-write
+    /// constructor uses this to retain the blocking task-review capability
+    /// alongside unrestricted writing tools (REQ-PROJ-033/036).
     #[must_use]
     pub fn with_propose_task(mut self) -> Self {
         self.tools.push(Arc::new(ProposeTaskTool));
@@ -1459,6 +1474,10 @@ mod tests {
         const PARENT_TERMINAL_TOOLS: &[&str] =
             &["terminal_last_command", "terminal_command_history"];
 
+        // Coordinator: bounded global tools only; no task-management authority.
+        let coordinator = names(&ToolRegistry::coordinator(Vec::new()));
+        assert!(!coordinator.contains("propose_task"));
+
         // Direct: full suite, no propose_task, no sub-agent submission tools.
         let direct = names(&ToolRegistry::direct(Vec::new()));
         assert!(direct.contains("bash"));
@@ -1475,15 +1494,16 @@ mod tests {
         assert!(!direct.contains("submit_result"));
         assert!(!direct.contains("submit_error"));
 
-        // Direct + with_propose_task: the writing-mode fork seam (Work/Branch
-        // always, Direct-in-a-git-repo conditionally — REQ-PROJ-036). Adds
-        // propose_task on top of the full suite; the base `direct()` stays
-        // propose_task-free above.
-        let direct_fork = names(&ToolRegistry::direct(Vec::new()).with_propose_task());
-        assert!(direct_fork.contains("propose_task"));
-        assert!(!direct_fork.contains("commission_review"));
-        assert!(direct_fork.contains("bash"));
-        assert!(direct_fork.contains("patch"));
+        // Git-backed parents with write authority retain the full suite and
+        // the same blocking proposal gateway used by read-only Explore.
+        let git_backed_writing =
+            names(&ToolRegistry::git_backed_writing_parent(Vec::new(), writing_tools()).unwrap());
+        assert!(git_backed_writing.contains("propose_task"));
+        assert!(git_backed_writing.contains("search_conversations"));
+        assert!(git_backed_writing.contains("send_conversation_message"));
+        assert!(!git_backed_writing.contains("commission_review"));
+        assert!(git_backed_writing.contains("bash"));
+        assert!(git_backed_writing.contains("patch"));
 
         // Explore (sandbox): read-only/planning tools + sandboxed bash.
         let work = names(&ToolRegistry::explore(

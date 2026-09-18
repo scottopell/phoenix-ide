@@ -195,18 +195,6 @@ fn resolve_task_file(
     })
 }
 
-/// Whether `dir` (or any ancestor) is inside a git repository.
-///
-/// A `.git` entry is matched whether it is a directory (ordinary repo), a file
-/// (linked worktree / submodule, where `.git` is a `gitdir:` pointer), so a
-/// Direct origin started inside any git checkout is recognised. Like
-/// [`resolve_task_file`], this is a deterministic, bounded, local FS read the
-/// state machine treats as a data-load, not an external side effect: it gates
-/// the fork path (REQ-PROJ-036 — a Direct origin must be git-backed to fork).
-fn is_git_repository(dir: &Path) -> bool {
-    dir.ancestors().any(|a| a.join(".git").exists())
-}
-
 /// The retry-budget ceiling for retryable LLM errors. Surfaced via
 /// `SseEvent::LlmAttempt.max_attempts` on every retry-scheduling event
 /// so the client can render `(retry K/N <reason>)` (specs/llm-retry-visibility/
@@ -2313,25 +2301,59 @@ pub fn transition_parent(
                     }
                 };
 
-                // Mode-aware resolution (REQ-PROJ-033/036). Explore parks (the
-                // in-place Explore->Work gateway); the writing modes record a
-                // non-blocking fork and keep running. `ModeKind::Managed` covers
-                // both Explore and Work, so the precise mode comes from
-                // `mode_context`.
-                let is_explore = matches!(context.mode_context, Some(ModeContext::Explore { .. }));
-                let fork_eligible = matches!(context.mode, ModeKind::Branch)
-                    || matches!(
-                        context.mode_context,
-                        Some(
-                            ModeContext::Work { .. }
-                                | ModeContext::Branch { .. }
-                                | ModeContext::DetachedApprovedTask { .. }
-                        )
+                let proposal_eligible = matches!(
+                    context.mode_context,
+                    Some(
+                        ModeContext::Explore { .. }
+                            | ModeContext::Work { .. }
+                            | ModeContext::Branch { .. }
+                            | ModeContext::DetachedApprovedTask { .. }
                     )
-                    || (matches!(context.mode, ModeKind::Direct)
-                        && is_git_repository(context.filesystem_root()));
+                ) || matches!(context.mode, ModeKind::Branch);
 
-                if is_explore {
+                if !proposal_eligible {
+                    let err_msg = "propose_task is unavailable for this conversation.".to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("propose_task produces exactly one tool_use and one result");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                if should_trigger_continuation(
+                    &usage_data,
+                    context.context_window,
+                    context.effective_effort.level(),
+                ) {
+                    let tr = handle_context_exhaustion(
+                        context,
+                        content,
+                        tool_calls,
+                        usage_data,
+                        request_id,
+                        final_attempt,
+                    );
+                    return Ok(ParentTransitionResult {
+                        new_state: ParentState::try_from(tr.new_state)
+                            .expect("handle_context_exhaustion returns parent-valid state"),
+                        effects: tr.effects,
+                    });
+                }
+
+                if proposal_eligible {
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
                         "Plan submitted for review".to_string(),
@@ -2358,60 +2380,6 @@ pub fn transition_parent(
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change()),
                     );
-                }
-
-                if !fork_eligible {
-                    // Direct origin outside a git repository: the tool registry
-                    // does not offer propose_task here (no default branch to fork
-                    // from — REQ-PROJ-036), so this is unreachable in practice.
-                    // Surface a tool error rather than panic; record nothing.
-                    let err_msg = "propose_task is unavailable: a fork cuts from the \
-                         repository's default branch, but this working directory is \
-                         not inside a git repository."
-                        .to_string();
-                    let display_data = make_display_data(&content);
-                    let assistant_message = AssistantMessage::new(
-                        request_id.clone(),
-                        content,
-                        Some(usage_data),
-                        display_data,
-                    );
-                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("propose_task produces exactly one tool_use and one result");
-                    return Ok(ParentTransitionResult::new(ParentState::Core(
-                        CoreState::LlmRequesting { attempt: 1 },
-                    ))
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm));
-                }
-
-                // Fork proposal (REQ-PROJ-033). At the continuation threshold the
-                // fork does NOT fire: ContextThresholdReachedParent (the check
-                // below) parks into awaiting_continuation instead, replaying the
-                // propose_task call after continuation. Without this guard a fork
-                // would be recorded while the origin is over-budget.
-                if should_trigger_continuation(
-                    &usage_data,
-                    context.context_window,
-                    context.effective_effort.level(),
-                ) {
-                    let tr = handle_context_exhaustion(
-                        context,
-                        content,
-                        tool_calls,
-                        usage_data,
-                        request_id,
-                        final_attempt,
-                    );
-                    return Ok(ParentTransitionResult {
-                        new_state: ParentState::try_from(tr.new_state)
-                            .expect("handle_context_exhaustion returns parent-valid state"),
-                        effects: tr.effects,
-                    });
                 }
 
                 let proposal_id = uuid::Uuid::new_v4().to_string();
@@ -6724,12 +6692,14 @@ mod tests {
     // ========================================================================
     // Fork proposal interception (REQ-PROJ-033/036).
     //
-    // Explore parks (in-place Explore->Work gateway, unchanged); Work/Branch/
-    // Direct-in-a-git-repo record a non-blocking fork and keep running.
+    // Explore parks in the blocking review path, including when an approved
+    // objective has already granted write authority. Work/Branch take the fork
+    // path below; Direct is rejected even if a stale call is replayed.
     // ========================================================================
     mod fork_proposal {
         use super::*;
         use crate::state::{ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::db_schema::ToolOutcome;
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
         use tempfile::TempDir;
 
@@ -6764,6 +6734,10 @@ mod tests {
         }
 
         fn propose_event(task_file: &str) -> Event {
+            propose_event_with_usage(task_file, Usage::default())
+        }
+
+        fn propose_event_with_usage(task_file: &str, usage: Usage) -> Event {
             let propose_tool = ToolCall::new(
                 "tool-propose-1",
                 ToolInput::ProposeTask(ProposeTaskInput {
@@ -6778,7 +6752,7 @@ mod tests {
                 }],
                 tool_calls: vec![propose_tool],
                 end_turn: false,
-                usage: Usage::default(),
+                usage,
                 request_id: "test-req-id".to_string(),
             }
         }
@@ -6809,15 +6783,17 @@ mod tests {
         }
 
         #[test]
-        fn explore_valid_file_parks_into_awaiting_task_approval() {
+        fn approved_explore_with_write_authority_parks_without_git_or_fork_effects() {
             let (tmp, rel) = worktree_with_task();
-            let ctx = ctx_for(
+            let mut ctx = ctx_for(
                 &tmp,
                 ModeKind::Managed,
                 Some(ModeContext::Explore {
                     next_taskmd_id_hint: None,
                 }),
             );
+            ctx.resource_authority = phoenix_core::work_scope::ResourceAuthority::Work;
+            ctx.work_scope_worktree = Some(tmp.path().to_path_buf());
 
             let result = transition(
                 &ConvState::LlmRequesting { attempt: 1 },
@@ -6828,24 +6804,40 @@ mod tests {
 
             assert!(
                 matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
-                "Explore must park, got {:?}",
+                "approved Explore must park, got {:?}",
                 result.new_state
             );
             assert!(
                 result
                     .effects
                     .iter()
-                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
-                "Explore parks via PersistCheckpoint"
+                    .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })),
+                "approved Explore parks via PersistCheckpoint"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::PersistState)),
+                "approved Explore persists AwaitingTaskApproval"
             );
             assert!(
                 fork_proposal_effect(&result.effects).is_none(),
-                "Explore must NOT record a fork proposal"
+                "approved Explore must not record a fork proposal"
+            );
+            assert!(
+                !result.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::ApproveTask { .. }
+                        | Effect::ApproveTaskFreshHandoff { .. }
+                        | Effect::ResolveTask { .. }
+                )),
+                "proposal interception must not perform an approval or lifecycle Git effect"
             );
         }
 
         #[test]
-        fn work_valid_file_forks_without_parking() {
+        fn work_valid_file_parks_for_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -6864,40 +6856,19 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            assert!(
-                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-                "Work fork continues running, got {:?}",
-                result.new_state
-            );
-            assert!(
-                !matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
-                "Work fork must NOT park"
-            );
-            assert!(
-                !result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
-                "fork path emits PersistForkProposal, not a separate PersistCheckpoint"
-            );
-            let (proposal_id, task_file, title, priority, body) =
-                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
-            assert!(!proposal_id.is_empty(), "a proposal_id must be present");
-            assert_eq!(task_file, &rel);
-            assert_eq!(title, "Fix the bug");
-            assert_eq!(priority, phoenix_core::task_source::Priority::P1);
-            assert!(body.contains("plan body for the fork"));
-            assert!(
-                result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::RequestLlm)),
-                "fork continues with a fresh LLM request"
-            );
+            assert!(matches!(
+                result.new_state,
+                ConvState::AwaitingTaskApproval { .. }
+            ));
+            assert!(fork_proposal_effect(&result.effects).is_none());
+            assert!(result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
         }
 
         #[test]
-        fn branch_valid_file_takes_the_fork_path() {
+        fn branch_valid_file_parks_for_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -6916,28 +6887,16 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            assert!(
-                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-                "Branch fork continues running, got {:?}",
-                result.new_state
-            );
-            assert!(
-                fork_proposal_effect(&result.effects).is_some(),
-                "Branch records a fork proposal"
-            );
-            assert!(
-                result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::RequestLlm)),
-                "Branch fork re-requests the LLM"
-            );
+            assert!(matches!(
+                result.new_state,
+                ConvState::AwaitingTaskApproval { .. }
+            ));
+            assert!(fork_proposal_effect(&result.effects).is_none());
         }
 
         #[test]
-        fn direct_in_git_repo_takes_the_fork_path() {
+        fn direct_in_git_repo_rejects_unadvertised_propose_task() {
             let (tmp, rel) = worktree_with_task();
-            // Make the worktree a git repo so is_git_repository() is satisfied.
             std::fs::create_dir(tmp.path().join(".git")).unwrap();
             let ctx = ctx_for(&tmp, ModeKind::Direct, Some(ModeContext::Direct));
 
@@ -6948,24 +6907,70 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            assert!(
-                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-                "Direct-in-git fork continues running, got {:?}",
-                result.new_state
+            assert!(matches!(
+                result.new_state,
+                ConvState::LlmRequesting { attempt: 1 }
+            ));
+            assert!(fork_proposal_effect(&result.effects).is_none());
+            let checkpoint = result
+                .effects
+                .iter()
+                .find_map(|effect| {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match effect {
+                        Effect::PersistCheckpoint { data } => Some(data),
+                        _ => None,
+                    }
+                })
+                .expect("Direct rejection must persist a tool result");
+            let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+            assert!(matches!(
+                &tool_results[0].outcome,
+                ToolOutcome::Error { output, .. }
+                    if output == "propose_task is unavailable for this conversation."
+            ));
+        }
+
+        #[test]
+        fn approved_explore_threshold_precedes_task_approval() {
+            let (tmp, rel) = worktree_with_task();
+            let mut ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Explore {
+                    next_taskmd_id_hint: None,
+                }),
             );
-            assert!(
-                fork_proposal_effect(&result.effects).is_some(),
-                "Direct-in-git records a fork proposal"
-            );
+            ctx.resource_authority = phoenix_core::work_scope::ResourceAuthority::Work;
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event_with_usage(
+                    &rel,
+                    Usage {
+                        input_tokens: 180_000,
+                        ..Usage::default()
+                    },
+                ),
+            )
+            .expect("transition must succeed");
+
+            let ConvState::AwaitingContinuation { request } = result.new_state else {
+                panic!("threshold must win before approval");
+            };
+            assert_eq!(request.rejected_tool_calls.len(), 1);
+            assert_eq!(request.rejected_tool_calls[0].name(), "propose_task");
+            assert!(fork_proposal_effect(&result.effects).is_none());
         }
 
         /// REQ-PROJ-033: the fork snapshot is the authoritative file BYTES. A
         /// brief with significant leading/trailing whitespace and a trailing
         /// newline must reach `Effect::PersistForkProposal { body }` unaltered —
-        /// it is the verbatim source for the fork's committed file, NOT the
+        /// it is the verbatim source for the approval checkpoint, not the
         /// trimmed display plan.
         #[test]
-        fn fork_body_preserves_raw_file_bytes() {
+        fn approval_plan_preserves_raw_file_bytes() {
             let tmp = TempDir::new().unwrap();
             std::fs::create_dir(tmp.path().join("tasks")).unwrap();
             let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
@@ -6989,17 +6994,11 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            let (_, _, _, _, body) =
-                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
-            assert_eq!(
-                body, raw,
-                "fork body must be the raw file bytes, not the trimmed plan"
-            );
-            assert_ne!(
-                body,
-                &raw.trim().to_string(),
-                "fork body must NOT be the trimmed display plan"
-            );
+            let ConvState::AwaitingTaskApproval { plan, .. } = result.new_state else {
+                panic!("write-authority proposal must await approval");
+            };
+            assert_eq!(plan, raw, "approval plan must preserve raw file bytes");
+            assert_ne!(plan, raw.trim(), "approval plan must not be trimmed");
         }
 
         #[test]

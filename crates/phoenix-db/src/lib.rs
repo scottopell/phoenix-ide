@@ -7539,6 +7539,37 @@ impl Database {
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> DbResult<()> {
+        self.persist_approved_task_authority_inner(conversation_id, approval, None)
+            .await
+    }
+
+    /// Persist replacement task authority and the selected state atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] when validation, update, or commit fails.
+    pub async fn persist_approved_task_authority_and_state(
+        &self,
+        conversation_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        self.persist_approved_task_authority_inner(
+            conversation_id,
+            approval,
+            Some((approval_message, state, state_updated_at)),
+        )
+        .await
+    }
+
+    async fn persist_approved_task_authority_inner(
+        &self,
+        conversation_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
+    ) -> DbResult<()> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -7601,6 +7632,20 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
+        if let Some((approval_message, state, state_updated_at)) = settlement {
+            insert_message_tx(&mut tx, approval_message).await?;
+            let state_json = serde_json::to_string(state).unwrap();
+            sqlx::query(
+                "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+            )
+            .bind(state_json)
+            .bind(conv_state_kind(state))
+            .bind(state_updated_at.to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -8664,6 +8709,46 @@ impl Database {
             .execute(&mut *tx)
             .await?;
 
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a tool round and its selected conversation state atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] when message insertion, state update, or commit fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the conversation state cannot be serialized.
+    pub async fn persist_tool_round_and_state(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        insert_message_tx(&mut tx, assistant).await?;
+        for msg in tool_results {
+            insert_message_tx(&mut tx, msg).await?;
+        }
+        let state_json = serde_json::to_string(state).unwrap();
+        let result = sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+        )
+        .bind(state_json)
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }

@@ -946,6 +946,17 @@ impl InMemoryStorage {
             .collect()
     }
 
+    pub fn approved_task_authority(
+        &self,
+        conv_id: &str,
+    ) -> Option<phoenix_core::task_handoff::ApprovedTaskSnapshot> {
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+    }
+
     pub fn queue_complete_creation_job_result(
         &self,
         result: Result<crate::db::CreationCasOutcome, String>,
@@ -1765,6 +1776,19 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_tool_round(conv_id, assistant, tool_results)
+            .await?;
+        self.update_state(conv_id, state, state_updated_at).await
+    }
+
     async fn persist_tool_round_with_terminal_obligation(
         &self,
         conv_id: &str,
@@ -2021,17 +2045,30 @@ impl StateStore for InMemoryStorage {
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        let mut authorities = self.approved_task_authorities.lock().unwrap();
-        match authorities.get(conv_id) {
-            Some(existing) if existing != &snapshot => {
-                Err("approved task conflicts with the committed objective".to_string())
-            }
-            Some(_) => Ok(()),
-            None => {
-                authorities.insert(conv_id.to_string(), snapshot);
-                Ok(())
-            }
-        }
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), snapshot);
+        Ok(())
+    }
+
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_approved_task_authority(conv_id, approval)
+            .await?;
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(approval_message.clone());
+        self.update_state(conv_id, state, state_updated_at).await
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {

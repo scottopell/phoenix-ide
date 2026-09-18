@@ -1867,6 +1867,12 @@ where
     turn_trigger: super::TurnTriggerSlot,
 }
 
+#[derive(Debug)]
+enum FollowUpApprovalError {
+    BeforeGit(String),
+    AuthorityLost(String),
+}
+
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -3395,12 +3401,27 @@ where
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
+                let checkpoint_commits_state = matches!(
+                    effect,
+                    Effect::PersistCheckpoint { .. }
+                        if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
+                );
+                let approval_commits_state = matches!(
+                    effect,
+                    Effect::ApproveTask { .. }
+                        if self.has_existing_write_scope()
+                );
+                let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
+                    && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
                     effect,
                     Effect::PersistState
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
-                );
+                ) || checkpoint_commits_state;
+                if redundant_approval_state_persist {
+                    continue;
+                }
                 if matches!(effect, Effect::PersistState)
                     && self.handoff_completion_authority.is_some()
                     && matches!(self.state, ConvState::HandedOff { .. })
@@ -3705,6 +3726,12 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
+                }
+                if checkpoint_commits_state {
+                    state_committed = true;
+                }
+                if approval_commits_state {
+                    state_committed = true;
                 }
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
@@ -7631,9 +7658,21 @@ where
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                self.storage
-                    .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                    .await?;
+                if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+                    self.storage
+                        .persist_tool_round_and_state(
+                            &conv_id,
+                            &agent_msg,
+                            &tool_msgs,
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await?;
+                } else {
+                    self.storage
+                        .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
+                        .await?;
+                }
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
@@ -8353,6 +8392,161 @@ where
         Ok(())
     }
 
+    fn has_existing_write_scope(&self) -> bool {
+        self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
+            && self.context.work_scope_worktree.is_some()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn approve_follow_up_in_existing_scope(
+        &mut self,
+        task_file: &str,
+        title: &str,
+        priority: crate::task_source::Priority,
+        plan: &str,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), FollowUpApprovalError> {
+        reread_reviewed_task_handoff_snapshot_at_exact_path(
+            self.context.filesystem_root(),
+            self.context.filesystem_root(),
+            &self.context.tasks_dir_name,
+            task_file,
+            title,
+            priority,
+            plan,
+        )
+        .map_err(FollowUpApprovalError::BeforeGit)?;
+        let cwd = self.context.filesystem_root().to_path_buf();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
+        let task_file_owned = task_file.to_string();
+        let title_owned = title.to_string();
+        let plan_owned = plan.to_string();
+        let blocking_admission = admitted.reborrow();
+        let reviewed =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                persist_fresh_approved_task_artifact_blocking(
+                    &cwd,
+                    &tasks_dir_name,
+                    &task_file_owned,
+                    &title_owned,
+                    priority,
+                    &plan_owned,
+                )
+            })
+            .await
+            .map_err(|error| {
+                FollowUpApprovalError::AuthorityLost(format!(
+                    "Follow-up task approval join error after Git admission: {error}"
+                ))
+            })?
+            .map_err(|error| match error {
+                FollowUpArtifactError::BeforeGit(error) => FollowUpApprovalError::BeforeGit(error),
+                FollowUpArtifactError::AfterGit(error) => {
+                    FollowUpApprovalError::AuthorityLost(error)
+                }
+            })?;
+
+        let approval_msg = format!(
+            "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
+            self.context.filesystem_root().display(),
+        );
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
+        let seq = self.broadcast_tx.next_seq();
+        let message = crate::db::Message {
+            message_id: msg_id,
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id: seq,
+            message_type: crate::db::MessageType::User,
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        self.storage
+            .persist_approved_task_authority_and_state(
+                &self.context.conversation_id,
+                &TaskApprovalHandoffData {
+                    task_id: reviewed.task_id,
+                    task_title: reviewed.task_title.clone(),
+                    title: title.to_string(),
+                    priority,
+                    plan: plan.to_string(),
+                    task_file: task_file.to_string(),
+                    artifact_body: reviewed.artifact_body,
+                },
+                &message,
+                &self.state,
+                self.state_updated_at,
+            )
+            .await
+            .map_err(FollowUpApprovalError::AuthorityLost)?;
+
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(message);
+        let task_title = reviewed.task_title;
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|sequence_id| SseEvent::ConversationUpdate {
+                sequence_id,
+                update: crate::runtime::ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: None,
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
+                    branch_name: None,
+                    worktree_path: None,
+                    conv_mode_label: None,
+                    base_branch: None,
+                    task_title: Some(task_title),
+                    work_scope_key: None,
+                    model: None,
+                    archived: None,
+                },
+            });
+        Ok(())
+    }
+
+    fn restore_retryable_task_approval(
+        &mut self,
+        task_file: String,
+        title: String,
+        priority: crate::task_source::Priority,
+        plan: String,
+        error: &str,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<(), String> {
+        self.install_live_state(
+            ConvState::AwaitingTaskApproval {
+                task_file,
+                title,
+                priority,
+                plan,
+            },
+            Utc::now(),
+            true,
+        )?;
+        self.settle_turn_span();
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|seq| SseEvent::Error {
+                sequence_id: seq,
+                error: crate::runtime::user_facing_error::UserFacingError::retryable(
+                    "Task approval failed",
+                    format!(
+                        "Phoenix could not finalise the task: {error}. The conversation stays in approval state — try approving again or abandon."
+                    ),
+                ),
+            });
+        Ok(())
+    }
+
     /// REQ-BED-028: Execute git operations for task approval.
     ///
     /// Sequence: parse on-disk task file -> create worktree (or promote early one) ->
@@ -8369,6 +8563,23 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        if self.has_existing_write_scope() {
+            let result = self
+                .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
+                .await;
+            return match result {
+                Ok(()) => Ok(()),
+                Err(FollowUpApprovalError::BeforeGit(error)) => {
+                    self.restore_retryable_task_approval(
+                        task_file, title, priority, plan, &error, admitted,
+                    )?;
+                    Err(error)
+                }
+                Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
+                )),
+            };
+        }
         if matches!(
             self.context.mode_context.as_ref(),
             Some(ModeContext::DetachedApprovedTask { .. })
@@ -8476,10 +8687,9 @@ where
                 );
 
                 // Persist as a user message so the LLM sees the approval + plan context.
-                // The propose_task tool_use/result get stripped from history (tool not in
-                // Work registry), so this message carries the plan forward. Must be the
-                // last message before the next LLM call to avoid ending on an assistant
-                // message (Anthropic rejects trailing assistant as "prefill").
+                // This must be the last message before the next LLM call to avoid ending
+                // on an assistant message (Anthropic rejects trailing assistant as
+                // "prefill").
                 let branch_msg = format!(
                     "Task approved. You are on branch {} in {}.\n\n\
                      ## Approved plan: {}\n\n\
@@ -8627,7 +8837,12 @@ where
 
         let approval = match result {
             Ok(result) => result,
-            Err(e) => {
+            Err(FollowUpArtifactError::AfterGit(error)) => {
+                return Err(format!(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: fresh task approval crossed the Git authority boundary without reconciliation: {error}"
+                ));
+            }
+            Err(FollowUpArtifactError::BeforeGit(e)) => {
                 tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
                     ConvState::AwaitingTaskApproval {
@@ -8711,6 +8926,53 @@ struct ReviewedTaskHandoffSnapshot {
     artifact_body: String,
 }
 
+#[derive(Debug)]
+enum FollowUpArtifactError {
+    BeforeGit(String),
+    AfterGit(String),
+}
+
+impl std::fmt::Display for FollowUpArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::BeforeGit(message) | Self::AfterGit(message) => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+fn compensate_follow_up_artifact_failure(
+    cwd: &Path,
+    original_relative: &str,
+    promoted_relative: &str,
+    original_path: &Path,
+    promoted_path: &Path,
+    error: String,
+) -> FollowUpArtifactError {
+    let reset = run_git(
+        cwd,
+        &[
+            "reset",
+            "--quiet",
+            "--",
+            original_relative,
+            promoted_relative,
+        ],
+    );
+    let rename = std::fs::rename(promoted_path, original_path).map_err(|rename_error| {
+        format!("failed to restore '{original_relative}' after '{error}': {rename_error}")
+    });
+    match (reset, rename) {
+        (Ok(_), Ok(())) => FollowUpArtifactError::BeforeGit(error),
+        (reset, rename) => FollowUpArtifactError::AfterGit(format!(
+            "{error}; task artifact compensation failed (index: {}; worktree: {})",
+            reset.err().unwrap_or_else(|| "restored".to_string()),
+            rename.err().unwrap_or_else(|| "restored".to_string()),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -8718,11 +8980,13 @@ fn persist_fresh_approved_task_artifact_blocking(
     expected_title: &str,
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, String> {
+) -> Result<ReviewedTaskHandoffSnapshot, FollowUpArtifactError> {
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut snapshot = reread_reviewed_task_handoff_snapshot(
+    let original_path_was_tracked =
+        run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
+    let mut snapshot = reread_reviewed_task_handoff_snapshot_at_exact_path(
         cwd,
         cwd,
         tasks_dir_name,
@@ -8730,42 +8994,155 @@ fn persist_fresh_approved_task_artifact_blocking(
         expected_title,
         expected_priority,
         expected_plan,
-    )?;
+    )
+    .map_err(FollowUpArtifactError::BeforeGit)?;
+    let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
     if detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-        let parsed = taskmd_core::filename::parse_filename(filename)
-            .ok_or_else(|| format!("invalid taskmd filename: '{filename}'"))?;
+            .ok_or_else(|| {
+                FollowUpArtifactError::BeforeGit(format!(
+                    "task_file has no filename component: '{task_file}'"
+                ))
+            })?;
+        let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+            FollowUpArtifactError::BeforeGit(format!("invalid taskmd filename: '{filename}'"))
+        })?;
         let promoted = promote_task_status_to_in_progress(
             &cwd.join(tasks_dir_name),
             &parsed.id,
             parsed.status,
             filename,
-        )?;
+        )
+        .map_err(FollowUpArtifactError::BeforeGit)?;
         if promoted != filename {
+            let promoted_relative = format!("{tasks_dir_name}/{promoted}");
+            promotion = Some((
+                task_file.to_string(),
+                promoted_relative.clone(),
+                cwd.join(task_file),
+                cwd.join(&promoted_relative),
+            ));
             let _ = run_git(cwd, &["add", "--", task_file]);
-            snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
+            snapshot.task_file = promoted_relative;
         }
     }
-    ensure_gitignore_has_phoenix(cwd)?;
-    run_git(cwd, &["add", "--", &snapshot.task_file])?;
-    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
-        run_git(
-            cwd,
-            &[
-                "commit",
-                "-m",
-                &format!("task {}: {}", snapshot.task_id, expected_title),
-            ],
+    let compensate = |error: String| match &promotion {
+        Some((original_relative, promoted_relative, original_path, promoted_path)) => {
+            compensate_follow_up_artifact_failure(
+                cwd,
+                original_relative,
+                promoted_relative,
+                original_path,
+                promoted_path,
+                error,
+            )
+        }
+        None => FollowUpArtifactError::BeforeGit(error),
+    };
+    crate::git_ops::ensure_local_exclude_has_phoenix(cwd).map_err(&compensate)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(&compensate)?;
+    let mut approved_paths = vec![snapshot.task_file.as_str()];
+    if original_path_was_tracked && snapshot.task_file != task_file {
+        approved_paths.push(task_file);
+    }
+    let mut diff_args = vec!["diff", "--cached", "--quiet", "--"];
+    diff_args.extend(approved_paths.iter().copied());
+    if run_git(cwd, &diff_args).is_err() {
+        let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
+        let mut commit_args = vec![
+            "commit",
+            "--only",
+            "--no-verify",
+            "-m",
+            &commit_message,
+            "--",
+        ];
+        commit_args.extend(approved_paths.iter().copied());
+        run_git(cwd, &commit_args).map_err(|error| {
+            compensate(format!("Failed to commit approved task artifact: {error}"))
+        })?;
+        let mut hash = phoenix_core::git::command()
+            .arg("hash-object")
+            .arg("--stdin")
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
+        std::io::Write::write_all(
+            &mut hash.stdin.take().expect("hash-object stdin"),
+            snapshot.artifact_body.as_bytes(),
         )
-        .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
+        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
+        let reviewed_blob = String::from_utf8(
+            hash.wait_with_output()
+                .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
+                .stdout,
+        )
+        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
+        .trim()
+        .to_string();
+        let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{}", snapshot.task_file)])
+            .map_err(FollowUpArtifactError::AfterGit)?;
+        if committed_blob != reviewed_blob {
+            return Err(FollowUpArtifactError::AfterGit(
+                "committed task artifact differs from the reviewed bytes".to_string(),
+            ));
+        }
     }
     Ok(snapshot)
 }
 
 fn reread_reviewed_task_handoff_snapshot(
+    cwd: &std::path::Path,
+    approval_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let proposed_path = cwd.join(task_file);
+    if proposed_path.exists() {
+        return reread_reviewed_task_handoff_snapshot_at_exact_path(
+            cwd,
+            approval_root,
+            tasks_dir_name,
+            task_file,
+            expected_title,
+            expected_priority,
+            expected_plan,
+        );
+    }
+    let filename = proposed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!("Failed to read reviewed task file '{task_file}': file not found")
+    })?;
+    let promoted_file = format!(
+        "{}-{}-in-progress--{}.md",
+        parsed.id, parsed.priority, parsed.slug
+    );
+    let promoted = Path::new(task_file).with_file_name(promoted_file);
+    let promoted = promoted
+        .to_str()
+        .ok_or_else(|| format!("promoted task path is not UTF-8: '{}'", promoted.display()))?;
+    reread_reviewed_task_handoff_snapshot_at_exact_path(
+        cwd,
+        approval_root,
+        tasks_dir_name,
+        promoted,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )
+}
+
+fn reread_reviewed_task_handoff_snapshot_at_exact_path(
     cwd: &std::path::Path,
     _repo_root: &std::path::Path,
     tasks_dir_name: &str,
@@ -8775,29 +9152,27 @@ fn reread_reviewed_task_handoff_snapshot(
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, String> {
     let path = cwd.join(task_file);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-            let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-                format!("Failed to read reviewed task file '{task_file}': {error}")
-            })?;
-            let promoted = path.with_file_name(format!(
-                "{}-{}-in-progress--{}.md",
-                parsed.id, parsed.priority, parsed.slug
-            ));
-            std::fs::read_to_string(promoted)
-                .map_err(|_| format!("Failed to read reviewed task file '{task_file}': {error}"))?
-        }
-        Err(error) => {
-            return Err(format!(
-                "Failed to read reviewed task file '{task_file}': {error}"
-            ))
-        }
-    };
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Reviewed task file '{task_file}' must remain a regular file. Reject and re-approve the replacement artifact."
+        ));
+    }
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve reviewed task file '{task_file}': {error}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve the working directory: {error}"))?;
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(format!(
+            "Reviewed task file '{task_file}' resolves outside the working directory. Reject and re-approve the replacement artifact."
+        ));
+    }
+    let body = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
     if body != expected_plan {
         return Err(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
@@ -15112,6 +15487,225 @@ mod authoritative_user_message_effect_tests {
             );
             assert!(rt.direct_turn_materialization_aborted);
         }
+    }
+}
+
+#[cfg(test)]
+mod approved_explore_follow_up_tests {
+    use super::test_git_helpers::{add_worktree, init_repo};
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn approved_explore_runtime(
+        worktree: PathBuf,
+        task_file: &str,
+        plan: &str,
+        storage: Arc<InMemoryStorage>,
+        broadcast_tx: SseBroadcaster,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let mut context = ConvContext::new(
+            "approved-explore-follow-up",
+            worktree.clone(),
+            "test-model",
+            200_000,
+        );
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
+        context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+        context.work_scope_worktree = Some(worktree);
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let event_tx = mpsc::channel::<Event>(1).0;
+        ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: task_file.to_string(),
+                title: "Follow up".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: plan.to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcast_tx,
+        )
+    }
+
+    #[test]
+    fn reread_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cwd.path().join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n";
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), plan).unwrap();
+        symlink(outside.path(), cwd.path().join(task_file)).unwrap();
+
+        let error = reread_reviewed_task_handoff_snapshot_at_exact_path(
+            cwd.path(),
+            cwd.path(),
+            "tasks",
+            task_file,
+            "Follow up",
+            crate::task_source::Priority::P1,
+            plan,
+        )
+        .expect_err("symlink replacement must be rejected");
+
+        assert!(error.contains("must remain a regular file"));
+    }
+
+    #[tokio::test]
+    async fn follow_up_validation_failure_restores_approval_state() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-failure",
+            "task-72003-existing-failure",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let reviewed_plan = "# Follow up\n\nReviewed.\n";
+        std::fs::write(worktree.join(task_file), "# Follow up\n\nEdited.\n").unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
+        runtime.state = ConvState::LlmRequesting { attempt: 1 };
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                reviewed_plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect_err("edited task must fail approval");
+
+        assert!(error.contains("no longer matches the approved plan"));
+        assert!(matches!(
+            runtime.state,
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_approval_preserves_existing_branch_and_replaces_objective() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up",
+            "task-72003-existing",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        std::fs::write(worktree.join("unrelated.txt"), "base\n").unwrap();
+        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
+        run_git(&worktree, &["commit", "-m", "unrelated baseline"]).unwrap();
+        std::fs::write(worktree.join("unrelated.txt"), "staged work\n").unwrap();
+        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .persist_approved_task_authority(
+                "approved-explore-follow-up",
+                &TaskApprovalHandoffData {
+                    task_id: "72003".to_string(),
+                    task_title: "Existing task".to_string(),
+                    title: "Existing task".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: "# Existing task\n".to_string(),
+                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
+                    artifact_body: "# Existing task\n".to_string(),
+                },
+            )
+            .await
+            .expect("existing approved objective");
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
+        let branch_before = run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect("follow-up approval");
+
+        let promoted_task_file = "tasks/72004-p1-in-progress--follow-up.md";
+        assert!(!worktree.join(task_file).exists());
+        assert!(worktree.join(promoted_task_file).exists());
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before,
+            "follow-up approval must not replace or promote the existing branch"
+        );
+        run_git(&worktree, &["diff", "--exit-code", "HEAD", "--", "tasks"])
+            .expect("approved follow-up artifact must be committed");
+        assert_eq!(
+            run_git(&worktree, &["show", "HEAD:unrelated.txt"]).unwrap(),
+            "base",
+            "follow-up commit must exclude unrelated staged work"
+        );
+        assert!(
+            run_git(&worktree, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .lines()
+                .any(|path| path == "unrelated.txt"),
+            "unrelated staged work must remain staged"
+        );
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let replacement = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("replacement objective");
+        assert_eq!(replacement.task_id, "72004");
+        assert_eq!(replacement.task_file, task_file);
+        assert!(
+            std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
+                event,
+                SseEvent::ConversationUpdate {
+                    update: crate::runtime::ConversationMetadataUpdate {
+                        task_title: Some(ref title),
+                        ..
+                    },
+                    ..
+                } if title == "Follow up"
+            ))
+        );
     }
 }
 
