@@ -38,11 +38,13 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
 
   useEffect(() => {
     const generation = ++requestGeneration.current;
+    viewRevision.current += 1;
     let refreshPending = false;
     setView(null);
     setLoading(true);
     setSaving(false);
     setFeedback(null);
+    savePending.current = false;
     setFailedValue(null);
     const refresh = (initial: boolean) => {
       if (refreshPending || savePending.current) return;
@@ -76,6 +78,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   }, [reference, scopeKind]);
 
   const save = useCallback(async (enabled: boolean) => {
+    const generation = requestGeneration.current;
     const revision = ++viewRevision.current;
     savePending.current = true;
     setSaving(true);
@@ -85,16 +88,20 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       const next = scopeKind === 'ordinary'
         ? await api.updateProductConversationAutomaticContinuation(reference!, enabled)
         : await api.updateCoordinatorAutomaticContinuation(enabled);
-      if (viewRevision.current === revision) {
+      if (requestGeneration.current === generation && viewRevision.current === revision) {
         setView(next);
         setFeedback('Saved');
       }
     } catch (error) {
-      setFailedValue(enabled);
-      setFeedback(errorMessage(error, 'Failed to save automatic continuation setting'));
+      if (requestGeneration.current === generation && viewRevision.current === revision) {
+        setFailedValue(enabled);
+        setFeedback(errorMessage(error, 'Failed to save automatic continuation setting'));
+      }
     } finally {
-      savePending.current = false;
-      setSaving(false);
+      if (requestGeneration.current === generation) {
+        savePending.current = false;
+        setSaving(false);
+      }
     }
   }, [reference, scopeKind]);
 

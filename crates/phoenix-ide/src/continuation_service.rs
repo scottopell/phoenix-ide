@@ -77,6 +77,21 @@ impl ContinuationApplicationService {
                 .await;
         }
 
+        if self
+            .runtime
+            .db()
+            .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.runtime
+                .db()
+                .supersede_automatic_continuation(&admission.predecessor_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+
         let current = self.current_admission(admission).await?;
         let plan = recovery_plan(current.phase)
             .ok_or_else(|| "automatic admission is not progressable".to_string())?;

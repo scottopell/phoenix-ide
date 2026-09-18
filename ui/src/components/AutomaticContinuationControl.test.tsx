@@ -108,6 +108,33 @@ describe('AutomaticContinuationControl', () => {
     expect(checkbox).toBeChecked();
   });
 
+  it('does not publish a save response after navigating to another aggregate', async () => {
+    let resolveSave: ((next: AutomaticContinuationView) => void) | undefined;
+    apiMock.getProductConversationAutomaticContinuation.mockImplementation((reference: string) =>
+      Promise.resolve(view({ aggregate: { kind: 'ordinary', product_conversation_id: reference } })),
+    );
+    apiMock.updateProductConversationAutomaticContinuation.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveSave = resolve; }),
+    );
+    const { rerender } = render(
+      <AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-a' }} />,
+    );
+    const checkbox = await screen.findByRole('checkbox', { name: /automatically accept future generated handoffs/i });
+    fireEvent.click(checkbox);
+    rerender(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-b' }} />);
+    expect(await screen.findByText('Off')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSave?.(view({
+        aggregate: { kind: 'ordinary', product_conversation_id: 'pc-a' },
+        auto_continue_on_context_exhaustion: true,
+      }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Off')).toBeInTheDocument();
+    expect(screen.queryByText('Saved')).not.toBeInTheDocument();
+  });
+
   it('does not let an older poll overwrite a newer successful save', async () => {
     vi.useFakeTimers();
     let resolvePoll: ((next: AutomaticContinuationView) => void) | undefined;
