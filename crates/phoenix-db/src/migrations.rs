@@ -530,6 +530,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "settled_close_participant_allows_legacy_member_delete",
         sql: MIGRATION_102,
     },
+    Migration {
+        version: 103,
+        name: "enforce_close_ambient_writer_authority_pairs",
+        sql: MIGRATION_103,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -8983,6 +8988,11 @@ CREATE TABLE close_ambient_writer_evidence (
     access_mode TEXT NOT NULL CHECK (access_mode IN ('write_only', 'read_write', 'writable_shared_mapping', 'namespace_write')),
     observed_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(observed_at_unix_micros) = 'integer' AND observed_at_unix_micros >= 0),
+    CHECK (
+        (match_kind = 'descriptor' AND access_mode IN ('write_only', 'read_write'))
+        OR (match_kind = 'mapping' AND access_mode = 'writable_shared_mapping')
+        OR (match_kind = 'namespace_directory' AND access_mode = 'namespace_write')
+    ),
     PRIMARY KEY (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_codec, identity_value,
@@ -9000,7 +9010,39 @@ CREATE TABLE close_ambient_writer_evidence (
 );
 ";
 
+<<<<<<< HEAD
 const MIGRATION_101: &str = r"
+||||||| parent of 137fe86cc (fix: close remaining retirement recovery gaps)
+const MIGRATION_100: &str = r"
+=======
+const MIGRATION_102: &str = r"
+CREATE TRIGGER close_ambient_writer_evidence_valid_authority_insert
+BEFORE INSERT ON close_ambient_writer_evidence
+FOR EACH ROW
+WHEN NOT (
+    (NEW.match_kind = 'descriptor' AND NEW.access_mode IN ('write_only', 'read_write'))
+    OR (NEW.match_kind = 'mapping' AND NEW.access_mode = 'writable_shared_mapping')
+    OR (NEW.match_kind = 'namespace_directory' AND NEW.access_mode = 'namespace_write')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ambient writer match kind and access mode must form valid authority');
+END;
+
+CREATE TRIGGER close_ambient_writer_evidence_valid_authority_update
+BEFORE UPDATE OF match_kind, access_mode ON close_ambient_writer_evidence
+FOR EACH ROW
+WHEN NOT (
+    (NEW.match_kind = 'descriptor' AND NEW.access_mode IN ('write_only', 'read_write'))
+    OR (NEW.match_kind = 'mapping' AND NEW.access_mode = 'writable_shared_mapping')
+    OR (NEW.match_kind = 'namespace_directory' AND NEW.access_mode = 'namespace_write')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ambient writer match kind and access mode must form valid authority');
+END;
+";
+
+const MIGRATION_100: &str = r"
+>>>>>>> 137fe86cc (fix: close remaining retirement recovery gaps)
 CREATE TABLE close_needs_repair_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
@@ -10580,7 +10622,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_102: &str = r"
+const MIGRATION_103: &str = r"
 DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
 DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
 
@@ -17287,6 +17329,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(preserved_scope, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_102_rejects_invalid_ambient_writer_authority_pairs() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE close_ambient_writer_evidence (
+                 match_kind TEXT NOT NULL,
+                 access_mode TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+
+        for (match_kind, access_mode) in [
+            ("descriptor", "write_only"),
+            ("descriptor", "read_write"),
+            ("mapping", "writable_shared_mapping"),
+            ("namespace_directory", "namespace_write"),
+        ] {
+            sqlx::query(
+                "INSERT INTO close_ambient_writer_evidence (match_kind, access_mode)
+                 VALUES (?1, ?2)",
+            )
+            .bind(match_kind)
+            .bind(access_mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let invalid = sqlx::query(
+            "INSERT INTO close_ambient_writer_evidence (match_kind, access_mode)
+             VALUES ('mapping', 'read_write')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("mapping plus descriptor access must be rejected");
+        assert!(invalid
+            .to_string()
+            .contains("match kind and access mode must form valid authority"));
+        let invalid_update = sqlx::query(
+            "UPDATE close_ambient_writer_evidence
+             SET access_mode = 'namespace_write'
+             WHERE match_kind = 'descriptor' AND access_mode = 'write_only'",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("updates must preserve valid authority pairs");
+        assert!(invalid_update
+            .to_string()
+            .contains("match kind and access mode must form valid authority"));
     }
 
     #[allow(clippy::too_many_lines)]
