@@ -104,7 +104,7 @@ describe('CoordinatorPage', () => {
 
     const control = await screen.findByTestId('automatic-continuation-control');
     fireEvent.click(control.querySelector('summary')!);
-    const checkbox = screen.getByRole('checkbox', { name: 'Always accept generated handoffs and continue' });
+    const checkbox = screen.getByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
     expect(checkbox).not.toBeChecked();
     expect(apiMock.getCoordinatorAutomaticContinuation).toHaveBeenCalledTimes(1);
 

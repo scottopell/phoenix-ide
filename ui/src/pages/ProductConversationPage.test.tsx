@@ -400,7 +400,7 @@ describe('ProductConversationPage', () => {
     renderPage();
 
     const control = await screen.findByTestId('automatic-continuation-control');
-    expect(control).toHaveTextContent('Auto-continue Off');
+    await waitFor(() => expect(control).toHaveTextContent('Auto-continue Off'));
     expect(api.getProductConversationAutomaticContinuation).toHaveBeenCalledWith('pc-1');
   });
 
