@@ -1309,7 +1309,7 @@ async fn render_message_page_bounded_as(
         if messages.is_empty() {
             if cursor_pending {
                 return Err(PreviousReadError::InvalidCursor(
-                    "read cursor points beyond the rendered transcript".to_string(),
+                    "read cursor message is absent from the transcript; restart this read without a cursor".to_string(),
                 ));
             }
             break;
@@ -1318,13 +1318,13 @@ async fn render_message_page_bounded_as(
             after_sequence = Some(message.sequence_id);
             if cursor_pending && message.sequence_id != cursor.message_sequence {
                 return Err(PreviousReadError::InvalidCursor(
-                    "read cursor message is absent from the transcript".to_string(),
+                    "read cursor message is absent from the transcript; restart this read without a cursor".to_string(),
                 ));
             }
             if message_is_hidden(&message) {
                 if cursor_pending {
                     return Err(PreviousReadError::InvalidCursor(
-                        "read cursor points to a hidden message".to_string(),
+                        "read cursor points to a hidden message; restart this read without a cursor".to_string(),
                     ));
                 }
                 continue;
@@ -1352,7 +1352,7 @@ async fn render_message_page_bounded_as(
                 cursor_pending = false;
                 if cursor.byte_offset > line.len() || !line.is_char_boundary(cursor.byte_offset) {
                     return Err(PreviousReadError::InvalidCursor(
-                        "read cursor byte offset is outside the rendered message".to_string(),
+                        "read cursor byte offset is outside the rendered message; restart this read without a cursor".to_string(),
                     ));
                 }
                 cursor.byte_offset
@@ -1361,7 +1361,7 @@ async fn render_message_page_bounded_as(
             };
             let Some(remaining_line) = line.get(line_start..) else {
                 return Err(PreviousReadError::InvalidCursor(
-                    "read cursor byte offset is outside the rendered message".to_string(),
+                    "read cursor byte offset is outside the rendered message; restart this read without a cursor".to_string(),
                 ));
             };
             let mut line_offset = line_start;
@@ -1495,11 +1495,7 @@ fn render_global_read_page(
             .unwrap_or(&conv.id),
         PREVIOUS_TITLE_BYTES,
     );
-    let link_target = conv.slug.as_deref().unwrap_or(&conv.id);
-    let link = format!(
-        "/c/{}",
-        truncate_utf8_bytes(link_target, PREVIOUS_TITLE_BYTES)
-    );
+    let link = format!("/c/{}", conv.id);
     let mut output = format!(
         "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n{}",
         truncate_utf8_bytes(&conv.id, PREVIOUS_TITLE_BYTES),
@@ -1578,11 +1574,7 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
     };
-    let link_target = conv.slug.as_deref().unwrap_or(&conv.id);
-    let base = format!(
-        "/c/{}",
-        truncate_utf8_bytes(link_target, PREVIOUS_TITLE_BYTES)
-    );
+    let base = format!("/c/{}", conv.id);
     let href = if message_type_has_rendered_anchor(message.message_type) {
         format!("{base}#message-{}", message.message_id)
     } else {
@@ -2437,6 +2429,54 @@ mod tests {
 
         assert!(error.contains("unsupported"));
         assert!(error.contains("restart this list without a cursor"));
+    }
+
+    #[tokio::test]
+    async fn stale_cursor_failures_always_direct_restart_without_cursor() {
+        let (service, _) = predecessor_service().await;
+        let conversation = service.db.get_conversation("pred-a").await.unwrap();
+        let message = service.db.get_message_by_id("a-msg").await.unwrap();
+        let rendered = super::render_global_message_line(&conversation, &message);
+        let cursor = super::encode_conversation_read_cursor(
+            &ConversationReadCursorScope::Global,
+            "pred-a",
+            &PreviousReadPosition {
+                message_sequence: message.sequence_id,
+                byte_offset: 0,
+                message_id: Some(message.message_id.clone()),
+                rendered_sha256: Some(super::rendered_sha256(&rendered)),
+            },
+        )
+        .unwrap();
+        sqlx::query("UPDATE messages SET display_data = ?1 WHERE message_id = ?2")
+            .bind(r#"{"hidden":true}"#)
+            .bind(&message.message_id)
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+
+        let error = service
+            .read_conversation("pred-a", Some(&cursor))
+            .await
+            .unwrap_err();
+        assert!(error.contains("restart this read without a cursor"));
+
+        let beyond = super::encode_conversation_read_cursor(
+            &ConversationReadCursorScope::Global,
+            "pred-a",
+            &PreviousReadPosition {
+                message_sequence: i64::MAX,
+                byte_offset: 0,
+                message_id: Some("missing".to_string()),
+                rendered_sha256: Some("missing".to_string()),
+            },
+        )
+        .unwrap();
+        let error = service
+            .read_conversation("pred-a", Some(&beyond))
+            .await
+            .unwrap_err();
+        assert!(error.contains("restart this read without a cursor"));
     }
 
     #[tokio::test]
