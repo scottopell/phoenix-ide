@@ -4606,6 +4606,12 @@ async fn send_chat(
                     "idempotency_conflict",
                 )))
             }
+            crate::send_chat_service::SendChatServiceError::MessageIdTooLong => {
+                AppError::BadRequest(
+                    "message_id produces a persisted identity longer than 256 UTF-8 bytes"
+                        .to_string(),
+                )
+            }
             crate::send_chat_service::SendChatServiceError::Internal(message) => {
                 AppError::Internal(message)
             }
