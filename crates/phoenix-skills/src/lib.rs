@@ -306,6 +306,11 @@ fn collect_builtin_skills_from_dir(
             continue;
         };
         if extracted_content != content {
+            tracing::warn!(
+                skill = %dir_name,
+                path = %skill_md.display(),
+                "rejecting extracted built-in skill because it differs from embedded bytes"
+            );
             continue;
         }
         let content_hash = {
@@ -673,9 +678,7 @@ pub fn invoke_trusted_coordinator_builtin(
         write!(content, "\n\n## Embedded reference: {path}\n\n{asset}")
             .expect("writing to a String cannot fail");
     }
-    Ok(format!(
-        "<trusted_builtin_skill audience=\"global-coordinator\" name=\"{skill_name}\">\n{content}\n</trusted_builtin_skill>"
-    ))
+    Ok(content)
 }
 
 /// Strip YAML frontmatter (--- delimited block at the top of the file).
@@ -1350,7 +1353,7 @@ mod tests {
             .expect("authenticated coordinator catalog");
         std::fs::write(&extracted, "forged after discovery").unwrap();
         let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &authenticated).unwrap();
-        assert!(trusted.contains("<trusted_builtin_skill"));
+        assert!(!trusted.contains("<trusted_builtin_skill"));
         assert!(trusted.contains("Embedded reference"));
         assert!(!trusted.contains("forged after discovery"));
     }

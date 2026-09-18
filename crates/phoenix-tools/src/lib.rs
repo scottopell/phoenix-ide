@@ -277,7 +277,7 @@ impl ToolOutput {
     #[must_use]
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
-            Self::TrustedInstructions(instructions) => instructions.replace_output(text.into()),
+            Self::TrustedInstructions(_) => {}
             Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
         }
         self

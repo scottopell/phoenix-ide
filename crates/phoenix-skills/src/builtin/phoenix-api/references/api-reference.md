@@ -10,7 +10,7 @@ This reference describes the server API, not a privileged bypass. Use the Phoeni
 4. Keep secrets out of command arguments, shell tracing, files, logs, summaries, and tool output. Prefer an already-populated environment variable expanded inside the scoped shell. Do not inspect the Phoenix database or process environment to hunt for a credential, and do not echo or interpolate a secret into diagnostic output.
 5. A `401` or `403` is a stop condition. Do not weaken or route around authorization.
 
-Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv and preserve it byte-for-byte: write `Authorization: Bearer ` followed by the environment variable's raw bytes and a newline to a mode-600 temporary header file (for example with `printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD"`), pass that file with `curl --header @path`, then remove it before the Bash command returns. Do not place the credential in curl config syntax, which interprets backslash escapes. Parse JSON structurally rather than relying on display text.
+Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv and off disk: stream `Authorization: Bearer ` followed by the environment variable's raw bytes and a newline to curl's header stdin (for example, `printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD" | curl ... --header @-`). Do not place the credential in curl config syntax, which interprets backslash escapes. Parse JSON structurally rather than relying on display text.
 
 ## WorkScope admission
 

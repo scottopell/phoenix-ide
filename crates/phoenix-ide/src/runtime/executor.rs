@@ -600,9 +600,15 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
 }
 
 fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    let persisted_output = match &result.outcome {
+        ToolOutcome::TrustedInstructions { .. } => {
+            "Authenticated built-in skill instructions were delivered for this live request."
+        }
+        _ => result.output(),
+    };
     MessageContent::tool_with_images(
         &result.tool_use_id,
-        result.output(),
+        persisted_output,
         result.is_error(),
         result.images().to_vec(),
     )
@@ -633,7 +639,9 @@ fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[
                     .iter()
                     .find(|(trusted_id, _)| trusted_id == tool_use_id)
                 {
-                    *content = format!("<trusted_builtin_skill>{trusted}</trusted_builtin_skill>");
+                    *content = format!(
+                        "<trusted_builtin_skill audience=\"global-coordinator\">{trusted}</trusted_builtin_skill>"
+                    );
                 }
             }
         }
@@ -19123,8 +19131,21 @@ mod steer_drain_detector_tests {
                 }
                 _ => None,
             }),
-            Some(("authenticated instructions", false))
+            Some((
+                "Authenticated built-in skill instructions were delivered for this live request.",
+                false
+            ))
         ));
+        let persisted = msgs
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Tool(content) => Some(content.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!persisted.contains("authenticated instructions"));
+        assert!(!persisted.contains("trusted_builtin_skill"));
     }
 
     #[tokio::test]
