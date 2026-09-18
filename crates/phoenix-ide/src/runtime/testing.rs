@@ -2052,6 +2052,18 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_approved_task_authority(conv_id, approval)
+            .await?;
+        self.update_state(conv_id, state, state_updated_at).await
+    }
+
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
         Ok(self
             .modes

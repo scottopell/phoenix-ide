@@ -3406,8 +3406,13 @@ where
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                 );
+                let approval_commits_state = matches!(
+                    effect,
+                    Effect::ApproveTask { .. }
+                        if self.has_existing_write_scope()
+                );
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
-                    && state_committed
+                    && (state_committed || approval_commits_state)
                     && matches!(self.state, ConvState::AwaitingTaskApproval { .. });
                 let is_state_persist = matches!(
                     effect,
@@ -3724,6 +3729,9 @@ where
                     generated_events.push(gen_event);
                 }
                 if checkpoint_commits_state {
+                    state_committed = true;
+                }
+                if approval_commits_state {
                     state_committed = true;
                 }
                 if self.creation_settlement_disposition
@@ -8503,7 +8511,7 @@ where
             })?;
 
         self.storage
-            .persist_approved_task_authority(
+            .persist_approved_task_authority_and_state(
                 &self.context.conversation_id,
                 &TaskApprovalHandoffData {
                     task_id: reviewed.task_id,
@@ -8514,6 +8522,8 @@ where
                     task_file: task_file.to_string(),
                     artifact_body: reviewed.artifact_body,
                 },
+                &self.state,
+                self.state_updated_at,
             )
             .await
             .map_err(FollowUpApprovalError::AuthorityLost)?;

@@ -448,6 +448,14 @@ pub trait StateStore: Send + Sync {
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String>;
 
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String>;
+
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
     /// `ModeKind` discriminant, not the concrete paths).
@@ -961,6 +969,18 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .persist_approved_task_authority(conv_id, approval)
+            .await
+    }
+
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_approved_task_authority_and_state(conv_id, approval, state, state_updated_at)
             .await
     }
 
@@ -1916,6 +1936,19 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .persist_approved_task_authority(conv_id, approval)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .persist_approved_task_authority_and_state(conv_id, approval, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }

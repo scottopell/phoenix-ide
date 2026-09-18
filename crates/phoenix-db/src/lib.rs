@@ -7303,6 +7303,36 @@ impl Database {
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> DbResult<()> {
+        self.persist_approved_task_authority_inner(conversation_id, approval, None)
+            .await
+    }
+
+    /// Persist replacement task authority and the selected state atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] when validation, update, or commit fails.
+    pub async fn persist_approved_task_authority_and_state(
+        &self,
+        conversation_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        self.persist_approved_task_authority_inner(
+            conversation_id,
+            approval,
+            Some((state, state_updated_at)),
+        )
+        .await
+    }
+
+    async fn persist_approved_task_authority_inner(
+        &self,
+        conversation_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        state: Option<(&ConvState, DateTime<Utc>)>,
+    ) -> DbResult<()> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -7365,6 +7395,18 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
+        if let Some((state, state_updated_at)) = state {
+            let state_json = serde_json::to_string(state).unwrap();
+            sqlx::query(
+                "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4",
+            )
+            .bind(state_json)
+            .bind(conv_state_kind(state))
+            .bind(state_updated_at.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
