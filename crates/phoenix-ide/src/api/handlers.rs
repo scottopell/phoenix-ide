@@ -5425,12 +5425,26 @@ async fn cancel_steering_message(
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
+fn continuation_expansion_policy(
+    authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+) -> crate::send_chat_service::MessageExpansionPolicy {
+    match authority {
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        }
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        }
+    }
+}
+
 async fn dispatch_continuation_handoff(
     state: &AppState,
     intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {
     let parent_id = intent.parent_conversation_id.clone();
     let conversation_id = intent.successor_conversation_id.clone();
+    let expansion_policy = continuation_expansion_policy(intent.opening_authority);
     let dispatch = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
@@ -5442,7 +5456,7 @@ async fn dispatch_continuation_handoff(
         images: Vec::new(),
         files: Vec::new(),
         user_agent: intent.user_agent,
-        expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+        expansion_policy,
     })
     .await;
     match dispatch {
@@ -5522,18 +5536,67 @@ async fn continue_conversation(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
-    let message_id = continuation_message_id(req.message_id.clone())?;
+    let failed_admission = state
+        .runtime
+        .db()
+        .automatic_continuation_admission(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .filter(|admission| {
+            admission.phase
+                == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Failed
+        });
+    let (message_id, handoff, user_agent, opening_authority) = if let Some(admission) =
+        failed_admission
+    {
+        let summary = state
+            .runtime
+            .db()
+            .get_messages(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .into_iter()
+            .find(|message| message.message_id == admission.summary_message_id)
+            .ok_or_else(|| {
+                AppError::Internal("automatic continuation summary is missing".to_string())
+            })?;
+        let crate::db::MessageContent::Continuation(summary) = summary.content else {
+            return Err(AppError::Internal(
+                "automatic continuation summary has the wrong message type".to_string(),
+            ));
+        };
+        state
+            .runtime
+            .db()
+            .retry_failed_automatic_continuation(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        (
+            admission.first_message_id,
+            summary.summary,
+            Some("phoenix-automatic-continuation".to_string()),
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        )
+    } else {
+        (
+            continuation_message_id(req.message_id.clone())?,
+            req.handoff,
+            req.user_agent,
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        )
+    };
 
     let (outcome, intent) = state
         .runtime
         .db()
         .continue_conversation_with_intent(
             &id,
-            crate::db::NewContinuationDispatchIntent::user_authorized(
+            crate::db::NewContinuationDispatchIntent {
                 message_id,
-                req.handoff,
-                req.user_agent,
-            ),
+                handoff,
+                user_agent,
+                opening_authority,
+            },
         )
         .await
         .map_err(|e| match e {
@@ -9360,6 +9423,22 @@ pub(crate) mod hard_delete_cascade_tests {
         fn model_id(&self) -> &str {
             "claude-sonnet-5"
         }
+    }
+
+    #[test]
+    fn continuation_dispatch_preserves_persisted_opening_authority() {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        assert_eq!(
+            continuation_expansion_policy(ContinuationOpeningAuthority::UserAuthorizedInstruction),
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        );
+        assert_eq!(
+            continuation_expansion_policy(
+                ContinuationOpeningAuthority::GeneratedPredecessorContext
+            ),
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        );
     }
 
     /// Construct a minimal `AppState` backed by an in-memory database.

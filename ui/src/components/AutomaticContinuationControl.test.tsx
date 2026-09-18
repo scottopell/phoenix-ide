@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { AutomaticContinuationControl } from './AutomaticContinuationControl';
 import type { AutomaticContinuationView } from '../api';
 
@@ -34,6 +34,7 @@ async function openControl() {
 describe('AutomaticContinuationControl', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
     apiMock.getProductConversationAutomaticContinuation.mockResolvedValue(view());
     apiMock.updateProductConversationAutomaticContinuation.mockResolvedValue(view({
       auto_continue_on_context_exhaustion: true,
@@ -45,6 +46,10 @@ describe('AutomaticContinuationControl', () => {
       aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-pc' },
       auto_continue_on_context_exhaustion: true,
     }));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('defaults an ordinary ProductConversation OFF from GET and immediately PUTs the checked value', async () => {
@@ -101,6 +106,38 @@ describe('AutomaticContinuationControl', () => {
     await waitFor(() => expect(apiMock.updateProductConversationAutomaticContinuation).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Saved')).toBeInTheDocument();
     expect(checkbox).toBeChecked();
+  });
+
+  it('refreshes durable progress and exposes a later breaker failure without remounting', async () => {
+    vi.useFakeTimers();
+    apiMock.getProductConversationAutomaticContinuation
+      .mockResolvedValueOnce(view({
+        auto_continue_on_context_exhaustion: true,
+        admission: {
+          predecessor_transcript_row_id: 'row-exhausted',
+          phase: 'admitted',
+          no_progress_attempts: 0,
+          actionable_failure: null,
+        },
+      }))
+      .mockResolvedValueOnce(view({
+        auto_continue_on_context_exhaustion: true,
+        admission: {
+          predecessor_transcript_row_id: 'row-exhausted',
+          phase: 'failed',
+          no_progress_attempts: 5,
+          actionable_failure: {
+            message: 'Successor dispatch could not be accepted.',
+            first_message_id: 'automatic-first-message',
+          },
+        },
+      }));
+    render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-1' }} />);
+
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByText('Admitted', { selector: 'strong' })).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(screen.getByRole('alert')).toHaveTextContent('Successor dispatch could not be accepted.');
   });
 
   it('shows failed admission status with manual generated-handoff recovery guidance', async () => {
