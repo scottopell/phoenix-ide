@@ -9063,7 +9063,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         run_git(cwd, &commit_args).map_err(|error| {
             compensate(format!("Failed to commit approved task artifact: {error}"))
         })?;
-        let mut hash = std::process::Command::new("git")
+        let mut hash = phoenix_core::git::command()
             .arg("hash-object")
             .arg("--stdin")
             .current_dir(cwd)
