@@ -1875,8 +1875,11 @@ impl RuntimeManager {
         let detail = detail.into();
         let cause = AmbientWriterIndeterminateDiagnostic::from_marker(&detail)
             .map(|diagnostic| diagnostic.durable_cause());
-        self.route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, cause)
+        let detail = self
+            .route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, cause)
             .await
+            .map_err(E::from)?;
+        Err(E::from(detail))
     }
 
     pub(crate) async fn route_close_evidence_invariant_to_repair<T, E>(
@@ -1892,27 +1895,66 @@ impl RuntimeManager {
         let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
             .expect("static Close evidence identifiers are non-blank");
         let detail = format!("Close evidence invariant {invariant} failed in {relation}");
-        self.route_close_attempt_to_repair_with_cause(
-            attempt_id,
-            scope,
-            RetirementFailureReason::ManualRepairRequired,
-            detail,
-            Some(cause),
-        )
-        .await
+        let detail = self
+            .route_close_attempt_to_repair_with_cause(
+                attempt_id,
+                scope,
+                RetirementFailureReason::ManualRepairRequired,
+                detail,
+                Some(cause),
+            )
+            .await
+            .map_err(E::from)?;
+        Err(E::from(detail))
     }
 
-    async fn route_close_attempt_to_repair_with_cause<T, E>(
+    pub(crate) async fn persist_close_error_repair(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        error: &CloseRetirementError,
+    ) -> Result<(), String> {
+        let detail = match error {
+            CloseRetirementError::EvidenceInvariant {
+                invariant,
+                relation,
+            } => {
+                let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+                    .expect("typed Close evidence identifiers are non-blank");
+                self.route_close_attempt_to_repair_with_cause(
+                    attempt_id,
+                    scope,
+                    RetirementFailureReason::ManualRepairRequired,
+                    format!("Close evidence invariant {invariant} failed in {relation}"),
+                    Some(cause),
+                )
+                .await?
+            }
+            CloseRetirementError::Message(message) => {
+                let cause = AmbientWriterIndeterminateDiagnostic::from_marker(message)
+                    .map(|diagnostic| diagnostic.durable_cause());
+                self.route_close_attempt_to_repair_with_cause(
+                    attempt_id,
+                    scope,
+                    RetirementFailureReason::ManualRepairRequired,
+                    message.clone(),
+                    cause,
+                )
+                .await?
+            }
+        };
+        tracing::debug!(%detail, "Close error routed durably to repair");
+        Ok(())
+    }
+
+    async fn route_close_attempt_to_repair_with_cause(
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
         reason: RetirementFailureReason,
         detail: impl Into<String>,
         cause: Option<CloseNeedsRepairCause>,
-    ) -> Result<T, E>
-    where
-        E: From<String>,
-    {
+    ) -> Result<String, String> {
         let detail = detail.into();
         let captured = self
             .db()
@@ -1952,7 +1994,7 @@ impl RuntimeManager {
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(E::from(detail))
+        Ok(detail)
     }
 
     async fn record_close_residual<T, E>(

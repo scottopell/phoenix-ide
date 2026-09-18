@@ -777,35 +777,11 @@ pub(crate) async fn retry_close_retirement(
                 .next()
                 .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
                 .scope;
-            match &error {
-                CloseRetirementError::EvidenceInvariant {
-                    invariant,
-                    relation,
-                } => {
-                    state
-                        .runtime
-                        .route_close_evidence_invariant_to_repair::<(), CloseRetirementError>(
-                            retried.attempt_id(),
-                            &scope,
-                            invariant,
-                            relation,
-                        )
-                        .await
-                        .expect_err("repair routing returns the persisted repair detail");
-                }
-                CloseRetirementError::Message(message) => {
-                    state
-                        .runtime
-                        .route_close_attempt_to_repair::<(), CloseRetirementError>(
-                            retried.attempt_id(),
-                            &scope,
-                            phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-                            message,
-                        )
-                        .await
-                        .expect_err("repair routing returns the persisted repair detail");
-                }
-            }
+            state
+                .runtime
+                .persist_close_error_repair(retried.attempt_id(), &scope, &error)
+                .await
+                .map_err(AppError::Internal)?;
         }
         return Err(AppError::Conflict(Box::new(
             close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await,
