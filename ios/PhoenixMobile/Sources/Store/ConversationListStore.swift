@@ -174,6 +174,7 @@ final class ConversationListStore {
                 branch_name: incoming.branch_name,
                 task_title: existing.task_title,
                 archived: incoming.archived,
+                product_close_action: incoming.product_close_action,
                 project_name: incoming.project_name,
                 conv_mode_label: incoming.conv_mode_label,
                 presentation_mode: incoming.presentation_mode,
@@ -280,6 +281,12 @@ final class ConversationListStore {
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
         transcriptToAggregate[transcriptRowId]
+    }
+
+    func transcriptRowIds(forAggregateId aggregateId: String) -> [String] {
+        transcriptToAggregate.compactMap { transcriptId, mappedAggregateId in
+            mappedAggregateId == aggregateId ? transcriptId : nil
+        }
     }
 
     func cachedTranscriptRowId(forAggregateId aggregateId: String) -> String? {

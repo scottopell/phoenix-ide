@@ -28,8 +28,9 @@ use super::AppState;
 use crate::db::{
     DbError, ProductConversationAggregate, ProductConversationCloseAvailability,
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
-    ProductConversationListProjection, ProductConversationSegment,
-    ProductConversationSegmentCeiling, ProductConversationSource, ProductConversationSourceKind,
+    ProductConversationListLifecycle, ProductConversationListProjection,
+    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSource,
+    ProductConversationSourceKind,
 };
 use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
@@ -47,6 +48,33 @@ pub struct SnapshotQuery {
 #[derive(Debug, Deserialize)]
 pub struct RenameProductConversationRequest {
     pub title: String,
+}
+
+pub async fn close_product_conversation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<super::types::SuccessResponse>, AppError> {
+    for attempt in 0..2 {
+        let product_conversation = state
+            .db
+            .read_ordinary_product_conversation_snapshot(&reference, None, None, 1)
+            .await
+            .map_err(db_to_app)?
+            .aggregate;
+        match crate::api::lifecycle_handlers::close_legacy_compat(
+            &state,
+            &product_conversation.latest_transcript_row_id,
+            "archive",
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(AppError::Conflict(conflict))
+                if attempt == 0 && conflict.error_type == "inactive_close_transcript" => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(super::types::SuccessResponse { success: true }))
 }
 
 pub async fn rename_product_conversation(
@@ -316,12 +344,12 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
             title: projection.root_title.clone(),
         },
         lifecycle: match projection.lifecycle {
-            OrdinaryProductConversationLifecycle::Open => ProductConversationLifecycleView::Open {
-                close_action: close_action_view(projection.close_availability),
-            },
-            OrdinaryProductConversationLifecycle::History => {
-                ProductConversationLifecycleView::History
+            ProductConversationListLifecycle::Open { close_availability } => {
+                ProductConversationLifecycleView::Open {
+                    close_action: close_action_view(close_availability),
+                }
             }
+            ProductConversationListLifecycle::History => ProductConversationLifecycleView::History,
         },
         latest_transcript_row_id: projection.latest_transcript_row_id.clone(),
         updated_at: projection.updated_at.to_rfc3339(),
@@ -344,9 +372,6 @@ fn close_action_view(
         }
         ProductConversationCloseAvailability::Unavailable(reason) => {
             let reason = match reason {
-                ProductConversationCloseUnavailableReason::History => {
-                    ProductConversationCloseUnavailableReasonView::History
-                }
                 ProductConversationCloseUnavailableReason::ActiveCloseAttempt => {
                     ProductConversationCloseUnavailableReasonView::ActiveCloseAttempt
                 }
@@ -862,6 +887,15 @@ fn db_to_app(error: DbError) -> AppError {
             AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
                 format!("ProductConversation {id} is read-only in History"),
                 "product_conversation_not_open",
+            )))
+        }
+        DbError::CloseAdmissionFenced(fence) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!(
+                    "ProductConversation {} has an active Close attempt {} in phase {:?}",
+                    fence.product_conversation_id, fence.attempt_id, fence.phase
+                ),
+                "close_admission_fenced",
             )))
         }
         error => AppError::Internal(error.to_string()),

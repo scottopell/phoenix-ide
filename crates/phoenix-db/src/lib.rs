@@ -56,9 +56,9 @@ pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
     ProductConversationAggregate, ProductConversationCloseAvailability,
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
-    ProductConversationListProjection, ProductConversationSegment,
-    ProductConversationSegmentCeiling, ProductConversationSnapshotRead, ProductConversationSource,
-    ProductConversationSourceKind, ProductConversationTranscriptRow,
+    ProductConversationListLifecycle, ProductConversationListProjection,
+    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSnapshotRead,
+    ProductConversationSource, ProductConversationSourceKind, ProductConversationTranscriptRow,
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{

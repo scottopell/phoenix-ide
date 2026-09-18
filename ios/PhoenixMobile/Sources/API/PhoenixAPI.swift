@@ -309,6 +309,10 @@ struct PhoenixAPI: Sendable {
     }
 
     func productConversationListRowToConversation(_ row: ProductConversationListRow) -> Conversation {
+        let closeAction: ProductConversationCloseAction? = switch row.lifecycle {
+        case .open(let closeAction): closeAction
+        case .history: nil
+        }
         let (presentationMode, requiresAction): (String?, Bool?) = switch row.presentation {
         case .needsAction:
             ("needs_action", true)
@@ -330,7 +334,8 @@ struct PhoenixAPI: Sendable {
             state_updated_at: nil,
             branch_name: nil,
             task_title: nil,
-            archived: row.ordinary_lifecycle == .history,
+            archived: row.lifecycle == .history,
+            product_close_action: closeAction,
             project_name: nil,
             conv_mode_label: nil,
             presentation_mode: presentationMode,
@@ -381,6 +386,12 @@ struct PhoenixAPI: Sendable {
     func cancel(conversationId: String) async throws -> CancelResponse {
         try await post(
             "api/conversations/\(conversationId)/cancel", body: [:], as: CancelResponse.self)
+    }
+
+    func closeProductConversation(reference: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
     }
 
     func archive(conversationId: String) async throws {
