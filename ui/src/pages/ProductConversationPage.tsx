@@ -866,6 +866,7 @@ function ProductConversationPageInner() {
     } : null;
   }
   const paginationRequestRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const currentLatestProjection = snapshot
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
@@ -900,6 +901,7 @@ function ProductConversationPageInner() {
   useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
+    const requestGeneration = ++snapshotRequestRef.current;
     const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
     if (!isBackgroundRefresh) setLoading(true);
     setError(null);
@@ -918,7 +920,7 @@ function ProductConversationPageInner() {
       : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
@@ -930,14 +932,14 @@ function ProductConversationPageInner() {
         if (!isBackgroundRefresh) setHistoryGeneration(0);
       })
       .catch((err) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
         setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && snapshotRequestRef.current === requestGeneration) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -1177,6 +1179,7 @@ function ProductConversationPageInner() {
         messages={messages}
         recallDisabled={!liveControlsEnabled}
         onCoordinatorProfileSaved={(savedProductConversationId, profile) => {
+          snapshotRequestRef.current += 1;
           paginationRequestRef.current += 1;
           setOwnedSnapshot((current) => (
             current?.productConversationId === savedProductConversationId

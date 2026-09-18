@@ -5,7 +5,10 @@ use super::{
 };
 use crate::db::{Message, MessageContent};
 use crate::state_machine::state::ToolCall;
-use phoenix_core::llm_language::COORDINATOR_CONTINUATION_SYSTEM_PROMPT;
+use phoenix_core::llm_language::{
+    project_coordinator_continuation_instruction, LlmLanguage,
+    COORDINATOR_CONTINUATION_SYSTEM_PROMPT,
+};
 
 #[cfg(test)]
 mod evaluation;
@@ -34,13 +37,16 @@ impl CompactionPolicy {
         }
     }
 
-    pub(super) fn instruction(&self, rejected_tool_calls: &[ToolCall]) -> String {
+    pub(super) fn instruction(
+        &self,
+        rejected_tool_calls: &[ToolCall],
+        language: LlmLanguage,
+    ) -> String {
         match self {
             Self::Work => build_continuation_prompt(rejected_tool_calls),
             Self::ProjectCoordinator => {
-                let mut prompt = String::from(
-                    "Write a compact handoff for the next Project Coordinator context. Preserve the current mission; unresolved commitments and their owners; blockers and reactivation conditions; evidence and exact references; user corrections and authority limits; and the next concrete verification and stopping points. Distinguish requested, accepted, reported, and independently verified work. Preserve uncertainty when evidence conflicts. Record explicit retirement or supersession facts so completed work is not reopened. Do not reproduce or summarize the Project Coordinator charter: the next turn loads the current charter independently by ProductConversation identity. Forget repetitive history before unresolved commitments and do not invent completion, authority, evidence, or owners.",
-                );
+                let mut prompt =
+                    String::from(project_coordinator_continuation_instruction(language));
                 append_rejected_tool_calls(&mut prompt, rejected_tool_calls);
                 prompt
             }
@@ -187,7 +193,8 @@ mod tests {
 
     #[test]
     fn project_coordinator_policy_is_role_appropriate_and_excludes_charter() {
-        let project = CompactionPolicy::for_profile(false, true).instruction(&[]);
+        let project =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::PhoenixNative);
         assert!(project.contains("current mission"));
         assert!(project.contains("unresolved commitments and their owners"));
         assert!(project.contains("Do not reproduce or summarize the Project Coordinator charter"));
@@ -196,8 +203,21 @@ mod tests {
             CONTINUATION_SYSTEM_PROMPT
         );
         assert!(!CompactionPolicy::for_profile(false, false)
-            .instruction(&[])
+            .instruction(&[], LlmLanguage::PhoenixNative)
             .contains("Project Coordinator charter"));
+    }
+
+    #[test]
+    fn project_coordinator_policy_uses_selected_llm_language() {
+        let phoenix =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::PhoenixNative);
+        let caveman =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::Caveman);
+
+        assert!(phoenix.starts_with("Write a compact handoff"));
+        assert!(caveman.starts_with("Write short handoff"));
+        assert!(caveman.contains("Do not copy or sum up Project Coordinator charter"));
+        assert!(!caveman.contains("Write a compact handoff"));
     }
 
     #[test]
@@ -209,7 +229,8 @@ mod tests {
                 input: serde_json::json!({"scope": "bounded"}),
             },
         );
-        let prompt = CompactionPolicy::for_profile(false, true).instruction(&[call]);
+        let prompt = CompactionPolicy::for_profile(false, true)
+            .instruction(&[call], LlmLanguage::PhoenixNative);
         assert!(prompt.contains("These pending tool calls did not run"));
         assert!(prompt.contains("example"));
         assert!(prompt.contains("bounded"));
