@@ -2353,7 +2353,7 @@ pub fn transition_parent(
                     });
                 }
 
-                if matches!(context.mode_context, Some(ModeContext::Explore { .. })) {
+                if proposal_eligible {
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
                         "Plan submitted for review".to_string(),
@@ -6837,7 +6837,7 @@ mod tests {
         }
 
         #[test]
-        fn work_valid_file_forks_without_parking() {
+        fn work_valid_file_parks_for_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -6856,40 +6856,19 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            assert!(
-                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-                "Work fork continues running, got {:?}",
-                result.new_state
-            );
-            assert!(
-                !matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
-                "Work fork must NOT park"
-            );
-            assert!(
-                !result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
-                "fork path emits PersistForkProposal, not a separate PersistCheckpoint"
-            );
-            let (proposal_id, task_file, title, priority, body) =
-                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
-            assert!(!proposal_id.is_empty(), "a proposal_id must be present");
-            assert_eq!(task_file, &rel);
-            assert_eq!(title, "Fix the bug");
-            assert_eq!(priority, phoenix_core::task_source::Priority::P1);
-            assert!(body.contains("plan body for the fork"));
-            assert!(
-                result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::RequestLlm)),
-                "fork continues with a fresh LLM request"
-            );
+            assert!(matches!(
+                result.new_state,
+                ConvState::AwaitingTaskApproval { .. }
+            ));
+            assert!(fork_proposal_effect(&result.effects).is_none());
+            assert!(result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
         }
 
         #[test]
-        fn branch_valid_file_takes_the_fork_path() {
+        fn branch_valid_file_parks_for_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -6908,22 +6887,11 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            assert!(
-                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-                "Branch fork continues running, got {:?}",
-                result.new_state
-            );
-            assert!(
-                fork_proposal_effect(&result.effects).is_some(),
-                "Branch records a fork proposal"
-            );
-            assert!(
-                result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::RequestLlm)),
-                "Branch fork re-requests the LLM"
-            );
+            assert!(matches!(
+                result.new_state,
+                ConvState::AwaitingTaskApproval { .. }
+            ));
+            assert!(fork_proposal_effect(&result.effects).is_none());
         }
 
         #[test]
@@ -6999,10 +6967,10 @@ mod tests {
         /// REQ-PROJ-033: the fork snapshot is the authoritative file BYTES. A
         /// brief with significant leading/trailing whitespace and a trailing
         /// newline must reach `Effect::PersistForkProposal { body }` unaltered —
-        /// it is the verbatim source for the fork's committed file, NOT the
+        /// it is the verbatim source for the approval checkpoint, not the
         /// trimmed display plan.
         #[test]
-        fn fork_body_preserves_raw_file_bytes() {
+        fn approval_plan_preserves_raw_file_bytes() {
             let tmp = TempDir::new().unwrap();
             std::fs::create_dir(tmp.path().join("tasks")).unwrap();
             let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
@@ -7026,17 +6994,11 @@ mod tests {
             )
             .expect("transition must succeed");
 
-            let (_, _, _, _, body) =
-                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
-            assert_eq!(
-                body, raw,
-                "fork body must be the raw file bytes, not the trimmed plan"
-            );
-            assert_ne!(
-                body,
-                &raw.trim().to_string(),
-                "fork body must NOT be the trimmed display plan"
-            );
+            let ConvState::AwaitingTaskApproval { plan, .. } = result.new_state else {
+                panic!("write-authority proposal must await approval");
+            };
+            assert_eq!(plan, raw, "approval plan must preserve raw file bytes");
+            assert_ne!(plan, raw.trim(), "approval plan must not be trimmed");
         }
 
         #[test]

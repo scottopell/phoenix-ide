@@ -8359,11 +8359,9 @@ where
         Ok(())
     }
 
-    fn is_approved_explore_follow_up(&self) -> bool {
-        matches!(
-            self.context.mode_context.as_ref(),
-            Some(ModeContext::Explore { .. })
-        ) && self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
+    fn has_existing_write_scope(&self) -> bool {
+        self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
+            && self.context.work_scope_worktree.is_some()
     }
 
     async fn publish_follow_up_approval(
@@ -8551,7 +8549,7 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
-        if self.is_approved_explore_follow_up() {
+        if self.has_existing_write_scope() {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
                 .await;
@@ -8825,7 +8823,12 @@ where
 
         let approval = match result {
             Ok(result) => result,
-            Err(e) => {
+            Err(FollowUpArtifactError::AfterGit(error)) => {
+                return Err(format!(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: fresh task approval crossed the Git authority boundary without reconciliation: {error}"
+                ));
+            }
+            Err(FollowUpArtifactError::BeforeGit(e)) => {
                 tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
                     ConvState::AwaitingTaskApproval {
@@ -9033,11 +9036,27 @@ fn persist_fresh_approved_task_artifact_blocking(
     diff_args.extend(approved_paths.iter().copied());
     if run_git(cwd, &diff_args).is_err() {
         let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
-        let mut commit_args = vec!["commit", "--only", "-m", &commit_message, "--"];
+        let mut commit_args = vec![
+            "commit",
+            "--only",
+            "--no-verify",
+            "-m",
+            &commit_message,
+            "--",
+        ];
         commit_args.extend(approved_paths.iter().copied());
         run_git(cwd, &commit_args).map_err(|error| {
             compensate(format!("Failed to commit approved task artifact: {error}"))
         })?;
+        let reviewed_blob = run_git(cwd, &["hash-object", "--", &snapshot.task_file])
+            .map_err(FollowUpArtifactError::AfterGit)?;
+        let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{}", snapshot.task_file)])
+            .map_err(FollowUpArtifactError::AfterGit)?;
+        if committed_blob != reviewed_blob {
+            return Err(FollowUpArtifactError::AfterGit(
+                "committed task artifact differs from the reviewed bytes".to_string(),
+            ));
+        }
     }
     Ok(snapshot)
 }
