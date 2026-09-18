@@ -2530,7 +2530,11 @@ final class AppModelProductConversationTests: XCTestCase {
         await session.awaitHardDeleteReportForTesting()
         await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
 
-        XCTAssertNotNil(model.existingSession(for: "row-1"))
+        let retainedSession = try XCTUnwrap(model.existingSession(for: "row-1"))
+        XCTAssertFalse(retainedSession.acceptsConversationActions)
+        let acceptedWhilePending = await retainedSession.send(
+            text: "must not enqueue while fence is uncommitted")
+        XCTAssertFalse(acceptedWhilePending)
         XCTAssertFalse(model.listStore.conversations.isEmpty)
         XCTAssertFalse(store.inspectOutbox(conversationId: "row-1").visibleEntries.isEmpty)
         XCTAssertNil(model.session(for: "row-1", aggregateAuthority: "pc-1"))
@@ -2547,8 +2551,8 @@ final class AppModelProductConversationTests: XCTestCase {
         let (api, registration) = makeHTTPAPI(probe: probe)
         defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
         let model = makeModel(conversationPersistenceStore: store)
+        model.connectivity.setOnlineForTesting(false)
         model.replaceAPIForTesting(api)
-        model.connectivity.setOnlineForTesting(true)
         model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
         let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
         session.receive(.initSnapshot(.init(
@@ -2566,6 +2570,7 @@ final class AppModelProductConversationTests: XCTestCase {
         store.persistHardDeleteFenceResult = true
         model.triggerStartupHardDeleteRecoveryForTesting()
         await model.awaitStartupHardDeleteRecoveryForTesting()
+        model.connectivity.setOnlineForTesting(true)
 
         XCTAssertEqual(store.persistedHardDeleteFences.map(\.aggregateAuthority), ["pc-1"])
         XCTAssertTrue(probe.chatPostPaths.isEmpty)

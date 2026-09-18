@@ -769,6 +769,7 @@ final class AppModel {
     private var hardDeleteCleanupWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var completedHardDeleteCleanupGenerations: Set<Int> = []
     private var hardDeletedConversationIds: Set<String> = []
+    private var hardDeletedAggregateAuthorities: Set<String> = []
     private var hardDeleteFenceRetryObligations: Set<HardDeleteFenceRetryObligation> = []
     private var nextHardDeleteCleanupGeneration = 0
 
@@ -894,6 +895,7 @@ final class AppModel {
             return
         }
         hardDeletedConversationIds.formUnion(fences.flatMap(\.memberConversationIds))
+        hardDeletedAggregateAuthorities.formUnion(fences.map(\.aggregateAuthority))
         guard !fences.isEmpty else {
             persistedOutboxHydrated = true
             schedulePersistedOutboxDrain()
@@ -1067,6 +1069,7 @@ final class AppModel {
         startupHardDeleteRecoveryTask = nil
         persistedOutboxHydrated = false
         hardDeletedConversationIds.removeAll()
+        hardDeletedAggregateAuthorities.removeAll()
         apiGeneration += 1
         let configuredAPI: PhoenixAPI?
         if !credentialMigrationBlocked,
@@ -1120,7 +1123,9 @@ final class AppModel {
 
     func session(for conversationId: String, aggregateAuthority: String? = nil) -> ConversationSession? {
         guard let api else { return nil }
-        guard !hardDeletedConversationIds.contains(conversationId) else { return nil }
+        guard !hardDeletedConversationIds.contains(conversationId),
+              aggregateAuthority.map({ !hardDeletedAggregateAuthorities.contains($0) }) ?? true
+        else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
             self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
@@ -1371,6 +1376,8 @@ final class AppModel {
         guard let api,
               api.configurationIdentity == report.configurationIdentity
         else { return }
+        hardDeletedConversationIds.insert(report.conversationId)
+        hardDeletedAggregateAuthorities.insert(report.aggregateAuthority)
         let persistedMembers = conversationPersistenceStore.persistedConversationIds(
             aggregateId: report.aggregateAuthority,
             scope: report.configurationIdentity.persistenceScope,
@@ -2016,7 +2023,9 @@ final class AppModel {
             guard sessions[conversationId] == nil else {
                 continue
             }
-            guard !hardDeletedConversationIds.contains(conversationId) else {
+            guard !hardDeletedConversationIds.contains(conversationId),
+                  owner.aggregateAuthority.map({ !hardDeletedAggregateAuthorities.contains($0) }) ?? true
+            else {
                 continue
             }
             let drainSession: ConversationSession
