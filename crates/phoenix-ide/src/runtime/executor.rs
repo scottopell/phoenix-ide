@@ -3401,12 +3401,23 @@ where
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
+                let checkpoint_commits_state = matches!(
+                    effect,
+                    Effect::PersistCheckpoint { .. }
+                        if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
+                );
+                let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
+                    && state_committed
+                    && matches!(self.state, ConvState::AwaitingTaskApproval { .. });
                 let is_state_persist = matches!(
                     effect,
                     Effect::PersistState
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
-                );
+                ) || checkpoint_commits_state;
+                if redundant_approval_state_persist {
+                    continue;
+                }
                 if matches!(effect, Effect::PersistState)
                     && self.handoff_completion_authority.is_some()
                     && matches!(self.state, ConvState::HandedOff { .. })
@@ -3711,6 +3722,9 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
+                }
+                if checkpoint_commits_state {
+                    state_committed = true;
                 }
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
