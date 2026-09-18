@@ -163,12 +163,7 @@ pub async fn put_project_coordinator_profile(
                 updated_at_unix_micros: profile.updated_at_unix_micros(),
             })))
         }
-        Ok(ProjectCoordinatorProfileWriteOutcome::Disabled) => {
-            let revision = state
-                .db
-                .get_project_coordinator_profile_revision(&product_conversation_id)
-                .await
-                .map_err(db_to_app)?;
+        Ok(ProjectCoordinatorProfileWriteOutcome::Disabled { revision }) => {
             Ok(Json(Some(ProjectCoordinatorProfileView {
                 enabled: false,
                 charter: String::new(),
@@ -207,6 +202,9 @@ pub async fn put_project_coordinator_profile(
                 "Project Coordinator profile commit outcome was unclassifiable".to_string(),
             ))
         }
+        Err(ProjectCoordinatorProfileWriteDbError::NotCommitted) => Err(AppError::Internal(
+            "Project Coordinator profile write did not commit".to_string(),
+        )),
         Err(ProjectCoordinatorProfileWriteDbError::Database(error)) => {
             tracing::error!(%error, "failed to persist Project Coordinator profile");
             Err(AppError::Internal(
@@ -474,17 +472,12 @@ async fn project_coordinator_profile_view(
     state: &AppState,
     product_conversation_id: &ProductConversationId,
 ) -> Result<Option<ProjectCoordinatorProfileView>, AppError> {
-    let profile = state
+    let settings = state
         .db
-        .get_project_coordinator_profile(product_conversation_id)
+        .get_project_coordinator_profile_settings(product_conversation_id)
         .await
         .map_err(db_to_app)?;
-    let revision = state
-        .db
-        .get_project_coordinator_profile_revision(product_conversation_id)
-        .await
-        .map_err(db_to_app)?;
-    Ok(Some(match profile {
+    Ok(Some(match settings.profile {
         Some(profile) => ProjectCoordinatorProfileView {
             enabled: true,
             charter: profile.charter().to_string(),
@@ -494,7 +487,7 @@ async fn project_coordinator_profile_view(
         None => ProjectCoordinatorProfileView {
             enabled: false,
             charter: String::new(),
-            revision,
+            revision: settings.revision,
             updated_at_unix_micros: 0,
         },
     }))

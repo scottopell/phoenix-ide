@@ -9,7 +9,13 @@ use crate::{Database, DbResult};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectCoordinatorProfileWriteOutcome {
     Saved(ProjectCoordinatorProfile),
-    Disabled,
+    Disabled { revision: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCoordinatorProfileSettings {
+    pub profile: Option<ProjectCoordinatorProfile>,
+    pub revision: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +26,8 @@ pub enum ProjectCoordinatorProfileWriteDbError {
     Database(#[from] sqlx::Error),
     #[error("Project Coordinator profile commit outcome is unclassifiable")]
     AmbiguousCommit,
+    #[error("Project Coordinator profile commit did not apply")]
+    NotCommitted,
 }
 
 fn validate_charter(charter: &str) -> Result<(), ProjectCoordinatorProfileWriteError> {
@@ -79,6 +87,45 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(profile_from_row).transpose()
+    }
+
+    /// Reads the active profile and retained revision from one `SQLite` snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the settings query cannot complete or persisted profile
+    /// fields violate domain invariants.
+    pub async fn get_project_coordinator_profile_settings(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<ProjectCoordinatorProfileSettings> {
+        let row = sqlx::query(
+            "SELECT profile.charter, profile.revision AS active_revision,
+                    profile.updated_at_unix_micros,
+                    COALESCE(fence.revision, 0) AS retained_revision
+             FROM product_conversations conversation
+             LEFT JOIN product_conversation_coordinator_profiles profile
+               ON profile.product_conversation_id = conversation.id
+             LEFT JOIN product_conversation_coordinator_profile_revisions fence
+               ON fence.product_conversation_id = conversation.id
+             WHERE conversation.id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        let revision = row.get("retained_revision");
+        let charter: Option<String> = row.try_get("charter")?;
+        let profile = charter
+            .map(|charter| {
+                ProjectCoordinatorProfile::new(
+                    charter,
+                    row.get("active_revision"),
+                    row.get("updated_at_unix_micros"),
+                )
+                .map_err(|error| crate::DbError::Serialization(error.to_string()))
+            })
+            .transpose()?;
+        Ok(ProjectCoordinatorProfileSettings { profile, revision })
     }
 
     /// Reads the retained revision even when the profile is disabled.
@@ -184,31 +231,38 @@ impl Database {
             .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
             .await?;
-            ProjectCoordinatorProfileWriteOutcome::Disabled
+            ProjectCoordinatorProfileWriteOutcome::Disabled {
+                revision: new_revision,
+            }
         };
 
-        if tx.commit().await.is_err()
-            && !self
-                .project_coordinator_write_matches(
+        if tx.commit().await.is_err() {
+            return match self
+                .classify_project_coordinator_write(
                     product_conversation_id,
                     charter,
+                    expected_revision,
                     new_revision,
                     now,
                 )
                 .await
-        {
-            return Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit);
+            {
+                Some(true) => Ok(outcome),
+                Some(false) => Err(ProjectCoordinatorProfileWriteDbError::NotCommitted),
+                None => Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit),
+            };
         }
         Ok(outcome)
     }
 
-    async fn project_coordinator_write_matches(
+    async fn classify_project_coordinator_write(
         &self,
         product_conversation_id: &ProductConversationId,
         charter: Option<&str>,
+        expected_revision: i64,
         revision: i64,
         updated_at_unix_micros: i64,
-    ) -> bool {
+    ) -> Option<bool> {
         let persisted_revision: Result<Option<i64>, _> = sqlx::query_scalar(
             "SELECT revision FROM product_conversation_coordinator_profile_revisions
              WHERE product_conversation_id = ?1",
@@ -216,10 +270,18 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .fetch_optional(&self.pool)
         .await;
-        if !matches!(persisted_revision, Ok(Some(value)) if value == revision) {
-            return false;
+        let persisted_revision = match persisted_revision {
+            Ok(Some(value)) => value,
+            Ok(None) if expected_revision == 0 => 0,
+            Ok(None) | Err(_) => return None,
+        };
+        if persisted_revision == expected_revision {
+            return Some(false);
         }
-        match charter {
+        if persisted_revision != revision {
+            return None;
+        }
+        Some(match charter {
             Some(charter) => sqlx::query(
                 "SELECT 1 FROM product_conversation_coordinator_profiles
                  WHERE product_conversation_id = ?1 AND charter = ?2
@@ -236,7 +298,7 @@ impl Database {
                 .get_project_coordinator_profile(product_conversation_id)
                 .await
                 .is_ok_and(|profile| profile.is_none()),
-        }
+        })
     }
 }
 
@@ -413,6 +475,12 @@ mod tests {
         db.write_project_coordinator_profile(&id, None, 1)
             .await
             .expect("disable");
+        let disabled = db
+            .get_project_coordinator_profile_settings(&id)
+            .await
+            .expect("disabled settings");
+        assert_eq!(disabled.profile, None);
+        assert_eq!(disabled.revision, 2);
         let stale_disabled = db
             .write_project_coordinator_profile(&id, Some("stale disabled editor"), 0)
             .await

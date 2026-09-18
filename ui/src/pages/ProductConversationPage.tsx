@@ -674,7 +674,10 @@ function ProjectCoordinatorSettings({
   onSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
-  onSaved: (profile: ProductConversationSnapshotView['project_coordinator_profile']) => void;
+  onSaved: (
+    productConversationId: string,
+    profile: ProductConversationSnapshotView['project_coordinator_profile'],
+  ) => void;
 }) {
   const profile = snapshot.project_coordinator_profile;
   const [open, setOpen] = useState(false);
@@ -703,7 +706,7 @@ function ProjectCoordinatorSettings({
         charter,
         expected_revision: baseRevision,
       });
-      onSaved(savedProfile);
+      onSaved(snapshot.product_conversation_id, savedProfile);
       setOpen(false);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Failed to save Project Coordinator profile');
@@ -776,7 +779,10 @@ function ProductConversationHeader({
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
-  onCoordinatorProfileSaved: (profile: ProductConversationSnapshotView['project_coordinator_profile']) => void;
+  onCoordinatorProfileSaved: (
+    productConversationId: string,
+    profile: ProductConversationSnapshotView['project_coordinator_profile'],
+  ) => void;
 }) {
   const source = snapshot.source;
   return (
@@ -1170,11 +1176,12 @@ function ProductConversationPageInner() {
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
-        onCoordinatorProfileSaved={(profile) => {
-          setOwnedSnapshot((current) => current ? {
-            ...current,
-            value: { ...current.value, project_coordinator_profile: profile },
-          } : current);
+        onCoordinatorProfileSaved={(savedProductConversationId, profile) => {
+          setOwnedSnapshot((current) => (
+            current?.productConversationId === savedProductConversationId
+              ? { ...current, value: { ...current.value, project_coordinator_profile: profile } }
+              : current
+          ));
           setSnapshotRetry((retry) => retry + 1);
         }}
       />
@@ -1221,6 +1228,7 @@ function ProductConversationPageInner() {
             suppressTaskApprovalOwner={true}
             mutationEnabled={liveControlsEnabled}
             aggregateLifecycleOpen={isOpen}
+            systemPromptRevision={snapshot.project_coordinator_profile?.revision ?? 0}
             onProjectionChange={setLatestProjection}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
