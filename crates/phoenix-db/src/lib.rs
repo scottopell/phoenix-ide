@@ -33,6 +33,10 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
+use phoenix_core::domain::product_conversation::{
+    AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ContinuationOpeningAuthority,
+    ProductConversationId,
+};
 use phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID;
 use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
@@ -397,7 +401,62 @@ pub(crate) async fn commit_continuation_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    admit_automatic_continuation_tx(
+        tx,
+        conversation_id,
+        operation_id,
+        &message.message_id,
+        state_updated_at.timestamp_micros(),
+    )
+    .await?;
     Ok(ContinuationCommitOutcome::Applied)
+}
+
+async fn admit_automatic_continuation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    operation_id: &str,
+    summary_message_id: &str,
+    admitted_at_unix_micros: i64,
+) -> DbResult<()> {
+    let first_message_id = format!("automatic-continuation-{conversation_id}-{operation_id}");
+    sqlx::query(
+        "INSERT INTO automatic_continuation_admissions (
+             predecessor_conversation_id, product_conversation_id, summary_message_id,
+             operation_id, first_message_id, opening_authority, phase,
+             no_progress_attempts, last_error,
+             admitted_at_unix_micros, updated_at_unix_micros
+         )
+         SELECT conversation.id, conversation.product_conversation_id, ?2, ?3, ?4,
+                'generated_predecessor_context', 'admitted', 0, NULL, ?5, ?5
+         FROM conversations conversation
+         JOIN product_conversations product
+           ON product.id = conversation.product_conversation_id
+         WHERE conversation.id = ?1
+           AND conversation.parent_conversation_id IS NULL
+           AND conversation.runtime_role IN ('user', 'coordinator')
+           AND conversation.state_kind = 'context_exhausted'
+           AND conversation.continued_in_conv_id IS NULL
+           AND product.auto_continue_on_context_exhaustion = 1
+           AND (
+               product.kind = 'coordinator'
+               OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM close_obligations obligation
+               WHERE obligation.product_conversation_id = product.id
+                 AND obligation.phase <> 'completed'
+           )
+         ON CONFLICT(predecessor_conversation_id) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(summary_message_id)
+    .bind(operation_id)
+    .bind(first_message_id)
+    .bind(admitted_at_unix_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
@@ -529,6 +588,7 @@ pub struct ContinuationDispatchIntent {
     pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
+    pub opening_authority: ContinuationOpeningAuthority,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +596,33 @@ pub struct NewContinuationDispatchIntent {
     pub message_id: ClientTurnKey,
     pub handoff: String,
     pub user_agent: Option<String>,
+    pub opening_authority: ContinuationOpeningAuthority,
+}
+
+impl NewContinuationDispatchIntent {
+    #[must_use]
+    pub fn user_authorized(
+        message_id: ClientTurnKey,
+        handoff: String,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self {
+            message_id,
+            handoff,
+            user_agent,
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        }
+    }
+
+    #[must_use]
+    pub fn generated_predecessor_context(message_id: ClientTurnKey, handoff: String) -> Self {
+        Self {
+            message_id,
+            handoff,
+            user_agent: None,
+            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        }
+    }
 }
 
 /// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
@@ -1196,6 +1283,21 @@ pub enum ContinuationCommitOutcome {
     Applied,
     Duplicate,
     Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticContinuationAdmission {
+    pub predecessor_conversation_id: String,
+    pub product_conversation_id: ProductConversationId,
+    pub summary_message_id: String,
+    pub operation_id: String,
+    pub first_message_id: ClientTurnKey,
+    pub opening_authority: ContinuationOpeningAuthority,
+    pub phase: AutomaticContinuationPhase,
+    pub no_progress_attempts: u32,
+    pub last_error: Option<String>,
+    pub admitted_at_unix_micros: i64,
+    pub updated_at_unix_micros: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4329,7 +4431,9 @@ impl Database {
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
         let row = sqlx::query(
-            "SELECT parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
+            "SELECT parent_conversation_id, successor_conversation_id, message_id,
+                    handoff, user_agent, opening_authority
+             FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
         .fetch_optional(&self.pool)
@@ -4342,6 +4446,12 @@ impl Database {
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 handoff: row.get("handoff"),
                 user_agent: row.get("user_agent"),
+                opening_authority: ContinuationOpeningAuthority::from_db_str(
+                    &row.get::<String, _>("opening_authority"),
+                )
+                .ok_or_else(|| {
+                    DbError::Serialization("unknown continuation opening authority".to_string())
+                })?,
             })
         })
         .transpose()
@@ -6408,6 +6518,109 @@ impl Database {
         Ok(ids)
     }
 
+    /// Read the aggregate-scoped automatic-continuation preference.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation is missing or its preference cannot be read.
+    pub async fn auto_continue_on_context_exhaustion(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<AutoContinueOnContextExhaustion> {
+        let enabled: Option<i64> = sqlx::query_scalar(
+            "SELECT auto_continue_on_context_exhaustion
+             FROM product_conversations WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        enabled
+            .map(|value| AutoContinueOnContextExhaustion::from(value != 0))
+            .ok_or_else(|| DbError::ProductConversationUnavailable(product_conversation_id.clone()))
+    }
+
+    /// Persist the aggregate-scoped automatic-continuation preference.
+    ///
+    /// The update is prospective: it never scans or admits an already-exhausted transcript.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation is missing or the update fails.
+    pub async fn set_auto_continue_on_context_exhaustion(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        preference: AutoContinueOnContextExhaustion,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE product_conversations
+             SET auto_continue_on_context_exhaustion = ?1
+             WHERE id = ?2",
+        )
+        .bind(i64::from(bool::from(preference)))
+        .bind(product_conversation_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ProductConversationUnavailable(
+                product_conversation_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return the automatic continuation admitted for this predecessor, if any.
+    ///
+    /// # Errors
+    /// Returns an error when persisted admission fields are invalid or cannot be read.
+    pub async fn automatic_continuation_admission(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<Option<AutomaticContinuationAdmission>> {
+        let row = sqlx::query(
+            "SELECT product_conversation_id, summary_message_id, operation_id,
+                    first_message_id, opening_authority, phase,
+                    no_progress_attempts, last_error,
+                    admitted_at_unix_micros, updated_at_unix_micros
+             FROM automatic_continuation_admissions
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(predecessor_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let product_conversation_id: String = row.try_get("product_conversation_id")?;
+        let first_message_id: String = row.try_get("first_message_id")?;
+        let opening_authority: String = row.try_get("opening_authority")?;
+        let phase: String = row.try_get("phase")?;
+        let attempts: i64 = row.try_get("no_progress_attempts")?;
+        Ok(Some(AutomaticContinuationAdmission {
+            predecessor_conversation_id: predecessor_conversation_id.to_string(),
+            product_conversation_id: ProductConversationId::parse(product_conversation_id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            summary_message_id: row.try_get("summary_message_id")?,
+            operation_id: row.try_get("operation_id")?,
+            first_message_id: ClientTurnKey::try_from(first_message_id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            opening_authority: ContinuationOpeningAuthority::from_db_str(&opening_authority)
+                .ok_or_else(|| {
+                    DbError::Serialization(format!(
+                        "unknown continuation opening authority: {opening_authority}"
+                    ))
+                })?,
+            phase: AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
+                DbError::Serialization(format!("unknown automatic continuation phase: {phase}"))
+            })?,
+            no_progress_attempts: u32::try_from(attempts).map_err(|_| {
+                DbError::Serialization(format!(
+                    "invalid automatic continuation no-progress attempts: {attempts}"
+                ))
+            })?,
+            last_error: row.try_get("last_error")?,
+            admitted_at_unix_micros: row.try_get("admitted_at_unix_micros")?,
+            updated_at_unix_micros: row.try_get("updated_at_unix_micros")?,
+        }))
+    }
+
     /// Atomically commit a generated continuation summary when the persisted
     /// continuation operation still matches `operation_id`.
     ///
@@ -7943,13 +8156,17 @@ impl Database {
 
         if let Some(intent) = intent {
             sqlx::query(
-                "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO continuation_dispatch_intents (
+                     parent_conversation_id, successor_conversation_id, message_id,
+                     handoff, user_agent, opening_authority, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(parent_id)
             .bind(&new_id)
             .bind(intent.message_id.as_str())
             .bind(&intent.handoff)
             .bind(intent.user_agent.as_deref())
+            .bind(intent.opening_authority.as_str())
             .bind(&now_str)
             .execute(&mut *tx)
             .await?;
@@ -17617,6 +17834,309 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn continuation_commit_admits_automatic_work_only_when_preference_was_enabled() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (conversation_id, operation_id, enabled) in [
+            ("auto-off", "shared-operation", false),
+            ("auto-on", "shared-operation", true),
+            ("auto-on-second", "shared-operation", true),
+        ] {
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            if enabled {
+                let product_conversation_id = db
+                    .get_conversation(conversation_id)
+                    .await
+                    .unwrap()
+                    .product_conversation_id;
+                db.set_auto_continue_on_context_exhaustion(
+                    &product_conversation_id,
+                    AutoContinueOnContextExhaustion::Enabled,
+                )
+                .await
+                .unwrap();
+            }
+            db.update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: operation_id.to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let summary = format!("exact summary for {conversation_id}  \n");
+            let content = MessageContent::continuation(&summary);
+            let message = Message {
+                message_id: format!("continuation-{conversation_id}"),
+                conversation_id: conversation_id.to_string(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            };
+            assert_eq!(
+                db.commit_continuation(
+                    conversation_id,
+                    operation_id,
+                    &message,
+                    &ConvState::ContextExhausted { summary },
+                    Utc::now(),
+                )
+                .await
+                .unwrap(),
+                ContinuationCommitOutcome::Applied
+            );
+        }
+
+        assert!(db
+            .automatic_continuation_admission("auto-off")
+            .await
+            .unwrap()
+            .is_none());
+        let auto_off_product = db
+            .get_conversation("auto-off")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.set_auto_continue_on_context_exhaustion(
+            &auto_off_product,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .automatic_continuation_admission("auto-off")
+            .await
+            .unwrap()
+            .is_none());
+
+        let admitted = db
+            .automatic_continuation_admission("auto-on")
+            .await
+            .unwrap()
+            .expect("enabled aggregate admits automatic continuation atomically");
+        assert_eq!(admitted.predecessor_conversation_id, "auto-on");
+        assert_eq!(admitted.operation_id, "shared-operation");
+        assert_eq!(admitted.summary_message_id, "continuation-auto-on");
+        assert_eq!(
+            admitted.opening_authority,
+            ContinuationOpeningAuthority::GeneratedPredecessorContext
+        );
+        assert_eq!(admitted.phase, AutomaticContinuationPhase::Admitted);
+        assert_eq!(admitted.no_progress_attempts, 0);
+        assert!(admitted.last_error.is_none());
+        assert!(admitted.admitted_at_unix_micros >= 0);
+        assert_eq!(
+            admitted.updated_at_unix_micros,
+            admitted.admitted_at_unix_micros
+        );
+        let immutable_authority = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET opening_authority = 'user_authorized_instruction'
+             WHERE predecessor_conversation_id = 'auto-on'",
+        )
+        .execute(&db.pool)
+        .await;
+        assert!(immutable_authority.is_err());
+        assert!(db
+            .automatic_continuation_admission("auto-on-second")
+            .await
+            .unwrap()
+            .is_some());
+
+        let auto_on_product = admitted.product_conversation_id.clone();
+        db.set_auto_continue_on_context_exhaustion(
+            &auto_on_product,
+            AutoContinueOnContextExhaustion::Disabled,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .automatic_continuation_admission("auto-on")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db.commit_continuation(
+                "auto-on",
+                "shared-operation",
+                &db.get_messages("auto-on").await.unwrap()[0],
+                &ConvState::ContextExhausted {
+                    summary: "exact summary for auto-on  \n".to_string(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        let admission_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM automatic_continuation_admissions
+             WHERE operation_id = 'shared-operation'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(admission_count, 2);
+    }
+
+    #[tokio::test]
+    async fn coordinator_continuation_commit_admits_automatic_work() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.set_auto_continue_on_context_exhaustion(
+            &coordinator.product_conversation_id,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        let operation_id = "coordinator-operation";
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let summary = "coordinator exact summary".to_string();
+        let content = MessageContent::continuation(&summary);
+        let message = Message {
+            message_id: "coordinator-continuation-summary".to_string(),
+            conversation_id: coordinator.id.clone(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            db.commit_continuation(
+                &coordinator.id,
+                operation_id,
+                &message,
+                &ConvState::ContextExhausted { summary },
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        let admission = db
+            .automatic_continuation_admission(&coordinator.id)
+            .await
+            .unwrap()
+            .expect("coordinator aggregate is eligible for automatic admission");
+        assert_eq!(
+            admission.product_conversation_id,
+            coordinator.product_conversation_id
+        );
+        assert_eq!(
+            admission.opening_authority,
+            ContinuationOpeningAuthority::GeneratedPredecessorContext
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_continuation_admission_obeys_history_and_close_fences() {
+        for (conversation_id, history, active_close) in
+            [("auto-history", true, false), ("auto-close", false, true)]
+        {
+            let db = Database::open_in_memory().await.unwrap();
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let conversation = db.get_conversation(conversation_id).await.unwrap();
+            db.set_auto_continue_on_context_exhaustion(
+                &conversation.product_conversation_id,
+                AutoContinueOnContextExhaustion::Enabled,
+            )
+            .await
+            .unwrap();
+            if history {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+                     WHERE id = ?1",
+                )
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            if active_close {
+                db.begin_close_foundation(
+                    &conversation.product_conversation_id,
+                    &TranscriptConversationId::parse(conversation.id.clone()).unwrap(),
+                    "automatic-continuation-close-fence",
+                )
+                .await
+                .unwrap();
+            }
+            let operation_id = format!("operation-{conversation_id}");
+            db.update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: operation_id.clone(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let summary = format!("summary-{conversation_id}");
+            let content = MessageContent::continuation(&summary);
+            let message = Message {
+                message_id: format!("summary-{conversation_id}"),
+                conversation_id: conversation_id.to_string(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            };
+            assert_eq!(
+                db.commit_continuation(
+                    conversation_id,
+                    &operation_id,
+                    &message,
+                    &ConvState::ContextExhausted { summary },
+                    Utc::now(),
+                )
+                .await
+                .unwrap(),
+                ContinuationCommitOutcome::Applied
+            );
+            assert!(db
+                .automatic_continuation_admission(conversation_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn raw_continuation_start_and_commit_reserve_writer_before_reads() {
         let (_dir, setup, contender) = open_test_db_pair().await;
         setup
@@ -22542,11 +23062,11 @@ mod tests {
         )
         .await;
 
-        let requested = NewContinuationDispatchIntent {
-            message_id: ClientTurnKey::try_from("opening-message").unwrap(),
-            handoff: "Exact edited handoff".to_string(),
-            user_agent: Some("test-agent".to_string()),
-        };
+        let requested = NewContinuationDispatchIntent::user_authorized(
+            ClientTurnKey::try_from("opening-message").unwrap(),
+            "Exact edited handoff".to_string(),
+            Some("test-agent".to_string()),
+        );
         let (outcome, intent) = db
             .continue_conversation_with_intent("parent-intent", requested)
             .await
@@ -22562,6 +23082,10 @@ mod tests {
         assert_eq!(intent.successor_conversation_id, successor_id);
         assert_eq!(intent.message_id.as_str(), "opening-message");
         assert_eq!(intent.handoff, "Exact edited handoff");
+        assert_eq!(
+            intent.opening_authority,
+            ContinuationOpeningAuthority::UserAuthorizedInstruction
+        );
 
         let content = MessageContent::User(UserContent::new("Exact edited handoff"));
         db.add_message("opening-message", &successor_id, &content, None, None)
@@ -22572,6 +23096,69 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn generated_context_authority_survives_dispatch_settlement() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "generated-authority-parent",
+            "generated-authority-parent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let content = MessageContent::continuation("exact generated context");
+        db.add_message(
+            "generated-summary",
+            "generated-authority-parent",
+            &content,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (outcome, intent) = db
+            .continue_conversation_with_intent(
+                "generated-authority-parent",
+                NewContinuationDispatchIntent::generated_predecessor_context(
+                    ClientTurnKey::try_from("generated-opening").unwrap(),
+                    "exact generated context".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        let successor = match outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!("expected Created, already continued to {}", conversation.id)
+            }
+            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("expected Created, parent state was {state_variant}")
+            }
+        };
+        assert_eq!(
+            intent.unwrap().opening_authority,
+            ContinuationOpeningAuthority::GeneratedPredecessorContext
+        );
+        let opening = MessageContent::User(UserContent::new("exact generated context"));
+        db.add_message("generated-opening", &successor.id, &opening, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .continuation_dispatch_intent("generated-authority-parent")
+            .await
+            .unwrap()
+            .is_none());
+        let authority: String = sqlx::query_scalar(
+            "SELECT opening_authority FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = 'generated-authority-parent'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(authority, "generated_predecessor_context");
     }
 
     #[tokio::test]
@@ -22587,11 +23174,11 @@ mod tests {
         .await;
         db.continue_conversation_with_intent(
             "parent-retry-intent",
-            NewContinuationDispatchIntent {
-                message_id: ClientTurnKey::try_from("original-message").unwrap(),
-                handoff: "Original handoff".to_string(),
-                user_agent: None,
-            },
+            NewContinuationDispatchIntent::user_authorized(
+                ClientTurnKey::try_from("original-message").unwrap(),
+                "Original handoff".to_string(),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -22599,11 +23186,11 @@ mod tests {
         let (outcome, intent) = db
             .continue_conversation_with_intent(
                 "parent-retry-intent",
-                NewContinuationDispatchIntent {
-                    message_id: ClientTurnKey::try_from("different-message").unwrap(),
-                    handoff: "Must not replace original".to_string(),
-                    user_agent: None,
-                },
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("different-message").unwrap(),
+                    "Must not replace original".to_string(),
+                    None,
+                ),
             )
             .await
             .unwrap();

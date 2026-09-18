@@ -5500,11 +5500,11 @@ async fn continue_conversation(
         .db()
         .continue_conversation_with_intent(
             &id,
-            crate::db::NewContinuationDispatchIntent {
+            crate::db::NewContinuationDispatchIntent::user_authorized(
                 message_id,
-                handoff: req.handoff,
-                user_agent: req.user_agent,
-            },
+                req.handoff,
+                req.user_agent,
+            ),
         )
         .await
         .map_err(|e| match e {

@@ -2,6 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -73,6 +74,100 @@ impl fmt::Display for ProductConversationIdError {
 }
 
 impl std::error::Error for ProductConversationIdError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AutoContinueOnContextExhaustion {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl AutoContinueOnContextExhaustion {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+impl From<bool> for AutoContinueOnContextExhaustion {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+impl From<AutoContinueOnContextExhaustion> for bool {
+    fn from(preference: AutoContinueOnContextExhaustion) -> Self {
+        preference.is_enabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ContinuationOpeningAuthority {
+    UserAuthorizedInstruction,
+    GeneratedPredecessorContext,
+}
+
+impl ContinuationOpeningAuthority {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserAuthorizedInstruction => "user_authorized_instruction",
+            Self::GeneratedPredecessorContext => "generated_predecessor_context",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "user_authorized_instruction" => Self::UserAuthorizedInstruction,
+            "generated_predecessor_context" => Self::GeneratedPredecessorContext,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AutomaticContinuationPhase {
+    Admitted,
+    SuccessorReserved,
+    OwnershipTransferred,
+    DispatchAccepted,
+    MessageSettled,
+    Failed,
+}
+
+impl AutomaticContinuationPhase {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::SuccessorReserved => "successor_reserved",
+            Self::OwnershipTransferred => "ownership_transferred",
+            Self::DispatchAccepted => "dispatch_accepted",
+            Self::MessageSettled => "message_settled",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "admitted" => Self::Admitted,
+            "successor_reserved" => Self::SuccessorReserved,
+            "ownership_transferred" => Self::OwnershipTransferred,
+            "dispatch_accepted" => Self::DispatchAccepted,
+            "message_settled" => Self::MessageSettled,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +274,46 @@ impl ProductConversationKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_continuation_preference_defaults_off_and_converts_explicitly() {
+        assert_eq!(
+            AutoContinueOnContextExhaustion::default(),
+            AutoContinueOnContextExhaustion::Disabled
+        );
+        assert!(!AutoContinueOnContextExhaustion::default().is_enabled());
+        assert_eq!(
+            AutoContinueOnContextExhaustion::from(true),
+            AutoContinueOnContextExhaustion::Enabled
+        );
+        assert!(bool::from(AutoContinueOnContextExhaustion::Enabled));
+    }
+
+    #[test]
+    fn continuation_opening_authority_has_no_implicit_fallback() {
+        assert_eq!(
+            ContinuationOpeningAuthority::from_db_str("user_authorized_instruction"),
+            Some(ContinuationOpeningAuthority::UserAuthorizedInstruction)
+        );
+        assert_eq!(
+            ContinuationOpeningAuthority::GeneratedPredecessorContext.as_str(),
+            "generated_predecessor_context"
+        );
+        assert_eq!(ContinuationOpeningAuthority::from_db_str("unknown"), None);
+    }
+
+    #[test]
+    fn automatic_continuation_phase_rejects_unknown_storage_values() {
+        assert_eq!(
+            AutomaticContinuationPhase::from_db_str("admitted"),
+            Some(AutomaticContinuationPhase::Admitted)
+        );
+        assert_eq!(
+            AutomaticContinuationPhase::MessageSettled.as_str(),
+            "message_settled"
+        );
+        assert_eq!(AutomaticContinuationPhase::from_db_str("unknown"), None);
+    }
 
     #[test]
     fn product_conversation_id_rejects_empty() {

@@ -481,6 +481,7 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
             successor_transcript_row_id,
             continuation_message_id,
             accepted_successor_message_id,
+            opening_authority,
             summary,
             ..
         } => ProductConversationHandoffView::Completed {
@@ -488,6 +489,7 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
             successor_transcript_row_id: successor_transcript_row_id.clone(),
             continuation_message_id: continuation_message_id.clone(),
             accepted_successor_message_id: accepted_successor_message_id.clone(),
+            opening_authority: *opening_authority,
             summary: summary.clone(),
         },
         ProductConversationHandoff::Historical {
@@ -810,11 +812,11 @@ mod tests {
             .db
             .continue_conversation_with_intent(
                 &root.id,
-                crate::db::NewContinuationDispatchIntent {
-                    message_id: ClientTurnKey::try_from(opening_message_id.to_string()).unwrap(),
-                    handoff: "accepted opening handoff".to_string(),
-                    user_agent: None,
-                },
+                crate::db::NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from(opening_message_id.to_string()).unwrap(),
+                    "accepted opening handoff".to_string(),
+                    None,
+                ),
             )
             .await
             .unwrap();

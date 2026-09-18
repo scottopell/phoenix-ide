@@ -634,3 +634,26 @@ state instead of recognizing the moment they want. A fixed role — navigation
 always, on cold load and while streaming — avoids the ambiguity of a slot that
 means different things at different moments; live activity is the StateBar's
 job (REQ-CONV-007).
+
+---
+
+### REQ-CONV-024: Automatic Context Continuation Control
+
+WHEN the user views a stable ordinary ProductConversation or the stable Global Coordinator aggregate
+THE SYSTEM SHALL expose one aggregate-scoped automatic context continuation control
+AND SHALL show it OFF unless that exact aggregate has been explicitly enabled
+AND SHALL explain that the control applies only to future entries into context exhausted state
+AND SHALL NOT imply that enabling it starts, wakes, or resumes a row that is already context exhausted
+AND SHALL NOT imply that disabling it cancels already-admitted continuation work
+
+WHEN the viewed route is a subordinate conversation, sub-agent, legacy row-only fallback, or another aggregate kind
+THE SYSTEM SHALL NOT expose the automatic continuation control
+
+WHEN one admitted automatic continuation operation opens its bounded no-progress breaker or cannot complete
+THE SYSTEM SHALL show the actionable failure persisted for that admission
+AND SHALL keep the predecessor's accepted generated handoff visible
+AND SHALL present an explicit safe retry or fallback through the shared manual continuation operation using that same payload and opening-message identity
+AND SHALL NOT imply that the failure disables later automatic continuations for the aggregate
+AND SHALL NOT silently loop, fabricate progress, or introduce a separate automatic-retry action
+
+**Rationale:** Automatic continuation configuration belongs to the durable conversation users recognize, not to a replaceable transcript segment. Prospective semantics prevent a toggle from misrepresenting already-exhausted or already-admitted work, while the shared continuation operation remains the single recovery path.

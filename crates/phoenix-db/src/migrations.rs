@@ -510,7 +510,211 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_invalid_continuation_dispatch_intents",
         sql: MIGRATION_098,
     },
+    Migration {
+        version: 100,
+        name: "persist_automatic_continuation_admission",
+        sql: MIGRATION_100,
+    },
 ];
+
+const MIGRATION_100: &str = r"
+ALTER TABLE product_conversations
+ADD COLUMN auto_continue_on_context_exhaustion INTEGER NOT NULL DEFAULT 0
+CHECK (
+    typeof(auto_continue_on_context_exhaustion) = 'integer'
+    AND auto_continue_on_context_exhaustion IN (0, 1)
+);
+
+DROP TRIGGER consume_continuation_dispatch_intent;
+DROP TRIGGER IF EXISTS completed_continuation_handoffs_validate_insert;
+DROP TRIGGER IF EXISTS completed_continuation_handoffs_immutable;
+CREATE TABLE completed_continuation_handoffs_with_authority (
+    predecessor_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT UNIQUE NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    continuation_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    accepted_successor_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    opening_authority TEXT NOT NULL
+        CHECK (opening_authority IN ('user_authorized_instruction', 'generated_predecessor_context'))
+);
+INSERT INTO completed_continuation_handoffs_with_authority (
+    predecessor_conversation_id, successor_conversation_id,
+    continuation_message_id, accepted_successor_message_id, opening_authority
+)
+SELECT predecessor_conversation_id, successor_conversation_id,
+       continuation_message_id, accepted_successor_message_id,
+       'user_authorized_instruction'
+FROM completed_continuation_handoffs;
+DROP TABLE completed_continuation_handoffs;
+ALTER TABLE completed_continuation_handoffs_with_authority
+RENAME TO completed_continuation_handoffs;
+
+CREATE TRIGGER completed_continuation_handoffs_validate_insert
+BEFORE INSERT ON completed_continuation_handoffs
+FOR EACH ROW WHEN
+    NEW.predecessor_conversation_id = NEW.successor_conversation_id
+    OR NOT EXISTS (
+        SELECT 1 FROM conversations predecessor
+        WHERE predecessor.id = NEW.predecessor_conversation_id
+          AND predecessor.continued_in_conv_id = NEW.successor_conversation_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages continuation
+        WHERE continuation.message_id = NEW.continuation_message_id
+          AND continuation.conversation_id = NEW.predecessor_conversation_id
+          AND continuation.message_type = 'continuation'
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages accepted
+        WHERE accepted.message_id = NEW.accepted_successor_message_id
+          AND accepted.conversation_id = NEW.successor_conversation_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff relation mismatch');
+END;
+
+CREATE TRIGGER completed_continuation_handoffs_immutable
+BEFORE UPDATE ON completed_continuation_handoffs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff is immutable');
+END;
+
+CREATE TABLE continuation_dispatch_intents_with_authority (
+    parent_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT UNIQUE NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE NOT NULL CHECK (length(message_id) > 0),
+    handoff TEXT NOT NULL CHECK (length(trim(handoff)) > 0),
+    user_agent TEXT,
+    opening_authority TEXT NOT NULL
+        CHECK (opening_authority IN ('user_authorized_instruction', 'generated_predecessor_context')),
+    created_at TEXT NOT NULL
+);
+INSERT INTO continuation_dispatch_intents_with_authority (
+    parent_conversation_id, successor_conversation_id, message_id,
+    handoff, user_agent, opening_authority, created_at
+)
+SELECT parent_conversation_id, successor_conversation_id, message_id,
+       handoff, user_agent, 'user_authorized_instruction', created_at
+FROM continuation_dispatch_intents;
+DROP TABLE continuation_dispatch_intents;
+ALTER TABLE continuation_dispatch_intents_with_authority
+RENAME TO continuation_dispatch_intents;
+
+CREATE TRIGGER continuation_dispatch_intents_immutable_identity
+BEFORE UPDATE OF parent_conversation_id, successor_conversation_id,
+                 message_id, handoff, opening_authority
+ON continuation_dispatch_intents
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'continuation dispatch intent identity is immutable');
+END;
+
+CREATE TRIGGER consume_continuation_dispatch_intent
+AFTER INSERT ON messages
+WHEN EXISTS (
+    SELECT 1 FROM continuation_dispatch_intents intent
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
+      AND intent.successor_conversation_id = NEW.conversation_id
+)
+BEGIN
+    INSERT INTO completed_continuation_handoffs (
+        predecessor_conversation_id, successor_conversation_id,
+        continuation_message_id, accepted_successor_message_id, opening_authority
+    )
+    SELECT intent.parent_conversation_id, intent.successor_conversation_id,
+           continuation.message_id, NEW.message_id, intent.opening_authority
+    FROM continuation_dispatch_intents intent
+    JOIN messages continuation
+      ON continuation.conversation_id = intent.parent_conversation_id
+     AND continuation.message_type = 'continuation'
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
+      AND intent.successor_conversation_id = NEW.conversation_id
+    ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
+    LIMIT 1;
+
+    DELETE FROM continuation_dispatch_intents
+    WHERE successor_conversation_id = NEW.conversation_id
+      AND (message_id = NEW.message_id
+           OR NEW.message_id = successor_conversation_id || ':' || message_id);
+END;
+
+CREATE TABLE automatic_continuation_admissions (
+    predecessor_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    product_conversation_id TEXT NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    summary_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    operation_id TEXT NOT NULL CHECK (length(trim(operation_id)) > 0),
+    first_message_id TEXT UNIQUE NOT NULL CHECK (length(trim(first_message_id)) > 0),
+    opening_authority TEXT NOT NULL DEFAULT 'generated_predecessor_context'
+        CHECK (opening_authority = 'generated_predecessor_context'),
+    phase TEXT NOT NULL DEFAULT 'admitted'
+        CHECK (phase IN (
+            'admitted', 'successor_reserved', 'ownership_transferred',
+            'dispatch_accepted', 'message_settled', 'failed'
+        )),
+    no_progress_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(no_progress_attempts) = 'integer' AND no_progress_attempts >= 0),
+    last_error TEXT,
+    admitted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(admitted_at_unix_micros) = 'integer' AND admitted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    CHECK ((phase = 'failed') = (last_error IS NOT NULL)),
+    UNIQUE (predecessor_conversation_id, product_conversation_id)
+);
+
+CREATE TRIGGER automatic_continuation_admissions_immutable_identity
+BEFORE UPDATE OF predecessor_conversation_id, product_conversation_id,
+                 summary_message_id, operation_id, first_message_id,
+                 opening_authority, admitted_at_unix_micros
+ON automatic_continuation_admissions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'automatic continuation admission identity is immutable');
+END;
+
+CREATE TRIGGER automatic_continuation_admissions_validate_insert
+BEFORE INSERT ON automatic_continuation_admissions
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM conversations predecessor
+    JOIN product_conversations product
+      ON product.id = predecessor.product_conversation_id
+    JOIN messages summary
+      ON summary.message_id = NEW.summary_message_id
+     AND summary.conversation_id = predecessor.id
+     AND summary.message_type = 'continuation'
+    WHERE predecessor.id = NEW.predecessor_conversation_id
+      AND predecessor.product_conversation_id = NEW.product_conversation_id
+      AND predecessor.parent_conversation_id IS NULL
+      AND predecessor.runtime_role IN ('user', 'coordinator')
+      AND predecessor.state_kind = 'context_exhausted'
+      AND predecessor.continued_in_conv_id IS NULL
+      AND product.auto_continue_on_context_exhaustion = 1
+      AND (
+          product.kind = 'coordinator'
+          OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_obligations obligation
+          WHERE obligation.product_conversation_id = product.id
+            AND obligation.phase <> 'completed'
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'automatic continuation admission requires eligible opted-in context exhaustion');
+END;
+";
 
 const MIGRATION_098: &str = r"
 DELETE FROM continuation_dispatch_intents
@@ -10241,6 +10445,152 @@ mod tests {
         assert!(empty_insert.is_err());
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_100_defaults_historical_aggregates_off_and_manual_intents_to_user_authority()
+    {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 ordinary_lifecycle TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT REFERENCES product_conversations(id),
+                 parent_conversation_id TEXT,
+                 runtime_role TEXT NOT NULL,
+                 state_kind TEXT NOT NULL,
+                 continued_in_conv_id TEXT
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL
+             );
+             CREATE TABLE close_obligations (
+                 product_conversation_id TEXT NOT NULL,
+                 phase TEXT NOT NULL
+             );
+             CREATE TABLE completed_continuation_handoffs (
+                 predecessor_conversation_id TEXT PRIMARY KEY NOT NULL,
+                 successor_conversation_id TEXT UNIQUE NOT NULL,
+                 continuation_message_id TEXT UNIQUE NOT NULL,
+                 accepted_successor_message_id TEXT UNIQUE NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_045).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('ordinary', 'ordinary', 'open'), ('coordinator', 'coordinator', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 state_kind, continued_in_conv_id
+             ) VALUES
+                 ('parent', 'ordinary', NULL, 'user', 'context_exhausted', 'successor'),
+                 ('successor', 'ordinary', NULL, 'user', 'idle', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES ('parent', 'successor', 'manual-message', 'manual handoff', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+
+        let preferences: Vec<i64> = sqlx::query_scalar(
+            "SELECT auto_continue_on_context_exhaustion
+             FROM product_conversations ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preferences, vec![0, 0]);
+        let authority: String = sqlx::query_scalar(
+            "SELECT opening_authority FROM continuation_dispatch_intents
+             WHERE parent_conversation_id = 'parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(authority, "user_authorized_instruction");
+        let mutable_authority = sqlx::query(
+            "UPDATE continuation_dispatch_intents
+             SET opening_authority = 'generated_predecessor_context'
+             WHERE parent_conversation_id = 'parent'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mutable_authority.is_err());
+        let authority_default: Option<String> = sqlx::query(
+            "SELECT dflt_value FROM pragma_table_info('continuation_dispatch_intents')
+             WHERE name = 'opening_authority'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("dflt_value");
+        assert!(authority_default.is_none());
+        let admission_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM automatic_continuation_admissions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(admission_count, 0);
+        let timestamp_columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, type FROM pragma_table_info('automatic_continuation_admissions')
+             WHERE name IN ('admitted_at_unix_micros', 'updated_at_unix_micros')
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            timestamp_columns,
+            vec![
+                ("admitted_at_unix_micros".to_string(), "INTEGER".to_string()),
+                ("updated_at_unix_micros".to_string(), "INTEGER".to_string()),
+            ]
+        );
+        let invalid_timestamp = sqlx::query(
+            "INSERT INTO automatic_continuation_admissions (
+                 predecessor_conversation_id, product_conversation_id, summary_message_id,
+                 operation_id, first_message_id, opening_authority, phase,
+                 no_progress_attempts, last_error,
+                 admitted_at_unix_micros, updated_at_unix_micros
+             ) VALUES (
+                 'parent', 'ordinary', 'missing-summary', 'operation', 'opening',
+                 'generated_predecessor_context', 'admitted', 0, NULL, -1, 0
+             )",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_timestamp.is_err());
+        assert!(sqlx::query(
+            "UPDATE product_conversations
+             SET auto_continue_on_context_exhaustion = 2 WHERE id = 'ordinary'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
     #[test]
     fn compiled_migration_digest_binds_version_name_and_sql_body() {
         let baseline =
@@ -14879,7 +15229,8 @@ mod tests {
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
+                    (100, 'temporarily_skip_automatic_continuation_admission')",
         )
         .execute(&pool)
         .await
@@ -15771,7 +16122,8 @@ mod tests {
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
+                    (100, 'temporarily_skip_automatic_continuation_admission')",
         )
         .execute(pool)
         .await

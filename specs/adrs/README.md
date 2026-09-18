@@ -65,6 +65,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
+| [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 
 ## For agents: which decisions bind your task
 
@@ -105,6 +106,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
+| Specifying opt-in automatic continuation consent, admission, or generated-context authority | 054, then 025, 031, 045, and 046 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 | Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 
@@ -144,6 +146,7 @@ ADR-000 (adopt spEARS v2 for new work)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
       │   └── ADR-045 (Provider prompts use persisted generation-fenced projections)
+      │       └── ADR-054 (Automatic continuation admission binds consent and context authority)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
