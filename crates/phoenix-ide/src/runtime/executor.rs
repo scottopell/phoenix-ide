@@ -8438,7 +8438,7 @@ where
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), FollowUpApprovalError> {
-        reread_reviewed_task_handoff_snapshot(
+        reread_reviewed_task_handoff_snapshot_at_exact_path(
             self.context.filesystem_root(),
             self.context.filesystem_root(),
             &self.context.tasks_dir_name,
@@ -8937,7 +8937,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original_path_was_tracked =
         run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
-    let mut snapshot = reread_reviewed_task_handoff_snapshot(
+    let mut snapshot = reread_reviewed_task_handoff_snapshot_at_exact_path(
         cwd,
         cwd,
         tasks_dir_name,
@@ -8994,6 +8994,53 @@ fn persist_fresh_approved_task_artifact_blocking(
 }
 
 fn reread_reviewed_task_handoff_snapshot(
+    cwd: &std::path::Path,
+    approval_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let proposed_path = cwd.join(task_file);
+    if proposed_path.exists() {
+        return reread_reviewed_task_handoff_snapshot_at_exact_path(
+            cwd,
+            approval_root,
+            tasks_dir_name,
+            task_file,
+            expected_title,
+            expected_priority,
+            expected_plan,
+        );
+    }
+    let filename = proposed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!("Failed to read reviewed task file '{task_file}': file not found")
+    })?;
+    let promoted_file = format!(
+        "{}-{}-in-progress--{}.md",
+        parsed.id, parsed.priority, parsed.slug
+    );
+    let promoted = Path::new(task_file).with_file_name(promoted_file);
+    let promoted = promoted
+        .to_str()
+        .ok_or_else(|| format!("promoted task path is not UTF-8: '{}'", promoted.display()))?;
+    reread_reviewed_task_handoff_snapshot_at_exact_path(
+        cwd,
+        approval_root,
+        tasks_dir_name,
+        promoted,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )
+}
+
+fn reread_reviewed_task_handoff_snapshot_at_exact_path(
     cwd: &std::path::Path,
     _repo_root: &std::path::Path,
     tasks_dir_name: &str,
@@ -15407,7 +15454,7 @@ mod approved_explore_follow_up_tests {
         std::fs::write(outside.path(), plan).unwrap();
         symlink(outside.path(), cwd.path().join(task_file)).unwrap();
 
-        let error = reread_reviewed_task_handoff_snapshot(
+        let error = reread_reviewed_task_handoff_snapshot_at_exact_path(
             cwd.path(),
             cwd.path(),
             "tasks",
