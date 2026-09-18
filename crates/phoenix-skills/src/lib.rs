@@ -406,17 +406,29 @@ pub fn discover_builtin_skills_for_audience(
     audience: SkillAudience,
 ) -> Vec<SkillMetadata> {
     let mut skills = Vec::new();
-    let mut seen_names = HashSet::new();
-    let mut seen_paths = HashSet::new();
-    let mut seen_content = HashSet::new();
-    if let Some(dir) = builtin_dir.filter(|dir| dir.is_dir()) {
-        collect_builtin_skills_from_dir(
-            dir,
-            &mut skills,
-            &mut seen_names,
-            &mut seen_paths,
-            &mut seen_content,
-        );
+    let _ = builtin_dir;
+    for name in builtin::skill_names() {
+        let Some(content) = builtin::embedded_skill(&name) else {
+            continue;
+        };
+        let Some(fm) = parse_skill_frontmatter(&content) else {
+            continue;
+        };
+        if fm.name != name {
+            continue;
+        }
+        skills.push(SkillMetadata {
+            name: fm.name,
+            description: fm.description,
+            argument_hint: fm.argument_hint,
+            audience: fm.audience.unwrap_or_default(),
+            source: SkillSource::Builtin {
+                path: builtin::default_extract_dir()
+                    .unwrap_or_default()
+                    .join(name)
+                    .join("SKILL.md"),
+            },
+        });
     }
     skills.retain(|skill| skill.audience == audience);
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1346,9 +1358,9 @@ mod tests {
             Some(&extract_dir),
             SkillAudience::GlobalCoordinator,
         );
-        assert!(tampered.is_empty());
+        assert_eq!(tampered.len(), 1);
+        assert_eq!(tampered[0].description, "Use supported Phoenix HTTP APIs for user-authorized Global Coordinator lifecycle actions.");
 
-        builtin::extract_to(&extract_dir).unwrap();
         let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
             .expect("authenticated coordinator catalog");
         std::fs::write(&extracted, "forged after discovery").unwrap();

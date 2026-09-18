@@ -2819,7 +2819,18 @@ where
             self.retry_timer_handle = None;
         }
 
-        if matches!(outcome, EffectOutcome::Llm(LlmOutcome::Response { .. })) {
+        if matches!(&outcome, EffectOutcome::Llm(_))
+            && !matches!(
+                &outcome,
+                EffectOutcome::Llm(
+                    LlmOutcome::RateLimited { .. }
+                        | LlmOutcome::ServerError { .. }
+                        | LlmOutcome::InvalidResponse { .. }
+                        | LlmOutcome::NetworkError { .. }
+                        | LlmOutcome::TimedOut { .. }
+                )
+            )
+        {
             self.pending_trusted_tool_results.clear();
         }
 

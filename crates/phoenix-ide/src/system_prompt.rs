@@ -390,16 +390,16 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_prompt_references_skill_only_when_embedded_skill_exists() {
-        let temp = TempDir::new().unwrap();
+    fn coordinator_prompt_references_skill_only_when_catalog_is_authenticated() {
         let without_skill =
-            build_coordinator_system_prompt_with_options(LlmLanguage::default(), Some(temp.path()));
+            build_coordinator_system_prompt_with_catalog(LlmLanguage::default(), None);
         assert!(!without_skill.contains("available_skills"));
         assert!(!without_skill.contains("phoenix-api"));
 
-        crate::skills::builtin::extract_to(temp.path()).unwrap();
+        let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None)
+            .expect("embedded Coordinator skill catalog");
         let with_skill =
-            build_coordinator_system_prompt_with_options(LlmLanguage::default(), Some(temp.path()));
+            build_coordinator_system_prompt_with_catalog(LlmLanguage::default(), Some(&catalog));
         assert!(with_skill.contains("available_skills"));
         assert!(with_skill.contains("phoenix-api"));
         assert!(!with_skill.contains("allium"));
@@ -409,8 +409,9 @@ mod tests {
     #[test]
     fn coordinator_prompt_uses_conversation_llm_language() {
         let without_builtins =
-            build_coordinator_system_prompt_with_options(LlmLanguage::Caveman, None);
-        assert!(!without_builtins.contains("trusted_builtin_skill"));
+            build_coordinator_system_prompt_with_catalog(LlmLanguage::Caveman, None);
+        assert!(!without_builtins.contains("<available_skills>"));
+        assert!(!without_builtins.contains("phoenix-api"));
         assert!(!without_builtins.contains("documented Phoenix APIs"));
 
         let prompt = coordinator_prompt_with_builtins(LlmLanguage::Caveman);
