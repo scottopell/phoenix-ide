@@ -315,7 +315,15 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
     output: &PreviousTranscriptsOutput,
 ) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string_pretty(output)?;
-    if json.len() <= PREVIOUS_TOOL_RESULT_BYTES {
+    if json.len() <= PREVIOUS_TOOL_RESULT_BYTES
+        || matches!(
+            output,
+            PreviousTranscriptsOutput::ReadPage {
+                starts_at: Some(start),
+                ..
+            } if start.message_id.len() > PREVIOUS_TITLE_BYTES
+        )
+    {
         return Ok(json);
     }
     serde_json::to_string_pretty(&PreviousTranscriptsOutput::ResultTruncated {
@@ -890,17 +898,14 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         PreviousTranscriptsOutput::ReadPage {
             transcript: previous_summary(conv, ordinal, ordinal + 1 == predecessors.len()),
-            starts_at: page.start.map(|start| {
-                let message_id = if start.message_id.len() <= PREVIOUS_TITLE_BYTES {
-                    start.message_id
-                } else {
-                    format!("sha256:{}", identity_sha256(&start.message_id))
-                };
-                PreviousTranscriptReadStart {
-                    message_ref: format!("@conv:{}#message-{message_id}", conv.id),
-                    message_id,
-                    byte_offset: start.byte_offset,
-                }
+            starts_at: page.start.map(|start| PreviousTranscriptReadStart {
+                message_ref: format!(
+                    "@conv:{}#message-{}",
+                    conv.id,
+                    percent_encode_url_component(&start.message_id)
+                ),
+                message_id: start.message_id,
+                byte_offset: start.byte_offset,
             }),
             content: page.content,
             next_cursor,
@@ -1436,9 +1441,10 @@ async fn resolve_conversation_read_target(
         if id.is_empty() {
             return Err("conversation reference is missing an id".to_string());
         }
+        let message_id = message_id.map(percent_decode_url_component).transpose()?;
         return Ok(ConversationReadTarget {
             conversation_id: id.to_string(),
-            message_id: message_id.map(str::to_string),
+            message_id,
         });
     }
     if let Some(rest) = reference
@@ -1449,18 +1455,23 @@ async fn resolve_conversation_read_target(
         let conv = load_conversation_by_slug_or_id(service, slug)
             .await
             .map_err(|e| format!("conversation reference not found: {e:?}"))?;
+        let message_id = fragment
+            .and_then(message_id_fragment)
+            .map(percent_decode_url_component)
+            .transpose()?;
         return Ok(ConversationReadTarget {
             conversation_id: conv.id,
-            message_id: fragment.and_then(message_id_fragment).map(str::to_string),
+            message_id,
         });
     }
     let (id, message_id) = parse_conv_handle(reference);
     if id.is_empty() {
         Err("conversation reference is missing an id".to_string())
     } else {
+        let message_id = message_id.map(percent_decode_url_component).transpose()?;
         Ok(ConversationReadTarget {
             conversation_id: id.to_string(),
-            message_id: message_id.map(str::to_string),
+            message_id,
         })
     }
 }
@@ -1563,6 +1574,29 @@ fn percent_encode_url_component(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn percent_decode_url_component(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let hex = bytes
+            .get(index + 1..index + 3)
+            .ok_or_else(|| "message fragment has an invalid percent escape".to_string())?;
+        let encoded = std::str::from_utf8(hex)
+            .ok()
+            .and_then(|value| u8::from_str_radix(value, 16).ok())
+            .ok_or_else(|| "message fragment has an invalid percent escape".to_string())?;
+        decoded.push(encoded);
+        index += 3;
+    }
+    String::from_utf8(decoded).map_err(|_| "message fragment is not valid UTF-8".to_string())
 }
 
 fn conversation_href(conv: &Conversation) -> String {
@@ -2500,11 +2534,14 @@ mod tests {
     }
 
     #[test]
-    fn message_fragment_identity_percent_encodes_reserved_bytes() {
+    fn message_fragment_identity_round_trips_reserved_bytes() {
+        let encoded = super::percent_encode_url_component("foo)bar baz");
+        assert_eq!(encoded, "foo%29bar%20baz");
         assert_eq!(
-            super::percent_encode_url_component("foo)bar baz"),
-            "foo%29bar%20baz"
+            super::percent_decode_url_component(&encoded),
+            Ok("foo)bar baz".to_string())
         );
+        assert!(super::percent_decode_url_component("broken%2").is_err());
     }
 
     #[tokio::test]
@@ -2520,7 +2557,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_read_bounds_start_provenance_and_keeps_identity() {
+    async fn encoded_message_fragment_resolves_persisted_identity() {
+        let (service, _) = predecessor_service().await;
+        sqlx::query("UPDATE messages SET message_id = 'foo)bar' WHERE message_id = 'a-msg'")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+
+        let output = service
+            .read_conversation("/c/pred-a#message-foo%29bar", None)
+            .await
+            .unwrap();
+
+        assert!(output.contains("alpha only predecessor evidence"));
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_preserves_legacy_oversized_message_identity() {
         let (service, binding) = predecessor_service().await;
         let long_id = "m".repeat(PREVIOUS_TOOL_RESULT_BYTES);
         sqlx::query("UPDATE messages SET message_id = ?1 WHERE message_id = 'a-msg'")
@@ -2543,17 +2596,18 @@ mod tests {
         let output = service
             .read_predecessor_conversation(&binding, "pred-a", None)
             .await;
+        assert!(serialize_previous_transcripts_output_bounded(&output).is_ok());
         let PreviousTranscriptsOutput::ReadPage {
             starts_at,
             next_cursor,
             ..
-        } = output
+        } = &output
         else {
             panic!("long message id must remain readable");
         };
 
-        let starts_at = starts_at.expect("bounded provenance");
-        assert!(starts_at.message_id.starts_with("sha256:"));
+        let starts_at = starts_at.as_ref().expect("legacy provenance");
+        assert_eq!(starts_at.message_id, long_id);
         assert!(starts_at.message_ref.contains(&starts_at.message_id));
         assert!(next_cursor.is_some());
     }

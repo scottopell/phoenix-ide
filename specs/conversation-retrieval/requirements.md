@@ -383,6 +383,8 @@ hold within a single oversized message (continuation by intra-message
 offset), so one huge message cannot exceed the bound
 THE SYSTEM SHALL NOT return a single read result large enough to push
 the next bounded-loop model call past its context window
+EXCEPT THAT a row whose persisted message identifier predates the identifier bound SHALL retain its actual resolvable identifier and percent-encoded citation even when that narrow provenance field exceeds the nominal page allowance
+AND newly admitted persisted message identifiers SHALL NOT exceed 256 UTF-8 bytes
 
 THE read tool SHALL issue only versioned opaque string cursors whose payload
 identifies the host scope, requested source, persisted message identity,

@@ -39,6 +39,8 @@ Persisted model history can contain tool calls with the numeric cursor shape. Re
 
 The host validates every binding before returning continued content. A target, scope, message, or freshness mismatch rejects the cursor and directs the model to restart without a cursor.
 
+New persisted message identifiers are limited to 256 UTF-8 bytes at database admission. Rows that predate this constraint retain their actual identifiers: read output and percent-encoded citations may exceed the nominal page allowance by the narrow amount necessary to preserve resolvable legacy provenance. Phoenix does not rewrite legacy identifiers or substitute digest aliases for them.
+
 Numeric cursors and unsupported cursor versions are rejected explicitly. Phoenix does not translate numeric cursors, persist cursor handles, or maintain a compatibility cache. Global Coordinator and predecessor-bound tools share the same cursor codec and read engine; their authority scopes remain distinct.
 
 ## Consequences
