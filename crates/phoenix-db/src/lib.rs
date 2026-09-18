@@ -6711,7 +6711,7 @@ impl Database {
         let predecessors: Vec<String> = sqlx::query_scalar(
             "SELECT predecessor_conversation_id
              FROM automatic_continuation_admissions
-             WHERE phase NOT IN ('message_settled', 'failed')
+             WHERE phase NOT IN ('message_settled', 'superseded', 'failed')
                AND updated_at_unix_micros <= ?1 - CASE no_progress_attempts
                    WHEN 0 THEN 0
                    WHEN 1 THEN 5000000
@@ -6756,6 +6756,33 @@ impl Database {
         )
         .bind(predecessor_conversation_id)
         .bind(phase.as_str())
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve an automatic admission after a different manual opening wins.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing, terminal, or the update fails.
+    pub async fn supersede_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = 'superseded', no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?2
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded', 'failed')",
+        )
+        .bind(predecessor_conversation_id)
         .bind(Utc::now().timestamp_micros())
         .execute(&self.pool)
         .await?;
@@ -18368,6 +18395,21 @@ mod tests {
             .has_settled_automatic_continuation(&admitted)
             .await
             .unwrap());
+        db.supersede_automatic_continuation("auto-on")
+            .await
+            .unwrap();
+        let superseded = db
+            .automatic_continuation_admission("auto-on")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(superseded.phase, AutomaticContinuationPhase::Superseded);
+        assert!(!db
+            .pending_automatic_continuation_admissions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|admission| admission.predecessor_conversation_id == "auto-on"));
 
         let admission_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM automatic_continuation_admissions

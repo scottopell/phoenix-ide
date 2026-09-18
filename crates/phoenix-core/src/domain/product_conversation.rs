@@ -139,6 +139,7 @@ pub enum AutomaticContinuationPhase {
     OwnershipTransferred,
     DispatchAccepted,
     MessageSettled,
+    Superseded,
     Failed,
 }
 
@@ -151,6 +152,7 @@ impl AutomaticContinuationPhase {
             Self::OwnershipTransferred => "ownership_transferred",
             Self::DispatchAccepted => "dispatch_accepted",
             Self::MessageSettled => "message_settled",
+            Self::Superseded => "superseded",
             Self::Failed => "failed",
         }
     }
@@ -163,6 +165,7 @@ impl AutomaticContinuationPhase {
             "ownership_transferred" => Self::OwnershipTransferred,
             "dispatch_accepted" => Self::DispatchAccepted,
             "message_settled" => Self::MessageSettled,
+            "superseded" => Self::Superseded,
             "failed" => Self::Failed,
             _ => return None,
         })

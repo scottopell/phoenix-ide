@@ -681,7 +681,7 @@ CREATE TABLE automatic_continuation_admissions (
     phase TEXT NOT NULL DEFAULT 'admitted'
         CHECK (phase IN (
             'admitted', 'successor_reserved', 'ownership_transferred',
-            'dispatch_accepted', 'message_settled', 'failed'
+            'dispatch_accepted', 'message_settled', 'superseded', 'failed'
         )),
     no_progress_attempts INTEGER NOT NULL DEFAULT 0
         CHECK (typeof(no_progress_attempts) = 'integer' AND no_progress_attempts >= 0),
