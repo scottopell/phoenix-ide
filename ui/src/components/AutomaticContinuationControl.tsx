@@ -35,27 +35,38 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
 
   useEffect(() => {
     const generation = ++requestGeneration.current;
+    let refreshPending = false;
     setView(null);
     setLoading(true);
     setSaving(false);
     setFeedback(null);
     setFailedValue(null);
-    const request = scopeKind === 'ordinary'
-      ? api.getProductConversationAutomaticContinuation(reference!)
-      : api.getCoordinatorAutomaticContinuation();
-    request
-      .then((next) => {
-        if (requestGeneration.current === generation) setView(next);
-      })
-      .catch((error: unknown) => {
-        if (requestGeneration.current === generation) {
-          setFeedback(errorMessage(error, 'Failed to load automatic continuation setting'));
-        }
-      })
-      .finally(() => {
-        if (requestGeneration.current === generation) setLoading(false);
-      });
-    return () => { requestGeneration.current += 1; };
+    const refresh = (initial: boolean) => {
+      if (refreshPending) return;
+      refreshPending = true;
+      const request = scopeKind === 'ordinary'
+        ? api.getProductConversationAutomaticContinuation(reference!)
+        : api.getCoordinatorAutomaticContinuation();
+      void request
+        .then((next) => {
+          if (requestGeneration.current === generation) setView(next);
+        })
+        .catch((error: unknown) => {
+          if (initial && requestGeneration.current === generation) {
+            setFeedback(errorMessage(error, 'Failed to load automatic continuation setting'));
+          }
+        })
+        .finally(() => {
+          refreshPending = false;
+          if (initial && requestGeneration.current === generation) setLoading(false);
+        });
+    };
+    refresh(true);
+    const interval = window.setInterval(() => refresh(false), 5_000);
+    return () => {
+      window.clearInterval(interval);
+      requestGeneration.current += 1;
+    };
   }, [reference, scopeKind]);
 
   const save = useCallback(async (enabled: boolean) => {

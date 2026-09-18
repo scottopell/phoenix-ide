@@ -70,7 +70,7 @@ impl ContinuationApplicationService {
         if self
             .runtime
             .db()
-            .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
+            .has_settled_automatic_continuation(admission)
             .await
             .map_err(|error| error.to_string())?
         {

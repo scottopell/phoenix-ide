@@ -6669,6 +6669,32 @@ impl Database {
         Ok(exists != 0)
     }
 
+    /// Return whether the automatic admission's exact generated opening settled durably.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn has_settled_automatic_continuation(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+    ) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM completed_continuation_handoffs
+                 WHERE predecessor_conversation_id = ?1
+                   AND (accepted_successor_message_id = ?2
+                        OR accepted_successor_message_id = successor_conversation_id || ':' || ?2)
+                   AND continuation_message_id = ?3
+                   AND opening_authority = 'generated_predecessor_context'
+             )",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(admission.first_message_id.as_str())
+        .bind(&admission.summary_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
     /// List automatic continuation obligations that still require reconciliation.
     ///
     /// # Errors
@@ -18181,6 +18207,38 @@ mod tests {
             .unwrap(),
             ContinuationCommitOutcome::Duplicate
         );
+        let (manual_outcome, _) = db
+            .continue_conversation_with_intent(
+                "auto-on",
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("manual-race-winner").unwrap(),
+                    "manual handoff".to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let manual_successor = match manual_outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected manual race winner, got {other:?}")
+            }
+        };
+        db.add_message(
+            "manual-race-winner",
+            &manual_successor.id,
+            &MessageContent::user("manual handoff"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .has_settled_automatic_continuation(&admitted)
+            .await
+            .unwrap());
+
         let admission_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM automatic_continuation_admissions
              WHERE operation_id = 'shared-operation'",
