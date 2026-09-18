@@ -222,15 +222,15 @@ enum ConversationReadCursorScope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ConversationReadCursor {
     version: u8,
-    scope: ConversationReadCursorScope,
-    target_conversation_id: String,
-    message_id: String,
+    scope_sha256: String,
+    target_conversation_id_sha256: String,
+    message_id_sha256: String,
     message_sequence: i64,
     byte_offset: usize,
     rendered_sha256: String,
 }
 
-const CONVERSATION_READ_CURSOR_VERSION: u8 = 1;
+const CONVERSATION_READ_CURSOR_VERSION: u8 = 2;
 const LEGACY_NUMERIC_CURSOR_MESSAGE: &str =
     "numeric read_conversation cursors are no longer accepted; restart this read without a cursor";
 
@@ -1168,8 +1168,18 @@ fn decode_cursor_bytes(encoded: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+fn identity_sha256(identity: &str) -> String {
+    encode_cursor_bytes(Sha256::digest(identity.as_bytes()).as_ref())
+}
+
+fn scope_sha256(scope: &ConversationReadCursorScope) -> Result<String, String> {
+    serde_json::to_vec(scope)
+        .map(|encoded| encode_cursor_bytes(Sha256::digest(&encoded).as_ref()))
+        .map_err(|error| format!("failed to encode read cursor scope: {error}"))
+}
+
 fn rendered_sha256(rendered: &str) -> String {
-    encode_cursor_bytes(Sha256::digest(rendered.as_bytes()).as_ref())
+    identity_sha256(rendered)
 }
 
 fn encode_conversation_read_cursor(
@@ -1187,16 +1197,16 @@ fn encode_conversation_read_cursor(
         .ok_or_else(|| "cursor freshness identity is missing".to_string())?;
     let cursor = ConversationReadCursor {
         version: CONVERSATION_READ_CURSOR_VERSION,
-        scope: scope.clone(),
-        target_conversation_id: target_conversation_id.to_string(),
-        message_id,
+        scope_sha256: scope_sha256(scope)?,
+        target_conversation_id_sha256: identity_sha256(target_conversation_id),
+        message_id_sha256: identity_sha256(&message_id),
         message_sequence: position.message_sequence,
         byte_offset: position.byte_offset,
         rendered_sha256,
     };
     let json = serde_json::to_vec(&cursor)
         .map_err(|error| format!("failed to encode read cursor: {error}"))?;
-    Ok(format!("v1.{}", encode_cursor_bytes(&json)))
+    Ok(format!("v2.{}", encode_cursor_bytes(&json)))
 }
 
 fn decode_conversation_read_cursor(
@@ -1215,7 +1225,7 @@ fn decode_conversation_read_cursor(
     if cursor.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(LEGACY_NUMERIC_CURSOR_MESSAGE.to_string());
     }
-    let encoded = cursor.strip_prefix("v1.").ok_or_else(|| {
+    let encoded = cursor.strip_prefix("v2.").ok_or_else(|| {
         "unsupported read_conversation cursor version; restart this read without a cursor"
             .to_string()
     })?;
@@ -1229,13 +1239,15 @@ fn decode_conversation_read_cursor(
                 .to_string(),
         );
     }
-    if &decoded.scope != expected_scope || decoded.target_conversation_id != expected_target {
+    if decoded.scope_sha256 != scope_sha256(expected_scope)?
+        || decoded.target_conversation_id_sha256 != identity_sha256(expected_target)
+    {
         return Err("read_conversation cursor does not belong to this host scope and target; restart this read without a cursor".to_string());
     }
     Ok(PreviousReadPosition {
         message_sequence: decoded.message_sequence,
         byte_offset: decoded.byte_offset,
-        message_id: Some(decoded.message_id),
+        message_id: Some(decoded.message_id_sha256),
         rendered_sha256: Some(decoded.rendered_sha256),
     })
 }
@@ -1334,8 +1346,9 @@ async fn render_message_page_bounded_as(
                 ReadRenderKind::StrictPredecessor => render_previous_message_line(conv, &message),
             };
             let line_freshness = rendered_sha256(&line);
+            let message_id_sha256 = identity_sha256(&message.message_id);
             if cursor_pending
-                && (cursor.message_id.as_deref() != Some(message.message_id.as_str())
+                && (cursor.message_id.as_deref() != Some(message_id_sha256.as_str())
                     || cursor.rendered_sha256.as_deref() != Some(line_freshness.as_str()))
             {
                 return Err(PreviousReadError::InvalidCursor(
@@ -2197,7 +2210,12 @@ mod tests {
         let cursor = encode_conversation_read_cursor(&scope, "predecessor", &position).unwrap();
         assert_eq!(
             decode_conversation_read_cursor(Some(&cursor), &scope, "predecessor"),
-            Ok(position)
+            Ok(PreviousReadPosition {
+                message_sequence: position.message_sequence,
+                byte_offset: position.byte_offset,
+                message_id: Some(super::identity_sha256("message")),
+                rendered_sha256: position.rendered_sha256.clone(),
+            })
         );
         assert!(decode_conversation_read_cursor(Some(&cursor), &scope, "other").is_err());
         assert!(
@@ -2214,6 +2232,28 @@ mod tests {
                 .unwrap_err()
                 .contains("host scope and target")
         );
+    }
+
+    #[test]
+    fn read_cursor_size_is_independent_of_persisted_identifier_lengths() {
+        let long = "x".repeat(PREVIOUS_TOOL_RESULT_BYTES);
+        let scope = ConversationReadCursorScope::StrictPredecessors {
+            product_conversation_id: long.clone(),
+            executing_transcript_id: long.clone(),
+        };
+        let cursor = encode_conversation_read_cursor(
+            &scope,
+            &long,
+            &PreviousReadPosition {
+                message_sequence: 1,
+                byte_offset: 2,
+                message_id: Some(long.clone()),
+                rendered_sha256: Some("digest".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(cursor.len() < 1_024);
     }
 
     #[test]
