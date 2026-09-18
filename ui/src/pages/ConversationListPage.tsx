@@ -63,8 +63,8 @@ export function ConversationListPage() {
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
-  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
-  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
+  const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
   const visibleConversationCount = effectiveVisibleConversationCount({
     showArchived,
     productListError,

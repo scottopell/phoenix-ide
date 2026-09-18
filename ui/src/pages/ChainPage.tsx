@@ -45,7 +45,11 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
-import { notifyArchiveCloseConflict } from '../notifications';
+import {
+  notifyArchiveCloseConflict,
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
+} from '../notifications';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
@@ -416,6 +420,8 @@ export function ChainPage() {
           try {
             const updated = await api.setChainName(rootConvId, name);
             dispatch({ type: 'LOAD_OK', view: updated });
+            notifyProductConversationListMayHaveChanged();
+            notifyProductConversationSnapshotChanged(updated.product_conversation_id);
           } catch (err) {
             dispatch({
               type: 'LOAD_FAIL',
@@ -434,6 +440,8 @@ export function ChainPage() {
           try {
             const updated = await api.regenerateChainName(rootConvId);
             dispatch({ type: 'LOAD_OK', view: updated });
+            notifyProductConversationListMayHaveChanged();
+            notifyProductConversationSnapshotChanged(updated.product_conversation_id);
           } catch (err) {
             showError(
               err instanceof Error ? err.message : 'Failed to regenerate name',

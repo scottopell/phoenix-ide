@@ -271,8 +271,7 @@ pub struct ProductConversationListRow {
     pub product_conversation_id: String,
     pub canonical_route: String,
     pub canonical_root: ProductConversationTranscriptRowView,
-    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
-    pub close_action: ProductConversationCloseActionView,
+    pub lifecycle: ProductConversationLifecycleView,
     pub latest_transcript_row_id: String,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
@@ -330,6 +329,16 @@ pub struct AutomaticContinuationFailureView {
     pub first_message_id: String,
     pub accepted_handoff: String,
     pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationLifecycleView {
+    Open {
+        close_action: ProductConversationCloseActionView,
+    },
+    History,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

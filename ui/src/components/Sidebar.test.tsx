@@ -65,8 +65,7 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     slug: `root-${id}`,
     title: `Root ${id}`,
   },
-  ordinary_lifecycle: 'open',
-  close_action: { availability: 'available' },
+  lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
@@ -93,7 +92,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [
         makeProductConversation('pc-open', { canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' } }),
-        makeProductConversation('pc-archived', { ordinary_lifecycle: 'history', canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' } }),
+        makeProductConversation('pc-archived', { lifecycle: { state: 'history' }, canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' } }),
       ],
     });
   });
@@ -262,8 +261,7 @@ describe('Sidebar — ProductConversation navigation', () => {
   it('does not expose product conversation actions for history rows', async () => {
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [makeProductConversation('pc-history', {
-        ordinary_lifecycle: 'history',
-        close_action: { availability: 'unavailable', reason: 'history' },
+        lifecycle: { state: 'history' },
       })],
     });
 
