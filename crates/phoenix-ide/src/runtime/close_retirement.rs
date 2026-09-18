@@ -30,8 +30,8 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    AdoptCloseWorktreeCleanupPlanRequest, AmbientWriterAccessMode, AmbientWriterDetector,
-    AmbientWriterEvidence, AmbientWriterMatchKind, BindCloseWorktreeFinalTombstoneObjectRequest,
+    AdoptCloseWorktreeCleanupPlanRequest, AmbientWriterAuthority, AmbientWriterDescriptorAccess,
+    AmbientWriterDetector, AmbientWriterEvidence, BindCloseWorktreeFinalTombstoneObjectRequest,
     BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
     CaptureCloseRetirementInventoryScopeRequest, CloseNeedsRepairCause,
     CloseWorktreeFinalTombstone, RecordCloseAmbientWriterEvidenceRequest,
@@ -1331,13 +1331,33 @@ impl RuntimeManager {
                     {
                         let identity = identity.clone();
                         let cleanup_plan = cleanup_plan.clone();
+                        let db = self.db().clone();
+                        let runtime = tokio::runtime::Handle::current();
+                        let attempt = attempt_id.clone();
+                        let recovery_scope = scope.clone();
+                        let recovery_snapshot = snapshot.clone();
+                        let recovery_resource = target.resource.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
-                            match resume_final_worktree_tombstone(
+                            match resume_final_worktree_tombstone_with_binding(
                                 cleanup_plan
                                     .final_tombstone
                                     .as_ref()
                                     .expect("filtered above"),
                                 &identity,
+                                |object_device, object_inode| {
+                                    runtime
+                                        .block_on(db.bind_close_worktree_final_tombstone_object(
+                                            BindCloseWorktreeFinalTombstoneObjectRequest {
+                                                attempt_id: attempt.clone(),
+                                                scope: recovery_scope.clone(),
+                                                snapshot: recovery_snapshot.clone(),
+                                                resource: recovery_resource.clone(),
+                                                object_device,
+                                                object_inode,
+                                            },
+                                        ))
+                                        .map_err(|error| error.to_string())
+                                },
                             ) {
                                 FinalTombstoneRecovery::Completed => {}
                                 FinalTombstoneRecovery::Residual(detail) => return Err(detail),
@@ -1434,9 +1454,34 @@ impl RuntimeManager {
                                 .await;
                         }
                         let identity = identity.clone();
+                        let db = self.db().clone();
+                        let runtime = tokio::runtime::Handle::current();
+                        let attempt = attempt_id.clone();
+                        let recovery_scope = scope.clone();
+                        let recovery_snapshot = snapshot.clone();
+                        let recovery_resource = target.resource.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
                             if let Some(tombstone) = &cleanup_plan.final_tombstone {
-                                match resume_final_worktree_tombstone(tombstone, &identity) {
+                                match resume_final_worktree_tombstone_with_binding(
+                                    tombstone,
+                                    &identity,
+                                    |object_device, object_inode| {
+                                        runtime
+                                            .block_on(
+                                                db.bind_close_worktree_final_tombstone_object(
+                                                    BindCloseWorktreeFinalTombstoneObjectRequest {
+                                                        attempt_id: attempt.clone(),
+                                                        scope: recovery_scope.clone(),
+                                                        snapshot: recovery_snapshot.clone(),
+                                                        resource: recovery_resource.clone(),
+                                                        object_device,
+                                                        object_inode,
+                                                    },
+                                                ),
+                                            )
+                                            .map_err(|error| error.to_string())
+                                    },
+                                ) {
                                     FinalTombstoneRecovery::Completed => {}
                                     FinalTombstoneRecovery::Residual(detail) => return Err(detail),
                                 }
@@ -3458,13 +3503,18 @@ where
     clippy::too_many_lines,
     reason = "exhaustive recovery keeps every persisted tombstone state and authority check visible"
 )]
-fn resume_final_worktree_tombstone(
+fn resume_final_worktree_tombstone_with_binding<B>(
     tombstone: &CloseWorktreeFinalTombstone,
     identity: &WorktreeIdentity,
-) -> FinalTombstoneRecovery {
+    mut bind_object_identity: B,
+) -> FinalTombstoneRecovery
+where
+    B: FnMut(u64, u64) -> Result<(), String>,
+{
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
     let expected_identity = identity.fingerprint().as_str();
     let captured_path = worktree_path(identity);
@@ -3547,64 +3597,72 @@ fn resume_final_worktree_tombstone(
         (Some(device), Some(inode)) => (device, inode),
         (None, None) => {
             let captured_exists = match captured_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe captured worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
-            let quarantine_exists = match quarantine_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe quarantined worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
-            match (captured_exists, quarantine_exists) {
-                    (true, false) => {
-                        if observe_worktree_fingerprint(&captured_path).as_deref()
-                            != Some(expected_identity)
-                        {
-                            return FinalTombstoneRecovery::Residual(
-                                "captured worktree does not match recorded final tombstone identity; preserved for manual repair".to_string(),
-                            );
-                        }
-                        let tombstone_object = tombstone.root.join("object");
-                        if let Err(error) = std::fs::rename(&captured_path, &tombstone_object) {
-                            return FinalTombstoneRecovery::Residual(format!(
-                                "cannot resume recorded final tombstone pre-rename state: {error}"
-                            ));
-                        }
-                        let metadata = match std::fs::symlink_metadata(&tombstone_object) {
-                            Ok(metadata) => metadata,
-                            Err(error) => {
-                                return FinalTombstoneRecovery::Residual(format!(
-                                    "cannot identify resumed final tombstone object: {error}"
-                                ))
-                            }
-                        };
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt as _;
-                            (metadata.dev(), metadata.ino())
-                        }
-                        #[cfg(not(unix))]
-                        unreachable!()
-                    }
-                    (false, false) => return FinalTombstoneRecovery::Completed,
-                    (true, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "captured and quarantined worktree paths are both present during final tombstone recovery; preserved for manual repair".to_string(),
-                        )
-                    }
-                    (false, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "recorded final tombstone object identity is absent and only quarantine remains; preserved for manual repair".to_string(),
-                        )
-                    }
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe captured worktree path during final tombstone recovery: {error}"
+                    ))
                 }
+            };
+            let quarantine_exists = match quarantine_path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe quarantined worktree path during final tombstone recovery: {error}"
+                    ))
+                }
+            };
+            let tombstone_object = tombstone.root.join("object");
+            let object_exists = match tombstone_object.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe final tombstone object during recovery: {error}"
+                    ))
+                }
+            };
+            let source = match (captured_exists, quarantine_exists, object_exists) {
+                (true, false, false) => Some((&captured_path, "captured")),
+                (false, true, false) => Some((&quarantine_path, "quarantined")),
+                (false, false, true) => None,
+                (false, false, false) => return FinalTombstoneRecovery::Completed,
+                _ => {
+                    return FinalTombstoneRecovery::Residual(
+                        "multiple worktree locations are present during final tombstone recovery; preserved for manual repair".to_string(),
+                    )
+                }
+            };
+            if let Some((source, description)) = source {
+                if observe_worktree_fingerprint(source).as_deref() != Some(expected_identity) {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "{description} worktree does not match recorded final tombstone identity; preserved for manual repair"
+                    ));
+                }
+                if let Err(error) = std::fs::rename(source, &tombstone_object) {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot resume recorded final tombstone pre-object state: {error}"
+                    ));
+                }
+            }
+            if observe_worktree_fingerprint(&tombstone_object).as_deref() != Some(expected_identity)
+            {
+                return FinalTombstoneRecovery::Residual(
+                    "unbound final tombstone object does not match captured worktree identity; preserved for manual repair".to_string(),
+                );
+            }
+            let metadata = match std::fs::symlink_metadata(&tombstone_object) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot identify resumed final tombstone object: {error}"
+                    ))
+                }
+            };
+            let object_identity = (metadata.dev(), metadata.ino());
+            if let Err(detail) = bind_object_identity(object_identity.0, object_identity.1) {
+                return FinalTombstoneRecovery::Residual(detail);
+            }
+            object_identity
         }
         _ => return FinalTombstoneRecovery::Residual(
             "recorded final tombstone object identity is incomplete; preserved for manual repair"
@@ -3670,6 +3728,14 @@ fn resume_final_worktree_tombstone(
             "cannot remove empty recorded final tombstone: {error}"
         )),
     }
+}
+
+#[cfg(all(unix, test))]
+fn resume_final_worktree_tombstone(
+    tombstone: &CloseWorktreeFinalTombstone,
+    identity: &WorktreeIdentity,
+) -> FinalTombstoneRecovery {
+    resume_final_worktree_tombstone_with_binding(tombstone, identity, |_, _| Ok(()))
 }
 
 #[cfg(not(unix))]
@@ -3939,6 +4005,27 @@ fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvi
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbientWriterAccessMode {
+    WriteOnly,
+    ReadWrite,
+    NamespaceWrite,
+}
+
+impl AmbientWriterAccessMode {
+    fn authority(self) -> AmbientWriterAuthority {
+        match self {
+            Self::WriteOnly => {
+                AmbientWriterAuthority::Descriptor(AmbientWriterDescriptorAccess::WriteOnly)
+            }
+            Self::ReadWrite => {
+                AmbientWriterAuthority::Descriptor(AmbientWriterDescriptorAccess::ReadWrite)
+            }
+            Self::NamespaceWrite => AmbientWriterAuthority::NamespaceDirectory,
+        }
+    }
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn linux_descriptor_access_mode_from_flags(open_flags: i32) -> Option<AmbientWriterAccessMode> {
     match open_flags & libc::O_ACCMODE {
@@ -4095,8 +4182,7 @@ fn linux_mapping_writer_evidence(
             process_incarnation: before_incarnation,
             executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
             matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
-            match_kind: AmbientWriterMatchKind::Mapping,
-            access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+            authority: AmbientWriterAuthority::WritableSharedMapping,
         },
     ))
 }
@@ -4358,8 +4444,7 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                         process_incarnation: before_incarnation,
                         executable: before_executable,
                         matched_path: GitPathIdentity::from_bytes(mapped_path.to_bytes().to_vec()),
-                        match_kind: AmbientWriterMatchKind::Mapping,
-                        access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+                        authority: AmbientWriterAuthority::WritableSharedMapping,
                     },
                 ));
             }
@@ -4499,7 +4584,12 @@ fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, S
     })?;
     let pids = macos_all_pids()
         .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        if !macos_process_is_relevant(pid, effective_uid)? {
+            continue;
+        }
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
             libc::proc_pidinfo(
@@ -4569,8 +4659,7 @@ fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, S
                 process_incarnation: before_incarnation,
                 executable: before_executable,
                 matched_path: GitPathIdentity::from_bytes(cwd.to_bytes().to_vec()),
-                match_kind: AmbientWriterMatchKind::NamespaceDirectory,
-                access_mode: AmbientWriterAccessMode::NamespaceWrite,
+                authority: AmbientWriterAuthority::NamespaceDirectory,
             },
         ));
     }
@@ -4933,12 +5022,7 @@ fn linux_descriptor_writer_evidence(
             process_incarnation: before_incarnation.to_string(),
             executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
             matched_path: GitPathIdentity::from_bytes(target.as_os_str().as_bytes().to_vec()),
-            match_kind: if access_mode == AmbientWriterAccessMode::NamespaceWrite {
-                AmbientWriterMatchKind::NamespaceDirectory
-            } else {
-                AmbientWriterMatchKind::Descriptor
-            },
-            access_mode,
+            authority: access_mode.authority(),
         },
     )))
 }
@@ -5034,8 +5118,7 @@ fn linux_namespace_cwd_writer_evidence_if_stable(
             process_incarnation: before_incarnation.to_string(),
             executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
             matched_path: GitPathIdentity::from_bytes(cwd.as_os_str().as_bytes().to_vec()),
-            match_kind: AmbientWriterMatchKind::NamespaceDirectory,
-            access_mode: AmbientWriterAccessMode::NamespaceWrite,
+            authority: AmbientWriterAuthority::NamespaceDirectory,
         },
     )))
 }
@@ -5477,8 +5560,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                         process_incarnation: before_incarnation,
                         executable: before_executable,
                         matched_path: GitPathIdentity::from_bytes(candidate.to_bytes().to_vec()),
-                        match_kind: AmbientWriterMatchKind::Descriptor,
-                        access_mode,
+                        authority: access_mode.authority(),
                     },
                 ));
             }
@@ -6397,9 +6479,10 @@ mod tests {
         remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
         remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
-        rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
-        staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
-        CloseLeaseFailure, ExactWorktreeRemoval, FinalTombstoneRecovery,
+        resume_final_worktree_tombstone_with_binding, rotate_inspection_generation,
+        run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
+        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
+        ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::CloseWorktreeFinalTombstone;
     use phoenix_core::domain::close::{
@@ -7043,6 +7126,81 @@ mod tests {
             FinalTombstoneRecovery::Completed
         ));
         assert!(!target.exists());
+        assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_root_only_resumes_from_quarantine() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        let identity = inspection_identity(&target);
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&target, &quarantine).unwrap();
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+        let bound = std::sync::Mutex::new(None);
+
+        assert!(matches!(
+            resume_final_worktree_tombstone_with_binding(&recorded, &identity, |device, inode| {
+                *bound.lock().unwrap() = Some((device, inode));
+                Ok(())
+            },),
+            FinalTombstoneRecovery::Completed
+        ));
+        assert!(bound.into_inner().unwrap().is_some());
+        assert!(!target.exists());
+        assert!(!quarantine.exists());
+        assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_preserves_unbound_object_when_binding_fails() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        let identity = inspection_identity(&target);
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&target, &quarantine).unwrap();
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+
+        let first = resume_final_worktree_tombstone_with_binding(&recorded, &identity, |_, _| {
+            Err("injected binding failure".to_string())
+        });
+        assert!(matches!(
+            first,
+            FinalTombstoneRecovery::Residual(detail) if detail.contains("injected binding failure")
+        ));
+        assert!(!quarantine.exists());
+        assert!(recorded.root.join("object").exists());
+
+        assert!(matches!(
+            resume_final_worktree_tombstone_with_binding(&recorded, &identity, |_, _| Ok(())),
+            FinalTombstoneRecovery::Completed
+        ));
         assert!(!recorded.root.exists());
     }
 
@@ -7946,8 +8104,9 @@ mod tests {
             process_incarnation: incarnation.to_string(),
             executable: GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
             matched_path: GitPathIdentity::from_bytes(b"/tmp/quarantine/file".to_vec()),
-            match_kind: super::AmbientWriterMatchKind::Descriptor,
-            access_mode: super::AmbientWriterAccessMode::ReadWrite,
+            authority: super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::ReadWrite,
+            ),
         }
     }
 
@@ -8663,12 +8822,10 @@ mod tests {
         assert_eq!(evidence.process_id, 1274);
         assert_eq!(evidence.process_incarnation, "4242");
         assert_eq!(
-            evidence.access_mode,
-            super::AmbientWriterAccessMode::WriteOnly
-        );
-        assert_eq!(
-            evidence.match_kind,
-            super::AmbientWriterMatchKind::Descriptor
+            evidence.authority,
+            super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::WriteOnly,
+            )
         );
     }
 
@@ -8727,12 +8884,8 @@ mod tests {
             panic!("read-only directory descriptor must preserve namespace mutation authority");
         };
         assert_eq!(
-            evidence.match_kind,
-            super::AmbientWriterMatchKind::NamespaceDirectory
-        );
-        assert_eq!(
-            evidence.access_mode,
-            super::AmbientWriterAccessMode::NamespaceWrite
+            evidence.authority,
+            super::AmbientWriterAuthority::NamespaceDirectory
         );
     }
 
@@ -8759,12 +8912,8 @@ mod tests {
         };
         assert_eq!(evidence.process_id, 1279);
         assert_eq!(
-            evidence.match_kind,
-            super::AmbientWriterMatchKind::NamespaceDirectory
-        );
-        assert_eq!(
-            evidence.access_mode,
-            super::AmbientWriterAccessMode::NamespaceWrite
+            evidence.authority,
+            super::AmbientWriterAuthority::NamespaceDirectory
         );
     }
 
@@ -8892,10 +9041,9 @@ mod tests {
         else {
             panic!("live writable shared mapping must produce complete evidence");
         };
-        assert_eq!(evidence.match_kind, super::AmbientWriterMatchKind::Mapping);
         assert_eq!(
-            evidence.access_mode,
-            super::AmbientWriterAccessMode::WritableSharedMapping
+            evidence.authority,
+            super::AmbientWriterAuthority::WritableSharedMapping
         );
 
         // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
@@ -9017,12 +9165,10 @@ mod tests {
             panic!("stable external writer must preserve quarantine");
         };
         assert_eq!(
-            residual.evidence.access_mode,
-            super::AmbientWriterAccessMode::WriteOnly
-        );
-        assert_eq!(
-            residual.evidence.match_kind,
-            super::AmbientWriterMatchKind::Descriptor
+            residual.evidence.authority,
+            super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::WriteOnly,
+            )
         );
         assert!(residual.detail.contains("stable ambient writer"));
         assert!(!closing.exists());

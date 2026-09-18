@@ -701,12 +701,6 @@ pub(crate) async fn retry_close_retirement(
         .segments
         .last()
         .map(|segment| segment.transcript_row.conversation.id.as_str());
-    if active_transcript != Some(id.as_str()) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close retry is accepted only from the active aggregate transcript",
-            "inactive_close_transcript",
-        ))));
-    }
     let attempt = state
         .db
         .get_active_close_obligation_for_product(&transcript.product_conversation_id)
@@ -717,6 +711,14 @@ pub(crate) async fn retry_close_retirement(
                 "close_retry_unavailable",
             )))
         })?;
+    if active_transcript != Some(id.as_str()) {
+        let active_transcript = active_transcript.ok_or_else(|| {
+            AppError::Internal("ProductConversation has no active transcript".to_string())
+        })?;
+        return Err(AppError::Conflict(Box::new(
+            inactive_close_transcript_conflict(active_transcript, attempt.as_ref()),
+        )));
+    }
     let attempt = attempt.ok_or_else(|| {
         AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "No active Close attempt is available for retry",
@@ -1164,6 +1166,8 @@ mod tests {
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
+    use phoenix_core::domain::close::{CloseAttemptId, CloseObligation, CloseRetirementSnapshot};
+    use phoenix_core::domain::product_conversation::ProductConversationId;
 
     #[test]
     fn ambient_writer_indeterminate_conflict_is_structured_and_safe() {
@@ -1271,6 +1275,32 @@ mod tests {
         assert_eq!(
             without_obligation.active_transcript_id.as_deref(),
             Some("active")
+        );
+
+        let timestamp = Utc.with_ymd_and_hms(2026, 9, 18, 0, 0, 0).unwrap();
+        let needs_repair = CloseObligation::parse(
+            CloseAttemptId::parse("attempt-1").unwrap(),
+            ProductConversationId::parse("product-1").unwrap(),
+            ClosePhase::NeedsRepair,
+            Some(CloseRetirementSnapshot::parse("generation-1", "fingerprint-1").unwrap()),
+            timestamp,
+            timestamp,
+            None,
+            None,
+        )
+        .unwrap();
+        let with_obligation = inactive_close_transcript_conflict("active", Some(&needs_repair));
+        assert_eq!(with_obligation.attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(
+            with_obligation.active_transcript_id.as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            with_obligation
+                .recovery_action
+                .as_ref()
+                .map(|action| action.path.as_str()),
+            Some("/api/conversations/active/close/retry-retirement")
         );
     }
 

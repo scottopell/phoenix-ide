@@ -806,37 +806,35 @@ impl AmbientWriterDetector {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AmbientWriterMatchKind {
-    Descriptor,
-    Mapping,
-    NamespaceDirectory,
-}
-
-impl AmbientWriterMatchKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Descriptor => "descriptor",
-            Self::Mapping => "mapping",
-            Self::NamespaceDirectory => "namespace_directory",
-        }
-    }
+pub enum AmbientWriterDescriptorAccess {
+    WriteOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AmbientWriterAccessMode {
-    WriteOnly,
-    ReadWrite,
+pub enum AmbientWriterAuthority {
+    Descriptor(AmbientWriterDescriptorAccess),
     WritableSharedMapping,
-    NamespaceWrite,
+    NamespaceDirectory,
 }
 
-impl AmbientWriterAccessMode {
-    fn as_str(self) -> &'static str {
+impl AmbientWriterAuthority {
+    #[must_use]
+    pub fn match_kind(self) -> &'static str {
         match self {
-            Self::WriteOnly => "write_only",
-            Self::ReadWrite => "read_write",
+            Self::Descriptor(_) => "descriptor",
+            Self::WritableSharedMapping => "mapping",
+            Self::NamespaceDirectory => "namespace_directory",
+        }
+    }
+
+    #[must_use]
+    pub fn access_mode(self) -> &'static str {
+        match self {
+            Self::Descriptor(AmbientWriterDescriptorAccess::WriteOnly) => "write_only",
+            Self::Descriptor(AmbientWriterDescriptorAccess::ReadWrite) => "read_write",
             Self::WritableSharedMapping => "writable_shared_mapping",
-            Self::NamespaceWrite => "namespace_write",
+            Self::NamespaceDirectory => "namespace_write",
         }
     }
 }
@@ -848,8 +846,7 @@ pub struct AmbientWriterEvidence {
     pub process_incarnation: String,
     pub executable: GitPathIdentity,
     pub matched_path: GitPathIdentity,
-    pub match_kind: AmbientWriterMatchKind,
-    pub access_mode: AmbientWriterAccessMode,
+    pub authority: AmbientWriterAuthority,
 }
 
 #[derive(Debug, Clone)]
@@ -3788,8 +3785,8 @@ impl Database {
         .bind(request.evidence.executable.encode())
         .bind(request.evidence.matched_path.codec())
         .bind(request.evidence.matched_path.encode())
-        .bind(request.evidence.match_kind.as_str())
-        .bind(request.evidence.access_mode.as_str())
+        .bind(request.evidence.authority.match_kind())
+        .bind(request.evidence.authority.access_mode())
         .bind(now)
         .execute(&self.pool)
         .await
@@ -3822,8 +3819,8 @@ impl Database {
         .bind(request.evidence.executable.encode())
         .bind(request.evidence.matched_path.codec())
         .bind(request.evidence.matched_path.encode())
-        .bind(request.evidence.match_kind.as_str())
-        .bind(request.evidence.access_mode.as_str())
+        .bind(request.evidence.authority.match_kind())
+        .bind(request.evidence.authority.access_mode())
         .fetch_one(&self.pool)
         .await?;
         if !exact_evidence_exists {
@@ -10158,8 +10155,9 @@ mod tests {
                 process_incarnation: "1234:5678".to_string(),
                 executable: GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
                 matched_path: GitPathIdentity::from_bytes(b"/tmp/quarantine/open".to_vec()),
-                match_kind: AmbientWriterMatchKind::Descriptor,
-                access_mode: AmbientWriterAccessMode::ReadWrite,
+                authority: AmbientWriterAuthority::Descriptor(
+                    AmbientWriterDescriptorAccess::ReadWrite,
+                ),
             },
         };
         db.record_close_ambient_writer_evidence(request.clone())
