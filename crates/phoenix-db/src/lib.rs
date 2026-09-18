@@ -8383,6 +8383,46 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a tool round and its selected conversation state atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] when message insertion, state update, or commit fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the conversation state cannot be serialized.
+    pub async fn persist_tool_round_and_state(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        insert_message_tx(&mut tx, assistant).await?;
+        for msg in tool_results {
+            insert_message_tx(&mut tx, msg).await?;
+        }
+        let state_json = serde_json::to_string(state).unwrap();
+        let result = sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+        )
+        .bind(state_json)
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Persist a terminal tool checkpoint and its direct-turn obligation atomically.
     ///
     /// # Errors

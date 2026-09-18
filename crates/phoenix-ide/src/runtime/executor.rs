@@ -7637,9 +7637,21 @@ where
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                self.storage
-                    .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                    .await?;
+                if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+                    self.storage
+                        .persist_tool_round_and_state(
+                            &conv_id,
+                            &agent_msg,
+                            &tool_msgs,
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await?;
+                } else {
+                    self.storage
+                        .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
+                        .await?;
+                }
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result

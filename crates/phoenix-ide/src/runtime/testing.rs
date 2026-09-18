@@ -1776,6 +1776,19 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_tool_round(conv_id, assistant, tool_results)
+            .await?;
+        self.update_state(conv_id, state, state_updated_at).await
+    }
+
     async fn persist_tool_round_with_terminal_obligation(
         &self,
         conv_id: &str,

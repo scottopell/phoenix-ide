@@ -335,6 +335,15 @@ pub trait MessageStore: Send + Sync {
         tool_results: &[crate::db::Message],
     ) -> Result<(), String>;
 
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String>;
+
     async fn persist_tool_round_with_terminal_obligation(
         &self,
         conv_id: &str,
@@ -835,6 +844,19 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round(conv_id, assistant, tool_results)
+            .await
+    }
+
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_tool_round_and_state(conv_id, assistant, tool_results, state, state_updated_at)
             .await
     }
 
@@ -1587,6 +1609,20 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .persist_tool_round(conv_id, assistant, tool_results)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .persist_tool_round_and_state(conv_id, assistant, tool_results, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }
