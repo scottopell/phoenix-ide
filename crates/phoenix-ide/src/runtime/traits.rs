@@ -1070,7 +1070,7 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 // ============================================================================
 
 use crate::db::Database;
-use crate::tools::{ToolRegistry, WritingConversationTools};
+use crate::tools::ToolRegistry;
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
@@ -2063,7 +2063,6 @@ pub struct ToolRegistryExecutor {
     mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
-    writing_tools: Option<WritingConversationTools>,
     host_bound_tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
 }
 
@@ -2079,7 +2078,6 @@ impl ToolRegistryExecutor {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
             agent_catalog,
-            writing_tools: None,
             host_bound_tools: Vec::new(),
         }
     }
@@ -2096,15 +2094,8 @@ impl ToolRegistryExecutor {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),
             agent_catalog,
-            writing_tools: None,
             host_bound_tools: Vec::new(),
         }
-    }
-
-    #[must_use]
-    pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
-        self.writing_tools = tools;
-        self
     }
 
     #[must_use]
@@ -2233,11 +2224,6 @@ impl ToolExecutor for ToolRegistryExecutor {
 
     fn upgrade_to_work_mode(&self) {
         let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec());
-        if let Some(tools) = self.writing_tools.clone() {
-            registry = registry
-                .try_with_writing_conversation_tools(tools)
-                .expect("fresh Work registry has no scoped writing capabilities");
-        }
         for tool in self.host_bound_tools.iter().cloned() {
             if registry.find_tool(tool.name()).is_none() {
                 registry = registry
@@ -2315,7 +2301,7 @@ mod tool_registry_executor_tests {
     }
 
     #[tokio::test]
-    async fn explore_upgrade_preserves_host_bound_writing_tools() {
+    async fn explore_upgrade_preserves_scoped_predecessor_tools_without_global_authority() {
         let executor = ToolRegistryExecutor::builtin_only(
             ToolRegistry::explore(
                 "tasks",

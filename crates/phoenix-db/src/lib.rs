@@ -11352,6 +11352,25 @@ impl Database {
         Ok(rows)
     }
 
+    /// Returns whether migration-owned recovery permits materializing an oversized message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compatibility snapshot cannot be queried.
+    pub async fn is_legacy_oversized_message_id(&self, message_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM legacy_oversized_creation_message_ids
+                 WHERE message_id = ?1
+             )",
+        )
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Get the first messages in sequence order, capped by `limit`.
     ///
     /// # Errors
