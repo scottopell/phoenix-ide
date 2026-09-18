@@ -240,7 +240,7 @@ pub async fn set_chain_name(
     } else {
         state
             .db
-            .set_chain_name(&root_id, None)
+            .clear_ordinary_product_conversation_legacy_title(&root_id)
             .await
             .map_err(db_to_app)?;
     }
