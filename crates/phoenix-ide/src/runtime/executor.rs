@@ -2819,20 +2819,7 @@ where
             self.retry_timer_handle = None;
         }
 
-        if matches!(&outcome, EffectOutcome::Llm(_))
-            && !matches!(
-                &outcome,
-                EffectOutcome::Llm(
-                    LlmOutcome::RateLimited { .. }
-                        | LlmOutcome::ServerError { .. }
-                        | LlmOutcome::InvalidResponse { .. }
-                        | LlmOutcome::NetworkError { .. }
-                        | LlmOutcome::TimedOut { .. }
-                )
-            )
-        {
-            self.pending_trusted_tool_results.clear();
-        }
+        let is_llm_outcome = matches!(&outcome, EffectOutcome::Llm(_));
 
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
@@ -2867,6 +2854,14 @@ where
                 return Err(invalid.reason);
             }
         };
+        if is_llm_outcome
+            && !result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
+        {
+            self.pending_trusted_tool_results.clear();
+        }
 
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
 
@@ -6901,6 +6896,11 @@ where
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
         self.refresh_active_prompt_projection().await?;
+        let trusted_results = self.pending_trusted_tool_results.clone();
+        let trusted_token_reserve = trusted_results
+            .iter()
+            .map(|(_, content)| estimate_text_tokens(content))
+            .sum::<usize>();
         let mut frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
@@ -6911,12 +6911,13 @@ where
                 .messages,
             None,
             &self.clearable_names,
-            self.context.context_window,
+            self.context
+                .context_window
+                .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
         .await;
 
-        let trusted_results = self.pending_trusted_tool_results.clone();
         overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
