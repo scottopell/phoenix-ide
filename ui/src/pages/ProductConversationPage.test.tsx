@@ -206,7 +206,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     product_conversation_id: 'pc-1',
     close: null,
     project_coordinator_eligible: true,
-    project_coordinator_profile: null,
+    project_coordinator_profile: { enabled: false, charter: '', revision: 0, updated_at_unix_micros: 0 },
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
     canonical_root: { transcript_row_id: 'row-1', slug: 'root-slug', title: 'Root title' },
@@ -404,7 +404,7 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
       enabled: true,
       charter: 'Coordinate this product.',
-      expected_revision: null,
+      expected_revision: 0,
     }));
   });
 
@@ -428,6 +428,7 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot)
       .mockResolvedValueOnce(makeSnapshot({
         project_coordinator_profile: {
+          enabled: true,
           charter: 'Opened charter',
           revision: 4,
           updated_at_unix_micros: 1,
@@ -435,6 +436,7 @@ describe('ProductConversationPage', () => {
       }))
       .mockResolvedValue(makeSnapshot({
         project_coordinator_profile: {
+          enabled: true,
           charter: 'Other editor charter',
           revision: 5,
           updated_at_unix_micros: 2,
@@ -460,6 +462,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
       project_coordinator_profile: {
+        enabled: true,
         charter: 'Saved charter',
         revision: 7,
         updated_at_unix_micros: 1,
@@ -483,6 +486,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
       project_coordinator_profile: {
+        enabled: true,
         charter: 'Saved charter',
         revision: 3,
         updated_at_unix_micros: 1,

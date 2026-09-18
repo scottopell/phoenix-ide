@@ -109,6 +109,19 @@ Coordinate outcomes rather than merely distributing tasks. Delegate bounded outc
 
 You retain arbitration of scope, priorities, shared resources, exceptions, verification standards, and stopping points. Work directly when the change is small or delegation would lose essential context. This profile grants no additional tools, permissions, lifecycle authority, or ability to edit its charter.";
 
+pub fn append_project_coordinator_guidance(system_prompt: &mut String) {
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(PROJECT_COORDINATOR_GUIDANCE);
+}
+
+pub fn inspected_project_coordinator_prompt(base: &str, charter: &str) -> String {
+    let mut prompt = base.to_string();
+    append_project_coordinator_guidance(&mut prompt);
+    prompt.push_str("\n\n");
+    prompt.push_str(&project_coordinator_charter_block(charter));
+    prompt
+}
+
 pub fn project_coordinator_charter_block(charter: &str) -> String {
     format!("# User-authored Project Coordinator charter\n\n{charter}")
 }
@@ -966,6 +979,18 @@ mod project_coordinator_tests {
         );
         assert!(!prompt.contains(PROJECT_COORDINATOR_GUIDANCE));
         assert!(!prompt.contains("User-authored Project Coordinator charter"));
+    }
+
+    #[test]
+    fn inspected_prompt_matches_live_profile_content() {
+        let base = "base";
+        let inspected = inspected_project_coordinator_prompt(base, "current charter");
+        assert_eq!(
+            inspected,
+            format!(
+                "base\n\n{PROJECT_COORDINATOR_GUIDANCE}\n\n# User-authored Project Coordinator charter\n\ncurrent charter"
+            )
+        );
     }
 
     #[test]

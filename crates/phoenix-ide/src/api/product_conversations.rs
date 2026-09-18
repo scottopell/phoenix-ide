@@ -157,12 +157,25 @@ pub async fn put_project_coordinator_profile(
     {
         Ok(ProjectCoordinatorProfileWriteOutcome::Saved(profile)) => {
             Ok(Json(Some(ProjectCoordinatorProfileView {
+                enabled: true,
                 charter: profile.charter().to_string(),
                 revision: profile.revision(),
                 updated_at_unix_micros: profile.updated_at_unix_micros(),
             })))
         }
-        Ok(ProjectCoordinatorProfileWriteOutcome::Disabled) => Ok(Json(None)),
+        Ok(ProjectCoordinatorProfileWriteOutcome::Disabled) => {
+            let revision = state
+                .db
+                .get_project_coordinator_profile_revision(&product_conversation_id)
+                .await
+                .map_err(db_to_app)?;
+            Ok(Json(Some(ProjectCoordinatorProfileView {
+                enabled: false,
+                charter: String::new(),
+                revision,
+                updated_at_unix_micros: 0,
+            })))
+        }
         Err(ProjectCoordinatorProfileWriteDbError::Domain(
             ProjectCoordinatorProfileWriteError::InvalidCharter,
         )) => Err(AppError::BadRequest(
@@ -461,16 +474,30 @@ async fn project_coordinator_profile_view(
     state: &AppState,
     product_conversation_id: &ProductConversationId,
 ) -> Result<Option<ProjectCoordinatorProfileView>, AppError> {
-    Ok(state
+    let profile = state
         .db
         .get_project_coordinator_profile(product_conversation_id)
         .await
-        .map_err(db_to_app)?
-        .map(|profile| ProjectCoordinatorProfileView {
+        .map_err(db_to_app)?;
+    let revision = state
+        .db
+        .get_project_coordinator_profile_revision(product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    Ok(Some(match profile {
+        Some(profile) => ProjectCoordinatorProfileView {
+            enabled: true,
             charter: profile.charter().to_string(),
             revision: profile.revision(),
             updated_at_unix_micros: profile.updated_at_unix_micros(),
-        }))
+        },
+        None => ProjectCoordinatorProfileView {
+            enabled: false,
+            charter: String::new(),
+            revision,
+            updated_at_unix_micros: 0,
+        },
+    }))
 }
 
 type AggregatePageMessages =
@@ -931,7 +958,7 @@ mod tests {
             serde_json::json!({
                 "enabled": true,
                 "charter": "  exact charter\n",
-                "expected_revision": null
+                "expected_revision": 0
             }),
         )
         .await;
@@ -982,7 +1009,8 @@ mod tests {
         let cleared: serde_json::Value =
             serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(cleared, serde_json::Value::Null);
+        assert_eq!(cleared["enabled"], false);
+        assert_eq!(cleared["revision"], 2);
     }
 
     async fn create_completed_continuation(
