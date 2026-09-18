@@ -742,6 +742,28 @@ pub struct AmbientWriterIndeterminateCause {
 
 impl AmbientWriterIndeterminateCause {
     fn new(detector: String, operation: String, error_kind: String) -> Result<Self, &'static str> {
+        if !matches!(detector.as_str(), "linux_procfs" | "macos_libproc") {
+            return Err("invalid ambient-writer detector");
+        }
+        if !matches!(
+            operation.as_str(),
+            "observe_ambient_writer"
+                | "read_process_incarnation"
+                | "read_process_credentials"
+                | "read_process_executable"
+                | "read_working_directory"
+                | "read_mappings"
+                | "read_descriptors"
+                | "enumerate_processes"
+        ) {
+            return Err("invalid ambient-writer operation");
+        }
+        if !matches!(
+            error_kind.as_str(),
+            "permission_denied" | "invalid_data" | "io_error"
+        ) {
+            return Err("invalid ambient-writer error kind");
+        }
         Ok(Self {
             detector: NonEmptyString::new(detector)?,
             operation: NonEmptyString::new(operation)?,
@@ -4122,20 +4144,31 @@ impl Database {
                         .to_string(),
                 });
             }
+            let target_columns: WorktreeCleanupPlanColumns = sqlx::query_as(
+                "SELECT administrative_dir_codec, administrative_dir_value,
+                        administrative_dir_incarnation, final_tombstone_root_codec,
+                        final_tombstone_root_value, final_tombstone_root_device,
+                        final_tombstone_root_inode, final_tombstone_object_device,
+                        final_tombstone_object_inode
+                 FROM close_worktree_cleanup_plans
+                 WHERE attempt_id=?1 AND scope=?2
+                   AND inspection_generation=?3 AND inspection_fingerprint=?4
+                   AND resource_kind=?5 AND identity_kind=?6
+                   AND identity_codec=?7 AND identity_value=?8",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            let target_plan = worktree_cleanup_plan_from_columns(&target_columns)?;
             tx.commit().await?;
-            return self
-                .close_worktree_cleanup_plan(
-                    &request.attempt_id,
-                    &request.scope,
-                    &request.target_snapshot,
-                    &request.resource,
-                )
-                .await?
-                .ok_or_else(|| DbError::CloseEvidenceInvariant {
-                    invariant: "adoption_lineage_requires_target_cleanup_plan",
-                    relation: "close_worktree_cleanup_adoptions+close_worktree_cleanup_plans",
-                    detail: "adoption lineage exists without its target cleanup plan".to_string(),
-                });
+            return Ok(target_plan);
         }
         let sources: Vec<AdoptableWorktreeCleanupPlanColumns> = sqlx::query_as(
             "SELECT plan.inspection_generation, plan.inspection_fingerprint,

@@ -3266,6 +3266,25 @@ impl RuntimeManager {
                 if !Self::close_retirement_is_startup_admitted(obligation.phase()) {
                     return Ok(false);
                 }
+                if obligation.phase() == phoenix_core::domain::close::ClosePhase::NeedsRepair {
+                    if let Err(error) = manager
+                        .db
+                        .retry_close_retirement(obligation.attempt_id())
+                        .await
+                    {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close needs-repair attempt could not re-enter inspection");
+                        return Ok(false);
+                    }
+                    if let Err(error) = manager
+                        .inspect_close_retirement(obligation.attempt_id().clone())
+                        .await
+                    {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close needs-repair attempt could not rebuild inspection");
+                        return Ok(false);
+                    }
+                }
                 match manager
                     .resume_close_runtime_resources_on_startup(obligation.attempt_id().clone())
                     .await

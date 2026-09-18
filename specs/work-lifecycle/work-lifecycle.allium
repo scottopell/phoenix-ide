@@ -886,12 +886,12 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
 }
 
 
-rule LegacyFk787PartialRetryCanResumeFromPriorCleanupAuthority {
+rule PartialRetryCanResumeFromPriorCleanupAuthority {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     let obligation = bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
     requires: obligation.phase = awaiting_retirement_inspection
     requires: exists obligation.active_retirement_snapshot
-    requires: active_generation_is_legacy_fk787_partial_retry(product_conversation, attempt_id)
+    requires: active_generation_is_partial_retry(product_conversation, attempt_id)
     requires: every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(product_conversation, attempt_id)
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
@@ -952,14 +952,14 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       ordered scope identity and inspection fingerprint. Any target-set, order, or
 --       per-scope fingerprint change produces a different aggregate fingerprint.
 --
---   active_generation_is_legacy_fk787_partial_retry(
+--   active_generation_is_partial_retry(
 --       product_conversation: bedrock/ProductConversation,
 --       attempt_id: String
 --   ) -> Boolean
 --       True iff every captured WorkScope has an active retry inspection and sealed
 --       inventory, the active generation has no dispatch or cleanup plan, and each exact
---       captured worktree has an active manual-repair residual whose detail identifies
---       SQLite foreign-key code 787 from the cleanup-plan persistence defect.
+--       captured worktree has an active manual-repair residual from rejected cleanup-plan
+--       persistence.
 --
 --   every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(
 --       product_conversation: bedrock/ProductConversation,
