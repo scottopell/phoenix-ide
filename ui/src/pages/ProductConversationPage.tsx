@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -716,6 +717,9 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
+        <AutomaticContinuationControl
+          scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }}
+        />
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>

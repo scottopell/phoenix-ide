@@ -65,6 +65,7 @@ impl DirectTurnAttemptAuthority {
 pub enum SubmittedDirectTurnExpansionPolicy {
     ExpandReferences,
     LiteralText,
+    GeneratedPredecessorContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

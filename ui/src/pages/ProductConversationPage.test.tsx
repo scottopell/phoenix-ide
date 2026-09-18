@@ -174,6 +174,8 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
+      getProductConversationAutomaticContinuation: vi.fn(),
+      updateProductConversationAutomaticContinuation: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
       getPrStatus: vi.fn(),
       getChain: vi.fn(),
@@ -373,6 +375,13 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.getProductConversationAutomaticContinuation).mockReset();
+    vi.mocked(api.getProductConversationAutomaticContinuation).mockResolvedValue({
+      aggregate: { kind: 'ordinary', product_conversation_id: 'pc-1' },
+      auto_continue_on_context_exhaustion: false,
+      admission: null,
+    });
+    vi.mocked(api.updateProductConversationAutomaticContinuation).mockReset();
     vi.mocked(api.reportProductConversationOpen).mockClear();
     vi.mocked(api.getChain).mockReset();
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
@@ -384,6 +393,15 @@ describe('ProductConversationPage', () => {
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
       work_change: { kind: 'clean' },
     });
+  });
+
+  it('shows the aggregate automatic-continuation control on an ordinary ProductConversation', async () => {
+    const { api } = await import('../api');
+    renderPage();
+
+    const control = await screen.findByTestId('automatic-continuation-control');
+    expect(control).toHaveTextContent('Auto-continue Off');
+    expect(api.getProductConversationAutomaticContinuation).toHaveBeenCalledWith('pc-1');
   });
 
   it('reports hidden-at-start opens without waiting for or fabricating paint', async () => {
