@@ -105,8 +105,11 @@ describe('CoordinatorPage', () => {
     const control = await screen.findByTestId('automatic-continuation-control');
     fireEvent.click(control.querySelector('summary')!);
     const checkbox = screen.getByRole('checkbox', { name: 'Automatically accept future generated handoffs and continue' });
-    expect(checkbox).not.toBeChecked();
-    expect(apiMock.getCoordinatorAutomaticContinuation).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(apiMock.getCoordinatorAutomaticContinuation).toHaveBeenCalledTimes(1);
+      expect(checkbox).toBeEnabled();
+      expect(checkbox).not.toBeChecked();
+    });
 
     fireEvent.click(checkbox);
     await waitFor(() => expect(apiMock.updateCoordinatorAutomaticContinuation).toHaveBeenCalledWith(true));
@@ -144,7 +147,7 @@ describe('CoordinatorPage', () => {
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('ordinary-conversation');
   });
 
-  it('mounts a historical Coordinator chain member without canonicalizing it', async () => {
+  it('canonicalizes a historical Coordinator chain member without exposing aggregate controls', async () => {
     render(
       <MemoryRouter initialEntries={['/global/old-coordinator#message-source']}>
         <Routes>
@@ -153,8 +156,9 @@ describe('CoordinatorPage', () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    expect(screen.getByText('/global/old-coordinator')).toBeInTheDocument();
+    expect(await screen.findByText('/global/conv-coordinator')).toBeInTheDocument();
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('old-coordinator');
+    expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
   });
 
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {

@@ -30,6 +30,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [failedValue, setFailedValue] = useState<boolean | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const requestGeneration = useRef(0);
   const viewRevision = useRef(0);
   const savePending = useRef(false);
@@ -105,6 +106,30 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     }
   }, [reference, scopeKind]);
 
+  const retryFailedAdmission = useCallback(async () => {
+    const admission = view?.admission;
+    if (!admission?.actionable_failure) return;
+    setRetrying(true);
+    setFeedback(null);
+    try {
+      const response = await api.continueConversation(
+        admission.predecessor_transcript_row_id,
+        {
+          handoff: 'Retry persisted generated handoff',
+          message_id: admission.actionable_failure.first_message_id,
+        },
+      );
+      if (response.status === 'dispatch_failed') {
+        throw new Error(response.error ?? 'Failed to retry generated handoff');
+      }
+      setFeedback('Generated handoff retry accepted');
+    } catch (error) {
+      setFeedback(errorMessage(error, 'Failed to retry generated handoff'));
+    } finally {
+      setRetrying(false);
+    }
+  }, [view]);
+
   const enabled = view?.auto_continue_on_context_exhaustion ?? false;
   const admission = view?.admission ?? null;
   const phaseLabel = admission ? PHASE_LABELS[admission.phase] : null;
@@ -146,7 +171,14 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
             {failedAdmission?.actionable_failure && (
               <div role="alert" className="automatic-continuation__failure">
                 <span>{failedAdmission.actionable_failure.message}</span>
-                <span> Retry safely with the existing Continue control on the generated handoff. Automatic continuation remains enabled for future exhaustions.</span>
+                <span> Retry safely with the same persisted generated handoff and message identity. Automatic continuation remains enabled for future exhaustions.</span>
+                <button
+                  type="button"
+                  disabled={retrying}
+                  onClick={() => { void retryFailedAdmission(); }}
+                >
+                  {retrying ? 'Retrying…' : 'Retry generated handoff'}
+                </button>
               </div>
             )}
           </div>

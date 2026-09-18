@@ -40,6 +40,12 @@ impl TryFrom<&str> for ClientTurnKey {
     }
 }
 
+impl std::fmt::Display for ClientTurnKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TurnAuthorityId(pub u64);
 
@@ -213,6 +219,10 @@ pub enum TurnCommand {
         expected_generation: u64,
         reason: String,
     },
+    Rearm {
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +252,14 @@ pub enum TurnOutcome {
         terminal: TurnTerminal,
         disposition: AcceptedDisposition,
     },
+    Rearmed {
+        turn_id: TurnAuthorityId,
+        generation: u64,
+    },
+    RearmReplay {
+        turn_id: TurnAuthorityId,
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +270,10 @@ pub enum TurnConflict {
     StaleGeneration { actual: u64 },
     AlreadyTerminal,
     MaterializationIdentityChanged { canonical: CanonicalMessageId },
+    RearmRequiresRuntime,
+    RearmRequiresTerminal,
+    RearmRequiresUnmaterialized,
+    RearmOwnerConflict { owner: TurnAuthorityId },
     CorruptAggregate(&'static str),
 }
 
@@ -367,6 +389,10 @@ impl DurableTurnModel {
                 expected_generation,
                 TurnTerminal::Failed { reason },
             ),
+            TurnCommand::Rearm {
+                turn_id,
+                expected_generation,
+            } => self.rearm(turn_id, expected_generation),
         }
     }
 
@@ -513,6 +539,74 @@ impl DurableTurnModel {
                 canonical: canonical.clone(),
             }),
         }
+    }
+
+    fn rearm(
+        &mut self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+    ) -> Result<TurnStep, TurnConflict> {
+        let turn = self
+            .turns
+            .get_mut(&turn_id)
+            .ok_or(TurnConflict::UnknownTurn)?;
+        if turn.generation == expected_generation.saturating_add(1)
+            && matches!(
+                turn.lifecycle,
+                TurnLifecycle::Accepted {
+                    disposition: AcceptedDisposition::Runtime
+                }
+            )
+            && matches!(turn.materialization, Materialization::Unmaterialized)
+        {
+            return if self.live_owner.get(&turn.conversation) == Some(&turn_id) {
+                Ok(TurnStep {
+                    outcome: TurnOutcome::RearmReplay {
+                        turn_id,
+                        generation: turn.generation,
+                    },
+                    owed_effects: Vec::new(),
+                })
+            } else {
+                Err(TurnConflict::RearmOwnerConflict {
+                    owner: self
+                        .live_owner
+                        .get(&turn.conversation)
+                        .copied()
+                        .unwrap_or(turn_id),
+                })
+            };
+        }
+        if turn.generation != expected_generation {
+            return Err(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            });
+        }
+        let disposition = match &turn.lifecycle {
+            TurnLifecycle::Terminal { disposition, .. } => *disposition,
+            TurnLifecycle::Accepted { .. } => return Err(TurnConflict::RearmRequiresTerminal),
+        };
+        if disposition != AcceptedDisposition::Runtime {
+            return Err(TurnConflict::RearmRequiresRuntime);
+        }
+        if !matches!(turn.materialization, Materialization::Unmaterialized) {
+            return Err(TurnConflict::RearmRequiresUnmaterialized);
+        }
+        if let Some(owner) = self.live_owner.get(&turn.conversation).copied() {
+            return Err(TurnConflict::RearmOwnerConflict { owner });
+        }
+        turn.generation = turn.generation.saturating_add(1);
+        turn.lifecycle = TurnLifecycle::Accepted {
+            disposition: AcceptedDisposition::Runtime,
+        };
+        self.live_owner.insert(turn.conversation.clone(), turn_id);
+        Ok(TurnStep {
+            outcome: TurnOutcome::Rearmed {
+                turn_id,
+                generation: turn.generation,
+            },
+            owed_effects: vec![OwedTurnEffect::RuntimeDelivery { turn_id }],
+        })
     }
 
     fn terminate(
@@ -804,6 +898,173 @@ mod tests {
                 message_id: CanonicalMessageId("late".into()),
             })
             .is_err());
+    }
+
+    #[test]
+    fn terminal_runtime_turn_rearms_exactly_and_replays_idempotently() {
+        let mut model = DurableTurnModel::default();
+        let original_prepared = prepared(1);
+        let original_key = ClientTurnKey::new("turn").unwrap();
+        model
+            .apply(TurnCommand::Accept {
+                conversation: ConversationAuthority("conv-a".into()),
+                client_key: original_key.clone(),
+                prepared: original_prepared.clone(),
+                turn_id: TurnAuthorityId(1),
+                disposition: AcceptedDisposition::Runtime,
+            })
+            .unwrap();
+        model
+            .apply(TurnCommand::Fail {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+                reason: "worker exited".into(),
+            })
+            .unwrap();
+
+        let rearmed = model
+            .apply(TurnCommand::Rearm {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            rearmed,
+            TurnStep {
+                outcome: TurnOutcome::Rearmed {
+                    turn_id: TurnAuthorityId(1),
+                    generation: 2,
+                },
+                owed_effects: vec![OwedTurnEffect::RuntimeDelivery {
+                    turn_id: TurnAuthorityId(1),
+                }],
+            }
+        );
+        let turn = model.turn(&TurnAuthorityId(1)).unwrap();
+        assert_eq!(turn.client_key, original_key);
+        assert_eq!(turn.prepared, original_prepared);
+        assert_eq!(turn.materialization, Materialization::Unmaterialized);
+        assert_eq!(
+            turn.lifecycle,
+            TurnLifecycle::Accepted {
+                disposition: AcceptedDisposition::Runtime,
+            }
+        );
+        assert_eq!(
+            model
+                .apply(TurnCommand::Rearm {
+                    turn_id: TurnAuthorityId(1),
+                    expected_generation: 1,
+                })
+                .unwrap(),
+            TurnStep {
+                outcome: TurnOutcome::RearmReplay {
+                    turn_id: TurnAuthorityId(1),
+                    generation: 2,
+                },
+                owed_effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn rearm_rejects_live_materialized_steering_stale_and_competing_owner() {
+        let terminal = |disposition, materialization| DurableTurn {
+            id: TurnAuthorityId(1),
+            conversation: ConversationAuthority("conv-a".into()),
+            client_key: ClientTurnKey::new("target").unwrap(),
+            prepared: prepared(1),
+            generation: 1,
+            lifecycle: TurnLifecycle::Terminal {
+                terminal: TurnTerminal::Failed {
+                    reason: "failed".into(),
+                },
+                disposition,
+            },
+            materialization,
+        };
+        let command = TurnCommand::Rearm {
+            turn_id: TurnAuthorityId(1),
+            expected_generation: 1,
+        };
+
+        let mut live = DurableTurnModel::default();
+        live.apply(TurnCommand::Accept {
+            conversation: ConversationAuthority("conv-a".into()),
+            client_key: ClientTurnKey::new("live").unwrap(),
+            prepared: prepared(1),
+            turn_id: TurnAuthorityId(1),
+            disposition: AcceptedDisposition::Runtime,
+        })
+        .unwrap();
+        assert_eq!(
+            live.apply(TurnCommand::Rearm {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+            }),
+            Err(TurnConflict::RearmRequiresTerminal)
+        );
+
+        let mut materialized = DurableTurnModel::from_turns([terminal(
+            AcceptedDisposition::Runtime,
+            Materialization::Materialized {
+                message_id: CanonicalMessageId("message".into()),
+            },
+        )])
+        .unwrap();
+        assert_eq!(
+            materialized.apply(command.clone()),
+            Err(TurnConflict::RearmRequiresUnmaterialized)
+        );
+
+        let mut steering = DurableTurnModel::from_turns([terminal(
+            AcceptedDisposition::Steering,
+            Materialization::Unmaterialized,
+        )])
+        .unwrap();
+        assert_eq!(
+            steering.apply(command.clone()),
+            Err(TurnConflict::RearmRequiresRuntime)
+        );
+
+        let mut stale = DurableTurnModel::from_turns([terminal(
+            AcceptedDisposition::Runtime,
+            Materialization::Unmaterialized,
+        )])
+        .unwrap();
+        assert_eq!(
+            stale.apply(TurnCommand::Rearm {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+            }),
+            Err(TurnConflict::StaleGeneration { actual: 1 })
+        );
+
+        let competitor = DurableTurn {
+            id: TurnAuthorityId(2),
+            conversation: ConversationAuthority("conv-a".into()),
+            client_key: ClientTurnKey::new("competitor").unwrap(),
+            prepared: prepared(2),
+            generation: 0,
+            lifecycle: TurnLifecycle::Accepted {
+                disposition: AcceptedDisposition::Runtime,
+            },
+            materialization: Materialization::Unmaterialized,
+        };
+        let mut owned = DurableTurnModel::from_turns([
+            terminal(
+                AcceptedDisposition::Runtime,
+                Materialization::Unmaterialized,
+            ),
+            competitor,
+        ])
+        .unwrap();
+        assert_eq!(
+            owned.apply(command),
+            Err(TurnConflict::RearmOwnerConflict {
+                owner: TurnAuthorityId(2),
+            })
+        );
     }
 
     #[test]

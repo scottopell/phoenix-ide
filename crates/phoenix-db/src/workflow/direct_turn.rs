@@ -36,6 +36,7 @@ enum TransactionCut {
 const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
 const DIRECT_TURN_MATERIALIZED_TRANSITION_ID: u64 = 2;
 const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 3;
+const DIRECT_TURN_REARMED_TRANSITION_ID: u64 = 4;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,20 @@ pub enum ClaimAuthoritativeTurnEstablishment {
 pub struct ReleaseAuthoritativeTurnInput {
     pub authority: super::LocalAttemptAuthority,
     pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RearmAuthoritativeTurnInput {
+    pub turn_id: TurnAuthorityId,
+    pub expected_generation: u64,
+    pub rearmed_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RearmAuthoritativeTurnOutcome {
+    Rearmed { turn: DurableTurn },
+    ExactReplay { turn: DurableTurn },
+    Rejected(TurnConflict),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,6 +546,229 @@ impl WorkflowRepository {
             .transpose()
     }
 
+    pub async fn rearm_terminal_runtime_direct_turn(
+        &self,
+        input: &RearmAuthoritativeTurnInput,
+    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+        self.rearm_terminal_runtime_direct_turn_inner(input, None)
+            .await
+    }
+
+    pub async fn rearm_terminal_runtime_direct_turn_for_automatic_continuation(
+        &self,
+        input: &RearmAuthoritativeTurnInput,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+        self.rearm_terminal_runtime_direct_turn_inner(input, Some(predecessor_conversation_id))
+            .await
+    }
+
+    async fn rearm_terminal_runtime_direct_turn_inner(
+        &self,
+        input: &RearmAuthoritativeTurnInput,
+        automatic_continuation_predecessor: Option<&str>,
+    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+        let mut tx = self.begin_immediate_tx().await?;
+        let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(input.turn_id.0, "turn_id")?)
+            .fetch_optional(&mut *tx.tx)
+            .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                TurnConflict::UnknownTurn,
+            ));
+        };
+        let turn = row_to_turn_tx(&mut tx.tx, row).await?;
+        let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn.id).await?;
+        let mut turns = vec![turn.clone()];
+        if let Some(owner) =
+            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &turn.conversation).await?
+        {
+            if owner.id != turn.id {
+                turns.push(owner);
+            }
+        }
+        let mut model = phoenix_workflow::DurableTurnModel::from_turns(turns).map_err(conflict)?;
+        let step = match model.apply(TurnCommand::Rearm {
+            turn_id: turn.id,
+            expected_generation: input.expected_generation,
+        }) {
+            Ok(step) => step,
+            Err(rejected) => {
+                tx.rollback().await?;
+                return Ok(RearmAuthoritativeTurnOutcome::Rejected(rejected));
+            }
+        };
+        if matches!(step.outcome, TurnOutcome::RearmReplay { .. }) {
+            let exact = load_exact_rearmed_turn_tx(
+                &mut tx.tx,
+                turn.id,
+                workflow_id,
+                input.expected_generation.saturating_add(1),
+            )
+            .await?;
+            let Some(exact) = exact else {
+                tx.rollback().await?;
+                return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                    TurnConflict::StaleGeneration {
+                        actual: turn.generation,
+                    },
+                ));
+            };
+            if let Some(predecessor_conversation_id) = automatic_continuation_predecessor {
+                let reopened = ensure_rearmed_automatic_continuation_tx(
+                    &mut tx.tx,
+                    predecessor_conversation_id,
+                    input.rearmed_at,
+                )
+                .await?;
+                if !reopened {
+                    tx.rollback().await?;
+                    return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                        TurnConflict::RearmRequiresTerminal,
+                    ));
+                }
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            return Ok(RearmAuthoritativeTurnOutcome::ExactReplay { turn: exact });
+        }
+
+        let head = tx
+            .fetch_workflow_head(workflow_id)
+            .await?
+            .ok_or_else(|| DbError::Serialization("direct-turn workflow missing".to_string()))?;
+        if head.generation.0 != input.expected_generation || head.status == WorkflowStatus::Active {
+            tx.rollback().await?;
+            return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                TurnConflict::StaleGeneration {
+                    actual: turn.generation,
+                },
+            ));
+        }
+        if load_live_attempt_for_workflow_tx(&mut tx.tx, workflow_id)
+            .await?
+            .is_some()
+        {
+            tx.rollback().await?;
+            return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                TurnConflict::RearmRequiresTerminal,
+            ));
+        }
+
+        let next_generation = input.expected_generation.saturating_add(1);
+        let effect_id = next_available_effect_id_tx(&mut tx.tx, workflow_id).await?;
+        let transition_id = next_available_transition_id_tx(
+            &mut tx.tx,
+            workflow_id,
+            DIRECT_TURN_REARMED_TRANSITION_ID,
+        )
+        .await?;
+        let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn.id.0 };
+        let event = direct_turn_profile::DirectTurnEvent::Rearmed {
+            turn_id: turn.id.0,
+            generation: next_generation,
+        };
+        let intent = direct_turn_profile::RuntimeTurnIntent {
+            turn_id: turn.id.0,
+            conversation_id: turn.conversation.0.clone(),
+            client_turn_key: turn.client_key.as_str().to_string(),
+            prepared_fingerprint: turn.prepared.fingerprint().to_string(),
+        };
+        let plan = CommitTransitionPlanCas {
+            workflow_id,
+            expected_version: head.version,
+            transition_id: phoenix_workflow::TransitionId(transition_id),
+            generation: Generation(next_generation),
+            next_status: WorkflowStatus::Active,
+            event_codec: local_codec(&direct_turn_profile::event_codec()),
+            event_payload: serde_json::to_vec(&event).map_err(|error| {
+                DbError::Serialization(format!("encode direct-turn rearmed event: {error}"))
+            })?,
+            next_snapshot_codec: local_codec(&direct_turn_profile::snapshot_codec()),
+            next_snapshot_payload: serde_json::to_vec(&snapshot).map_err(|error| {
+                DbError::Serialization(format!("encode direct-turn snapshot: {error}"))
+            })?,
+            committed_at: input.rearmed_at,
+            effects: vec![LocalEffectDecl {
+                effect_id: EffectId(effect_id),
+                declared_workflow_version: head.version.next(),
+                family: "direct_turn.delivery".to_string(),
+                kind: "deliver_runtime_turn".to_string(),
+                intent_codec: local_codec(&direct_turn_profile::intent_codec()),
+                intent_payload: serde_json::to_vec(&intent).map_err(|error| {
+                    DbError::Serialization(format!("encode direct-turn intent: {error}"))
+                })?,
+                generation: Generation(next_generation),
+                role: EffectRole::Required,
+                capability: ExecutionCapability::ReclaimableObservation,
+                next_eligible_at: None,
+                destructive_resource: None,
+                status: EffectStatus::Eligible,
+            }],
+            dependencies: vec![],
+            barriers: vec![],
+            barrier_members: vec![],
+            deliveries: vec![],
+            schedules: vec![],
+        };
+        if tx.commit_transition_plan(&plan).await? != phoenix_workflow::CommitOutcome::Committed {
+            tx.rollback().await?;
+            return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                TurnConflict::StaleGeneration {
+                    actual: turn.generation,
+                },
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE durable_turns
+             SET generation = ?2, terminal_kind = NULL, terminal_reason = NULL,
+                 owns_conversation = 1
+             WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NOT NULL
+               AND disposition = 'Runtime' AND canonical_message_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM durable_turns owner
+                   WHERE owner.conversation_id = durable_turns.conversation_id
+                     AND owner.owns_conversation = 1
+               )",
+        )
+        .bind(to_i64(turn.id.0, "turn_id")?)
+        .bind(to_i64(next_generation, "generation")?)
+        .bind(to_i64(input.expected_generation, "expected_generation")?)
+        .execute(&mut *tx.tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            tx.rollback().await?;
+            return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                TurnConflict::StaleGeneration {
+                    actual: turn.generation,
+                },
+            ));
+        }
+        if let Some(predecessor_conversation_id) = automatic_continuation_predecessor {
+            if !ensure_rearmed_automatic_continuation_tx(
+                &mut tx.tx,
+                predecessor_conversation_id,
+                input.rearmed_at,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(RearmAuthoritativeTurnOutcome::Rejected(
+                    TurnConflict::RearmRequiresTerminal,
+                ));
+            }
+        }
+        let rearmed = load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn.id, workflow_id)
+            .await?
+            .ok_or_else(|| DbError::Serialization("rearmed direct turn missing".to_string()))?;
+        tx.commit().await?;
+        Ok(RearmAuthoritativeTurnOutcome::Rearmed { turn: rearmed })
+    }
+
     #[cfg(test)]
     async fn establish_authoritative_turn_claim_at_cut(
         &self,
@@ -612,8 +850,13 @@ impl WorkflowRepository {
         let canonical_turn =
             load_turn_for_workflow_tx(&self.pool, &mut tx, input.turn_id, input.workflow_id)
                 .await?;
-        let attempt =
-            load_live_attempt_tx(&mut tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?;
+        let Some(effect_id) =
+            current_runtime_effect_id_tx(&mut tx, input.workflow_id, input.turn_id).await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let attempt = load_live_attempt_tx(&mut tx, input.workflow_id, effect_id.0).await?;
         tx.commit().await?;
         let Some(attempt) = attempt else {
             return Ok(None);
@@ -669,14 +912,24 @@ impl WorkflowRepository {
                 canonical_turn: None,
             });
         };
+        let Some(effect_id) =
+            current_runtime_effect_id_tx(&mut tx.tx, input.workflow_id, input.turn_id).await?
+        else {
+            return Ok(ClaimAuthoritativeTurnResult {
+                outcome: ClaimOutcome::Ineligible,
+                authority: None,
+                attempt: None,
+                canonical_turn: Some(canonical_turn),
+            });
+        };
         let Some(existing_live_attempt) =
-            load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
+            load_live_attempt_tx(&mut tx.tx, input.workflow_id, effect_id.0).await?
         else {
             let attempt_id = next_attempt_id_tx(tx).await?;
             let result = tx
                 .begin_attempt(&super::BeginAttemptInput {
                     workflow_id: input.workflow_id,
-                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                    effect_id,
                     attempt_id,
                     process_incarnation: input.process_incarnation,
                     now: input.now,
@@ -708,7 +961,7 @@ impl WorkflowRepository {
             tx,
             &super::ExpireLeaseInput {
                 workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                effect_id,
                 attempt_id: existing_live_attempt.id,
                 now: input.now,
             },
@@ -726,7 +979,7 @@ impl WorkflowRepository {
         let result = tx
             .begin_attempt(&super::BeginAttemptInput {
                 workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                effect_id,
                 attempt_id,
                 process_incarnation: input.process_incarnation,
                 now: input.now,
@@ -2064,6 +2317,12 @@ impl WorkflowRepository {
         })?;
         let snapshot_payload = serde_json::to_vec(&snapshot)
             .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?;
+        let transition_id = next_available_transition_id_tx(
+            &mut tx.tx,
+            workflow_id,
+            DIRECT_TURN_TERMINAL_TRANSITION_ID,
+        )
+        .await?;
         let committed = tx
             .commit_transition_head_cas(
                 workflow_id,
@@ -2074,7 +2333,7 @@ impl WorkflowRepository {
                 &event_payload,
                 &snapshot_codec,
                 &snapshot_payload,
-                phoenix_workflow::TransitionId(DIRECT_TURN_TERMINAL_TRANSITION_ID),
+                phoenix_workflow::TransitionId(transition_id),
                 terminal_commit_timestamp(),
             )
             .await?;
@@ -2167,6 +2426,131 @@ async fn workflow_id_for_turn_tx(
             .fetch_one(&mut **tx)
             .await?;
     Ok(WorkflowId(to_u64(workflow_id, "workflow_id")?))
+}
+
+async fn current_runtime_effect_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+    turn_id: TurnAuthorityId,
+) -> DbResult<Option<EffectId>> {
+    let row = sqlx::query_scalar::<_, i64>(
+        "SELECT e.effect_id
+         FROM workflow_effects e
+         JOIN workflows w ON w.workflow_id = e.workflow_id
+         JOIN durable_turns t ON t.workflow_id = w.workflow_id
+         WHERE e.workflow_id = ?1 AND t.turn_id = ?2
+           AND e.generation = t.generation AND e.generation = w.generation
+           AND e.kind = 'deliver_runtime_turn' AND e.status IN ('Eligible', 'Executing')
+         ORDER BY e.effect_id DESC LIMIT 1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|value| to_u64(value, "effect_id").map(EffectId))
+        .transpose()
+}
+
+async fn load_live_attempt_for_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+) -> DbResult<Option<AttemptId>> {
+    let value = sqlx::query_scalar::<_, i64>(
+        "SELECT attempt_id FROM workflow_attempts
+         WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')
+         LIMIT 1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_optional(&mut **tx)
+    .await?;
+    value
+        .map(|value| to_u64(value, "attempt_id").map(AttemptId))
+        .transpose()
+}
+
+async fn next_available_effect_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+) -> DbResult<u64> {
+    let value = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(effect_id), 0) + 1 FROM workflow_effects WHERE workflow_id = ?1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_one(&mut **tx)
+    .await?;
+    to_u64(value, "effect_id")
+}
+
+async fn next_available_transition_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+    minimum: u64,
+) -> DbResult<u64> {
+    let value = sqlx::query_scalar::<_, i64>(
+        "SELECT MAX(COALESCE((SELECT MAX(transition_id) + 1 FROM workflow_transitions
+                              WHERE workflow_id = ?1), 1), ?2)",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(minimum, "minimum_transition_id")?)
+    .fetch_one(&mut **tx)
+    .await?;
+    to_u64(value, "transition_id")
+}
+
+async fn ensure_rearmed_automatic_continuation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    predecessor_conversation_id: &str,
+    rearmed_at: Timestamp,
+) -> DbResult<bool> {
+    Ok(sqlx::query(
+        "UPDATE automatic_continuation_admissions
+         SET phase = 'dispatch_accepted', resume_phase = 'dispatch_accepted',
+             no_progress_attempts = 0, last_error = NULL, updated_at_unix_micros = ?2
+         WHERE predecessor_conversation_id = ?1
+           AND phase IN ('failed', 'dispatch_accepted')",
+    )
+    .bind(predecessor_conversation_id)
+    .bind(to_i64(rearmed_at.0, "rearmed_at")?)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+async fn load_exact_rearmed_turn_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+    workflow_id: WorkflowId,
+    generation: u64,
+) -> DbResult<Option<DurableTurn>> {
+    let exact: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM workflows w
+             JOIN workflow_transitions tr ON tr.workflow_id = w.workflow_id
+             JOIN workflow_effects e ON e.workflow_id = w.workflow_id
+             JOIN durable_turns t ON t.workflow_id = w.workflow_id
+             WHERE w.workflow_id = ?1 AND w.status = 'Active' AND w.generation = ?2
+               AND tr.generation = ?2 AND tr.event_codec_family = 'direct_turn.event'
+               AND e.generation = ?2 AND e.kind = 'deliver_runtime_turn'
+               AND e.status IN ('Eligible', 'Executing')
+               AND t.turn_id = ?3 AND t.generation = ?2
+               AND t.disposition = 'Runtime' AND t.terminal_kind IS NULL
+               AND t.canonical_message_id IS NULL AND t.owns_conversation = 1
+         )",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(generation, "generation")?)
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exact == 0 {
+        return Ok(None);
+    }
+    let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .fetch_one(&mut **tx)
+        .await?;
+    row_to_turn_tx(tx, row).await.map(Some)
 }
 
 async fn next_direct_turn_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<TurnAuthorityId> {
@@ -2400,9 +2784,11 @@ fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u
                 reason: reason.clone(),
             },
         )),
-        TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => Err(
-            DbError::Serialization("terminal repository command required".to_string()),
-        ),
+        TurnCommand::Accept { .. }
+        | TurnCommand::Materialize { .. }
+        | TurnCommand::Rearm { .. } => Err(DbError::Serialization(
+            "terminal repository command required".to_string(),
+        )),
     }
 }
 
@@ -5379,6 +5765,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_runtime_rearm_is_exact_idempotent_and_fences_old_authority() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "rearm-exact", 12).await;
+        let before = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 20))
+            .await
+            .unwrap();
+        let old_authority = claim.authority.unwrap();
+        repo.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id,
+            expected_generation: 0,
+            reason: "context exhausted".into(),
+        })
+        .await
+        .unwrap();
+        let old_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = ?1),
+                 (SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = ?1),
+                 (SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1)",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+
+        let input = RearmAuthoritativeTurnInput {
+            turn_id,
+            expected_generation: 1,
+            rearmed_at: Timestamp(30),
+        };
+        let RearmAuthoritativeTurnOutcome::Rearmed { turn } = repo
+            .rearm_terminal_runtime_direct_turn(&input)
+            .await
+            .unwrap()
+        else {
+            panic!("expected exact rearm")
+        };
+        assert_eq!(turn.id, before.id);
+        assert_eq!(turn.conversation, before.conversation);
+        assert_eq!(turn.client_key, before.client_key);
+        assert_eq!(turn.prepared, before.prepared);
+        assert_eq!(turn.materialization, Materialization::Unmaterialized);
+        assert_eq!(turn.generation, 2);
+        assert_eq!(
+            turn.lifecycle,
+            TurnLifecycle::Accepted {
+                disposition: AcceptedDisposition::Runtime,
+            }
+        );
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&input).await.unwrap(),
+            RearmAuthoritativeTurnOutcome::ExactReplay { turn } if turn.generation == 2
+        ));
+
+        let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
+            "SELECT e.effect_id, e.generation, e.kind, e.status
+             FROM workflow_effects e WHERE e.workflow_id = ?1 ORDER BY e.effect_id",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_all(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 0, "deliver_runtime_turn".into(), "Invalidated".into()),
+                (2, 2, "deliver_runtime_turn".into(), "Eligible".into()),
+            ]
+        );
+        let new_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = ?1),
+                 (SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = ?1),
+                 (SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1)",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(old_counts, (2, 1, 1));
+        assert_eq!(new_counts, (3, 2, 1));
+        let transition: (i64, i64, Vec<u8>) = sqlx::query_as(
+            "SELECT transition_id, generation, event_payload
+             FROM workflow_transitions WHERE workflow_id = ?1 ORDER BY to_version DESC LIMIT 1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            transition.0,
+            i64::try_from(DIRECT_TURN_REARMED_TRANSITION_ID).unwrap()
+        );
+        assert_eq!(transition.1, 2);
+        assert_eq!(
+            serde_json::from_slice::<direct_turn_profile::DirectTurnEvent>(&transition.2).unwrap(),
+            direct_turn_profile::DirectTurnEvent::Rearmed {
+                turn_id: turn_id.0,
+                generation: 2,
+            }
+        );
+
+        let fresh_claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 40))
+            .await
+            .unwrap();
+        let fresh_authority = fresh_claim.authority.unwrap();
+        assert_eq!(fresh_authority.effect_id, EffectId(2));
+        assert_eq!(fresh_authority.generation, Generation(2));
+        assert_eq!(fresh_authority.declared_workflow_version, Version(3));
+        assert_eq!(
+            repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
+                turn_id,
+                authority: old_authority,
+                prepared: prepared_payload("message-conv-a-rearm-exact"),
+                now: Timestamp(41),
+            })
+            .await
+            .unwrap(),
+            DirectTurnMaterializationEligibility::StaleAuthority
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_rearm_rejects_live_materialized_steering_stale_and_competing_owner() {
+        let repo = repo().await;
+
+        let (live_id, _) = created_turn(&repo, "rearm-live", 1).await;
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&RearmAuthoritativeTurnInput {
+                turn_id: live_id,
+                expected_generation: 0,
+                rearmed_at: Timestamp(10),
+            })
+            .await
+            .unwrap(),
+            RearmAuthoritativeTurnOutcome::Rejected(TurnConflict::RearmRequiresTerminal)
+        ));
+
+        let materialized = repo
+            .accept_authoritative_turn(&input("conv-b", "rearm-materialized", 2))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: materialized_id,
+            ..
+        } = materialized.outcome
+        else {
+            panic!("expected materialized turn")
+        };
+        let materialized_workflow = repo
+            .workflow_id_for_turn(materialized_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let materialized_claim = repo
+            .claim_authoritative_turn(&claim_input(materialized_workflow, materialized_id, 15))
+            .await
+            .unwrap();
+        repo.materialize_authoritative_turn(&materialize_input(
+            materialized_id,
+            materialized_claim.authority.unwrap(),
+            1,
+            1,
+            "message-conv-b-rearm-materialized",
+            16,
+        ))
+        .await
+        .established()
+        .unwrap();
+        repo.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id: materialized_id,
+            expected_generation: 0,
+            reason: "failed".into(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&RearmAuthoritativeTurnInput {
+                turn_id: materialized_id,
+                expected_generation: 1,
+                rearmed_at: Timestamp(11),
+            })
+            .await
+            .unwrap(),
+            RearmAuthoritativeTurnOutcome::Rejected(TurnConflict::RearmRequiresUnmaterialized)
+        ));
+
+        repo.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id: live_id,
+            expected_generation: 0,
+            reason: "failed".into(),
+        })
+        .await
+        .unwrap();
+        let competitor = repo
+            .accept_authoritative_turn(&input("conv-a", "rearm-competitor", 3))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: competitor_id,
+            ..
+        } = competitor.outcome
+        else {
+            panic!("expected competitor")
+        };
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&RearmAuthoritativeTurnInput {
+                turn_id: live_id,
+                expected_generation: 1,
+                rearmed_at: Timestamp(12),
+            })
+            .await
+            .unwrap(),
+            RearmAuthoritativeTurnOutcome::Rejected(TurnConflict::RearmOwnerConflict { owner })
+                if owner == competitor_id
+        ));
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&RearmAuthoritativeTurnInput {
+                turn_id: live_id,
+                expected_generation: 0,
+                rearmed_at: Timestamp(13),
+            })
+            .await
+            .unwrap(),
+            RearmAuthoritativeTurnOutcome::Rejected(TurnConflict::StaleGeneration { actual: 1 })
+        ));
+
+        let steering = repo
+            .accept_authoritative_turn(&input("conv-d", "rearm-steering", 4))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: steering_id,
+            ..
+        } = steering.outcome
+        else {
+            panic!("expected steering fixture")
+        };
+        repo.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id: steering_id,
+            expected_generation: 0,
+            reason: "failed".into(),
+        })
+        .await
+        .unwrap();
+        sqlx::query("UPDATE durable_turns SET disposition = 'Steering' WHERE turn_id = ?1")
+            .bind(i64::try_from(steering_id.0).unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.rearm_terminal_runtime_direct_turn(&RearmAuthoritativeTurnInput {
+                turn_id: steering_id,
+                expected_generation: 1,
+                rearmed_at: Timestamp(14),
+            })
+            .await
+            .unwrap(),
+            RearmAuthoritativeTurnOutcome::Rejected(TurnConflict::RearmRequiresRuntime)
+        ));
+    }
+
+    #[tokio::test]
     async fn terminal_cas_advances_status_version_generation_and_transition_rows() {
         for (key, command, expected_status, expected_terminal) in [
             (
@@ -5428,7 +6084,9 @@ mod tests {
                     expected_generation: 0,
                     reason,
                 },
-                TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => unreachable!(),
+                TurnCommand::Accept { .. }
+                | TurnCommand::Materialize { .. }
+                | TurnCommand::Rearm { .. } => unreachable!(),
             };
             let step = repo.terminate_authoritative_turn(command).await.unwrap();
             assert_eq!(

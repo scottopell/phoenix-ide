@@ -520,6 +520,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_automatic_continuation_superseded_phase",
         sql: MIGRATION_101,
     },
+    Migration {
+        version: 102,
+        name: "preserve_automatic_continuation_resume_phase",
+        sql: MIGRATION_102,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -718,6 +723,33 @@ FOR EACH ROW WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'automatic continuation admission requires eligible opted-in context exhaustion');
+END;
+";
+
+const MIGRATION_102: &str = r"
+ALTER TABLE automatic_continuation_admissions
+ADD COLUMN resume_phase TEXT NOT NULL DEFAULT 'admitted'
+CHECK (resume_phase IN (
+    'admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted'
+));
+
+UPDATE automatic_continuation_admissions
+SET resume_phase = CASE
+    WHEN phase IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+        THEN phase
+    WHEN EXISTS (
+        SELECT 1
+        FROM continuation_dispatch_intents intent
+        JOIN durable_turns turn
+          ON turn.conversation_id = intent.successor_conversation_id
+         AND turn.client_turn_key = intent.message_id
+        WHERE intent.parent_conversation_id = automatic_continuation_admissions.predecessor_conversation_id
+    ) THEN 'dispatch_accepted'
+    WHEN EXISTS (
+        SELECT 1 FROM continuation_dispatch_intents intent
+        WHERE intent.parent_conversation_id = automatic_continuation_admissions.predecessor_conversation_id
+    ) THEN 'successor_reserved'
+    ELSE 'admitted'
 END;
 ";
 
@@ -10688,6 +10720,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_102_backfills_highest_derivable_resume_phase() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE automatic_continuation_admissions (
+                 predecessor_conversation_id TEXT PRIMARY KEY,
+                 phase TEXT NOT NULL
+             );
+             CREATE TABLE continuation_dispatch_intents (
+                 parent_conversation_id TEXT PRIMARY KEY,
+                 successor_conversation_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 conversation_id TEXT NOT NULL,
+                 client_turn_key TEXT NOT NULL
+             );
+             INSERT INTO automatic_continuation_admissions VALUES
+                 ('admitted', 'admitted'),
+                 ('reserved', 'successor_reserved'),
+                 ('transferred', 'ownership_transferred'),
+                 ('accepted', 'dispatch_accepted'),
+                 ('failed-intent', 'failed'),
+                 ('failed-turn', 'failed'),
+                 ('failed-empty', 'failed');
+             INSERT INTO continuation_dispatch_intents VALUES
+                 ('failed-intent', 'successor-intent', 'opening-intent'),
+                 ('failed-turn', 'successor-turn', 'opening-turn');
+             INSERT INTO durable_turns VALUES ('successor-turn', 'opening-turn');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT predecessor_conversation_id, resume_phase
+             FROM automatic_continuation_admissions ORDER BY predecessor_conversation_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("accepted".to_string(), "dispatch_accepted".to_string()),
+                ("admitted".to_string(), "admitted".to_string()),
+                ("failed-empty".to_string(), "admitted".to_string()),
+                (
+                    "failed-intent".to_string(),
+                    "successor_reserved".to_string()
+                ),
+                ("failed-turn".to_string(), "dispatch_accepted".to_string()),
+                ("reserved".to_string(), "successor_reserved".to_string()),
+                (
+                    "transferred".to_string(),
+                    "ownership_transferred".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn migration_101_preserves_rows_and_adds_superseded_phase() {
         let pool = test_pool().await;
         sqlx::raw_sql(
@@ -15427,7 +15522,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_automatic_continuation_superseded')",
+                    (101, 'temporarily_skip_automatic_continuation_superseded'),
+                    (102, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(&pool)
         .await
@@ -16321,7 +16417,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_automatic_continuation_superseded')",
+                    (101, 'temporarily_skip_automatic_continuation_superseded'),
+                    (102, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(pool)
         .await

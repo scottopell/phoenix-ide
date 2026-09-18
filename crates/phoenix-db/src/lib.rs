@@ -1294,10 +1294,21 @@ pub struct AutomaticContinuationAdmission {
     pub first_message_id: ClientTurnKey,
     pub opening_authority: ContinuationOpeningAuthority,
     pub phase: AutomaticContinuationPhase,
+    pub resume_phase: AutomaticContinuationPhase,
     pub no_progress_attempts: u32,
     pub last_error: Option<String>,
     pub admitted_at_unix_micros: i64,
     pub updated_at_unix_micros: i64,
+}
+
+fn accepted_continuation_message_matches(
+    successor_conversation_id: &str,
+    accepted_message_id: &str,
+    first_message_id: &ClientTurnKey,
+) -> bool {
+    accepted_message_id == first_message_id.as_str()
+        || accepted_message_id
+            == format!("{successor_conversation_id}:{}", first_message_id.as_str())
 }
 
 impl AutomaticContinuationAdmission {
@@ -6580,7 +6591,7 @@ impl Database {
     ) -> DbResult<Option<AutomaticContinuationAdmission>> {
         let row = sqlx::query(
             "SELECT product_conversation_id, summary_message_id, operation_id,
-                    first_message_id, opening_authority, phase,
+                    first_message_id, opening_authority, phase, resume_phase,
                     no_progress_attempts, last_error,
                     admitted_at_unix_micros, updated_at_unix_micros
              FROM automatic_continuation_admissions
@@ -6596,6 +6607,7 @@ impl Database {
         let first_message_id: String = row.try_get("first_message_id")?;
         let opening_authority: String = row.try_get("opening_authority")?;
         let phase: String = row.try_get("phase")?;
+        let resume_phase: String = row.try_get("resume_phase")?;
         let attempts: i64 = row.try_get("no_progress_attempts")?;
         Ok(Some(AutomaticContinuationAdmission {
             predecessor_conversation_id: predecessor_conversation_id.to_string(),
@@ -6614,6 +6626,13 @@ impl Database {
             phase: AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
                 DbError::Serialization(format!("unknown automatic continuation phase: {phase}"))
             })?,
+            resume_phase: AutomaticContinuationPhase::from_db_str(&resume_phase).ok_or_else(
+                || {
+                    DbError::Serialization(format!(
+                        "unknown automatic continuation resume phase: {resume_phase}"
+                    ))
+                },
+            )?,
             no_progress_attempts: u32::try_from(attempts).map_err(|_| {
                 DbError::Serialization(format!(
                     "invalid automatic continuation no-progress attempts: {attempts}"
@@ -6684,7 +6703,6 @@ impl Database {
                    AND (accepted_successor_message_id = ?2
                         OR accepted_successor_message_id = successor_conversation_id || ':' || ?2)
                    AND continuation_message_id = ?3
-                   AND opening_authority = 'generated_predecessor_context'
              )",
         )
         .bind(&admission.predecessor_conversation_id)
@@ -6738,7 +6756,12 @@ impl Database {
     ) -> DbResult<()> {
         let updated = sqlx::query(
             "UPDATE automatic_continuation_admissions
-             SET phase = ?2, no_progress_attempts = 0, last_error = NULL,
+             SET phase = ?2,
+                 resume_phase = CASE
+                     WHEN ?2 IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+                     THEN ?2 ELSE resume_phase
+                 END,
+                 no_progress_attempts = 0, last_error = NULL,
                  updated_at_unix_micros = ?3
              WHERE predecessor_conversation_id = ?1
                AND (
@@ -6786,6 +6809,99 @@ impl Database {
             ));
         }
         Ok(())
+    }
+
+    /// Classify a failed attempt against durable handoff settlement before charging the breaker.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or classification/update fails.
+    pub async fn reconcile_or_record_automatic_continuation_no_progress(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+        error: &str,
+    ) -> DbResult<AutomaticContinuationPhase> {
+        let mut tx = self.pool.begin().await?;
+        let completed: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT successor_conversation_id, accepted_successor_message_id,
+                    continuation_message_id
+             FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((successor_id, accepted_message_id, summary_message_id)) = completed {
+            let exact_message = accepted_continuation_message_matches(
+                &successor_id,
+                &accepted_message_id,
+                &admission.first_message_id,
+            );
+            let phase = if exact_message && summary_message_id == admission.summary_message_id {
+                AutomaticContinuationPhase::MessageSettled
+            } else {
+                AutomaticContinuationPhase::Superseded
+            };
+            sqlx::query(
+                "UPDATE automatic_continuation_admissions
+             SET phase = ?2,
+                 resume_phase = CASE
+                     WHEN ?2 IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+                     THEN ?2 ELSE resume_phase
+                 END,
+                 no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?3
+
+                 WHERE predecessor_conversation_id = ?1
+                   AND phase NOT IN ('message_settled', 'superseded', 'failed')",
+            )
+            .bind(&admission.predecessor_conversation_id)
+            .bind(phase.as_str())
+            .bind(Utc::now().timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(phase);
+        }
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET no_progress_attempts = no_progress_attempts + 1,
+                 phase = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN 'failed'
+                     ELSE phase
+                 END,
+                 last_error = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN ?3
+                     ELSE NULL
+                 END,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded', 'failed')
+             RETURNING no_progress_attempts",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(i64::from(
+            AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS,
+        ))
+        .bind(error)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(attempts) = attempts else {
+            return Err(DbError::ConversationNotFound(
+                admission.predecessor_conversation_id.clone(),
+            ));
+        };
+        tx.commit().await?;
+        if u32::try_from(attempts).map_err(|_| {
+            DbError::Serialization(format!(
+                "invalid automatic continuation no-progress attempts: {attempts}"
+            ))
+        })? >= AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS
+        {
+            Ok(AutomaticContinuationPhase::Failed)
+        } else {
+            Ok(admission.phase)
+        }
     }
 
     /// Record one automatic-continuation attempt that made no durable progress.
@@ -6848,14 +6964,29 @@ impl Database {
     pub async fn retry_failed_automatic_continuation(
         &self,
         predecessor_conversation_id: &str,
+        resume_phase: AutomaticContinuationPhase,
     ) -> DbResult<()> {
+        if !matches!(
+            resume_phase,
+            AutomaticContinuationPhase::Admitted
+                | AutomaticContinuationPhase::SuccessorReserved
+                | AutomaticContinuationPhase::OwnershipTransferred
+                | AutomaticContinuationPhase::DispatchAccepted
+        ) {
+            return Err(DbError::Serialization(format!(
+                "invalid automatic continuation retry phase: {}",
+                resume_phase.as_str()
+            )));
+        }
         let updated = sqlx::query(
             "UPDATE automatic_continuation_admissions
-             SET phase = 'admitted', no_progress_attempts = 0, last_error = NULL,
-                 updated_at_unix_micros = ?2
+             SET phase = ?2, resume_phase = ?2,
+                 no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?3
              WHERE predecessor_conversation_id = ?1 AND phase = 'failed'",
         )
         .bind(predecessor_conversation_id)
+        .bind(resume_phase.as_str())
         .bind(Utc::now().timestamp_micros())
         .execute(&self.pool)
         .await?;
@@ -18265,9 +18396,15 @@ mod tests {
             .has_settled_automatic_continuation(&admitted)
             .await
             .unwrap());
-        db.supersede_automatic_continuation("auto-on")
+        assert_eq!(
+            db.reconcile_or_record_automatic_continuation_no_progress(
+                &admitted,
+                "late failure after manual settlement",
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            AutomaticContinuationPhase::Superseded
+        );
         let superseded = db
             .automatic_continuation_admission("auto-on")
             .await
@@ -18291,7 +18428,63 @@ mod tests {
         assert_eq!(admission_count, 2);
     }
 
+    #[test]
+    fn accepted_continuation_identity_requires_exact_successor_namespace() {
+        let first = ClientTurnKey::try_from("automatic-opening").unwrap();
+        assert!(accepted_continuation_message_matches(
+            "successor",
+            "automatic-opening",
+            &first,
+        ));
+        assert!(accepted_continuation_message_matches(
+            "successor",
+            "successor:automatic-opening",
+            &first,
+        ));
+        assert!(!accepted_continuation_message_matches(
+            "successor",
+            "other:automatic-opening",
+            &first,
+        ));
+    }
+
     #[tokio::test]
+    async fn scoped_summary_lookup_is_independent_of_transcript_length() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("summary-lookup", "summary-lookup", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..2_000 {
+            db.add_message(
+                &format!("history-{index}"),
+                "summary-lookup",
+                &MessageContent::user(format!("history {index}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "target-summary",
+            "summary-lookup",
+            &MessageContent::continuation("exact summary"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let summary = db
+            .get_message_by_id_in_conversation("summary-lookup", "target-summary")
+            .await
+            .unwrap();
+        assert_eq!(summary.message_id, "target-summary");
+        assert!(matches!(summary.content, MessageContent::Continuation(_)));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn automatic_continuation_breaker_is_bounded_and_explicit_retry_preserves_identity() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("breaker-parent", "breaker-parent", "/tmp", true, None, None)
@@ -18347,23 +18540,44 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::SuccessorReserved,
+        )
+        .await
+        .unwrap();
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::OwnershipTransferred,
+        )
+        .await
+        .unwrap();
         for attempt in 1..=AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
             let phase = db
                 .record_automatic_continuation_no_progress("breaker-parent", "runtime unavailable")
                 .await
                 .unwrap();
             if attempt < AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
-                assert_eq!(phase, AutomaticContinuationPhase::Admitted);
+                assert_eq!(phase, AutomaticContinuationPhase::OwnershipTransferred);
             } else {
                 assert_eq!(phase, AutomaticContinuationPhase::Failed);
             }
         }
+        let failed = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.resume_phase,
+            AutomaticContinuationPhase::OwnershipTransferred
+        );
         assert!(db
             .pending_automatic_continuation_admissions()
             .await
             .unwrap()
             .is_empty());
-        db.retry_failed_automatic_continuation("breaker-parent")
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
             .await
             .unwrap();
         let retried = db
@@ -18371,7 +18585,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(retried.phase, AutomaticContinuationPhase::Admitted);
+        assert_eq!(
+            retried.phase,
+            AutomaticContinuationPhase::OwnershipTransferred
+        );
         assert_eq!(retried.no_progress_attempts, 0);
         assert!(retried.last_error.is_none());
         assert_eq!(retried.summary_message_id, original.summary_message_id);
