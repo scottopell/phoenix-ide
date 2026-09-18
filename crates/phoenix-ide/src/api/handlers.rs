@@ -4136,6 +4136,7 @@ async fn get_system_prompt(
             system_prompt = crate::system_prompt::inspected_project_coordinator_prompt(
                 &system_prompt,
                 profile.charter(),
+                conversation.llm_language,
             );
         }
     }

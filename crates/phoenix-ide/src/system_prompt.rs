@@ -109,21 +109,39 @@ Coordinate outcomes rather than merely distributing tasks. Delegate bounded outc
 
 You retain arbitration of scope, priorities, shared resources, exceptions, verification standards, and stopping points. Work directly when the change is small or delegation would lose essential context. This profile grants no additional tools, permissions, lifecycle authority, or ability to edit its charter.";
 
-pub fn append_project_coordinator_guidance(system_prompt: &mut String) {
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str(PROJECT_COORDINATOR_GUIDANCE);
+const PROJECT_COORDINATOR_GUIDANCE_CAVEMAN: &str = "## Project Coordinator\n\nDelegate bounded outcome when useful and allowed. Worker own scope: fix, validate, publish, qualify. You decide scope, priority, shared resource, exception, proof, stop. Do small work direct when better. No new tool, permission, lifecycle power, or charter edit power.";
+
+pub fn project_coordinator_guidance(language: LlmLanguage) -> &'static str {
+    match language {
+        LlmLanguage::PhoenixNative => PROJECT_COORDINATOR_GUIDANCE,
+        LlmLanguage::Caveman => PROJECT_COORDINATOR_GUIDANCE_CAVEMAN,
+    }
 }
 
-pub fn inspected_project_coordinator_prompt(base: &str, charter: &str) -> String {
+pub fn append_project_coordinator_guidance(system_prompt: &mut String, language: LlmLanguage) {
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(project_coordinator_guidance(language));
+}
+
+pub fn inspected_project_coordinator_prompt(
+    base: &str,
+    charter: &str,
+    language: LlmLanguage,
+) -> String {
     let mut prompt = base.to_string();
-    append_project_coordinator_guidance(&mut prompt);
+    append_project_coordinator_guidance(&mut prompt, language);
     prompt.push_str("\n\n");
-    prompt.push_str(&project_coordinator_charter_block(charter));
+    prompt.push_str(&project_coordinator_charter_block(charter, language));
     prompt
 }
 
-pub fn project_coordinator_charter_block(charter: &str) -> String {
-    format!("# User-authored Project Coordinator charter\n\n{charter}")
+pub fn project_coordinator_charter_block(charter: &str, language: LlmLanguage) -> String {
+    match language {
+        LlmLanguage::PhoenixNative => {
+            format!("# User-authored Project Coordinator charter\n\n{charter}")
+        }
+        LlmLanguage::Caveman => format!("# User charter\n\n{charter}"),
+    }
 }
 
 pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
@@ -984,7 +1002,11 @@ mod project_coordinator_tests {
     #[test]
     fn inspected_prompt_matches_live_profile_content() {
         let base = "base";
-        let inspected = inspected_project_coordinator_prompt(base, "current charter");
+        let inspected = inspected_project_coordinator_prompt(
+            base,
+            "current charter",
+            LlmLanguage::PhoenixNative,
+        );
         assert_eq!(
             inspected,
             format!(
@@ -994,9 +1016,21 @@ mod project_coordinator_tests {
     }
 
     #[test]
+    fn project_coordinator_blocks_honor_caveman_language() {
+        assert_eq!(
+            project_coordinator_guidance(LlmLanguage::Caveman),
+            PROJECT_COORDINATOR_GUIDANCE_CAVEMAN
+        );
+        assert_eq!(
+            project_coordinator_charter_block("own outcome", LlmLanguage::Caveman),
+            "# User charter\n\nown outcome"
+        );
+    }
+
+    #[test]
     fn charter_is_a_distinct_verbatim_system_block() {
         let charter = "  first line\nsecond line  ";
-        let block = project_coordinator_charter_block(charter);
+        let block = project_coordinator_charter_block(charter, LlmLanguage::PhoenixNative);
         assert_eq!(
             block,
             "# User-authored Project Coordinator charter\n\n  first line\nsecond line  "

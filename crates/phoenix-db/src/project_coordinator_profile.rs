@@ -57,9 +57,11 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<Option<ProjectCoordinatorProfile>> {
         let row = sqlx::query(
-            "SELECT charter, revision, updated_at_unix_micros
-             FROM product_conversation_coordinator_profiles
-             WHERE product_conversation_id = ?1",
+            "SELECT profile.charter, fence.revision, profile.updated_at_unix_micros
+             FROM product_conversation_coordinator_profiles profile
+             JOIN product_conversation_coordinator_profile_revisions fence
+               ON fence.product_conversation_id = profile.product_conversation_id
+             WHERE profile.product_conversation_id = ?1",
         )
         .bind(product_conversation_id.as_str())
         .fetch_optional(&self.pool)
@@ -77,10 +79,12 @@ impl Database {
         conversation_id: &str,
     ) -> DbResult<Option<ProjectCoordinatorProfile>> {
         let row = sqlx::query(
-            "SELECT profile.charter, profile.revision, profile.updated_at_unix_micros
+            "SELECT profile.charter, fence.revision, profile.updated_at_unix_micros
              FROM conversations conversation
              JOIN product_conversation_coordinator_profiles profile
                ON profile.product_conversation_id = conversation.product_conversation_id
+             JOIN product_conversation_coordinator_profile_revisions fence
+               ON fence.product_conversation_id = profile.product_conversation_id
              WHERE conversation.id = ?1",
         )
         .bind(conversation_id)
@@ -100,7 +104,7 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<ProjectCoordinatorProfileSettings> {
         let row = sqlx::query(
-            "SELECT profile.charter, profile.revision AS active_revision,
+            "SELECT profile.charter,
                     profile.updated_at_unix_micros,
                     COALESCE(fence.revision, 0) AS retained_revision
              FROM product_conversations conversation
@@ -117,12 +121,8 @@ impl Database {
         let charter: Option<String> = row.try_get("charter")?;
         let profile = charter
             .map(|charter| {
-                ProjectCoordinatorProfile::new(
-                    charter,
-                    row.get("active_revision"),
-                    row.get("updated_at_unix_micros"),
-                )
-                .map_err(|error| crate::DbError::Serialization(error.to_string()))
+                ProjectCoordinatorProfile::new(charter, revision, row.get("updated_at_unix_micros"))
+                    .map_err(|error| crate::DbError::Serialization(error.to_string()))
             })
             .transpose()?;
         Ok(ProjectCoordinatorProfileSettings { profile, revision })
@@ -205,16 +205,14 @@ impl Database {
         let outcome = if let Some(charter) = charter {
             sqlx::query(
                 "INSERT INTO product_conversation_coordinator_profiles
-                         (product_conversation_id, charter, revision, updated_at_unix_micros)
-                     VALUES (?1, ?2, ?3, ?4)
+                         (product_conversation_id, charter, updated_at_unix_micros)
+                     VALUES (?1, ?2, ?3)
                      ON CONFLICT(product_conversation_id) DO UPDATE SET
                          charter = excluded.charter,
-                         revision = excluded.revision,
                          updated_at_unix_micros = excluded.updated_at_unix_micros",
             )
             .bind(product_conversation_id.as_str())
             .bind(charter)
-            .bind(new_revision)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -263,17 +261,26 @@ impl Database {
         revision: i64,
         updated_at_unix_micros: i64,
     ) -> Option<bool> {
-        let persisted_revision: Result<Option<i64>, _> = sqlx::query_scalar(
-            "SELECT revision FROM product_conversation_coordinator_profile_revisions
-             WHERE product_conversation_id = ?1",
+        let classified: Result<Option<(i64, Option<i64>)>, _> = sqlx::query_as(
+            "SELECT fence.revision,
+                    CASE
+                      WHEN profile.product_conversation_id IS NOT NULL
+                       AND profile.charter IS ?2
+                       AND profile.updated_at_unix_micros = ?3
+                      THEN 1 ELSE 0
+                    END AS intended_match
+             FROM product_conversation_coordinator_profile_revisions fence
+             LEFT JOIN product_conversation_coordinator_profiles profile
+               ON profile.product_conversation_id = fence.product_conversation_id
+             WHERE fence.product_conversation_id = ?1",
         )
         .bind(product_conversation_id.as_str())
+        .bind(charter)
+        .bind(updated_at_unix_micros)
         .fetch_optional(&self.pool)
         .await;
-        let persisted_revision = match persisted_revision {
-            Ok(Some(value)) => value,
-            Ok(None) if expected_revision == 0 => 0,
-            Ok(None) | Err(_) => return None,
+        let Some((persisted_revision, intended_match)) = classified.ok()? else {
+            return (expected_revision == 0).then_some(false);
         };
         if persisted_revision == expected_revision {
             return Some(false);
@@ -281,24 +288,10 @@ impl Database {
         if persisted_revision != revision {
             return None;
         }
-        Some(match charter {
-            Some(charter) => sqlx::query(
-                "SELECT 1 FROM product_conversation_coordinator_profiles
-                 WHERE product_conversation_id = ?1 AND charter = ?2
-                   AND revision = ?3 AND updated_at_unix_micros = ?4",
-            )
-            .bind(product_conversation_id.as_str())
-            .bind(charter)
-            .bind(revision)
-            .bind(updated_at_unix_micros)
-            .fetch_optional(&self.pool)
-            .await
-            .is_ok_and(|row| row.is_some()),
-            None => self
-                .get_project_coordinator_profile(product_conversation_id)
-                .await
-                .is_ok_and(|profile| profile.is_none()),
-        })
+        match charter {
+            Some(_) => intended_match.map(|value| value == 1),
+            None => Some(intended_match == Some(0)),
+        }
     }
 }
 
