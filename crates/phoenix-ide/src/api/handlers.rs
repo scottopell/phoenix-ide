@@ -2205,19 +2205,18 @@ fn creation_request_matches_job<'a>(
     req: &'a CreateConversationRequest,
     raw_files: &'a [RawAttachmentPart],
     job: &'a crate::db::ConversationCreationJob,
+    conversation: &'a crate::db::Conversation,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
         let intent = &job.intent;
         job.message_id.as_deref() == Some(req.message_id.as_str())
-            && intent.cwd == req.cwd
-            && intent
-                .model
+            && req
+                .conversation_id
                 .as_deref()
-                .is_none_or(|model| model == req.model)
-            && intent
-                .effort
-                .as_ref()
-                .is_none_or(|effort| Some(effort) == req.effort.as_ref())
+                .is_none_or(|id| id == job.conversation_id)
+            && intent.cwd == req.cwd
+            && intent.model.as_deref().or(conversation.model.as_deref()) == Some(req.model.as_str())
+            && intent.effort.as_ref().or(conversation.effort.as_ref()) == req.effort.as_ref()
             && intent.text == req.text
             && intent.mode.as_deref() == req.mode.as_deref().filter(|mode| *mode != "direct")
             && intent.base_branch == req.base_branch
@@ -2328,7 +2327,7 @@ async fn create_conversation_with_id_inner(
             .flatten()
         {
             let is_same_create =
-                creation_request_matches_job(&req, &raw_files, &existing_job).await;
+                creation_request_matches_job(&req, &raw_files, &existing_job, &conv).await;
             if !is_same_create {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "conversation_id already belongs to an existing conversation",
@@ -2362,7 +2361,7 @@ async fn create_conversation_with_id_inner(
             .await
         {
             tracing::info!(message_id = %req.message_id, "Create request hit existing creation job message id");
-            if !creation_request_matches_job(&req, &raw_files, &existing_job).await {
+            if !creation_request_matches_job(&req, &raw_files, &existing_job, &conv).await {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "message_id already belongs to a different creation intent",
                     "idempotency_conflict",
@@ -9082,6 +9081,11 @@ mod conversation_cwd_validation_tests {
             )
             .await
             .expect("existing shell");
+        sqlx::query("UPDATE conversations SET model = 'claude-sonnet-5' WHERE id = ?1")
+            .bind(&conv_id)
+            .execute(state.db.pool())
+            .await
+            .expect("persisted creation model");
         state
             .db
             .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
