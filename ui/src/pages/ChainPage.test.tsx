@@ -599,6 +599,23 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
   });
 });
 
+describe('ChainPage — History naming controls', () => {
+  it('hides rename and regeneration controls', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain({
+      archived: true,
+      chain_name: null,
+      display_name: 'History Chain',
+    }));
+
+    renderAt(ROOT_ID);
+
+    expect(await screen.findByText('History Chain')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /History Chain/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Regenerate name from chain content' })).toBeNull();
+  });
+});
+
 describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
   it('clicking regenerate calls regenerateChainName and applies the returned name', async () => {
     const { api } = await import('../api');
