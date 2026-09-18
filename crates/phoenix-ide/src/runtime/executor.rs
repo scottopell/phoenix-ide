@@ -8373,7 +8373,7 @@ where
         priority: crate::task_source::Priority,
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) {
+    ) -> Result<(), String> {
         let approval_msg = format!(
             "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
             self.context.filesystem_root().display(),
@@ -8400,7 +8400,9 @@ where
                     .persisted_message(msg);
             }
             Err(error) => {
-                panic!("approved follow-up authority committed without approval message projection: {error}");
+                return Err(format!(
+                    "approved follow-up authority committed without approval message projection: {error}"
+                ));
             }
         }
         let _ = self
@@ -8425,6 +8427,7 @@ where
                     archived: None,
                 },
             });
+        Ok(())
     }
 
     async fn approve_follow_up_in_existing_scope(
@@ -8492,7 +8495,8 @@ where
             .map_err(FollowUpApprovalError::AuthorityLost)?;
 
         self.publish_follow_up_approval(reviewed.task_title, title, priority, plan, admitted)
-            .await;
+            .await
+            .map_err(FollowUpApprovalError::AuthorityLost)?;
         Ok(())
     }
 
