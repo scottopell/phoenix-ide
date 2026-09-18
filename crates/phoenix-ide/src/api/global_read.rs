@@ -865,6 +865,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn previous_read(
         &self,
         binding: &PreviousTranscriptsBinding,
@@ -872,13 +873,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         cursor: Option<&str>,
     ) -> PreviousTranscriptsOutput {
         let target = match resolve_conversation_read_target(self, transcript_ref).await {
-            Ok(target) if target.message_id.is_none() => target.conversation_id,
-            Ok(_) => {
-                return PreviousTranscriptsOutput::InvalidTarget {
-                    message: "conversation message fragments are not accepted by predecessor read"
-                        .to_string(),
-                }
-            }
+            Ok(target) => target,
             Err(error) => {
                 return PreviousTranscriptsOutput::InvalidTarget {
                     message: error.clone(),
@@ -888,10 +883,6 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         let scope = ConversationReadCursorScope::StrictPredecessors {
             product_conversation_id: binding.product_conversation_id.clone(),
             executing_transcript_id: binding.executing_transcript_id.clone(),
-        };
-        let position = match decode_conversation_read_cursor(cursor, &scope, &target) {
-            Ok(position) => position,
-            Err(message) => return PreviousTranscriptsOutput::InvalidCursor { message },
         };
         let predecessors = match self.predecessor_conversations(binding).await {
             Ok(predecessors) if predecessors.is_empty() => {
@@ -903,12 +894,45 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         let Some((ordinal, conv)) = predecessors
             .iter()
             .enumerate()
-            .find(|(_, conv)| conv.id == target)
+            .find(|(_, conv)| conv.id == target.conversation_id)
         else {
             return PreviousTranscriptsOutput::InvalidTarget {
                 message: "requested transcript is not a predecessor of the executing transcript"
                     .to_string(),
             };
+        };
+        let position = if let Some(message_id) = target.message_id.as_deref() {
+            if cursor.is_some() {
+                return PreviousTranscriptsOutput::InvalidCursor {
+                    message: "message-fragment reads cannot be combined with a cursor; continue with the transcript id and the returned cursor".to_string(),
+                };
+            }
+            let message = match self.db.get_message_by_id(message_id).await {
+                Ok(message) if message.conversation_id == conv.id => message,
+                Ok(_) => {
+                    return PreviousTranscriptsOutput::InvalidTarget {
+                        message: "message does not belong to the requested predecessor transcript"
+                            .to_string(),
+                    }
+                }
+                Err(error) => {
+                    return PreviousTranscriptsOutput::InvalidTarget {
+                        message: format!("message not found: {error}"),
+                    }
+                }
+            };
+            let rendered = render_previous_message_line(conv, &message);
+            PreviousReadPosition {
+                message_sequence: message.sequence_id,
+                byte_offset: 0,
+                message_id: Some(identity_sha256(&message.message_id)),
+                rendered_sha256: Some(rendered_sha256(&rendered)),
+            }
+        } else {
+            match decode_conversation_read_cursor(cursor, &scope, &target.conversation_id) {
+                Ok(position) => position,
+                Err(message) => return PreviousTranscriptsOutput::InvalidCursor { message },
+            }
         };
         let page = match render_message_page_bounded(&self.db, conv, position).await {
             Ok(page) => page,
@@ -924,7 +948,9 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         let next_cursor = match page
             .next_cursor
-            .map(|position| encode_conversation_read_cursor(&scope, &target, &position))
+            .map(|position| {
+                encode_conversation_read_cursor(&scope, &target.conversation_id, &position)
+            })
             .transpose()
         {
             Ok(cursor) => cursor,
@@ -2606,6 +2632,45 @@ mod tests {
             .unwrap();
 
         assert!(output.contains("alpha only predecessor evidence"));
+    }
+
+    #[tokio::test]
+    async fn emitted_predecessor_message_ref_starts_targeted_read_at_message() {
+        let (service, binding) = predecessor_service().await;
+        let search = service
+            .search_predecessor_conversations(&binding, "alpha")
+            .await;
+        let PreviousTranscriptsOutput::SearchResults { results, .. } = search else {
+            panic!("predecessor search results");
+        };
+        let message_ref = results.first().expect("search hit").message_ref.clone();
+
+        let output = service
+            .read_predecessor_conversation(&binding, &message_ref, None)
+            .await;
+        let PreviousTranscriptsOutput::ReadPage {
+            starts_at, content, ..
+        } = output
+        else {
+            panic!("targeted predecessor read page");
+        };
+
+        assert_eq!(starts_at.expect("page start").message_id, "a-msg");
+        assert!(content.contains("alpha only predecessor evidence"));
+    }
+
+    #[tokio::test]
+    async fn targeted_predecessor_read_rejects_nonmember_message() {
+        let (service, binding) = predecessor_service().await;
+
+        let output = service
+            .read_predecessor_conversation(&binding, "@conv:pred-a#message-b-msg", None)
+            .await;
+
+        assert!(matches!(
+            output,
+            PreviousTranscriptsOutput::InvalidTarget { .. }
+        ));
     }
 
     #[tokio::test]

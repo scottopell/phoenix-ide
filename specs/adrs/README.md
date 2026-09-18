@@ -71,6 +71,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 | [059](059_read-conversation-cursors-are-versioned-opaque-strings.md) | Read-conversation cursors are versioned opaque strings | Accepted | REQ-RET-008/009, REQ-COMP-006 |
+| [060](060_global-tools-remain-coordinator-only.md) | Phoenix-wide tools remain Coordinator-only | Accepted | REQ-GR-007, REQ-RET-009 |
 
 ## For agents: which decisions bind your task
 
@@ -113,7 +114,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
 | Specifying opt-in automatic continuation consent, admission, or generated-context authority | 054, then 025, 031, 045, and 046 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
-| Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, continuation recall orientation, or read cursor authority | 059, then 051, 027, 031, and 045 |
+| Specifying ordinary-parent predecessor recall, global-tool authority, planning-parent recall eligibility, continuation recall orientation, or read cursor authority | 060, then 059, 051, 027, 031, and 045 |
 
 ## Decision dependencies
 

@@ -2443,27 +2443,6 @@ mod tool_registry_executor_tests {
             ),
             Arc::from(Vec::new()),
         )
-        .with_writing_tools(Some(
-            WritingConversationTools::new(
-                Arc::new(NamedMarker {
-                    name: "search_conversations",
-                    description: "predecessor scoped search",
-                }),
-                Arc::new(NamedMarker {
-                    name: "read_conversation",
-                    description: "predecessor scoped read",
-                }),
-                Arc::new(NamedMarker {
-                    name: "query_database",
-                    description: "query",
-                }),
-                Arc::new(NamedMarker {
-                    name: "send_conversation_message",
-                    description: "send",
-                }),
-            )
-            .unwrap(),
-        ))
         .with_host_bound_tools(vec![
             Arc::new(NamedMarker {
                 name: "previous_transcripts",
@@ -2494,6 +2473,16 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "previous_transcripts"));
+        let explore_names = executor
+            .definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!explore_names.iter().any(|name| name == "query_database"));
+        assert!(!explore_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
         executor.upgrade_to_work_mode();
         assert!(executor
             .definitions()
@@ -2515,6 +2504,16 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "previous_transcripts"));
+        let work_names = executor
+            .definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!work_names.iter().any(|name| name == "query_database"));
+        assert!(!work_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
         assert_predecessor_tool_definitions(&executor).await;
     }
 }

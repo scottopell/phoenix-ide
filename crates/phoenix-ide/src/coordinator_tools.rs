@@ -746,6 +746,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_global_bundle_and_ordinary_predecessor_bundle_do_not_overlap_authority() {
+        let (global, _) = application_tools().await;
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let global = global.into_tools().collect::<Vec<_>>();
+        let predecessor = predecessor_host_bound_tools(
+            service,
+            PreviousTranscriptsBinding::new("product".to_string(), "current".to_string()),
+        );
+        let global_names = tool_names(&global);
+        let predecessor_names = tool_names(&predecessor);
+
+        assert!(global_names.iter().any(|name| name == "query_database"));
+        assert!(global_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
+        assert!(!global_names
+            .iter()
+            .any(|name| name == "previous_transcripts"));
+        assert_eq!(
+            predecessor_names,
+            vec![
+                "previous_transcripts",
+                "search_conversations",
+                "read_conversation"
+            ]
+        );
+        assert!(!predecessor_names
+            .iter()
+            .any(|name| name == "query_database"));
+        assert!(!predecessor_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
+    }
+
+    #[tokio::test]
     async fn read_conversation_rejects_present_malformed_cursor() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));

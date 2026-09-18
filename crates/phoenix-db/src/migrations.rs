@@ -745,6 +745,11 @@ SELECT DISTINCT message_id
 FROM steering_messages
 WHERE length(CAST(message_id AS BLOB)) > 256;
 
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM continuation_dispatch_intents
+WHERE length(CAST(message_id AS BLOB)) > 256;
+
 CREATE TRIGGER messages_bound_new_message_id_bytes
 BEFORE INSERT ON messages
 FOR EACH ROW
@@ -10397,6 +10402,7 @@ mod tests {
     use sqlx::Row;
     use std::str::FromStr;
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_099_preserves_legacy_ids_and_bounds_new_utf8_bytes() {
         let pool = test_pool().await;
@@ -10419,6 +10425,10 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE continuation_dispatch_intents (message_id TEXT PRIMARY KEY)")
             .execute(&pool)
             .await
             .unwrap();
@@ -10456,6 +10466,13 @@ mod tests {
             .await
             .unwrap();
 
+        let admitted_continuation = "k".repeat(257);
+        sqlx::query("INSERT INTO continuation_dispatch_intents (message_id) VALUES (?1)")
+            .bind(&admitted_continuation)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
 
         assert_eq!(
@@ -10482,6 +10499,11 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&admitted_steering)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_continuation)
             .execute(&pool)
             .await
             .unwrap();
