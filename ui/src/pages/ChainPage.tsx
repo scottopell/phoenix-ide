@@ -689,7 +689,7 @@ function ChainPageHeader({
 
   return (
     <header className="chain-page-header">
-      {editing ? (
+      {editing && !chain.archived ? (
         <input
           ref={inputRef}
           className="chain-page-name-input"
@@ -701,6 +701,8 @@ function ChainPageHeader({
           placeholder="Name this chain…"
           maxLength={200}
         />
+      ) : chain.archived ? (
+        <span className="chain-page-name">{chain.display_name}</span>
       ) : (
         <button
           type="button"
@@ -711,7 +713,7 @@ function ChainPageHeader({
           {chain.display_name}
         </button>
       )}
-      <button
+      {!chain.archived && <button
         type="button"
         className="chain-page-regenerate"
         onClick={() => void regenerate()}
@@ -730,7 +732,7 @@ function ChainPageHeader({
           <Sparkles size={14} />
         )}
         <span>{regenerating ? 'Regenerating…' : 'Regenerate'}</span>
-      </button>
+      </button>}
       <span className="chain-page-meta">
         {chain.current_member_count}{' '}
         {chain.current_member_count === 1 ? 'conversation' : 'conversations'}
