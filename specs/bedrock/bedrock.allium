@@ -154,6 +154,7 @@ enum AutoContinuationPhase {
     | ownership_transferred
     | dispatch_accepted
     | message_settled
+    | superseded
     | failed
 }
 enum ContinuationOpeningAuthority {
@@ -1383,7 +1384,7 @@ rule ProspectiveAutoContinuationSettingChanged {
 
 rule AdmittedAutomaticContinuationUsesManualOperation {
     when: AutomaticContinuationAdmissionRuns(admission, new_conv)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: admission.predecessor.parent_status = context_exhausted
     requires: admission.no_progress_attempts < config.max_auto_continuation_attempts_without_durable_progress
     ensures: ContinuationSuccessorOperationRuns(
@@ -1399,9 +1400,21 @@ rule AdmittedAutomaticContinuationUsesManualOperation {
         -- compare-and-commit and resolve to its winner.
 }
 
+rule ManualContinuationWinnerSupersedesAutomaticAdmission {
+    when: ContinuationSuccessorAttemptLosesRace(conversation, requested_handoff, first_message_id)
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
+        requires: conversation.continued_in_conv_id != absent
+        requires: not SuccessorOpeningAcceptedExactlyOnce(
+            conversation.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
+        ensures: admission.phase = superseded
+        ensures: not SafeManualContinuationRetryOffered(admission)
+}
+
 rule AutomaticContinuationDurablePhaseAdvances {
     when: AutomaticContinuationDurableProgress(admission, phase)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: phase = next_auto_continuation_phase(admission.phase)
     ensures: admission.phase = phase
     ensures: admission.no_progress_attempts = 0
@@ -1446,7 +1459,7 @@ rule FailedAutomaticContinuationUsesAcceptedManualPayload {
 
 rule ServerRestartResumesAdmittedAutomaticContinuation {
     when: ServerRestarted(conversation)
-    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, failed }:
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
         ensures: AutomaticContinuationAdmissionRuns(admission, auto_continuation_successor_identity(admission))
 }
 
@@ -2582,6 +2595,15 @@ invariant AutoContinuationAdmissionProvenanceMatchesOperation {
             continuation_summary_message_id(admission.continuation_operation_id)
         and admission.first_message_id =
             auto_continuation_first_message_id(admission.continuation_operation_id)
+}
+
+invariant SupersededAutoContinuationHasDifferentSuccessorAcceptance {
+    for admission in AutoContinuationAdmission where admission.phase = superseded:
+        admission.predecessor.continued_in_conv_id != absent
+        and not SuccessorOpeningAcceptedExactlyOnce(
+            admission.predecessor.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
 }
 
 invariant SettledAutoContinuationHasExactlyOneSuccessorAcceptance {

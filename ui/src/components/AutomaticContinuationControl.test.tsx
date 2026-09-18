@@ -33,7 +33,7 @@ async function openControl() {
 
 describe('AutomaticContinuationControl', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     vi.useRealTimers();
     apiMock.getProductConversationAutomaticContinuation.mockResolvedValue(view());
     apiMock.updateProductConversationAutomaticContinuation.mockResolvedValue(view({
@@ -106,6 +106,46 @@ describe('AutomaticContinuationControl', () => {
     await waitFor(() => expect(apiMock.updateProductConversationAutomaticContinuation).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Saved')).toBeInTheDocument();
     expect(checkbox).toBeChecked();
+  });
+
+  it('does not let an older poll overwrite a newer successful save', async () => {
+    vi.useFakeTimers();
+    let resolvePoll: ((next: AutomaticContinuationView) => void) | undefined;
+    apiMock.getProductConversationAutomaticContinuation
+      .mockResolvedValueOnce(view({ auto_continue_on_context_exhaustion: false }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolvePoll = resolve; }));
+    apiMock.updateProductConversationAutomaticContinuation.mockResolvedValueOnce(
+      view({ auto_continue_on_context_exhaustion: true }),
+    );
+    render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-1' }} />);
+
+    await act(async () => { await Promise.resolve(); });
+    const checkbox = screen.getByRole('checkbox', { name: /automatically accept future generated handoffs/i });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    fireEvent.click(checkbox);
+    await act(async () => { await Promise.resolve(); });
+    expect(checkbox).toBeChecked();
+
+    await act(async () => {
+      resolvePoll?.(view({ auto_continue_on_context_exhaustion: false }));
+      await Promise.resolve();
+    });
+    expect(checkbox).toBeChecked();
+  });
+
+  it('renders a manual race winner as a terminal superseded admission', async () => {
+    apiMock.getProductConversationAutomaticContinuation.mockResolvedValueOnce(view({
+      admission: {
+        predecessor_transcript_row_id: 'row-exhausted',
+        phase: 'superseded',
+        no_progress_attempts: 0,
+        actionable_failure: null,
+      },
+    }));
+    render(<AutomaticContinuationControl scope={{ kind: 'ordinary', reference: 'pc-1' }} />);
+
+    expect(await screen.findByText('Continued manually', { selector: 'strong' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('refreshes durable progress and exposes a later breaker failure without remounting', async () => {

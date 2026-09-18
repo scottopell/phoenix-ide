@@ -8,6 +8,7 @@ const PHASE_LABELS: Record<AutomaticContinuationAdmission['phase'], string> = {
   ownership_transferred: 'Ownership transferred',
   dispatch_accepted: 'Dispatch accepted',
   message_settled: 'Continued',
+  superseded: 'Continued manually',
   failed: 'Failed',
 };
 
@@ -30,6 +31,8 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const [feedback, setFeedback] = useState<string | null>(null);
   const [failedValue, setFailedValue] = useState<boolean | null>(null);
   const requestGeneration = useRef(0);
+  const viewRevision = useRef(0);
+  const savePending = useRef(false);
   const scopeKind = scope.kind;
   const reference = scope.kind === 'ordinary' ? scope.reference : null;
 
@@ -42,14 +45,17 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     setFeedback(null);
     setFailedValue(null);
     const refresh = (initial: boolean) => {
-      if (refreshPending) return;
+      if (refreshPending || savePending.current) return;
       refreshPending = true;
+      const revision = ++viewRevision.current;
       const request = scopeKind === 'ordinary'
         ? api.getProductConversationAutomaticContinuation(reference!)
         : api.getCoordinatorAutomaticContinuation();
       void request
         .then((next) => {
-          if (requestGeneration.current === generation) setView(next);
+          if (requestGeneration.current === generation && viewRevision.current === revision) {
+            setView(next);
+          }
         })
         .catch((error: unknown) => {
           if (initial && requestGeneration.current === generation) {
@@ -70,6 +76,8 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   }, [reference, scopeKind]);
 
   const save = useCallback(async (enabled: boolean) => {
+    const revision = ++viewRevision.current;
+    savePending.current = true;
     setSaving(true);
     setFeedback(null);
     setFailedValue(null);
@@ -77,12 +85,15 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       const next = scopeKind === 'ordinary'
         ? await api.updateProductConversationAutomaticContinuation(reference!, enabled)
         : await api.updateCoordinatorAutomaticContinuation(enabled);
-      setView(next);
-      setFeedback('Saved');
+      if (viewRevision.current === revision) {
+        setView(next);
+        setFeedback('Saved');
+      }
     } catch (error) {
       setFailedValue(enabled);
       setFeedback(errorMessage(error, 'Failed to save automatic continuation setting'));
     } finally {
+      savePending.current = false;
       setSaving(false);
     }
   }, [reference, scopeKind]);
@@ -119,7 +130,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         {admission && (
           <div className={`automatic-continuation__admission automatic-continuation__admission--${admission.phase}`}>
             <strong>{phaseLabel}</strong>
-            {admission.phase !== 'message_settled' && admission.phase !== 'failed' && (
+            {admission.phase !== 'message_settled' && admission.phase !== 'superseded' && admission.phase !== 'failed' && (
               <span> · automatic handoff in progress</span>
             )}
             {admission.no_progress_attempts > 0 && (

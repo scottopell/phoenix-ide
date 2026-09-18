@@ -233,6 +233,9 @@ fn admission_phase_view(
         AutomaticContinuationPhase::MessageSettled => {
             AutomaticContinuationAdmissionPhaseView::MessageSettled
         }
+        AutomaticContinuationPhase::Superseded => {
+            AutomaticContinuationAdmissionPhaseView::Superseded
+        }
         AutomaticContinuationPhase::Failed => AutomaticContinuationAdmissionPhaseView::Failed,
     }
 }

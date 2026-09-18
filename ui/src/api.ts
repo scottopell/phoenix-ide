@@ -90,13 +90,8 @@ export type { ProductConversationCreationRecoveryResponse } from './generated/Pr
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
 
-export type AutomaticContinuationAdmissionPhase =
-  | 'admitted'
-  | 'successor_reserved'
-  | 'ownership_transferred'
-  | 'dispatch_accepted'
-  | 'message_settled'
-  | 'failed';
+export type { AutomaticContinuationAdmissionPhaseView as AutomaticContinuationAdmissionPhase } from './generated/AutomaticContinuationAdmissionPhaseView';
+import type { AutomaticContinuationAdmissionPhaseView as AutomaticContinuationAdmissionPhase } from './generated/AutomaticContinuationAdmissionPhaseView';
 
 export interface AutomaticContinuationAdmission {
   predecessor_transcript_row_id: string;

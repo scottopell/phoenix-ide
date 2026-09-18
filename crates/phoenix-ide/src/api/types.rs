@@ -318,6 +318,7 @@ pub enum AutomaticContinuationAdmissionPhaseView {
     OwnershipTransferred,
     DispatchAccepted,
     MessageSettled,
+    Superseded,
     Failed,
 }
 

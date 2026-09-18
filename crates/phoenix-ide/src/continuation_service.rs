@@ -31,17 +31,15 @@ fn recovery_plan(phase: AutomaticContinuationPhase) -> Option<RecoveryPlan> {
             transfer_ownership: true,
             dispatch_opening: true,
         },
-        AutomaticContinuationPhase::OwnershipTransferred => RecoveryPlan {
+        AutomaticContinuationPhase::OwnershipTransferred
+        | AutomaticContinuationPhase::DispatchAccepted => RecoveryPlan {
             reserve_successor: false,
             transfer_ownership: false,
             dispatch_opening: true,
         },
-        AutomaticContinuationPhase::DispatchAccepted => RecoveryPlan {
-            reserve_successor: false,
-            transfer_ownership: false,
-            dispatch_opening: false,
-        },
-        AutomaticContinuationPhase::MessageSettled | AutomaticContinuationPhase::Failed => {
+        AutomaticContinuationPhase::MessageSettled
+        | AutomaticContinuationPhase::Superseded
+        | AutomaticContinuationPhase::Failed => {
             return None;
         }
     })
@@ -128,6 +126,16 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "automatic continuation dispatch intent is missing".to_string())?;
+        if intent.message_id != admission.first_message_id
+            || intent.opening_authority != ContinuationOpeningAuthority::GeneratedPredecessorContext
+        {
+            self.runtime
+                .db()
+                .supersede_automatic_continuation(&admission.predecessor_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         let successor = self
             .runtime
             .db()
@@ -191,11 +199,13 @@ impl ContinuationApplicationService {
                 SendChatOutcome::Delivered
                 | SendChatOutcome::AlreadyPersisted
                 | SendChatOutcome::QueuedAsSteering => {
-                    self.advance_current(
-                        &admission.predecessor_conversation_id,
-                        AutomaticContinuationPhase::DispatchAccepted,
-                    )
-                    .await?;
+                    if current.phase == AutomaticContinuationPhase::OwnershipTransferred {
+                        self.advance_current(
+                            &admission.predecessor_conversation_id,
+                            AutomaticContinuationPhase::DispatchAccepted,
+                        )
+                        .await?;
+                    }
                 }
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
@@ -356,13 +366,14 @@ mod tests {
             Some(RecoveryPlan {
                 reserve_successor: false,
                 transfer_ownership: false,
-                dispatch_opening: false,
+                dispatch_opening: true,
             })
         );
         assert_eq!(
             recovery_plan(AutomaticContinuationPhase::MessageSettled),
             None
         );
+        assert_eq!(recovery_plan(AutomaticContinuationPhase::Superseded), None);
         assert_eq!(recovery_plan(AutomaticContinuationPhase::Failed), None);
     }
 }
