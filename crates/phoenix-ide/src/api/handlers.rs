@@ -127,6 +127,7 @@ pub fn create_router(state: AppState) -> Router {
 
     let router = router
         // Static assets (embedded or filesystem fallback)
+        .merge(crate::api::product_conversations::automatic_continuation_routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))

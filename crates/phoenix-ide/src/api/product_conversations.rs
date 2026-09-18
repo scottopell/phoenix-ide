@@ -1,26 +1,33 @@
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    routing::get,
+    Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
-use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+use phoenix_core::domain::product_conversation::{
+    AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
+    OrdinaryProductConversationLifecycle, ProductConversationId,
+};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
-    OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
-    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
-    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
-    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
+    AutomaticContinuationAdmissionPhaseView, AutomaticContinuationAdmissionView,
+    AutomaticContinuationAggregateView, AutomaticContinuationFailureView,
+    AutomaticContinuationView, OrdinaryProductConversationLifecycleView,
+    ProductConversationChainQaCompatibilityView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationClosePhaseView,
+    ProductConversationCloseResidualView, ProductConversationCloseView,
+    ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
+    ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
+    ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView,
+    ProductConversationWorkIdentityView, UpdateAutomaticContinuationRequest,
 };
 use super::AppState;
 use crate::db::{
@@ -63,6 +70,203 @@ struct AggregateSegmentCeiling {
     transcript_row_id: String,
     tail_sequence_id: i64,
     tail_message_id: Option<String>,
+}
+
+pub fn automatic_continuation_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/product-conversations/:reference/automatic-continuation",
+            get(get_product_conversation_automatic_continuation)
+                .put(put_product_conversation_automatic_continuation),
+        )
+        .route(
+            "/api/global/coordinator/automatic-continuation",
+            get(get_coordinator_automatic_continuation).put(put_coordinator_automatic_continuation),
+        )
+}
+
+pub async fn get_product_conversation_automatic_continuation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let resolved = state
+        .db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(db_to_app)?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(
+        &state,
+        resolved.product_conversation_id,
+        aggregate.latest_transcript_row_id,
+        false,
+    )
+    .await
+    .map(Json)
+}
+
+pub async fn put_product_conversation_automatic_continuation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(request): Json<UpdateAutomaticContinuationRequest>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let resolved = state
+        .db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(db_to_app)?;
+    state
+        .db
+        .set_auto_continue_on_context_exhaustion(
+            &resolved.product_conversation_id,
+            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+        )
+        .await
+        .map_err(db_to_app)?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(
+        &state,
+        resolved.product_conversation_id,
+        aggregate.latest_transcript_row_id,
+        false,
+    )
+    .await
+    .map(Json)
+}
+
+pub async fn get_coordinator_automatic_continuation(
+    State(state): State<AppState>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    coordinator_automatic_continuation_view(&state)
+        .await
+        .map(Json)
+}
+
+pub async fn put_coordinator_automatic_continuation(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAutomaticContinuationRequest>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let coordinator_id = coordinator_conversation_id(&state).await?;
+    let coordinator = state
+        .db
+        .get_conversation(&coordinator_id)
+        .await
+        .map_err(db_to_app)?;
+    state
+        .db
+        .set_auto_continue_on_context_exhaustion(
+            &coordinator.product_conversation_id,
+            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+        )
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(
+        &state,
+        coordinator.product_conversation_id,
+        coordinator.id,
+        true,
+    )
+    .await
+    .map(Json)
+}
+
+async fn coordinator_automatic_continuation_view(
+    state: &AppState,
+) -> Result<AutomaticContinuationView, AppError> {
+    let coordinator_id = coordinator_conversation_id(state).await?;
+    let coordinator = state
+        .db
+        .get_conversation(&coordinator_id)
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(
+        state,
+        coordinator.product_conversation_id,
+        coordinator.id,
+        true,
+    )
+    .await
+}
+
+async fn coordinator_conversation_id(state: &AppState) -> Result<String, AppError> {
+    state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(db_to_app)?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))
+}
+
+async fn automatic_continuation_view(
+    state: &AppState,
+    product_conversation_id: ProductConversationId,
+    latest_transcript_row_id: String,
+    coordinator: bool,
+) -> Result<AutomaticContinuationView, AppError> {
+    let preference = state
+        .db
+        .auto_continue_on_context_exhaustion(&product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    let admission = state
+        .db
+        .automatic_continuation_admission(&latest_transcript_row_id)
+        .await
+        .map_err(db_to_app)?
+        .map(|admission| AutomaticContinuationAdmissionView {
+            predecessor_transcript_row_id: admission.predecessor_conversation_id,
+            phase: admission_phase_view(admission.phase),
+            no_progress_attempts: admission.no_progress_attempts,
+            actionable_failure: admission.last_error.map(|message| {
+                AutomaticContinuationFailureView {
+                    message,
+                    first_message_id: admission.first_message_id.as_str().to_string(),
+                }
+            }),
+        });
+    let id = product_conversation_id.to_string();
+    Ok(AutomaticContinuationView {
+        aggregate: if coordinator {
+            AutomaticContinuationAggregateView::Coordinator {
+                product_conversation_id: id,
+            }
+        } else {
+            AutomaticContinuationAggregateView::Ordinary {
+                product_conversation_id: id,
+            }
+        },
+        auto_continue_on_context_exhaustion: preference.is_enabled(),
+        admission,
+    })
+}
+
+fn admission_phase_view(
+    phase: AutomaticContinuationPhase,
+) -> AutomaticContinuationAdmissionPhaseView {
+    match phase {
+        AutomaticContinuationPhase::Admitted => AutomaticContinuationAdmissionPhaseView::Admitted,
+        AutomaticContinuationPhase::SuccessorReserved => {
+            AutomaticContinuationAdmissionPhaseView::SuccessorReserved
+        }
+        AutomaticContinuationPhase::OwnershipTransferred => {
+            AutomaticContinuationAdmissionPhaseView::OwnershipTransferred
+        }
+        AutomaticContinuationPhase::DispatchAccepted => {
+            AutomaticContinuationAdmissionPhaseView::DispatchAccepted
+        }
+        AutomaticContinuationPhase::MessageSettled => {
+            AutomaticContinuationAdmissionPhaseView::MessageSettled
+        }
+        AutomaticContinuationPhase::Failed => AutomaticContinuationAdmissionPhaseView::Failed,
+    }
 }
 
 pub async fn list_product_conversations(
@@ -775,6 +979,7 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => AppError::NotFound(id.to_string()),
         error => AppError::Internal(error.to_string()),
     }
 }
