@@ -56,33 +56,13 @@ Creation recovery surfaces:
 - `GET /api/product-conversations/creation` returns `product_creations` and optional `next_cursor`. Follow `?cursor={next_cursor}` until the requested `request_id` is found or no cursor remains.
 - `POST /api/product-conversations/creation/{request_id}/retry-delivery` retries delivery for that creation identity.
 - `POST /api/product-conversations/creation/{request_id}/cancel` requests cancellation.
-- `DELETE /api/product-conversations/creation/{request_id}` requests deletion where `allowed_actions` includes `delete`; it returns acceptance, then the creation worker performs cleanup.
+- `DELETE /api/product-conversations/creation/{request_id}` requests deletion where `allowed_actions` includes `delete`; it returns acceptance, then the creation worker performs cleanup. The current API exposes no terminal deletion tombstone: the recovery listing omits `deletion_pending` rows, so absence cannot distinguish in-progress cleanup from completion. Report deletion as accepted but not observably completed.
 
-Read `allowed_actions` first. After deletion acceptance, re-read the recovery listing until the resulting state is observed. These are creation-recovery operations, not a general conversation retry API.
+Read `allowed_actions` first. These are creation-recovery operations, not a general conversation retry API.
 
 ## Send or steer a message
 
-`POST /api/conversations/{writable_transcript_row_id}/chat`
-
-```json
-{
-  "text": "message authorized by the user",
-  "message_id": "client-generated UUID",
-  "images": [],
-  "files": [],
-  "user_agent": null
-}
-```
-
-`message_id` makes an exact chat retry idempotent. Generate it once and keep it unchanged if delivery is uncertain. The response fields are `queued`, `steering`, and `already_persisted` (false-valued optional flags may be omitted). They describe acceptance/disposition only. Verify the exact identity with:
-
-`POST /api/conversations/{id}/messages/reconcile`
-
-```json
-{"message_ids":["the same message_id"]}
-```
-
-Each entry is `persisted`, `steering_queued`, or `absent`; the response also reports `conversation_idle`. A persisted or queued message still does not prove the assistant completed the requested work. Re-read `GET /api/conversations/{id}` and report `agent_working`/`presentation_mode` and the observed resulting messages.
+Do not use `POST /api/conversations/{id}/chat` from the Coordinator. That generic browser endpoint expands slash commands and `@file` references and accepts attachments and user-agent metadata, so it does not preserve the Coordinator's literal-text-only cross-conversation contract. Use the dedicated `send_conversation_message` tool for non-empty literal text to one existing non-Coordinator conversation. Its delivered/queued result is acceptance only; re-read the target conversation to report observed execution separately.
 
 ## Continue a context-exhausted transcript
 
@@ -115,6 +95,7 @@ Current APIs do not provide:
 - a uniform operation ID, normalized receipt, or audit record across those actions;
 - a general retry endpoint for an existing conversation turn;
 - a caller idempotency key for cancel;
-- proof of asynchronous execution completion in an accepted HTTP response.
+- proof of asynchronous execution completion in an accepted HTTP response;
+- observable completion for accepted creation-recovery deletion.
 
 Do not manufacture these guarantees with local files, ad-hoc receipt formats, database writes, polling loops, or background monitors. Use bounded follow-up reads when the user needs observation. If the requested result depends on a missing guarantee or endpoint, report the exact gap and propose a separately scoped server change.

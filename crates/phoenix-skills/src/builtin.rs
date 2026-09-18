@@ -308,10 +308,10 @@ mod tests {
         assert!(reference.contains("/{latest_transcript_row_id}/continue"));
         assert!(reference.contains("conversation.state.type == \"context_exhausted\""));
         assert!(!reference.contains("verified as `ContextExhausted`"));
-        assert!(reference.contains("/{writable_transcript_row_id}/chat"));
+        assert!(reference.contains("send_conversation_message"));
+        assert!(reference.contains("Do not use `POST /api/conversations/{id}/chat`"));
         assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
         assert!(reference.contains("Reuse the same `message_id`"));
-        assert!(reference.contains("messages/reconcile"));
         assert!(reference.contains("Current APIs do not provide"));
         assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
     }
