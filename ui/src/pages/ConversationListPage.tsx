@@ -32,6 +32,7 @@ import { effectiveVisibleConversationCount } from './conversationListCount';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
 } from '../notifications';
@@ -315,6 +316,7 @@ export function ConversationListPage() {
       setProductConversations((rows) => rows.map((row) =>
         row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
       notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+      notifyProductConversationListMayHaveChanged();
       setProductRenameTarget(null);
       setProductRenameError(undefined);
     } catch (err) {
@@ -325,17 +327,15 @@ export function ConversationListPage() {
   const handleProductClose = async () => {
     if (!productCloseTarget) return;
     try {
-      const rootId = productCloseTarget.canonical_root.transcript_row_id;
-      if (rootId === productCloseTarget.latest_transcript_row_id) {
-        await api.archiveConversation(rootId);
-      } else {
-        await api.archiveChain(rootId);
-      }
+      await api.closeProductConversation(productCloseTarget.product_conversation_id);
       setProductCloseTarget(null);
       setProductListRevision((revision) => revision + 1);
+      notifyProductConversationListMayHaveChanged();
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        const confirmationRoute = productCloseTarget.canonical_route;
         setProductCloseTarget(null);
+        navigate(confirmationRoute);
       }
       console.error('Failed to close product conversation:', err);
     }
@@ -446,7 +446,7 @@ export function ConversationListPage() {
               onNewConversation={handleNewConversation}
               onArchive={handleArchive}
               onDelete={handleSetDeleteTarget}
-              onRename={handleSetRenameTarget}
+              {...(!productListError ? { onRename: handleSetRenameTarget } : {})}
               onConversationClick={handleConversationClick}
               onProductConversationClick={(row) => navigate(row.canonical_route)}
               onProductConversationRename={(row) => {

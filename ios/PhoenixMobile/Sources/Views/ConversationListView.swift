@@ -139,17 +139,6 @@ struct ConversationListView: View {
                             isCoordinator: isCoordinator)
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if !isCoordinator {
-                            Button {
-                                Task { await model.archive(conversationId: transcriptRowId) }
-                            } label: {
-                                Label("Archive", systemImage: "archivebox")
-                            }
-                            .tint(.orange)
-                            .disabled(!model.connectivity.isOnline)
-                        }
-                    }
                 }
             }
             .listStyle(.plain)

@@ -16,11 +16,7 @@ import type { ChainWorkIdentity } from "./ChainWorkIdentity";
  */
 export type ChainView = { root_conv_id: string, product_conversation_id: string, chain_name: string | null, display_name: string, 
 /**
- * `true` when the chain is archived. Chain archive is a write-cascade
- * across all members, so any member's `archived` flag is authoritative;
- * we read it off the root for clarity. Archive is a terminal lifecycle
- * transition — archived chain roots 404 on the chain route, so the UI
- * has no unarchive affordance.
+ * `true` when the owning `ProductConversation` is in History.
  */
 archived: boolean, members: Array<ChainMemberSummary>, qa_history: Array<ChainQaRow>, current_member_count: number, current_total_messages: number, 
 /**

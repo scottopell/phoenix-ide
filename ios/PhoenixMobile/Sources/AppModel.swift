@@ -142,6 +142,7 @@ final class AppModel {
             branch_name: liveUpdate.branch_name,
             task_title: existing.task_title,
             archived: existing.archived,
+            product_close_action: existing.product_close_action,
             project_name: liveUpdate.project_name,
             conv_mode_label: liveUpdate.conv_mode_label,
             presentation_mode: liveUpdate.presentation_mode,
@@ -340,6 +341,62 @@ final class AppModel {
 
     /// Online-only archive. Returns false with `lastActionError` on failure.
     var lastActionError: String?
+
+    @discardableResult
+    func closeProductConversation(_ conversation: Conversation) async -> Bool {
+        let conversationId = conversation.transcriptRowIdentity
+        let transcriptIds = Set(
+            listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
+                + [conversationId])
+        let startedGeneration = apiGeneration
+        guard let api, connectivity.isOnline else {
+            lastActionError = "Closing needs a connection — it can't be queued."
+            return false
+        }
+        let hasInMemoryMessages = transcriptIds.contains {
+            sessions[$0]?.outbox.visibleEntries.isEmpty == false
+        }
+        guard !hasInMemoryMessages else {
+            lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
+            return false
+        }
+        for transcriptId in transcriptIds {
+            if let session = sessions[transcriptId] {
+                _ = await session.outbox.flushPersistence()
+            }
+        }
+        guard transcriptIds.allSatisfy({
+            if case .empty = Outbox.storedContents(conversationId: $0) { return true }
+            return false
+        }) else {
+            lastActionError = "This conversation has queued or unreadable messages. Resolve them before closing."
+            return false
+        }
+        let aggregateSessions = transcriptIds.compactMap { session(for: $0) }
+        guard aggregateSessions.allSatisfy({ $0.beginArchiving() }) else {
+            aggregateSessions.forEach { $0.endArchiving() }
+            lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
+            return false
+        }
+        var closed = false
+        defer { if !closed { aggregateSessions.forEach { $0.endArchiving() } } }
+        do {
+            try await api.closeProductConversation(reference: conversation.aggregateIdentity)
+            guard apiGeneration == startedGeneration else { return false }
+            closed = true
+            for session in aggregateSessions {
+                session.stop()
+                await session.clearCachedSnapshotAndWait()
+                await session.outbox.clearAndWait()
+            }
+            listStore.remove(aggregateId: conversation.aggregateIdentity)
+            await listStore.refresh(api: api)
+            return true
+        } catch {
+            lastActionError = error.localizedDescription
+            return false
+        }
+    }
 
     @discardableResult
     func archive(conversationId: String) async -> Bool {

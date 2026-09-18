@@ -355,7 +355,6 @@ pub enum ProductConversationCloseActionView {
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ProductConversationCloseUnavailableReasonView {
-    History,
     ActiveCloseAttempt,
     AwaitingTaskApproval,
     AwaitingContinuation,

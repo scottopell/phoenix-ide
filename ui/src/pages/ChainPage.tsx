@@ -423,10 +423,9 @@ export function ChainPage() {
             notifyProductConversationListMayHaveChanged();
             notifyProductConversationSnapshotChanged(updated.product_conversation_id);
           } catch (err) {
-            dispatch({
-              type: 'LOAD_FAIL',
-              error: err instanceof Error ? err.message : 'Failed to rename chain',
-            });
+            const message = err instanceof Error ? err.message : 'Failed to rename chain';
+            dispatch({ type: 'LOAD_FAIL', error: message });
+            throw err;
           }
         }}
         onRegenerate={async () => {
@@ -632,6 +631,7 @@ function ChainPageHeader({
 }: ChainPageHeaderProps) {
   const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
   const [value, setValue] = useScopedState(chain.root_conv_id, chain.display_name);
+  const [renameError, setRenameError] = useScopedState<string | null>(chain.root_conv_id, null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Manual name regeneration (REQ-CHN-010). In-flight disables the button and
@@ -671,13 +671,18 @@ function ChainPageHeader({
 
   const commit = async () => {
     const trimmed = value.trim();
-    if (!trimmed || trimmed === chain.display_name) {
+    if (trimmed === chain.display_name) {
       setValue(chain.display_name);
       setEditing(false);
       return;
     }
-    await onRename(trimmed);
-    setEditing(false);
+    try {
+      await onRename(trimmed || null);
+      setRenameError(null);
+      setEditing(false);
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : 'Failed to rename chain');
+    }
   };
 
   const cancel = () => {
@@ -698,17 +703,20 @@ function ChainPageHeader({
   return (
     <header className="chain-page-header">
       {editing && !chain.archived ? (
-        <input
-          ref={inputRef}
-          className="chain-page-name-input"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onBlur={() => void commit()}
-          onKeyDown={onKeyDown}
-          aria-label="Chain name"
-          placeholder="Name this chain…"
-          maxLength={200}
-        />
+        <>
+          <input
+            ref={inputRef}
+            className="chain-page-name-input"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={() => void commit()}
+            onKeyDown={onKeyDown}
+            aria-label="Chain name"
+            placeholder="Name this chain…"
+            maxLength={200}
+          />
+          {renameError && <span className="chain-page-name-error" role="alert">{renameError}</span>}
+        </>
       ) : chain.archived ? (
         <span className="chain-page-name">{chain.display_name}</span>
       ) : (

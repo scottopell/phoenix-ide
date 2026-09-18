@@ -35,7 +35,7 @@ interface ConversationListProps {
   onNewConversation: () => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
@@ -63,7 +63,7 @@ interface ConversationRowProps {
   onToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onCloseMenu: () => void;
   /** Forwarded only when this row's menu is open; lets the parent install a
    *  click-outside listener scoped to the actual DOM node. */
@@ -446,17 +446,19 @@ export const ConversationRow = memo(function ConversationRow({
           </button>
           {isMenuOpen && (
             <div className="conv-item-actions">
-              <button
-                className="action-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseMenu();
-                  onRename(conv);
-                }}
-                title={`Rename conversation "${displayTitle}"`}
-              >
-                Rename
-              </button>
+              {onRename && (
+                <button
+                  className="action-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseMenu();
+                    onRename(conv);
+                  }}
+                  title={`Rename conversation "${displayTitle}"`}
+                >
+                  Rename
+                </button>
+              )}
               {!showArchived && (
                 <button
                   className="action-btn"
@@ -507,7 +509,7 @@ interface ChainBlockProps {
   onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onCloseRowMenu: () => void;
   rowMenuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
@@ -615,7 +617,7 @@ export const ChainBlock = memo(function ChainBlock({
               onToggleMenu={onRowToggleMenu}
               onArchive={onArchive}
               onDelete={onDelete}
-              onRename={onRename}
+              {...(onRename ? { onRename } : {})}
               onCloseMenu={onCloseRowMenu}
               menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
             />
@@ -926,7 +928,7 @@ export function ConversationList({
                   onToggleMenu={toggleActions}
                   onArchive={onArchive}
                   onDelete={onDelete}
-                  onRename={onRename}
+                  {...(onRename ? { onRename } : {})}
                   onCloseMenu={closeRowMenu}
                   menuRef={expandedId === conv.id ? menuRef : undefined}
                 />
@@ -960,7 +962,7 @@ export function ConversationList({
                 onRowToggleMenu={toggleActions}
                 onArchive={onArchive}
                 onDelete={onDelete}
-                onRename={onRename}
+                {...(onRename ? { onRename } : {})}
                 onCloseRowMenu={closeRowMenu}
                 rowMenuRef={menuRef}
               />

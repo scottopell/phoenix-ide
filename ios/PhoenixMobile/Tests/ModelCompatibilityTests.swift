@@ -43,12 +43,12 @@ final class ModelCompatibilityTests: XCTestCase {
     func testProductConversationListRowDecodesStatePresentation() throws {
         let row = try JSONDecoder().decode(
             ProductConversationListRow.self,
-            from: Data(#"{"product_conversation_id":"pc-123","canonical_route":"/product-conversations/pc-123","canonical_root":{"transcript_row_id":"root-123","slug":"root-slug","title":"Root title"},"ordinary_lifecycle":"open","latest_transcript_row_id":"latest-123","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"state","display_name":"Root title","presentation_mode":"working"}}"#.utf8))
+            from: Data(#"{"product_conversation_id":"pc-123","canonical_route":"/product-conversations/pc-123","canonical_root":{"transcript_row_id":"root-123","slug":"root-slug","title":"Root title"},"lifecycle":{"state":"open","close_action":{"availability":"available"}},"latest_transcript_row_id":"latest-123","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"state","display_name":"Root title","presentation_mode":"working"}}"#.utf8))
 
         XCTAssertEqual(row.product_conversation_id, "pc-123")
         XCTAssertEqual(row.canonical_route, "/product-conversations/pc-123")
         XCTAssertEqual(row.canonical_root.transcript_row_id, "root-123")
-        XCTAssertEqual(row.ordinary_lifecycle, .open)
+        XCTAssertEqual(row.lifecycle, .open(closeAction: .available))
         XCTAssertEqual(row.latest_transcript_row_id, "latest-123")
         XCTAssertEqual(row.updated_at, "2025-01-02T03:04:05Z")
         XCTAssertEqual(
@@ -56,10 +56,20 @@ final class ModelCompatibilityTests: XCTestCase {
             .state(displayName: "Root title", presentationMode: "working"))
     }
 
+    func testProductConversationListRowDecodesUnavailableCloseAction() throws {
+        let row = try JSONDecoder().decode(
+            ProductConversationListRow.self,
+            from: Data(#"{"product_conversation_id":"pc-busy","canonical_route":"/product-conversations/pc-busy","canonical_root":{"transcript_row_id":"root-busy","slug":"root-busy","title":"Busy"},"lifecycle":{"state":"open","close_action":{"availability":"unavailable","reason":"awaiting_continuation"}},"latest_transcript_row_id":"latest-busy","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"state","display_name":"Busy","presentation_mode":"working"}}"#.utf8))
+
+        XCTAssertEqual(
+            row.lifecycle,
+            .open(closeAction: .unavailable(reason: .awaiting_continuation)))
+    }
+
     func testProductConversationListRowDecodesNeedsActionPresentation() throws {
         let row = try JSONDecoder().decode(
             ProductConversationListRow.self,
-            from: Data(#"{"product_conversation_id":"pc-need","canonical_route":"/product-conversations/pc-need","canonical_root":{"transcript_row_id":"root-need","slug":"root-need","title":"Needs help"},"ordinary_lifecycle":"open","latest_transcript_row_id":"latest-need","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Needs help"}}"#.utf8))
+            from: Data(#"{"product_conversation_id":"pc-need","canonical_route":"/product-conversations/pc-need","canonical_root":{"transcript_row_id":"root-need","slug":"root-need","title":"Needs help"},"lifecycle":{"state":"open","close_action":{"availability":"available"}},"latest_transcript_row_id":"latest-need","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Needs help"}}"#.utf8))
 
         XCTAssertEqual(
             row.presentation,
@@ -117,7 +127,7 @@ final class ModelCompatibilityTests: XCTestCase {
             allowSelfSigned: false)!
         let row = try JSONDecoder().decode(
             ProductConversationListRow.self,
-            from: Data(#"{"product_conversation_id":"pc-map","canonical_route":"/product-conversations/pc-map","canonical_root":{"transcript_row_id":"root-map","slug":"root-map","title":"Mapped"},"ordinary_lifecycle":"history","latest_transcript_row_id":"latest-map","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Mapped"}}"#.utf8))
+            from: Data(#"{"product_conversation_id":"pc-map","canonical_route":"/product-conversations/pc-map","canonical_root":{"transcript_row_id":"root-map","slug":"root-map","title":"Mapped"},"lifecycle":{"state":"history"},"latest_transcript_row_id":"latest-map","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Mapped"}}"#.utf8))
 
         let conversation = api.productConversationListRowToConversation(row)
 

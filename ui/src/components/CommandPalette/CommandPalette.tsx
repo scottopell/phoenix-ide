@@ -14,7 +14,7 @@ import { createCodeSource } from './sources/CodeSource';
 import { createConversationContentSource } from './sources/ConversationContentSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import { notifyArchiveCloseConflict } from '../../notifications';
+import { notifyArchiveCloseConflict, notifyProductConversationListMayHaveChanged } from '../../notifications';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
@@ -148,8 +148,9 @@ export function CommandPalette({ conversations, productConversations = [], activ
               if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
-                  if (activeProduct && activeProduct.canonical_root.transcript_row_id === activeProduct.latest_transcript_row_id) {
-                    await api.archiveConversation(targetId);
+                  if (activeProduct) {
+                    await api.closeProductConversation(activeProduct.product_conversation_id);
+                    notifyProductConversationListMayHaveChanged();
                   } else if (chainRootId != null) {
                     await api.archiveChain(chainRootId);
                   } else {

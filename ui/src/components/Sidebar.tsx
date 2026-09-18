@@ -15,6 +15,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
 } from '../notifications';
@@ -278,6 +279,7 @@ export function Sidebar({
       setProductConversations((rows) => rows.map((row) =>
         row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
       notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+      notifyProductConversationListMayHaveChanged();
       setProductRenameTarget(null);
       setProductRenameError(undefined);
       onConversationCreated();
@@ -322,21 +324,21 @@ export function Sidebar({
   const handleProductClose = useCallback(async () => {
     if (!productCloseTarget) return;
     try {
-      if (productCloseTarget.canonical_root.transcript_row_id === productCloseTarget.latest_transcript_row_id) {
-        await api.archiveConversation(productCloseTarget.canonical_root.transcript_row_id);
-      } else {
-        await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
-      }
+      await api.closeProductConversation(productCloseTarget.product_conversation_id);
       setProductCloseTarget(null);
       onConversationCreated();
       setProductConversationsRetry((revision) => revision + 1);
+      notifyProductConversationListMayHaveChanged();
+      notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        const confirmationRoute = productCloseTarget.canonical_route;
         setProductCloseTarget(null);
+        navigate(confirmationRoute);
       }
       console.error('Failed to close product conversation:', err);
     }
-  }, [productCloseTarget, onConversationCreated]);
+  }, [productCloseTarget, onConversationCreated, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -526,7 +528,7 @@ export function Sidebar({
           onNewConversation={handleNewClick}
           onArchive={handleArchive}
           onDelete={handleSetDeleteTarget}
-          onRename={handleSetRenameTarget}
+          {...(!productConversationsError ? { onRename: handleSetRenameTarget } : {})}
           onConversationClick={handleConversationClick}
           onProductConversationClick={(row) => navigate(row.canonical_route)}
           onProductConversationRename={handleSetProductRenameTarget}

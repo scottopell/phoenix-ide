@@ -18,6 +18,7 @@ vi.mock('../api', async () => {
       ...actual.api,
       archiveChain: vi.fn(),
       archiveConversation: vi.fn(),
+      closeProductConversation: vi.fn(),
       codexLoginPreflight: vi.fn(),
       listProductConversations: vi.fn(),
       renameProductConversation: vi.fn(),
@@ -118,7 +119,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {
-    vi.mocked(api.archiveConversation).mockResolvedValue({ ok: true });
+    vi.mocked(api.closeProductConversation).mockResolvedValue(undefined);
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [{ ...productConversation(), latest_transcript_row_id: 'root-mobile' }],
     });
@@ -128,7 +129,6 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.getByText(/move the entire product conversation to read-only History and stop its active work/)).toBeInTheDocument();
     touchActivate(screen.getByRole('button', { name: 'Close' }));
 
-    await waitFor(() => expect(api.archiveConversation).toHaveBeenCalledWith('root-mobile'));
-    expect(api.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.closeProductConversation).toHaveBeenCalledWith('pc-mobile'));
   });
 });
