@@ -271,6 +271,84 @@ impl ProductConversationKind {
     }
 }
 
+pub const PROJECT_COORDINATOR_CHARTER_MAX_BYTES: usize = 32_768;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCoordinatorProfile {
+    charter: String,
+    revision: i64,
+    updated_at_unix_micros: i64,
+}
+
+impl ProjectCoordinatorProfile {
+    /// Constructs a profile only when all persisted invariants hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectCoordinatorProfileWriteError::InvalidProfile`] for an oversized or
+    /// NUL-containing charter, nonpositive revision, or negative update timestamp.
+    pub fn new(
+        charter: String,
+        revision: i64,
+        updated_at_unix_micros: i64,
+    ) -> Result<Self, ProjectCoordinatorProfileWriteError> {
+        if charter.as_bytes().contains(&0)
+            || charter.len() > PROJECT_COORDINATOR_CHARTER_MAX_BYTES
+            || revision < 1
+            || updated_at_unix_micros < 0
+        {
+            return Err(ProjectCoordinatorProfileWriteError::InvalidProfile);
+        }
+        Ok(Self {
+            charter,
+            revision,
+            updated_at_unix_micros,
+        })
+    }
+
+    #[must_use]
+    pub fn charter(&self) -> &str {
+        &self.charter
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn updated_at_unix_micros(&self) -> i64 {
+        self.updated_at_unix_micros
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCoordinatorProfileWriteError {
+    InvalidCharter,
+    InvalidProfile,
+    NotOrdinary,
+    NotOpen,
+    RevisionConflict,
+}
+
+impl fmt::Display for ProjectCoordinatorProfileWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCharter => f.write_str("project coordinator charter is invalid"),
+            Self::InvalidProfile => f.write_str("project coordinator profile is invalid"),
+            Self::NotOrdinary => {
+                f.write_str("project coordinator profile requires an ordinary ProductConversation")
+            }
+            Self::NotOpen => {
+                f.write_str("project coordinator profile requires an Open ProductConversation")
+            }
+            Self::RevisionConflict => f.write_str("project coordinator profile revision conflict"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectCoordinatorProfileWriteError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

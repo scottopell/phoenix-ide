@@ -669,6 +669,98 @@ function RecallDisclosure({
   );
 }
 
+function ProjectCoordinatorSettings({
+  snapshot,
+  onSaved,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  onSaved: (
+    productConversationId: string,
+    profile: ProductConversationSnapshotView['project_coordinator_profile'],
+  ) => void;
+}) {
+  const profile = snapshot.project_coordinator_profile;
+  const [open, setOpen] = useState(false);
+  const [enabled, setEnabled] = useState(profile?.enabled ?? false);
+  const [charter, setCharter] = useState(profile?.charter ?? '');
+  const [baseRevision, setBaseRevision] = useState(profile?.revision ?? 0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reset = useCallback(() => {
+    setEnabled(profile?.enabled ?? false);
+    setCharter(profile?.charter ?? '');
+    setBaseRevision(profile?.revision ?? 0);
+    setError(null);
+  }, [profile]);
+  const dirty = enabled !== (profile?.enabled ?? false) || charter !== (profile?.charter ?? '');
+  const charterBytes = new TextEncoder().encode(charter).length;
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!dirty || saving || (enabled && charterBytes > 32_768)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const savedProfile = await api.putProjectCoordinatorProfile(snapshot.product_conversation_id, {
+        enabled,
+        charter,
+        expected_revision: baseRevision,
+      });
+      onSaved(snapshot.product_conversation_id, savedProfile);
+      setOpen(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Failed to save Project Coordinator profile');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details
+      className="product-conversation-page__coordinator-settings"
+      open={open}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        setOpen(nextOpen);
+        if (nextOpen) reset();
+      }}
+    >
+      <summary>Coordinator {profile?.enabled ? '✓' : '+'}</summary>
+      <form onSubmit={(event) => void save(event)}>
+        <label className="product-conversation-page__coordinator-toggle">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => setEnabled(event.target.checked)}
+            disabled={saving}
+          />
+          Use Project Coordinator guidance
+        </label>
+        <label htmlFor="project-coordinator-charter">Charter</label>
+        <textarea
+          id="project-coordinator-charter"
+          value={charter}
+          onChange={(event) => setCharter(event.target.value)}
+          disabled={!enabled || saving}
+          rows={8}
+          aria-describedby="project-coordinator-charter-help"
+        />
+        <p id="project-coordinator-charter-help">
+          Plain text loaded fresh for every turn. Supported LLM tools and chat cannot mutate it. {charterBytes.toLocaleString()} / 32,768 bytes.
+        </p>
+        {charterBytes > 32_768 && <p role="alert">Charter exceeds 32,768 UTF-8 bytes.</p>}
+        {error && <p role="alert">{error}</p>}
+        <div className="product-conversation-page__coordinator-actions">
+          <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
+          <button type="submit" className="btn-primary" disabled={!dirty || saving || (enabled && charterBytes > 32_768)}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+    </details>
+  );
+}
+
 function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView['source']>): string {
   switch (source.relation) {
     case 'approved_task':
@@ -681,11 +773,16 @@ function ProductConversationHeader({
   productConversationId,
   messages,
   recallDisabled,
+  onCoordinatorProfileSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
+  onCoordinatorProfileSaved: (
+    productConversationId: string,
+    profile: ProductConversationSnapshotView['project_coordinator_profile'],
+  ) => void;
 }) {
   const source = snapshot.source;
   return (
@@ -715,6 +812,9 @@ function ProductConversationHeader({
             messages={messages}
             disabled={recallDisabled}
           />
+        )}
+        {snapshot.project_coordinator_eligible && (
+          <ProjectCoordinatorSettings snapshot={snapshot} onSaved={onCoordinatorProfileSaved} />
         )}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
@@ -766,6 +866,7 @@ function ProductConversationPageInner() {
     } : null;
   }
   const paginationRequestRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const currentLatestProjection = snapshot
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
@@ -800,6 +901,7 @@ function ProductConversationPageInner() {
   useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
+    const requestGeneration = ++snapshotRequestRef.current;
     const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
     if (!isBackgroundRefresh) setLoading(true);
     setError(null);
@@ -818,7 +920,7 @@ function ProductConversationPageInner() {
       : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
@@ -830,14 +932,14 @@ function ProductConversationPageInner() {
         if (!isBackgroundRefresh) setHistoryGeneration(0);
       })
       .catch((err) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
         setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && snapshotRequestRef.current === requestGeneration) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -1076,6 +1178,17 @@ function ProductConversationPageInner() {
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
+        onCoordinatorProfileSaved={(savedProductConversationId, profile) => {
+          snapshotRequestRef.current += 1;
+          paginationRequestRef.current += 1;
+          setOwnedSnapshot((current) => {
+            if (current?.productConversationId !== savedProductConversationId) return current;
+            const currentProfile = current.value.project_coordinator_profile;
+            if (currentProfile && profile && currentProfile.revision > profile.revision) return current;
+            return { ...current, value: { ...current.value, project_coordinator_profile: profile } };
+          });
+          setSnapshotRetry((retry) => retry + 1);
+        }}
       />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
@@ -1120,6 +1233,7 @@ function ProductConversationPageInner() {
             suppressTaskApprovalOwner={true}
             mutationEnabled={liveControlsEnabled}
             aggregateLifecycleOpen={isOpen}
+            systemPromptRevision={snapshot.project_coordinator_profile?.revision ?? 0}
             onProjectionChange={setLatestProjection}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />

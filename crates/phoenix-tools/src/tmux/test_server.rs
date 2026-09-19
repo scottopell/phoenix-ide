@@ -204,11 +204,14 @@ def owner_alive():
             or (root / ".cleanup-request").exists()):
         return False
     try:
-        return time.time() - heartbeat.stat().st_mtime <= heartbeat_stale
+        heartbeat_age = time.time() - heartbeat.stat().st_mtime
     except FileNotFoundError:
         return False
     except OSError:
         return False
+    if os.getppid() == parent:
+        return True
+    return heartbeat_age <= heartbeat_stale
 
 def reserve_spawn(socket, control, token):
     if any(existing_socket == socket or existing_control == control
@@ -979,6 +982,15 @@ while time.monotonic() < cleanup_deadline:
     ]
     unconfirmed_state = (any(state != "absent" for state in states)
                          or bool(unconfirmed_obligations))
+    for record in list(owned):
+        if time.monotonic() >= cleanup_deadline:
+            break
+        socket, device, inode, control, processes = record
+        if any(identity_state(identity) != "absent" for identity in processes):
+            try:
+                retire_record(record, cleanup_deadline)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                pass
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -1134,6 +1146,11 @@ while time.monotonic() < cleanup_deadline:
             )
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
+if (not original_root_exists() and not control_root.exists()
+        and all(identity_state(identity) == "absent"
+                for _socket, _device, _inode, _control, processes in owned
+                for identity in processes)):
+    sys.exit(0)
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
 sys.exit(1)
 "##;
@@ -2254,6 +2271,13 @@ mod tests {
     }
 
     #[test]
+    fn vanished_roots_require_recorded_process_absence() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "not original_root_exists() and not control_root.exists()\n        and all(identity_state(identity) == \"absent\""
+        ));
+    }
+
+    #[test]
     fn spawn_path_is_reserved_before_tmux_starts() {
         let reservation = WATCHDOG_PROGRAM
             .find("obligation = reserve_spawn(socket, control, token)")
@@ -2895,6 +2919,13 @@ mod tests {
     }
 
     #[test]
+    fn live_parent_identity_outranks_a_delayed_heartbeat() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "heartbeat_age = time.time() - heartbeat.stat().st_mtime\n    except FileNotFoundError:\n        return False\n    except OSError:\n        return False\n    if os.getppid() == parent:\n        return True\n    return heartbeat_age <= heartbeat_stale"
+        ));
+    }
+
+    #[test]
     fn heartbeat_disappearance_enters_cleanup_and_retires_exact_processes() {
         if which::which("tmux").is_err() {
             return;
@@ -3217,11 +3248,7 @@ mod tests {
     fn final_root_quarantine_allows_late_non_socket_artifact() {
         let hook_dir = TempDir::new().unwrap();
         let hook = hook_dir.path().join("publish-late-entry");
-        fs::write(
-            &hook,
-            "#!/bin/sh\nmktemp \"$1/late-entry.XXXXXX\" >/dev/null\n",
-        )
-        .unwrap();
+        fs::write(&hook, "#!/bin/sh\ntouch \"$1/late-entry\"\n").unwrap();
         let mut permissions = fs::metadata(&hook).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&hook, permissions).unwrap();

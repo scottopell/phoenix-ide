@@ -279,9 +279,26 @@ pub struct ProductConversationListRow {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProjectCoordinatorProfileView {
+    pub enabled: bool,
+    pub charter: String,
+    pub revision: i64,
+    pub updated_at_unix_micros: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectCoordinatorProfileWriteRequest {
+    pub enabled: bool,
+    pub charter: String,
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationSnapshotView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
+    pub project_coordinator_eligible: bool,
     pub canonical_route: String,
     pub requested_transcript_row_id: String,
     pub canonical_root: ProductConversationTranscriptRowView,
@@ -290,6 +307,7 @@ pub struct ProductConversationSnapshotView {
     pub writable_transcript_row_id: Option<String>,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
+    pub project_coordinator_profile: Option<ProjectCoordinatorProfileView>,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
     pub source: Option<ProductConversationSourceView>,
     pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,

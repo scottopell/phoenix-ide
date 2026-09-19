@@ -205,6 +205,7 @@ interface EmbeddedConversationHostProps {
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
+  systemPromptRevision?: number;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -232,6 +233,7 @@ export function EmbeddedConversationPage({
   suppressMessageViewerOwner = false,
   onCloseCompleted,
   suppressTaskApprovalOwner = false,
+  systemPromptRevision = 0,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -267,6 +269,7 @@ export function EmbeddedConversationPage({
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
+        systemPromptRevision={systemPromptRevision}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
@@ -303,6 +306,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner,
   suppressTaskApprovalOwner,
   onCloseCompleted,
+  systemPromptRevision,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -316,6 +320,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
+  systemPromptRevision: number;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -390,6 +395,7 @@ function ConversationPageContent({
   const [deletingConversation, setDeletingConversation] = useState(false);
   const historyGenerationRef = useRef(0);
   const historyRequestTokenRef = useRef(0);
+  const systemPromptRequestRef = useRef(0);
   const historyCommandTokenRef = useRef(0);
   const historyViewRef = useRef({ conversationId: '', generation: 0, transcriptGeneration: 0 });
   const [historyExpansion, dispatchHistoryExpansion] = useReducer(
@@ -1157,11 +1163,25 @@ function ConversationPageContent({
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
     if (!conversationId) return;
+    const requestGeneration = ++systemPromptRequestRef.current;
     api
       .getSystemPrompt(conversationId)
-      .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId }))
-      .catch((err) => console.warn('Failed to load system prompt:', err));
-  }, [conversationId, dispatch]);
+      .then((sp) => {
+        if (systemPromptRequestRef.current !== requestGeneration) return;
+        dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId });
+      })
+      .catch((err) => {
+        if (systemPromptRequestRef.current === requestGeneration) {
+          console.warn('Failed to load system prompt:', err);
+          dispatch({ type: 'set_system_prompt', systemPrompt: null, expectedConversationId: conversationId });
+        }
+      });
+    return () => {
+      if (systemPromptRequestRef.current === requestGeneration) {
+        systemPromptRequestRef.current += 1;
+      }
+    };
+  }, [conversationId, dispatch, systemPromptRevision]);
 
   // availableModels is populated by the shared useModels() poller above.
 

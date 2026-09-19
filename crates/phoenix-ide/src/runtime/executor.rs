@@ -6943,6 +6943,35 @@ where
                 explore_bash_capability,
             )
         };
+        let project_coordinator_profile = if is_coordinator || is_sub_agent {
+            None
+        } else {
+            match self
+                .storage
+                .get_project_coordinator_profile(&self.context.conversation_id)
+                .await
+            {
+                Ok(profile) => profile,
+                Err(error) => {
+                    let _ = llm_tx.send(LlmOutcome::NetworkError {
+                        message: format!("failed to load Project Coordinator profile: {error}"),
+                    });
+                    self.llm_task_handle = Some(tokio::spawn(async {}));
+                    tokio::spawn(forward_llm_outcome(
+                        llm_rx,
+                        dispatch_generation,
+                        llm_outcome_tx,
+                    ));
+                    return Ok(None);
+                }
+            }
+        };
+        if project_coordinator_profile.is_some() {
+            crate::system_prompt::append_project_coordinator_guidance(
+                &mut system_prompt,
+                self.context.llm_language,
+            );
+        }
         if has_approved_task_write_authority {
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
@@ -6957,6 +6986,14 @@ where
             request_tool_surface == LlmToolSurface::SubAgentTerminal,
         );
         let mut system = vec![SystemContent::cached(&system_prompt)];
+        if let Some(profile) = project_coordinator_profile {
+            system.push(SystemContent::new(
+                crate::system_prompt::project_coordinator_charter_block(
+                    profile.charter(),
+                    self.context.llm_language,
+                ),
+            ));
+        }
         if is_coordinator {
             let capsule = match coordinator_read_service {
                 Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
@@ -8123,8 +8160,24 @@ where
                 }));
             }
         };
-        let policy = CompactionPolicy::for_coordinator(self.context.is_coordinator);
-        let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
+        let is_project_coordinator = if self.context.is_coordinator || self.context.is_sub_agent {
+            false
+        } else {
+            match self.storage.get_project_coordinator_profile(&conv_id).await {
+                Ok(profile) => profile.is_some(),
+                Err(error) => {
+                    return Ok(Some(Event::ContinuationFailed {
+                        operation_id,
+                        error: format!("failed to load Project Coordinator profile: {error}"),
+                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                    }));
+                }
+            }
+        };
+        let policy =
+            CompactionPolicy::for_profile(self.context.is_coordinator, is_project_coordinator);
+        let mut continuation_prompt =
+            policy.instruction(&rejected_tool_calls, self.context.llm_language);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
@@ -11869,6 +11922,89 @@ mod dispatch_context_budget_tests {
     }
 
     #[tokio::test]
+    async fn project_coordinator_request_loads_current_charter_as_separate_system_block() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "project-coordinator-prompt";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_project_coordinator_profile(
+            conv_id,
+            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile::new(
+                "current charter".to_string(),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            crate::runtime::traits::MessageStore::get_project_coordinator_profile(
+                storage.as_ref(),
+                conv_id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .charter(),
+            "current charter"
+        );
+        storage
+            .add_message(
+                "initial",
+                conv_id,
+                &MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("done")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].system[0]
+                .text
+                .contains(crate::system_prompt::PROJECT_COORDINATOR_GUIDANCE),
+            "recorded system blocks: {:#?}",
+            requests[0].system
+        );
+        assert_eq!(requests[0].system.len(), 2);
+        assert_eq!(
+            requests[0].system[1].text,
+            "# User-authored Project Coordinator charter\n\ncurrent charter"
+        );
+        assert!(!requests[0].messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("current charter")))));
+    }
+
+    #[tokio::test]
     async fn request_rounds_use_one_snapshot_then_tails_and_rebuild_once_on_invalidation() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "bounded-projection-rounds";
@@ -12948,7 +13084,7 @@ mod authoritative_user_message_effect_tests {
                 .contains("Cancel Crick"));
             assert_eq!(
                 request.system[0].text,
-                CompactionPolicy::for_coordinator(coordinator).system_prompt()
+                CompactionPolicy::for_profile(coordinator, false).system_prompt()
             );
             assert!(request.messages.len() < 63);
         }
