@@ -30,12 +30,14 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
-    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
-    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    RouteCloseAttemptToRepairRequest,
+    AdoptCloseWorktreeCleanupPlanRequest, AmbientWriterAuthority, AmbientWriterDescriptorAccess,
+    AmbientWriterDetector, AmbientWriterEvidence, BindCloseWorktreeFinalTombstoneObjectRequest,
+    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
+    CaptureCloseRetirementInventoryScopeRequest, CloseNeedsRepairCause,
+    CloseWorktreeFinalTombstone, RecordCloseAmbientWriterEvidenceRequest,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -145,9 +147,10 @@ impl RuntimeManager {
     pub(crate) async fn inspect_close_retirement_only(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<CloseRetirementSnapshot, String> {
+    ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
         self.inspect_close_retirement_with_continuation(attempt_id, false)
             .await
+            .map_err(|error| CloseRetirementError::Message(error.clone()))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -156,6 +159,22 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
         continue_clean_retirement: bool,
     ) -> Result<CloseRetirementSnapshot, String> {
+        if continue_clean_retirement {
+            if let Some(resumed) = self
+                .db()
+                .resume_legacy_fk787_close_retirement_generation(&attempt_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let snapshot = resumed.snapshot().cloned().ok_or_else(|| {
+                    "resumed Close retirement has no inspection snapshot".to_string()
+                })?;
+                self.retire_close_runtime_resources(attempt_id)
+                    .await
+                    .map_err(String::from)?;
+                return Ok(snapshot);
+            }
+        }
         let prior_obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
@@ -294,7 +313,9 @@ impl RuntimeManager {
                                         } else {
                                             prior_snapshot
                                         };
-                                        self.retire_close_runtime_resources(attempt_id).await?;
+                                        self.retire_close_runtime_resources(attempt_id)
+                                            .await
+                                            .map_err(String::from)?;
                                         return Ok(active_snapshot);
                                     }
                                     return Ok(prior_snapshot);
@@ -367,7 +388,9 @@ impl RuntimeManager {
             .cloned()
             .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())?;
         if continue_clean_retirement && obligation.phase() == ClosePhase::RetirementRequested {
-            self.retire_close_runtime_resources(attempt_id).await?;
+            self.retire_close_runtime_resources(attempt_id)
+                .await
+                .map_err(String::from)?;
         }
         Ok(snapshot)
     }
@@ -682,11 +705,28 @@ impl RuntimeManager {
 
     /// Retires exactly the unresolved inventory targets. The coordinator never
     /// advances Close to `Completed`; it only creates per-resource evidence.
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn retire_close_runtime_resources(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
+        self.retire_close_runtime_resources_with_adoption_routing(attempt_id, false)
+            .await
+    }
+
+    pub(super) async fn resume_close_runtime_resources_on_startup(
+        &self,
+        attempt_id: CloseAttemptId,
+    ) -> Result<(), CloseRetirementError> {
+        self.retire_close_runtime_resources_with_adoption_routing(attempt_id, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retire_close_runtime_resources_with_adoption_routing(
+        &self,
+        attempt_id: CloseAttemptId,
+        route_adoption_invariant_to_repair: bool,
+    ) -> Result<(), CloseRetirementError> {
         let _execution = self
             .close_retirement_execution
             .lock(attempt_id.as_str())
@@ -1014,8 +1054,12 @@ impl RuntimeManager {
                 }
             }
         }
-        self.retire_close_worktrees_and_scopes(&attempt_id, &snapshot)
-            .await?;
+        self.retire_close_worktrees_and_scopes(
+            &attempt_id,
+            &snapshot,
+            route_adoption_invariant_to_repair,
+        )
+        .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
         self.discard_close_resource_leases(&attempt_id).await;
@@ -1134,12 +1178,31 @@ impl RuntimeManager {
         Ok(())
     }
 
+    fn ensure_no_active_residuals(
+        obligation: &phoenix_core::domain::close::CloseObligation,
+        snapshot: &CloseRetirementSnapshot,
+        evidence: &[phoenix_core::domain::close::CloseRetiredResource],
+    ) -> Result<(), CloseRetirementError> {
+        if obligation.phase() == ClosePhase::NeedsRepair
+            && evidence.iter().any(|item| {
+                item.snapshot == *snapshot
+                    && matches!(item.outcome, RetirementOutcome::Residual { .. })
+            })
+        {
+            return Err(CloseRetirementError::Message(
+                "Close needs-repair phase retains active residual evidence".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn retire_close_worktrees_and_scopes(
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
-    ) -> Result<(), String> {
+        route_adoption_invariant_to_repair: bool,
+    ) -> Result<(), CloseRetirementError> {
         let targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
@@ -1150,6 +1213,12 @@ impl RuntimeManager {
             .list_close_retirement_evidence(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let obligation = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        Self::ensure_no_active_residuals(&obligation, snapshot, &evidence)?;
         let retired = evidence
             .into_iter()
             .filter(|evidence| {
@@ -1237,19 +1306,140 @@ impl RuntimeManager {
                         .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
                         .await
                         .map_err(|error| error.to_string())?;
+                    let existing_cleanup_plan = if captured_path
+                        .try_exists()
+                        .map_err(|error| error.to_string())?
+                    {
+                        existing_cleanup_plan
+                    } else if quarantine_path
+                        .try_exists()
+                        .map_err(|error| error.to_string())?
+                        && existing_cleanup_plan.is_none()
+                    {
+                        let common_git_dir = exact_worktree_common_git_dir(&quarantine_path)?;
+                        let observed_administrative_dir =
+                            exact_worktree_administrative_dir(&quarantine_path, &common_git_dir)?;
+                        let observed_administrative_dir_incarnation =
+                            observe_administrative_dir_incarnation(&observed_administrative_dir)?;
+                        let adopted = self
+                            .db()
+                            .adopt_close_worktree_cleanup_plan(
+                                AdoptCloseWorktreeCleanupPlanRequest {
+                                    attempt_id: attempt_id.clone(),
+                                    scope: scope.clone(),
+                                    target_snapshot: snapshot.clone(),
+                                    resource: target.resource.clone(),
+                                    observed_administrative_dir,
+                                    observed_administrative_dir_incarnation,
+                                },
+                            )
+                            .await
+                            .map_err(map_close_retirement_db_error);
+                        match adopted {
+                            Ok(plan) => Some(plan),
+                            Err(CloseRetirementError::EvidenceInvariant {
+                                invariant,
+                                relation,
+                                ..
+                            }) if route_adoption_invariant_to_repair => {
+                                self.route_close_evidence_invariant_to_repair::<
+                                    (),
+                                    CloseRetirementError,
+                                >(attempt_id, &scope, &invariant, &relation)
+                                .await
+                                .expect_err("repair routing returns a typed failure");
+                                return Err(CloseRetirementError::EvidenceInvariant {
+                                    scope: Some(scope.clone()),
+                                    invariant,
+                                    relation,
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        existing_cleanup_plan
+                    };
                     if let Some(cleanup_plan) = existing_cleanup_plan
                         .as_ref()
                         .filter(|plan| plan.final_tombstone.is_some())
                     {
+                        let tombstone = cleanup_plan
+                            .final_tombstone
+                            .as_ref()
+                            .expect("filtered above");
+                        if tombstone.object_device.is_none()
+                            && quarantine_path
+                                .try_exists()
+                                .map_err(|error| error.to_string())?
+                        {
+                            let observe = std::sync::Arc::clone(&self.ambient_writer_observer);
+                            let observed_path = quarantine_path.clone();
+                            match tokio::task::spawn_blocking(move || observe(&observed_path))
+                                .await
+                                .map_err(|error| error.to_string())?
+                            {
+                                Ok(Some(evidence)) => {
+                                    self.db()
+                                        .record_close_ambient_writer_evidence(
+                                            RecordCloseAmbientWriterEvidenceRequest {
+                                                attempt_id: attempt_id.clone(),
+                                                scope: scope.clone(),
+                                                snapshot: snapshot.clone(),
+                                                resource: target.resource.clone(),
+                                                evidence,
+                                            },
+                                        )
+                                        .await
+                                        .map_err(map_close_retirement_db_error)?;
+                                    self.cancel_close_resource_leases(attempt_id)
+                                        .await
+                                        .map_err(CloseRetirementError::Message)?;
+                                    return Err(CloseRetirementError::Message(
+                                        "stable ambient writer appeared before final tombstone recovery"
+                                            .to_string(),
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(reason) => {
+                                    let error = CloseRetirementError::Message(format!(
+                                        "worktree cannot be reinspected before final tombstone recovery: {reason}"
+                                    ));
+                                    self.persist_close_error_repair(attempt_id, &scope, &error)
+                                        .await
+                                        .map_err(CloseRetirementError::Message)?;
+                                    return Err(error);
+                                }
+                            }
+                        }
                         let identity = identity.clone();
                         let cleanup_plan = cleanup_plan.clone();
+                        let db = self.db().clone();
+                        let runtime = tokio::runtime::Handle::current();
+                        let attempt = attempt_id.clone();
+                        let recovery_scope = scope.clone();
+                        let recovery_snapshot = snapshot.clone();
+                        let recovery_resource = target.resource.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
-                            match resume_final_worktree_tombstone(
+                            match resume_final_worktree_tombstone_with_binding(
                                 cleanup_plan
                                     .final_tombstone
                                     .as_ref()
                                     .expect("filtered above"),
                                 &identity,
+                                |object_device, object_inode| {
+                                    runtime
+                                        .block_on(db.bind_close_worktree_final_tombstone_object(
+                                            BindCloseWorktreeFinalTombstoneObjectRequest {
+                                                attempt_id: attempt.clone(),
+                                                scope: recovery_scope.clone(),
+                                                snapshot: recovery_snapshot.clone(),
+                                                resource: recovery_resource.clone(),
+                                                object_device,
+                                                object_inode,
+                                            },
+                                        ))
+                                        .map_err(|error| error.to_string())
+                                },
                             ) {
                                 FinalTombstoneRecovery::Completed => {}
                                 FinalTombstoneRecovery::Residual(detail) => return Err(detail),
@@ -1346,9 +1536,34 @@ impl RuntimeManager {
                                 .await;
                         }
                         let identity = identity.clone();
+                        let db = self.db().clone();
+                        let runtime = tokio::runtime::Handle::current();
+                        let attempt = attempt_id.clone();
+                        let recovery_scope = scope.clone();
+                        let recovery_snapshot = snapshot.clone();
+                        let recovery_resource = target.resource.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
                             if let Some(tombstone) = &cleanup_plan.final_tombstone {
-                                match resume_final_worktree_tombstone(tombstone, &identity) {
+                                match resume_final_worktree_tombstone_with_binding(
+                                    tombstone,
+                                    &identity,
+                                    |object_device, object_inode| {
+                                        runtime
+                                            .block_on(
+                                                db.bind_close_worktree_final_tombstone_object(
+                                                    BindCloseWorktreeFinalTombstoneObjectRequest {
+                                                        attempt_id: attempt.clone(),
+                                                        scope: recovery_scope.clone(),
+                                                        snapshot: recovery_snapshot.clone(),
+                                                        resource: recovery_resource.clone(),
+                                                        object_device,
+                                                        object_inode,
+                                                    },
+                                                ),
+                                            )
+                                            .map_err(|error| error.to_string())
+                                    },
+                                ) {
                                     FinalTombstoneRecovery::Completed => {}
                                     FinalTombstoneRecovery::Residual(detail) => return Err(detail),
                                 }
@@ -1481,6 +1696,8 @@ impl RuntimeManager {
                         let snapshot_for_tombstone = snapshot.clone();
                         let runtime = tokio::runtime::Handle::current();
                         let persistence_runtime = runtime.clone();
+                        let ambient_writer_observer =
+                            std::sync::Arc::clone(&self.ambient_writer_observer);
                         let final_removal =
                             tokio::task::spawn_blocking(move || {
                                 inspect_and_remove_exact_worktree(
@@ -1524,6 +1741,7 @@ impl RuntimeManager {
                                                 .map_err(|error| error.to_string())
                                         }
                                     },
+                                    ambient_writer_observer,
                                 )
                             })
                             .await
@@ -1547,7 +1765,7 @@ impl RuntimeManager {
                                     .map_err(|error| error.to_string())?;
                                 Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
                                     .await?;
-                                return Err(detail);
+                                return Err(CloseRetirementError::Message(detail));
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
@@ -1561,19 +1779,32 @@ impl RuntimeManager {
                                     )
                                     .await;
                             }
-                            Err(reason) => {
-                                return self
-                                    .record_close_residual(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &format!(
-                                        "worktree cannot be reinspected before removal: {reason}"
-                                    ),
+                            Ok(ExactWorktreeRemoval::AmbientWriterResidual(residual)) => {
+                                self.db()
+                                    .record_close_ambient_writer_evidence(
+                                        RecordCloseAmbientWriterEvidenceRequest {
+                                            attempt_id: attempt_id.clone(),
+                                            scope: scope.clone(),
+                                            snapshot: snapshot.clone(),
+                                            resource: target.resource.clone(),
+                                            evidence: residual.evidence,
+                                        },
                                     )
-                                    .await;
+                                    .await
+                                    .map_err(map_close_retirement_db_error)?;
+                                self.cancel_close_resource_leases(attempt_id)
+                                    .await
+                                    .map_err(CloseRetirementError::Message)?;
+                                return Err(CloseRetirementError::Message(residual.detail));
+                            }
+                            Err(reason) => {
+                                let error = CloseRetirementError::Message(format!(
+                                    "worktree cannot be reinspected before removal: {reason}"
+                                ));
+                                self.persist_close_error_repair(attempt_id, &scope, &error)
+                                    .await
+                                    .map_err(CloseRetirementError::Message)?;
+                                return Err(error);
                             }
                         };
                         if let Some(fresh_snapshot) = fresh_snapshot {
@@ -1695,13 +1926,100 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn route_close_attempt_to_repair<T>(
+    pub(crate) async fn route_close_attempt_to_repair<T, E>(
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
         reason: RetirementFailureReason,
         detail: impl Into<String>,
-    ) -> Result<T, String> {
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
+        let detail = detail.into();
+        let cause = AmbientWriterIndeterminateDiagnostic::from_marker(&detail)
+            .map(|diagnostic| diagnostic.durable_cause());
+        let detail = self
+            .route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, cause)
+            .await
+            .map_err(E::from)?;
+        Err(E::from(detail))
+    }
+
+    pub(crate) async fn route_close_evidence_invariant_to_repair<T, E>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        invariant: &str,
+        relation: &str,
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
+        let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+            .expect("static Close evidence identifiers are non-blank");
+        let detail = format!("Close evidence invariant {invariant} failed in {relation}");
+        let detail = self
+            .route_close_attempt_to_repair_with_cause(
+                attempt_id,
+                scope,
+                RetirementFailureReason::ManualRepairRequired,
+                detail,
+                Some(cause),
+            )
+            .await
+            .map_err(E::from)?;
+        Err(E::from(detail))
+    }
+
+    pub(crate) async fn persist_close_error_repair(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        error: &CloseRetirementError,
+    ) -> Result<(), String> {
+        let detail = match error {
+            CloseRetirementError::EvidenceInvariant {
+                invariant,
+                relation,
+                ..
+            } => {
+                let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+                    .expect("typed Close evidence identifiers are non-blank");
+                self.route_close_attempt_to_repair_with_cause(
+                    attempt_id,
+                    scope,
+                    RetirementFailureReason::ManualRepairRequired,
+                    format!("Close evidence invariant {invariant} failed in {relation}"),
+                    Some(cause),
+                )
+                .await?
+            }
+            CloseRetirementError::Message(message) => {
+                let cause = AmbientWriterIndeterminateDiagnostic::from_marker(message)
+                    .map(|diagnostic| diagnostic.durable_cause());
+                self.route_close_attempt_to_repair_with_cause(
+                    attempt_id,
+                    scope,
+                    RetirementFailureReason::ManualRepairRequired,
+                    message.clone(),
+                    cause,
+                )
+                .await?
+            }
+        };
+        tracing::debug!(%detail, "Close error routed durably to repair");
+        Ok(())
+    }
+
+    async fn route_close_attempt_to_repair_with_cause(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: impl Into<String>,
+        cause: Option<CloseNeedsRepairCause>,
+    ) -> Result<String, String> {
         let detail = detail.into();
         let captured = self
             .db()
@@ -1734,16 +2052,17 @@ impl RuntimeManager {
                 residual,
                 reason,
                 detail: detail.clone(),
+                cause,
             })
             .await
             .map_err(|error| error.to_string())?;
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail)
+        Ok(detail)
     }
 
-    async fn record_close_residual<T>(
+    async fn record_close_residual<T, E>(
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
@@ -1751,7 +2070,10 @@ impl RuntimeManager {
         resource: RetiredResourceIdentity,
         reason: RetirementFailureReason,
         detail: &str,
-    ) -> Result<T, String> {
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1768,7 +2090,7 @@ impl RuntimeManager {
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail.to_string())
+        Err(E::from(detail.to_string()))
     }
 
     /// Completes one live lease. Callers must persist exactly one receipt per
@@ -2554,7 +2876,7 @@ fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
     }
 }
 
-fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, String> {
+pub(super) fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, String> {
     let path = worktree_path(identity);
     let parent = path
         .parent()
@@ -2579,10 +2901,147 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
     Ok(parent.join(name))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticDetector {
+    NativeProcessInventory,
+    MacosProcPidinfo,
+    LinuxProcfs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticOperation {
+    ObserveAmbientWriter,
+    ReadProcessIncarnation,
+    ReadProcessExecutable,
+    ReadWorkingDirectory,
+    ReadMappings,
+    ReadProcessCredentials,
+    EnumerateDescriptors,
+    EnumerateDescriptor,
+    ReadDescriptorTarget,
+    ReadDescriptorMetadata,
+    ReadDescriptorAccessMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticErrorKind {
+    PermissionDenied,
+    NotFound,
+    InvalidData,
+    Indeterminate,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AmbientWriterIndeterminateDiagnostic {
+    pub detector: AmbientWriterDiagnosticDetector,
+    pub operation: AmbientWriterDiagnosticOperation,
+    pub error_kind: AmbientWriterDiagnosticErrorKind,
+}
+
+impl AmbientWriterIndeterminateDiagnostic {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn marker(&self) -> String {
+        format!(
+            "ambient_writer_indeterminate:{}",
+            serde_json::to_string(self).expect("diagnostic serialization is total"),
+        )
+    }
+
+    pub(crate) fn from_marker(message: &str) -> Option<Self> {
+        let marker = "ambient_writer_indeterminate:";
+        serde_json::from_str(message.get(message.find(marker)? + marker.len()..)?).ok()
+    }
+
+    fn durable_cause(&self) -> CloseNeedsRepairCause {
+        CloseNeedsRepairCause::ambient_writer_indeterminate(
+            serde_json::to_value(self.detector)
+                .expect("diagnostic detector serialization is total")
+                .as_str()
+                .expect("diagnostic detector serializes as a string"),
+            serde_json::to_value(self.operation)
+                .expect("diagnostic operation serialization is total")
+                .as_str()
+                .expect("diagnostic operation serializes as a string"),
+            serde_json::to_value(self.error_kind)
+                .expect("diagnostic error kind serialization is total")
+                .as_str()
+                .expect("diagnostic error kind serializes as a string"),
+        )
+        .expect("diagnostic identifiers are non-empty")
+    }
+
+    pub(crate) fn from_durable_cause(cause: &crate::db::AmbientWriterIndeterminateCause) -> Self {
+        Self {
+            detector: serde_json::from_value(serde_json::Value::String(
+                cause.detector().to_string(),
+            ))
+            .expect("durable diagnostic constructor validates detector literals"),
+            operation: serde_json::from_value(serde_json::Value::String(
+                cause.operation().to_string(),
+            ))
+            .expect("durable diagnostic constructor validates operation literals"),
+            error_kind: serde_json::from_value(serde_json::Value::String(
+                cause.error_kind().to_string(),
+            ))
+            .expect("durable diagnostic constructor validates error-kind literals"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum CloseRetirementError {
+    #[error("{0}")]
+    Message(String),
+    #[error("Close evidence invariant {invariant} failed in {relation}")]
+    EvidenceInvariant {
+        scope: Option<WorkScopeId>,
+        invariant: String,
+        relation: String,
+    },
+}
+
+impl From<String> for CloseRetirementError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<CloseRetirementError> for String {
+    fn from(error: CloseRetirementError) -> Self {
+        error.to_string()
+    }
+}
+
+fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementError {
+    match error {
+        crate::db::DbError::CloseEvidenceInvariant {
+            invariant,
+            relation,
+            ..
+        } => CloseRetirementError::EvidenceInvariant {
+            scope: None,
+            invariant: invariant.to_string(),
+            relation: relation.to_string(),
+        },
+        error => CloseRetirementError::Message(error.to_string()),
+    }
+}
+
 enum ExactWorktreeRemoval {
     Retired,
     ReinspectionRequired { detail: String },
     Residual { detail: String },
+    AmbientWriterResidual(AmbientWriterResidual),
+}
+
+#[derive(Debug)]
+struct AmbientWriterResidual {
+    detail: String,
+    evidence: AmbientWriterEvidence,
 }
 
 enum FinalTombstoneRecovery {
@@ -2590,6 +3049,7 @@ enum FinalTombstoneRecovery {
     Residual(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -2598,6 +3058,7 @@ fn inspect_and_remove_exact_worktree<B>(
     administrative_dir_incarnation: &str,
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
+    inspect_external_writer: AmbientWriterObserver,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
@@ -2611,6 +3072,7 @@ where
         final_tombstone,
         bind_tombstone,
         |_| {},
+        move |path| inspect_external_writer(path),
     )
 }
 
@@ -2640,11 +3102,12 @@ where
         None,
         |_, _, _| Ok(()),
         after_quarantine,
+        |_| Ok(None),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
+fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B, W>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
@@ -2653,10 +3116,12 @@ fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    inspect_external_writer: W,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    W: Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -2686,13 +3151,14 @@ where
                 .to_string(),
         });
     }
-    runtime.block_on(quarantine_and_remove_exact_worktree(
+    runtime.block_on(quarantine_and_remove_exact_worktree_with_writer_inspection(
         identity,
         administrative_dir.to_path_buf(),
         administrative_dir_incarnation.to_string(),
         final_tombstone.cloned(),
         bind_tombstone,
         after_quarantine,
+        inspect_external_writer,
     ))
 }
 
@@ -2712,7 +3178,9 @@ fn exact_worktree_common_git_dir(worktree: &Path) -> Result<PathBuf, String> {
     Ok(path_buf_from_git_bytes(output.stdout.trim_ascii()))
 }
 
-fn observe_administrative_dir_incarnation(administrative_dir: &Path) -> Result<String, String> {
+pub(super) fn observe_administrative_dir_incarnation(
+    administrative_dir: &Path,
+) -> Result<String, String> {
     let metadata = std::fs::symlink_metadata(administrative_dir).map_err(|error| {
         format!(
             "cannot observe worktree administrative-directory incarnation {}: {error}",
@@ -3058,6 +3526,13 @@ where
         let _ = std::fs::remove_dir(&tombstone_root);
         return Err(error);
     }
+    if observe_identity(deletion_target)? != expected_identity {
+        let _ = std::fs::remove_dir(&tombstone_root);
+        return Err(format!(
+            "{description} identity changed before final deletion; replacement preserved at {}",
+            deletion_target.display()
+        ));
+    }
     if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
         let _ = std::fs::remove_dir(&tombstone_root);
         return Err(format!(
@@ -3192,13 +3667,18 @@ where
     clippy::too_many_lines,
     reason = "exhaustive recovery keeps every persisted tombstone state and authority check visible"
 )]
-fn resume_final_worktree_tombstone(
+fn resume_final_worktree_tombstone_with_binding<B>(
     tombstone: &CloseWorktreeFinalTombstone,
     identity: &WorktreeIdentity,
-) -> FinalTombstoneRecovery {
+    mut bind_object_identity: B,
+) -> FinalTombstoneRecovery
+where
+    B: FnMut(u64, u64) -> Result<(), String>,
+{
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
     let expected_identity = identity.fingerprint().as_str();
     let captured_path = worktree_path(identity);
@@ -3281,64 +3761,72 @@ fn resume_final_worktree_tombstone(
         (Some(device), Some(inode)) => (device, inode),
         (None, None) => {
             let captured_exists = match captured_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe captured worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
-            let quarantine_exists = match quarantine_path.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => {
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot observe quarantined worktree path during final tombstone recovery: {error}"
-                        ))
-                    }
-                };
-            match (captured_exists, quarantine_exists) {
-                    (true, false) => {
-                        if observe_worktree_fingerprint(&captured_path).as_deref()
-                            != Some(expected_identity)
-                        {
-                            return FinalTombstoneRecovery::Residual(
-                                "captured worktree does not match recorded final tombstone identity; preserved for manual repair".to_string(),
-                            );
-                        }
-                        let tombstone_object = tombstone.root.join("object");
-                        if let Err(error) = std::fs::rename(&captured_path, &tombstone_object) {
-                            return FinalTombstoneRecovery::Residual(format!(
-                                "cannot resume recorded final tombstone pre-rename state: {error}"
-                            ));
-                        }
-                        let metadata = match std::fs::symlink_metadata(&tombstone_object) {
-                            Ok(metadata) => metadata,
-                            Err(error) => {
-                                return FinalTombstoneRecovery::Residual(format!(
-                                    "cannot identify resumed final tombstone object: {error}"
-                                ))
-                            }
-                        };
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt as _;
-                            (metadata.dev(), metadata.ino())
-                        }
-                        #[cfg(not(unix))]
-                        unreachable!()
-                    }
-                    (false, false) => return FinalTombstoneRecovery::Completed,
-                    (true, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "captured and quarantined worktree paths are both present during final tombstone recovery; preserved for manual repair".to_string(),
-                        )
-                    }
-                    (false, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "recorded final tombstone object identity is absent and only quarantine remains; preserved for manual repair".to_string(),
-                        )
-                    }
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe captured worktree path during final tombstone recovery: {error}"
+                    ))
                 }
+            };
+            let quarantine_exists = match quarantine_path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe quarantined worktree path during final tombstone recovery: {error}"
+                    ))
+                }
+            };
+            let tombstone_object = tombstone.root.join("object");
+            let object_exists = match tombstone_object.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot observe final tombstone object during recovery: {error}"
+                    ))
+                }
+            };
+            let source = match (captured_exists, quarantine_exists, object_exists) {
+                (true, false, false) => Some((&captured_path, "captured")),
+                (false, true, false) => Some((&quarantine_path, "quarantined")),
+                (false, false, true) => None,
+                (false, false, false) => return FinalTombstoneRecovery::Completed,
+                _ => {
+                    return FinalTombstoneRecovery::Residual(
+                        "multiple worktree locations are present during final tombstone recovery; preserved for manual repair".to_string(),
+                    )
+                }
+            };
+            if let Some((source, description)) = source {
+                if observe_worktree_fingerprint(source).as_deref() != Some(expected_identity) {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "{description} worktree does not match recorded final tombstone identity; preserved for manual repair"
+                    ));
+                }
+                if let Err(error) = std::fs::rename(source, &tombstone_object) {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot resume recorded final tombstone pre-object state: {error}"
+                    ));
+                }
+            }
+            if observe_worktree_fingerprint(&tombstone_object).as_deref() != Some(expected_identity)
+            {
+                return FinalTombstoneRecovery::Residual(
+                    "unbound final tombstone object does not match captured worktree identity; preserved for manual repair".to_string(),
+                );
+            }
+            let metadata = match std::fs::symlink_metadata(&tombstone_object) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return FinalTombstoneRecovery::Residual(format!(
+                        "cannot identify resumed final tombstone object: {error}"
+                    ))
+                }
+            };
+            let object_identity = (metadata.dev(), metadata.ino());
+            if let Err(detail) = bind_object_identity(object_identity.0, object_identity.1) {
+                return FinalTombstoneRecovery::Residual(detail);
+            }
+            object_identity
         }
         _ => return FinalTombstoneRecovery::Residual(
             "recorded final tombstone object identity is incomplete; preserved for manual repair"
@@ -3404,6 +3892,14 @@ fn resume_final_worktree_tombstone(
             "cannot remove empty recorded final tombstone: {error}"
         )),
     }
+}
+
+#[cfg(all(unix, test))]
+fn resume_final_worktree_tombstone(
+    tombstone: &CloseWorktreeFinalTombstone,
+    identity: &WorktreeIdentity,
+) -> FinalTombstoneRecovery {
+    resume_final_worktree_tombstone_with_binding(tombstone, identity, |_, _| Ok(()))
 }
 
 #[cfg(not(unix))]
@@ -3491,7 +3987,7 @@ where
     )
 }
 
-fn exact_worktree_administrative_dir(
+pub(super) fn exact_worktree_administrative_dir(
     worktree: &Path,
     common_git_dir: &Path,
 ) -> Result<PathBuf, String> {
@@ -3512,29 +4008,434 @@ fn exact_worktree_administrative_dir(
     Ok(git_dir)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExternalWriterEvidence {
-    PositiveWriterFound,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ExternalWriterEvidence {
+    PositiveWriterFound(AmbientWriterEvidence),
     NoPositiveEvidence,
 }
 
-impl ExternalWriterEvidence {
-    fn found(self) -> bool {
-        matches!(self, Self::PositiveWriterFound)
+pub(super) type AmbientWriterObserver = std::sync::Arc<
+    dyn Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + Sync + 'static,
+>;
+
+pub(super) fn production_ambient_writer_observer() -> AmbientWriterObserver {
+    std::sync::Arc::new(|path| {
+        quarantine_has_external_writer(path).map_err(|error| {
+            if AmbientWriterIndeterminateDiagnostic::from_marker(&error).is_some() {
+                error
+            } else {
+                AmbientWriterIndeterminateDiagnostic {
+                    detector: AmbientWriterDiagnosticDetector::NativeProcessInventory,
+                    operation: AmbientWriterDiagnosticOperation::ObserveAmbientWriter,
+                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                }
+                .marker()
+            }
+        })
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn test_open_descriptor_ambient_writer_observer(
+    proc_root: PathBuf,
+) -> AmbientWriterObserver {
+    std::sync::Arc::new(move |path| {
+        inspect_ambient_writer_until_quiescent(
+            AmbientWriterObservationPolicy::production(),
+            || match quarantine_has_open_descriptors_in(path, &proc_root)? {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+                }
+            },
+            std::thread::sleep,
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbientWriterObservationPolicy {
+    max_observations: std::num::NonZeroUsize,
+    required_clean: std::num::NonZeroUsize,
+    spacing: std::time::Duration,
+}
+
+impl AmbientWriterObservationPolicy {
+    fn new(
+        max_observations: usize,
+        required_clean: usize,
+        spacing: std::time::Duration,
+    ) -> Result<Self, String> {
+        let max_observations = std::num::NonZeroUsize::new(max_observations)
+            .ok_or_else(|| "ambient writer observation budget must be positive".to_string())?;
+        let required_clean = std::num::NonZeroUsize::new(required_clean)
+            .ok_or_else(|| "required clean observations must be positive".to_string())?;
+        if required_clean > max_observations {
+            return Err("required clean observations exceed the observation budget".to_string());
+        }
+        Ok(Self {
+            max_observations,
+            required_clean,
+            spacing,
+        })
+    }
+
+    fn production() -> Self {
+        Self::new(3, 2, std::time::Duration::from_millis(100))
+            .expect("production ambient-writer observation policy is valid")
     }
 }
 
-fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
-    Ok(quarantine_has_open_descriptors(path)?.found()
-        || quarantine_has_process_cwd(path)?
-        || quarantine_has_writable_mappings(path)?)
+fn inspect_ambient_writer_until_quiescent(
+    policy: AmbientWriterObservationPolicy,
+    mut observe: impl FnMut() -> Result<ExternalWriterEvidence, String>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<Option<AmbientWriterEvidence>, String> {
+    let mut consecutive_clean = 0;
+    let mut final_writer = None;
+    for observation in 0..policy.max_observations.get() {
+        match observe()? {
+            ExternalWriterEvidence::NoPositiveEvidence => {
+                consecutive_clean += 1;
+                final_writer = None;
+                if consecutive_clean == policy.required_clean.get() {
+                    return Ok(None);
+                }
+            }
+            ExternalWriterEvidence::PositiveWriterFound(evidence) => {
+                consecutive_clean = 0;
+                final_writer = Some(evidence);
+            }
+        }
+        if observation + 1 < policy.max_observations.get() {
+            wait(policy.spacing);
+        }
+    }
+    final_writer.map_or_else(
+        || {
+            Err(
+                "ambient writer observation budget ended without two clean observations"
+                    .to_string(),
+            )
+        },
+        |evidence| Ok(Some(evidence)),
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => match quarantine_has_namespace_cwd(path)?
+            {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    quarantine_has_writable_mappings(path)
+                }
+            },
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => match quarantine_has_namespace_cwd(path)?
+            {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    quarantine_has_writable_mappings(path)
+                }
+            },
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => quarantine_has_writable_mappings(path),
+        },
+        std::thread::sleep,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbientWriterAccessMode {
+    WriteOnly,
+    ReadWrite,
+    NamespaceWrite,
+}
+
+impl AmbientWriterAccessMode {
+    fn authority(self) -> AmbientWriterAuthority {
+        match self {
+            Self::WriteOnly => {
+                AmbientWriterAuthority::Descriptor(AmbientWriterDescriptorAccess::WriteOnly)
+            }
+            Self::ReadWrite => {
+                AmbientWriterAuthority::Descriptor(AmbientWriterDescriptorAccess::ReadWrite)
+            }
+            Self::NamespaceWrite => AmbientWriterAuthority::NamespaceDirectory,
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_descriptor_access_mode_from_flags(open_flags: i32) -> Option<AmbientWriterAccessMode> {
+    match open_flags & libc::O_ACCMODE {
+        libc::O_WRONLY => Some(AmbientWriterAccessMode::WriteOnly),
+        libc::O_RDWR => Some(AmbientWriterAccessMode::ReadWrite),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_access_mode(open_flags: u32) -> Option<AmbientWriterAccessMode> {
+    const FREAD: u32 = 0x0000_0001;
+    const FWRITE: u32 = 0x0000_0002;
+    if open_flags & FWRITE == 0 {
+        None
+    } else if open_flags & FREAD != 0 {
+        Some(AmbientWriterAccessMode::ReadWrite)
+    } else {
+        Some(AmbientWriterAccessMode::WriteOnly)
+    }
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn classify_descriptor_access_mode(
+    access_mode: Option<AmbientWriterAccessMode>,
+    target_is_directory: bool,
+) -> Option<AmbientWriterAccessMode> {
+    access_mode.or_else(|| target_is_directory.then_some(AmbientWriterAccessMode::NamespaceWrite))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_inspection_is_transient_disappearance(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ESRCH | libc::ENOENT | libc::EBADF))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_process_identity_failure_is_disappearance(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ESRCH | libc::ENOENT))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_inventory_count(bytes: usize, record_size: usize) -> Result<usize, String> {
+    if record_size == 0 || !bytes.is_multiple_of(record_size) {
+        return Err("process descriptor inventory contains a partial record".to_string());
+    }
+    Ok(bytes / record_size)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
+    quarantine_has_writable_mappings_in(path, production_proc_root(), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut display = Vec::new();
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b'\n' {
+            display.extend_from_slice(b"\\012");
+        } else {
+            display.push(*byte);
+        }
+    }
+    display
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writable_shared_mapping_path(
+    mapping: &str,
+    canonical: &Path,
+) -> Result<Option<String>, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut fields = mapping
+        .splitn(6, char::is_whitespace)
+        .filter(|field| !field.is_empty());
+    let _address = fields.next();
+    let permissions = fields.next().unwrap_or_default();
+    let _offset = fields.next();
+    let _device = fields.next();
+    let _inode = fields.next();
+    let mapped_path = fields.next().unwrap_or_default().trim_start();
+    if mapped_path.as_bytes().ends_with(b" (deleted)") {
+        return Ok(None);
+    }
+    if permissions.as_bytes().get(1) != Some(&b'w') || permissions.as_bytes().get(3) != Some(&b's')
+    {
+        return Ok(None);
+    }
+    let canonical_display = linux_procfs_display_path(canonical);
+    if !path_is_within(
+        Path::new(std::ffi::OsStr::from_bytes(mapped_path.as_bytes())),
+        Path::new(std::ffi::OsStr::from_bytes(&canonical_display)),
+    ) {
+        return Ok(None);
+    }
+    if mapped_path
+        .as_bytes()
+        .windows(4)
+        .any(|bytes| bytes == b"\\012")
+    {
+        return Err("matching process mapping pathname has ambiguous procfs escaping".to_string());
+    }
+    Ok(Some(mapped_path.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_revalidated_writer_identity(
+    before_incarnation: &str,
+    before_executable: &Path,
+    resource_still_matches: bool,
+    after_incarnation: &str,
+    after_executable: &Path,
+) -> Result<bool, String> {
+    if after_incarnation != before_incarnation || after_executable != before_executable {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    Ok(resource_still_matches)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn revalidated_writer_identity(
+    before_incarnation: &str,
+    before_executable: &GitPathIdentity,
+    resource_still_matches: bool,
+    after_incarnation: &str,
+    after_executable: &GitPathIdentity,
+) -> Result<bool, String> {
+    if after_incarnation != before_incarnation || after_executable != before_executable {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    Ok(resource_still_matches)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mapping_writer_evidence(
+    process: &std::fs::DirEntry,
+    before_incarnation: String,
+    executable: &Path,
+    mapped_path: String,
+) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation,
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
+            authority: AmbientWriterAuthority::WritableSharedMapping,
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mapping_writer_evidence_if_stable(
+    process: &std::fs::DirEntry,
+    before_incarnation: &str,
+    canonical: &Path,
+    mapped_path: String,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    let process_path = process.path();
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let Some(current_mappings) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadMappings,
+        || std::fs::read_to_string(process_path.join("maps")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut mapping_still_matches = false;
+    for current_mapping in current_mappings.lines() {
+        if linux_writable_shared_mapping_path(current_mapping, canonical)?.as_deref()
+            == Some(mapped_path.as_str())
+        {
+            mapping_still_matches = true;
+            break;
+        }
+    }
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        mapping_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    linux_mapping_writer_evidence(
+        process,
+        before_incarnation.to_string(),
+        &executable,
+        mapped_path,
+    )
+    .map(Some)
 }
 
 #[cfg(target_os = "linux")]
@@ -3542,43 +4443,54 @@ fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
-) -> Result<bool, String> {
+) -> Result<ExternalWriterEvidence, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "mapping") {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for mapping inspection: {error}"))?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot enumerate a process for mapping inspection: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "mapping")? {
             continue;
         }
-        let Ok(mappings) = std::fs::read_to_string(process.path().join("maps")) else {
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
+            Ok(incarnation) => incarnation,
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
+        };
+        let Some(mappings) = linux_read_leaf_after_capture(
+            &process_path,
+            &before_incarnation,
+            AmbientWriterDiagnosticOperation::ReadMappings,
+            || std::fs::read_to_string(process_path.join("maps")),
+        )?
+        else {
             continue;
         };
         for mapping in mappings.lines() {
-            let mut fields = mapping
-                .splitn(6, char::is_whitespace)
-                .filter(|field| !field.is_empty());
-            let _address = fields.next();
-            let permissions = fields.next().unwrap_or_default();
-            let _offset = fields.next();
-            let _device = fields.next();
-            let _inode = fields.next();
-            let mapped_path = fields.next().unwrap_or_default().trim_start();
-            if permissions.as_bytes().get(1) == Some(&b'w')
-                && permissions.as_bytes().get(3) == Some(&b's')
-                && path_is_within(Path::new(mapped_path), &canonical)
-            {
-                return Ok(true);
+            let Some(mapped_path) = linux_writable_shared_mapping_path(mapping, &canonical)? else {
+                continue;
+            };
+            if let Some(evidence) = linux_mapping_writer_evidence_if_stable(
+                &process,
+                &before_incarnation,
+                &canonical,
+                mapped_path,
+            )? {
+                return Ok(evidence);
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
+#[allow(clippy::too_many_lines)]
 #[cfg(target_os = "macos")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
@@ -3621,9 +4533,8 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(false);
-    };
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for mapping inspection: {error}"))?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut address = 0_u64;
         loop {
@@ -3645,9 +4556,12 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
                 != i32::try_from(size_of::<ProcRegionWithPathInfo>())
                     .expect("region path info size fits i32")
             {
-                // Ambient process inspection is observational. A short kernel
-                // result proves nothing about this process, so skip it.
-                break;
+                return Err(AmbientWriterIndeterminateDiagnostic {
+                    detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                    operation: AmbientWriterDiagnosticOperation::ReadMappings,
+                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                }
+                .marker());
             }
             let info = unsafe { info.assume_init() };
             let Some(next) = info.region.address.checked_add(info.region.size) else {
@@ -3669,26 +4583,92 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
                     &canonical,
                 )
             {
-                return Ok(true);
+                let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+                    continue;
+                };
+                let Some(before_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
+                else {
+                    continue;
+                };
+                let Some(after_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                let mut revalidated = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+                let revalidated_bytes = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        PROC_PIDREGIONPATHINFO,
+                        info.region.address,
+                        revalidated.as_mut_ptr().cast(),
+                        i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                            .expect("region path info fits i32"),
+                    )
+                };
+                if revalidated_bytes
+                    != i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                        .expect("region path info size fits i32")
+                {
+                    return Err(AmbientWriterIndeterminateDiagnostic {
+                        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                        operation: AmbientWriterDiagnosticOperation::ReadMappings,
+                        error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                    }
+                    .marker());
+                }
+                let revalidated = unsafe { revalidated.assume_init() };
+                let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
+                let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
+                let mapping_still_matches = revalidated.region.address == info.region.address
+                    && revalidated.region.size == info.region.size
+                    && revalidated.region.protection & u32::try_from(libc::VM_PROT_WRITE).unwrap()
+                        != 0
+                    && matches!(
+                        revalidated.region.share_mode,
+                        SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
+                    )
+                    && revalidated_path.to_bytes() == mapped_path.to_bytes();
+                if after_uid != uid {
+                    return Err("matching writer identity changed during inspection".to_string());
+                }
+                if !revalidated_writer_identity(
+                    &before_incarnation,
+                    &before_executable,
+                    mapping_still_matches,
+                    &after_incarnation,
+                    &after_executable,
+                )? {
+                    continue;
+                }
+                return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                    AmbientWriterEvidence {
+                        detector: AmbientWriterDetector::MacosProcPidinfo,
+                        process_id: i64::from(pid),
+                        process_incarnation: before_incarnation,
+                        executable: before_executable,
+                        matched_path: GitPathIdentity::from_bytes(mapped_path.to_bytes().to_vec()),
+                        authority: AmbientWriterAuthority::WritableSharedMapping,
+                    },
+                ));
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
+fn production_proc_root() -> &'static Path {
+    Path::new("/proc")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
@@ -3697,56 +4677,66 @@ fn quarantine_has_process_cwd_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "cwd") {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    for process in processes {
+        let process = process
+            .map_err(|error| format!("cannot enumerate a process for cwd inspection: {error}"))?;
+        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
             continue;
         }
-        if std::fs::read_link(process.path().join("cwd"))
-            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
-        {
-            return Ok(true);
+        match std::fs::read_link(process.path().join("cwd")) {
+            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
+            Ok(_) => {}
+            Err(_) if !process.path().exists() => {}
+            Err(error) => return Err(format!("cannot inspect process cwd: {error}")),
         }
     }
     Ok(false)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids() -> Option<Vec<i32>> {
+fn macos_all_pids() -> Result<Vec<i32>, String> {
     macos_all_pids_with(|buffer, buffer_bytes| unsafe {
         libc::proc_listpids(1, 0, buffer, buffer_bytes)
     })
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
+fn macos_all_pids_with(
+    mut list: impl FnMut(*mut libc::c_void, i32) -> i32,
+) -> Result<Vec<i32>, String> {
     use std::mem::size_of;
 
     let mut capacity = 4096_usize;
     loop {
         let mut pids = vec![0_i32; capacity];
-        let capacity_bytes = pids.len().checked_mul(size_of::<i32>())?;
-        let capacity_bytes_i32 = i32::try_from(capacity_bytes).ok()?;
+        let capacity_bytes = pids
+            .len()
+            .checked_mul(size_of::<i32>())
+            .ok_or_else(|| "process inventory capacity overflow".to_string())?;
+        let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+            .map_err(|_| "process inventory exceeds platform limits".to_string())?;
         let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
         if pid_bytes < 0 {
-            return None;
+            return Err("cannot enumerate process inventory".to_string());
         }
-        let pid_bytes = usize::try_from(pid_bytes).ok()?;
+        let pid_bytes = usize::try_from(pid_bytes)
+            .map_err(|_| "process inventory byte count is invalid".to_string())?;
         if pid_bytes < capacity_bytes {
-            // A non-integral short result is not a trustworthy PID inventory.
             if !pid_bytes.is_multiple_of(size_of::<i32>()) {
-                return None;
+                return Err("process inventory contains a partial PID".to_string());
             }
             pids.truncate(pid_bytes / size_of::<i32>());
-            return Some(pids);
+            return Ok(pids);
         }
-        capacity = capacity.checked_mul(2)?;
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or_else(|| "process inventory capacity overflow".to_string())?;
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
@@ -3755,9 +4745,8 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(false);
-    };
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
@@ -3789,7 +4778,100 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "macos")]
+fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        if !macos_process_is_relevant(pid, effective_uid)? {
+            continue;
+        }
+        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                    .expect("vnode path info fits i32"),
+            )
+        };
+        if bytes
+            != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                .expect("vnode path info size fits i32")
+        {
+            let error = std::io::Error::last_os_error();
+            if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                continue;
+            }
+            return Err(format!(
+                "cannot inspect process {pid} working directory: {error}"
+            ));
+        }
+        let info = unsafe { info.assume_init() };
+        let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
+        let cwd = unsafe { CStr::from_ptr(cwd_bytes.as_ptr()) };
+        let cwd_path = Path::new(std::ffi::OsStr::from_bytes(cwd.to_bytes()));
+        if !path_is_within(cwd_path, &canonical) {
+            continue;
+        }
+        let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+            return Err(format!(
+                "cannot prove process {pid} working-directory owner identity"
+            ));
+        };
+        let Some(before_executable) = macos_process_executable(pid)? else {
+            return Err(format!(
+                "cannot prove process {pid} working-directory executable identity"
+            ));
+        };
+        let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)? else {
+            return Err(format!(
+                "cannot reprove process {pid} working-directory owner identity"
+            ));
+        };
+        let Some(after_executable) = macos_process_executable(pid)? else {
+            return Err(format!(
+                "cannot reprove process {pid} working-directory executable identity"
+            ));
+        };
+        if after_uid != uid {
+            return Err("matching writer identity changed during inspection".to_string());
+        }
+        if !revalidated_writer_identity(
+            &before_incarnation,
+            &before_executable,
+            true,
+            &after_incarnation,
+            &after_executable,
+        )? {
+            continue;
+        }
+        return Ok(ExternalWriterEvidence::PositiveWriterFound(
+            AmbientWriterEvidence {
+                detector: AmbientWriterDetector::MacosProcPidinfo,
+                process_id: i64::from(pid),
+                process_incarnation: before_incarnation,
+                executable: before_executable,
+                matched_path: GitPathIdentity::from_bytes(cwd.to_bytes().to_vec()),
+                authority: AmbientWriterAuthority::NamespaceDirectory,
+            },
+        ));
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
     Err("process working-directory inspection is unsupported on this platform".to_string())
 }
@@ -3825,8 +4907,8 @@ impl LinuxProcessEffectiveUid {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxProcessOwner {
-    Relevant,
-    Unrelated,
+    Inspectable,
+    DifferentUser,
     Vanished,
 }
 
@@ -3838,7 +4920,7 @@ fn linux_process_owner(
 ) -> Result<LinuxProcessOwner, String> {
     let status = match std::fs::read_to_string(process.path().join("status")) {
         Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !process.path().exists() => {
             return Ok(LinuxProcessOwner::Vanished);
         }
         Err(error) => {
@@ -3848,25 +4930,18 @@ fn linux_process_owner(
             ));
         }
     };
-    let process_effective_uid =
-        LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
-            format!(
+    let process_uid = LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
+        format!(
             "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
             process.file_name().to_string_lossy()
         )
-        })?;
+    })?;
 
-    // The scanned proc files use `PTRACE_MODE_READ_FSCREDS`: Linux compares the
-    // scanner's filesystem UID with the target's real, effective, and saved UIDs.
-    // Effective UID is Phoenix's process-ownership boundary; unlike proc-dir inode
-    // ownership, it is not rewritten to root when a same-user target is nondumpable.
-    Ok(
-        if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
-            LinuxProcessOwner::Relevant
-        } else {
-            LinuxProcessOwner::Unrelated
-        },
-    )
+    Ok(if process_uid.0 == effective_uid {
+        LinuxProcessOwner::Inspectable
+    } else {
+        LinuxProcessOwner::DifferentUser
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3874,16 +4949,17 @@ fn linux_process_is_relevant(
     process: &std::fs::DirEntry,
     effective_uid: libc::uid_t,
     inventory: &str,
-) -> bool {
-    process
+) -> Result<bool, String> {
+    if !process
         .file_name()
         .as_encoded_bytes()
         .iter()
         .all(u8::is_ascii_digit)
-        && matches!(
-            linux_process_owner(process, effective_uid, inventory),
-            Ok(LinuxProcessOwner::Relevant)
-        )
+    {
+        return Ok(false);
+    }
+    linux_process_owner(process, effective_uid, inventory)
+        .map(|owner| owner == LinuxProcessOwner::Inspectable)
 }
 
 #[cfg(target_os = "linux")]
@@ -3895,8 +4971,495 @@ fn linux_descriptor_target_is_within(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum LinuxScannerError {
+    ProcessDisappeared,
+    Indeterminate {
+        operation: AmbientWriterDiagnosticOperation,
+        error_kind: AmbientWriterDiagnosticErrorKind,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxScannerError {
+    fn from_process_io(
+        process: &Path,
+        operation: AmbientWriterDiagnosticOperation,
+        error: &std::io::Error,
+    ) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound
+            && matches!(
+                std::fs::metadata(process),
+                Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            Self::ProcessDisappeared
+        } else {
+            Self::Indeterminate {
+                operation,
+                error_kind: diagnostic_error_kind(error),
+            }
+        }
+    }
+
+    fn invalid(operation: AmbientWriterDiagnosticOperation) -> Self {
+        Self::Indeterminate {
+            operation,
+            error_kind: AmbientWriterDiagnosticErrorKind::InvalidData,
+        }
+    }
+
+    fn into_marker(self) -> String {
+        match self {
+            Self::ProcessDisappeared => linux_indeterminate(
+                AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+                AmbientWriterDiagnosticErrorKind::NotFound,
+            ),
+            Self::Indeterminate {
+                operation,
+                error_kind,
+            } => linux_indeterminate(operation, error_kind),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_incarnation(process: &Path) -> Result<String, LinuxScannerError> {
+    let stat = std::fs::read_to_string(process.join("stat")).map_err(|error| {
+        LinuxScannerError::from_process_io(
+            process,
+            AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+            &error,
+        )
+    })?;
+    let after_command = stat
+        .rfind(") ")
+        .and_then(|index| stat.get(index + 2..))
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })?;
+    after_command
+        .split_ascii_whitespace()
+        .nth(19)
+        .filter(|start_time| !start_time.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(process: &Path) -> Result<Option<char>, LinuxScannerError> {
+    let stat = match std::fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat,
+        Err(error) => {
+            return match LinuxScannerError::from_process_io(
+                process,
+                AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+                &error,
+            ) {
+                LinuxScannerError::ProcessDisappeared => Ok(None),
+                error @ LinuxScannerError::Indeterminate { .. } => Err(error),
+            }
+        }
+    };
+    stat.rfind(") ")
+        .and_then(|index| stat.get(index + 2..))
+        .and_then(|after_command| after_command.split_ascii_whitespace().next())
+        .and_then(|state| state.chars().next())
+        .map(Some)
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_incarnation_after_capture(
+    process: &Path,
+    captured_incarnation: &str,
+) -> Result<Option<String>, String> {
+    match linux_process_incarnation(process) {
+        Ok(current) if current == captured_incarnation => Ok(Some(current)),
+        Ok(_) | Err(LinuxScannerError::ProcessDisappeared) => Ok(None),
+        Err(error) => Err(error.into_marker()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_leaf_after_capture<T>(
+    process: &Path,
+    captured_incarnation: &str,
+    operation: AmbientWriterDiagnosticOperation,
+    read: impl FnOnce() -> std::io::Result<T>,
+) -> Result<Option<T>, String> {
+    match read() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if matches!(
+                operation,
+                AmbientWriterDiagnosticOperation::EnumerateDescriptor
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorTarget
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorMetadata
+                    | AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode
+            ) || linux_process_incarnation_after_capture(process, captured_incarnation)?
+                .is_none()
+                || linux_process_state(process)
+                    .map_err(LinuxScannerError::into_marker)?
+                    .is_none_or(|state| state == 'Z')
+            {
+                Ok(None)
+            } else {
+                Err(linux_inventory_diagnostic(operation, &error))
+            }
+        }
+        Err(error) => Err(linux_inventory_diagnostic(operation, &error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxDescriptorAccess {
+    Disappeared,
+    NoWrite,
+    Mode(AmbientWriterAccessMode),
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_access_mode(
+    process: &Path,
+    captured_incarnation: &str,
+    path: &Path,
+) -> Result<LinuxDescriptorAccess, String> {
+    let Some(fdinfo) = linux_read_leaf_after_capture(
+        process,
+        captured_incarnation,
+        AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+        || std::fs::read_to_string(path),
+    )?
+    else {
+        return Ok(LinuxDescriptorAccess::Disappeared);
+    };
+    let flags = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:\t"))
+        .ok_or_else(|| {
+            linux_indeterminate(
+                AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+                AmbientWriterDiagnosticErrorKind::InvalidData,
+            )
+        })?;
+    let flags = i32::from_str_radix(flags, 8).map_err(|_| {
+        linux_indeterminate(
+            AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+            AmbientWriterDiagnosticErrorKind::InvalidData,
+        )
+    })?;
+    Ok(match linux_descriptor_access_mode_from_flags(flags) {
+        Some(access_mode) => LinuxDescriptorAccess::Mode(access_mode),
+        None => LinuxDescriptorAccess::NoWrite,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_open_descriptors_in(path, Path::new("/proc"))
+    quarantine_has_open_descriptors_in(path, production_proc_root())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_writer_evidence(
+    process: &std::fs::DirEntry,
+    descriptor: &std::fs::DirEntry,
+    canonical: &Path,
+    before_incarnation: &str,
+    target: &Path,
+    target_is_directory: bool,
+    access_mode: AmbientWriterAccessMode,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let process_path = process.path();
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let Some(current_target) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadDescriptorTarget,
+        || std::fs::read_link(descriptor.path()),
+    )?
+    else {
+        return Ok(None);
+    };
+    let current_access_mode = match linux_descriptor_access_mode(
+        &process_path,
+        before_incarnation,
+        &process_path.join("fdinfo").join(descriptor.file_name()),
+    )? {
+        LinuxDescriptorAccess::Disappeared => return Ok(None),
+        LinuxDescriptorAccess::NoWrite => {
+            classify_descriptor_access_mode(None, target_is_directory)
+        }
+        LinuxDescriptorAccess::Mode(access_mode) => {
+            classify_descriptor_access_mode(Some(access_mode), target_is_directory)
+        }
+    };
+    let resource_still_matches = current_target == target
+        && current_access_mode == Some(access_mode)
+        && linux_descriptor_target_is_within(Ok(current_target), canonical);
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        resource_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(Some(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(target.as_os_str().as_bytes().to_vec()),
+            authority: access_mode.authority(),
+        },
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_writer_evidence_if_stable(
+    process: &std::fs::DirEntry,
+    before_incarnation: &str,
+    canonical: &Path,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let process_path = process.path();
+    let Some(cwd) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+        || std::fs::read_link(process_path.join("cwd")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !path_is_within(&cwd, canonical) {
+        return Ok(None);
+    }
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let Some(current_cwd) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+        || std::fs::read_link(process_path.join("cwd")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let resource_still_matches = path_is_within(&current_cwd, canonical);
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        resource_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(Some(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(cwd.as_os_str().as_bytes().to_vec()),
+            authority: AmbientWriterAuthority::NamespaceDirectory,
+        },
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    quarantine_has_namespace_cwd_in(path, production_proc_root(), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_namespace_cwd_in(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<ExternalWriterEvidence, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    for process in processes {
+        let process = process
+            .map_err(|error| format!("cannot enumerate a process for cwd inspection: {error}"))?;
+        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
+            continue;
+        }
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
+            Ok(incarnation) => incarnation,
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
+        };
+        if let Some(evidence) = linux_namespace_cwd_writer_evidence_if_stable(
+            &process,
+            &before_incarnation,
+            &canonical,
+        )? {
+            return Ok(evidence);
+        }
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_indeterminate(
+    operation: AmbientWriterDiagnosticOperation,
+    error_kind: AmbientWriterDiagnosticErrorKind,
+) -> String {
+    AmbientWriterIndeterminateDiagnostic {
+        detector: AmbientWriterDiagnosticDetector::LinuxProcfs,
+        operation,
+        error_kind,
+    }
+    .marker()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn diagnostic_error_kind(error: &std::io::Error) -> AmbientWriterDiagnosticErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        std::io::ErrorKind::NotFound => AmbientWriterDiagnosticErrorKind::NotFound,
+        std::io::ErrorKind::InvalidData => AmbientWriterDiagnosticErrorKind::InvalidData,
+        _ => AmbientWriterDiagnosticErrorKind::Other,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_inventory_diagnostic(
+    operation: AmbientWriterDiagnosticOperation,
+    error: &std::io::Error,
+) -> String {
+    AmbientWriterIndeterminateDiagnostic {
+        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+        operation,
+        error_kind: diagnostic_error_kind(error),
+    }
+    .marker()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_inventory_diagnostic(
+    operation: AmbientWriterDiagnosticOperation,
+    error: &std::io::Error,
+) -> String {
+    linux_indeterminate(operation, diagnostic_error_kind(error))
+}
+
+#[cfg(target_os = "linux")]
+fn canonicalize_quarantine_for_descriptor_scan(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_is_deleted(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.nlink() == 0
 }
 
 #[cfg(target_os = "linux")]
@@ -3904,26 +5467,102 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
+    let canonical = canonicalize_quarantine_for_descriptor_scan(path)?;
+    let effective_uid = unsafe { libc::geteuid() };
+    let processes = std::fs::read_dir(proc_root).map_err(|error| {
+        format!("cannot enumerate processes for descriptor inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for process in processes.flatten().filter(|process| {
-        process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-    }) {
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot enumerate a process for descriptor inspection: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "descriptor")? {
+            continue;
+        }
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
+            Ok(incarnation) => incarnation,
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
+        };
+        let descriptor_path = process_path.join("fd");
+        let Some(descriptors) = linux_read_leaf_after_capture(
+            &process_path,
+            &before_incarnation,
+            AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+            || std::fs::read_dir(&descriptor_path),
+        )?
+        else {
             continue;
         };
-        for descriptor in descriptors.flatten() {
-            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)
-            {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+        for descriptor in descriptors {
+            let Some(descriptor) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::EnumerateDescriptor,
+                || descriptor,
+            )?
+            else {
+                continue;
+            };
+            let Some(target) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadDescriptorTarget,
+                || std::fs::read_link(descriptor.path()),
+            )?
+            else {
+                continue;
+            };
+            let Some(target_metadata) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+                || std::fs::metadata(descriptor.path()),
+            )?
+            else {
+                continue;
+            };
+            if linux_descriptor_is_deleted(&target_metadata) {
+                continue;
+            }
+            if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
+                continue;
+            }
+            let access_mode = match linux_descriptor_access_mode(
+                &process_path,
+                &before_incarnation,
+                &process_path.join("fdinfo").join(descriptor.file_name()),
+            )? {
+                LinuxDescriptorAccess::Disappeared => continue,
+                LinuxDescriptorAccess::NoWrite => {
+                    let Some(access_mode) =
+                        classify_descriptor_access_mode(None, target_metadata.is_dir())
+                    else {
+                        continue;
+                    };
+                    access_mode
+                }
+                LinuxDescriptorAccess::Mode(access_mode) => {
+                    let Some(access_mode) = classify_descriptor_access_mode(
+                        Some(access_mode),
+                        target_metadata.is_dir(),
+                    ) else {
+                        continue;
+                    };
+                    access_mode
+                }
+            };
+            if let Some(evidence) = linux_descriptor_writer_evidence(
+                &process,
+                &descriptor,
+                &canonical,
+                &before_incarnation,
+                &target,
+                target_metadata.is_dir(),
+                access_mode,
+            )? {
+                return Ok(evidence);
             }
         }
     }
@@ -3933,6 +5572,92 @@ fn quarantine_has_open_descriptors_in(
 #[cfg(target_os = "macos")]
 fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: usize) -> bool {
     returned_bytes >= capacity_bytes
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_owner_incarnation(pid: i32) -> Result<Option<(libc::uid_t, String)>, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info fits i32"),
+        )
+    };
+    if bytes != i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info size fits i32") {
+        let error = std::io::Error::last_os_error();
+        if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
+            return Ok(None);
+        }
+        return Err(format!("cannot inspect process {pid} incarnation: {error}"));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(Some((
+        info.pbi_uid,
+        format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_executable(pid: i32) -> Result<Option<GitPathIdentity>, String> {
+    let mut executable = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let executable_bytes = unsafe {
+        libc::proc_pidpath(
+            pid,
+            executable.as_mut_ptr().cast(),
+            u32::try_from(executable.len()).expect("process path buffer fits u32"),
+        )
+    };
+    if executable_bytes <= 0 {
+        let error = std::io::Error::last_os_error();
+        if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
+            return Ok(None);
+        }
+        return Err(format!("cannot inspect process {pid} executable: {error}"));
+    }
+    executable.truncate(usize::try_from(executable_bytes).expect("positive process path size"));
+    Ok(Some(GitPathIdentity::from_bytes(executable)))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_is_relevant(pid: i32, effective_uid: libc::uid_t) -> Result<bool, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    // SAFETY: proc_pidinfo initializes the declared C structure on success.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("process info fits i32"),
+        )
+    };
+    if bytes <= 0 {
+        let error = std::io::Error::last_os_error();
+        if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+            return Ok(false);
+        }
+        return Err(macos_inventory_diagnostic(
+            AmbientWriterDiagnosticOperation::ReadProcessCredentials,
+            &error,
+        ));
+    }
+    let bytes = usize::try_from(bytes).expect("positive process info byte count");
+    if bytes < size_of::<libc::proc_bsdinfo>() {
+        return Err(macos_inventory_diagnostic(
+            AmbientWriterDiagnosticOperation::ReadProcessCredentials,
+            &std::io::Error::from(std::io::ErrorKind::InvalidData),
+        ));
+    }
+    // SAFETY: the exact structure size was reported initialized above.
+    let info = unsafe { info.assume_init() };
+    Ok(info.pbi_uid == effective_uid)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3957,13 +5682,18 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     }
 
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+    let pids = macos_all_pids().map_err(|error| {
+        format!("cannot enumerate processes for descriptor inspection: {error}")
+    })?;
+    'processes: for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        if !macos_process_is_relevant(pid, effective_uid)? {
+            continue;
+        }
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
             let mut descriptors = vec![
@@ -3974,9 +5704,8 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 descriptor_capacity
             ];
             let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
-            let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
-                break Vec::new();
-            };
+            let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+                .map_err(|_| "descriptor inventory exceeds platform limits".to_string())?;
             // SAFETY: the vector provides writable storage for exactly the byte count passed.
             let descriptor_bytes = unsafe {
                 libc::proc_pidinfo(
@@ -3988,18 +5717,27 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 )
             };
             if descriptor_bytes <= 0 {
-                break Vec::new();
+                let error = std::io::Error::last_os_error();
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                    continue 'processes;
+                }
+                return Err(macos_inventory_diagnostic(
+                    AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+                    &error,
+                ));
             }
             let descriptor_bytes =
                 usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
             if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
-                descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
+                descriptors.truncate(macos_descriptor_inventory_count(
+                    descriptor_bytes,
+                    size_of::<libc::proc_fdinfo>(),
+                )?);
                 break descriptors;
             }
-            let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
-                break Vec::new();
-            };
-            descriptor_capacity = next_capacity;
+            descriptor_capacity = descriptor_capacity
+                .checked_mul(2)
+                .ok_or_else(|| "descriptor inventory capacity overflow".to_string())?;
         };
         for descriptor in descriptors
             .into_iter()
@@ -4020,18 +5758,94 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 != i32::try_from(size_of::<VnodeFdInfoWithPath>())
                     .expect("vnode info size fits i32")
             {
-                continue;
+                let error = std::io::Error::last_os_error();
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                    continue;
+                }
+                return Err(macos_inventory_diagnostic(
+                    AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+                    &error,
+                ));
             }
             // SAFETY: the exact structure size was reported as initialized above.
             let info = unsafe { info.assume_init() };
             let path_bytes = info.vnode.vip_path.as_flattened();
             // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
             let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
-            if path_is_within(
-                Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
-                &canonical,
-            ) {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+            let candidate_path = Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
+            let candidate_is_within = path_is_within(candidate_path, &canonical);
+            let target_is_directory =
+                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
+            let Some(access_mode) = classify_descriptor_access_mode(
+                macos_descriptor_access_mode(info.file.open_flags),
+                candidate_is_within && target_is_directory,
+            ) else {
+                continue;
+            };
+            if candidate_is_within {
+                let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+                    continue;
+                };
+                let Some(before_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
+                else {
+                    continue;
+                };
+                let Some(after_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                let mut revalidated = MaybeUninit::<VnodeFdInfoWithPath>::uninit();
+                let revalidated_bytes = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        descriptor.proc_fd,
+                        PROC_PIDFDVNODEPATHINFO,
+                        revalidated.as_mut_ptr().cast(),
+                        i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                            .expect("vnode info fits i32"),
+                    )
+                };
+                if revalidated_bytes
+                    != i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                        .expect("vnode info size fits i32")
+                {
+                    return Err(AmbientWriterIndeterminateDiagnostic {
+                        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                        operation: AmbientWriterDiagnosticOperation::EnumerateDescriptor,
+                        error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                    }
+                    .marker());
+                }
+                let revalidated = unsafe { revalidated.assume_init() };
+                let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
+                let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
+                let resource_still_matches = revalidated_path.to_bytes() == candidate.to_bytes()
+                    && macos_descriptor_access_mode(revalidated.file.open_flags)
+                        == macos_descriptor_access_mode(info.file.open_flags);
+                if after_uid != uid {
+                    return Err("matching writer identity changed during inspection".to_string());
+                }
+                if !revalidated_writer_identity(
+                    &before_incarnation,
+                    &before_executable,
+                    resource_still_matches,
+                    &after_incarnation,
+                    &after_executable,
+                )? {
+                    continue;
+                }
+                return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                    AmbientWriterEvidence {
+                        detector: AmbientWriterDetector::MacosProcPidinfo,
+                        process_id: i64::from(pid),
+                        process_incarnation: before_incarnation,
+                        executable: before_executable,
+                        matched_path: GitPathIdentity::from_bytes(candidate.to_bytes().to_vec()),
+                        authority: access_mode.authority(),
+                    },
+                ));
             }
         }
     }
@@ -4156,17 +5970,19 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn quarantine_and_remove_exact_worktree<F, B>(
+async fn quarantine_and_remove_exact_worktree_with_writer_inspection<F, B, W>(
     identity: &WorktreeIdentity,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    inspect_external_writer: W,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    W: Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -4241,14 +6057,6 @@ where
         }
 
         after_quarantine(&path);
-        if quarantine_has_open_descriptors(&quarantine)?.found() {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "open descriptors can still modify the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
         if path
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
@@ -4261,13 +6069,16 @@ where
                 ),
             });
         }
-        if quarantine_has_external_writer(&quarantine)? {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "an external process can still write the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
+        if let Some(evidence) = inspect_external_writer(&quarantine)? {
+            return Ok(ExactWorktreeRemoval::AmbientWriterResidual(
+                AmbientWriterResidual {
+                    detail: format!(
+                        "a stable ambient writer retains the confirmed worktree quarantine at {}",
+                        quarantine.display()
+                    ),
+                    evidence,
+                },
+            ));
         }
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
         if administrative_dir != planned_administrative_dir {
@@ -4946,22 +6757,25 @@ mod tests {
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
-        planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
+        planned_administrative_dir_is_absent,
+        quarantine_and_remove_exact_worktree_with_writer_inspection,
         remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
         remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
-        rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
-        staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
-        CloseLeaseFailure, ExactWorktreeRemoval, FinalTombstoneRecovery,
+        resume_final_worktree_tombstone_with_binding, rotate_inspection_generation,
+        run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
+        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
+        ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::CloseWorktreeFinalTombstone;
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
-    use std::io::Write as _;
     #[cfg(target_os = "linux")]
-    use std::io::{BufRead as _, Read as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -4973,9 +6787,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_process_inventory_failures_are_absent_evidence() {
-        assert_eq!(super::macos_all_pids_with(|_, _| -1), None);
-        assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
+    fn macos_process_inventory_failures_are_indeterminate() {
+        assert!(super::macos_all_pids_with(|_, _| -1)
+            .unwrap_err()
+            .contains("cannot enumerate process inventory"));
+        assert!(super::macos_all_pids_with(|_, _| 3)
+            .unwrap_err()
+            .contains("partial PID"));
     }
 
     #[cfg(target_os = "macos")]
@@ -4995,7 +6813,7 @@ mod tests {
             i32::try_from(values.len() * size_of::<i32>()).unwrap()
         });
 
-        assert_eq!(pids, Some(vec![17, 23]));
+        assert_eq!(pids, Ok(vec![17, 23]));
         assert_eq!(calls, 2);
     }
 
@@ -5118,13 +6936,14 @@ mod tests {
         std::fs::remove_dir_all(&unrelated).unwrap();
         let administrative_dir = exact_worktree_administrative_dir(&linked, &bare).unwrap();
 
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = super::quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(None),
         )
         .await
         .unwrap();
@@ -5595,6 +7414,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recorded_final_tombstone_root_only_resumes_from_quarantine() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        let identity = inspection_identity(&target);
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&target, &quarantine).unwrap();
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+        let bound = std::sync::Mutex::new(None);
+
+        assert!(matches!(
+            resume_final_worktree_tombstone_with_binding(&recorded, &identity, |device, inode| {
+                *bound.lock().unwrap() = Some((device, inode));
+                Ok(())
+            },),
+            FinalTombstoneRecovery::Completed
+        ));
+        assert!(bound.into_inner().unwrap().is_some());
+        assert!(!target.exists());
+        assert!(!quarantine.exists());
+        assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_preserves_unbound_object_when_binding_fails() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        let identity = inspection_identity(&target);
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&target, &quarantine).unwrap();
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            object_device: None,
+            object_inode: None,
+        };
+
+        let first = resume_final_worktree_tombstone_with_binding(&recorded, &identity, |_, _| {
+            Err("injected binding failure".to_string())
+        });
+        assert!(matches!(
+            first,
+            FinalTombstoneRecovery::Residual(detail) if detail.contains("injected binding failure")
+        ));
+        assert!(!quarantine.exists());
+        assert!(recorded.root.join("object").exists());
+
+        assert!(matches!(
+            resume_final_worktree_tombstone_with_binding(&recorded, &identity, |_, _| Ok(())),
+            FinalTombstoneRecovery::Completed
+        ));
+        assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recorded_final_tombstone_root_only_converges_receipt_missing_after_completed_delete() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -5650,14 +7544,8 @@ mod tests {
 
         assert!(error.contains("identity changed before final deletion"));
         assert!(displaced.exists());
-        let preserved = std::fs::read_dir(temp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("object/replacement-marker"))
-            .find(|candidate| candidate.is_file())
-            .expect("swapped worktree replacement must remain in the private tombstone");
         assert_eq!(
-            std::fs::read_to_string(preserved).unwrap(),
+            std::fs::read_to_string(quarantine.join("replacement-marker")).unwrap(),
             replacement_marker
         );
     }
@@ -5692,14 +7580,8 @@ mod tests {
 
         assert!(error.contains("identity changed before final deletion"));
         assert!(displaced.exists());
-        let preserved = std::fs::read_dir(temp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("object/replacement-marker"))
-            .find(|candidate| candidate.is_file())
-            .expect("swapped admin replacement must remain in the private tombstone");
         assert_eq!(
-            std::fs::read_to_string(preserved).unwrap(),
+            std::fs::read_to_string(quarantine.join("replacement-marker")).unwrap(),
             replacement_marker
         );
     }
@@ -5881,6 +7763,7 @@ mod tests {
                 None,
                 |_, _, _| Ok(()),
                 |_| {},
+                |_| Ok(None),
             )
         })
         .await
@@ -6463,13 +8346,14 @@ mod tests {
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
         let common = super::exact_worktree_common_git_dir(&closing).unwrap();
         let administrative_dir = exact_worktree_administrative_dir(&closing, &common).unwrap();
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = super::quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(None),
         )
         .await
         .unwrap();
@@ -6482,6 +8366,338 @@ mod tests {
     fn descriptor_scan_has_no_external_executable_dependency() {
         let source = include_str!("close_retirement.rs");
         assert!(!source.contains("Command::new(\"lsof\")"));
+    }
+
+    fn writer_evidence(incarnation: &str) -> super::AmbientWriterEvidence {
+        super::AmbientWriterEvidence {
+            detector: super::AmbientWriterDetector::MacosProcPidinfo,
+            process_id: 42,
+            process_incarnation: incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+            matched_path: GitPathIdentity::from_bytes(b"/tmp/quarantine/file".to_vec()),
+            authority: super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::ReadWrite,
+            ),
+        }
+    }
+
+    #[test]
+    fn read_only_descriptor_flags_never_authorize_writer() {
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_RDONLY),
+            None
+        );
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_WRONLY),
+            Some(super::AmbientWriterAccessMode::WriteOnly)
+        );
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_RDWR),
+            Some(super::AmbientWriterAccessMode::ReadWrite)
+        );
+        assert_eq!(super::macos_descriptor_access_mode(0x1), None);
+        assert_eq!(
+            super::macos_descriptor_access_mode(0x2),
+            Some(super::AmbientWriterAccessMode::WriteOnly)
+        );
+        assert_eq!(
+            super::macos_descriptor_access_mode(0x3),
+            Some(super::AmbientWriterAccessMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn read_only_directory_descriptor_authorizes_namespace_mutation() {
+        assert_eq!(
+            super::classify_descriptor_access_mode(None, true),
+            Some(super::AmbientWriterAccessMode::NamespaceWrite)
+        );
+        assert_eq!(super::classify_descriptor_access_mode(None, false), None);
+    }
+
+    #[test]
+    fn transient_descriptor_errno_is_disappearance_not_indeterminacy() {
+        for errno in [libc::ESRCH, libc::ENOENT, libc::EBADF] {
+            assert!(super::macos_descriptor_inspection_is_transient_disappearance(Some(errno)));
+        }
+        assert!(!super::macos_descriptor_inspection_is_transient_disappearance(Some(libc::EACCES)));
+        assert!(!super::macos_descriptor_inspection_is_transient_disappearance(None));
+    }
+
+    #[test]
+    fn macos_writable_mapping_identity_eperm_is_indeterminate() {
+        assert!(!super::macos_process_identity_failure_is_disappearance(
+            Some(libc::EPERM)
+        ));
+        assert!(super::macos_process_identity_failure_is_disappearance(
+            Some(libc::ESRCH)
+        ));
+        assert!(super::macos_process_identity_failure_is_disappearance(
+            Some(libc::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn changed_successful_writer_identity_is_indeterminate() {
+        assert!(super::revalidated_writer_identity(
+            "before",
+            &GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+            true,
+            "after",
+            &GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::revalidated_writer_identity(
+            "stable",
+            &GitPathIdentity::from_bytes(b"/bin/before".to_vec()),
+            true,
+            "stable",
+            &GitPathIdentity::from_bytes(b"/bin/after".to_vec()),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+    }
+
+    #[test]
+    fn ambient_writer_working_directory_diagnostic_serializes_stably() {
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic {
+            detector: super::AmbientWriterDiagnosticDetector::LinuxProcfs,
+            operation: super::AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+            error_kind: super::AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        };
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["operation"], "read_working_directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_uid_process_inventory_is_outside_inspection_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = temp.path().join("4242");
+        std::fs::create_dir(&process).unwrap();
+        std::fs::write(process.join("status"), "Name:\tother\nUid:\t7\t7\t7\t7\n").unwrap();
+        let entry = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::linux_process_owner(&entry, 501, "descriptor").unwrap(),
+            super::LinuxProcessOwner::DifferentUser,
+        );
+    }
+
+    #[test]
+    fn partial_descriptor_inventory_is_indeterminate() {
+        assert_eq!(super::macos_descriptor_inventory_count(16, 8).unwrap(), 2);
+        assert!(super::macos_descriptor_inventory_count(15, 8)
+            .unwrap_err()
+            .contains("partial record"));
+        assert!(super::macos_descriptor_inventory_count(0, 0).is_err());
+    }
+
+    fn observation_policy(
+        max: usize,
+        clean: usize,
+        spacing_ms: u64,
+    ) -> super::AmbientWriterObservationPolicy {
+        super::AmbientWriterObservationPolicy::new(
+            max,
+            clean,
+            std::time::Duration::from_millis(spacing_ms),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transient_writer_requires_two_clean_observations_without_sleeping() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-1")),
+        ];
+        let mut waits = Vec::new();
+        let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
+            || Ok(observations.pop().unwrap()),
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn stable_writer_is_retained_with_complete_evidence_without_sleeping() {
+        let evidence = writer_evidence("start-stable");
+        let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
+            || {
+                Ok(super::ExternalWriterEvidence::PositiveWriterFound(
+                    evidence.clone(),
+                ))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result, Some(evidence));
+    }
+
+    #[test]
+    fn injected_observation_policy_controls_budget_clean_threshold_and_spacing() {
+        let mut observations = 0;
+        let mut waits = Vec::new();
+        let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(2, 2, 37),
+            || {
+                observations += 1;
+                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(observations, 2);
+        assert_eq!(waits, vec![std::time::Duration::from_millis(37)]);
+
+        assert!(
+            super::AmbientWriterObservationPolicy::new(1, 2, std::time::Duration::ZERO,).is_err()
+        );
+    }
+
+    #[test]
+    fn exhausted_clean_streak_does_not_replay_an_earlier_writer() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("transient")),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        ];
+        let error = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 0),
+            || Ok(observations.pop().unwrap()),
+            |_| {},
+        )
+        .expect_err("one final clean observation does not establish quiescence");
+        assert!(error.contains("budget ended without two clean observations"));
+    }
+
+    #[test]
+    fn pid_reuse_keeps_the_new_process_incarnation_distinct() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-new")),
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-new")),
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-old")),
+        ];
+        let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
+            || Ok(observations.pop().unwrap()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.unwrap().process_incarnation, "start-new");
+    }
+
+    #[test]
+    fn detector_indeterminacy_fails_closed() {
+        let error = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
+            || Err("detector cannot establish process incarnation".to_string()),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("process incarnation"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_inventory_failure_preserves_typed_diagnostic() {
+        let marker = super::macos_inventory_diagnostic(
+            super::AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic::from_marker(&marker).unwrap();
+        assert_eq!(
+            diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::MacosProcPidinfo
+        );
+        assert_eq!(
+            diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadDescriptorMetadata
+        );
+        assert_eq!(
+            diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::PermissionDenied
+        );
+    }
+
+    #[allow(clippy::items_after_statements)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_only_file_descriptor_under_quarantine_is_not_a_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let readiness = tempfile::tempdir().unwrap();
+        let path = temp.path().join("read-only");
+        let marker = readiness.path().join("reader-ready");
+        std::fs::write(&path, b"evidence").unwrap();
+        let mut reader = std::process::Command::new("sh")
+            .args(["-c", "exec 3<\"$TARGET\"; touch \"$MARKER\"; exec sleep 30"])
+            .env("TARGET", &path)
+            .env("MARKER", &marker)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            // test-timing-allow: polling backoff; the helper's marker is the completion signal
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "external reader became ready");
+        #[repr(C)]
+        struct ProcFileInfo {
+            open_flags: u32,
+            status: u32,
+            offset: i64,
+            file_type: i32,
+            guard_flags: u32,
+        }
+        #[repr(C)]
+        struct VnodeFdInfoWithPath {
+            file: ProcFileInfo,
+            vnode: libc::vnode_info_path,
+        }
+        let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        let bytes = unsafe {
+            libc::proc_pidfdinfo(
+                i32::try_from(reader.id()).unwrap(),
+                3,
+                2,
+                info.as_mut_ptr().cast(),
+                i32::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).unwrap(),
+            )
+        };
+        assert_eq!(
+            bytes,
+            i32::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).unwrap()
+        );
+        let info = unsafe { info.assume_init() };
+        assert_eq!(
+            super::macos_descriptor_access_mode(info.file.open_flags),
+            None
+        );
+        let path_bytes = info.vnode.vip_path.as_flattened();
+        let candidate = unsafe { std::ffi::CStr::from_ptr(path_bytes.as_ptr()) };
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(
+            std::fs::canonicalize(Path::new(
+                std::ffi::OsStr::from_bytes(candidate.to_bytes(),)
+            ))
+            .unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+        reader.kill().unwrap();
+        reader.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -6529,7 +8745,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_treats_same_user_nondumpable_process_as_observational() {
+    fn same_user_nondumpable_process_is_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -6572,16 +8788,265 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::linux_process_owner(&process, effective_uid, "working-directory").unwrap(),
-            super::LinuxProcessOwner::Relevant,
+            super::LinuxProcessOwner::Inspectable,
             "same-user nondumpable process must be attributed from kernel credentials"
         );
-        let scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
+        let cwd_scan =
+            super::quarantine_has_namespace_cwd_in(temp.path(), &proc_root, effective_uid);
+        let mapping_scan =
+            super::quarantine_has_writable_mappings_in(temp.path(), &proc_root, effective_uid);
+        let descriptor_scan = super::quarantine_has_open_descriptors_in(temp.path(), &proc_root);
 
         drop(child.stdin.take());
         child.wait().unwrap();
+        assert!(cwd_scan.is_err());
+        assert!(super::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &mapping_scan.unwrap_err()
+        )
+        .is_some());
+        assert!(super::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &descriptor_scan.unwrap_err()
+        )
+        .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_synthetic_process_identity(process: &Path, pid: i64) {
+        write_synthetic_process_credentials(process, pid);
+        std::os::unix::fs::symlink("/bin/writer", process.join("exe")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_root_for_process(parent: &Path, pid: u32) -> PathBuf {
+        let proc_root = parent.join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        std::os::unix::fs::symlink(format!("/proc/{pid}"), proc_root.join(pid.to_string()))
+            .unwrap();
+        proc_root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injected_proc_universe_is_separate_from_production_proc_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = proc_root_for_process(temp.path(), std::process::id());
+
+        assert_ne!(proc_root, super::production_proc_root());
+        assert_eq!(super::production_proc_root(), Path::new("/proc"));
+        assert_eq!(std::fs::read_dir(&proc_root).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_synthetic_process_credentials(process: &Path, pid: i64) {
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        std::fs::write(
+            process.join("status"),
+            format!("Name:\twriter\nUid:\t{effective_uid}\t{effective_uid}\t{effective_uid}\t{effective_uid}\n"),
+        )
+        .unwrap();
+        let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
+        std::fs::write(
+            process.join("stat"),
+            format!("{pid} (writer) S {fields} 4242\n"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_process_does_not_require_executable_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1276");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_credentials(&process, 1276);
+        std::fs::write(process.join("maps"), "1000-2000 rw-s 0 00:00 0 /outside\n").unwrap();
+        std::os::unix::fs::symlink("/outside", process.join("fd/3")).unwrap();
+
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
+        assert_eq!(
+            super::quarantine_has_writable_mappings_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_resource_without_executable_identity_is_indeterminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1277");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let matched = quarantine.join("matched");
+        std::fs::write(&matched, "writer").unwrap();
+        write_synthetic_process_credentials(&process, 1277);
+        std::fs::write(
+            process.join("maps"),
+            format!("1000-2000 rw-s 0 00:00 0 {}\n", matched.display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&matched, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
+
+        let descriptor_error = super::quarantine_has_open_descriptors_in(
+            &quarantine,
+            temp.path().join("proc").as_path(),
+        )
+        .unwrap_err();
+        let descriptor_diagnostic =
+            super::AmbientWriterIndeterminateDiagnostic::from_marker(&descriptor_error).unwrap();
+        assert_eq!(
+            descriptor_diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            descriptor_diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadProcessExecutable
+        );
+        assert_eq!(
+            descriptor_diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::NotFound
+        );
+
+        let mapping_error = super::quarantine_has_writable_mappings_in(
+            &quarantine,
+            temp.path().join("proc").as_path(),
+            unsafe { libc::geteuid() },
+        )
+        .unwrap_err();
+        let mapping_diagnostic =
+            super::AmbientWriterIndeterminateDiagnostic::from_marker(&mapping_error).unwrap();
+        assert_eq!(
+            mapping_diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            mapping_diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadProcessExecutable
+        );
+        assert_eq!(
+            mapping_diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::NotFound
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_writer_with_changed_identity_is_indeterminate() {
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/before"),
+            true,
+            "after",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/before"),
+            false,
+            "after",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/stable"),
+            true,
+            "after",
+            Path::new("/bin/stable"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/before"),
+            true,
+            "stable",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/stable"),
+            false,
+            "after",
+            Path::new("/bin/stable"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/before"),
+            false,
+            "stable",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/stable"),
+            true,
+            "stable",
+            Path::new("/bin/stable"),
+        )
+        .unwrap());
+        assert!(!super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/stable"),
+            false,
+            "stable",
+            Path::new("/bin/stable"),
+        )
+        .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_writable_shared_mapping_is_not_live_path_authority() {
+        let mapping = "7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/quarantine/file (deleted)";
+        assert_eq!(
+            super::linux_writable_shared_mapping_path(
+                mapping,
+                std::path::Path::new("/tmp/quarantine"),
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_matching_mapping_path_is_indeterminate() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let canonical = Path::new(std::ffi::OsStr::from_bytes(b"/quarantine/line\nbreak"));
+        let mapping = "1000-2000 rw-s 0 00:00 0 /quarantine/line\\012break/file";
         assert!(
-            scan.is_ok(),
-            "same-user nondumpable process unreadability must remain observational: {scan:?}"
+            super::linux_writable_shared_mapping_path(mapping, canonical)
+                .unwrap_err()
+                .contains("ambiguous procfs escaping")
         );
     }
 
@@ -6607,21 +9072,61 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_ignores_ambient_failures_and_finds_readable_writer() {
+    fn non_directory_descriptor_inventory_emits_safe_indeterminate_diagnostic() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let ambient = proc_root.join("1273");
-        let writer = proc_root.join("1274");
-        std::fs::create_dir_all(&ambient).unwrap();
-        std::fs::create_dir_all(writer.join("fd")).unwrap();
+        let process = proc_root.join("1278");
+        std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+        write_synthetic_process_credentials(&process, 1278);
+        std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
 
+        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root)
+            .expect_err("protected live inventory must be indeterminate");
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic::from_marker(&error).unwrap();
         assert_eq!(
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::PositiveWriterFound,
+            diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::EnumerateDescriptors
+        );
+        assert_eq!(
+            diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::Other
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_finds_writable_writer_with_actual_euid() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let writer = proc_root.join("1274");
+        std::fs::create_dir_all(writer.join("fd")).unwrap();
+        std::fs::create_dir_all(writer.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_identity(&writer, 1274);
+        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+        std::fs::write(quarantine.join("open-file"), b"open").unwrap();
+
+        std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
+
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap()
+        else {
+            panic!("writable descriptor must produce complete evidence");
+        };
+        assert_eq!(evidence.process_id, 1274);
+        assert_eq!(evidence.process_incarnation, "4242");
+        assert_eq!(
+            evidence.authority,
+            super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::WriteOnly,
+            )
         );
     }
 
@@ -6632,6 +9137,7 @@ mod tests {
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
+        std::fs::create_dir(&proc_root).unwrap();
 
         assert_eq!(
             super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
@@ -6642,6 +9148,10 @@ mod tests {
         std::fs::create_dir_all(&descriptors).unwrap();
         std::os::unix::fs::symlink(temp.path().join("outside"), descriptors.join("3")).unwrap();
         std::os::unix::fs::symlink(temp.path().join("missing"), descriptors.join("4")).unwrap();
+        std::fs::create_dir_all(proc_root.join("1273/fdinfo")).unwrap();
+        write_synthetic_process_identity(&proc_root.join("1273"), 1273);
+        std::fs::write(proc_root.join("1273/fdinfo/3"), "flags:\t00000000\n").unwrap();
+        std::fs::write(proc_root.join("1273/fdinfo/4"), "flags:\t00000001\n").unwrap();
         std::fs::create_dir_all(proc_root.join("self/fd")).unwrap();
         std::os::unix::fs::symlink(quarantine.join("ignored"), proc_root.join("self/fd/5"))
             .unwrap();
@@ -6654,68 +9164,113 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
+    fn read_only_directory_descriptor_is_namespace_writer_in_synthetic_procfs() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_cwd = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(&unreadable_cwd).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
+        let process = temp.path().join("proc/1275");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(
-            unreadable_cwd.join("status"),
-            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
-        )
-        .unwrap();
-        std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
-        std::fs::write(writer.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
-        std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
+        write_synthetic_process_identity(&process, 1275);
+        std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "flags:\t00000000\n").unwrap();
 
-        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_open_descriptors_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+            )
+            .unwrap()
+        else {
+            panic!("read-only directory descriptor must preserve namespace mutation authority");
+        };
+        assert_eq!(
+            evidence.authority,
+            super::AmbientWriterAuthority::NamespaceDirectory
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
+    fn retained_cwd_is_namespace_writer_in_synthetic_procfs() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let unreadable_status = proc_root.join("1");
-        let unreadable_maps = proc_root.join("2");
-        let writer = proc_root.join("3");
-        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
+        let process = temp.path().join("proc/1279");
+        std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        for process in [&unreadable_maps, &writer] {
-            std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
-        }
-        std::fs::write(
-            writer.join("maps"),
-            format!(
-                "00000000-00001000 rw-s 00000000 00:00 1 {}\n",
-                quarantine.join("mapped-file").display()
-            ),
-        )
-        .unwrap();
+        write_synthetic_process_identity(&process, 1279);
+        std::os::unix::fs::symlink(&quarantine, process.join("cwd")).unwrap();
 
-        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_namespace_cwd_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap()
+        else {
+            panic!("retained cwd must preserve namespace mutation authority");
+        };
+        assert_eq!(evidence.process_id, 1279);
+        assert_eq!(
+            evidence.authority,
+            super::AmbientWriterAuthority::NamespaceDirectory
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence() {
+    fn cwd_scan_reports_ambient_unreadability_as_indeterminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let unreadable_status = proc_root.join("1");
+        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+
+        let error = super::quarantine_has_process_cwd_in(&quarantine, &proc_root, effective_uid)
+            .unwrap_err();
+        assert!(error.contains("kernel credentials"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_reports_ambient_unreadability_as_indeterminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let unreadable_status = proc_root.join("1");
+        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+
+        let error = super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, unsafe {
+            libc::geteuid()
+        })
+        .unwrap_err();
+        assert!(error.contains("kernel credentials"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_proc_inventory_is_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
-        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
-        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, effective_uid).is_err()
+        );
+        assert!(
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, effective_uid,)
+                .is_err()
+        );
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -6725,10 +9280,20 @@ mod tests {
         let missing_quarantine = temp.path().join("missing-quarantine");
         let proc_root = temp.path().join("proc");
 
-        assert!(super::quarantine_has_process_cwd_in(&missing_quarantine, &proc_root, 1).is_err());
-        assert!(
-            super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root, 1).is_err()
-        );
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(super::quarantine_has_process_cwd_in(
+            &missing_quarantine,
+            &proc_root,
+            effective_uid,
+        )
+        .is_err());
+        assert!(super::quarantine_has_writable_mappings_in(
+            &missing_quarantine,
+            &proc_root,
+            effective_uid,
+        )
+        .is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -6759,11 +9324,28 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED);
         drop(file);
 
+        let proc_fixture = tempfile::tempdir().unwrap();
+        let proc_root = proc_fixture.path().join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        let pid = std::process::id().to_string();
+        std::os::unix::fs::symlink("/proc/self", proc_root.join(pid)).unwrap();
+
         assert_eq!(
-            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
+            super::quarantine_has_open_descriptors_in(temp.path(), &proc_root).unwrap(),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         );
-        assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_writable_mappings_in(temp.path(), &proc_root, unsafe {
+                libc::geteuid()
+            })
+            .unwrap()
+        else {
+            panic!("live writable shared mapping must produce complete evidence");
+        };
+        assert_eq!(
+            evidence.authority,
+            super::AmbientWriterAuthority::WritableSharedMapping
+        );
 
         // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -6778,6 +9360,19 @@ mod tests {
             .current_dir(temp.path())
             .spawn()
             .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let pid = child.id();
+            let proc_root = proc_root_for_process(temp.path(), pid);
+            assert!(matches!(
+                super::quarantine_has_namespace_cwd_in(temp.path(), &proc_root, unsafe {
+                    libc::geteuid()
+                },)
+                .unwrap(),
+                super::ExternalWriterEvidence::PositiveWriterFound(_)
+            ));
+        }
+        #[cfg(target_os = "macos")]
         assert!(super::quarantine_has_process_cwd(temp.path()).unwrap());
         child.kill().unwrap();
         child.wait().unwrap();
@@ -6794,37 +9389,97 @@ mod tests {
         run_git(&closing, &["add", "tracked"]);
         run_git(&closing, &["commit", "--quiet", "-m", "tracked"]);
         let identity = inspection_identity(&closing);
-        let mut descriptor = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&tracked)
-            .unwrap();
+        let marker = temp.path().join("writer-ready");
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        let child = std::sync::Arc::new(std::sync::Mutex::new(None));
+        #[cfg(target_os = "linux")]
+        let proc_root = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+        let callback_child = child.clone();
+        #[cfg(target_os = "linux")]
+        let callback_proc_root = proc_root.clone();
+        let callback_marker = marker.clone();
+        let callback_quarantine = quarantine.clone();
 
         let administrative_dir = closing.join(".git");
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             move |_| {
-                descriptor.write_all(b"after\n").unwrap();
-                descriptor.flush().unwrap();
-                std::mem::forget(descriptor);
+                let spawned = std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        "exec 3>>\"$TARGET\"; printf 'after\\n' >&3; touch \"$MARKER\"; exec sleep 30",
+                    ])
+                    .env("TARGET", callback_quarantine.join("tracked"))
+                    .env("MARKER", &callback_marker)
+                    .spawn()
+                    .unwrap();
+                #[cfg(target_os = "linux")]
+                {
+                    *callback_proc_root.lock().unwrap() =
+                        Some(proc_root_for_process(callback_quarantine.parent().unwrap(), spawned.id()));
+                }
+                *callback_child.lock().unwrap() = Some(spawned);
+                for _ in 0..100 {
+                    if callback_marker.exists() {
+                        return;
+                    }
+                    // test-timing-allow: polling backoff; the helper's marker is the completion signal
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                panic!("external writer did not become ready");
+            },
+            move |path| {
+                #[cfg(target_os = "linux")]
+                {
+                    let proc_root = proc_root
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("writer process universe is initialized");
+                    super::inspect_ambient_writer_until_quiescent(
+                        super::AmbientWriterObservationPolicy::production(),
+                        || match super::quarantine_has_open_descriptors_in(path, &proc_root)? {
+                            positive @ super::ExternalWriterEvidence::PositiveWriterFound(_) => {
+                                Ok(positive)
+                            }
+                            super::ExternalWriterEvidence::NoPositiveEvidence => {
+                                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
+                            }
+                        },
+                        std::thread::sleep,
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    super::quarantine_has_external_writer(path)
+                }
             },
         )
         .await
         .unwrap();
 
-        let ExactWorktreeRemoval::Residual { detail } = outcome else {
-            panic!("open descriptor must preserve quarantine");
+        let ExactWorktreeRemoval::AmbientWriterResidual(residual) = outcome else {
+            panic!("stable external writer must preserve quarantine");
         };
-        assert!(detail.contains("open descriptors"));
+        assert_eq!(
+            residual.evidence.authority,
+            super::AmbientWriterAuthority::Descriptor(
+                super::AmbientWriterDescriptorAccess::WriteOnly,
+            )
+        );
+        assert!(residual.detail.contains("stable ambient writer"));
         assert!(!closing.exists());
-        let quarantine = worktree_quarantine_path(&identity).unwrap();
         assert_eq!(
             std::fs::read_to_string(quarantine.join("tracked")).unwrap(),
             "before\nafter\n"
         );
+        let mut child = child.lock().unwrap().take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]

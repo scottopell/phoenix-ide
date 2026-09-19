@@ -7,6 +7,40 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
 import { canCancelConversationState } from './utils';
 
+describe('api.retryCloseRetirement', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('preserves structured conflict recovery fields', async () => {
+    const detail = {
+      error: 'retirement needs repair',
+      error_type: 'close_needs_repair',
+      attempt_id: 'attempt-1',
+      active_transcript_id: 'transcript-1',
+      failed_invariant: 'worktree_identity',
+      failed_relation: 'close_worktree_cleanup_plans',
+      recovery_action: {
+        method: 'POST' as const,
+        path: '/api/conversations/transcript-1/close/retry-retirement',
+      },
+    };
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => detail,
+    } as unknown as Response);
+
+    const rejected = api.retryCloseRetirement('transcript-1', 'attempt-1');
+    await expect(rejected).rejects.toBeInstanceOf(ConflictError);
+    await expect(rejected).rejects.toMatchObject({ detail });
+  });
+});
+
 describe('api.continueConversation', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());

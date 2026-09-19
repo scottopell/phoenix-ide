@@ -15,7 +15,7 @@ import { Square, SendHorizontal, Zap } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
 import { useDraftActions, useDraftValue, useScopedState, useInlineReferences } from '../hooks';
 import type { ConversationState, FileAttachment, ImageData } from '../api';
-import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
+import { api, ConflictError, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
@@ -436,6 +436,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // restore the draft if an ExpansionError comes back (user must fix the
     // broken @reference before re-sending).
     const previousVoiceBase = voiceBase;
+    const previousVoiceInterim = voiceInterim;
     if (voiceBase !== null) {
       setVoiceBase(null);
       setVoiceInterim('');
@@ -448,20 +449,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     try {
       await onSend(text, images, files);
     } catch (err) {
-      if (err instanceof ExpansionError) {
-        // Surface expansion error inline and restore the draft (REQ-IR-007)
-        // so the user can fix or remove the broken @reference.
-        setExpansionError(err.detail.error);
+      const closeFenced = err instanceof ConflictError
+        && err.detail.error_type === 'close_admission_fenced';
+      if (err instanceof ExpansionError || closeFenced) {
+        if (err instanceof ExpansionError) {
+          setExpansionError(err.detail.error);
+        }
         if (previousVoiceBase !== null) {
           setVoiceBase(previousVoiceBase);
+          setVoiceInterim(previousVoiceInterim);
         } else {
           setDraft(text);
         }
         setImages(images);
         setFiles(files);
       }
-      // Non-expansion errors: draft is already cleared; the message queue
-      // shows the failure with a retry button.
+      // Other errors remain visible in the message queue with a retry button.
     }
   }, [
     voiceBase,

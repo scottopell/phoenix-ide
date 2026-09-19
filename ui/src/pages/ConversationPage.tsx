@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ConflictError, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -1335,6 +1335,11 @@ function ConversationPageContent({
           });
         }
       } catch (err) {
+        if (err instanceof ConflictError && err.detail.error_type === 'close_admission_fenced') {
+          dismissRef.current(localId);
+          rollbackOptimisticPhase();
+          throw err;
+        }
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
           // an inline error so the user can fix or remove the broken

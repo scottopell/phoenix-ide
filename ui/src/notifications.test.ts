@@ -6,6 +6,7 @@ import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
+  closeRecoveryGuidance,
   getProductConversationListRevision,
   notifyCatchUp,
   notifyConversationStateChange,
@@ -110,6 +111,25 @@ describe('product conversation list revision notifications', () => {
 });
 
 describe('archive close conflict notifications', () => {
+  it('extracts typed exact-attempt recovery without parsing prose', () => {
+    const error = new ConflictError({
+      error: 'Close needs attention',
+      error_type: 'close_retirement_needs_repair',
+      attempt_id: 'attempt-1',
+      active_transcript_id: 'active-1',
+      recovery_action: {
+        method: 'POST',
+        path: '/api/conversations/active-1/close/retry-retirement',
+      },
+    });
+    expect(closeRecoveryGuidance(error)).toEqual({
+      attemptId: 'attempt-1',
+      activeTranscriptId: 'active-1',
+      retryPath: '/api/conversations/active-1/close/retry-retirement',
+    });
+    expect(closeRecoveryGuidance(new Error('Close needs attention'))).toBeNull();
+  });
+
   it('notifies for every durable Close conflict', () => {
     const closeListener = vi.fn();
     const listListener = vi.fn();
@@ -117,11 +137,11 @@ describe('archive close conflict notifications', () => {
     const unsubscribeList = subscribeProductConversationListRevision(listListener);
     const startRevision = getProductConversationListRevision();
 
-    expect(notifyArchiveCloseConflict('conv-1', new Error('boom'))).toBe(false);
+    expect(notifyArchiveCloseConflict('conv-1', new Error('boom'))).toBeNull();
     expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
       error: 'other conflict',
       error_type: 'proposal_resolved',
-    }))).toBe(false);
+    }))).toBeNull();
 
     expect(closeListener).toHaveBeenCalledTimes(0);
     expect(listListener).toHaveBeenCalledTimes(0);
@@ -130,7 +150,7 @@ describe('archive close conflict notifications', () => {
     expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
       error: 'close loss confirmation required',
       error_type: 'close_loss_confirmation_required',
-    }))).toBe(true);
+    }))).toBe('conv-1');
     expect(closeListener).toHaveBeenCalledTimes(1);
     expect(listListener).toHaveBeenCalledTimes(0);
     for (const error_type of [
@@ -143,8 +163,13 @@ describe('archive close conflict notifications', () => {
       expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
         error: 'durable Close requires attention',
         error_type,
-      }))).toBe(true);
+      }))).toBe('conv-1');
     }
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'inactive Close transcript',
+      error_type: 'inactive_close_transcript',
+      active_transcript_id: 'active-2',
+    }))).toBe('active-2');
     expect(closeListener).toHaveBeenCalledTimes(6);
 
     vi.runAllTimers();

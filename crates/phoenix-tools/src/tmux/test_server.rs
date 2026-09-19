@@ -1874,6 +1874,9 @@ fn wait_for_watchdog_arm(watchdog: &mut Child, root: &Path) -> io::Result<()> {
 }
 
 fn request_cleanup(root: &Path, graceful: bool) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
     let request = root.join(".cleanup-request");
     let pending = root.join(".cleanup-request.pending");
     let reason: &[u8] = if graceful { b"graceful" } else { b"drop" };
@@ -2104,6 +2107,15 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cleanup_request_accepts_already_removed_owned_root() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        root.close().unwrap();
+
+        request_cleanup(&path, false).unwrap();
     }
 
     #[test]
