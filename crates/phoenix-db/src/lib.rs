@@ -11691,7 +11691,9 @@ impl Database {
                  UNION ALL
                  SELECT 1 FROM steering_messages WHERE message_id = ?1
                  UNION ALL
-                 SELECT 1 FROM continuation_dispatch_intents WHERE message_id = ?1
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE message_id = ?1
+                    OR successor_conversation_id || ':' || message_id = ?1
              )",
         )
         .bind(message_id)

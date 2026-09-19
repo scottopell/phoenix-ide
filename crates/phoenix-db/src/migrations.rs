@@ -741,6 +741,7 @@ WHEN length(CAST(NEW.message_id AS BLOB)) > 256
  AND NOT EXISTS (
      SELECT 1 FROM continuation_dispatch_intents
      WHERE message_id = NEW.message_id
+        OR successor_conversation_id || ':' || message_id = NEW.message_id
  )
 BEGIN
     SELECT RAISE(ABORT, 'message id exceeds 256 UTF-8 bytes');
@@ -10411,10 +10412,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE continuation_dispatch_intents (message_id TEXT PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE continuation_dispatch_intents (
+                message_id TEXT PRIMARY KEY,
+                successor_conversation_id TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let legacy = "x".repeat(257);
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(&legacy)
@@ -10449,12 +10455,19 @@ mod tests {
             .await
             .unwrap();
 
-        let admitted_continuation = "k".repeat(257);
-        sqlx::query("INSERT INTO continuation_dispatch_intents (message_id) VALUES (?1)")
-            .bind(&admitted_continuation)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let continuation_key = "k".repeat(240);
+        let continuation_successor = "successor-conversation";
+        let admitted_continuation = format!("{continuation_successor}:{continuation_key}");
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents
+                (message_id, successor_conversation_id)
+             VALUES (?1, ?2)",
+        )
+        .bind(&continuation_key)
+        .bind(continuation_successor)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
 
@@ -10490,6 +10503,24 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM continuation_dispatch_intents WHERE message_id = ?1")
+            .bind(&continuation_key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM messages WHERE message_id = ?1")
+            .bind(&admitted_continuation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retired_continuation = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_continuation)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(retired_continuation
+            .to_string()
+            .contains("message id exceeds 256 UTF-8 bytes"));
 
         sqlx::query("DELETE FROM durable_turns WHERE conversation_id = ?1")
             .bind(&turn_conversation)
