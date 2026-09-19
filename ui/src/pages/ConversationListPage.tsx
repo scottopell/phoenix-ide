@@ -134,6 +134,7 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productCloseError, setProductCloseError] = useState<string | undefined>();
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
@@ -331,11 +332,14 @@ export function ConversationListPage() {
       setProductCloseTarget(null);
       setProductListRevision((revision) => revision + 1);
       notifyProductConversationListMayHaveChanged();
+      setProductCloseError(undefined);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         const confirmationRoute = productCloseTarget.canonical_route;
         setProductCloseTarget(null);
         navigate(confirmationRoute);
+      } else {
+        setProductCloseError(err instanceof Error ? err.message : 'Failed to close product conversation');
       }
       console.error('Failed to close product conversation:', err);
     }
@@ -453,7 +457,10 @@ export function ConversationListPage() {
                 setProductRenameError(undefined);
                 setProductRenameTarget(row);
               }}
-              {...(isOnline ? { onProductConversationClose: setProductCloseTarget } : {})}
+              {...(isOnline ? { onProductConversationClose: (row: ProductConversationListRow) => {
+                setProductCloseError(undefined);
+                setProductCloseTarget(row);
+              } } : {})}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(
@@ -489,7 +496,8 @@ export function ConversationListPage() {
         confirmText="Close"
         danger
         onConfirm={handleProductClose}
-        onCancel={() => setProductCloseTarget(null)}
+        {...(productCloseError ? { error: productCloseError } : {})}
+        onCancel={() => { setProductCloseTarget(null); setProductCloseError(undefined); }}
       />
       <RenameDialog
         visible={productRenameTarget !== null}
