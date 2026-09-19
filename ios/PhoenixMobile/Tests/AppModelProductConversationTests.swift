@@ -616,6 +616,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
     var persistHardDeleteFenceResult = true
     private(set) var persistedHardDeleteFences: [PersistedHardDeleteFence] = []
+    private(set) var persistedHardDeleteFenceHistory: [PersistedHardDeleteFence] = []
     fileprivate var persistHardDeleteFenceGate: AsyncCandidateGate?
     private(set) var hardDeleteFencePersistAttemptCount = 0
 
@@ -729,13 +730,23 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         }
         guard persistHardDeleteFenceResult else { return false }
         persistedHardDeleteFences.append(fence)
+        persistedHardDeleteFenceHistory.append(fence)
         return true
     }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         hardDeleteFenceLoadCount += 1
-        return hardDeleteFenceLoadResult
+        switch hardDeleteFenceLoadResult {
+        case .inaccessible:
+            return .inaccessible
+        case .accessible:
+            return .accessible(persistedHardDeleteFences.filter {
+                $0.persistenceScope == persistenceScope
+            })
+        }
     }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        persistedHardDeleteFences.removeAll { $0 == fence }
+    }
     func removeAllPersistedConversationState() async {
         if let gate = removeAllGate {
             removeAllGate = nil
@@ -2544,6 +2555,37 @@ final class AppModelProductConversationTests: XCTestCase {
         }
     }
 
+    func testTrustReplacementRecoversFenceCommittedByStaleEpoch() async throws {
+        let gate = AsyncCandidateGate()
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1"],
+            contentsByConversationId: ["row-1": .entries([makePendingOutboxEntry(conversationId: "row-1")])],
+            aggregateMembersById: ["pc-1": ["row-1"]])
+        store.persistHardDeleteFenceGate = gate
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.connectivity.setOnlineForTesting(false)
+        model.replaceAPIForTesting(api)
+        let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"), messages: [],
+            agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+
+        session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await gate.waitForEntry()
+        model.rebuildTrustForTesting(true)
+        await gate.release()
+        await session.awaitHardDeleteReportForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+
+        XCTAssertTrue(store.persistedHardDeleteFences.isEmpty)
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertNil(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+    }
+
     func testConcurrentAggregateHardDeletesCommitOneFence() async throws {
         let gate = AsyncCandidateGate()
         let store = MutableTestConversationPersistenceStore(
@@ -2575,7 +2617,7 @@ final class AppModelProductConversationTests: XCTestCase {
         await gate.release()
         await first.awaitHardDeleteReportForTesting()
         XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
-        XCTAssertEqual(store.persistedHardDeleteFences.map(\.aggregateAuthority), ["pc-1"])
+        XCTAssertEqual(store.persistedHardDeleteFenceHistory.map(\.aggregateAuthority), ["pc-1"])
     }
 
     func testHardDeleteFenceFailureLeavesAuthoritativeStateAndOutboxIntact() async throws {
@@ -2642,7 +2684,7 @@ final class AppModelProductConversationTests: XCTestCase {
         await model.awaitStartupHardDeleteRecoveryForTesting()
         model.connectivity.setOnlineForTesting(true)
 
-        XCTAssertEqual(store.persistedHardDeleteFences.map(\.aggregateAuthority), ["pc-1"])
+        XCTAssertEqual(store.persistedHardDeleteFenceHistory.map(\.aggregateAuthority), ["pc-1"])
         XCTAssertTrue(probe.chatPostPaths.isEmpty)
         if case .missing = store.inspectOutbox(conversationId: "row-1").state {} else { XCTFail("expected retried fence cleanup to remove outbox") }
         XCTAssertTrue(model.listStore.conversations.isEmpty)

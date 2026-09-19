@@ -1069,8 +1069,6 @@ final class AppModel {
         startupHardDeleteRecoveryTask?.cancel()
         startupHardDeleteRecoveryTask = nil
         persistedOutboxHydrated = false
-        hardDeletedConversationIds.removeAll()
-        hardDeletedAggregateAuthorities.removeAll()
         apiGeneration += 1
         let configuredAPI: PhoenixAPI?
         if !credentialMigrationBlocked,
@@ -1088,6 +1086,10 @@ final class AppModel {
         }
         let previousConfigurationIdentity = api?.configurationIdentity
         api = configuredAPI
+        if previousConfigurationIdentity?.persistenceScope != configuredAPI?.configurationIdentity.persistenceScope {
+            hardDeletedConversationIds.removeAll()
+            hardDeletedAggregateAuthorities.removeAll()
+        }
         sessions.values.forEach { $0.revokeConfigurationForReplacement() }
         drainSessions.values.forEach { $0.revokeConfigurationForReplacement() }
         sessions.removeAll()
@@ -1320,7 +1322,10 @@ final class AppModel {
                 persistedOutboxHydrated = false
                 return
             }
-            guard contextIsCurrent() else { return }
+            guard contextIsCurrent() else {
+                finishStartupHydration()
+                return
+            }
         case .committed(let persisted):
             fence = persisted
         }
