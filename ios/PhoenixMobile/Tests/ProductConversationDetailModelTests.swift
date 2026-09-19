@@ -766,6 +766,31 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(model.fallbackSession?.conversationId, "row-outbox")
     }
 
+    func testLatePersistedMemberDiscoveryDoesNotDiscardFreshSnapshotMembers() async {
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        let gate = AsyncGate()
+        let root = makeSession(id: "row-1")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: makeAPI(), connectivity: connectivity,
+            sessionProvider: { id, _ in id == "row-1" ? root : nil },
+            existingSession: { id in id == "row-1" ? root : nil },
+            discoverPersistedMembers: {
+                await gate.signalStartedAndWaitForRelease()
+                return PersistedMemberDiscovery(
+                    currentAuthorityMemberIds: ["row-1"],
+                    persistedOutboxOwnerIds: [])
+            })
+
+        let start = Task { await model.start() }
+        await gate.waitUntilStarted()
+        model.applyForTesting(snapshot())
+        await gate.release()
+        await start.value
+
+        XCTAssertEqual(model.aggregateMemberTranscriptRowIds, ["row-1", "row-2"])
+    }
+
     func testStoppedModelIgnoresLatePersistedMemberDiscovery() async {
         let connectivity = ConnectivityMonitor()
         connectivity.setOnlineForTesting(false)

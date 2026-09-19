@@ -867,7 +867,7 @@ final class ProductConversationDetailModel {
         }
         aggregateTranscriptRowIds.formUnion(memberIds)
         let provenIds = Set(provenCachedMemberSessions().map(\.conversationId))
-        aggregateTranscriptRowIds = provenIds
+        aggregateTranscriptRowIds.formUnion(provenIds)
         if retainedFallbackSession == nil,
            let initialTranscriptRowId,
            provenIds.contains(initialTranscriptRowId)
