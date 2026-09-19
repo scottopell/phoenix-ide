@@ -346,6 +346,7 @@ final class AppModel {
 
     @discardableResult
     func closeProductConversation(_ conversation: Conversation) async -> Bool {
+        guard ClientOperation.close.policy == .onlineOnly else { return false }
         let conversationId = conversation.transcriptRowIdentity
         let transcriptIds = Set(
             listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
@@ -431,6 +432,20 @@ final class AppModel {
             try await api.deleteConversation(
                 reference: conversation.transcriptRowIdentity,
                 chainRootId: conversation.chain_root_id)
+            let transcriptIds = Set(
+                listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
+                    + [conversation.transcriptRowIdentity])
+            for transcriptId in transcriptIds {
+                if let session = sessions[transcriptId] {
+                    session.stop()
+                    await session.clearCachedSnapshotAndWait()
+                    await session.outbox.clearAndWait()
+                    if sessions[transcriptId] === session { sessions[transcriptId] = nil }
+                } else {
+                    DiskStore.remove(name: "conv-\(transcriptId)")
+                    DiskStore.remove(name: "outbox-\(transcriptId)")
+                }
+            }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
             return true
         } catch {

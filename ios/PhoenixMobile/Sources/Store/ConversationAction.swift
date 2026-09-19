@@ -40,6 +40,7 @@ enum ConversationAction: Equatable {
 enum ClientOperation {
     case chat
     case archive
+    case close
     case delete
     case conversationAction(ConversationAction)
 
@@ -52,7 +53,7 @@ enum ClientOperation {
         switch self {
         case .chat:
             return .outboxed
-        case .archive, .delete, .conversationAction:
+        case .archive, .close, .delete, .conversationAction:
             return .onlineOnly
         }
     }
