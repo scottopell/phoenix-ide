@@ -2,6 +2,99 @@ import Foundation
 import Observation
 import UserNotifications
 
+@MainActor
+enum ProductHistorySnapshotStore {
+    static let schemaVersion = 1
+
+    static func cacheName(productConversationId: String) -> String {
+        "product-history-\(productConversationId)"
+    }
+
+    static func load(productConversationId: String) -> ProductConversationSnapshot? {
+        guard let snapshot = DiskStore.loadVersioned(
+            ProductConversationSnapshot.self,
+            name: cacheName(productConversationId: productConversationId),
+            version: schemaVersion),
+            snapshot.product_conversation_id == productConversationId
+        else { return nil }
+        return snapshot
+    }
+
+    @discardableResult
+    static func save(_ snapshot: ProductConversationSnapshot) -> Bool {
+        DiskStore.saveVersioned(
+            snapshot,
+            name: cacheName(productConversationId: snapshot.product_conversation_id),
+            version: schemaVersion)
+    }
+
+    static func merge(_ pages: [ProductConversationSnapshot]) throws -> ProductConversationSnapshot {
+        guard var merged = pages.first else {
+            throw ProductHistoryLoadError.emptyResponse
+        }
+        let aggregateId = merged.product_conversation_id
+        var segmentsByOrdinal: [Int64: ProductConversationSegment] = [:]
+
+        for page in pages {
+            guard page.product_conversation_id == aggregateId else {
+                throw ProductHistoryLoadError.aggregateIdentityChanged
+            }
+            for segment in page.segments {
+                if var existing = segmentsByOrdinal[segment.segment_ordinal] {
+                    guard existing.transcript_row_id == segment.transcript_row_id else {
+                        throw ProductHistoryLoadError.segmentIdentityChanged
+                    }
+                    var messagesById: [String: Message] = [:]
+                    for message in existing.messages + segment.messages
+                        where messagesById[message.message_id] == nil
+                    {
+                        messagesById[message.message_id] = message
+                    }
+                    existing.messages = messagesById.values.sorted {
+                        ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
+                    }
+                    if existing.handoff == nil { existing.handoff = segment.handoff }
+                    segmentsByOrdinal[segment.segment_ordinal] = existing
+                } else {
+                    var ordered = segment
+                    var messagesById: [String: Message] = [:]
+                    for message in segment.messages where messagesById[message.message_id] == nil {
+                        messagesById[message.message_id] = message
+                    }
+                    ordered.messages = messagesById.values.sorted {
+                        ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
+                    }
+                    segmentsByOrdinal[segment.segment_ordinal] = ordered
+                }
+            }
+        }
+
+        merged.segments = segmentsByOrdinal.values.sorted {
+            ($0.segment_ordinal, $0.transcript_row_id) < ($1.segment_ordinal, $1.transcript_row_id)
+        }
+        merged.before = nil
+        merged.has_older = false
+        return merged
+    }
+}
+
+enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
+    case emptyResponse
+    case aggregateIdentityChanged
+    case segmentIdentityChanged
+    case missingCursor
+    case repeatedCursor
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyResponse: "The server returned no Product History snapshot."
+        case .aggregateIdentityChanged: "Product History changed identity while loading."
+        case .segmentIdentityChanged: "Product History lineage changed while loading."
+        case .missingCursor, .repeatedCursor: "The server returned an invalid Product History page cursor."
+        }
+    }
+}
+
 /// Root composition: server settings, connectivity, API client, stores, and
 /// the active per-conversation sessions.
 @MainActor
@@ -228,9 +321,47 @@ final class AppModel {
 
     func loadProductHistory(productConversationId: String) async throws -> ProductConversationSnapshot {
         guard let api, connectivity.isOnline else {
+            if let cached = ProductHistorySnapshotStore.load(
+                productConversationId: productConversationId)
+            {
+                return cached
+            }
             throw APIError.transport(underlying: URLError(.notConnectedToInternet))
         }
-        return try await api.getProductConversation(reference: productConversationId)
+
+        do {
+            var pages: [ProductConversationSnapshot] = []
+            var before: String?
+            var seenCursors: Set<String> = []
+            repeat {
+                let page = try await api.getProductConversation(
+                    reference: productConversationId,
+                    before: before)
+                guard page.product_conversation_id == productConversationId else {
+                    throw ProductHistoryLoadError.aggregateIdentityChanged
+                }
+                pages.append(page)
+                guard page.has_older else { break }
+                guard let next = page.before, !next.isEmpty else {
+                    throw ProductHistoryLoadError.missingCursor
+                }
+                guard seenCursors.insert(next).inserted else {
+                    throw ProductHistoryLoadError.repeatedCursor
+                }
+                before = next
+            } while true
+
+            let snapshot = try ProductHistorySnapshotStore.merge(pages)
+            ProductHistorySnapshotStore.save(snapshot)
+            return snapshot
+        } catch let error as APIError where error.isTransport {
+            if let cached = ProductHistorySnapshotStore.load(
+                productConversationId: productConversationId)
+            {
+                return cached
+            }
+            throw error
+        }
     }
 
     func navigationConversationId(for conversation: Conversation) -> String {
@@ -456,6 +587,8 @@ final class AppModel {
                 DiskStore.remove(name: "outbox-\(transcriptId)")
             }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
+            DiskStore.remove(name: ProductHistorySnapshotStore.cacheName(
+                productConversationId: conversation.aggregateIdentity))
             return true
         } catch {
             lastActionError = error.localizedDescription

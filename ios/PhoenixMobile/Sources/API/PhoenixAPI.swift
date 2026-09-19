@@ -277,9 +277,6 @@ struct PhoenixAPI: Sendable {
         return response.product_conversations.map(productConversationListRowToConversation)
     }
 
-    func getProductConversation(reference: String) async throws -> ProductConversationSnapshot {
-        try await get("api/product-conversations/\(reference)", as: ProductConversationSnapshot.self)
-    }
 
     func listProductConversations() async throws -> ProductConversationListResponse {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
@@ -297,9 +294,11 @@ struct PhoenixAPI: Sendable {
             as: ConversationWithMessagesResponse.self)
     }
 
-    func getProductConversation(id: String, before: String? = nil, messageLimit: Int? = nil) async throws
-        -> ProductConversationSnapshot
-    {
+    func getProductConversation(
+        reference: String,
+        before: String? = nil,
+        messageLimit: Int? = nil
+    ) async throws -> ProductConversationSnapshot {
         var query: [URLQueryItem] = []
         if let before, !before.isEmpty {
             query.append(URLQueryItem(name: "before", value: before))
@@ -308,7 +307,7 @@ struct PhoenixAPI: Sendable {
             query.append(URLQueryItem(name: "message_limit", value: String(messageLimit)))
         }
         return try await get(
-            "api/product-conversations/\(id)", query: query,
+            "api/product-conversations/\(reference)", query: query,
             as: ProductConversationSnapshot.self)
     }
 

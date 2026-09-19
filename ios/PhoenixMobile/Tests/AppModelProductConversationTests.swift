@@ -58,6 +58,129 @@ final class AppModelProductConversationTests: XCTestCase {
             version: 1)
     }
 
+    private func message(_ id: String, sequence: Int64) -> Message {
+        Message(
+            message_id: id,
+            conversation_id: nil,
+            sequence_id: sequence,
+            message_type: "user",
+            content: .object(["text": .string(id)]),
+            display_data: nil,
+            created_at: nil)
+    }
+
+    private func historySnapshot(
+        aggregateId: String = "pc-history",
+        segments: [ProductConversationSegment],
+        before: String? = nil,
+        hasOlder: Bool = false
+    ) -> ProductConversationSnapshot {
+        ProductConversationSnapshot(
+            product_conversation_id: aggregateId,
+            close: nil,
+            canonical_route: "/product-conversations/\(aggregateId)",
+            requested_transcript_row_id: "latest",
+            canonical_root: ProductConversationTranscriptRow(
+                transcript_row_id: "root", slug: "root", title: "Root"),
+            ordinary_lifecycle: .history,
+            latest_transcript_row_id: "latest",
+            writable_transcript_row_id: nil,
+            updated_at: "2025-01-02T03:04:05Z",
+            presentation: .state(displayName: "Root", presentationMode: "done"),
+            work_identity: nil,
+            source: nil,
+            chain_qa_compatibility: nil,
+            segments: segments,
+            before: before,
+            has_older: hasOlder)
+    }
+
+    func testProductHistoryMergePreservesAggregateIdentityAndLineageOrderWithoutDuplicates() throws {
+        let newer = historySnapshot(
+            segments: [
+                ProductConversationSegment(
+                    segment_ordinal: 1,
+                    transcript_row_id: "successor",
+                    slug: "successor",
+                    title: "Successor",
+                    messages: [message("m4", sequence: 2), message("m3", sequence: 1)],
+                    handoff: nil),
+                ProductConversationSegment(
+                    segment_ordinal: 0,
+                    transcript_row_id: "root",
+                    slug: "root",
+                    title: "Root",
+                    messages: [message("m2", sequence: 2)],
+                    handoff: nil),
+            ],
+            before: "older-page",
+            hasOlder: true)
+        let handoff = ProductConversationHandoff.historical(
+            predecessorTranscriptRowId: "root",
+            successorTranscriptRowId: "successor",
+            continuationMessageId: "boundary",
+            summary: "Continued after the first transcript")
+        let older = historySnapshot(segments: [
+            ProductConversationSegment(
+                segment_ordinal: 0,
+                transcript_row_id: "root",
+                slug: "root",
+                title: "Root",
+                messages: [message("m2", sequence: 2), message("m1", sequence: 1)],
+                handoff: handoff),
+        ])
+
+        let merged = try ProductHistorySnapshotStore.merge([newer, older])
+
+        XCTAssertEqual(merged.product_conversation_id, "pc-history")
+        XCTAssertEqual(merged.segments.map(\.transcript_row_id), ["root", "successor"])
+        XCTAssertEqual(merged.segments[0].messages.map(\.message_id), ["m1", "m2"])
+        XCTAssertEqual(merged.segments[1].messages.map(\.message_id), ["m3", "m4"])
+        XCTAssertEqual(merged.segments[0].handoff, handoff)
+        XCTAssertFalse(merged.has_older)
+        XCTAssertNil(merged.before)
+    }
+
+    func testProductHistoryVersionedCacheReopensOfflineAndRejectsWrongAggregate() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
+        let snapshot = historySnapshot(segments: [
+            ProductConversationSegment(
+                segment_ordinal: 0,
+                transcript_row_id: "root",
+                slug: "root",
+                title: "Root",
+                messages: [message("cached", sequence: 1)],
+                handoff: nil),
+        ])
+        XCTAssertTrue(ProductHistorySnapshotStore.save(snapshot))
+        XCTAssertNil(ProductHistorySnapshotStore.load(productConversationId: "different-aggregate"))
+
+        let model = AppModel()
+        model.connectivity.setOnlineForTesting(false)
+        let reopened = try await model.loadProductHistory(productConversationId: "pc-history")
+
+        XCTAssertEqual(reopened.product_conversation_id, "pc-history")
+        XCTAssertEqual(reopened.segments[0].messages.map(\.message_id), ["cached"])
+    }
+
+    func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {
+        let historical = ProductConversationHandoff.historical(
+            predecessorTranscriptRowId: "root",
+            successorTranscriptRowId: "next",
+            continuationMessageId: "handoff",
+            summary: "Historical summary")
+        let completed = ProductConversationHandoff.completed(
+            predecessorTranscriptRowId: "root",
+            successorTranscriptRowId: "next",
+            continuationMessageId: "handoff",
+            acceptedSuccessorMessageId: "accepted",
+            summary: "Completed summary")
+
+        XCTAssertEqual(historical.displaySummary, "Historical summary")
+        XCTAssertEqual(completed.displaySummary, "Completed summary")
+    }
+
     func testBackgroundIntegrationPreservesAuthoritativeAggregateIdentityAfterLegacyCache() {
         let model = AppModel()
         let aggregateProjection = conversation(
