@@ -151,8 +151,17 @@ impl SendChatApplicationService {
                 predecessor_conversation_id,
             )
             .await
-            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-        {
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    crate::db::workflow::RearmAuthoritativeTurnError::DurableFactUnclassified(_)
+                ) {
+                    self.runtime.signal_fatal_local_authority(
+                        "automatic_continuation_rearm_classification",
+                    );
+                }
+                SendChatServiceError::Internal(error.to_string())
+            })? {
             crate::db::workflow::RearmAuthoritativeTurnOutcome::Rearmed { .. }
             | crate::db::workflow::RearmAuthoritativeTurnOutcome::ExactReplay { .. } => {
                 Ok(AutomaticRetryTurnState::RearmedWithAdmission)

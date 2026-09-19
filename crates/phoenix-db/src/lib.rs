@@ -7072,7 +7072,8 @@ impl Database {
                  updated_at_unix_micros = CASE WHEN phase = 'failed' THEN ?3 ELSE updated_at_unix_micros END
              WHERE predecessor_conversation_id = ?1
                AND phase IN ('failed', 'admitted', 'successor_reserved',
-                             'ownership_transferred', 'dispatch_accepted', 'message_settled')",
+                             'ownership_transferred', 'dispatch_accepted', 'message_settled',
+                             'superseded')",
         )
         .bind(predecessor_conversation_id)
         .bind(resume_phase.as_str())

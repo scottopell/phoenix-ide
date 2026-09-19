@@ -91,6 +91,16 @@ pub struct RearmAuthoritativeTurnInput {
     pub rearmed_at: Timestamp,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RearmAuthoritativeTurnError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error("durable rearm outcome could not be classified: {0}")]
+    DurableFactUnclassified(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RearmAuthoritativeTurnOutcome {
     Rearmed { turn: DurableTurn },
@@ -549,7 +559,7 @@ impl WorkflowRepository {
     pub async fn rearm_terminal_runtime_direct_turn(
         &self,
         input: &RearmAuthoritativeTurnInput,
-    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+    ) -> Result<RearmAuthoritativeTurnOutcome, RearmAuthoritativeTurnError> {
         self.rearm_terminal_runtime_direct_turn_inner(input, None)
             .await
     }
@@ -558,7 +568,7 @@ impl WorkflowRepository {
         &self,
         input: &RearmAuthoritativeTurnInput,
         predecessor_conversation_id: &str,
-    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+    ) -> Result<RearmAuthoritativeTurnOutcome, RearmAuthoritativeTurnError> {
         self.rearm_terminal_runtime_direct_turn_inner(input, Some(predecessor_conversation_id))
             .await
     }
@@ -567,7 +577,7 @@ impl WorkflowRepository {
         &self,
         input: &RearmAuthoritativeTurnInput,
         automatic_continuation_predecessor: Option<&str>,
-    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+    ) -> Result<RearmAuthoritativeTurnOutcome, RearmAuthoritativeTurnError> {
         let mut tx = self.begin_immediate_tx().await?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(input.turn_id.0, "turn_id")?)
@@ -794,15 +804,24 @@ impl WorkflowRepository {
         workflow_id: WorkflowId,
         automatic_continuation_predecessor: Option<&str>,
         commit_error: DbError,
-    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
-        let mut classification = self.begin_tx().await?;
+    ) -> Result<RearmAuthoritativeTurnOutcome, RearmAuthoritativeTurnError> {
+        let mut classification = self.begin_tx().await.map_err(|error| {
+            RearmAuthoritativeTurnError::DurableFactUnclassified(format!(
+                "rearm commit failed ({commit_error}); classification could not start: {error}"
+            ))
+        })?;
         let exact = load_exact_rearmed_turn_tx(
             &mut classification.tx,
             input.turn_id,
             workflow_id,
             input.expected_generation.saturating_add(1),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            RearmAuthoritativeTurnError::DurableFactUnclassified(format!(
+                "rearm commit failed ({commit_error}); exact turn classification failed: {error}"
+            ))
+        })?;
         let admission_rearmed = if let Some(predecessor) = automatic_continuation_predecessor {
             sqlx::query_scalar::<_, i64>(
                 "SELECT EXISTS(
@@ -814,15 +833,23 @@ impl WorkflowRepository {
             )
             .bind(predecessor)
             .fetch_one(&mut *classification.tx)
-            .await?
-                != 0
+            .await
+            .map_err(|error| {
+                RearmAuthoritativeTurnError::DurableFactUnclassified(format!(
+                    "rearm commit failed ({commit_error}); admission classification failed: {error}"
+                ))
+            })? != 0
         } else {
             true
         };
-        classification.rollback().await?;
+        classification.rollback().await.map_err(|error| {
+            RearmAuthoritativeTurnError::DurableFactUnclassified(format!(
+                "rearm commit failed ({commit_error}); classification close failed: {error}"
+            ))
+        })?;
         match exact {
             Some(turn) if admission_rearmed => Ok(RearmAuthoritativeTurnOutcome::Rearmed { turn }),
-            _ => Err(commit_error),
+            _ => Err(RearmAuthoritativeTurnError::Database(commit_error)),
         }
     }
 
