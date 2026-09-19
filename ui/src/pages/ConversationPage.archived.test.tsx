@@ -9,7 +9,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore, type InitPayload, type SSEAction } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, ExpansionError, type Conversation, type Message } from '../api';
+import { api, ConflictError, ExpansionError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { cacheDB } from '../cache';
@@ -601,6 +601,21 @@ describe('ConversationPage message delivery reconciliation', () => {
     });
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('restores a close-fenced message to the composer instead of stranding it as failed', async () => {
+    vi.spyOn(api, 'sendMessage').mockRejectedValue(new ConflictError({
+      error: 'Conversation is closing and cannot accept new work.',
+      error_type: 'close_admission_fenced',
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'do not lose this draft' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+    expect(await screen.findByDisplayValue('do not lose this draft')).toBeInTheDocument();
   });
 
   it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
