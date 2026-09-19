@@ -186,6 +186,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
+  const composerHasContentRef = useRef(false);
+  useEffect(() => {
+    composerHasContentRef.current = draft.length > 0
+      || images.length > 0
+      || files.length > 0
+      || voiceBase !== null
+      || voiceInterim.length > 0;
+  }, [draft, images, files, voiceBase, voiceInterim]);
 
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -445,13 +453,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setImages([]);
     setFiles([]);
     setExpansionError(null);
+    composerHasContentRef.current = false;
 
     try {
       await onSend(text, images, files);
     } catch (err) {
       const closeFenced = err instanceof ConflictError
         && err.detail.error_type === 'close_admission_fenced';
-      if (err instanceof ExpansionError || closeFenced) {
+      if ((err instanceof ExpansionError || closeFenced)
+        && !composerHasContentRef.current) {
         if (err instanceof ExpansionError) {
           setExpansionError(err.detail.error);
         }

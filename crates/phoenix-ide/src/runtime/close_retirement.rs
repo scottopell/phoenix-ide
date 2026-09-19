@@ -3873,7 +3873,10 @@ where
         );
     }
     let object = tombstone.root.join("object");
-    if observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity) {
+    let identity_still_present = object.join(".git").try_exists().unwrap_or(false);
+    if identity_still_present
+        && observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity)
+    {
         return FinalTombstoneRecovery::Residual("recorded final tombstone object does not match captured worktree identity; preserved for manual repair".to_string());
     }
     if let Err(detail) = remove_directory_contents_at(&object_fd) {
@@ -5279,6 +5282,16 @@ fn linux_descriptor_writer_evidence(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_namespace_path_is_deleted(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    let Some(candidate) = bytes.strip_suffix(b" (deleted)") else {
+        return false;
+    };
+    std::fs::metadata(Path::new(std::ffi::OsStr::from_bytes(candidate))).is_err()
+}
+
+#[cfg(target_os = "linux")]
 fn linux_namespace_cwd_writer_evidence_if_stable(
     process: &std::fs::DirEntry,
     before_incarnation: &str,
@@ -5296,6 +5309,9 @@ fn linux_namespace_cwd_writer_evidence_if_stable(
     else {
         return Ok(None);
     };
+    if linux_namespace_path_is_deleted(&cwd) {
+        return Ok(None);
+    }
     if !path_is_within(&cwd, canonical) {
         return Ok(None);
     }
