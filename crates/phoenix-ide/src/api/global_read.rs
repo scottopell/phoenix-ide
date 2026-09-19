@@ -1769,7 +1769,10 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
     };
     let base = format!("/c/{}", conv.id);
     let href = if message_type_has_rendered_anchor(message.message_type) {
-        format!("{base}#message-{}", message.message_id)
+        format!(
+            "{base}#message-{}",
+            percent_encode_url_component(&message.message_id)
+        )
     } else {
         base
     };
@@ -2707,6 +2710,41 @@ mod tests {
         let encoded = format!("message-{}", &message_id);
         assert!(global.contains(&encoded));
         assert!(chain.contains(&encoded));
+    }
+
+    #[tokio::test]
+    async fn global_and_chain_message_links_percent_encode_delimiters() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("encoded-link", "encoded-link", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let message_id = "message )#% with-space";
+        db.add_message_with_seq(
+            message_id,
+            "encoded-link",
+            1,
+            &crate::db::MessageContent::user("encoded evidence"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let global = service
+            .read_conversation("encoded-link", None)
+            .await
+            .unwrap();
+        let chain = service
+            .read_chain_conversation("encoded-link", "encoded-link", None)
+            .await
+            .unwrap();
+
+        let encoded = "message-message%20%29%23%25%20with-space";
+        assert!(global.contains(encoded));
+        assert!(chain.contains(encoded));
+        assert!(!global.contains("#message-message )#% with-space"));
+        assert!(!chain.contains("#message-message )#% with-space"));
     }
 
     #[test]
