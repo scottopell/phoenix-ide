@@ -323,6 +323,9 @@ struct PhoenixAPI: Sendable {
         return Conversation(
             id: row.latest_transcript_row_id,
             product_conversation_id: row.product_conversation_id,
+            chain_root_id: row.canonical_root.transcript_row_id == row.latest_transcript_row_id
+                ? nil
+                : row.canonical_root.transcript_row_id,
             slug: row.canonical_root.slug,
             title: row.canonical_root.title,
             model: nil,
