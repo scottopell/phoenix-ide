@@ -19,7 +19,7 @@ export function FilePathContextMenu() {
   const menuRef = useRef<HTMLDivElement>(null);
 
   const handleContextMenu = useCallback((e: MouseEvent) => {
-    if (e.shiftKey) return;
+    if (e.shiftKey || window.getSelection()?.toString()) return;
 
     const target = e.target as HTMLElement | null;
     const messagesContainer = document.getElementById('messages');

@@ -17,11 +17,59 @@ vi.mock('../../cache', () => ({
   },
 }));
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
+  it('appends two source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? 800 : 0;
+    });
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('virtual-transcript__row')) return new DOMRect(0, 0, 390, 120);
+      if (this.id === 'messages') return new DOMRect(0, 0, 390, 800);
+      return originalRect.call(this);
+    });
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ left: 20, top: 100, bottom: 130, right: 250, width: 230, height: 30 }),
+    });
+    const scenario = getProductConversationScenario('inline-message-reactions');
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    const draft = await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(draft).toHaveValue('Let’s keep the first version focused.'));
+    const send = vi.spyOn(api, 'sendMessage');
+    for (const [messageId, reaction] of [
+      ['reaction-answer-older', 'Preserve this guarantee.'],
+      ['reaction-answer', 'Strong idea; test deterministic state patterns.'],
+    ]) {
+      const paragraph = await waitFor(() => {
+        const found = container.querySelector(`[data-inline-reaction-message="${messageId}"] .agent-text-block p`);
+        expect(found).not.toBeNull();
+        return found!;
+      });
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent(document, new Event('selectionchange'));
+      const reactionInput = await screen.findByRole('textbox', { name: 'Your reaction' });
+      fireEvent.change(reactionInput, { target: { value: reaction } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
+    }
+    expect((draft as HTMLTextAreaElement).value).toContain('Let’s keep the first version focused.\n\nRegarding message #2 (reaction-history:reaction-answer-older):');
+    expect((draft as HTMLTextAreaElement).value).toContain('Regarding message #2 (reaction-work:reaction-answer):');
+    expect(send).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Open message reviewer' })[0]!);
+    const viewer = await screen.findByRole('dialog', { name: 'Message viewer: Agent message #2' });
+    expect(viewer).toHaveTextContent('Preserve the user’s draft and every completed tool result.');
+    expect(screen.getByRole('button', { name: 'Add note to line 1' })).toBeInTheDocument();
+    send.mockRestore();
+    window.getSelection()?.removeAllRanges();
+  });
+
   it('makes the active transcript the bounded flex owner instead of inheriting .view.active block layout', () => {
     const activeTranscriptRule = productConversationCss.match(/\.product-conversation-page__transcript\.view\.active\s*{([^}]*)}/s)?.[1];
 

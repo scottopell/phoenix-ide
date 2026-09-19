@@ -1,0 +1,104 @@
+.inline-reaction {
+  position: fixed;
+  z-index: 950;
+  width: min(360px, calc(100vw - 24px));
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 25%);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.inline-reaction[hidden] { display: none; }
+
+.inline-reaction-header,
+.inline-reaction-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inline-reaction-header { color: var(--text-secondary); }
+
+.inline-reaction button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.inline-reaction-header button {
+  border: 0;
+  background: transparent;
+}
+
+.inline-reaction button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.inline-reaction-quote {
+  margin: 6px 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-color);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inline-reaction textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.inline-reaction-actions { justify-content: flex-end; }
+
+.inline-reaction-discard {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.inline-reaction-discard span { width: 100%; }
+
+.inline-reaction-notice:not(:empty) {
+  position: fixed;
+  z-index: 950;
+  right: 16px;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  pointer-events: none;
+  font-size: 13px;
+}
+
+@media (pointer: coarse), (width <= 768px) {
+  .inline-reaction button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .inline-reaction textarea { font-size: 16px; }
+}

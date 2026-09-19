@@ -6,6 +6,7 @@ import { FileExplorerProvider } from '../../components/FileExplorer';
 import { ConversationReadinessProvider } from '../../contexts/ConversationReadinessContext';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { ConversationProvider } from '../../conversation';
+import { useDraftActions } from '../../hooks/useDraft';
 import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
 import { installProductConversationFixtureApi } from './mockApi';
@@ -13,6 +14,12 @@ import type { ProductConversationScenario } from './types';
 
 interface Props {
   scenario: ProductConversationScenario;
+}
+
+function SeedReactionDraft({ slug, text }: { slug: string; text: string }) {
+  const { setDraftIfEmpty } = useDraftActions(slug);
+  useEffect(() => setDraftIfEmpty(text), [setDraftIfEmpty, text]);
+  return null;
 }
 
 function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario): boolean {
@@ -83,6 +90,9 @@ function ProductConversationFixtureBody({ scenario }: Props) {
     >
       <MemoryRouter initialEntries={[`/product-conversations/fixture-product-conversation${fixtureHash}`]}>
         <ConversationProvider>
+          {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
+            <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
+          )}
           <ConversationReadinessProvider>
             <ChainProvider>
               <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>

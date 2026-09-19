@@ -12,6 +12,9 @@ const storyFor = (id: ProductConversationScenarioId): Story => {
   };
 };
 
+export const InlineMessageReactions = storyFor('inline-message-reactions');
+InlineMessageReactions.storyName = 'inline-message-reactions';
+
 export const DesktopMultiSegmentQaWork = storyFor('desktop-multi-segment-qa-work');
 DesktopMultiSegmentQaWork.storyName = 'desktop-multi-segment-qa-work';
 

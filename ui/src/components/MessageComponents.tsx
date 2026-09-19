@@ -14,6 +14,7 @@
 
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -1300,9 +1301,17 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }
 
   return (
-    <div id={`message-${message.message_id}`} className="message agent" data-sequence-id={message.sequence_id}>
+    <div
+      id={`message-${message.message_id}`}
+      className="message agent"
+      data-sequence-id={message.sequence_id}
+      data-message-id={message.message_id}
+      data-inline-reaction-message={message.message_id}
+      data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
+    >
       {!suppressMessageCopy && !isFirstInTurn && (
         <div className="message-mobile-copy-row">
+          <MessageReviewAction message={message} />
           <MessageCopyButton message={message} title="Copy Phoenix message" />
         </div>
       )}
@@ -1317,6 +1326,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           <AgentRetryBadge message={message} />
           {!suppressMessageCopy && (
             <span className="message-header-actions">
+              <MessageReviewAction message={message} />
               <MessageCopyButton message={message} title="Copy Phoenix message" />
             </span>
           )}

@@ -23,6 +23,8 @@ palette, modal dialog)
 THE SYSTEM SHALL push a focus scope onto the stack
 AND auto-focus the primary interactive element of that scope
 
+Selection-triggered inline reactions are a non-modal exception: they register local keyboard ownership without moving focus away from the native selection (see `specs/prose-feedback/requirements.md`, REQ-PF-018).
+
 WHEN the interactive panel is dismissed
 THE SYSTEM SHALL pop the focus scope
 AND restore focus to the element that was focused before the scope was pushed
@@ -93,6 +95,8 @@ ambiguity.
 WHEN an interactive panel appears that accepts keyboard input
 THE SYSTEM SHALL focus the primary interactive element within 100ms
 AND the user SHALL be able to begin keyboard interaction without clicking
+
+A reaction input revealed by native text selection SHALL remain unfocused until the user explicitly enters it, preserving native copy actions and avoiding an unsolicited mobile keyboard.
 
 WHEN focus cannot be set (element not yet rendered)
 THE SYSTEM SHALL retry focus on the next animation frame

@@ -37,7 +37,7 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
       // Read-modify-write inside the reducer so concurrent appends
       // (terminal selection + prose-reader notes in quick succession)
       // compose deterministically.
-      const next = atom.draft.trim()
+      const next = atom.draft !== ''
         ? atom.draft + '\n\n' + action.text
         : action.text;
       return { draft: next };

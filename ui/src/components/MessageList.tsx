@@ -50,6 +50,8 @@ import {
 import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
+import { InlineMessageReaction, type ReactionDraftDestination } from './InlineMessageReaction';
+import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
@@ -181,6 +183,8 @@ interface MessageListProps {
   workScopeKey?: string | undefined;
   enableMessageSidepanel?: boolean | undefined;
   enableMessageFullscreen?: boolean | undefined;
+  reactionScopeKey?: string | undefined;
+  reactionDestination?: ReactionDraftDestination | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
    *  indices currently rendered. Fired as the user scrolls. The conversation nav
    *  uses it to highlight the active chapter. */
@@ -541,6 +545,8 @@ function MessageListImpl({
   workScopeKey,
   enableMessageSidepanel = true,
   enableMessageFullscreen = false,
+  reactionScopeKey,
+  reactionDestination,
   onVisibleRangeChange,
   onChaptersChange,
   hasOlderMessages = false,
@@ -1791,33 +1797,35 @@ function MessageListImpl({
         {olderHistoryError && !hasOlderMessages && (
           <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
-        <VirtualTranscript
-          key={conversationId ?? '__empty__'}
-          ref={transcriptRef}
-          scrollerId="messages"
-          ariaLabel="Conversation transcript"
-          scrollerRef={handleScrollerRef}
-          items={allUnits}
-          renderItem={itemContent}
-          getKey={computeItemKey}
-          initialTail={allUnits.length > 0}
-          estimatedExtent={120}
-          overscan={600}
-          onPinnedChange={handlePinnedStateChange}
-          onTotalExtentChange={handleTotalListHeightChanged}
-          onRangeChange={handleRangeChanged}
-          header={systemPrompt ? (
-            <SystemPromptHeader
-              systemPrompt={systemPrompt}
-              expanded={systemPromptExpanded}
-              onToggle={toggleSystemPrompt}
-              contentRef={systemPromptRef}
-              activeHighlight={activeSystemPromptHighlight}
-            />
-          ) : null}
-          empty={<EmptyTranscriptState />}
-          className="message-virtual-transcript"
-        />
+        <MessageReviewEnabledContext.Provider value={enableMessageSidepanel}>
+          <VirtualTranscript
+            key={conversationId ?? '__empty__'}
+            ref={transcriptRef}
+            scrollerId="messages"
+            ariaLabel="Conversation transcript"
+            scrollerRef={handleScrollerRef}
+            items={allUnits}
+            renderItem={itemContent}
+            getKey={computeItemKey}
+            initialTail={allUnits.length > 0}
+            estimatedExtent={120}
+            overscan={600}
+            onPinnedChange={handlePinnedStateChange}
+            onTotalExtentChange={handleTotalListHeightChanged}
+            onRangeChange={handleRangeChanged}
+            header={systemPrompt ? (
+              <SystemPromptHeader
+                systemPrompt={systemPrompt}
+                expanded={systemPromptExpanded}
+                onToggle={toggleSystemPrompt}
+                contentRef={systemPromptRef}
+                activeHighlight={activeSystemPromptHighlight}
+              />
+            ) : null}
+            empty={<EmptyTranscriptState />}
+            className="message-virtual-transcript"
+          />
+        </MessageReviewEnabledContext.Provider>
       </section>
       {!isEmpty && hasUnreadTailContent && (
         <button className="jump-to-newest" onClick={scrollToNewest}>
@@ -1825,6 +1833,11 @@ function MessageListImpl({
         </button>
       )}
       <FilePathContextMenu />
+      <InlineMessageReaction
+        scopeKey={reactionScopeKey ?? conversationId ?? slug ?? '__empty__'}
+        messages={messages}
+        destination={reactionDestination}
+      />
       <MessageContextMenu
         messages={messages}
         enableMessageSidepanel={enableMessageSidepanel}

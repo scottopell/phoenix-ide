@@ -1,0 +1,35 @@
+.message-review-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+
+.message-review-action:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+@media (hover: none), (width <= 768px) {
+  .message-review-action {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .message:has(.message-review-action) .message-header-actions {
+    position: static;
+  }
+
+  .message:has(.message-review-action) {
+    padding-right: 12px;
+  }
+}
