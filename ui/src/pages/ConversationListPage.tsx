@@ -134,9 +134,14 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
+
+  useEffect(() => {
+    productCloseTargetRef.current = productCloseTarget;
+  }, [productCloseTarget]);
 
   const { credentialStatus } = useModels();
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -329,15 +334,18 @@ export function ConversationListPage() {
     if (!productCloseTarget) return;
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      setProductCloseTarget(null);
+      setProductCloseTarget((current) =>
+        current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       setProductListRevision((revision) => revision + 1);
       notifyProductConversationListMayHaveChanged();
       setProductCloseError(null);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         const confirmationRoute = productCloseTarget.canonical_route;
-        setProductCloseTarget(null);
-        navigate(confirmationRoute);
+        if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
+          setProductCloseTarget(null);
+          navigate(confirmationRoute);
+        }
       } else {
         setProductCloseError({
           productId: productCloseTarget.product_conversation_id,

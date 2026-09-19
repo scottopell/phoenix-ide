@@ -143,16 +143,16 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
 
   useEffect(() => {
     let cancelled = false;
-    let generation = 0;
+    let inFlight: Promise<void> | null = null;
     const refresh = () => {
-      const requestGeneration = ++generation;
-      return api.listProductConversations()
+      if (inFlight) return inFlight;
+      inFlight = api.listProductConversations()
         .then((response) => {
-          if (!cancelled && requestGeneration === generation) {
-            setProductConversations(response.product_conversations);
-          }
+          if (!cancelled) setProductConversations(response.product_conversations);
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { inFlight = null; });
+      return inFlight;
     };
     void refresh();
     const interval = window.setInterval(refresh, 5_000);
