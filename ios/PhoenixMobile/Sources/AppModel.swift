@@ -421,6 +421,22 @@ final class AppModel {
     }
 
     @discardableResult
+    func deleteHistoryConversation(_ conversation: Conversation) async -> Bool {
+        guard let api, connectivity.isOnline else {
+            lastActionError = "Deleting needs a connection — it can't be queued."
+            return false
+        }
+        do {
+            try await api.deleteConversation(reference: conversation.transcriptRowIdentity)
+            listStore.remove(aggregateId: conversation.aggregateIdentity)
+            return true
+        } catch {
+            lastActionError = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
         let serverIdentifiesCoordinator = conversationId == coordinatorConversationId

@@ -616,7 +616,7 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
     fireEvent.change(input, { target: { value: '   ' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    await waitFor(() => expect(api.setChainName).toHaveBeenCalledWith(ROOT_ID, null));
+    expect(api.setChainName).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
   });
 });

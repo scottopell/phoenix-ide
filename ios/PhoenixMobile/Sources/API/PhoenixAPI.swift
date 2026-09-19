@@ -394,6 +394,11 @@ struct PhoenixAPI: Sendable {
             "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
     }
 
+    func deleteConversation(reference: String) async throws {
+        struct OkResponse: Codable { var ok: Bool? }
+        _ = try await post("api/conversations/\(reference)/delete", body: [:], as: OkResponse.self)
+    }
+
     func archive(conversationId: String) async throws {
         struct OkResponse: Codable { var ok: Bool? }
         _ = try await post(
