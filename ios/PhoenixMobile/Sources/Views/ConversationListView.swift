@@ -139,6 +139,17 @@ struct ConversationListView: View {
                             isCoordinator: isCoordinator)
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        if !isCoordinator && conversation.product_close_action == .available {
+                            Button {
+                                Task { await model.closeProductConversation(conversation) }
+                            } label: {
+                                Label("Close", systemImage: "archivebox")
+                            }
+                            .tint(.orange)
+                            .disabled(!model.connectivity.isOnline)
+                        }
+                    }
                 }
             }
             .listStyle(.plain)
