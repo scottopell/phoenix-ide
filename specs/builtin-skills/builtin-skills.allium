@@ -124,8 +124,8 @@ rule DiscoverCoordinatorBuiltin {
 
     @guidance
         -- Coordinator discovery parses immutable bytes embedded in the binary.
-        -- It does not depend on the extraction cache and does not scan
-        -- repository or user filesystem skill directories.
+        -- Its catalog metadata has no filesystem path and does not depend on
+        -- the extraction cache or scan repository/user skill directories.
 }
 
 rule InvokeCoordinatorBuiltin {
@@ -144,8 +144,8 @@ rule InvokeCoordinatorBuiltin {
 
     @guidance
         -- Invocation reads the immutable asset embedded in the binary, not the
-        -- mutable extraction cache. Embedded companion references are included
-        -- in the authenticated result.
+        -- mutable extraction cache, identifies its base as an embedded resource,
+        -- and includes companion references in the authenticated result.
 }
 
 ------------------------------------------------------------
@@ -164,9 +164,8 @@ rule RenderBuiltinInCatalog {
         -- skills.allium InjectSkillCatalog rule). Built-ins render with
         -- the literal "(built-in)" annotation so the catalog stays terse
         -- and so the LLM can distinguish phoenix-bundled skills from
-        -- user-installed ones at a glance. The real extract path is still
-        -- available to the LLM via the `Base directory` line emitted when
-        -- the skill is invoked.
+        -- user-installed ones at a glance. Coordinator invocation identifies
+        -- the base as an embedded resource rather than claiming a disk path.
         --
         -- Note: this rule treats Skill.source as a String discriminator
         -- ("Builtin" vs other locations). skills.allium models source as
@@ -180,11 +179,11 @@ rule RenderBuiltinInCatalog {
 -- Invariants
 ------------------------------------------------------------
 
--- Both source variants imply a readable file on disk after extraction.
--- For Filesystem this is the user's authored SKILL.md; for Builtin it is
--- the file written by ExtractBuiltinAssets at server startup.
+-- Ordinary catalog source variants imply a readable file on disk after
+-- extraction. Coordinator catalog metadata is authenticated from embedded
+-- bytes and therefore has no filesystem source path.
 invariant SourceImpliesReadableFile {
-    for skill in Skills:
+    for skill in Skills where skill.audience != "global-coordinator":
         file_exists(skill.path) and is_readable(skill.path)
 }
 

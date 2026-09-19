@@ -132,10 +132,8 @@ pub(crate) fn build_coordinator_system_prompt_with_catalog(
         for skill in skills {
             let _ = writeln!(
                 prompt,
-                "\n- **{}** — {} {}",
-                skill.name,
-                skill.description,
-                skill.display_location()
+                "\n- **{}** — {} (built-in)",
+                skill.name, skill.description
             );
         }
         prompt.push_str("</available_skills>");

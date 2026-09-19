@@ -31,9 +31,16 @@ pub enum SkillAudience {
     GlobalCoordinator,
 }
 
+/// Metadata authenticated directly from a Coordinator built-in's embedded bytes.
+#[derive(Debug, Clone)]
+pub struct CoordinatorSkillMetadata {
+    pub name: String,
+    pub description: String,
+}
+
 /// A non-empty authenticated catalog available to the Global Coordinator.
 #[derive(Debug, Clone)]
-pub struct AuthenticatedCoordinatorSkillCatalog(Vec<SkillMetadata>);
+pub struct AuthenticatedCoordinatorSkillCatalog(Vec<CoordinatorSkillMetadata>);
 
 impl AuthenticatedCoordinatorSkillCatalog {
     #[must_use]
@@ -44,7 +51,7 @@ impl AuthenticatedCoordinatorSkillCatalog {
     }
 
     #[must_use]
-    pub fn skills(&self) -> &[SkillMetadata] {
+    pub fn skills(&self) -> &[CoordinatorSkillMetadata] {
         &self.0
     }
 }
@@ -379,9 +386,7 @@ pub fn discover_skills_for_audience(
             builtin_dir.as_deref(),
             audience,
         ),
-        SkillAudience::GlobalCoordinator => {
-            discover_builtin_skills_for_audience(builtin_dir.as_deref(), audience)
-        }
+        SkillAudience::GlobalCoordinator => Vec::new(),
     }
 }
 
@@ -404,7 +409,7 @@ pub fn discover_skills_for_audience_with_options(
 pub fn discover_builtin_skills_for_audience(
     builtin_dir: Option<&Path>,
     audience: SkillAudience,
-) -> Vec<SkillMetadata> {
+) -> Vec<CoordinatorSkillMetadata> {
     let mut skills = Vec::new();
     let _ = builtin_dir;
     for name in builtin::skill_names() {
@@ -417,20 +422,14 @@ pub fn discover_builtin_skills_for_audience(
         if fm.name != name {
             continue;
         }
-        skills.push(SkillMetadata {
+        if fm.audience.unwrap_or_default() != audience {
+            continue;
+        }
+        skills.push(CoordinatorSkillMetadata {
             name: fm.name,
             description: fm.description,
-            argument_hint: fm.argument_hint,
-            audience: fm.audience.unwrap_or_default(),
-            source: SkillSource::Builtin {
-                path: builtin::default_extract_dir()
-                    .unwrap_or_default()
-                    .join(name)
-                    .join("SKILL.md"),
-            },
         });
     }
-    skills.retain(|skill| skill.audience == audience);
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
@@ -649,16 +648,9 @@ pub fn invoke_trusted_coordinator_builtin(
     catalog: &AuthenticatedCoordinatorSkillCatalog,
 ) -> Result<String, String> {
     let skills = catalog.skills();
-    let audience_catalog = skills
-        .iter()
-        .filter(|skill| skill.audience == SkillAudience::GlobalCoordinator)
-        .collect::<Vec<_>>();
-    let skill = audience_catalog
-        .iter()
-        .copied()
-        .find(|skill| skill.name == skill_name)
-        .ok_or_else(|| {
-            let available = audience_catalog
+    if !skills.iter().any(|skill| skill.name == skill_name) {
+        return Err({
+            let available = skills
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>();
@@ -671,15 +663,11 @@ pub fn invoke_trusted_coordinator_builtin(
                     available.join(", ")
                 }
             )
-        })?;
-    if !matches!(skill.source, SkillSource::Builtin { .. }) {
-        return Err(format!(
-            "Skill '{skill_name}' is not an authenticated built-in"
-        ));
+        });
     }
     let raw_content = builtin::embedded_skill(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
-    let mut content = format_skill_expansion(&skill.skill_dir(), &raw_content, None);
+    let mut content = format_skill_expansion("embedded://builtin-skills", &raw_content, None);
     content.push_str("\n\nAll authenticated companion references are included below; do not read the mutable extraction cache.");
     let assets = builtin::embedded_skill_assets(skill_name)
         .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?;
@@ -1363,9 +1351,11 @@ mod tests {
 
         let authenticated = AuthenticatedCoordinatorSkillCatalog::discover(Some(&extract_dir))
             .expect("authenticated coordinator catalog");
-        std::fs::write(&extracted, "forged after discovery").unwrap();
+        assert_eq!(authenticated.skills()[0].name, "phoenix-api");
+        std::fs::remove_dir_all(&extract_dir).unwrap();
         let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &authenticated).unwrap();
         assert!(!trusted.contains("<trusted_builtin_skill"));
+        assert!(trusted.contains("Base directory for this skill: embedded://builtin-skills"));
         assert!(trusted.contains("Embedded reference"));
         assert!(!trusted.contains("forged after discovery"));
     }

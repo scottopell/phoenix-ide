@@ -3858,18 +3858,17 @@ mod tests {
         let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
         let task = tokio::spawn(adopted.commit_publication());
-        if tokio::time::timeout(Duration::from_secs(120), async {
-            while !acknowledged.exists() {
+        let acknowledgment = tokio::time::timeout(Duration::from_secs(120), async {
+            while !acknowledged.exists() && !task.is_finished() {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .is_err()
-        {
+        .await;
+        if acknowledgment.is_err() || !acknowledged.exists() {
             task.abort();
-            let _ = task.await;
+            let task_result = task.await;
             owner.shutdown();
-            panic!("publication hook was not acknowledged");
+            panic!("publication hook was not acknowledged; task result: {task_result:?}");
         }
         task.abort();
         let _ = task.await;
@@ -3939,18 +3938,17 @@ mod tests {
         let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
         let task = tokio::spawn(adopted.commit_publication());
-        if tokio::time::timeout(Duration::from_secs(120), async {
-            while !entered.exists() {
+        let hook_entry = tokio::time::timeout(Duration::from_secs(120), async {
+            while !entered.exists() && !task.is_finished() {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .is_err()
-        {
+        .await;
+        if hook_entry.is_err() || !entered.exists() {
             task.abort();
-            let _ = task.await;
+            let task_result = task.await;
             owner.shutdown();
-            panic!("publication hook was not entered");
+            panic!("publication hook was not entered; task result: {task_result:?}");
         }
         task.abort();
         let _ = task.await;

@@ -108,22 +108,12 @@ impl Tool for SkillTool {
             return ToolOutput::error("authenticated built-in skills do not accept arguments");
         }
 
-        let skills = match self.audience {
-            phoenix_skills::SkillAudience::Conversation => {
-                phoenix_skills::discover_skills_for_audience(
-                    ctx.working_dir(),
-                    phoenix_skills::SkillAudience::Conversation,
-                )
-            }
-            phoenix_skills::SkillAudience::GlobalCoordinator => self
-                .coordinator_catalog
-                .as_ref()
-                .expect("Coordinator SkillTool requires authenticated catalog")
-                .skills()
-                .to_vec(),
-        };
         let result = match self.audience {
             phoenix_skills::SkillAudience::Conversation => {
+                let skills = phoenix_skills::discover_skills_for_audience(
+                    ctx.working_dir(),
+                    phoenix_skills::SkillAudience::Conversation,
+                );
                 phoenix_skills::invoke_skill(skill_name, args, self.audience, &skills)
                     .map(|invocation| invocation.body)
             }
