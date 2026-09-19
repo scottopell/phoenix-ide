@@ -226,6 +226,13 @@ final class AppModel {
             latestTranscriptRowId: latestTranscriptRowId)
     }
 
+    func loadProductHistory(productConversationId: String) async throws -> ProductConversationSnapshot {
+        guard let api, connectivity.isOnline else {
+            throw APIError.transport(underlying: URLError(.notConnectedToInternet))
+        }
+        return try await api.getProductConversation(reference: productConversationId)
+    }
+
     func navigationConversationId(for conversation: Conversation) -> String {
         resolvedNavigationConversationId(
             aggregateId: conversation.product_conversation_id,
@@ -437,17 +444,16 @@ final class AppModel {
                 listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
                     + [conversation.transcriptRowIdentity])
             for transcriptId in transcriptIds {
-                if let session = sessions[transcriptId] {
+                let owners = [sessions[transcriptId], drainSessions[transcriptId]].compactMap { $0 }
+                for session in owners {
                     session.stop()
                     await session.clearCachedSnapshotAndWait()
                     await session.outbox.clearAndWait()
-                    if sessions[transcriptId] === session { sessions[transcriptId] = nil }
-                    if drainSessions[transcriptId] === session { drainSessions[transcriptId] = nil }
-                } else {
-                    DiskStore.remove(name: "conv-\(transcriptId)")
-                    DiskStore.remove(name: "outbox-\(transcriptId)")
-                    drainSessions[transcriptId] = nil
                 }
+                sessions[transcriptId] = nil
+                drainSessions[transcriptId] = nil
+                DiskStore.remove(name: "conv-\(transcriptId)")
+                DiskStore.remove(name: "outbox-\(transcriptId)")
             }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
             return true
