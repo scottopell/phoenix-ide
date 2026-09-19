@@ -338,7 +338,8 @@ export function ConversationListPage() {
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       setProductListRevision((revision) => revision + 1);
       notifyProductConversationListMayHaveChanged();
-      setProductCloseError(null);
+      setProductCloseError((current) =>
+        current?.productId === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         const confirmationRoute = productCloseTarget.canonical_route;

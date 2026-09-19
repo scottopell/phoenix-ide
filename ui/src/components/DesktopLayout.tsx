@@ -144,14 +144,21 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   useEffect(() => {
     let cancelled = false;
     let inFlight: Promise<void> | null = null;
+    let controller: AbortController | null = null;
     const refresh = () => {
       if (inFlight) return inFlight;
-      inFlight = api.listProductConversations()
+      controller = new AbortController();
+      const timeout = window.setTimeout(() => controller?.abort(), 15_000);
+      inFlight = api.listProductConversations(controller.signal)
         .then((response) => {
           if (!cancelled) setProductConversations(response.product_conversations);
         })
         .catch(() => {})
-        .finally(() => { inFlight = null; });
+        .finally(() => {
+          window.clearTimeout(timeout);
+          controller = null;
+          inFlight = null;
+        });
       return inFlight;
     };
     void refresh();
@@ -159,6 +166,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     const unsubscribe = subscribeProductConversationListRevision(() => { void refresh(); });
     return () => {
       cancelled = true;
+      controller?.abort();
       window.clearInterval(interval);
       unsubscribe();
     };

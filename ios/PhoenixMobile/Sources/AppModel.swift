@@ -54,6 +54,7 @@ final class AppModel {
     /// through the session's single drain task.
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
+    private var closeActionGeneration = 0
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -354,6 +355,8 @@ final class AppModel {
             lastActionError = "Closing needs a connection — it can't be queued."
             return false
         }
+        closeActionGeneration += 1
+        let startedCloseActionGeneration = closeActionGeneration
         guard closingProductConversationIds.insert(conversation.aggregateIdentity).inserted else {
             return false
         }
@@ -407,10 +410,10 @@ final class AppModel {
                 withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
             UNUserNotificationCenter.current().removePendingNotificationRequests(
                 withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
-            await listStore.refresh(api: api)
             return true
         } catch {
-            guard apiGeneration == startedGeneration else { return false }
+            guard apiGeneration == startedGeneration,
+                  closeActionGeneration == startedCloseActionGeneration else { return false }
             lastActionError = error.localizedDescription
             return false
         }
