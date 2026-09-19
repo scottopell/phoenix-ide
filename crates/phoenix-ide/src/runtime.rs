@@ -8387,27 +8387,21 @@ mod scope_liveness_tests {
             })
             .await
             .unwrap();
-        for kind in [
-            phoenix_core::domain::close::RetiredResourceKind::Worktree,
-            phoenix_core::domain::close::RetiredResourceKind::WorkScope,
-        ] {
-            let resource = manager
-                .db()
-                .list_close_expected_retirement_resources(attempt_id.as_str())
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|resource| resource.scope == scope && resource.resource.kind() == kind)
-                .unwrap()
-                .resource;
+        let expected_resources = manager
+            .db()
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .unwrap();
+        for expected in expected_resources {
+            let kind = expected.resource.kind();
             manager
                 .db()
                 .record_close_retirement_dispatch(
                     phoenix_db::RecordCloseRetirementDispatchRequest {
                         attempt_id: attempt_id.clone(),
-                        scope: scope.clone(),
+                        scope: expected.scope.clone(),
                         snapshot: retry_snapshot.clone(),
-                        resource: resource.clone(),
+                        resource: expected.resource.clone(),
                     },
                 )
                 .await
@@ -8425,9 +8419,9 @@ mod scope_liveness_tests {
                 .record_close_retirement_evidence(
                     phoenix_db::RecordCloseRetirementEvidenceRequest {
                         attempt_id: attempt_id.clone(),
-                        scope: scope.clone(),
+                        scope: expected.scope,
                         snapshot: retry_snapshot.clone(),
-                        resource,
+                        resource: expected.resource,
                         outcome,
                         detail: None,
                     },
