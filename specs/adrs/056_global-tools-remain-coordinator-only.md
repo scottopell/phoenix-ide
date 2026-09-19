@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-19
 - **Affects:** REQ-GR-007, REQ-RET-009
-- **Supersedes:** ADR-027 and ADR-051 only where they imply that ordinary parents receive Phoenix-wide search or read tools
+- **Supersedes:** ADR-027 and ADR-051 wherever they grant ordinary parents Phoenix-wide search, read, database-query, reference-resolution, or cross-conversation messaging capabilities
 
 ## Context
 
@@ -25,4 +25,4 @@ Ordinary parents receive only host-bound predecessor discovery, search, and read
 
 ## Consequences
 
-Ordinary parents can recover relevant lineage evidence without gaining ambient access to unrelated Phoenix history. The Coordinator remains the sole agent surface for Phoenix-wide orientation. Existing historical decisions remain authoritative except for their superseded implication that ordinary write-capable parents receive global search or read tools.
+Ordinary parents can recover relevant lineage evidence without gaining ambient access to unrelated Phoenix history. The Coordinator remains the sole agent surface for Phoenix-wide orientation. Existing historical decisions remain authoritative except for their superseded grants of Phoenix-wide search, read, database-query, reference-resolution, or cross-conversation messaging capabilities to ordinary parents.
