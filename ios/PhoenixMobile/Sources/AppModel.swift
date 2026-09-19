@@ -53,6 +53,7 @@ final class AppModel {
     /// is not open. Retaining one per conversation serializes every trigger
     /// through the session's single drain task.
     private var drainSessions: [String: ConversationSession] = [:]
+    private var closingProductConversationIds: Set<String> = []
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -353,6 +354,10 @@ final class AppModel {
             lastActionError = "Closing needs a connection — it can't be queued."
             return false
         }
+        guard closingProductConversationIds.insert(conversation.aggregateIdentity).inserted else {
+            return false
+        }
+        defer { closingProductConversationIds.remove(conversation.aggregateIdentity) }
         let hasInMemoryMessages = transcriptIds.contains {
             sessions[$0]?.outbox.visibleEntries.isEmpty == false
         }
@@ -373,13 +378,17 @@ final class AppModel {
             return false
         }
         let aggregateSessions = transcriptIds.compactMap { session(for: $0) }
-        guard aggregateSessions.allSatisfy({ $0.beginArchiving() }) else {
-            aggregateSessions.forEach { $0.endArchiving() }
-            lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
-            return false
+        var fencedSessions: [ConversationSession] = []
+        for session in aggregateSessions {
+            guard session.beginArchiving() else {
+                fencedSessions.forEach { $0.endArchiving() }
+                lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
+                return false
+            }
+            fencedSessions.append(session)
         }
         var closed = false
-        defer { if !closed { aggregateSessions.forEach { $0.endArchiving() } } }
+        defer { if !closed { fencedSessions.forEach { $0.endArchiving() } } }
         do {
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
@@ -393,6 +402,7 @@ final class AppModel {
             await listStore.refresh(api: api)
             return true
         } catch {
+            guard apiGeneration == startedGeneration else { return false }
             lastActionError = error.localizedDescription
             return false
         }
