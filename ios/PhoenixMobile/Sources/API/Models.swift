@@ -12,6 +12,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// additive-optional: legacy `/api/conversations` rows omit it; nil means
     /// the transcript-row id is the only available identity.
     var product_conversation_id: String?
+    var chain_root_id: String?
     var slug: String?
     var title: String?
     var model: String?
