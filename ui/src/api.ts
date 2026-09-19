@@ -1703,7 +1703,9 @@ export const api = {
   },
 
   async listProductConversations(signal?: AbortSignal): Promise<ProductConversationListResponseType> {
-    const resp = await fetch('/api/product-conversations', signal ? { signal } : undefined);
+    const resp = signal
+      ? await fetch('/api/product-conversations', { signal })
+      : await fetch('/api/product-conversations');
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversations');
     }
