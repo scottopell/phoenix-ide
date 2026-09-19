@@ -20,7 +20,8 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
         || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
       const target = event.target instanceof Element ? event.target : document.activeElement;
-      if (target?.closest('input, textarea, select, button, a[href], [contenteditable], [role="button"], [role="textbox"], [role="combobox"]')) return;
+      const control = target?.closest('input, textarea, select, button, summary, a[href], audio, video, [contenteditable], [tabindex], [role="button"], [role="textbox"], [role="combobox"]');
+      if (control && control !== document.getElementById('messages')) return;
       if (!inputRef.current || bubbleRef.current?.hidden) return;
       event.preventDefault();
       inputRef.current.focus({ preventScroll: true });
@@ -53,13 +54,11 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       const bottom = top + (viewport?.height ?? window.innerHeight);
       const transcript = scroller.getBoundingClientRect();
       const range = restoreReactionRange(source);
-      let rect = range?.getBoundingClientRect();
+      const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
-        scroller.scrollTop += rect.top - Math.max(top, transcript.top) - 72;
         window.getSelection()?.removeAllRanges();
         window.getSelection()?.addRange(range!);
-        rect = range!.getBoundingClientRect();
       }
       const visibleTop = Math.max(top, transcript.top);
       const visibleBottom = Math.min(bottom, transcript.bottom);

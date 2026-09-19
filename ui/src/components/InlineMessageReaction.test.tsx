@@ -32,7 +32,7 @@ function Harness({ store, scope = 'conversation-a', append }: { store: InlineRea
         <div id="messages">
           {messages.map((message) => (
             <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-occurrence={`${message.conversation_id}:${message.message_id}`} data-message-id={message.message_id} data-sequence-id="2">
-              <div className="agent-text-block"><p data-testid={message.message_id}>Deterministic state patterns <code>replay(events)</code></p></div>
+              <div className="agent-text-block" data-fragment-id="text-0"><p data-testid={message.message_id}>Deterministic state patterns <code>replay(events)</code></p></div>
             </div>
           ))}
         </div>

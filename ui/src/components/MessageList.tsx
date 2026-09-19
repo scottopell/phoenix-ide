@@ -51,6 +51,7 @@ import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
 import { InlineMessageReaction, type ReactionDraftDestination } from './InlineMessageReaction';
+import { restoreReactionRange } from './reactionRange';
 import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
@@ -1843,7 +1844,8 @@ function MessageListImpl({
             : message.message_id === source.messageId;
           const index = historicalUnits.findIndex((unit) => agentTurnsInHistoricalUnit(unit).some((turn) => matches(turn.agent)));
           if (index < 0) return false;
-          scrollToUnitIndex(index);
+          dispatchScrollEvent({ type: 'navigationJumped' });
+          transcriptRef.current?.scrollToIndex(index, 'start', 72, (row) => restoreReactionRange(source, row));
           return true;
         }}
       />

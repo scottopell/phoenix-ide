@@ -1,5 +1,6 @@
 import type { Message } from '../api';
 import type { ReactionSource } from '../conversation/InlineReactionStore';
+import { reactionTextOffset } from './reactionRange';
 
 function parentElement(node: Node | null): Element | null {
   return node instanceof Element ? node : node?.parentElement ?? null;
@@ -21,17 +22,21 @@ export function readReactionSelection(selection: Selection | null, messages: Mes
     : candidate.message_id === owner.dataset['inlineReactionMessage']);
   const data = message?.display_data as { productOccurrenceToken?: string; productHistoricalHandoff?: unknown } | null;
   if (!message || message.message_type !== 'agent' || data?.productHistoricalHandoff) return null;
-  const prefix = document.createRange();
-  prefix.selectNodeContents(owner);
-  prefix.setEnd(range.startContainer, range.startOffset);
-  const startOffset = prefix.toString().length;
+  const startBlock = start.closest('.agent-text-block')!;
+  const endBlock = end.closest('.agent-text-block')!;
+  const startFragment = startBlock.closest<HTMLElement>('[data-fragment-id]')?.dataset['fragmentId'];
+  const endFragment = endBlock.closest<HTMLElement>('[data-fragment-id]')?.dataset['fragmentId'];
+  if (!startFragment || !endFragment) return null;
   return {
     source: {
       messageId: message.message_id,
       sequenceId: message.sequence_id,
       occurrenceToken: data?.productOccurrenceToken,
       quote: selection.toString(),
-      textOffsets: { start: startOffset, end: startOffset + range.toString().length },
+      textAnchor: {
+        start: { fragmentId: startFragment, offset: reactionTextOffset(startBlock, range.startContainer, range.startOffset) },
+        end: { fragmentId: endFragment, offset: reactionTextOffset(endBlock, range.endContainer, range.endOffset) },
+      },
     },
     range: range.cloneRange(),
   };

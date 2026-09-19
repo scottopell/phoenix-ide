@@ -288,6 +288,25 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('resolves an exact range target after its virtualized row mounts', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    render(<VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(30, 200)}
+      getKey={(item) => item.id} estimatedExtent={200} overscan={0} initialTail={false}
+      renderItem={renderRow} scrollerRef={(element) => { scroller = element; }} />);
+    expect(screen.queryByTestId('payload-item-20')).toBeNull();
+    const resolve = vi.fn((row: HTMLElement) => {
+      const range = document.createRange();
+      range.selectNodeContents(row.querySelector('[data-height]')!);
+      range.getBoundingClientRect = () => ({ top: 38, height: 10 } as DOMRect);
+      return range;
+    });
+    act(() => ref.current?.scrollToIndex(20, 'start', 12, resolve));
+    expect(resolve).toHaveBeenCalled();
+    expect(screen.getByTestId('payload-item-20')).toBeInTheDocument();
+    expect(scrollTopOf(scroller)).toBe(4026);
+  });
+
   it('compensates scrollTop when a measured row above the top-edge anchor resizes', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;

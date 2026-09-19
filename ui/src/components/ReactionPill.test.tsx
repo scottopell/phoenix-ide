@@ -6,7 +6,7 @@ import { restoreReactionRange } from './reactionRange';
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import type { ReactionSource } from '../conversation/InlineReactionStore';
 
-const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textOffsets: { start: 6, end: 12 } };
+const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textAnchor: { start: { fragmentId: 'text-0', offset: 6 }, end: { fragmentId: 'text-0', offset: 12 } } };
 const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn(() => true);
@@ -14,7 +14,7 @@ let offscreen = false;
 function Fixture({ mounted = true, body = 'Keep this guarantee' }: { mounted?: boolean; body?: string }) {
   return <FocusScopeProvider>
     <div id="messages">
-      {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer">first <strong>second</strong> third</div>}
+      {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
     <ReactionPill source={source} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
@@ -51,6 +51,28 @@ describe('reaction pill', () => {
     expect(add).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
     expect(add).toHaveBeenCalledOnce();
+  });
+
+  it('leaves Enter to native disclosure controls and custom focus stops', () => {
+    render(<><Fixture /><details><summary>Details</summary>Content</details><div tabIndex={0}>Custom control</div></>);
+    for (const control of [screen.getByText('Details'), screen.getByText('Custom control')]) {
+      control.focus();
+      expect(fireEvent.keyDown(control, { key: 'Enter' })).toBe(true);
+      expect(control).toHaveFocus();
+    }
+  });
+
+  it('restores prose independently of preceding tool/header text and fails closed on changed prose', () => {
+    const view = render(<Fixture />);
+    const owner = view.container.querySelector('[data-inline-reaction-message]')!;
+    const tool = document.createElement('div');
+    tool.textContent = 'Expanded thinking and changing tool status';
+    owner.prepend(tool);
+    expect(restoreReactionRange(source)?.toString()).toBe('second');
+    tool.remove();
+    expect(restoreReactionRange(source)?.toString()).toBe('second');
+    owner.querySelector('strong')!.textContent = 'WRONG!';
+    expect(restoreReactionRange(source)).toBeNull();
   });
 
   it('restores the exact passage through DOM remount and returns without focusing the input', async () => {
