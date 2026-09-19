@@ -13,7 +13,7 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | REQ-SVG-001 | Implemented | Typed invocation, Direct/Work registration and Explore/coordinator exclusion tests; real agent publication |
-| REQ-SVG-002 | Implemented | XML-aware allowlist, bounded reference graph, adversarial unit cases and actual Matplotlib fixture |
+| REQ-SVG-002 | Implemented | XML-aware allowlist, bounded reference graph, property applicability and parent-child models, adversarial unit cases and actual Matplotlib fixture |
 | REQ-SVG-003 | Implemented | Atomic database snapshot, invocation replay, rollback, reopen and transcript deletion tests; live source deletion and server restart |
 | REQ-SVG-004 | Implemented | Router authentication/owner/header tests; live image, source, attachment and direct-navigation checks |
 | REQ-SVG-005 | Implemented | Component tests, 12 browser fixture journeys and actual conversation controls/reload |
@@ -43,6 +43,8 @@ A real GPT-5.5 Direct conversation generated and published both a labelled disk-
 The disk chart keeps free space separate from measured directory bars and shows exact GiB labels. Native iOS compatibility was checked by inspecting its generic tool-result decoding/rendering path; no device run or native SVG renderer is claimed. Workscope retention uses the existing retained transcript owner, with no dependency on staging/worktree paths. No production deployment was performed.
 
 ### Review qualification
+
+The validator's focused suite passes all 18 tests, including incompatible presentation attributes/inline styles, stylesheet applicability with preserved universal/inherited styling, illegal resource/text child elements, clip reuse targets, and unsupported `tspan` transforms. The actual Matplotlib fixture remains accepted byte-for-byte.
 
 PR #793's first six findings are addressed by the validation-backed database boundary, assistant-message-scoped publication/result identity, token-scoped share retrieval, and stricter resource/selector/geometry validation. Focused tests cover repeated provider IDs through live checkpoints and restart/fan-in recovery; shared preview/source/download are tested without a password and after token revocation. The expanded runtime E2E and all 14 browser journeys pass.
 

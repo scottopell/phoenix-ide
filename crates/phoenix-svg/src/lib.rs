@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use roxmltree::{Document, Node, ParsingOptions};
@@ -77,6 +77,7 @@ enum ReferenceKind {
     Clip,
     Gradient,
     Reuse,
+    ClipReuse,
 }
 
 struct LocalReference {
@@ -91,6 +92,7 @@ impl LocalReference {
                 matches!(element, "linearGradient" | "radialGradient")
             }
             ReferenceKind::Clip => element == "clipPath",
+            ReferenceKind::ClipReuse => is_shape(element) || element == "text",
             ReferenceKind::Reuse => matches!(
                 element,
                 "g" | "path"
@@ -230,6 +232,7 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
                 "Nested svg viewports are unsupported; use groups instead.",
             ));
         }
+        content_model(node)?;
         for child in node.children().filter(Node::is_element) {
             edges[i].push(index[&child.id()]);
         }
@@ -247,7 +250,7 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
         }
         if node.tag_name().name() == "style" {
             let text: String = node.children().filter_map(|n| n.text()).collect();
-            stylesheet(&text, &mut css_budget)?;
+            stylesheet(&text, &mut css_budget, &elements)?;
         }
         for attr in node.attributes() {
             attributes += 1;
@@ -272,7 +275,7 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
             }
             match name {
                 "id" => {
-                    identifier(value)?;
+                    identifier(attr.value())?;
                     if ids.insert(value, i).is_some() {
                         return Err(invalid("SVG IDs must be unique."));
                     }
@@ -314,7 +317,14 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
                         LocalReference {
                             id: fragment(value)?,
                             kind: if node.tag_name().name() == "use" {
-                                ReferenceKind::Reuse
+                                if node
+                                    .parent_element()
+                                    .is_some_and(|parent| parent.tag_name().name() == "clipPath")
+                                {
+                                    ReferenceKind::ClipReuse
+                                } else {
+                                    ReferenceKind::Reuse
+                                }
                             } else {
                                 ReferenceKind::Gradient
                             },
@@ -364,12 +374,14 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
                 "type" if node.tag_name().name() == "style" => keyword(value, &["text/css"])?,
                 "style" => {
                     for (key, val) in declarations(value)? {
+                        check_presentation_element(node.tag_name().name(), key)?;
                         if let Some(reference) = presentation(key, val)? {
                             references.push((i, reference));
                         }
                     }
                 }
                 _ => {
+                    check_presentation_element(node.tag_name().name(), name)?;
                     if let Some(reference) = presentation(name, value)? {
                         references.push((i, reference));
                     }
@@ -465,7 +477,6 @@ fn geometry_attribute(element: &str, attribute: &str) -> Result<()> {
                 | "polyline"
                 | "polygon"
                 | "text"
-                | "tspan"
                 | "use"
                 | "clipPath"
         ),
@@ -494,6 +505,98 @@ fn geometry_attribute(element: &str, attribute: &str) -> Result<()> {
         Err(policy(
             "Geometry attribute is unsupported on this element; use the documented per-element geometry attributes.",
         ))
+    }
+}
+
+fn is_shape(element: &str) -> bool {
+    matches!(
+        element,
+        "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon"
+    )
+}
+
+fn content_model(node: Node<'_, '_>) -> Result<()> {
+    let parent = node.tag_name().name();
+    for child in node.children() {
+        if child.is_text()
+            && !matches!(parent, "text" | "tspan" | "style" | "title" | "desc")
+            && child.text().is_some_and(|text| !text.trim().is_empty())
+        {
+            return Err(policy(
+                "Visible text must be inside text or tspan elements.",
+            ));
+        }
+        if !child.is_element() {
+            continue;
+        }
+        let name = child.tag_name().name();
+        let descriptive = matches!(name, "title" | "desc");
+        let allowed = match parent {
+            "svg" | "g" | "defs" => {
+                supported_element(name) && !matches!(name, "svg" | "stop" | "tspan")
+            }
+            "linearGradient" | "radialGradient" => descriptive || name == "stop",
+            "text" | "tspan" => descriptive || name == "tspan",
+            "clipPath" => descriptive || is_shape(name) || matches!(name, "text" | "use"),
+            "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon" | "use"
+            | "stop" => descriptive,
+            _ => false,
+        };
+        if !allowed {
+            return Err(policy(
+                "Unsupported SVG parent-child combination: gradients contain stops, text contains tspan, clips contain shapes/text/use, and shapes/use/stops contain only title or desc.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn presentation_applies(element: &str, property: &str) -> bool {
+    let carrier = matches!(element, "svg" | "g" | "defs" | "clipPath" | "use");
+    let text = matches!(element, "text" | "tspan");
+    let drawing = is_shape(element) || text;
+    match property {
+        "stop-color" | "stop-opacity" => element == "stop",
+        "color" => {
+            carrier || drawing || matches!(element, "stop" | "linearGradient" | "radialGradient")
+        }
+        "fill" | "fill-opacity" | "fill-rule" | "stroke" | "stroke-opacity" | "stroke-width"
+        | "stroke-dashoffset" | "stroke-miterlimit" | "stroke-dasharray" | "stroke-linecap"
+        | "stroke-linejoin" | "clip-rule" | "visibility" => carrier || drawing,
+        "font-size" | "font-family" | "font-style" | "font-weight" | "letter-spacing"
+        | "word-spacing" | "text-anchor" | "text-rendering" | "dominant-baseline" => {
+            carrier || text
+        }
+        "alignment-baseline" => element == "tspan",
+        "shape-rendering" => carrier || is_shape(element),
+        "clip-path" | "opacity" => drawing || matches!(element, "svg" | "g" | "use" | "clipPath"),
+        "display" => drawing || matches!(element, "svg" | "g" | "use"),
+        "overflow" => element == "svg",
+        "vector-effect" => is_shape(element) || matches!(element, "text" | "use"),
+        _ => false,
+    }
+}
+
+fn check_presentation_element(element: &str, property: &str) -> Result<()> {
+    if presentation_applies(element, property) {
+        Ok(())
+    } else {
+        Err(policy(
+            "Presentation property does not apply to this element in the supported SVG profile; move it to a compatible shape, text, container or gradient stop.",
+        ))
+    }
+}
+
+fn selector_matches(selector: &str, node: Node<'_, '_>) -> bool {
+    if selector == "*" {
+        true
+    } else if let Some(id) = selector.strip_prefix('#') {
+        node.attribute("id") == Some(id)
+    } else if let Some(class) = selector.strip_prefix('.') {
+        node.attribute("class")
+            .is_some_and(|classes| classes.split_ascii_whitespace().any(|name| name == class))
+    } else {
+        node.tag_name().name() == selector
     }
 }
 
@@ -900,7 +1003,7 @@ fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
     }
     Ok(None)
 }
-fn stylesheet(mut value: &str, budget: &mut [usize; 3]) -> Result<()> {
+fn stylesheet(mut value: &str, budget: &mut [usize; 3], elements: &[Node<'_, '_>]) -> Result<()> {
     while !value.trim().is_empty() {
         budget[0] += 1;
         if budget[0] > MAX_CSS_RULES {
@@ -912,6 +1015,7 @@ fn stylesheet(mut value: &str, budget: &mut [usize; 3]) -> Result<()> {
         let (body, rest) = rest
             .split_once('}')
             .ok_or_else(|| invalid("Unclosed CSS rule."))?;
+        let mut selected_kinds = Vec::new();
         for selector in selectors.trim().split(',') {
             budget[1] += 1;
             if budget[1] > MAX_CSS_SELECTORS {
@@ -919,7 +1023,18 @@ fn stylesheet(mut value: &str, budget: &mut [usize; 3]) -> Result<()> {
                     "SVG stylesheets support at most 256 selectors total.",
                 ));
             }
-            css_selector(selector.trim())?;
+            let selector = selector.trim();
+            css_selector(selector)?;
+            let mut kinds: HashSet<_> = elements
+                .iter()
+                .copied()
+                .filter(|node| selector_matches(selector, *node))
+                .map(|node| node.tag_name().name())
+                .collect();
+            if kinds.is_empty() && supported_element(selector) {
+                kinds.insert(selector);
+            }
+            selected_kinds.push(kinds);
         }
         for (key, val) in declarations(body)? {
             budget[2] += 1;
@@ -932,6 +1047,17 @@ fn stylesheet(mut value: &str, budget: &mut [usize; 3]) -> Result<()> {
                 return Err(policy(
                     "Put local paint and clip references on elements, not in stylesheets.",
                 ));
+            }
+            for kinds in &selected_kinds {
+                if !kinds.is_empty()
+                    && !kinds
+                        .iter()
+                        .any(|element| presentation_applies(element, key))
+                {
+                    return Err(policy(
+                        "Stylesheet property has no compatible matched element; target an applicable shape, text, container or gradient stop.",
+                    ));
+                }
             }
         }
         value = rest;
@@ -1104,14 +1230,16 @@ mod tests {
             ("100%", "100%"),
             ("1em", "1em"),
         ] {
-            assert!(validate(
-                format!(
-                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"/>"#,
-                    pair.0, pair.1
+            assert!(
+                validate(
+                    format!(
+                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"/>"#,
+                        pair.0, pair.1
+                    )
+                    .as_bytes()
                 )
-                .as_bytes()
-            )
-            .is_err());
+                .is_err()
+            );
         }
         let by_viewbox =
             validate(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480"/>"#)
@@ -1251,10 +1379,10 @@ mod tests {
         ] {
             assert_eq!(rejected(body).category, ValidationCategory::Limit);
         }
-        assert!(validate(
-            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-300 1e-300"/>"#
-        )
-        .is_err());
+        assert!(
+            validate(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-300 1e-300"/>"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1358,7 +1486,7 @@ mod tests {
             "#_chart",
             ".a-2",
         ] {
-            validate(svg(&format!("<style>{selector}{{fill:red}}</style>")).as_bytes()).unwrap();
+            validate(svg(&format!("<style>{selector}{{color:red}}</style>")).as_bytes()).unwrap();
         }
         for selector in [
             ".",
@@ -1420,5 +1548,75 @@ mod tests {
             rejected(r#"<path pathLength="3px"/>"#).category,
             ValidationCategory::InvalidInput
         );
+    }
+
+    #[test]
+    fn presentation_attributes_and_inline_styles_require_compatible_elements() {
+        for body in [
+            r#"<rect width="10" height="10" stop-color="red"/>"#,
+            r#"<rect style="stop-opacity: 0.5"/>"#,
+            r#"<linearGradient><stop fill="red"/></linearGradient>"#,
+            r#"<linearGradient><stop style="stroke: red"/></linearGradient>"#,
+            r#"<g stop-color="red"><rect/></g>"#,
+            r#"<linearGradient style="fill: red"><stop/></linearGradient>"#,
+            r#"<rect font-size="12"/>"#,
+            r#"<path text-anchor="middle"/>"#,
+            r#"<text shape-rendering="crispEdges">text</text>"#,
+            r#"<g overflow="hidden"/>"#,
+            r#"<linearGradient><stop opacity="0.5"/></linearGradient>"#,
+            r#"<text><tspan transform="scale(2)">text</tspan></text>"#,
+            r##"<path id=" glyph " d="M0 0L1 1"/><use href="#glyph"/>"##,
+        ] {
+            assert_eq!(
+                rejected(body).category,
+                ValidationCategory::Policy,
+                "accepted {body}"
+            );
+        }
+        validate(svg(r##"<g fill="red" font-size="12" style="stroke: blue; text-anchor: middle"><rect width="10" height="10"/><text>Label<tspan alignment-baseline="middle">x</tspan></text></g><defs fill="green" font-family="sans-serif"><path id="p" d="M0 0L1 1"/><text id="t">Text</text><linearGradient color="blue"><stop stop-color="currentColor" stop-opacity="0.5"/></linearGradient></defs><use href="#p"/><use href="#t"/>"##).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn stylesheet_applicability_checks_selectors_without_rejecting_broad_rules() {
+        for body in [
+            r"<style>rect {stop-color:red}</style><rect/>",
+            r"<style>stop {fill:red}</style><linearGradient><stop/></linearGradient>",
+            r#"<style>#wrong {stop-opacity:0.5}</style><rect id="wrong"/>"#,
+            r#"<style>.wrong {font-size:12px}</style><rect class="wrong"/>"#,
+            r"<style>rect, stop {stop-color:red}</style><rect/><linearGradient><stop/></linearGradient>",
+        ] {
+            assert_eq!(
+                rejected(body).category,
+                ValidationCategory::Policy,
+                "accepted {body}"
+            );
+        }
+        validate(svg(r#"<style>* {stroke-linejoin:round; fill:red} .mixed {stop-color:blue} .text {font-size:12px} .unused {fill:green}</style><g class="text"><text>Label</text></g><rect class="mixed"/><linearGradient><stop class="mixed"/></linearGradient>"#).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn rejects_visual_children_outside_svg_content_models() {
+        for body in [
+            r#"<linearGradient id="g"><rect width="10" height="10" fill="red"/></linearGradient><rect width="10" height="10" fill="url(#g)"/>"#,
+            "<radialGradient><g><stop/></g></radialGradient>",
+            "<stop/>",
+            "<tspan>orphan</tspan>",
+            "<text><rect/></text>",
+            "<text><text>nested</text></text>",
+            "<text><tspan><path/></tspan></text>",
+            "<rect><g><circle/></g></rect>",
+            "<use><rect/></use>",
+            "<linearGradient><stop><rect/></stop></linearGradient>",
+            "<clipPath><g><rect/></g></clipPath>",
+            "<clipPath><linearGradient/></clipPath>",
+            "<title><text>nested</text></title>",
+            "<desc><rect/></desc>",
+            "<g>invisible raw text</g>",
+            "<linearGradient>ignored text</linearGradient>",
+            r##"<g id="g"><rect/></g><clipPath><use href="#g"/></clipPath>"##,
+        ] {
+            assert!(validate(svg(body).as_bytes()).is_err(), "accepted {body}");
+        }
+        validate(svg(r##"<title>Title</title><desc>Description</desc><defs><path id="p" d="M0 0L1 1"/><clipPath id="c"><title>Clip</title><use href="#p"/><text>Clip text<tspan>x</tspan></text></clipPath><linearGradient><title>Gradient</title><stop offset="0"><desc>Stop</desc></stop></linearGradient></defs><g><rect width="10" height="10"><title>Rectangle</title></rect><text>Text<tspan>Span<tspan>Nested span</tspan></tspan></text></g>"##).as_bytes()).unwrap();
     }
 }

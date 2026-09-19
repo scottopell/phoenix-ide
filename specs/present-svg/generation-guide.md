@@ -34,6 +34,8 @@ Matplotlib commonly emits a DOCTYPE and RDF metadata by default. Export without 
 
 References must resolve to a compatible element: fill/stroke paints and gradient `href` target linear or radial gradients; `clip-path` targets `clipPath`; `use` targets a group, shape, path, text, or another `use`. A matching ID alone is insufficient. Both gradient types may inherit shared gradient properties and stops from either gradient type.
 
+Inside `clipPath`, `use` must directly reference a shape/path or text, rather than a group or another `use`.
+
 Geometry attributes are element-specific:
 
 | Attributes | Supported elements |
@@ -49,12 +51,22 @@ Geometry attributes are element-specific:
 | `d` | `path` |
 | `points` | `polyline`, `polygon` |
 | `pathLength` (unitless) | `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon` |
-| `transform` | Root `svg`, `g`, shapes/paths, `text`, `tspan`, `use`, `clipPath` |
+| `transform` | Root `svg`, `g`, shapes/paths, `text`, `use`, `clipPath` |
 | `gradientTransform`, `gradientUnits`, `spreadMethod` | `linearGradient`, `radialGradient` |
 | `clipPathUnits` | `clipPath` |
 | `offset` | `stop` |
 
 Do not put geometry attributes on other elements: browsers may silently ignore them and produce a different visual from the one intended.
+
+## Content and presentation rules
+
+`svg`, `g`, and `defs` contain the supported graphics, definitions, gradients, clips, styles, titles and descriptions. Gradients contain `stop`, `title`, and `desc`. Text and spans contain text, nested `tspan`, `title`, and `desc`. Clips contain shapes/paths, text, `use`, `title`, and `desc`; groups are not supported inside clips. Shapes, `use`, and stops contain only `title` or `desc`. Titles, descriptions, and styles contain text only. Non-whitespace text outside text/span/style/title/description elements is rejected. In particular, putting a rectangle inside a gradient or a text element is an error.
+
+Presentation attributes and inline styles must apply to their element. `stop-color` and `stop-opacity` belong on stops; `fill` and `stroke` do not belong on stops. Font and text-layout properties belong on text/spans, with inherited properties also accepted on `svg`, `g`, `defs`, `clipPath`, and `use` as inheritance carriers. Paint/stroke properties similarly support graphics and inheritance carriers. `alignment-baseline` is supported on `tspan`; `overflow` on the root `svg`; `shape-rendering` on shapes or inheritance carriers; `vector-effect` on shapes, text, and `use`. Transform a text element or enclosing group rather than a `tspan`.
+
+Stylesheet applicability is checked for each selector and declaration. A selector that matches elements must include a compatible target; an element-name selector must name a compatible element even if none is present. Universal and shared-class rules may also match elements to which a property does not apply, provided the rule has a compatible target. This preserves ordinary rules such as Matplotlib's `* {stroke-linejoin: round}` while rejecting `rect {stop-color: red}` and `.stops {fill: red}` when that class selects only stops. Unmatched class/ID rules are permitted. These checks validate the supported profile; they do not claim that every rule visibly changes the rendered chart.
+
+The profile follows the [SVG property applicability and inheritance model](https://www.w3.org/TR/SVG11/propidx.html) and restricts accepted combinations explicitly rather than relying on a browser to discard unsupported declarations.
 
 ## Limits
 

@@ -23,7 +23,9 @@ AND SHALL accept only its documented static SVG element, attribute, and styling 
 AND SHALL reject scripts, event handlers, embedded HTML, navigation, animation, embedded image payloads, and external references in attributes or CSS
 AND SHALL preserve accepted visual content without silently stripping unsupported features.
 
-THE SYSTEM SHALL accept geometry attributes only on compatible elements, local references only to compatible resource types, and stylesheets only with the documented simple-selector grammar
+THE SYSTEM SHALL accept geometry and presentation attributes only on compatible elements, local references only to compatible resource types, and stylesheets only with the documented simple-selector grammar
+AND SHALL apply the same presentation-property restrictions to inline declarations and require each stylesheet selector with matches to have a compatible target for each declaration, while permitting broad selectors and inherited container styling
+AND SHALL enforce documented parent-child content models so visual elements and text cannot be placed where the SVG renderer ignores them
 AND SHALL require a validation-backed value at the storage publication boundary so unvalidated bytes and independently supplied dimensions cannot be published.
 
 THE SYSTEM SHALL support bounded local references for glyph reuse, clipping, and gradients
