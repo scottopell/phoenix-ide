@@ -67,6 +67,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
+| [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append selected text without taking selection focus | Accepted | Inline reaction draft insertion and selection ownership |
+| [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | Inline reaction presentation and keyboard access |
 | [058](058_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md) | Close retirement persists writer authority and atomically adopts retry evidence | Accepted | REQ-WL-002b/002c, REQ-BED-029, REQ-API-006; `AmbientWriterEvidenceRow`, `RetainedCleanupEvidenceAdoption` |
 | [059](059_legacy-fk787-close-retries-use-typed-runtime-reconciliation.md) | Legacy FK787 Close retries use typed runtime reconciliation | Accepted | REQ-WL-002b; Close retirement compatibility |
 
