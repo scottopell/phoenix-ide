@@ -2391,9 +2391,10 @@ rule ModeChangeNotification {
 --       admission: AutoContinuationAdmission
 --   ) -> Boolean
 --       True when the persisted actionable failure offers explicit retry or
---       fallback through ContinuationSuccessorOperationRuns with the same
---       predecessor summary, first-message identity, and generated-context
---       authority.
+--       fallback through ContinuationSuccessorOperationRunsWithPersistedWinner,
+--       preserving the reserved winner's exact bytes, identity, authority, user
+--       agent, and matching expansion policy. Before reservation it uses the
+--       admission's immutable generated payload and identity.
 --
 --   auto_continuation_successor_identity(
 --       admission: AutoContinuationAdmission

@@ -21,6 +21,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
+  const [currentCoordinatorId, setCurrentCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
 
   useEffect(() => {
     if (fixtureData) return;
@@ -30,6 +31,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     api.ensureGlobalCoordinator()
       .then((coordinator) => {
         if (cancelled) return;
+        setCurrentCoordinatorId(coordinator.conversation.id);
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
@@ -40,8 +42,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
               if (cancelled) return;
-              if (coordinator_id === slug && slug === coordinator.conversation.id) {
-                setResolvedCoordinatorId(coordinator_id);
+              if (coordinator_id) {
+                setResolvedCoordinatorId(slug);
               } else {
                 navigate(`/global/${coordinator.conversation.id}${location.search}${location.hash}`, { replace: true });
               }
@@ -66,7 +68,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
-      {!loading && !error && resolvedCoordinatorId && slug === resolvedCoordinatorId && (
+      {!loading && !error && resolvedCoordinatorId === slug && slug === currentCoordinatorId && (
         <div className="coordinator-page__automatic-continuation">
           <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
         </div>

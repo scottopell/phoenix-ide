@@ -198,6 +198,7 @@ describe('AutomaticContinuationControl', () => {
             message: 'Successor dispatch could not be accepted.',
             first_message_id: 'automatic-first-message',
             accepted_handoff: 'Persisted generated handoff',
+          opening_authority: 'generated_predecessor_context',
           },
         },
       }));
@@ -219,6 +220,7 @@ describe('AutomaticContinuationControl', () => {
           message: 'Dispatch failed.',
           first_message_id: 'automatic-first-message',
           accepted_handoff: 'Persisted generated handoff',
+          opening_authority: 'generated_predecessor_context',
         },
       },
     }));
@@ -250,6 +252,7 @@ describe('AutomaticContinuationControl', () => {
           message: 'Successor dispatch could not be accepted.',
           first_message_id: 'automatic-first-message',
           accepted_handoff: 'Persisted generated handoff',
+          opening_authority: 'generated_predecessor_context',
         },
       },
     }));

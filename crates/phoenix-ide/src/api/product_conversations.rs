@@ -216,18 +216,26 @@ async fn automatic_continuation_view(
                 .continuation_dispatch_intent(&admission.predecessor_conversation_id)
                 .await
                 .map_err(db_to_app)?;
-            let (first_message_id, accepted_handoff) = persisted_winner
-                .map(|intent| (intent.message_id.as_str().to_string(), intent.handoff))
+            let (first_message_id, accepted_handoff, opening_authority) = persisted_winner
+                .map(|intent| {
+                    (
+                        intent.message_id.as_str().to_string(),
+                        intent.handoff,
+                        intent.opening_authority,
+                    )
+                })
                 .unwrap_or_else(|| {
                     (
                         admission.first_message_id.as_str().to_string(),
                         summary.summary,
+                        admission.opening_authority,
                     )
                 });
             Some(AutomaticContinuationFailureView {
                 message,
                 first_message_id,
                 accepted_handoff,
+                opening_authority,
             })
         } else {
             None

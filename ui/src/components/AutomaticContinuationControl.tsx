@@ -172,13 +172,13 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
               <div role="alert" className="automatic-continuation__failure">
                 <span>{failedAdmission.actionable_failure.message}</span>
                 <pre>{failedAdmission.actionable_failure.accepted_handoff}</pre>
-                <span> Retry safely with the same persisted generated handoff and message identity. Automatic continuation remains enabled for future exhaustions.</span>
+                <span> Retry safely with the same persisted {failedAdmission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated handoff' : 'manual handoff'} and message identity. Automatic continuation remains enabled for future exhaustions.</span>
                 <button
                   type="button"
                   disabled={retrying}
                   onClick={() => { void retryFailedAdmission(); }}
                 >
-                  {retrying ? 'Retrying…' : 'Retry generated handoff'}
+                  {retrying ? 'Retrying…' : `Retry ${failedAdmission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated' : 'manual'} handoff`}
                 </button>
               </div>
             )}

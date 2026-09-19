@@ -328,6 +328,7 @@ pub struct AutomaticContinuationFailureView {
     pub message: String,
     pub first_message_id: String,
     pub accepted_handoff: String,
+    pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
