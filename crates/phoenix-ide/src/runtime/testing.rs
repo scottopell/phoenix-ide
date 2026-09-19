@@ -2066,7 +2066,7 @@ impl StateStore for InMemoryStorage {
         approval_message: &Message,
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
         self.persist_approved_task_authority(conv_id, approval)
             .await?;
         self.messages
@@ -2075,7 +2075,8 @@ impl StateStore for InMemoryStorage {
             .entry(conv_id.to_string())
             .or_default()
             .push(approval_message.clone());
-        self.update_state(conv_id, state, state_updated_at).await
+        self.update_state(conv_id, state, state_updated_at).await?;
+        Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(()))
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
