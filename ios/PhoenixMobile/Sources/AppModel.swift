@@ -1,9 +1,707 @@
 import Foundation
+import CryptoKit
 import Observation
 import UserNotifications
 
 /// Root composition: server settings, connectivity, API client, stores, and
 /// the active per-conversation sessions.
+
+@MainActor
+struct CoordinatorIdentityReceipt: Codable, Equatable, Sendable {
+    let persistenceScope: PersistenceScopeIdentity
+    let conversationId: String
+}
+
+@MainActor
+protocol CoordinatorIdentityStore {
+    func load(persistenceScope: PersistenceScopeIdentity) -> CoordinatorIdentityReceipt?
+    func save(_ receipt: CoordinatorIdentityReceipt)
+    func clear(persistenceScope: PersistenceScopeIdentity)
+    func clearAll()
+}
+
+@MainActor
+struct UserDefaultsCoordinatorIdentityStore: CoordinatorIdentityStore {
+    private let defaultsKey = "phoenix.coordinatorIdentityReceipts"
+
+    private func loadAll() -> [CoordinatorIdentityReceipt] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else { return [] }
+        return (try? JSONDecoder().decode([CoordinatorIdentityReceipt].self, from: data)) ?? []
+    }
+
+    private func saveAll(_ receipts: [CoordinatorIdentityReceipt]) {
+        guard let data = try? JSONEncoder().encode(receipts) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+
+    func load(persistenceScope: PersistenceScopeIdentity) -> CoordinatorIdentityReceipt? {
+        loadAll().first { $0.persistenceScope == persistenceScope }
+    }
+
+    func save(_ receipt: CoordinatorIdentityReceipt) {
+        var receipts = loadAll().filter { $0.persistenceScope != receipt.persistenceScope }
+        receipts.append(receipt)
+        saveAll(receipts)
+    }
+
+    func clear(persistenceScope: PersistenceScopeIdentity) {
+        saveAll(loadAll().filter { $0.persistenceScope != persistenceScope })
+    }
+
+    func clearAll() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+    }
+}
+
+enum HardDeleteFenceLoadResult: Equatable, Sendable {
+    case accessible([PersistedHardDeleteFence])
+    case inaccessible
+}
+
+struct PersistedHardDeleteFence: Codable, Equatable, Hashable, Sendable {
+    let persistenceScope: PersistenceScopeIdentity
+    let aggregateAuthority: String
+    let memberConversationIds: [String]
+
+    var storageName: String {
+        let identity = "\(persistenceScope.serverEndpoint)\u{1f}\(persistenceScope.credentialGeneration)\u{1f}\(aggregateAuthority)"
+        let digest = SHA256.hash(data: Data(identity.utf8))
+        return "hard-delete-" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private struct HardDeleteFenceRetryObligation: Hashable, Sendable {
+    let fence: PersistedHardDeleteFence
+}
+
+private struct PendingHardDeleteCleanup {
+    let configurationEpoch: Int
+    let configurationIdentity: APIConfigurationIdentity
+    var triggerConversationId: String?
+    var memberConversationIds: Set<String>
+    var fenceState: HardDeleteFenceState
+}
+
+enum HardDeleteFenceState: Sendable {
+    case needsCommit
+    case committed(PersistedHardDeleteFence)
+}
+
+struct HardDeleteCleanupContext: Sendable {
+    let configurationEpoch: Int
+    let configurationIdentity: APIConfigurationIdentity
+    let aggregateAuthority: String
+    let triggerConversationId: String?
+    let memberConversationIds: Set<String>
+    let fenceState: HardDeleteFenceState
+}
+
+struct PersistedOutboxOwner: Hashable {
+    let transcriptRowId: String
+    let aggregateAuthority: String?
+}
+
+struct PersistedMemberDiscovery: Equatable, Sendable {
+    var currentAuthorityMemberIds: Set<String>
+    var persistedOutboxOwnerIds: Set<String>
+
+    static let empty = PersistedMemberDiscovery(
+        currentAuthorityMemberIds: [],
+        persistedOutboxOwnerIds: [])
+}
+
+@MainActor
+protocol ConversationPersistenceStore {
+    var listPersistenceContext: VersionedDiskContext? { get }
+    var persistenceScope: PersistenceScopeIdentity? { get }
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner>
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner>
+    func hasCachedSnapshot(conversationId: String) -> Bool
+    func hasAuthoritativeCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) -> Bool
+    func inspectOutbox(conversationId: String) -> OutboxStoreInspection
+    func outboxPersistence(
+        conversationId: String,
+        aggregateAuthority: String?,
+        scope: PersistenceScopeIdentity
+    ) -> OutboxPersistenceHandle
+    func snapshotPersistence(conversationId: String) -> VersionedDiskWriter
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) -> Set<String>
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String>
+    func resetConversationListCache() async
+    func removePersistedConversationState(conversationId: String) async
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) async -> Bool
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool
+    func removeAllPersistedConversationState() async
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
+}
+
+extension ConversationPersistenceStore {
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        let members = persistedConversationIds(aggregateId: aggregateId, scope: scope)
+        let outboxOwners = await pendingOutboxOwners(scope: scope)
+        return PersistedMemberDiscovery(
+            currentAuthorityMemberIds: members,
+            persistedOutboxOwnerIds: Set(outboxOwners.compactMap {
+                $0.aggregateAuthority == aggregateId ? $0.transcriptRowId : nil
+            }))
+    }
+
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String> {
+        persistedConversationIds(aggregateId: aggregateId, scope: scope)
+    }
+
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool {
+        await removeAuthoritativePersistedConversationState(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority)
+    }
+}
+
+@MainActor
+struct DiskConversationPersistenceStore: ConversationPersistenceStore {
+    let baseDirectory: URL
+    let directory: URL
+    private let context: VersionedDiskContext
+    private let conversationListWriter: VersionedDiskWriter
+    let persistenceScope: PersistenceScopeIdentity?
+    var listPersistenceContext: VersionedDiskContext? { context }
+
+    init(baseDirectory: URL? = nil, context: VersionedDiskContext? = nil) {
+        let resolvedBaseDirectory = baseDirectory ?? DiskStore.baseDirectory
+        self.baseDirectory = resolvedBaseDirectory
+        self.directory = DiskStore.phoenixMobileDirectory(baseDirectory: resolvedBaseDirectory)
+        self.context = context ?? DiskStore.versionedContext(baseDirectory: resolvedBaseDirectory)
+        self.conversationListWriter = self.context.writer(name: "conversations", version: 2)
+        self.persistenceScope = nil
+    }
+
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
+        let schemaVersion = Outbox.schemaVersion
+        let directory = directory
+        return await Task.detached(priority: nil) {
+            Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name in
+                guard name.hasPrefix("outbox-") else { return nil }
+                let conversationId = String(name.dropFirst("outbox-".count))
+                guard !conversationId.isEmpty else { return nil }
+                let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+                switch DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: schemaVersion,
+                    migrate: { storedVersion, fileData in
+                        PersistedOutboxEnvelope.migrateLegacyEntries(
+                            storedVersion: storedVersion,
+                            fileData: fileData)
+                    })
+                {
+                case .missing:
+                    return nil
+                case .value(let envelope):
+                    guard envelope.scope == scope else { return nil }
+                    let hasVisiblePendingEntries = envelope.entries.contains {
+                        $0.conversationId == conversationId &&
+                        $0.isVisible &&
+                        $0.status == .pending &&
+                        !$0.acceptedByServer
+                    }
+                    return hasVisiblePendingEntries
+                        ? PersistedOutboxOwner(
+                            transcriptRowId: conversationId,
+                            aggregateAuthority: envelope.aggregateAuthority)
+                        : nil
+                case .incompatible, .unreadable:
+                    return nil
+                }
+            })
+        }.value
+    }
+
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> {
+        Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name in
+            guard name.hasPrefix("outbox-") else { return nil }
+            let conversationId = String(name.dropFirst("outbox-".count))
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            guard case .value(let envelope) = DiskStore.loadVersionedResult(
+                PersistedOutboxEnvelope.self,
+                source: source,
+                version: Outbox.schemaVersion,
+                migrate: { storedVersion, fileData in
+                    PersistedOutboxEnvelope.migrateLegacyEntries(
+                        storedVersion: storedVersion,
+                        fileData: fileData)
+                })
+            else {
+                return nil
+            }
+            guard envelope.scope == scope else { return nil }
+            return envelope.entries.contains {
+                $0.conversationId == conversationId &&
+                $0.isVisible &&
+                $0.status == .pending &&
+                !$0.acceptedByServer
+            } ? PersistedOutboxOwner(
+                transcriptRowId: conversationId,
+                aggregateAuthority: envelope.aggregateAuthority) : nil
+        })
+    }
+
+    func hasCachedSnapshot(conversationId: String) -> Bool {
+        let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        guard case .value(let snapshot) = DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: source,
+            version: ConversationSession.snapshotSchemaVersion)
+        else { return false }
+        return snapshot.conversation != nil && snapshot.syncedAt != nil
+    }
+
+    func hasCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Bool {
+        let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        guard case .value(let snapshot) = DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: source,
+            version: ConversationSession.snapshotSchemaVersion),
+            snapshot.conversation?.id == conversationId,
+            snapshot.syncedAt != nil
+        else { return false }
+        guard snapshot.conversation?.aggregateIdentity == aggregateAuthority else { return false }
+        if let authority = snapshot.authoritative {
+            return authority.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
+                && authority.aggregateAuthority == aggregateAuthority
+        }
+        return legacyScope == configurationIdentity.persistenceScope
+    }
+
+    func hasAuthoritativeCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) -> Bool {
+        let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        guard case .value(let snapshot) = DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: source,
+            version: ConversationSession.snapshotSchemaVersion),
+            snapshot.conversation?.id == conversationId,
+            snapshot.conversation?.aggregateIdentity == aggregateAuthority,
+            snapshot.syncedAt != nil,
+            snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope,
+            snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+        else { return false }
+        return true
+    }
+
+    func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
+        let source = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        switch DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: source,
+            version: Outbox.schemaVersion,
+            migrate: { storedVersion, fileData in
+                PersistedOutboxEnvelope.migrateLegacyEntries(
+                    storedVersion: storedVersion,
+                    fileData: fileData)
+            })
+        {
+        case .missing:
+            return OutboxStoreInspection(conversationId: conversationId, state: .missing)
+        case .value(let envelope):
+            return OutboxStoreInspection(
+                conversationId: conversationId,
+                state: .accessible(
+                    scope: envelope.scope,
+                    aggregateAuthority: envelope.aggregateAuthority,
+                    entries: envelope.entries))
+        case .incompatible:
+            return OutboxStoreInspection(conversationId: conversationId, state: .incompatibleNewerVersion)
+        case .unreadable:
+            return OutboxStoreInspection(conversationId: conversationId, state: .inaccessible)
+        }
+    }
+
+    func outboxPersistence(
+        conversationId: String,
+        aggregateAuthority: String?,
+        scope: PersistenceScopeIdentity
+    ) -> OutboxPersistenceHandle {
+        let source = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        let writer = context.writer(destinationURL: source, version: Outbox.schemaVersion)
+        return OutboxPersistenceHandle(
+            inspect: { requestedConversationId in
+                switch DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: Outbox.schemaVersion,
+                    migrate: { storedVersion, fileData in
+                        PersistedOutboxEnvelope.migrateLegacyEntries(
+                            storedVersion: storedVersion,
+                            fileData: fileData)
+                    })
+                {
+                case .missing:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .missing)
+                case .value(let envelope):
+                    return OutboxStoreInspection(
+                        conversationId: requestedConversationId,
+                        state: .accessible(
+                            scope: envelope.scope,
+                            aggregateAuthority: envelope.aggregateAuthority,
+                            entries: envelope.entries))
+                case .incompatible:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .incompatibleNewerVersion)
+                case .unreadable:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .inaccessible)
+                }
+            },
+            reserveRevision: { writer.reserveRevision() },
+            save: { envelope, revision in await writer.save(envelope, revision: revision) },
+            remove: { revision in await writer.remove(revision: revision) })
+    }
+
+    func snapshotPersistence(conversationId: String) -> VersionedDiskWriter {
+        let destination = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        return context.writer(destinationURL: destination, version: ConversationSession.snapshotSchemaVersion)
+    }
+
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        let schemaVersion = ConversationSession.snapshotSchemaVersion
+        let outboxSchemaVersion = Outbox.schemaVersion
+        let directory = directory
+        return await Task.detached(priority: nil) {
+            let snapshotIds = Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
+                guard name.hasPrefix("conv-") else { return nil }
+                let conversationId = String(name.dropFirst("conv-".count))
+                let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+                guard !conversationId.isEmpty,
+                      case .value(let snapshot) = DiskStore.loadVersionedResult(
+                        ConversationSession.PersistedSnapshot.self,
+                        source: source,
+                        version: schemaVersion),
+                      snapshot.conversation?.product_conversation_id == aggregateId,
+                      snapshot.conversation?.id == conversationId,
+                      snapshot.syncedAt != nil,
+                      snapshot.authoritative?.configurationIdentity.persistenceScope == scope,
+                      snapshot.authoritative?.aggregateAuthority == aggregateId
+                else { return nil }
+                return conversationId
+            })
+            let outboxIds = Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name -> String? in
+                guard name.hasPrefix("outbox-") else { return nil }
+                let conversationId = String(name.dropFirst("outbox-".count))
+                let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+                guard case .value(let envelope) = DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: outboxSchemaVersion),
+                    envelope.scope == scope,
+                    envelope.aggregateAuthority == aggregateId,
+                    envelope.entries.contains(where: {
+                        $0.conversationId == conversationId && $0.isVisible
+                    })
+                else { return nil }
+                return conversationId
+            })
+            return PersistedMemberDiscovery(
+                currentAuthorityMemberIds: snapshotIds,
+                persistedOutboxOwnerIds: outboxIds)
+        }.value
+    }
+
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) -> Set<String> {
+        persistedConversationIds(aggregateId: aggregateId, scope: scope, legacyScope: nil)
+    }
+
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String> {
+        let snapshotIds = Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
+            guard name.hasPrefix("conv-") else { return nil }
+            let conversationId = String(name.dropFirst("conv-".count))
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            let loaded: DiskStore.VersionedLoad<ConversationSession.PersistedSnapshot> = DiskStore.loadVersionedResult(
+                ConversationSession.PersistedSnapshot.self,
+                source: source,
+                version: ConversationSession.snapshotSchemaVersion)
+            guard !conversationId.isEmpty,
+                  case .value(let snapshot) = loaded,
+                  snapshot.conversation?.product_conversation_id == aggregateId,
+                  snapshot.conversation?.id == conversationId,
+                  snapshot.syncedAt != nil
+            else { return nil }
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == scope
+                && snapshot.authoritative?.aggregateAuthority == aggregateId
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == scope
+            return currentAuthorityMatches || provenLegacyMatches ? conversationId : nil
+        })
+        let outboxIds = Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name -> String? in
+            guard name.hasPrefix("outbox-") else { return nil }
+            let conversationId = String(name.dropFirst("outbox-".count))
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            guard case .value(let envelope) = DiskStore.loadVersionedResult(
+                PersistedOutboxEnvelope.self,
+                source: source,
+                version: Outbox.schemaVersion),
+                envelope.scope == scope,
+                envelope.aggregateAuthority == aggregateId,
+                envelope.entries.contains(where: { $0.conversationId == conversationId && $0.isVisible })
+            else { return nil }
+            return conversationId
+        })
+        return snapshotIds.union(outboxIds)
+    }
+
+    func resetConversationListCache() async {
+        let revision = conversationListWriter.reserveRevision()
+        await conversationListWriter.remove(revision: revision)
+    }
+
+    func removePersistedConversationState(conversationId: String) async {
+        let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        let snapshotWriter = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
+        let outboxWriter = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+        await snapshotWriter.remove(revision: snapshotWriter.reserveRevision())
+        await outboxWriter.remove(revision: outboxWriter.reserveRevision())
+    }
+
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) async -> Bool {
+        await removeAuthoritativePersistedConversationState(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority,
+            legacyScope: nil)
+    }
+
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool {
+        let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        let snapshotWriter = context.writer(
+            destinationURL: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
+        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
+        switch DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
+        {
+        case .missing:
+            await snapshotWriter.remove(revision: snapshotRemovalRevision)
+        case .value(let snapshot):
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
+                && snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == configurationIdentity.persistenceScope
+                && snapshot.conversation?.aggregateIdentity == aggregateAuthority
+            if snapshot.conversation?.id == conversationId,
+               currentAuthorityMatches || provenLegacyMatches
+            {
+                await snapshotWriter.remove(revision: snapshotRemovalRevision)
+            } else {
+                await snapshotWriter.fence(revision: snapshotRemovalRevision)
+            }
+        case .incompatible, .unreadable:
+            await snapshotWriter.fence(revision: snapshotRemovalRevision)
+            return false
+        }
+
+        let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        let outboxWriter = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+        let outboxRemovalRevision = outboxWriter.reserveRevision()
+        switch DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: outboxSource,
+            version: Outbox.schemaVersion)
+        {
+        case .missing:
+            await outboxWriter.remove(revision: outboxRemovalRevision)
+        case .value(let envelope):
+            if envelope.scope == configurationIdentity.persistenceScope,
+               envelope.aggregateAuthority == aggregateAuthority
+            {
+                await outboxWriter.remove(revision: outboxRemovalRevision)
+            } else {
+                await outboxWriter.fence(revision: outboxRemovalRevision)
+            }
+        case .incompatible, .unreadable:
+            await outboxWriter.fence(revision: outboxRemovalRevision)
+            return false
+        }
+
+        let snapshotResolved: Bool
+        switch DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
+        {
+        case .missing: snapshotResolved = true
+        case .value(let snapshot):
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
+                && snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == configurationIdentity.persistenceScope
+                && snapshot.conversation?.aggregateIdentity == aggregateAuthority
+            snapshotResolved = !(currentAuthorityMatches || provenLegacyMatches)
+        case .incompatible, .unreadable: snapshotResolved = false
+        }
+        let outboxResolved: Bool
+        switch DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: outboxSource,
+            version: Outbox.schemaVersion)
+        {
+        case .missing: outboxResolved = true
+        case .value(let envelope):
+            outboxResolved = envelope.scope != configurationIdentity.persistenceScope
+                || envelope.aggregateAuthority != aggregateAuthority
+        case .incompatible, .unreadable: outboxResolved = false
+        }
+        return snapshotResolved && outboxResolved
+    }
+
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+        let source = directory
+            .appendingPathComponent(fence.storageName)
+            .appendingPathExtension("json")
+        let writer = context.writer(destinationURL: source, version: 1)
+        return await writer.save(fence, revision: writer.reserveRevision())
+    }
+
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
+        var fences: [PersistedHardDeleteFence] = []
+        for name in DiskStore.names(in: directory, withPrefix: "hard-delete-") {
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            switch DiskStore.loadVersionedResult(
+                PersistedHardDeleteFence.self,
+                source: source,
+                version: 1)
+            {
+            case .missing:
+                continue
+            case .value(let fence):
+                if fence.persistenceScope == persistenceScope {
+                    fences.append(fence)
+                }
+            case .incompatible, .unreadable:
+                return .inaccessible
+            }
+        }
+        return .accessible(fences)
+    }
+
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        let source = directory.appendingPathComponent(fence.storageName).appendingPathExtension("json")
+        let writer = context.writer(destinationURL: source, version: 1)
+        await writer.remove(revision: writer.reserveRevision())
+    }
+
+    func removeAllPersistedConversationState() async {
+        await context.removeAllAndWait()
+    }
+}
+
+protocol CredentialStore {
+    func loadLegacyPassword(account: String) -> String?
+    func loadRecord(account: String) -> AppModel.CredentialRecord?
+    func saveRecord(_ record: AppModel.CredentialRecord, account: String) throws
+    func deleteRecord(account: String)
+}
+
+extension CredentialStore {
+    func loadLegacyPassword(account: String) -> String? { nil }
+}
+
+struct KeychainCredentialStore: CredentialStore {
+    func loadLegacyPassword(account: String) -> String? {
+        Keychain.password(account: account)
+    }
+
+    func loadRecord(account: String) -> AppModel.CredentialRecord? {
+        guard let data = Keychain.data(account: account),
+              case .value(let record) = DiskStore.loadVersionedResult(
+                  AppModel.CredentialRecord.self,
+                  fileData: data,
+                  version: AppModel.credentialRecordVersion)
+        else { return nil }
+        return record
+    }
+
+    func saveRecord(_ record: AppModel.CredentialRecord, account: String) throws {
+        try Keychain.setData(
+            DiskStore.encodeVersioned(record, version: AppModel.credentialRecordVersion),
+            account: account)
+    }
+
+    func deleteRecord(account: String) {
+        Keychain.delete(account: account)
+    }
+}
+
+enum ConversationNavigationDestination: Hashable {
+    case aggregate(aggregateId: String, initialTranscriptRowId: String)
+    case ordinary(transcriptRowId: String)
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -11,26 +709,36 @@ final class AppModel {
 
     private static let serverURLKey = "phoenix.serverURL"
     private static let trustSelfSignedKey = "phoenix.trustSelfSigned"
-    private static let passwordAccount = "server-password"
+    nonisolated fileprivate static let credentialRecordAccount = "server-credentials"
+    nonisolated fileprivate static let legacyPasswordAccount = "server-password"
     /// Shared with NewConversationView's @AppStorage. Cleared on sign-out:
     /// the value is a server-local filesystem path and must not leak (or be
     /// sent) to a different server configured later.
     static let lastCwdKey = "phoenix.lastCwd"
-    private static let coordinatorIdKey = "phoenix.coordinatorConversationId"
+
+    private var configurationMutationDepth = 0
+    private var signOutInProgress = false
 
     var serverURLString: String {
         didSet {
             UserDefaults.standard.set(serverURLString, forKey: Self.serverURLKey)
-            rebuildAPI()
+            rebuildAPIAfterConfigurationMutationIfNeeded()
         }
     }
 
     private(set) var password: String
+    private(set) var credentialGeneration: String
+    private var credentialMigrationBlocked = false
+    private let legacySnapshotPersistenceScope: PersistenceScopeIdentity?
+
+    var configurationIdentity: APIConfigurationIdentity? {
+        api?.configurationIdentity
+    }
 
     var trustSelfSigned: Bool {
         didSet {
             UserDefaults.standard.set(trustSelfSigned, forKey: Self.trustSelfSignedKey)
-            rebuildAPI()
+            rebuildAPIAfterConfigurationMutationIfNeeded()
         }
     }
 
@@ -41,7 +749,7 @@ final class AppModel {
     // MARK: - Services
 
     let connectivity = ConnectivityMonitor()
-    let listStore = ConversationListStore()
+    let listStore: ConversationListStore
     private(set) var api: PhoenixAPI?
     /// Invalidates responses started with earlier server credentials or URL.
     private var apiGeneration = 0
@@ -53,64 +761,437 @@ final class AppModel {
     /// is not open. Retaining one per conversation serializes every trigger
     /// through the session's single drain task.
     private var drainSessions: [String: ConversationSession] = [:]
+    private let hasCachedSnapshot: (String) -> Bool
+    private let conversationPersistenceStore: ConversationPersistenceStore
+    private let coordinatorIdentityStore: CoordinatorIdentityStore
+    private let credentialStore: CredentialStore
+    private var persistedOutboxHydrated = false
+    private var startupDrainGeneration = 0
+    private var startupHardDeleteRecoveryTask: Task<Void, Never>?
+    private var lastCompletedDrainGeneration = 0
+    private var persistedOutboxDrainTask: Task<Void, Never>?
+    private var persistedOutboxDrainTaskGeneration: Int?
+    private var persistedOutboxDrainAuthorityGeneration = 0
+    private var hardDeleteCleanupGenerationByConversationId: [String: Int] = [:]
+    private var hardDeleteCleanupWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var completedHardDeleteCleanupGenerations: Set<Int> = []
+    private var hardDeletedConversationIds: Set<String> = []
+    private var hardDeletedAggregateAuthorities: Set<String> = []
+    private var hardDeleteFenceRetryObligations: Set<HardDeleteFenceRetryObligation> = []
+    private var pendingHardDeleteCleanups: [String: PendingHardDeleteCleanup] = [:]
 
-    init() {
-        serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
-        password = Keychain.password(account: Self.passwordAccount) ?? ""
+    private var nextHardDeleteCleanupGeneration = 0
+
+    static func randomCredentialGenerationForTestsAndDefaults() -> String {
+        let bytes = (0..<16).map { _ in UInt8.random(in: .min ... .max) }
+        return Data(bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func ephemeralCredentialGeneration() -> String {
+        UUID().uuidString.lowercased()
+    }
+
+    struct CredentialRecord: Codable, Equatable, Sendable {
+        let password: String
+        let generation: String
+    }
+
+    nonisolated fileprivate static let credentialRecordVersion = 1
+
+    private static func mintedCredentialGeneration() -> String {
+        randomCredentialGenerationForTestsAndDefaults()
+    }
+
+    private static func loadCredentialRecord(from credentialStore: CredentialStore) -> CredentialRecord? {
+        credentialStore.loadRecord(account: Self.credentialRecordAccount)
+    }
+
+    private static func saveCredentialRecord(_ record: CredentialRecord, to credentialStore: CredentialStore) throws {
+        try credentialStore.saveRecord(record, account: Self.credentialRecordAccount)
+    }
+
+    private static func migrateLegacyCredentialIfNeeded(
+        persistedServerURL: String,
+        credentialStore: CredentialStore
+    ) -> (record: CredentialRecord?, legacyScope: PersistenceScopeIdentity?, blocked: Bool) {
+        if let record = loadCredentialRecord(from: credentialStore) {
+            return (record, nil, false)
+        }
+        guard let legacyPassword = credentialStore.loadLegacyPassword(account: Self.legacyPasswordAccount) else {
+            return (nil, nil, false)
+        }
+        let record = CredentialRecord(
+            password: legacyPassword,
+            generation: mintedCredentialGeneration())
+        let legacyScope = PersistenceScopeIdentity(
+            serverURL: persistedServerURL,
+            credentialGeneration: record.generation)
+        do {
+            try saveCredentialRecord(record, to: credentialStore)
+            credentialStore.deleteRecord(account: Self.legacyPasswordAccount)
+        } catch {
+            NSLog("Phoenix legacy credential migration could not persist versioned record")
+            return (nil, nil, true)
+        }
+        return (record, legacyScope, false)
+    }
+
+    init(
+        hasCachedSnapshot: ((String) -> Bool)? = nil,
+        conversationPersistenceStore: ConversationPersistenceStore? = nil,
+        coordinatorIdentityStore: CoordinatorIdentityStore? = nil,
+        credentialStore: CredentialStore = KeychainCredentialStore()
+    ) {
+        self.conversationPersistenceStore = conversationPersistenceStore ?? DiskConversationPersistenceStore()
+        self.hasCachedSnapshot = hasCachedSnapshot ?? self.conversationPersistenceStore.hasCachedSnapshot(conversationId:)
+        productConversationDetails = [:]
+        self.coordinatorIdentityStore = coordinatorIdentityStore ?? UserDefaultsCoordinatorIdentityStore()
+        self.credentialStore = credentialStore
+        let listContext = self.conversationPersistenceStore.listPersistenceContext ?? DiskStore.versionedContext()
+        listStore = ConversationListStore(hasCachedSnapshot: self.hasCachedSnapshot, context: listContext)
+        let persistedServerURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
+        serverURLString = persistedServerURL
+        let migratedCredential = Self.migrateLegacyCredentialIfNeeded(
+            persistedServerURL: persistedServerURL,
+            credentialStore: credentialStore)
+        password = migratedCredential.record?.password ?? ""
+        credentialGeneration = migratedCredential.record?.generation ?? ""
+        credentialMigrationBlocked = migratedCredential.blocked
+        legacySnapshotPersistenceScope = migratedCredential.legacyScope
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         attention = AttentionMonitor(
             currentConversations: listStore.conversations,
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.drainPersistedOutboxes()
-            Task { await self?.refreshList() }
+            guard let self, !self.signOutInProgress else { return }
+            self.scheduleDeliveryTrigger(.connectivityRestore)
+            Task { [weak self] in
+                guard let self, !self.signOutInProgress else { return }
+                await self.refreshList()
+            }
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
+        if let api,
+           self.coordinatorIdentityStore.load(persistenceScope: api.configurationIdentity.persistenceScope) == nil,
+           let legacyId = UserDefaults.standard.string(forKey: "phoenix.coordinatorConversationId")
+        {
+            self.coordinatorIdentityStore.save(.init(
+                persistenceScope: api.configurationIdentity.persistenceScope,
+                conversationId: legacyId))
+            UserDefaults.standard.removeObject(forKey: "phoenix.coordinatorConversationId")
+        }
+        coordinatorConversationId = api.flatMap {
+            self.coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
+        }
+        finishStartupHydration()
+    }
+
+    private func finishStartupHydration() {
+        guard startupHardDeleteRecoveryTask == nil, let api else { return }
+        let identity = api.configurationIdentity
+        let generation = apiGeneration
+        let fences: Set<PersistedHardDeleteFence>
+        switch conversationPersistenceStore.hardDeleteFences(persistenceScope: identity.persistenceScope) {
+        case .accessible(let loaded):
+            let pending = hardDeleteFenceRetryObligations
+                .map(\.fence)
+                .filter { $0.persistenceScope == identity.persistenceScope }
+            fences = Set(loaded).union(pending)
+        case .inaccessible:
+            persistedOutboxHydrated = false
+            return
+        }
+        hardDeletedConversationIds.formUnion(fences.flatMap(\.memberConversationIds))
+        hardDeletedAggregateAuthorities.formUnion(fences.map(\.aggregateAuthority))
+        guard !fences.isEmpty else {
+            persistedOutboxHydrated = true
+            schedulePersistedOutboxDrain()
+            return
+        }
+        startupHardDeleteRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.apiGeneration == generation,
+                   self.api?.configurationIdentity == identity {
+                    self.startupHardDeleteRecoveryTask = nil
+                }
+            }
+            for fence in fences {
+                let retry = HardDeleteFenceRetryObligation(fence: fence)
+                if self.hardDeleteFenceRetryObligations.contains(retry) {
+                    guard await self.conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                        self.persistedOutboxHydrated = false
+                        return
+                    }
+                    self.hardDeleteFenceRetryObligations.remove(retry)
+                }
+                await self.completePersistedHardDeleteFence(fence)
+            }
+            guard !Task.isCancelled,
+                  self.apiGeneration == generation,
+                  self.api?.configurationIdentity == identity else { return }
+            self.persistedOutboxHydrated = true
+            self.schedulePersistedOutboxDrain()
+        }
+    }
+
+    private enum DeliveryTrigger {
+        case connectivityRestore
+        case foreground
+    }
+
+    private func resumeAfterDeliveryTrigger(_ trigger: DeliveryTrigger) async {
+        let classifiedOnThisTrigger = !persistedOutboxHydrated
+        if classifiedOnThisTrigger {
+            finishStartupHydration()
+            await startupHardDeleteRecoveryTask?.value
+        }
+        guard persistedOutboxHydrated else { return }
+        for session in sessions.values {
+            switch trigger {
+            case .connectivityRestore:
+                session.resyncAfterConnectivityRestore()
+            case .foreground:
+                session.resyncAfterForeground()
+            }
+        }
+        if !classifiedOnThisTrigger {
+            schedulePersistedOutboxDrain()
+        }
+    }
+
+    private func completePersistedHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        guard let identity = api?.configurationIdentity,
+              identity.persistenceScope == fence.persistenceScope else { return }
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: identity,
+            aggregateAuthority: fence.aggregateAuthority,
+            triggerConversationId: nil,
+            memberConversationIds: Set(fence.memberConversationIds),
+            fenceState: .committed(fence)))
+    }
+
+    private func schedulePersistedOutboxDrain() {
+        startupDrainGeneration &+= 1
+        triggerPersistedOutboxDrainIfNeeded()
+    }
+
+    private func cancelPersistedOutboxDrainAuthority() {
+        persistedOutboxDrainAuthorityGeneration &+= 1
+        persistedOutboxDrainTask?.cancel()
+        persistedOutboxDrainTask = nil
+        persistedOutboxDrainTaskGeneration = nil
+    }
+
+    private func triggerPersistedOutboxDrainIfNeeded() {
+        guard !signOutInProgress,
+              persistedOutboxHydrated,
+              connectivity.isOnline,
+              api != nil,
+              persistedOutboxDrainTask == nil,
+              lastCompletedDrainGeneration < startupDrainGeneration
+        else { return }
+        let generation = startupDrainGeneration
+        let authorityGeneration = persistedOutboxDrainAuthorityGeneration
+        let apiIdentity = api?.configurationIdentity
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runPersistedOutboxDrain(
+                generation: generation,
+                authorityGeneration: authorityGeneration,
+                apiIdentity: apiIdentity)
+        }
+        persistedOutboxDrainTaskGeneration = generation
+        persistedOutboxDrainTask = task
+    }
+
+    private func runPersistedOutboxDrain(
+        generation: Int,
+        authorityGeneration: Int,
+        apiIdentity: APIConfigurationIdentity?
+    ) async {
+        guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+              api?.configurationIdentity == apiIdentity
+        else { return finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration) }
+        let drainedConversationIds = Set(await drainPersistedOutboxes(
+            authorityGeneration: authorityGeneration,
+            apiIdentity: apiIdentity))
+        guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+              api?.configurationIdentity == apiIdentity
+        else { return finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration) }
+        let joinedConversationIds = drainedConversationIds.union(Set(sessions.keys))
+        for conversationId in joinedConversationIds {
+            guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+                  api?.configurationIdentity == apiIdentity
+            else { return finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration) }
+            let session = drainSessions[conversationId] ?? sessions[conversationId]
+            guard let session,
+                  let drainGeneration = session.drainOutbox()
+            else { continue }
+            _ = await session.awaitDrainOutbox(generation: drainGeneration)
+            guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+                  api?.configurationIdentity == apiIdentity
+            else { return finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration) }
+            _ = await session.outbox.flushPersistence()
+        }
+        guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+              api?.configurationIdentity == apiIdentity
+        else { return finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration) }
+        lastCompletedDrainGeneration = max(lastCompletedDrainGeneration, generation)
+        finishPersistedOutboxDrain(generation: generation, authorityGeneration: authorityGeneration)
+    }
+
+    private func finishPersistedOutboxDrain(generation: Int, authorityGeneration: Int) {
+        if persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+           persistedOutboxDrainTaskGeneration == generation
+        {
+            persistedOutboxDrainTask = nil
+            persistedOutboxDrainTaskGeneration = nil
+            triggerPersistedOutboxDrainIfNeeded()
+        }
+    }
+
+    private func rebuildAPIAfterConfigurationMutationIfNeeded() {
+        guard configurationMutationDepth == 0 else { return }
+        rebuildAPI()
+    }
+
+    private func performAtomicConfigurationMutation(_ body: () throws -> Void) rethrows {
+        configurationMutationDepth += 1
+        defer {
+            configurationMutationDepth -= 1
+            if configurationMutationDepth == 0 {
+                rebuildAPI()
+            }
+        }
+        try body()
     }
 
     private func rebuildAPI() {
+        guard !signOutInProgress else { return }
+
+        cancelPersistedOutboxDrainAuthority()
+        startupHardDeleteRecoveryTask?.cancel()
+        startupHardDeleteRecoveryTask = nil
+        persistedOutboxHydrated = false
         apiGeneration += 1
-        guard let url = URL(string: serverURLString), url.host != nil else {
-            api = nil
-            return
+        let configuredAPI: PhoenixAPI?
+        if !credentialMigrationBlocked,
+           let url = URL(string: serverURLString), url.host != nil {
+            configuredAPI = PhoenixAPI(
+                baseURL: url,
+                password: password.isEmpty ? nil : password,
+                allowSelfSigned: trustSelfSigned,
+                configurationIdentity: APIConfigurationIdentity(
+                    serverURL: url.absoluteString,
+                    credentialGeneration: credentialGeneration,
+                    trustSelfSigned: trustSelfSigned))
+        } else {
+            configuredAPI = nil
         }
-        let rebuiltAPI = PhoenixAPI(
-            baseURL: url,
-            password: password.isEmpty ? nil : password,
-            allowSelfSigned: trustSelfSigned)
-        api = rebuiltAPI
-        guard let rebuiltAPI else { return }
-        for session in sessions.values { session.replaceAPI(rebuiltAPI) }
-        for session in drainSessions.values { session.replaceAPI(rebuiltAPI) }
+        let previousConfigurationIdentity = api?.configurationIdentity
+        api = configuredAPI
+        if previousConfigurationIdentity?.persistenceScope != configuredAPI?.configurationIdentity.persistenceScope {
+            hardDeletedConversationIds.removeAll()
+            hardDeletedAggregateAuthorities.removeAll()
+        }
+        sessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        drainSessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        sessions.removeAll()
+        drainSessions.removeAll()
+        let cachedDetails = Array(productConversationDetails.values)
+        productConversationDetails.removeAll()
+        for detail in cachedDetails {
+            detail.invalidateConfiguration()
+        }
+        if let previousConfigurationIdentity,
+           configuredAPI?.configurationIdentity.persistenceScope != previousConfigurationIdentity.persistenceScope
+        {
+            coordinatorIdentityStore.clear(persistenceScope: previousConfigurationIdentity.persistenceScope)
+        }
+        coordinatorConversationId = configuredAPI.flatMap {
+            coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
+        }
+        guard configuredAPI != nil else { return }
+        finishStartupHydration()
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
-        try Keychain.setPassword(password, account: Self.passwordAccount)
-        self.password = password
-        self.trustSelfSigned = trustSelfSigned
-        serverURLString = serverURL
+        let nextCredentialGeneration = Self.mintedCredentialGeneration()
+        let record = CredentialRecord(password: password, generation: nextCredentialGeneration)
+        try Self.saveCredentialRecord(record, to: credentialStore)
+        performAtomicConfigurationMutation {
+            self.password = record.password
+            self.credentialGeneration = record.generation
+            self.credentialMigrationBlocked = false
+            self.trustSelfSigned = trustSelfSigned
+            self.serverURLString = serverURL
+        }
     }
 
-    func session(for conversationId: String) -> ConversationSession? {
+    func session(for conversationId: String, aggregateAuthority: String? = nil) -> ConversationSession? {
         guard let api else { return nil }
+        guard !hardDeletedConversationIds.contains(conversationId),
+              aggregateAuthority.map({ !hardDeletedAggregateAuthorities.contains($0) }) ?? true
+        else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
             self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
         }
-        let onHardDeleted: (String) -> Void = { [weak self] deletedId in
-            self?.handleHardDeleted(deletedId, aggregateIdentity: self?.aggregateIdentity(forTranscriptRowId: conversationId))
+        let onHardDeleted: @MainActor (ConversationSession.HardDeleteContext) async -> Void = { [weak self] context in
+            await self?.handleHardDeleted(context)
         }
+        let expectedAggregateAuthority = aggregateAuthority ?? aggregateIdentity(forTranscriptRowId: conversationId) ?? conversationId
         let session: ConversationSession
         if let draining = drainSessions.removeValue(forKey: conversationId) {
-            draining.adoptOpenOwnership(
-                onConversationUpdate: onConversationUpdate,
-                onHardDeleted: onHardDeleted)
-            session = draining
+            if draining.aggregateAuthorityIdentity == expectedAggregateAuthority {
+                draining.adoptOpenOwnership(
+                    onConversationUpdate: onConversationUpdate,
+                    onHardDeleted: onHardDeleted)
+                session = draining
+            } else {
+                draining.revokeConfigurationForReplacement()
+                session = ConversationSession(
+                    conversationId: conversationId,
+                    api: api,
+                    connectivity: connectivity,
+                    outboxPersistence: conversationPersistenceStore.outboxPersistence(
+                        conversationId: conversationId,
+                        aggregateAuthority: expectedAggregateAuthority,
+                        scope: api.configurationIdentity.persistenceScope),
+                    snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
+                    retryTiming: LiveSessionTiming(),
+                    staleCheckTiming: LiveSessionTiming(),
+                    deliveryTriggerAllowed: { [weak self] in
+                        self?.persistedOutboxHydrated == true
+                            && self?.signOutInProgress == false
+                    },
+                    legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
+                    aggregateAuthority: expectedAggregateAuthority,
+                    onConversationUpdate: onConversationUpdate,
+                    onHardDeleted: onHardDeleted)
+            }
         } else {
             session = ConversationSession(
-                conversationId: conversationId, api: api, connectivity: connectivity,
+                conversationId: conversationId,
+                api: api,
+                connectivity: connectivity,
+                outboxPersistence: conversationPersistenceStore.outboxPersistence(
+                    conversationId: conversationId,
+                    aggregateAuthority: expectedAggregateAuthority,
+                    scope: api.configurationIdentity.persistenceScope),
+                snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
+                retryTiming: LiveSessionTiming(),
+                staleCheckTiming: LiveSessionTiming(),
+                deliveryTriggerAllowed: { [weak self] in
+                    self?.persistedOutboxHydrated == true
+                        && self?.signOutInProgress == false
+                },
+                legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
+                aggregateAuthority: expectedAggregateAuthority,
                 onConversationUpdate: onConversationUpdate,
                 onHardDeleted: onHardDeleted)
         }
@@ -119,7 +1200,26 @@ final class AppModel {
     }
 
     private func aggregateIdentity(forTranscriptRowId transcriptRowId: String) -> String? {
-        listStore.aggregateId(forTranscriptRowId: transcriptRowId)
+        if let aggregateId = listStore.aggregateId(forTranscriptRowId: transcriptRowId) {
+            return aggregateId
+        }
+        if let aggregateId = productConversationDetails.first(where: {
+            $0.value.aggregateMemberTranscriptRowIds.contains(transcriptRowId)
+        })?.key {
+            return aggregateId
+        }
+        let persistedAggregateIds = Set(listStore.transcriptToAggregate.values)
+            .union(productConversationDetails.keys)
+        guard let scope = api?.configurationIdentity.persistenceScope else { return nil }
+        for aggregateId in persistedAggregateIds {
+            if conversationPersistenceStore.persistedConversationIds(
+                aggregateId: aggregateId,
+                scope: scope).contains(transcriptRowId)
+            {
+                return aggregateId
+            }
+        }
+        return nil
     }
 
     private func mergeAggregateProjection(
@@ -151,9 +1251,10 @@ final class AppModel {
     }
 
     private func handleSessionConversationUpdate(_ conversation: Conversation, transcriptRowId: String) {
-        guard let aggregateIdentity = aggregateIdentity(forTranscriptRowId: transcriptRowId),
-              let existing = listStore.conversations.first(where: { $0.aggregateIdentity == aggregateIdentity })
-        else {
+        let aggregateIdentity = conversation.aggregateIdentity
+        guard let existing = listStore.conversations.first(where: {
+            $0.aggregateIdentity == aggregateIdentity
+        }) else {
             listStore.upsert(conversation)
             return
         }
@@ -162,31 +1263,208 @@ final class AppModel {
                 existing: existing,
                 liveUpdate: conversation,
                 aggregateIdentity: aggregateIdentity))
+        listStore.registerTranscriptAlias(
+            transcriptRowId: transcriptRowId,
+            aggregateId: aggregateIdentity)
     }
 
-    private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
-        let notificationId: String
-        if let aggregateIdentity {
-            listStore.remove(aggregateId: aggregateIdentity)
-            notificationId = aggregateIdentity
-        } else {
-            listStore.removeByTranscriptRowId(conversationId)
-            notificationId = conversationId
+    private func invalidateSuccessorCardinality(_ latestByAggregate: [String: String]) {
+        for (aggregateId, latestTranscriptRowId) in latestByAggregate {
+            guard let detail = productConversationDetails[aggregateId],
+                  let detailLatest = detail.latestTranscriptRowId,
+                  detailLatest != latestTranscriptRowId
+            else { continue }
+            detail.markCardinalityStaleAndRefreshIfActive()
         }
-        if pendingOpenConversationId == conversationId {
+    }
+
+    private func handleAggregateHardDeleted(
+        aggregateId: String,
+        transcriptRowId: String?,
+        segmentTranscriptRowIds: Set<String>
+    ) async {
+        guard let api else { return }
+        let persistedMembers = conversationPersistenceStore.persistedConversationIds(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope,
+            legacyScope: legacySnapshotPersistenceScope)
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope)
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
+            aggregate == aggregateId ? id : nil
+        })
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: api.configurationIdentity,
+            aggregateAuthority: aggregateId,
+            triggerConversationId: transcriptRowId,
+            memberConversationIds: persistedMembers
+                .union(discovery.currentAuthorityMemberIds)
+                .union(discovery.persistedOutboxOwnerIds)
+                .union(listMembers)
+                .union(segmentTranscriptRowIds)
+                .union(Set([transcriptRowId].compactMap { $0 })),
+            fenceState: .needsCommit))
+    }
+
+    private func runHardDeleteCleanup(_ context: HardDeleteCleanupContext) async {
+        if var pending = pendingHardDeleteCleanups[context.aggregateAuthority] {
+            guard pending.configurationEpoch == context.configurationEpoch,
+                  pending.configurationIdentity == context.configurationIdentity
+            else { return }
+            let expanded = !context.memberConversationIds.isSubset(of: pending.memberConversationIds)
+            pending.memberConversationIds.formUnion(context.memberConversationIds)
+            if expanded {
+                pending.fenceState = .needsCommit
+            }
+            if pending.triggerConversationId == nil {
+                pending.triggerConversationId = context.triggerConversationId
+            }
+            pendingHardDeleteCleanups[context.aggregateAuthority] = pending
+            hardDeletedConversationIds.formUnion(context.memberConversationIds)
+            return
+        }
+        pendingHardDeleteCleanups[context.aggregateAuthority] = .init(
+            configurationEpoch: context.configurationEpoch,
+            configurationIdentity: context.configurationIdentity,
+            triggerConversationId: context.triggerConversationId,
+            memberConversationIds: context.memberConversationIds,
+            fenceState: context.fenceState)
+        defer { pendingHardDeleteCleanups.removeValue(forKey: context.aggregateAuthority) }
+
+        func contextIsCurrent() -> Bool {
+            apiGeneration == context.configurationEpoch
+                && api?.configurationIdentity == context.configurationIdentity
+        }
+
+        while let pending = pendingHardDeleteCleanups[context.aggregateAuthority] {
+            let fence: PersistedHardDeleteFence
+            switch pending.fenceState {
+            case .needsCommit:
+                fence = PersistedHardDeleteFence(
+                    persistenceScope: pending.configurationIdentity.persistenceScope,
+                    aggregateAuthority: context.aggregateAuthority,
+                    memberConversationIds: pending.memberConversationIds.sorted())
+                guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                    NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
+                    hardDeleteFenceRetryObligations.insert(.init(fence: fence))
+                    hardDeletedConversationIds.formUnion(fence.memberConversationIds)
+                    persistedOutboxHydrated = false
+                    return
+                }
+                guard contextIsCurrent() else {
+                    finishStartupHydration()
+                    return
+                }
+            case .committed(let persisted):
+                fence = persisted
+            }
+
+            let memberIds = Set(fence.memberConversationIds)
+            guard pendingHardDeleteCleanups[context.aggregateAuthority]?.memberConversationIds == memberIds else {
+                continue
+            }
+        let cleanupGeneration = beginHardDeleteCleanup(conversationIds: memberIds)
+        productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
+        productConversationDetails.removeValue(forKey: context.aggregateAuthority)
+        for id in memberIds {
+            sessions.removeValue(forKey: id)?.revokeForHardDelete()
+            drainSessions.removeValue(forKey: id)?.revokeForHardDelete()
+        }
+        if pendingOpenConversationId == context.aggregateAuthority
+            || pendingOpenConversationId.map(memberIds.contains) == true
+        {
             pendingOpenConversationId = nil
         }
+
+        var removedAll = true
+        for id in memberIds {
+            let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
+                conversationId: id,
+                configurationIdentity: context.configurationIdentity,
+                aggregateAuthority: context.aggregateAuthority,
+                legacyScope: legacySnapshotPersistenceScope)
+            guard contextIsCurrent() else { return }
+            removedAll = removedAll && removed
+        }
+        guard removedAll,
+              await listStore.removeAndPersist(aggregateId: context.aggregateAuthority),
+              contextIsCurrent()
+        else {
+            completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
+            return
+        }
+        guard pendingHardDeleteCleanups[context.aggregateAuthority]?.memberConversationIds == memberIds else {
+            continue
+        }
+        await conversationPersistenceStore.retireHardDeleteFence(fence)
+        guard contextIsCurrent() else { return }
+        if pendingOpenConversationId == context.aggregateAuthority
+            || pendingOpenConversationId.map(memberIds.contains) == true
+        {
+            pendingOpenConversationId = nil
+        }
+        completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
         UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(notificationId)"])
+            withIdentifiers: ["attention-\(context.aggregateAuthority)"])
         UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: ["attention-\(notificationId)"])
+            withIdentifiers: ["attention-\(context.aggregateAuthority)"])
+            return
+        }
+    }
+
+    private func clearPersistedState(for conversationId: String) async {
+        await conversationPersistenceStore.removePersistedConversationState(conversationId: conversationId)
+    }
+
+    private func handleHardDeleted(_ report: ConversationSession.HardDeleteContext) async {
+        guard let api,
+              api.configurationIdentity == report.configurationIdentity
+        else { return }
+        hardDeletedConversationIds.insert(report.conversationId)
+        hardDeletedAggregateAuthorities.insert(report.aggregateAuthority)
+        if var pending = pendingHardDeleteCleanups[report.aggregateAuthority] {
+            if pending.memberConversationIds.insert(report.conversationId).inserted {
+                pending.fenceState = .needsCommit
+                pendingHardDeleteCleanups[report.aggregateAuthority] = pending
+            }
+        }
+        let persistedMembers = conversationPersistenceStore.persistedConversationIds(
+            aggregateId: report.aggregateAuthority,
+            scope: report.configurationIdentity.persistenceScope,
+            legacyScope: legacySnapshotPersistenceScope)
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
+            aggregate == report.aggregateAuthority ? id : nil
+        })
+        let knownMembers = persistedMembers.union(listMembers).union([report.conversationId])
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: report.configurationIdentity,
+            aggregateAuthority: report.aggregateAuthority,
+            triggerConversationId: report.conversationId,
+            memberConversationIds: knownMembers,
+            fenceState: .needsCommit))
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: report.aggregateAuthority,
+            scope: report.configurationIdentity.persistenceScope)
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: report.configurationIdentity,
+            aggregateAuthority: report.aggregateAuthority,
+            triggerConversationId: report.conversationId,
+            memberConversationIds: knownMembers
+                .union(discovery.currentAuthorityMemberIds)
+                .union(discovery.persistedOutboxOwnerIds),
+            fenceState: .needsCommit))
     }
 
     func refreshList() async {
-        guard let api else { return }
+        guard !signOutInProgress, let api else { return }
         attentionEvidenceGeneration &+= 1
-        await listStore.refresh(api: api)
+        let latestByAggregate = await listStore.refresh(api: api)
         if listStore.lastError == nil {
+            invalidateSuccessorCardinality(latestByAggregate)
             // The user is looking at fresh data — nothing here should nudge
             // them later.
             attention.seed(
@@ -197,6 +1475,7 @@ final class AppModel {
 
     // MARK: - Needs-attention nudges
 
+    private var productConversationDetails: [String: ProductConversationDetailModel] = [:]
     let attention: AttentionMonitor
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
@@ -226,6 +1505,249 @@ final class AppModel {
         resolvedNavigationConversationId(
             aggregateId: conversation.product_conversation_id,
             latestTranscriptRowId: conversation.transcriptRowIdentity)
+    }
+
+    func navigationDestination(
+        aggregateId: String?,
+        transcriptRowId: String
+    ) -> ConversationNavigationDestination {
+        guard let aggregateId else {
+            return .ordinary(transcriptRowId: transcriptRowId)
+        }
+        return .aggregate(
+            aggregateId: aggregateId,
+            initialTranscriptRowId: listStore.cachedNavigationTranscriptRowId(
+                forAggregateId: aggregateId,
+                latestTranscriptRowId: transcriptRowId))
+    }
+
+    func navigationDestination(for conversation: Conversation) -> ConversationNavigationDestination {
+        navigationDestination(
+            aggregateId: conversation.product_conversation_id,
+            transcriptRowId: conversation.transcriptRowIdentity)
+    }
+
+    func existingSession(for conversationId: String) -> ConversationSession? {
+        if let existing = sessions[conversationId] { return existing }
+        return drainSessions[conversationId]
+    }
+
+    func configureForTesting(serverURL: String, password: String = "", trustSelfSigned: Bool = true) {
+        let record = CredentialRecord(password: password, generation: Self.mintedCredentialGeneration())
+        try? Self.saveCredentialRecord(record, to: credentialStore)
+        performAtomicConfigurationMutation {
+            self.password = record.password
+            self.credentialGeneration = record.generation
+            self.credentialMigrationBlocked = false
+            self.trustSelfSigned = trustSelfSigned
+            self.serverURLString = serverURL
+        }
+    }
+
+    func replaceAPIForTesting(_ api: PhoenixAPI) {
+        cancelPersistedOutboxDrainAuthority()
+        sessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        drainSessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        sessions.removeAll()
+        drainSessions.removeAll()
+        self.api = api
+        coordinatorConversationId = coordinatorIdentityStore.load(persistenceScope: api.configurationIdentity.persistenceScope)?.conversationId
+        finishStartupHydration()
+    }
+
+    func rebuildTrustForTesting(_ trustSelfSigned: Bool) {
+        let currentServerURL = api?.configurationIdentity.serverURL ?? serverURLString
+        let currentGeneration = api?.configurationIdentity.credentialGeneration ?? credentialGeneration
+        performAtomicConfigurationMutation {
+            serverURLString = currentServerURL
+            credentialGeneration = currentGeneration
+            credentialMigrationBlocked = false
+            self.trustSelfSigned = trustSelfSigned
+        }
+    }
+
+    func triggerPersistedOutboxDrainIfNeededForTesting() {
+        triggerPersistedOutboxDrainIfNeeded()
+    }
+
+    func enableBackgroundNudgesForTesting() {
+        backgroundNudgesEnabled = true
+    }
+
+    enum PersistedOutboxDrainAwaitResult: Equatable {
+        case completed(Int)
+        case noCurrentDrain
+        case notReady
+    }
+
+    func triggerStartupHardDeleteRecoveryForTesting() {
+        persistedOutboxHydrated = false
+        finishStartupHydration()
+    }
+
+    func awaitStartupHardDeleteRecoveryForTesting() async {
+        await startupHardDeleteRecoveryTask?.value
+    }
+
+    func currentPersistedOutboxDrainGenerationForTesting() -> Int? {
+        persistedOutboxDrainTaskGeneration
+    }
+
+    func forceEvictSessionForTesting(_ conversationId: String) {
+        sessions.removeValue(forKey: conversationId)?.stop()
+        drainSessions.removeValue(forKey: conversationId)?.stop()
+    }
+
+    func awaitHardDeleteCleanupForTesting(conversationId: String) async {
+        guard let generation = hardDeleteCleanupGenerationByConversationId[conversationId] else { return }
+        if completedHardDeleteCleanupGenerations.contains(generation) { return }
+        await withCheckedContinuation { continuation in
+            if completedHardDeleteCleanupGenerations.contains(generation) {
+                continuation.resume()
+            } else {
+                hardDeleteCleanupWaiters[generation, default: []].append(continuation)
+            }
+        }
+    }
+
+    private func beginHardDeleteCleanup(conversationIds: Set<String>) -> Int {
+        nextHardDeleteCleanupGeneration &+= 1
+        let generation = nextHardDeleteCleanupGeneration
+        hardDeletedConversationIds.formUnion(conversationIds)
+        for conversationId in conversationIds {
+            hardDeleteCleanupGenerationByConversationId[conversationId] = generation
+        }
+        return generation
+    }
+
+    private func completeHardDeleteCleanup(generation: Int, conversationIds: Set<String>) {
+        completedHardDeleteCleanupGenerations.insert(generation)
+        for conversationId in conversationIds where hardDeleteCleanupGenerationByConversationId[conversationId] == generation {
+            hardDeleteCleanupGenerationByConversationId.removeValue(forKey: conversationId)
+        }
+        let waiters = hardDeleteCleanupWaiters.removeValue(forKey: generation) ?? []
+        waiters.forEach { $0.resume() }
+    }
+
+    func awaitPersistedOutboxDrainForTesting(generation: Int) async -> PersistedOutboxDrainAwaitResult {
+        if lastCompletedDrainGeneration >= generation {
+            return .completed(generation)
+        }
+        if !persistedOutboxHydrated || api == nil || !connectivity.isOnline {
+            return .notReady
+        }
+        guard persistedOutboxDrainTaskGeneration == generation,
+              let task = persistedOutboxDrainTask
+        else { return .noCurrentDrain }
+        await task.value
+        return lastCompletedDrainGeneration >= generation ? .completed(generation) : .noCurrentDrain
+    }
+
+    func awaitCurrentPersistedOutboxDrainForTesting() async -> PersistedOutboxDrainAwaitResult {
+        guard let generation = persistedOutboxDrainTaskGeneration else {
+            if !persistedOutboxHydrated || api == nil || !connectivity.isOnline {
+                return .notReady
+            }
+            return .noCurrentDrain
+        }
+        return await awaitPersistedOutboxDrainForTesting(generation: generation)
+    }
+
+    func forceAggregateNotFoundCleanupForTesting(
+        aggregateId: String,
+        transcriptRowId: String?,
+        memberIds: Set<String>
+    ) async {
+        await handleAggregateHardDeleted(
+            aggregateId: aggregateId,
+            transcriptRowId: transcriptRowId,
+            segmentTranscriptRowIds: memberIds)
+    }
+
+    func persistedOutboxContents(for conversationId: String) -> Outbox.StoredContents {
+        let inspection = conversationPersistenceStore.inspectOutbox(conversationId: conversationId)
+        switch inspection.state {
+        case .accessible:
+            return inspection.visibleEntries.isEmpty ? .empty : .hasVisibleEntries
+        case .missing:
+            return .empty
+        case .inaccessible, .incompatibleNewerVersion:
+            return .inaccessible
+        }
+    }
+
+    func productConversationDetailModel(
+        for aggregateId: String,
+        initialTranscriptRowId: String? = nil
+    ) -> ProductConversationDetailModel {
+        if let existing = productConversationDetails[aggregateId] {
+            if initialTranscriptRowId != nil {
+                existing.primeInitialTranscriptRowId(initialTranscriptRowId)
+            }
+            return existing
+        }
+        guard let api else {
+            fatalError("ProductConversationDetailModel requires configured API")
+        }
+        let created = ProductConversationDetailModel(
+            aggregateId: aggregateId,
+            initialTranscriptRowId: initialTranscriptRowId,
+            api: api,
+            connectivity: connectivity,
+            sessionProvider: { [weak self] transcriptRowId, aggregateAuthority in
+                self?.session(for: transcriptRowId, aggregateAuthority: aggregateAuthority)
+            },
+            existingSession: { [weak self] transcriptRowId in
+                self?.existingSession(for: transcriptRowId)
+            },
+            persistedOutboxContents: { [weak self] transcriptRowId in
+                self?.persistedOutboxContents(for: transcriptRowId) ?? .empty
+            },
+            hasCachedSnapshot: { [weak self] transcriptRowId in
+                guard let self, let api = self.api else { return false }
+                if self.conversationPersistenceStore.hasAuthoritativeCachedSnapshot(
+                    conversationId: transcriptRowId,
+                    configurationIdentity: api.configurationIdentity,
+                    aggregateAuthority: aggregateId)
+                {
+                    return true
+                }
+                guard let store = self.conversationPersistenceStore as? DiskConversationPersistenceStore else {
+                    return false
+                }
+                return store.hasCachedSnapshot(
+                    conversationId: transcriptRowId,
+                    configurationIdentity: api.configurationIdentity,
+                    aggregateAuthority: aggregateId,
+                    legacyScope: self.legacySnapshotPersistenceScope)
+            },
+            discoverPersistedMembers: { [weak self] in
+                guard let self, let api = self.api else { return .empty }
+                let identity = api.configurationIdentity
+                let generation = self.apiGeneration
+                let discovery = await self.conversationPersistenceStore.persistedMemberDiscovery(
+                    aggregateId: aggregateId,
+                    scope: identity.persistenceScope)
+                guard !Task.isCancelled,
+                      self.apiGeneration == generation,
+                      self.api?.configurationIdentity == identity
+                else { return .empty }
+                return discovery
+            },
+            handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
+                await self?.handleAggregateHardDeleted(
+                    aggregateId: aggregateId,
+                    transcriptRowId: transcriptRowId,
+                    segmentTranscriptRowIds: segmentTranscriptRowIds)
+            },
+            onConfigurationInvalidated: { [weak self] detail in
+                guard let self else { return }
+                if self.productConversationDetails[aggregateId] === detail {
+                    self.productConversationDetails.removeValue(forKey: aggregateId)
+                }
+            })
+        productConversationDetails[aggregateId] = created
+        return created
     }
 
     func setBackgroundNudges(_ enabled: Bool) async {
@@ -261,7 +1783,11 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations() else { return false }
+        guard let response = try? await api.listProductConversations() else { return false }
+        let latestByAggregate = Dictionary(uniqueKeysWithValues: response.product_conversations.map {
+            ($0.product_conversation_id, $0.latest_transcript_row_id)
+        })
+        let fresh = response.product_conversations.map(api.productConversationListRowToConversation)
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration
@@ -271,7 +1797,15 @@ final class AppModel {
               apiGeneration == startedGeneration,
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
-        guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
+        let coordinatorProjection = coordinatorConversationId.flatMap { coordinatorId in
+            listStore.conversations.first { $0.transcriptRowIdentity == coordinatorId }
+        }
+        guard listStore.applyExternal(
+            fresh,
+            startedAt: listToken,
+            preserving: coordinatorProjection.map { [$0.aggregateIdentity: $0] } ?? [:])
+        else { return false }
+        invalidateSuccessorCardinality(latestByAggregate)
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
@@ -283,7 +1817,7 @@ final class AppModel {
             from: fresh,
             transcriptToAggregate: listStore.transcriptToAggregate,
             isCurrent: isCurrent)
-        return await isCurrent()
+        return isCurrent()
     }
 
     // MARK: - Coordinator
@@ -291,12 +1825,11 @@ final class AppModel {
     /// The fleet Coordinator's conversation id, remembered across launches
     /// so its cached transcript opens offline and its list row is badged.
     /// Per-server state — cleared on sign-out.
-    private(set) var coordinatorConversationId: String? =
-        UserDefaults.standard.string(forKey: AppModel.coordinatorIdKey)
+    private(set) var coordinatorConversationId: String?
 
     var coordinatorAvailableOffline: Bool {
         guard let id = coordinatorConversationId else { return false }
-        return ConversationSession.hasCachedSnapshot(conversationId: id)
+        return hasCachedSnapshot(id)
     }
 
 
@@ -314,7 +1847,9 @@ final class AppModel {
                     return nil
                 }
                 coordinatorConversationId = conversation.id
-                UserDefaults.standard.set(conversation.id, forKey: Self.coordinatorIdKey)
+                coordinatorIdentityStore.save(CoordinatorIdentityReceipt(
+                    persistenceScope: api.configurationIdentity.persistenceScope,
+                    conversationId: conversation.id))
                 listStore.upsert(conversation)
                 return conversation.id
             } catch {
@@ -322,7 +1857,7 @@ final class AppModel {
                 if let apiError = error as? APIError,
                    apiError.isTransport,
                    let cached = coordinatorConversationId,
-                   ConversationSession.hasCachedSnapshot(conversationId: cached) {
+                   hasCachedSnapshot(cached) {
                     return cached
                 }
                 lastActionError = (error as? APIError)?.errorDescription
@@ -331,7 +1866,7 @@ final class AppModel {
             }
         }
         if let cached = coordinatorConversationId,
-           ConversationSession.hasCachedSnapshot(conversationId: cached) {
+           hasCachedSnapshot(cached) {
             return cached
         }
         lastActionError = "Opening the Coordinator offline needs a cached conversation."
@@ -340,6 +1875,38 @@ final class AppModel {
 
     /// Online-only archive. Returns false with `lastActionError` on failure.
     var lastActionError: String?
+
+    private func authoritativeAggregateMemberIds(
+        aggregateId: String,
+        triggeringTranscriptRowId: String
+    ) async -> Set<String> {
+        let detailMembers = productConversationDetails[aggregateId]?.aggregateMemberTranscriptRowIds ?? []
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { transcriptRowId, mappedAggregateId in
+            mappedAggregateId == aggregateId ? transcriptRowId : nil
+        })
+        guard let api else { return detailMembers.union(listMembers).union([triggeringTranscriptRowId]) }
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope)
+        return detailMembers
+            .union(listMembers)
+            .union([triggeringTranscriptRowId])
+            .union(discovery.currentAuthorityMemberIds)
+            .union(discovery.persistedOutboxOwnerIds)
+    }
+
+    func closeUnavailableExplanation(for conversation: Conversation) -> String? {
+        guard conversation.product_conversation_id != nil else {
+            return "Close is unavailable until conversation type is confirmed."
+        }
+        guard let detail = productConversationDetails[conversation.aggregateIdentity],
+              detail.closeCardinalityKnown,
+              let snapshot = detail.snapshot
+        else {
+            return "Open the conversation before closing it."
+        }
+        return nil
+    }
 
     @discardableResult
     func archive(conversationId: String) async -> Bool {
@@ -356,26 +1923,57 @@ final class AppModel {
             lastActionError = "Archiving needs a connection — it can't be queued."
             return false
         }
-        let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
-        guard !hasInMemoryMessages else {
-            lastActionError =
-                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+        let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
+            ?? productConversationDetails.first(where: {
+                $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
+            })?.key
+        let memberIds = if let aggregateId {
+            await authoritativeAggregateMemberIds(
+                aggregateId: aggregateId,
+                triggeringTranscriptRowId: conversationId)
+        } else {
+            Set([conversationId])
+        }
+        guard self.api?.configurationIdentity == api.configurationIdentity else {
+            lastActionError = "Conversation settings changed before archiving. Try again."
             return false
         }
-        if let session = sessions[conversationId] {
-            _ = await session.outbox.flushPersistence()
+        let archiveTarget: (chainRootId: String?, conversationId: String)
+        if let aggregateId {
+            guard let detail = productConversationDetails[aggregateId],
+                  detail.closeCardinalityKnown,
+                  let snapshot = detail.snapshot
+            else {
+                lastActionError = "Conversation changed before archiving. Try again."
+                return false
+            }
+            archiveTarget = (
+                snapshot.segments.count > 1 ? snapshot.canonical_root.transcript_row_id : nil,
+                snapshot.canonical_root.transcript_row_id)
+        } else {
+            archiveTarget = (nil, conversationId)
         }
-        switch Outbox.storedContents(conversationId: conversationId) {
-        case .empty:
-            break
-        case .hasVisibleEntries:
-            lastActionError =
-                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
-            return false
-        case .inaccessible:
-            lastActionError =
-                "This conversation's queued-message store can't be read by this app version. Upgrade or clear the cache before archiving."
-            return false
+        for memberId in memberIds {
+            if sessions[memberId]?.outbox.visibleEntries.isEmpty == false {
+                lastActionError =
+                    "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+                return false
+            }
+            if let session = sessions[memberId] {
+                _ = await session.outbox.flushPersistence()
+            }
+            switch persistedOutboxContents(for: memberId) {
+            case .empty:
+                break
+            case .hasVisibleEntries:
+                lastActionError =
+                    "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+                return false
+            case .inaccessible:
+                lastActionError =
+                    "This conversation's queued-message store can't be read by this app version. Upgrade or clear the cache before archiving."
+                return false
+            }
         }
         guard let session = session(for: conversationId), session.beginArchiving() else {
             lastActionError =
@@ -387,15 +1985,22 @@ final class AppModel {
             if !archived { session.endArchiving() }
         }
         do {
-            try await api.archive(conversationId: conversationId)
+            if let chainRootId = archiveTarget.chainRootId {
+                try await api.archiveChain(rootId: chainRootId)
+            } else {
+                try await api.archive(conversationId: archiveTarget.conversationId)
+            }
             archived = true
             session.stop()
             await session.clearCachedSnapshotAndWait()
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
-            let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
             if let aggregateId {
-                listStore.remove(aggregateId: aggregateId)
+                let removed = await listStore.removeAndPersist(aggregateId: aggregateId)
+                guard removed else {
+                    lastActionError = "The conversation closed, but its local list cache could not be updated."
+                    return false
+                }
             }
             let notificationId = aggregateId ?? conversationId
             UNUserNotificationCenter.current().removeDeliveredNotifications(
@@ -411,11 +2016,25 @@ final class AppModel {
     }
 
     func foregrounded() {
-        for session in sessions.values {
-            session.resyncAfterForeground()
-        }
-        drainPersistedOutboxes()
+        scheduleDeliveryTrigger(.foreground)
         Task { await refreshList() }
+    }
+
+    private func scheduleDeliveryTrigger(_ trigger: DeliveryTrigger) {
+        guard !signOutInProgress else { return }
+        if persistedOutboxHydrated {
+            for session in sessions.values {
+                switch trigger {
+                case .connectivityRestore:
+                    session.resyncAfterConnectivityRestore()
+                case .foreground:
+                    session.resyncAfterForeground()
+                }
+            }
+            schedulePersistedOutboxDrain()
+        } else {
+            Task { await resumeAfterDeliveryTrigger(trigger) }
+        }
     }
 
     func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {
@@ -434,28 +2053,61 @@ final class AppModel {
     /// its conversation was opened manually — breaking the restart-survival
     /// half of the offline queue. Sessions created here don't start an SSE
     /// stream; they exist to drain (their outbox reconciles on next open).
-    private func drainPersistedOutboxes() {
-        guard let api else { return }
-        for name in DiskStore.names(withPrefix: "outbox-") {
-            let conversationId = String(name.dropFirst("outbox-".count))
-            guard !conversationId.isEmpty, sessions[conversationId] == nil else {
-                // Open sessions already drain via their own triggers.
+    @discardableResult
+    private func drainPersistedOutboxes(
+        authorityGeneration: Int,
+        apiIdentity: APIConfigurationIdentity?
+    ) async -> [String] {
+        guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+              api?.configurationIdentity == apiIdentity,
+              let api
+        else { return [] }
+        var drainedConversationIds: [String] = []
+        let currentAPIIdentity = api.configurationIdentity
+        let candidateOwners = await conversationPersistenceStore.pendingOutboxOwners(
+            scope: api.configurationIdentity.persistenceScope)
+        guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+              currentAPIIdentity == apiIdentity
+        else { return drainedConversationIds }
+        for owner in candidateOwners.sorted(by: { $0.transcriptRowId < $1.transcriptRowId }) {
+            let conversationId = owner.transcriptRowId
+            guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
+                  currentAPIIdentity == apiIdentity
+            else { return drainedConversationIds }
+            guard sessions[conversationId] == nil else {
                 continue
             }
-            guard let entries = DiskStore.loadVersioned(
-                [OutboxEntry].self, name: name, version: Outbox.schemaVersion),
-                  entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
-            else { continue }
+            guard !hardDeletedConversationIds.contains(conversationId),
+                  owner.aggregateAuthority.map({ !hardDeletedAggregateAuthorities.contains($0) }) ?? true
+            else {
+                continue
+            }
             let drainSession: ConversationSession
             if let existing = drainSessions[conversationId] {
                 drainSession = existing
             } else {
                 drainSession = ConversationSession(
-                    conversationId: conversationId, api: api, connectivity: connectivity)
+                    conversationId: conversationId,
+                    api: api,
+                    connectivity: connectivity,
+                    outboxPersistence: conversationPersistenceStore.outboxPersistence(
+                    conversationId: conversationId,
+                    aggregateAuthority: owner.aggregateAuthority,
+                    scope: api.configurationIdentity.persistenceScope),
+                    snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
+                    retryTiming: LiveSessionTiming(),
+                    staleCheckTiming: LiveSessionTiming(),
+                    deliveryTriggerAllowed: { [weak self] in
+                        self?.persistedOutboxHydrated == true
+                            && self?.signOutInProgress == false
+                    },
+                    legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
+                    aggregateAuthority: owner.aggregateAuthority)
                 drainSessions[conversationId] = drainSession
             }
-            drainSession.drainOutbox()
+            drainedConversationIds.append(conversationId)
         }
+        return drainedConversationIds
     }
 
     func backgrounded() {
@@ -471,37 +2123,60 @@ final class AppModel {
     /// working directory, and the pinned certificate are per-server state
     /// and must not leak across a server/account switch.
     func signOut() async {
+        guard !signOutInProgress else { return }
+        signOutInProgress = true
+        defer { signOutInProgress = false }
+        cancelPersistedOutboxDrainAuthority()
+        apiGeneration += 1
         nudgePreferenceGeneration &+= 1
         backgroundNudgesEnabled = false
         nudgeAuthorizationHint = nil
         UserDefaults.standard.removeObject(forKey: Self.nudgesEnabledKey)
         BackgroundRefresh.cancelPending()
-        await clearCache()
         pendingOpenConversationId = nil
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
         notificationCenter.removeAllPendingNotificationRequests()
+        let configurationIdentity = api?.configurationIdentity
+        let ownedSessions = resetLocalStateForSignOut()
+        await removeLocalStateForSignOut(ownedSessions: ownedSessions)
+        api = nil
         UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
-        UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
+        if let configurationIdentity {
+            coordinatorIdentityStore.clear(persistenceScope: configurationIdentity.persistenceScope)
+        }
         coordinatorConversationId = nil
         CertPinStore.forget()
         password = ""
-        Keychain.deletePassword(account: Self.passwordAccount)
+        credentialStore.deleteRecord(account: Self.credentialRecordAccount)
+        credentialStore.deleteRecord(account: Self.legacyPasswordAccount)
+        credentialMigrationBlocked = false
+        credentialGeneration = Self.mintedCredentialGeneration()
         serverURLString = ""
+        trustSelfSigned = false
     }
 
-    func clearCache() async {
-        apiGeneration += 1
+    private func resetLocalStateForSignOut() -> [ConversationSession] {
+        let cachedDetails = Array(productConversationDetails.values)
+        productConversationDetails.removeAll()
+        for detail in cachedDetails { detail.invalidateConfiguration() }
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
-        for session in ownedSessions { session.stop() }
-        for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
-        for session in ownedSessions { await session.outbox.clearAndWait() }
+        for session in ownedSessions {
+            session.invalidateConfiguration()
+            session.stop()
+        }
         sessions.removeAll()
         drainSessions.removeAll()
-        await DiskStore.removeAllAndWait()
-        listStore.reset()
         attention.reset()
-        UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
+        return ownedSessions
+    }
+
+    private func removeLocalStateForSignOut(ownedSessions: [ConversationSession]) async {
+        for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
+        for session in ownedSessions { await session.outbox.clearAndWait() }
+        async let resetConversationListCache: Void = listStore.reset()
+        async let removeAllPersistedConversationState: Void = conversationPersistenceStore.removeAllPersistedConversationState()
+        _ = await (resetConversationListCache, removeAllPersistedConversationState)
         coordinatorConversationId = nil
     }
 
@@ -510,7 +2185,8 @@ final class AppModel {
         if let bundleIdentifier = Bundle.main.bundleIdentifier {
             UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
         }
-        Keychain.deletePassword(account: Self.passwordAccount)
+        KeychainCredentialStore().deleteRecord(account: Self.credentialRecordAccount)
+        KeychainCredentialStore().deleteRecord(account: Self.legacyPasswordAccount)
         DiskStore.removeAll()
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()

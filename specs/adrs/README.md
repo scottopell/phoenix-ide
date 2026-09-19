@@ -69,6 +69,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
+| [058](058_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 
