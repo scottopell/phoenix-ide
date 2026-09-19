@@ -1,3 +1,5 @@
+import { SvgArtifactCard } from './SvgArtifactCard';
+import { svgArtifactFromResult } from './svgArtifact';
 /**
  * Shared message rendering components used by both MessageList and VirtualizedMessageList.
  * 
@@ -714,6 +716,7 @@ function CompactToolStripImpl({
           item.isError ? 'error' : '',
           !item.hasResult ? 'pending' : '',
           item.name === 'bash' ? 'wide' : '',
+          item.svgArtifact ? 'svg-artifact-tool' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError
@@ -767,6 +770,7 @@ function CompactToolStripImpl({
                 <span className="compact-tool-card-summary" title={summary}>{summary}</span>
               )}
             </button>
+            {item.svgArtifact && <SvgArtifactCard artifact={item.svgArtifact} />}
             {isFirstCardForOwner && (
               <span className="compact-tool-owner-copy message-mobile-copy-row">
                 <MessageCopyButton
@@ -2878,7 +2882,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
     : 'Copy command';
 
 
+  const svgArtifact = svgArtifactFromResult(name, result);
   return (
+    <>
+    {svgArtifact && <SvgArtifactCard artifact={svgArtifact} />}
     <div className="tool-block" data-tool-id={toolId}>
       {/* Tool header with name */}
       <div className="tool-block-header">
@@ -3040,6 +3047,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
       {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
       {forkProposalId && <ForkProposalAffordance proposalId={forkProposalId} />}
     </div>
+    </>
   );
 }
 

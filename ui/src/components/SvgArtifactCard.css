@@ -1,0 +1,90 @@
+.svg-artifact-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.svg-artifact-card h3 { margin: 0 0 8px; }
+
+.svg-artifact-card p { margin: 8px 0; }
+
+.svg-artifact-image {
+  position: relative;
+  background: #fff;
+  color: #222;
+}
+
+.svg-artifact-image img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.svg-artifact-image [role="status"] {
+  position: absolute;
+  padding: 8px;
+}
+
+.svg-artifact-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.svg-artifact-dialog .selection-dialog__surface { width: min(1200px, calc(100vw - 40px)); }
+
+.svg-artifact-dialog .selection-dialog__heading { overflow-wrap: anywhere; }
+
+.svg-artifact-viewport {
+  overflow: auto;
+  max-height: 65dvh;
+  margin-top: 12px;
+}
+
+.svg-artifact-viewport .svg-artifact-image img { max-height: none; }
+
+.svg-artifact-source {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.compact-tool-card.svg-artifact-tool { grid-column: 1 / -1; }
+
+.svg-artifact-controls button,
+.svg-artifact-controls a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.svg-artifact-controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.svg-artifact-controls button:focus-visible,
+.svg-artifact-controls a:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .svg-artifact-controls button,
+  .svg-artifact-controls a { min-height: 44px; }
+}
