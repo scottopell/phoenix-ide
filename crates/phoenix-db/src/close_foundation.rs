@@ -3248,12 +3248,20 @@ impl Database {
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
                  administrative_dir_codec, administrative_dir_value,
-                 administrative_dir_incarnation, planned_at_us
+                 administrative_dir_incarnation,
+                 final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode,
+                 planned_at_us
              )
              SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
                     plan.identity_kind, plan.identity_codec, plan.identity_value,
                     plan.administrative_dir_codec, plan.administrative_dir_value,
-                    plan.administrative_dir_incarnation, plan.planned_at_us
+                    plan.administrative_dir_incarnation,
+                    plan.final_tombstone_root_codec, plan.final_tombstone_root_value,
+                    plan.final_tombstone_root_device, plan.final_tombstone_root_inode,
+                    plan.final_tombstone_object_device, plan.final_tombstone_object_inode,
+                    plan.planned_at_us
              FROM close_worktree_cleanup_plans plan
              WHERE plan.attempt_id = ?1
                AND plan.inspection_generation = ?2
@@ -12010,6 +12018,34 @@ mod tests {
         })
         .await
         .unwrap();
+        let tombstone = CloseWorktreeFinalTombstone {
+            root: std::path::PathBuf::from("/tmp/.phoenix-close-dispatched-absence"),
+            device: 41,
+            inode: 42,
+            object_device: Some(43),
+            object_inode: Some(44),
+        };
+        db.bind_close_worktree_final_tombstone(BindCloseWorktreeFinalTombstoneRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: worktree.resource.clone(),
+            tombstone: tombstone.clone(),
+        })
+        .await
+        .unwrap();
+        db.bind_close_worktree_final_tombstone_object(
+            BindCloseWorktreeFinalTombstoneObjectRequest {
+                attempt_id: attempt.clone(),
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: worktree.resource.clone(),
+                object_device: 43,
+                object_inode: 44,
+            },
+        )
+        .await
+        .unwrap();
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: attempt.clone(),
             snapshot: snapshot.clone(),
@@ -12051,7 +12087,7 @@ mod tests {
             Some(CloseWorktreeCleanupPlan {
                 administrative_dir: cleanup_dir,
                 administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
-                final_tombstone: None,
+                final_tombstone: Some(tombstone),
             }),
         );
         assert!(db
