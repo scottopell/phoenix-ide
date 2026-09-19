@@ -103,3 +103,13 @@ The user approved the pill fixture and requested Enter-to-focus. The approved pi
 Browser verification used actual mouse selection followed by Enter, typing, and Cmd+Enter with no click in the input. The exact selected quote and reaction appended to the existing draft and no message was submitted. Regression tests cover normal input/button Enter behavior, modified Enter, IME, and the existing append shortcut. Native phone-device acceptance remains the outstanding task criterion; no deployment is included.
 
 Integration validation: 19 focused tests passed. The broad `./dev.py check` passed every lane except a stale test expecting the superseded “Keep writing” label; that assertion was updated to “Keep”, and the full Vitest lane rerun passed. Browser verification confirmed Enter-to-focus and the unchanged Cmd+Enter append flow.
+
+## Local adversarial review before PR
+
+- Round 1: isolated virtualization and keyboard passes reviewed `d671971bba1b1a88bc5586e79360bf49277d4028..e1a414b8bceaf7a47ab1234a69a32dcf2eb204fd`. Two P2 defects reproduced: whole-message offsets drifted when earlier thinking/tool text changed; Enter intercepted native summary controls. Both fixed with regression tests.
+- Passage anchors now use stable prose-fragment identity and local offsets, validate the recovered quote, and route exact-range positioning through VirtualTranscript. Mutable header/tool content is excluded from anchor ownership.
+- Round 2: a fresh isolated full-feature review of `e2e98f9b720b0004e3fec8788ca3bcf61e0d0d88..4cf9069e35db7cfb865b082157b81e74cfc58437` found no further actionable defects, including an independent real-browser unmount/return journey.
+- Round 3: an anchored regression challenge on that same revised range checked multiple prose fragments, duplicate message IDs with occurrence identity, changed preceding header/tool text, unmount/remount, and fail-closed quote validation. No actionable findings.
+- Parent browser verification separately exercised ten-screen scrolling, actual source unmount, exact passage return, preserved reaction, and no autofocus. `./dev.py check` passed all 16 checks after rebase onto main. Physical-device mobile acceptance remains unverified.
+
+These local results precede external Codex review; no comparison against Codex findings is claimed yet. User retains merge and deployment ownership.
