@@ -24,6 +24,42 @@ describe('SVG artifact presentation', () => {
     expect(svgArtifactFromResult('present_svg', failed)).toBeNull();
   });
 
+  it.each([
+    '67e55044-10b1-426f-9247-bb680e5fe0c8',
+    '67E55044-10B1-426F-9247-BB680E5FE0C8',
+    '67e5504410b1426f9247bb680e5fe0c8',
+    '67E5504410B1426F9247BB680E5FE0C8',
+    '{67e55044-10b1-426f-9247-bb680e5fe0c8}',
+    '{67E55044-10B1-426F-9247-BB680E5FE0C8}',
+    'urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8',
+    'urn:uuid:67E55044-10B1-426F-9247-BB680E5FE0C8',
+    '{00000000-0000-0000-0000-000000000000}',
+    'urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff',
+  ])('retains supported conversation UUID form %s and encodes its artifact URLs', (conversationId) => {
+    const value = { ...artifact, conversation_id: conversationId };
+    const message = { ...result(value), conversation_id: conversationId };
+    const parsed = svgArtifactFromResult('present_svg', message);
+    expect(parsed).toEqual(value);
+    if (!parsed) throw new Error('expected accepted artifact');
+    render(<SvgArtifactCard artifact={parsed} />);
+    const url = `/api/conversations/${encodeURIComponent(conversationId)}/svg-artifacts/artifact-1`;
+    expect(screen.getByRole('img')).toHaveAttribute('src', url);
+    expect(screen.getByRole('link', { name: 'Download SVG' })).toHaveAttribute('href', `${url}/download`);
+  });
+
+  it.each([
+    '../owner', 'owner/other', 'owner%2fother', 'owner\n',
+    '{67e5504410b1426f9247bb680e5fe0c8}',
+    'urn:uuid:67e5504410b1426f9247bb680e5fe0c8',
+    'URN:UUID:67e55044-10b1-426f-9247-bb680e5fe0c8',
+    '{67e55044-10b1-426f-9247-bb680e5fe0c8',
+    'urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0cg',
+    'urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8/../other',
+  ])('rejects malformed wrapped UUIDs and unsafe conversation paths: %s', (conversationId) => {
+    const value = { ...artifact, conversation_id: conversationId };
+    expect(svgArtifactFromResult('present_svg', { ...result(value), conversation_id: conversationId })).toBeNull();
+  });
+
   it('uses only the share token and artifact ID for all shared representations', async () => {
     const fetchSource = vi.fn().mockResolvedValue({ ok: true, text: async () => '<svg/>' });
     vi.stubGlobal('fetch', fetchSource);
