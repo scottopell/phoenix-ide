@@ -113,6 +113,83 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn snapshot_survives_worktree_removal_and_scope_retirement() {
+        use crate::{ConvMode, ConvState, NonEmptyString};
+        use phoenix_core::work_scope::{
+            WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let worktree_path = worktree.path().to_str().unwrap();
+        let conversation = db
+            .create_conversation_with_project(
+                "retained-owner",
+                "retained-owner",
+                worktree_path,
+                true,
+                None,
+                None,
+                None,
+                &ConvMode::Branch {
+                    branch_name: NonEmptyString::new("chart-topic").unwrap(),
+                    worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+                    base_branch: NonEmptyString::new("main").unwrap(),
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let scope = conversation.attached_work_scope_id.unwrap();
+        let staging = worktree.path().join("chart.svg");
+        std::fs::write(&staging, b"<svg/>").unwrap();
+        let artifact = db
+            .publish_svg_artifact(
+                "retained-owner",
+                "call",
+                "Title",
+                "Description",
+                100.0,
+                50.0,
+                &std::fs::read(&staging).unwrap(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_state("retained-owner", &ConvState::Terminal)
+            .await
+            .unwrap();
+        worktree.close().unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            db.retire_work_scope(
+                WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(
+                    scope,
+                ),
+                "owned worktree removed",
+            )
+            .await
+            .unwrap(),
+            WorkScopeRetirementOutcome::Retired,
+        );
+        assert!(db.get_conversation("retained-owner").await.is_ok());
+        assert_eq!(
+            db.svg_artifact("retained-owner", &artifact.artifact_id)
+                .await
+                .unwrap(),
+            Some(artifact.clone()),
+        );
+        assert_eq!(
+            db.svg_artifact_for_invocation("retained-owner", "call")
+                .await
+                .unwrap(),
+            Some(artifact),
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_survives_database_reopen_and_staging_deletion() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("artifacts.db");
