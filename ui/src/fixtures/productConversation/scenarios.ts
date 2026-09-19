@@ -479,3 +479,17 @@ export function getProductConversationScenario(id: ProductConversationScenarioId
   if (!scenario) throw new Error(`Unknown ProductConversation scenario: ${id}`);
   return scenario;
 }
+
+export function makeVirtualizedReactionScenario(): ProductConversationScenario {
+  const base = getProductConversationScenario('inline-message-reactions');
+  const snapshot = base.snapshot!;
+  const subjects = ['interrupted tools', 'draft preservation', 'stale completions', 'retry identity', 'continuation boundaries', 'reconnect timing'];
+  const history = Array.from({ length: 36 }, (_, index) => {
+    const subject = subjects[index % subjects.length]!;
+    return [
+      textMessage(`recovery-question-${index}`, index * 2 + 3, 'user', `How would you verify ${subject} in the recovery flow?`),
+      textMessage(`recovery-answer-${index}`, index * 2 + 4, 'agent', `### Verifying ${subject}\n\nStart from a saved conversation with a completed tool result and an unfinished user draft. Interrupt the connection at the transition boundary, then replay the accepted events in order.\n\nAssert the recovered state before retrying: the original result remains attached to its conversation, the draft is unchanged, and no duplicate completion is accepted.\n\n- Compare emitted effects with the expected sequence.\n- Repeat with cancellation before and after completion.\n- Check the visible transcript after reconnecting.`),
+    ];
+  }).flat();
+  return { ...base, snapshot: { ...snapshot, segments: snapshot.segments.map((segment, index) => index === 0 ? { ...segment, messages: [...segment.messages, ...history] } : segment) } };
+}

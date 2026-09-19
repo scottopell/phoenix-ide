@@ -1,5 +1,9 @@
 # Prose Feedback UI - Executive Summary
 
+## Fixture review in progress
+
+The `inline-message-reactions` Ladle story has an opt-in single-line pill prototype with horizontal input scrolling, a docked Return to passage action, and in-row Keep/Discard confirmation. Its long production transcript forces source rows to unmount. Browser verification exercised actual unmount/remount, exact passage return, and automatic undocking on manual return. This presentation is fixture-only pending user feedback; the default application presentation and normative contract have not yet been switched.
+
 ## Requirements Summary
 
 Inline conversation reactions (REQ-PF-018–021) are implemented by `InlineMessageReaction`, with a conversation-keyed, session-local `InlineReactionStore` for unfinished text and the existing `DraftStore` for appended feedback. The production-page fixture `product-conversation--inline-message-reactions` includes a long answer, code, a table, historical messages with repeated sequence numbers, and an existing draft. The action uses ListPlus with the label Add to draft; `MessageReviewAction` provides explicit message-review entry on touch and desktop.

@@ -75,6 +75,17 @@ describe('inline message reactions', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Added to draft');
   });
 
+  it('dismisses an empty reaction without reopening it on pointerup', async () => {
+    render(<Harness store={new InlineReactionStore()} append={vi.fn()} />);
+    select(screen.getByTestId('old').firstChild!);
+    await screen.findByRole('textbox', { name: 'Your reaction' });
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss reaction' }));
+    fireEvent.pointerUp(document);
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(screen.queryByRole('textbox', { name: 'Your reaction' })).not.toBeInTheDocument();
+    expect(window.getSelection()?.toString()).toBe('');
+  });
+
   it('pins typed reactions across selection changes, unavailable destinations, unmounts, and navigation', async () => {
     const store = new InlineReactionStore();
     const append = vi.fn();

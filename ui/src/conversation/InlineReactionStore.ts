@@ -6,6 +6,7 @@ export interface ReactionSource {
   sequenceId: number;
   occurrenceToken?: string | undefined;
   quote: string;
+  textOffsets?: { start: number; end: number };
 }
 
 export interface InlineReaction {

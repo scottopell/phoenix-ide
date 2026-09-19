@@ -1837,6 +1837,15 @@ function MessageListImpl({
         scopeKey={reactionScopeKey ?? conversationId ?? slug ?? '__empty__'}
         messages={messages}
         destination={reactionDestination}
+        returnToSource={(source) => {
+          const matches = (message: Message) => source.occurrenceToken
+            ? (message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken === source.occurrenceToken
+            : message.message_id === source.messageId;
+          const index = historicalUnits.findIndex((unit) => agentTurnsInHistoricalUnit(unit).some((turn) => matches(turn.agent)));
+          if (index < 0) return false;
+          scrollToUnitIndex(index);
+          return true;
+        }}
       />
       <MessageContextMenu
         messages={messages}

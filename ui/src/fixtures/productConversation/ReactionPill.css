@@ -1,0 +1,93 @@
+.reaction-pill {
+  position: fixed;
+  z-index: 950;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  box-sizing: border-box;
+  padding: 3px 5px 3px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 28px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: 0 3px 14px rgb(0 0 0 / 22%);
+  font-size: 13px;
+}
+
+.reaction-pill[hidden] { display: none; }
+
+.reaction-pill input {
+  flex: 1;
+  min-width: 0;
+  width: 0;
+  height: 36px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.reaction-pill input:focus { outline: none; }
+
+.reaction-pill:focus-within { border-color: var(--text-secondary); }
+
+.reaction-pill button {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 20px;
+  padding: 0 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.reaction-pill button:hover { background: var(--bg-tertiary); }
+
+.reaction-pill button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.reaction-pill .reaction-pill-return {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.reaction-pill-return svg { flex-shrink: 0; }
+
+.reaction-pill-return span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.reaction-pill-label { flex: 1; }
+
+.reaction-pill-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+@media (pointer: coarse), (width <= 768px) {
+  .reaction-pill input {
+    height: 44px;
+    font-size: 16px;
+  }
+
+  .reaction-pill button {
+    min-width: 44px;
+    height: 44px;
+  }
+}

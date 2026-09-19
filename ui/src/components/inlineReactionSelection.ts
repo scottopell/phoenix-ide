@@ -21,12 +21,17 @@ export function readReactionSelection(selection: Selection | null, messages: Mes
     : candidate.message_id === owner.dataset['inlineReactionMessage']);
   const data = message?.display_data as { productOccurrenceToken?: string; productHistoricalHandoff?: unknown } | null;
   if (!message || message.message_type !== 'agent' || data?.productHistoricalHandoff) return null;
+  const prefix = document.createRange();
+  prefix.selectNodeContents(owner);
+  prefix.setEnd(range.startContainer, range.startOffset);
+  const startOffset = prefix.toString().length;
   return {
     source: {
       messageId: message.message_id,
       sequenceId: message.sequence_id,
       occurrenceToken: data?.productOccurrenceToken,
       quote: selection.toString(),
+      textOffsets: { start: startOffset, end: startOffset + range.toString().length },
     },
     range: range.cloneRange(),
   };

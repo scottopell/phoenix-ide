@@ -1,3 +1,4 @@
+import { makeVirtualizedReactionScenario } from '../fixtures/productConversation/scenarios';
 import type { Story } from '@ladle/react';
 import {
   getProductConversationScenario,
@@ -12,7 +13,8 @@ const storyFor = (id: ProductConversationScenarioId): Story => {
   };
 };
 
-export const InlineMessageReactions = storyFor('inline-message-reactions');
+const reactionScenario = makeVirtualizedReactionScenario();
+export const InlineMessageReactions: Story = () => <ProductConversationFixture scenario={reactionScenario} />;
 InlineMessageReactions.storyName = 'inline-message-reactions';
 
 export const DesktopMultiSegmentQaWork = storyFor('desktop-multi-segment-qa-work');

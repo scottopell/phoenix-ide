@@ -2,9 +2,10 @@ import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, 
 import { createPortal } from 'react-dom';
 import { ListPlus, X } from 'lucide-react';
 import type { Message } from '../api';
-import { InlineReactionContext, InlineReactionStore, formatInlineReaction } from '../conversation/InlineReactionStore';
+import { InlineReactionContext, InlineReactionStore, formatInlineReaction, type ReactionSource } from '../conversation/InlineReactionStore';
 import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import { readReactionSelection } from './inlineReactionSelection';
+import { ReactionPresentationContext } from './reactionPresentation';
 import './InlineMessageReaction.css';
 
 export interface ReactionDraftDestination {
@@ -15,6 +16,7 @@ interface Props {
   scopeKey: string;
   messages: Message[];
   destination?: ReactionDraftDestination | undefined;
+  returnToSource?: ((source: ReactionSource) => boolean) | undefined;
 }
 
 export function InlineMessageReaction(props: Props) {
@@ -22,7 +24,8 @@ export function InlineMessageReaction(props: Props) {
   return store ? <ReactionSession key={props.scopeKey} {...props} store={store} /> : null;
 }
 
-function ReactionSession({ scopeKey, messages, destination, store }: Props & { store: InlineReactionStore }) {
+function ReactionSession({ scopeKey, messages, destination, returnToSource, store }: Props & { store: InlineReactionStore }) {
+  const Presentation = useContext(ReactionPresentationContext) ?? ReactionBubble;
   const subscribe = useCallback((listener: () => void) => store.subscribe(scopeKey, listener), [scopeKey, store]);
   const getSnapshot = useCallback(() => store.getSnapshot(scopeKey), [scopeKey, store]);
   const reaction = useSyncExternalStore(subscribe, getSnapshot);
@@ -85,6 +88,7 @@ function ReactionSession({ scopeKey, messages, destination, store }: Props & { s
   const clear = () => {
     store.dispatch(scopeKey, { type: 'clear' });
     anchor.current = null;
+    window.getSelection()?.removeAllRanges();
   };
   const add = () => {
     const current = store.getSnapshot(scopeKey);
@@ -92,8 +96,6 @@ function ReactionSession({ scopeKey, messages, destination, store }: Props & { s
     try {
       destination.append(formatInlineReaction(current));
       clear();
-      // Clearing the consumed selection prevents pointerup from reopening it.
-      window.getSelection()?.removeAllRanges();
       setNotice('Added to draft');
     } catch {
       setNotice('Could not add to draft. Your reaction is still here.');
@@ -103,11 +105,13 @@ function ReactionSession({ scopeKey, messages, destination, store }: Props & { s
   return createPortal(
     <>
       {reaction && (
-        <ReactionBubble
+        <Presentation
           bubbleRef={bubbleRef}
           anchor={anchor.current}
           scopeId={focusScope}
           quote={reaction.source.quote}
+          source={reaction.source}
+          returnToSource={returnToSource}
           body={reaction.body}
           available={Boolean(destination)}
           onChange={(body) => store.dispatch(scopeKey, { type: 'edit', body })}
@@ -121,7 +125,9 @@ function ReactionSession({ scopeKey, messages, destination, store }: Props & { s
   );
 }
 
-interface BubbleProps {
+export interface BubbleProps {
+  source: ReactionSource;
+  returnToSource?: ((source: ReactionSource) => boolean) | undefined;
   bubbleRef: React.RefObject<HTMLDivElement>;
   anchor: Range | null;
   scopeId: string;

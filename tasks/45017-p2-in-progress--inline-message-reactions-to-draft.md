@@ -81,3 +81,17 @@ Implemented on `codex/inline-message-reactions` in the fresh worktree `/Users/sc
 - At 390px width: selected an older answer, entered a reaction, and appended to the current draft with the historical occurrence identity. The Review touch action opened the existing historical-message reviewer. Screenshots of desktop and narrow layouts are retained in the originating Codex conversation.
 - Reproducible fixture: `product-conversation--inline-message-reactions`, served locally at `http://127.0.0.1:61124/?mode=preview&story=product-conversation--inline-message-reactions` while the fixture server is running.
 - Remaining acceptance: real iOS Safari, installed PWA, and Android Chrome selection menus/handles, keyboard viewport/safe-area placement, and touch scrolling. No physical-device session is available here. Keep this task in progress for that acceptance; do not treat desktop viewport checks as native mobile evidence.
+
+## Revised interaction — fixture review before final integration
+
+The user requests an always-small, single-line pill. Long input scrolls horizontally; no automatic growth or larger editor. The anchored row contains only reaction input, lines-plus Add to draft, and ×. Plain Enter does not submit; Cmd/Ctrl+Enter appends. The existing multi-line production presentation is not replaced until fixture feedback is incorporated.
+
+An unfinished reaction whose selected passage leaves the transcript viewport becomes a compact dock above the composer. Its main action reads Return to passage with a reaction preview. Activating it uses production virtual-transcript navigation, waits for the source row to mount, restores the exact selected text range, and reopens the pill without focusing it. Manual scrolling back restores the pill too. Both anchored and docked states expose ×; typed reactions require Keep or Discard confirmation within the same compact row.
+
+The Ladle inline-message-reactions story now includes 36 additional recovery-review exchanges across the earlier segment, using the production VirtualTranscript and composer. The pill presentation is injected only by this fixture. Ordinary routes retain the previous presentation pending user feedback and final integration. Offset-based passage restoration, navigation plumbing, and the existing shared reaction/draft stores exercise the real boundaries instead of a mock transcript.
+
+Browser verification: a long typed reaction remained one line; scrolling eight screens removed the source message from the DOM and exposed the dock; Return to passage remounted it, restored the selected quote, and reopened the unchanged input without focus. Manual scrolling back also restored the pill. Docked dismissal offered Keep/Discard and Keep retained the text. Focused tests cover exact range reconstruction after remount, automatic undocking, long single-line input, IME/Enter behavior, and dismissal in both states.
+
+Next: user tries this fixture and provides interaction feedback; incorporate that feedback before promoting the pill out of the fixture and updating the normative interaction contract. Native phone-device acceptance remains outstanding.
+
+Validation for the fixture revision: `./dev.py check` passed all 16 checks. A browser-discovered empty-dismissal reopening bug was fixed with a focused regression test; the final `./dev.py check --lanes tsc,ui-lint,vitest` rerun passed all four UI checks, and fresh-browser empty dismissal stayed closed. The pill-to-production-draft append was browser-verified after the fixture revision.
