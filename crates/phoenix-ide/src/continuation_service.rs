@@ -202,14 +202,7 @@ impl ContinuationApplicationService {
             match outcome {
                 SendChatOutcome::Delivered
                 | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering => {
-                    self.runtime
-                        .db()
-                        .supersede_automatic_continuation(&admission.predecessor_conversation_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Ok(());
-                }
+                | SendChatOutcome::QueuedAsSteering => return Ok(()),
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
         }

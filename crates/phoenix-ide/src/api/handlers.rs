@@ -5523,13 +5523,6 @@ fn continuation_message_id(
     })
 }
 
-fn automatic_retry_intent_matches_admission(
-    admission: &crate::db::AutomaticContinuationAdmission,
-    intent: &crate::db::ContinuationDispatchIntent,
-) -> bool {
-    intent.message_id == admission.first_message_id
-}
-
 fn automatic_retry_phase_for_turn_state(
     state: crate::send_chat_service::AutomaticRetryTurnState,
     reserved_phase: phoenix_core::domain::product_conversation::AutomaticContinuationPhase,
@@ -5593,12 +5586,6 @@ async fn continue_conversation(
                 == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Admitted
             {
                 retry_phase = phoenix_core::domain::product_conversation::AutomaticContinuationPhase::SuccessorReserved;
-            }
-            if !automatic_retry_intent_matches_admission(&admission, &intent) {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "a different continuation opening already won",
-                    "continuation_superseded",
-                ))));
             }
             let (handoff, expansion_policy) = match intent.opening_authority {
                 phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => (
@@ -9490,39 +9477,6 @@ pub(crate) mod hard_delete_cascade_tests {
         fn model_id(&self) -> &str {
             "claude-sonnet-5"
         }
-    }
-
-    #[test]
-    fn automatic_retry_matches_persisted_identity_not_proposed_authority() {
-        use phoenix_core::domain::product_conversation::{
-            AutomaticContinuationPhase, ContinuationOpeningAuthority, ProductConversationId,
-        };
-        let admission = crate::db::AutomaticContinuationAdmission {
-            predecessor_conversation_id: "parent".to_string(),
-            product_conversation_id: ProductConversationId::new(),
-            summary_message_id: "summary".to_string(),
-            operation_id: "operation".to_string(),
-            first_message_id: phoenix_workflow::ClientTurnKey::try_from("opening").unwrap(),
-            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
-            phase: AutomaticContinuationPhase::Failed,
-            resume_phase: AutomaticContinuationPhase::SuccessorReserved,
-            no_progress_attempts: 5,
-            last_error: Some("failed".to_string()),
-            admitted_at_unix_micros: 1,
-            updated_at_unix_micros: 1,
-        };
-        let intent = crate::db::ContinuationDispatchIntent {
-            parent_conversation_id: "parent".to_string(),
-            successor_conversation_id: "successor".to_string(),
-            message_id: admission.first_message_id.clone(),
-            handoff: "summary".to_string(),
-            user_agent: None,
-            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
-        };
-
-        assert!(automatic_retry_intent_matches_admission(
-            &admission, &intent
-        ));
     }
 
     #[test]
