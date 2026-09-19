@@ -46,11 +46,28 @@ while IFS=$'\t' read -r asset_id asset_name; do
   gh api "repos/$repo/releases/assets/$asset_id" \
     -H 'Accept: application/octet-stream' >"$work/assets/$asset_name"
 done < <(jq -r '.assets[] | [.id, .name] | @tsv' "$metadata")
-(
-  cd "$work/assets"
-  sha256sum --check SHA256SUMS
-  grep -E '^[0-9a-f]{64} [ *].+$' SHA256SUMS | sed 's/^[0-9a-f]\{64\} [ *]//' | sort >"$work/manifest-names"
-)
+python3 - "$work/assets" "$work/manifest-names" <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+assets = Path(sys.argv[1])
+manifest = {}
+for line in (assets / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line)
+    if not match:
+        raise SystemExit(f"error: malformed SHA256SUMS line: {line!r}")
+    digest, name = match.groups()
+    if name in manifest:
+        raise SystemExit(f"error: duplicate SHA256SUMS member: {name}")
+    manifest[name] = digest
+for name, expected in manifest.items():
+    path = assets / name
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise SystemExit(f"error: SHA256SUMS digest mismatch for {name}")
+Path(sys.argv[2]).write_text("".join(f"{name}\n" for name in sorted(manifest)), encoding="utf-8")
+PY
 printf '%s\n' "${required[@]}" | sort >"$work/expected-manifest-names"
 cmp -s "$work/expected-manifest-names" "$work/manifest-names" || {
   echo "error: public release $tag has an unexpected checksum manifest" >&2

@@ -1,14 +1,5 @@
 name: Release
 
-# Releases are triggered by a version bump landing on `main`, never by a
-# human pushing a tag. This makes two invariants structural rather than
-# disciplinary:
-#   - the release tag always points at a commit that is on `main` (the
-#     workflow only ever tags the commit that triggered it), and
-#   - the tag always carries the `v` prefix the build expects (the workflow
-#     generates it from Cargo.toml — it cannot be fat-fingered).
-# A bump PR merged into `main` is the entire release action.
-
 permissions:
   contents: read
 
@@ -283,6 +274,7 @@ jobs:
 
   publish:
     needs: [gate, build-linux, build-macos]
+    environment: macos-release-signing
     permissions:
       contents: write
     runs-on: ubuntu-latest
