@@ -7048,7 +7048,7 @@ impl Database {
                  updated_at_unix_micros = CASE WHEN phase = 'failed' THEN ?3 ELSE updated_at_unix_micros END
              WHERE predecessor_conversation_id = ?1
                AND phase IN ('failed', 'admitted', 'successor_reserved',
-                             'ownership_transferred', 'dispatch_accepted')",
+                             'ownership_transferred', 'dispatch_accepted', 'message_settled')",
         )
         .bind(predecessor_conversation_id)
         .bind(resume_phase.as_str())
@@ -18845,6 +18845,23 @@ mod tests {
         );
         assert_eq!(retried.summary_message_id, original.summary_message_id);
         assert_eq!(retried.first_message_id, original.first_message_id);
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::MessageSettled,
+        )
+        .await
+        .unwrap();
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("a retry racing with exact terminal settlement remains idempotent");
+        assert_eq!(
+            db.automatic_continuation_admission("breaker-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::MessageSettled
+        );
         assert_eq!(retried.opening_authority, original.opening_authority);
     }
 

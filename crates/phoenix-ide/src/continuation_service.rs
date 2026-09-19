@@ -19,6 +19,19 @@ fn winning_intent_is_automatic(
     intent.message_id == admission.first_message_id
 }
 
+fn continuation_expansion_policy(
+    authority: ContinuationOpeningAuthority,
+) -> MessageExpansionPolicy {
+    match authority {
+        ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+            MessageExpansionPolicy::GeneratedPredecessorContext
+        }
+        ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+            MessageExpansionPolicy::LiteralText
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryPlan {
     reserve_successor: bool,
@@ -206,14 +219,7 @@ impl ContinuationApplicationService {
                 .get_or_create(&successor.id)
                 .await
                 .map_err(|error| error.clone())?;
-            let expansion_policy = match intent.opening_authority {
-                ContinuationOpeningAuthority::GeneratedPredecessorContext => {
-                    MessageExpansionPolicy::GeneratedPredecessorContext
-                }
-                ContinuationOpeningAuthority::UserAuthorizedInstruction => {
-                    MessageExpansionPolicy::ExpandReferences
-                }
-            };
+            let expansion_policy = continuation_expansion_policy(intent.opening_authority);
             let outcome =
                 SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
                     .send(SendChatRequest {
@@ -360,6 +366,14 @@ mod tests {
         };
 
         assert!(winning_intent_is_automatic(&admission, &intent));
+    }
+
+    #[test]
+    fn manual_continuation_recovery_preserves_literal_payload_semantics() {
+        assert_eq!(
+            continuation_expansion_policy(ContinuationOpeningAuthority::UserAuthorizedInstruction),
+            MessageExpansionPolicy::LiteralText
+        );
     }
 
     #[test]
