@@ -24981,6 +24981,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_delete_claim_identity_is_immutable() {
+        let db = Database::open_in_memory().await.unwrap();
+        let original = db
+            .create_conversation("claim-original", "claim-original", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let live = db
+            .create_conversation("claim-live", "claim-live", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(&original.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO close_hard_delete_claims (product_conversation_id) VALUES (?1)")
+            .bind(original.product_conversation_id.as_str())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let moved_claim = sqlx::query(
+            "UPDATE close_hard_delete_claims
+             SET product_conversation_id = ?1
+             WHERE product_conversation_id = ?2",
+        )
+        .bind(live.product_conversation_id.as_str())
+        .bind(original.product_conversation_id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("hard-delete claim identity must remain immutable");
+        assert!(moved_claim
+            .to_string()
+            .contains("hard-delete claim identity is immutable"));
+    }
+
+    #[tokio::test]
     async fn delete_conversation_removes_only_an_empty_product_owner() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db

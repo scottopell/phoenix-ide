@@ -8843,6 +8843,12 @@ BEGIN
     SELECT RAISE(ABORT, 'hard-delete claim requires an empty aggregate with completed Close obligations');
 END;
 
+CREATE TRIGGER close_hard_delete_claim_reject_update
+BEFORE UPDATE ON close_hard_delete_claims
+BEGIN
+    SELECT RAISE(ABORT, 'hard-delete claim identity is immutable');
+END;
+
 CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
 ON close_worktree_cleanup_plans (
     attempt_id, scope, inspection_generation, inspection_fingerprint,
