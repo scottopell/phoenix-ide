@@ -327,6 +327,7 @@ pub enum AutomaticContinuationAdmissionPhaseView {
 pub struct AutomaticContinuationFailureView {
     pub message: String,
     pub first_message_id: String,
+    pub accepted_handoff: String,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

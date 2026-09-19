@@ -75,27 +75,11 @@ impl ContinuationApplicationService {
         if self
             .runtime
             .db()
-            .has_settled_automatic_continuation(admission)
+            .reconcile_completed_automatic_continuation(admission)
             .await
             .map_err(|error| error.to_string())?
+            .is_some()
         {
-            return self
-                .advance_until(admission, AutomaticContinuationPhase::MessageSettled)
-                .await;
-        }
-
-        if self
-            .runtime
-            .db()
-            .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            self.runtime
-                .db()
-                .supersede_automatic_continuation(&admission.predecessor_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
             return Ok(());
         }
 
@@ -271,40 +255,6 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "automatic continuation admission is missing".to_string())
-    }
-
-    async fn advance_until(
-        &self,
-        admission: &AutomaticContinuationAdmission,
-        target: AutomaticContinuationPhase,
-    ) -> Result<(), String> {
-        let current = self
-            .runtime
-            .db()
-            .automatic_continuation_admission(&admission.predecessor_conversation_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "automatic continuation admission is missing".to_string())?;
-        let phases = [
-            AutomaticContinuationPhase::Admitted,
-            AutomaticContinuationPhase::SuccessorReserved,
-            AutomaticContinuationPhase::OwnershipTransferred,
-            AutomaticContinuationPhase::DispatchAccepted,
-            AutomaticContinuationPhase::MessageSettled,
-        ];
-        let current_index = phases
-            .iter()
-            .position(|phase| *phase == current.phase)
-            .ok_or_else(|| "automatic admission is not progressable".to_string())?;
-        let target_index = phases
-            .iter()
-            .position(|phase| *phase == target)
-            .ok_or_else(|| "automatic target phase is not progressable".to_string())?;
-        for phase in phases.iter().take(target_index + 1).skip(current_index + 1) {
-            self.advance_current(&admission.predecessor_conversation_id, *phase)
-                .await?;
-        }
-        Ok(())
     }
 
     async fn advance_current(

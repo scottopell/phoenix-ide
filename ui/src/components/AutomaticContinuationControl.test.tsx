@@ -197,6 +197,7 @@ describe('AutomaticContinuationControl', () => {
           actionable_failure: {
             message: 'Successor dispatch could not be accepted.',
             first_message_id: 'automatic-first-message',
+            accepted_handoff: 'Persisted generated handoff',
           },
         },
       }));
@@ -217,6 +218,7 @@ describe('AutomaticContinuationControl', () => {
         actionable_failure: {
           message: 'Dispatch failed.',
           first_message_id: 'automatic-first-message',
+          accepted_handoff: 'Persisted generated handoff',
         },
       },
     }));
@@ -230,7 +232,7 @@ describe('AutomaticContinuationControl', () => {
     await waitFor(() => expect(apiMock.continueConversation).toHaveBeenCalledWith(
       'row-exhausted',
       {
-        handoff: 'Retry persisted generated handoff',
+        handoff: 'Persisted generated handoff',
         message_id: 'automatic-first-message',
       },
     ));
@@ -247,6 +249,7 @@ describe('AutomaticContinuationControl', () => {
         actionable_failure: {
           message: 'Successor dispatch could not be accepted.',
           first_message_id: 'automatic-first-message',
+          accepted_handoff: 'Persisted generated handoff',
         },
       },
     }));
@@ -256,6 +259,7 @@ describe('AutomaticContinuationControl', () => {
     const alert = await screen.findByRole('alert');
     expect(control).toHaveAttribute('open');
     expect(alert).toHaveTextContent('Successor dispatch could not be accepted.');
+    expect(alert).toHaveTextContent('Persisted generated handoff');
     expect(alert).toHaveTextContent('same persisted generated handoff and message identity');
     expect(screen.getByRole('button', { name: 'Retry generated handoff' })).toBeEnabled();
     expect(alert).toHaveTextContent('remains enabled for future exhaustions');

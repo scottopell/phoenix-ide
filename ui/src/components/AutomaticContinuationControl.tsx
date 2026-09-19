@@ -115,7 +115,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       const response = await api.continueConversation(
         admission.predecessor_transcript_row_id,
         {
-          handoff: 'Retry persisted generated handoff',
+          handoff: admission.actionable_failure.accepted_handoff,
           message_id: admission.actionable_failure.first_message_id,
         },
       );
@@ -171,6 +171,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
             {failedAdmission?.actionable_failure && (
               <div role="alert" className="automatic-continuation__failure">
                 <span>{failedAdmission.actionable_failure.message}</span>
+                <pre>{failedAdmission.actionable_failure.accepted_handoff}</pre>
                 <span> Retry safely with the same persisted generated handoff and message identity. Automatic continuation remains enabled for future exhaustions.</span>
                 <button
                   type="button"
