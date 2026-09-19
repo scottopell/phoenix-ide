@@ -8907,6 +8907,38 @@ CREATE TABLE close_worktree_cleanup_adoptions (
 );
 
 DROP TRIGGER close_retirement_inspections_reject_sealed_delete;
+
+CREATE TRIGGER close_worktree_cleanup_adoption_requires_identical_payload
+BEFORE INSERT ON close_worktree_cleanup_adoptions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_worktree_cleanup_plans source
+    JOIN close_worktree_cleanup_plans target
+      ON target.attempt_id = source.attempt_id
+     AND target.scope = source.scope
+     AND target.resource_kind = source.resource_kind
+     AND target.identity_kind = source.identity_kind
+     AND target.identity_codec = source.identity_codec
+     AND target.identity_value = source.identity_value
+    WHERE source.attempt_id = NEW.attempt_id
+      AND source.scope = NEW.scope
+      AND source.inspection_generation = NEW.source_inspection_generation
+      AND source.inspection_fingerprint = NEW.source_inspection_fingerprint
+      AND target.inspection_generation = NEW.target_inspection_generation
+      AND target.inspection_fingerprint = NEW.target_inspection_fingerprint
+      AND source.administrative_dir_codec = target.administrative_dir_codec
+      AND source.administrative_dir_value = target.administrative_dir_value
+      AND source.administrative_dir_incarnation = target.administrative_dir_incarnation
+      AND source.final_tombstone_root_codec IS target.final_tombstone_root_codec
+      AND source.final_tombstone_root_value IS target.final_tombstone_root_value
+      AND source.final_tombstone_root_device IS target.final_tombstone_root_device
+      AND source.final_tombstone_root_inode IS target.final_tombstone_root_inode
+      AND source.final_tombstone_object_device IS target.final_tombstone_object_device
+      AND source.final_tombstone_object_inode IS target.final_tombstone_object_inode
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption requires identical cleanup-plan payloads');
+END;
 CREATE TRIGGER close_retirement_inspections_reject_sealed_delete
 BEFORE DELETE ON close_retirement_inspections
 FOR EACH ROW

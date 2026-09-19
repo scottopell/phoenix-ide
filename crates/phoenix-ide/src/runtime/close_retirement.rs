@@ -4262,6 +4262,16 @@ fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_mapping_path_is_deleted(path: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Some(candidate) = path.strip_suffix(b" (deleted)") else {
+        return false;
+    };
+    let candidate = Path::new(std::ffi::OsStr::from_bytes(candidate));
+    std::fs::metadata(candidate).is_err()
+}
+
+#[cfg(target_os = "linux")]
 fn linux_writable_shared_mapping_path(
     mapping: &[u8],
     canonical: &Path,
@@ -4283,7 +4293,9 @@ fn linux_writable_shared_mapping_path(
     if permissions.get(1) != Some(&b'w') || permissions.get(3) != Some(&b's') {
         return Ok(None);
     }
-    if inode == b"0" && mapped_path.ends_with(b" (deleted)") {
+    if mapped_path.ends_with(b" (deleted)")
+        && (inode == b"0" || linux_mapping_path_is_deleted(mapped_path))
+    {
         return Ok(None);
     }
     let canonical_display = linux_procfs_display_path(canonical);
