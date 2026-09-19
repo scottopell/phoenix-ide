@@ -866,6 +866,25 @@ mod tests {
     }
 
     #[test]
+    fn parity_invalid_request_exposes_manual_recovery() {
+        let state = serde_json::from_str(
+            r#"{"type":"error","message":"Bad request (400): The access_programs parameter is not enabled for this organization.","error_kind":"invalid_request"}"#,
+        )
+        .unwrap();
+        let event = SseEvent::StateChange {
+            sequence_id: 13,
+            state,
+            presentation_mode: "error".to_string(),
+            state_updated_at: ts(),
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["error"]["kind"], "invalid_request");
+        assert_eq!(typed["error"]["can_auto_retry"], false);
+        assert_eq!(typed["error"]["can_user_resume"], true);
+    }
+
+    #[test]
     fn parity_state_change_llm_requesting() {
         let event = SseEvent::StateChange {
             sequence_id: 14,

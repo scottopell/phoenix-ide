@@ -1976,7 +1976,7 @@ fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
 fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
     // Use selector + string to avoid Clone requirement on LlmOutcome.
     (
-        0..12u8,
+        0..13u8,
         proptest::collection::vec(arb_tool_call(), 0..3),
         "[a-zA-Z ]{1,20}",
     )
@@ -2032,6 +2032,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
             8 => LlmOutcome::ServerOverloaded { message: msg },
             9 => LlmOutcome::InvalidResponse { message: msg },
             10 => LlmOutcome::PromptRejected { message: msg },
+            11 => LlmOutcome::ContentFiltered { message: msg },
             _ => LlmOutcome::Cancelled,
         })
 }

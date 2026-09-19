@@ -536,6 +536,7 @@ export type ConversationState =
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
+  | { type: 'client_decode_error'; message: string }
   | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string; resume: RecoveryResumeTarget }
   | { type: 'provisioning'; prompt?: string | null }
@@ -576,6 +577,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'cancelling_sub_agents':
     case 'awaiting_task_approval':
     case 'awaiting_user_response':
+    case 'client_decode_error':
     case 'error':
     case 'recoverable_continuation_failure':
     case 'awaiting_recovery':
@@ -595,6 +597,7 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
     case 'terminal': return 'terminal';
     case 'handed_off': return 'terminal';
     case 'creation_cancelled': return 'terminal';
+    case 'client_decode_error':
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting-approval';

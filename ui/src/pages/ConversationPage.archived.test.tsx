@@ -652,17 +652,17 @@ describe('ConversationPage message delivery reconciliation', () => {
     expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm');
   });
 
-  it('sends quick prompt-rejection recovery as a new continue message', async () => {
+  it.each(['prompt_rejected', 'invalid_request'] as const)('sends %s recovery as a new continue message', async (kind) => {
     const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
       queued: true,
       steering: false,
     });
     const errorState = {
       type: 'error' as const,
-      message: 'invalid_prompt: rejected',
-      error_kind: 'prompt_rejected' as const,
+      message: 'Provider rejected the request',
+      error_kind: kind,
       error: {
-        kind: 'prompt_rejected' as const,
+        kind,
         can_auto_retry: false,
         can_user_resume: true,
       },
@@ -674,13 +674,24 @@ describe('ConversationPage message delivery reconciliation', () => {
     expect(sendMessage.mock.calls[0]?.[1]).toBe('continue');
   });
 
-  it('does not expose a composer for a terminal malformed request', async () => {
+  it('shows unreadable state without provider recovery actions or composer', async () => {
+    renderPage(makeConversation({ state: { type: 'client_decode_error', message: 'Unknown state' } }));
+
+    await screen.findByText('Unable to read conversation state');
+    expect(screen.getByText('Reload Phoenix to retrieve the conversation state.')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry.*continue/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
+  });
+
+  it('does not expose a composer for a terminal content-filter error', async () => {
     const errorState = {
       type: 'error' as const,
-      message: 'unsupported request parameter',
-      error_kind: 'invalid_request' as const,
+      message: 'content filtered',
+      error_kind: 'content_filter' as const,
       error: {
-        kind: 'invalid_request' as const,
+        kind: 'content_filter' as const,
         can_auto_retry: false,
         can_user_resume: false,
       },

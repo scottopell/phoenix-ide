@@ -151,10 +151,9 @@ impl LlmErrorKind {
             | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached
+            | Self::InvalidRequest
             | Self::PromptRejected => UserResumePolicy::Resumable,
-            Self::InvalidRequest | Self::ContentFilter | Self::ContextWindowExceeded => {
-                UserResumePolicy::NotResumable
-            }
+            Self::ContentFilter | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
         }
     }
 
@@ -210,7 +209,7 @@ mod tests {
             (
                 InvalidRequest,
                 AutoRetryPolicy::NoAutoRetry,
-                UserResumePolicy::NotResumable,
+                UserResumePolicy::Resumable,
             ),
             (
                 PromptRejected,

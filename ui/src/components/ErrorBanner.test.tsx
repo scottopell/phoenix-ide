@@ -45,8 +45,8 @@ describe('ErrorBanner', () => {
   it('offers neither Retry nor Dismiss for a non-resumable error', () => {
     render(
       <ErrorBanner
-        message="Bad request"
-        error={getErrorPresentation('invalid_request')}
+        message="Content filtered"
+        error={getErrorPresentation('content_filter')}
         onRetry={vi.fn()}
         onDismiss={vi.fn()}
       />,
@@ -57,6 +57,22 @@ describe('ErrorBanner', () => {
     // not offered for non-resumable errors.
     expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument();
     expect(screen.getByText(/start a new conversation/i)).toBeInTheDocument();
+  });
+
+  it('preserves the provider rejection and offers manual retry or dismiss', () => {
+    const message = 'Bad request (400): The access_programs parameter is not enabled for this organization.';
+    const onRetry = vi.fn();
+    const onDismiss = vi.fn();
+    const error = getErrorPresentation('invalid_request');
+    expect(error?.can_auto_retry).toBe(false);
+    render(<ErrorBanner message={message} error={error} onRetry={onRetry} onDismiss={onDismiss} />);
+
+    expect(screen.getByText(message)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /retry.*continue/i }));
+    expect(onRetry).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: /dismiss/i }));
+    expect(onDismiss).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
   });
 
   it('explains prompt rejection and keeps in-conversation recovery available', () => {
