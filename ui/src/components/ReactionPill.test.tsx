@@ -1,5 +1,5 @@
 import { createRef } from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReactionPill } from './ReactionPill';
 import { restoreReactionRange } from './reactionRange';
@@ -9,7 +9,7 @@ import type { ReactionSource } from '../conversation/InlineReactionStore';
 const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textAnchor: { start: { fragmentId: 'text-0', offset: 6 }, end: { fragmentId: 'text-0', offset: 12 } } };
 const add = vi.fn();
 const close = vi.fn();
-const navigate = vi.fn(() => true);
+const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
 function Fixture({ mounted = true, body = 'Keep this guarantee' }: { mounted?: boolean; body?: string }) {
   return <FocusScopeProvider>
@@ -23,6 +23,7 @@ function Fixture({ mounted = true, body = 'Keep this guarantee' }: { mounted?: b
 beforeEach(() => {
   offscreen = false;
   vi.clearAllMocks();
+  navigate.mockImplementation(() => true);
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 600, 500));
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect(20, offscreen ? -100 : 100, 150, 20) });
 });
@@ -85,11 +86,27 @@ describe('reaction pill', () => {
     expect(restoreReactionRange(source)).toBeNull();
     expect(screen.queryByRole('textbox')).toBeNull();
     fireEvent.click(dock);
-    expect(navigate).toHaveBeenCalledWith(source);
+    expect(navigate).toHaveBeenCalledWith(source, expect.any(AbortSignal));
     view.rerender(<Fixture />);
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('Keep this guarantee'));
     expect(window.getSelection()?.toString()).toBe('second');
     expect(screen.getByRole('textbox')).not.toHaveFocus();
+  });
+
+  it('keeps the dock usable after an asynchronous load failure and aborts on unmount', async () => {
+    let finish!: (found: boolean) => void;
+    navigate.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const view = render(<Fixture mounted={false} />);
+    fireEvent.click(screen.getByRole('button', { name: /Return to passage/ }));
+    expect(screen.getByRole('button', { name: /Returning to passage/ })).toBeDisabled();
+    await act(async () => { finish(false); });
+    const retry = screen.getByRole('button', { name: /Passage unavailable/ });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    const signal = navigate.mock.calls[1]![1];
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => { finish(false); });
   });
 
   it('automatically undocks on manual return and preserves the same one-line editor for long text', async () => {

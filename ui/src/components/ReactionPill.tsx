@@ -12,6 +12,16 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
   const [discard, setDiscard] = useState(false);
   const [error, setError] = useState('');
   const returning = useRef(false);
+  const returnRequest = useRef<AbortController | null>(null);
+  const [returnPending, setReturnPending] = useState(false);
+  useEffect(() => {
+    setReturnPending(false);
+    setError('');
+    return () => {
+      returnRequest.current?.abort();
+      returning.current = false;
+    };
+  }, [source]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -102,11 +112,27 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
     if (!docked) setError('');
   }, [docked]);
 
-  const returnToPassage = () => {
+  const returnToPassage = async () => {
+    returnRequest.current?.abort();
+    const request = new AbortController();
+    returnRequest.current = request;
     returning.current = true;
-    if (!returnToSource?.(source)) {
-      returning.current = false;
-      setError('Passage unavailable. Your reaction is saved here.');
+    setReturnPending(true);
+    setError('');
+    try {
+      const found = await returnToSource?.(source, request.signal);
+      if (request.signal.aborted) return;
+      if (!found) {
+        returning.current = false;
+        setError('Passage unavailable. Your reaction is saved here.');
+      }
+    } catch {
+      if (!request.signal.aborted) {
+        returning.current = false;
+        setError('Passage unavailable. Your reaction is saved here.');
+      }
+    } finally {
+      if (!request.signal.aborted) setReturnPending(false);
     }
   };
 
@@ -121,9 +147,9 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       ) : (
         <>
           {docked ? (
-            <button type="button" className="reaction-pill-return" onClick={returnToPassage} title={error || source.quote}>
+            <button type="button" className="reaction-pill-return" onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
               <ArrowUpRight size={18} aria-hidden="true" />
-              <span>{error || `Return to passage · ${body || source.quote}`}</span>
+              <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
             </button>
           ) : (
             <>

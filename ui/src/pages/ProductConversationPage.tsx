@@ -1101,7 +1101,7 @@ function ProductConversationPageInner() {
           conversationId={latestConversationId ?? snapshot.product_conversation_id}
           slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
           hasOlderMessages={snapshot.has_older}
-          onLoadOlderMessages={snapshot.has_older ? (restoreBasis) => { void loadOlderMessages(restoreBasis); } : undefined}
+          onLoadOlderMessages={snapshot.has_older ? loadOlderMessages : undefined}
           loadingOlderMessages={loadingOlder}
           olderHistoryError={olderError}
           transcriptPositioning={transcriptPositioning}

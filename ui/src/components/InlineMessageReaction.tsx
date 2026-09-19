@@ -15,7 +15,7 @@ interface Props {
   scopeKey: string;
   messages: Message[];
   destination?: ReactionDraftDestination | undefined;
-  returnToSource?: ((source: ReactionSource) => boolean) | undefined;
+  returnToSource?: ((source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>) | undefined;
 }
 
 export function InlineMessageReaction(props: Props) {
@@ -120,7 +120,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
 
 export interface ReactionPillProps {
   source: ReactionSource;
-  returnToSource?: ((source: ReactionSource) => boolean) | undefined;
+  returnToSource?: ((source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>) | undefined;
   bubbleRef: React.RefObject<HTMLDivElement>;
   scopeId: string;
   body: string;

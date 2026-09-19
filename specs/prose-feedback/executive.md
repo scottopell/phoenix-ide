@@ -2,7 +2,7 @@
 
 ## Approved pill integration
 
-The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. The dock restores a virtualized source passage and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
+The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. The dock loads older history when needed and restores the exact source occurrence and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
 
 ## Requirements Summary
 
@@ -54,3 +54,5 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 
 - `specs/file-explorer/` — Desktop File Explorer Panel (supersedes overlay file browsing on desktop)
 - `specs/viewer-find/` — Shared in-viewer find behavior for MetaViewer surfaces and task approval readers
+
+Paged-return regression coverage includes successive pages, failed-load retry, exhaustion, cancellation on discard/navigation, and a production-page fixture with a retained source absent from the initially loaded snapshot. Pagination completion is carried through the existing history loader; the virtual transcript remains the physical positioning owner.

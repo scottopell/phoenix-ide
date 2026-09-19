@@ -1088,7 +1088,7 @@ function ConversationPageContent({
   }, [slug, conversationId, historyExpansion, dispatch, eventCursorRef]);
 
   const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
-    void loadOlderMessagesForIntent({
+    return loadOlderMessagesForIntent({
       kind: 'reader_expansion',
       restore: restoreBasis ?? { kind: 'following_tail' },
     });

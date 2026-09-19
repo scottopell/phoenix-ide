@@ -31,7 +31,7 @@ Authority starting points: `specs/conversation-ui/requirements.md`, `specs/prose
 - [x] Ignore selection in editable controls, unrelated surfaces, and selections spanning multiple messages. Do not offer the mutation action when the current conversation has no eligible draft/composer destination. Streaming/incomplete assistant content is outside this first implementation.
 - [ ] Selection remains native: mouse drag, selection extension, keyboard selection, copying, right-click/system menus, mobile handles, and ordinary scrolling still work. Do not globally cancel pointer, selection, touch, or context-menu behavior to make the reaction UI work.
 - [ ] The input appears without autofocus. It does not cover the selected text or selection handles; placement follows available room and stays inside the visible viewport. On mobile, account for browser chrome, safe areas, and the on-screen keyboard after the user taps the input.
-- [x] The user may enter a multiline reaction. Blank/whitespace-only reactions cannot be added. Cmd/Ctrl+Enter adds; Enter alone inserts a newline. IME composition must not trigger append.
+- [x] The reaction input remains a single line with horizontal scrolling. Blank/whitespace-only reactions cannot be added. Cmd/Ctrl+Enter adds; plain Enter in the input does not append or submit. Unmodified Enter outside another control focuses the anchored input. IME composition must not trigger append.
 
 ### 2. Append atomically and keep reading
 
@@ -39,7 +39,7 @@ Authority starting points: `specs/conversation-ui/requirements.md`, `specs/prose
 - [x] Handle multiline selections and Markdown delimiters correctly so selected code/quotes cannot corrupt the surrounding feedback format. Preserve complete quote text and reaction text.
 - [x] Each activation appends exactly once. No model request, queued message, clipboard write, or separate review-note entry results. Repeated sequential reactions append in the user's action order.
 - [x] On success, clear the reaction input, dismiss the bubble, and provide a quiet accessible acknowledgement such as “Added to draft.” Preserve transcript scroll/reading position; do not autofocus or scroll to the composer. The normal composer remains editable and its Send action remains the only submission step.
-- [x] Do not silently lose a typed reaction or reattach it to another source when selection changes, a transcript row virtualizes, or a viewer opens. Pin the source snapshot for a non-empty reaction; replacing it requires adding or explicitly discarding that reaction first. Empty bubbles can dismiss when the selection clears. Explicit close discards the temporary reaction.
+- [x] Do not silently lose a typed reaction or reattach it to another source when selection changes, a transcript row virtualizes, or a viewer opens. Pin the source snapshot for a non-empty reaction; replacing it requires adding or explicitly discarding that reaction first. Empty pills can dismiss when the selection clears. Explicit close of a typed reaction offers Keep/Discard before clearing it.
 - [x] On route/conversation changes, never append an old reaction into the new conversation. Integrate dirty-reaction handling with existing navigation/focus conventions. If the destination becomes unavailable while composing, retain the reaction and explain why Add to draft is unavailable instead of reporting success.
 - [x] Inline reactions do not clear or submit notes already collected in the existing file/message/diff reviewer.
 
@@ -113,3 +113,11 @@ Integration validation: 19 focused tests passed. The broad `./dev.py check` pass
 - Parent browser verification separately exercised ten-screen scrolling, actual source unmount, exact passage return, preserved reaction, and no autofocus. `./dev.py check` passed all 16 checks after rebase onto main. Physical-device mobile acceptance remains unverified.
 
 These local results precede external Codex review; no comparison against Codex findings is claimed yet. User retains merge and deployment ownership.
+
+## External review follow-up
+
+Codex review on `6012c2de94a8d6582e33873af2307cad31ce6235` found a P2: a retained reaction could not return to a source outside the initially loaded history after leaving and reopening a conversation. The loaded-unit lookup rejected the source before requesting older pages. This violates the combined source-return and session-navigation promises in REQ-PF-018/020.
+
+Comparison: **near-match / Codex-only / validated / isolated**. The local isolated round reviewed `4cf9069e35db7cfb865b082157b81e74cfc58437`; the external head is one documentation-only commit later with the same base and unchanged affected code. The missing review move was to discard the loaded-history cache while retaining the app-level reaction, then challenge return across multiple pagination boundaries. DOM unmount/remount alone did not exercise that boundary.
+
+The follow-up routes source return through the existing history loader until the occurrence is available, with explicit completion, failure/exhaustion, and cancellation on navigation or discard. Regression coverage includes two-page lookup, immediate failure/retry without an intermediate loading render, pending-request cancellation, and a production-page cursor fetch restoring exact native selection without autofocus. The loader promise is preserved through both page owners and the navigation wrapper; the virtual transcript owns final positioning.

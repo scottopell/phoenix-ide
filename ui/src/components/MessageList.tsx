@@ -52,6 +52,7 @@ import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
 import { InlineMessageReaction, type ReactionDraftDestination } from './InlineMessageReaction';
 import { restoreReactionRange } from './reactionRange';
+import { useReactionSourceReturn } from './useReactionSourceReturn';
 import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
@@ -196,7 +197,7 @@ interface MessageListProps {
    *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
-  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
+  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => Promise<void>) | undefined;
   onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
@@ -1485,6 +1486,31 @@ function MessageListImpl({
     if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;
   }, [hasOlderMessages, olderHistoryError]);
 
+  const returnToReactionSource = useReactionSourceReturn({
+    scopeKey: reactionScopeKey ?? conversationId ?? slug ?? '__empty__',
+    historyKey: currentHistoryViewKey,
+    loading: loadingOlderMessages,
+    hasOlder: hasOlderMessages,
+    error: olderHistoryError,
+    locate: (source) => {
+      const matches = (message: Message) => source.occurrenceToken
+        ? (message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken === source.occurrenceToken
+        : message.message_id === source.messageId;
+      const index = historicalUnits.findIndex((unit) => agentTurnsInHistoricalUnit(unit).some((turn) => matches(turn.agent)));
+      if (index < 0) return false;
+      dispatchScrollEvent({ type: 'navigationJumped' });
+      transcriptRef.current?.scrollToIndex(index, 'start', 72, (row) => restoreReactionRange(source, row));
+      return true;
+    },
+    loadOlder: onLoadOlderMessages ? async () => {
+      cancelScheduledEarlierHistoryRef.current?.();
+      cancelScheduledEarlierHistoryRef.current = null;
+      earlierHistoryRequestScheduledRef.current = true;
+      transcriptRef.current?.preserveViewportOnNextItemsChange();
+      await onLoadOlderMessages({ kind: 'reader_viewport' });
+    } : undefined,
+  });
+
   useImperativeHandle(
     ref,
     () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
@@ -1838,16 +1864,7 @@ function MessageListImpl({
         scopeKey={reactionScopeKey ?? conversationId ?? slug ?? '__empty__'}
         messages={messages}
         destination={reactionDestination}
-        returnToSource={(source) => {
-          const matches = (message: Message) => source.occurrenceToken
-            ? (message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken === source.occurrenceToken
-            : message.message_id === source.messageId;
-          const index = historicalUnits.findIndex((unit) => agentTurnsInHistoricalUnit(unit).some((turn) => matches(turn.agent)));
-          if (index < 0) return false;
-          dispatchScrollEvent({ type: 'navigationJumped' });
-          transcriptRef.current?.scrollToIndex(index, 'start', 72, (row) => restoreReactionRange(source, row));
-          return true;
-        }}
+        returnToSource={returnToReactionSource}
       />
       <MessageContextMenu
         messages={messages}

@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
+import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';
 import { getProductConversationScenario } from './scenarios';
 
@@ -67,6 +68,58 @@ describe('ProductConversationFixture', () => {
     expect(viewer).toHaveTextContent('Preserve the user’s draft and every completed tool result.');
     expect(screen.getByRole('button', { name: 'Add note to line 1' })).toBeInTheDocument();
     send.mockRestore();
+    window.getSelection()?.removeAllRanges();
+  });
+
+  it('returns a retained reaction through the production older-history loader after the source cache is lost', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.id === 'messages' ? 800 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 390, this.id === 'messages' ? 800 : 120);
+    });
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(20, 100, 230, 30),
+    });
+    const originalSnapshot = InlineReactionStore.prototype.getSnapshot;
+    const observedStores = new Set<InlineReactionStore>();
+    vi.spyOn(InlineReactionStore.prototype, 'getSnapshot').mockImplementation(function (this: InlineReactionStore, key) {
+      observedStores.add(this);
+      return originalSnapshot.call(this, key);
+    });
+    const base = getProductConversationScenario('inline-message-reactions');
+    const snapshot = base.snapshot!;
+    const scenario = {
+      ...base,
+      snapshot: { ...snapshot, segments: snapshot.segments.slice(1), has_older: true, before: 'reaction-page' },
+      olderSnapshot: { ...snapshot, segments: snapshot.segments.slice(0, 1), has_older: false, before: null },
+    };
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    await screen.findByPlaceholderText('Type a message...');
+    await waitFor(() => expect(observedStores.size).toBe(1));
+    const reactionStore = [...observedStores][0]!;
+    expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).toBeNull();
+    const quote = 'Preserve the user’s draft';
+    act(() => {
+      reactionStore.dispatch(snapshot.product_conversation_id, { type: 'select', source: {
+        messageId: 'reaction-answer-older', sequenceId: 2,
+        occurrenceToken: 'reaction-history:reaction-answer-older', quote,
+        textAnchor: {
+          start: { fragmentId: 'agent-text-0', offset: 0 },
+          end: { fragmentId: 'agent-text-0', offset: quote.length },
+        },
+      } });
+      reactionStore.dispatch(snapshot.product_conversation_id, { type: 'edit', body: 'Keep this guarantee.' });
+    });
+    const fetchSnapshot = vi.spyOn(api, 'getProductConversationSnapshot');
+    fireEvent.click(await screen.findByRole('button', { name: /Return to passage/ }));
+    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
+    expect(input).toHaveValue('Keep this guarantee.');
+    expect(input).not.toHaveFocus();
+    expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' }));
+    await waitFor(() => expect(window.getSelection()?.toString()).toBe(quote));
+    expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull();
     window.getSelection()?.removeAllRanges();
   });
 
