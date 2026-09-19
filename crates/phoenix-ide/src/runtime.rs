@@ -3809,6 +3809,39 @@ impl RuntimeManager {
             return;
         }
 
+        let parent_resource =
+            match crate::resource_authority::resolve_resource_authority(&self.db, &parent_conv)
+                .await
+            {
+                Ok(resource) => resource,
+                Err(error) => {
+                    let _ = parent_event_tx
+                        .send(Event::SubAgentResult {
+                            agent_id: spec.agent_id,
+                            outcome: SubAgentOutcome::Failure {
+                                error: format!("failed to resolve parent capability: {error}"),
+                                error_kind: crate::db::ErrorKind::SubAgentError,
+                            },
+                        })
+                        .await;
+                    return;
+                }
+            };
+        if spec.mode == SubAgentMode::Work
+            && parent_resource.authority != crate::work_scope::ResourceAuthority::Work
+        {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Parent capability does not authorize a Work child".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         if let Err(error) = self.llm_registry.validate_execution_route(
             &spec.model_id,
             &spec.connection,
@@ -6195,6 +6228,15 @@ impl RuntimeManager {
                 )
                 });
         if active_creation_job {
+            return Ok(true);
+        }
+
+        if self
+            .db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             return Ok(true);
         }
 

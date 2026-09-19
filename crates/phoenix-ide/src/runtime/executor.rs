@@ -8676,7 +8676,7 @@ where
                 };
                 let approved_state = ConvState::LlmRequesting { attempt: 1 };
                 let state_updated_at = Utc::now();
-                storage
+                let establishment = storage
                     .persist_approved_task_authority_and_state(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
@@ -8693,6 +8693,13 @@ where
                         state_updated_at,
                     )
                     .await?;
+                if matches!(
+                    establishment,
+                    crate::db::LocalAuthorityResult::DurableFactUnclassified
+                ) {
+                    admitted.close("task_approval_authority_establishment");
+                    return Err("approval authority establishment is unclassified".to_string());
+                }
                 self.state = approved_state;
                 self.state_updated_at = state_updated_at;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
