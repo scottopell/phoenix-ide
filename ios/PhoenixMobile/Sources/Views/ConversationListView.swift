@@ -130,7 +130,9 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
-                    let navigationId = model.navigationConversationId(for: conversation)
+                    let navigationId = conversation.archived == true
+                        ? conversation.aggregateIdentity
+                        : model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
                         || transcriptRowId == model.coordinatorConversationId
                     NavigationLink(value: navigationId) {

@@ -442,9 +442,11 @@ final class AppModel {
                     await session.clearCachedSnapshotAndWait()
                     await session.outbox.clearAndWait()
                     if sessions[transcriptId] === session { sessions[transcriptId] = nil }
+                    if drainSessions[transcriptId] === session { drainSessions[transcriptId] = nil }
                 } else {
                     DiskStore.remove(name: "conv-\(transcriptId)")
                     DiskStore.remove(name: "outbox-\(transcriptId)")
+                    drainSessions[transcriptId] = nil
                 }
             }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
