@@ -56,8 +56,9 @@ pub use product_conversation_read::{
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
-    RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
+    FreshRetrieval, FreshRetrievalRequest, Fts5Retriever, MessageRetriever, ReconcileStats,
+    RetrievalError, RetrievalGrouping, RetrievalMatchMode, RetrievalRequest, RetrievalScope,
+    RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
 pub use sqlite_workload::{
@@ -11350,6 +11351,55 @@ impl Database {
         rows.reverse();
         hydrate_attachments(&self.pool, &mut rows).await?;
         Ok(rows)
+    }
+
+    /// Returns whether migration-owned recovery permits materializing an oversized message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compatibility snapshot cannot be queried.
+    pub async fn is_legacy_oversized_message_id(&self, message_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM legacy_oversized_creation_message_ids
+                 WHERE message_id = ?1
+             )",
+        )
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get the first messages in sequence order, capped by `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_messages_first_limited(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            let mut rows = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY sequence_id ASC
+                 LIMIT ?2",
+            )
+            .bind(conversation_id)
+            .bind(limit)
+            .try_map(parse_message_row)
+            .fetch_all(&self.pool)
+            .await?;
+
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get messages after a sequence ID, capped by `limit`.

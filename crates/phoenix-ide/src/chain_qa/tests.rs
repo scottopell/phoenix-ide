@@ -678,38 +678,26 @@ async fn read_conversation_accepts_hash_prefixed_id() {
     );
 }
 
-/// `read_page` streams the requested window without materializing the whole
-/// transcript, and its slicing/“more” marker match a simple full-render slice.
-#[test]
-fn read_page_paginates_large_transcript() {
-    let big = "x".repeat(READ_PAGE_CHARS + 500);
-    let messages = vec![crate::db::Message {
-        message_id: "m0".into(),
-        conversation_id: "c".into(),
-        sequence_id: 0,
-        message_type: MessageType::User,
-        content: MessageContent::user(big),
-        display_data: None,
-        usage_data: None,
-        created_at: chrono::Utc::now(),
-    }];
+#[tokio::test]
+async fn read_conversation_rejects_legacy_numeric_cursor_with_restart_guidance() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["cursor-a", "cursor-b"]).await;
+    add_user_message(&db, "cursor-b", 0, "content").await;
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+    let members = vec!["cursor-a".to_string(), "cursor-b".to_string()];
 
-    // Page 1: full window + a "more" marker pointing at the next cursor.
-    let page1 = read_page(&messages, 0);
-    assert!(
-        page1.starts_with("User: x"),
-        "got: {}",
-        page1.chars().take(20).collect::<String>()
-    );
-    assert!(page1.contains("more content"), "page 1 should signal more");
-    assert!(page1.contains(&format!("cursor={READ_PAGE_CHARS}")));
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({"conversation_id": "cursor-b", "cursor": 7000}),
+            &members,
+        )
+        .await;
 
-    // Page 2: the tail, no further marker.
-    let page2 = read_page(&messages, READ_PAGE_CHARS);
-    assert!(!page2.contains("more content"), "page 2 is the final page");
-
-    // A cursor at/after the end yields the terminal marker.
-    assert_eq!(read_page(&messages, 1_000_000), "(end of conversation)");
+    assert!(is_error);
+    assert!(out.contains("restart this read without a cursor"));
 }
 
 /// `read_conversation`'s transcript renderer surfaces content that lives outside
@@ -913,23 +901,22 @@ async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
 }
 
 #[tokio::test]
-async fn execute_tool_read_conversation_clamps_oversized_cursor() {
+async fn execute_tool_read_conversation_rejects_unsupported_cursor_type() {
     let db = Database::open_in_memory().await.unwrap();
     build_linear_chain(&db, &["cc-a", "cc-b"]).await;
     add_user_message(&db, "cc-a", 0, "some content").await;
     let qa = qa_for_tool_tests(&db);
 
-    // A cursor past the end must yield the terminal marker, never panic on the
-    // u64→usize narrowing.
     let (out, is_error) = qa
         .execute_tool(
             "read_conversation",
-            &serde_json::json!({ "conversation_id": "cc-a", "cursor": u64::MAX }),
+            &serde_json::json!({ "conversation_id": "cc-a", "cursor": {"bad": true} }),
             &["cc-a".to_string(), "cc-b".to_string()],
         )
         .await;
-    assert!(!is_error, "oversized cursor is not an error: {out}");
-    assert_eq!(out, "(end of conversation)");
+    assert!(is_error);
+    assert!(out.contains("unsupported read_conversation cursor type"));
+    assert!(out.contains("restart this read without a cursor"));
 }
 
 #[tokio::test]

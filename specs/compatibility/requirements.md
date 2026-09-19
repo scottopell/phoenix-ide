@@ -97,3 +97,15 @@ THE SYSTEM SHALL reject negative values
 THE SYSTEM SHALL format that integer as a human-readable date and time only at an application or presentation boundary
 
 **Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
+
+---
+
+### REQ-COMP-006 — Invalid Internal Tool Cursors Fail Explicitly
+
+IF an internal model-facing tool receives a cursor with an unsupported type or
+version
+THE SYSTEM SHALL reject the cursor with an explicit error directing the model
+to restart the operation without a cursor
+AND SHALL NOT reinterpret, translate, or persist the unsupported cursor.
+
+**Rationale:** Explicit restart behavior prevents a cursor from being interpreted under a different authority or position contract while avoiding a compatibility layer that preserves a representation without the required safety properties.

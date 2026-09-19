@@ -510,7 +510,55 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_invalid_continuation_dispatch_intents",
         sql: MIGRATION_098,
     },
+    Migration {
+        version: 99,
+        name: "bound_new_message_ids",
+        sql: MIGRATION_099,
+    },
 ];
+
+const MIGRATION_099: &str = r"
+CREATE TABLE legacy_oversized_creation_message_ids (
+    message_id TEXT PRIMARY KEY NOT NULL
+) STRICT;
+
+INSERT INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM conversation_creation_jobs
+WHERE message_id IS NOT NULL
+  AND length(CAST(message_id AS BLOB)) > 256;
+
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
+FROM durable_turns
+WHERE length(CAST(
+    COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
+    AS BLOB
+)) > 256;
+
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM steering_messages
+WHERE length(CAST(message_id AS BLOB)) > 256;
+
+INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
+SELECT DISTINCT message_id
+FROM continuation_dispatch_intents
+WHERE length(CAST(message_id AS BLOB)) > 256;
+
+CREATE TRIGGER messages_bound_new_message_id_bytes
+BEFORE INSERT ON messages
+FOR EACH ROW
+WHEN length(CAST(NEW.message_id AS BLOB)) > 256
+ AND NOT EXISTS (
+     SELECT 1
+     FROM legacy_oversized_creation_message_ids
+     WHERE message_id = NEW.message_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'message id exceeds 256 UTF-8 bytes');
+END;
+";
 
 const MIGRATION_098: &str = r"
 DELETE FROM continuation_dispatch_intents
@@ -10149,6 +10197,122 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_099_preserves_legacy_ids_and_bounds_new_utf8_bytes() {
+        let pool = test_pool().await;
+        sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_creation_jobs (message_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE durable_turns (
+                conversation_id TEXT NOT NULL,
+                client_turn_key TEXT NOT NULL,
+                canonical_message_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE continuation_dispatch_intents (message_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = "x".repeat(257);
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let admitted = "j".repeat(257);
+        sqlx::query("INSERT INTO conversation_creation_jobs (message_id) VALUES (?1)")
+            .bind(&admitted)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let turn_conversation = "c".repeat(250);
+        let turn_key = "turn-key";
+        let admitted_turn = format!("{turn_conversation}:{turn_key}");
+        sqlx::query(
+            "INSERT INTO durable_turns (conversation_id, client_turn_key, canonical_message_id)
+             VALUES (?1, ?2, NULL)",
+        )
+        .bind(&turn_conversation)
+        .bind(turn_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let admitted_steering = "s".repeat(257);
+        sqlx::query("INSERT INTO steering_messages (message_id) VALUES (?1)")
+            .bind(&admitted_steering)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let admitted_continuation = "k".repeat(257);
+        sqlx::query("INSERT INTO continuation_dispatch_intents (message_id) VALUES (?1)")
+            .bind(&admitted_continuation)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT message_id FROM messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            legacy
+        );
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind("é".repeat(128))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_turn)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_steering)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_continuation)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(format!("{}a", "é".repeat(128)))
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("message id exceeds 256 UTF-8 bytes"));
+    }
 
     #[tokio::test]
     async fn migration_098_retires_shipped_empty_continuation_intent_without_losing_successor() {

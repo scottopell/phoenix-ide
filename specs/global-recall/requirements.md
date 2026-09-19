@@ -4,7 +4,7 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Write-capable ordinary ProductConversations may use bounded global evidence and singular cross-conversation messaging on explicit turns, while restricted planning conversations and sub-agents remain scoped. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
+The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Ordinary ProductConversations remain limited to host-bound predecessor recall, while restricted planning conversations and sub-agents remain scoped. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
 
 ## Why the User Cares
 
@@ -12,7 +12,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 - **Long-running work should not fragment identity.** A continuation chain represents one work item even though it spans multiple conversations.
 - **Intervention should be narrow and trustworthy.** The Coordinator may send text to existing conversations, while the receiving conversation's authoritative state determines whether the message starts immediately, becomes steering, or is rejected.
 - **Committed actions should be transparent.** The Coordinator reports acceptance per target without implying that another agent understood, acknowledged, or completed the instruction.
-- **Global access should be deliberate and bounded.** Write-capable ordinary ProductConversations and the Coordinator may inspect Phoenix-wide evidence and send singular messages; restricted planning conversations and sub-agents remain scoped.
+- **Global access should be deliberate and bounded.** The Coordinator alone may inspect Phoenix-wide evidence and send singular cross-conversation messages; ordinary parents receive only scoped predecessor recall.
 
 ## Transparency Contract
 
@@ -66,7 +66,7 @@ Stored state, task metadata, and transcript content SHALL remain separate facts 
 
 ### REQ-GR-004: Provide Bounded Read-Only Relational Queries
 
-WHILE a write-capable ordinary ProductConversation or the Coordinator is answering a user request
+WHILE the Coordinator is answering a user request
 THE SYSTEM SHALL allow exactly one bounded read-only SQLite statement per database-query tool call against operational Phoenix data
 
 THE query capability SHALL support relational joins, common table expressions, grouping, ordering, JSON reads, and allowed full-text reads
@@ -115,19 +115,16 @@ THE SYSTEM SHALL reject the entire operation before mutating any chain member
 
 ### REQ-GR-007: Bound Phoenix-Wide Agent Capabilities
 
-WHILE a write-capable ordinary ProductConversation or the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, and singular cross-conversation messaging
+WHILE the singleton Global Coordinator is answering a user request
+THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, singular cross-conversation messaging, global reference resolution, and unsandboxed Bash
 
-WHILE a restricted planning conversation or sub-agent is running
+WHILE an ordinary ProductConversation, restricted planning conversation, or sub-agent is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 THE ordinary-parent predecessor capability defined by
 `../conversation-retrieval/requirements.md` REQ-RET-009 SHALL remain separate
-from Phoenix-wide capabilities: restricted planning parents may inspect their
-own predecessors through that bound capability without receiving global tools
-
-WHILE the singleton Global Coordinator is answering a user request
-THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
+from Phoenix-wide capabilities: ordinary parents may inspect only their own
+predecessor transcripts through that host-bound capability without receiving global tools
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
 
@@ -149,7 +146,7 @@ AND SHALL recognize that the endpoint may create only the successor transcript w
 
 THE Coordinator SHALL NOT create unrelated or new-work conversations, perform arbitrary lifecycle mutation, or monitor in the background
 
-THE SYSTEM MAY provide exactly one cross-conversation message mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
+THE SYSTEM MAY provide exactly one cross-conversation message mutation capability to the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 The separately specified continuation exception is not a cross-conversation message mutation capability and SHALL remain limited to the existing ProductConversation's successor transcript
 
@@ -215,7 +212,7 @@ THE SYSTEM SHALL keep the bounded read-only database query tool available when t
 
 ### REQ-GR-011A: Bound Database Integrity and Resource Use
 
-WHILE a write-capable ordinary ProductConversation or the Coordinator executes a database query
+WHILE the Coordinator executes a database query
 THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, credentials, tokens, settings, serialized state, and workflow payloads that may not be visible through normal UI
 
 THE SYSTEM SHALL describe this capability as operator-level forensic access and SHALL treat all returned values as untrusted stored data rather than instructions
@@ -235,7 +232,7 @@ THE SYSTEM SHALL preserve authorization-policy and execution-budget errors as di
 
 ### REQ-GR-012: Commit and Report One Message Outcome
 
-WHEN a write-capable ordinary ProductConversation or the Coordinator submits a valid text message to one resolved conversation
+WHEN the Coordinator submits a valid text message to one resolved conversation
 THE SYSTEM SHALL use the same authoritative acceptance and dispatch service used by the ordinary chat endpoint
 
 THE service SHALL preserve persisted-message idempotency, steering-queue idempotency, live runtime authority, stable stored-state rejection, runtime materialization, message acceptability checks, steering depth limits, persistence, broadcast behavior, and applicable PR auto-fix baseline behavior

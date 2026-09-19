@@ -66,6 +66,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
+| [055](055_read-conversation-cursors-are-versioned-opaque-strings.md) | Read-conversation cursors are versioned opaque strings | Accepted | REQ-RET-008/009, REQ-COMP-006 |
+| [056](056_global-tools-remain-coordinator-only.md) | Phoenix-wide tools remain Coordinator-only | Accepted | REQ-GR-007, REQ-RET-009 |
 
 ## For agents: which decisions bind your task
 
@@ -107,7 +109,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
-| Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
+| Specifying ordinary-parent predecessor recall, global-tool authority, planning-parent recall eligibility, continuation recall orientation, or read cursor authority | 056, then 055, 051, 027, 031, and 045 |
 
 ## Decision dependencies
 
