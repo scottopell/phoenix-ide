@@ -9,8 +9,6 @@ required_fragments = [
     'Retrying $TAG from its immutable main commit $TAG_COMMIT.',
     'git merge-base --is-ancestor "$TAG_COMMIT" origin/main',
     'validate_bundle_version "$VERSION"',
-    'bash scripts/verify-published-release.sh',
-    'echo "release=false" >> "$GITHUB_OUTPUT"',
     'commit: ${{ steps.ver.outputs.commit }}',
     'ref: ${{ needs.gate.outputs.commit }}',
     'environment: macos-release-signing',
@@ -60,9 +58,16 @@ for forbidden in [
     'Manual dispatch may retry an existing exact tag but cannot create $TAG.',
     '--clobber',
     'com.apple.security.app-sandbox',
+    'verify_public_release_if_present',
 ]:
     if forbidden in workflow:
         raise SystemExit(f'forbidden release workflow contract: {forbidden}')
+
+stable_check = workflow.index("printf '%s' \"$VERSION\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'")
+bundle_check = workflow.index('validate_bundle_version "$VERSION"', stable_check)
+tag_creation = workflow.index('git tag -a "$TAG"', bundle_check)
+if not stable_check < bundle_check < tag_creation:
+    raise SystemExit('stable and bundle-version validation must precede tag creation')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
@@ -96,5 +101,17 @@ for fragment in [
 ]:
     if fragment not in macos_workflow:
         raise SystemExit(f'missing macOS workflow regression check: {fragment}')
+
+for identity_path in [
+    'crates/phoenix-ide/build.rs',
+    'crates/phoenix-ide/Cargo.toml',
+    'scripts/verify-published-release.sh',
+    'scripts/test-verify-published-release.sh',
+]:
+    if macos_workflow.count(f'"{identity_path}"') != 2:
+        raise SystemExit(f'macOS workflow must trigger on {identity_path} for pull requests and pushes')
+
+if 'PHOENIX_EXPECTED_BUILD_IDENTITY="$expected_build_identity"' not in package_script:
+    raise SystemExit('desktop packaging must pass the complete helper identity into app assembly')
 
 print('desktop release workflow regression checks passed')

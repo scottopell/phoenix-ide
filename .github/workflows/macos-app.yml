@@ -16,8 +16,10 @@ on:
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
+      - "scripts/test-verify-published-release.sh"
   push:
     branches: [main]
     paths:
@@ -31,8 +33,10 @@ on:
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
+      - "scripts/test-verify-published-release.sh"
 
 concurrency:
   group: macos-app-${{ github.ref }}

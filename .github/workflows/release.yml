@@ -56,23 +56,6 @@ jobs:
               raise SystemExit("release version exceeds CFBundleVersion component limits")
           PY
           }
-          verify_public_release_if_present() {
-            if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$TAG" >/dev/null 2>&1; then
-              return 1
-            fi
-            bash scripts/verify-published-release.sh "$GITHUB_REPOSITORY" "$TAG" \
-              phoenix_ide-x86_64-unknown-linux-musl \
-              phoenix_ide-aarch64-unknown-linux-musl \
-              phoenix_ide-x86_64-unknown-linux-musl-debug \
-              phoenix_ide-aarch64-unknown-linux-musl-debug \
-              phoenix_ide-x86_64-apple-darwin \
-              phoenix_ide-aarch64-apple-darwin \
-              "Phoenix-macos-x86_64-apple-darwin-$TAG.zip" \
-              "Phoenix-macos-aarch64-apple-darwin-$TAG.zip"
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            return 0
-          }
-
           if [[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]]; then
             TAG=$RETRY_TAG
             printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
@@ -93,9 +76,6 @@ jobs:
             echo "Retrying $TAG from its immutable main commit $TAG_COMMIT."
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
-            if verify_public_release_if_present; then
-              exit 0
-            fi
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -112,9 +92,6 @@ jobs:
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             TAG_COMMIT=$(git rev-list -n 1 "$TAG")
-            if verify_public_release_if_present; then
-              exit 0
-            fi
             if [ "$TAG_COMMIT" = "$GITHUB_SHA" ]; then
               echo "Tag $TAG already points at this exact commit — retrying its release."
               echo "release=true" >> "$GITHUB_OUTPUT"

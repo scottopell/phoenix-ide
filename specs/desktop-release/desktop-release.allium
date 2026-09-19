@@ -10,10 +10,30 @@ enum ArtifactState { pending | built | verified | failed }
 enum NotaryState { pending | submitted | accepted | stapled | validated | failed }
 enum PublicationState { idle | inaccessible | uploading | verified | public | failed }
 enum FailureDomain { none | tag_gate | build | signing | notarization | publication | configuration }
+enum LowerHexDigit { `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` | a | b | c | d | e | f }
+
+value CommitHexWord {
+    d1: LowerHexDigit
+    d2: LowerHexDigit
+    d3: LowerHexDigit
+    d4: LowerHexDigit
+    d5: LowerHexDigit
+    d6: LowerHexDigit
+    d7: LowerHexDigit
+    d8: LowerHexDigit
+}
+
+value FullCommitIdentity {
+    w1: CommitHexWord
+    w2: CommitHexWord
+    w3: CommitHexWord
+    w4: CommitHexWord
+    w5: CommitHexWord
+}
 
 value ReleaseIdentity {
     tag: String
-    full_commit: String
+    full_commit: FullCommitIdentity
 }
 
 entity ReleaseGate {
@@ -99,8 +119,7 @@ surface DesktopReleaseWorkflow {
 -- Helpers
 --
 -- valid_release_identity(identity) -> Boolean
---   identity has a stable v-prefixed semantic tag and a forty-character
---   lowercase hexadecimal commit.
+--   identity has a stable v-prefixed semantic tag; its full commit is structural.
 -- bundle_version_representable(identity) -> Boolean
 --   identity.tag can be represented by the required bounded app bundle version.
 -- tag_absent(gate) -> Boolean
@@ -134,6 +153,11 @@ surface DesktopReleaseWorkflow {
 --   the public release contains exactly the required names and matching digests.
 -- public_release_differs(publication) -> Boolean
 --   a public release exists but is not the exact required release.
+-- release_absent_for_identity(identity) -> Boolean
+--   no public or inaccessible release exists for identity.tag.
+-- recoverable_inaccessible_publication_exists(publication) -> Boolean
+--   one inaccessible publication exists for publication.identity and can resume
+--   without replacing its release object.
 
 rule GateCreatesOnlyRepresentableStableTag {
     when: ReleaseTagCreated(gate)
@@ -205,11 +229,22 @@ rule GatekeeperValidationRequiresStapledTicket {
     ensures: pair.notarization = validated
 }
 
-rule PublicationCreatesOrReusesInaccessiblePreparation {
-    when: InaccessiblePublicationPrepared(gate, publication)
+rule PublicationCreatesInaccessiblePreparationOnlyWhenReleaseIsAbsent {
+    when: InaccessiblePublicationCreated(gate, publication)
     requires: gate.state = new_tag_created or gate.state = exact_tag_match
     requires: gate.identity = publication.identity
     requires: publication.state = idle or publication.state = failed
+    requires: release_absent_for_identity(publication.identity)
+    ensures: publication.state = inaccessible
+    ensures: publication.failure_domain = none
+}
+
+rule PublicationResumesExistingInaccessiblePreparation {
+    when: InaccessiblePublicationResumed(gate, publication)
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: publication.state = idle or publication.state = failed
+    requires: recoverable_inaccessible_publication_exists(publication)
     ensures: publication.state = inaccessible
     ensures: publication.failure_domain = none
 }
