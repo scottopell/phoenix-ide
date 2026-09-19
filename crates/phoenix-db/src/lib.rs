@@ -6688,6 +6688,53 @@ impl Database {
         Ok(exists != 0)
     }
 
+    /// Classify and persist any completed handoff for an automatic admission atomically.
+    ///
+    /// # Errors
+    /// Returns an error when classification or terminalization fails.
+    pub async fn reconcile_completed_automatic_continuation(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+    ) -> DbResult<Option<AutomaticContinuationPhase>> {
+        let phase: Option<String> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET phase = CASE WHEN EXISTS(
+                     SELECT 1
+                     FROM completed_continuation_handoffs AS completed
+                     WHERE completed.predecessor_conversation_id = ?1
+                       AND (completed.accepted_successor_message_id = ?2
+                            OR completed.accepted_successor_message_id =
+                               completed.successor_conversation_id || ':' || ?2)
+                       AND completed.continuation_message_id = ?3
+                 ) THEN 'message_settled' ELSE 'superseded' END,
+                 no_progress_attempts = 0,
+                 last_error = NULL,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded', 'failed')
+               AND EXISTS(
+                   SELECT 1 FROM completed_continuation_handoffs
+                   WHERE predecessor_conversation_id = ?1
+               )
+             RETURNING phase",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(admission.first_message_id.as_str())
+        .bind(&admission.summary_message_id)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&self.pool)
+        .await?;
+        phase
+            .map(|phase| {
+                AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
+                    DbError::Serialization(format!(
+                        "unknown reconciled automatic continuation phase: {phase}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Return whether the automatic admission's exact generated opening settled durably.
     ///
     /// # Errors
@@ -18339,6 +18386,52 @@ mod tests {
             .expect("stable aggregate lookup returns its admission");
         assert_eq!(latest.predecessor_conversation_id, "auto-on-second");
 
+        let second_admission = db
+            .automatic_continuation_admission("auto-on-second")
+            .await
+            .unwrap()
+            .unwrap();
+        let (exact_outcome, _) = db
+            .continue_conversation_with_intent(
+                "auto-on-second",
+                NewContinuationDispatchIntent::generated_predecessor_context(
+                    second_admission.first_message_id.clone(),
+                    "exact summary for auto-on-second  \n".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        let exact_successor = match exact_outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected exact automatic successor, got {other:?}")
+            }
+        };
+        db.add_message(
+            second_admission.first_message_id.as_str(),
+            &exact_successor.id,
+            &MessageContent::user("exact summary for auto-on-second  \n"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_completed_automatic_continuation(&second_admission)
+                .await
+                .unwrap(),
+            Some(AutomaticContinuationPhase::MessageSettled)
+        );
+        assert_eq!(
+            db.automatic_continuation_admission("auto-on-second")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::MessageSettled
+        );
+
         let auto_on_product = admitted.product_conversation_id.clone();
         db.set_auto_continue_on_context_exhaustion(
             &auto_on_product,
@@ -18397,13 +18490,10 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(
-            db.reconcile_or_record_automatic_continuation_no_progress(
-                &admitted,
-                "late failure after manual settlement",
-            )
-            .await
-            .unwrap(),
-            AutomaticContinuationPhase::Superseded
+            db.reconcile_completed_automatic_continuation(&admitted)
+                .await
+                .unwrap(),
+            Some(AutomaticContinuationPhase::Superseded)
         );
         let superseded = db
             .automatic_continuation_admission("auto-on")

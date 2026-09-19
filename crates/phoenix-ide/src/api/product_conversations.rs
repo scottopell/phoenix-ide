@@ -6,6 +6,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
+use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::domain::product_conversation::{
     AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
     OrdinaryProductConversationLifecycle, ProductConversationId,
@@ -194,18 +195,39 @@ async fn automatic_continuation_view(
         .db
         .latest_automatic_continuation_admission(&product_conversation_id)
         .await
-        .map_err(db_to_app)?
-        .map(|admission| AutomaticContinuationAdmissionView {
+        .map_err(db_to_app)?;
+    let admission = if let Some(admission) = admission {
+        let actionable_failure = if let Some(message) = admission.last_error {
+            let summary = state
+                .db
+                .get_message_by_id_in_conversation(
+                    &admission.predecessor_conversation_id,
+                    &admission.summary_message_id,
+                )
+                .await
+                .map_err(db_to_app)?;
+            let MessageContent::Continuation(summary) = summary.content else {
+                return Err(AppError::Internal(
+                    "automatic continuation summary has the wrong message type".to_string(),
+                ));
+            };
+            Some(AutomaticContinuationFailureView {
+                message,
+                first_message_id: admission.first_message_id.as_str().to_string(),
+                accepted_handoff: summary.summary,
+            })
+        } else {
+            None
+        };
+        Some(AutomaticContinuationAdmissionView {
             predecessor_transcript_row_id: admission.predecessor_conversation_id,
             phase: admission_phase_view(admission.phase),
             no_progress_attempts: admission.no_progress_attempts,
-            actionable_failure: admission.last_error.map(|message| {
-                AutomaticContinuationFailureView {
-                    message,
-                    first_message_id: admission.first_message_id.as_str().to_string(),
-                }
-            }),
-        });
+            actionable_failure,
+        })
+    } else {
+        None
+    };
     let id = product_conversation_id.to_string();
     Ok(AutomaticContinuationView {
         aggregate: if coordinator {
@@ -1383,6 +1405,31 @@ mod tests {
             root.id
         );
         assert_eq!(projected["admission"]["phase"], "admitted");
+
+        for _ in 0..crate::db::AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+            state
+                .db
+                .record_automatic_continuation_no_progress(&root.id, "dispatch unavailable")
+                .await
+                .unwrap();
+        }
+        let failed = create_router(state)
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::OK);
+        let failed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(failed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(failed["admission"]["phase"], "failed");
+        assert_eq!(
+            failed["admission"]["actionable_failure"]["accepted_handoff"],
+            "persisted API handoff"
+        );
+        assert_eq!(
+            failed["admission"]["actionable_failure"]["first_message_id"],
+            "automatic-continuation-auto-api-auto-api-operation"
+        );
     }
 
     #[tokio::test]
