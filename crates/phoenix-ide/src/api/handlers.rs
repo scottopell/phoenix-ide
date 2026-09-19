@@ -5600,6 +5600,16 @@ async fn continue_conversation(
                     "continuation_superseded",
                 ))));
             }
+            let (handoff, expansion_policy) = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => (
+                    summary.summary.as_str(),
+                    crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
+                ),
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => (
+                    intent.handoff.as_str(),
+                    crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+                ),
+            };
             let service = crate::send_chat_service::SendChatApplicationService::new(
                 state.runtime.db().clone(),
                 state.runtime.clone(),
@@ -5608,10 +5618,10 @@ async fn continue_conversation(
                 .rearm_exact_terminal_turn(
                     &id,
                     &intent.successor_conversation_id,
-                    &admission.first_message_id,
-                    &summary.summary,
+                    &intent.message_id,
+                    handoff,
                     intent.user_agent.clone(),
-                    crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
+                    expansion_policy,
                 )
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
