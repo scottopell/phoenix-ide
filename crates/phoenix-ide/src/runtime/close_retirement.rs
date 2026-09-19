@@ -5458,13 +5458,18 @@ fn linux_descriptor_target_is_live(target: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn canonicalize_quarantine_for_descriptor_scan(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
-    })?;
+    let canonical = canonicalize_quarantine_for_descriptor_scan(path)?;
     let effective_uid = unsafe { libc::geteuid() };
     let processes = std::fs::read_dir(proc_root).map_err(|error| {
         format!("cannot enumerate processes for descriptor inspection: {error}")
