@@ -3086,6 +3086,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let merged = try XCTUnwrap(model.listStore.conversations.first)
         let persisted = await session.flushSnapshotPersistence()
         XCTAssertTrue(persisted)
+        await model.listStore.awaitCachePersistence()
         XCTAssertEqual(merged.id, "row-1")
         XCTAssertEqual(merged.slug, "canonical-slug")
         XCTAssertEqual(merged.title, "Canonical title")
