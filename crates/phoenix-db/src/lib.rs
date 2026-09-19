@@ -6712,6 +6712,7 @@ impl Database {
                             OR completed.accepted_successor_message_id =
                                completed.successor_conversation_id || ':' || ?2)
                        AND completed.continuation_message_id = ?3
+                       AND completed.opening_authority = 'generated_predecessor_context'
                  ) THEN 'message_settled' ELSE 'superseded' END,
                  no_progress_attempts = 0,
                  last_error = NULL,
@@ -6756,6 +6757,7 @@ impl Database {
                    AND (accepted_successor_message_id = ?2
                         OR accepted_successor_message_id = successor_conversation_id || ':' || ?2)
                    AND continuation_message_id = ?3
+                   AND opening_authority = 'generated_predecessor_context'
              )",
         )
         .bind(&admission.predecessor_conversation_id)
@@ -6874,22 +6876,28 @@ impl Database {
         error: &str,
     ) -> DbResult<AutomaticContinuationPhase> {
         let mut tx = self.pool.begin().await?;
-        let completed: Option<(String, String, String)> = sqlx::query_as(
+        let completed: Option<(String, String, String, String)> = sqlx::query_as(
             "SELECT successor_conversation_id, accepted_successor_message_id,
-                    continuation_message_id
+                    continuation_message_id, opening_authority
              FROM completed_continuation_handoffs
              WHERE predecessor_conversation_id = ?1",
         )
         .bind(&admission.predecessor_conversation_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((successor_id, accepted_message_id, summary_message_id)) = completed {
+        if let Some((successor_id, accepted_message_id, summary_message_id, opening_authority)) =
+            completed
+        {
             let exact_message = accepted_continuation_message_matches(
                 &successor_id,
                 &accepted_message_id,
                 &admission.first_message_id,
             );
-            let phase = if exact_message && summary_message_id == admission.summary_message_id {
+            let phase = if exact_message
+                && summary_message_id == admission.summary_message_id
+                && opening_authority
+                    == ContinuationOpeningAuthority::GeneratedPredecessorContext.as_str()
+            {
                 AutomaticContinuationPhase::MessageSettled
             } else {
                 AutomaticContinuationPhase::Superseded
@@ -7033,10 +7041,14 @@ impl Database {
         }
         let updated = sqlx::query(
             "UPDATE automatic_continuation_admissions
-             SET phase = ?2, resume_phase = ?2,
-                 no_progress_attempts = 0, last_error = NULL,
-                 updated_at_unix_micros = ?3
-             WHERE predecessor_conversation_id = ?1 AND phase = 'failed'",
+             SET phase = CASE WHEN phase = 'failed' THEN ?2 ELSE phase END,
+                 resume_phase = CASE WHEN phase = 'failed' THEN ?2 ELSE resume_phase END,
+                 no_progress_attempts = CASE WHEN phase = 'failed' THEN 0 ELSE no_progress_attempts END,
+                 last_error = CASE WHEN phase = 'failed' THEN NULL ELSE last_error END,
+                 updated_at_unix_micros = CASE WHEN phase = 'failed' THEN ?3 ELSE updated_at_unix_micros END
+             WHERE predecessor_conversation_id = ?1
+               AND phase IN ('failed', 'admitted', 'successor_reserved',
+                             'ownership_transferred', 'dispatch_accepted')",
         )
         .bind(predecessor_conversation_id)
         .bind(resume_phase.as_str())
@@ -18592,7 +18604,7 @@ mod tests {
             .continue_conversation_with_intent(
                 "auto-on",
                 NewContinuationDispatchIntent::user_authorized(
-                    ClientTurnKey::try_from("manual-race-winner").unwrap(),
+                    admitted.first_message_id.clone(),
                     "manual handoff".to_string(),
                     None,
                 ),
@@ -18607,7 +18619,7 @@ mod tests {
             }
         };
         db.add_message(
-            "manual-race-winner",
+            admitted.first_message_id.as_str(),
             &manual_successor.id,
             &MessageContent::user("manual handoff"),
             None,
@@ -18811,6 +18823,26 @@ mod tests {
         );
         assert_eq!(retried.no_progress_attempts, 0);
         assert!(retried.last_error.is_none());
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("an identical concurrent retry accepts the already-reopened admission");
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::DispatchAccepted,
+        )
+        .await
+        .unwrap();
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("a retry racing with later durable progress remains idempotent");
+        assert_eq!(
+            db.automatic_continuation_admission("breaker-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::DispatchAccepted
+        );
         assert_eq!(retried.summary_message_id, original.summary_message_id);
         assert_eq!(retried.first_message_id, original.first_message_id);
         assert_eq!(retried.opening_authority, original.opening_authority);
