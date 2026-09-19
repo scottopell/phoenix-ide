@@ -1,8 +1,8 @@
 # Prose Feedback UI - Executive Summary
 
-## Fixture review in progress
+## Approved pill integration
 
-The `inline-message-reactions` Ladle story has an opt-in single-line pill prototype with horizontal input scrolling, a docked Return to passage action, and in-row Keep/Discard confirmation. Its long production transcript forces source rows to unmount. Browser verification exercised actual unmount/remount, exact passage return, and automatic undocking on manual return. This presentation is fixture-only pending user feedback; the default application presentation and normative contract have not yet been switched.
+The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. The dock restores a virtualized source passage and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
 
 ## Requirements Summary
 

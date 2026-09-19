@@ -3,8 +3,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReactionPill } from './ReactionPill';
 import { restoreReactionRange } from './reactionRange';
-import { FocusScopeProvider } from '../../hooks/useFocusScope';
-import type { ReactionSource } from '../../conversation/InlineReactionStore';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
+import type { ReactionSource } from '../conversation/InlineReactionStore';
 
 const source: ReactionSource = { messageId: 'answer', sequenceId: 2, occurrenceToken: 'earlier:answer', quote: 'second', textOffsets: { start: 6, end: 12 } };
 const add = vi.fn();
@@ -16,7 +16,7 @@ function Fixture({ mounted = true, body = 'Keep this guarantee' }: { mounted?: b
     <div id="messages">
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer">first <strong>second</strong> third</div>}
     </div>
-    <ReactionPill source={source} quote={source.quote} anchor={null} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    <ReactionPill source={source} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
 
@@ -28,7 +28,31 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
-describe('fixture reaction pill', () => {
+describe('reaction pill', () => {
+  it('focuses on Enter without appending, but leaves controls and composition alone', () => {
+    render(<><Fixture /><textarea aria-label="Composer" /><button>Other action</button></>);
+    const input = screen.getByRole('textbox', { name: 'Your reaction' });
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter', isComposing: true });
+    expect(input).not.toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Enter', shiftKey: true });
+    expect(input).not.toHaveFocus();
+    const composer = screen.getByRole('textbox', { name: 'Composer' });
+    composer.focus();
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    expect(composer).toHaveFocus();
+    const button = screen.getByRole('button', { name: 'Other action' });
+    button.focus();
+    fireEvent.keyDown(button, { key: 'Enter' });
+    expect(button).toHaveFocus();
+    button.blur();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(input).toHaveFocus();
+    expect(add).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
+    expect(add).toHaveBeenCalledOnce();
+  });
+
   it('restores the exact passage through DOM remount and returns without focusing the input', async () => {
     const view = render(<Fixture />);
     expect(restoreReactionRange(source)?.toString()).toBe('second');

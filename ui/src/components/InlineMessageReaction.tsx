@@ -1,11 +1,10 @@
-import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
-import { ListPlus, X } from 'lucide-react';
 import type { Message } from '../api';
 import { InlineReactionContext, InlineReactionStore, formatInlineReaction, type ReactionSource } from '../conversation/InlineReactionStore';
-import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
+import { useFocusScope } from '../hooks/useFocusScope';
 import { readReactionSelection } from './inlineReactionSelection';
-import { ReactionPresentationContext } from './reactionPresentation';
+import { ReactionPill } from './ReactionPill';
 import './InlineMessageReaction.css';
 
 export interface ReactionDraftDestination {
@@ -25,11 +24,9 @@ export function InlineMessageReaction(props: Props) {
 }
 
 function ReactionSession({ scopeKey, messages, destination, returnToSource, store }: Props & { store: InlineReactionStore }) {
-  const Presentation = useContext(ReactionPresentationContext) ?? ReactionBubble;
   const subscribe = useCallback((listener: () => void) => store.subscribe(scopeKey, listener), [scopeKey, store]);
   const getSnapshot = useCallback(() => store.getSnapshot(scopeKey), [scopeKey, store]);
   const reaction = useSyncExternalStore(subscribe, getSnapshot);
-  const anchor = useRef<Range | null>(null);
   const bubbleRef = useRef<HTMLDivElement>(null);
   const { activeScope } = useFocusScope();
   const focusScope = `inline-reaction:${scopeKey}`;
@@ -46,7 +43,6 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
       if (current?.body) return;
       const selected = readReactionSelection(window.getSelection(), messages);
       if (selected) {
-        anchor.current = selected.range;
         store.dispatch(scopeKey, { type: 'select', source: selected.source });
         setNotice('');
       } else if (current) {
@@ -87,7 +83,6 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
 
   const clear = () => {
     store.dispatch(scopeKey, { type: 'clear' });
-    anchor.current = null;
     window.getSelection()?.removeAllRanges();
   };
   const add = () => {
@@ -105,11 +100,9 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
   return createPortal(
     <>
       {reaction && (
-        <Presentation
+        <ReactionPill
           bubbleRef={bubbleRef}
-          anchor={anchor.current}
           scopeId={focusScope}
-          quote={reaction.source.quote}
           source={reaction.source}
           returnToSource={returnToSource}
           body={reaction.body}
@@ -125,110 +118,14 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
   );
 }
 
-export interface BubbleProps {
+export interface ReactionPillProps {
   source: ReactionSource;
   returnToSource?: ((source: ReactionSource) => boolean) | undefined;
   bubbleRef: React.RefObject<HTMLDivElement>;
-  anchor: Range | null;
   scopeId: string;
-  quote: string;
   body: string;
   available: boolean;
   onChange: (body: string) => void;
   onAdd: () => void;
   onClose: () => void;
-}
-
-function ReactionBubble({ bubbleRef, anchor, scopeId, quote, body, available, onChange, onAdd, onClose }: BubbleProps) {
-  useRegisterFocusScope(scopeId);
-  const { activeScope } = useFocusScope();
-  const [confirmDiscard, setConfirmDiscard] = useState(false);
-  const requestClose = () => { if (body) setConfirmDiscard(true); else onClose(); };
-  useKeyboardRouterShortcut({
-    id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
-    handler: (event) => {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      if (confirmDiscard) setConfirmDiscard(false);
-      else requestClose();
-    },
-  });
-
-  useLayoutEffect(() => {
-    const el = bubbleRef.current;
-    if (!el) return;
-    const position = () => {
-      const viewport = window.visualViewport;
-      const left = viewport?.offsetLeft ?? 0;
-      const top = viewport?.offsetTop ?? 0;
-      const width = viewport?.width ?? window.innerWidth;
-      const height = viewport?.height ?? window.innerHeight;
-      el.style.maxHeight = `${Math.max(80, height - 24)}px`;
-      el.style.width = `${Math.min(360, width - 24)}px`;
-      const box = el.getBoundingClientRect();
-      const rect = anchor?.startContainer.isConnected ? anchor.getBoundingClientRect() : null;
-      const gap = 24;
-      let y = top + height - box.height - 12;
-      let x = left + width - box.width - 12;
-      if (rect && rect.bottom >= top && rect.top <= top + height) {
-        x = rect.left;
-        if (rect.bottom + gap + box.height <= top + height - 12) y = rect.bottom + gap;
-        else if (rect.top - gap - box.height >= top + 12) y = rect.top - gap - box.height;
-      }
-      el.style.left = `${Math.max(left + 12, Math.min(x, left + width - box.width - 12))}px`;
-      el.style.top = `${Math.max(top + 12, y)}px`;
-    };
-    position();
-    const observer = new ResizeObserver(position);
-    observer.observe(el);
-    window.addEventListener('resize', position);
-    window.addEventListener('scroll', position, true);
-    window.visualViewport?.addEventListener('resize', position);
-    window.visualViewport?.addEventListener('scroll', position);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener('resize', position);
-      window.removeEventListener('scroll', position, true);
-      window.visualViewport?.removeEventListener('resize', position);
-      window.visualViewport?.removeEventListener('scroll', position);
-    };
-  }, [anchor, bubbleRef]);
-
-  return (
-    <div ref={bubbleRef} className="inline-reaction" role="region" aria-label="React to selected text" hidden={Boolean(activeScope && activeScope !== scopeId)}>
-      <div className="inline-reaction-header">
-        <span>Reaction</span>
-        <button type="button" onClick={requestClose} aria-label="Dismiss reaction"><X size={16} /></button>
-      </div>
-      <blockquote className="inline-reaction-quote" title={quote}>{quote}</blockquote>
-      <textarea
-        aria-label="Your reaction"
-        placeholder="Your reaction…"
-        rows={3}
-        value={body}
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            event.stopPropagation();
-            onAdd();
-          }
-        }}
-      />
-      {!available && <p role="status">The current message draft is unavailable. Your reaction is retained.</p>}
-      {confirmDiscard ? (
-        <div className="inline-reaction-discard" role="group" aria-label="Discard this reaction?">
-          <span>Discard this reaction?</span>
-          <button type="button" onClick={() => setConfirmDiscard(false)}>Keep writing</button>
-          <button type="button" onClick={onClose}>Discard</button>
-        </div>
-      ) : (
-        <div className="inline-reaction-actions">
-          <button type="button" disabled={!available || !body.trim()} onClick={onAdd} title="Add to draft (Cmd/Ctrl+Enter)">
-            <ListPlus size={18} aria-hidden="true" /> Add to draft
-          </button>
-        </div>
-      )}
-    </div>
-  );
 }

@@ -95,3 +95,11 @@ Browser verification: a long typed reaction remained one line; scrolling eight s
 Next: user tries this fixture and provides interaction feedback; incorporate that feedback before promoting the pill out of the fixture and updating the normative interaction contract. Native phone-device acceptance remains outstanding.
 
 Validation for the fixture revision: `./dev.py check` passed all 16 checks. A browser-discovered empty-dismissal reopening bug was fixed with a focused regression test; the final `./dev.py check --lanes tsc,ui-lint,vitest` rerun passed all four UI checks, and fresh-browser empty dismissal stayed closed. The pill-to-production-draft append was browser-verified after the fixture revision.
+
+## Approved integration and keyboard entry
+
+The user approved the pill fixture and requested Enter-to-focus. The approved pill is now the production conversation presentation; fixture overrides and the superseded multiline bubble have been removed. Selecting alone still preserves native focus. Unmodified Enter focuses the anchored pill without scrolling, except when an input/control owns the key, a higher focus scope is active, or IME composition is in progress. Cmd/Ctrl+Enter remains the existing append action. The one-line input consumes plain Enter without submitting.
+
+Browser verification used actual mouse selection followed by Enter, typing, and Cmd+Enter with no click in the input. The exact selected quote and reaction appended to the existing draft and no message was submitted. Regression tests cover normal input/button Enter behavior, modified Enter, IME, and the existing append shortcut. Native phone-device acceptance remains the outstanding task criterion; no deployment is included.
+
+Integration validation: 19 focused tests passed. The broad `./dev.py check` passed every lane except a stale test expecting the superseded “Keep writing” label; that assertion was updated to “Keep”, and the full Vitest lane rerun passed. Browser verification confirmed Enter-to-focus and the unchanged Cmd+Enter append flow.

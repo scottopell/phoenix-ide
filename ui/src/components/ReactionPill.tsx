@@ -1,17 +1,33 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowUpRight, ListPlus, X } from 'lucide-react';
-import type { BubbleProps } from '../../components/InlineMessageReaction';
+import type { ReactionPillProps } from './InlineMessageReaction';
 import { restoreReactionRange } from './reactionRange';
-import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../../hooks/useFocusScope';
+import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ReactionPill.css';
 
-export function ReactionPill({ source, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: BubbleProps) {
+export function ReactionPill({ source, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
   useRegisterFocusScope(scopeId);
   const { activeScope } = useFocusScope();
   const [docked, setDocked] = useState(false);
   const [discard, setDiscard] = useState(false);
   const [error, setError] = useState('');
   const returning = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (docked || discard || (activeScope && activeScope !== scopeId)) return;
+    const focusFromSelection = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
+        || event.repeat || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      const target = event.target instanceof Element ? event.target : document.activeElement;
+      if (target?.closest('input, textarea, select, button, a[href], [contenteditable], [role="button"], [role="textbox"], [role="combobox"]')) return;
+      if (!inputRef.current || bubbleRef.current?.hidden) return;
+      event.preventDefault();
+      inputRef.current.focus({ preventScroll: true });
+    };
+    document.addEventListener('keydown', focusFromSelection);
+    return () => document.removeEventListener('keydown', focusFromSelection);
+  }, [activeScope, bubbleRef, discard, docked, scopeId]);
   const requestClose = () => body ? setDiscard(true) : onClose();
   useKeyboardRouterShortcut({
     id: `${scopeId}:escape`, scopeId, key: 'Escape', layer: 'passive-content',
@@ -113,13 +129,15 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
           ) : (
             <>
               <input
+                ref={inputRef}
                 type="text"
                 aria-label="Your reaction"
-                placeholder="Your reaction…"
+                placeholder="Your reaction… (Enter to focus)"
                 title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
                 value={body}
                 onChange={(event) => onChange(event.target.value)}
                 onKeyDown={(event) => {
+                  if (event.nativeEvent.isComposing || event.keyCode === 229) return;
                   if (event.key === 'Enter') {
                     event.stopPropagation();
                     event.preventDefault();
@@ -135,7 +153,7 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
           <button type="button" aria-label="Dismiss reaction" title="Dismiss reaction" onClick={requestClose}><X size={16} aria-hidden="true" /></button>
         </>
       )}
-      <span className="reaction-pill-sr" role="status">{error || (!available ? 'Draft unavailable. Your reaction is retained.' : '')}</span>
+      {(error || !available) && <span className="reaction-pill-sr" role="status">{error || 'Draft unavailable. Your reaction is retained.'}</span>}
     </div>
   );
 }

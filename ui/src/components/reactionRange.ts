@@ -1,4 +1,4 @@
-import type { ReactionSource } from '../../conversation/InlineReactionStore';
+import type { ReactionSource } from '../conversation/InlineReactionStore';
 
 export function restoreReactionRange(source: ReactionSource): Range | null {
   const owner = Array.from(document.querySelectorAll<HTMLElement>('#messages [data-inline-reaction-message]')).find((el) =>

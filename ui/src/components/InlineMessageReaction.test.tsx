@@ -31,7 +31,7 @@ function Harness({ store, scope = 'conversation-a', append }: { store: InlineRea
       <InlineReactionContext.Provider value={store}>
         <div id="messages">
           {messages.map((message) => (
-            <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-id={message.message_id} data-sequence-id="2">
+            <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-occurrence={`${message.conversation_id}:${message.message_id}`} data-message-id={message.message_id} data-sequence-id="2">
               <div className="agent-text-block"><p data-testid={message.message_id}>Deterministic state patterns <code>replay(events)</code></p></div>
             </div>
           ))}
@@ -45,6 +45,7 @@ function Harness({ store, scope = 'conversation-a', append }: { store: InlineRea
 }
 
 beforeEach(() => {
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 600, 500));
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
     configurable: true,
     value: () => ({ left: 50, top: 50, bottom: 80, right: 300, width: 250, height: 30 }),
@@ -62,7 +63,7 @@ describe('inline message reactions', () => {
     select(screen.getByTestId('old').firstChild!);
     const input = await screen.findByRole('textbox', { name: 'Your reaction' });
     expect(input).not.toHaveFocus();
-    fireEvent.change(input, { target: { value: 'Strong idea\nPlease test cancellation too.' } });
+    fireEvent.change(input, { target: { value: 'Strong idea. Please test cancellation too.' } });
     drafts.dispatch('latest', { type: 'set_draft', text: 'Draft edited while reacting  ' });
     const add = screen.getByRole('button', { name: 'Add to draft' });
     fireEvent.click(add);
@@ -70,7 +71,7 @@ describe('inline message reactions', () => {
     expect(append).toHaveBeenCalledTimes(1);
     expect(drafts.getSnapshot('latest').draft).toContain('Draft edited while reacting  \n\nRegarding message #2 (row-old:old):');
     expect(drafts.getSnapshot('latest').draft).toContain('Deterministic state patterns ');
-    expect(drafts.getSnapshot('latest').draft).toContain('Strong idea\nPlease test cancellation too.');
+    expect(drafts.getSnapshot('latest').draft).toContain('Strong idea. Please test cancellation too.');
     expect(screen.queryByRole('textbox', { name: 'Your reaction' })).not.toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('Added to draft');
   });
@@ -147,8 +148,8 @@ describe('inline message reactions', () => {
     document.addEventListener('keydown', lower);
     fireEvent.keyDown(input, { key: 'Escape' });
     expect(lower).not.toHaveBeenCalled();
-    expect(screen.getByRole('group', { name: 'Discard this reaction?' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Keep writing' }));
+    expect(screen.getByText('Discard reaction?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep' }));
     expect(screen.getByRole('textbox')).toHaveValue('Keep');
     document.removeEventListener('keydown', lower);
   });

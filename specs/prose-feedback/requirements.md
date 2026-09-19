@@ -434,16 +434,25 @@ Task approval and fork-proposal review SHALL remain purpose-built decision surfa
 
 WHEN the user selects non-empty rendered text wholly within one finalized assistant message
 AND the conversation has an eligible current message draft
-THE SYSTEM SHALL immediately show a compact reaction input near the selection
+THE SYSTEM SHALL immediately show a single-line reaction pill near the selection
 AND SHALL preserve the selected text and stable source-message identity when the input receives focus
 AND SHALL NOT focus the input or open the software keyboard merely because text was selected.
 
 THE SYSTEM SHALL leave native selection, selection handles, copying, context menus, and scrolling available
 AND SHALL exclude editable fields, tool interfaces, streaming content, and selections spanning messages from reaction entry.
 
-WHEN viewport space is constrained or the selected source is no longer mounted
-THE SYSTEM SHALL keep the reaction accessible within the visible viewport with a source preview
-AND SHALL account for viewport changes caused by the software keyboard.
+THE SYSTEM SHALL keep the reaction input one line tall with horizontally scrolling overflow and explicit Add to draft and dismiss controls.
+
+WHEN the selected passage leaves the transcript viewport or its row unmounts
+THE SYSTEM SHALL retain an unfinished reaction in a compact dock with a reaction preview and Return to passage action.
+
+WHEN Return to passage is activated
+THE SYSTEM SHALL navigate using the source occurrence, restore its exact passage after the virtualized row mounts, and reopen the pill without autofocus.
+
+WHEN the user manually scrolls the source passage back into view
+THE SYSTEM SHALL restore the pill automatically.
+
+THE SYSTEM SHALL keep the pill and dock inside the visible viewport and account for viewport changes caused by the software keyboard.
 
 **Rationale:** Users compose feedback while reading without leaving the transcript or sacrificing ordinary platform text interactions.
 
@@ -460,7 +469,13 @@ THE SYSTEM SHALL dismiss and clear the reaction input and acknowledge the additi
 AND SHALL preserve the transcript reading position without focusing the composer.
 
 THE SYSTEM SHALL label the action Add to draft and use an append-oriented icon
-AND SHALL support Cmd/Ctrl+Enter to add, plain Enter for a newline, and IME composition without accidental addition.
+AND SHALL support Cmd/Ctrl+Enter to add and IME composition without accidental addition.
+
+WHEN a visible anchored pill is unfocused and the user presses unmodified Enter outside another interactive control
+THE SYSTEM SHALL focus the reaction input without scrolling or appending.
+
+THE SYSTEM SHALL leave Enter behavior in other inputs and controls unchanged
+AND SHALL NOT append or submit on plain Enter inside the reaction input.
 
 ### REQ-PF-020: Temporary Reaction Ownership
 
@@ -476,7 +491,7 @@ WHEN the destination is unavailable or append fails
 THE SYSTEM SHALL retain the reaction and explain the unavailable or failed action.
 
 WHEN the user requests dismissal of a typed reaction
-THE SYSTEM SHALL offer Keep writing and Discard
+THE SYSTEM SHALL offer Keep and Discard in the same compact row
 AND Escape SHALL resolve that local interaction before any enclosing navigation.
 
 Temporary reactions are session-local; refresh recovery and cross-device synchronization are not guaranteed. Appended text follows the ordinary message draft's persistence contract.

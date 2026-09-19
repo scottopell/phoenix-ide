@@ -96,7 +96,7 @@ WHEN an interactive panel appears that accepts keyboard input
 THE SYSTEM SHALL focus the primary interactive element within 100ms
 AND the user SHALL be able to begin keyboard interaction without clicking
 
-A reaction input revealed by native text selection SHALL remain unfocused until the user explicitly enters it, preserving native copy actions and avoiding an unsolicited mobile keyboard.
+A reaction input revealed by native text selection SHALL remain unfocused until the user explicitly enters it by click, tap, or unmodified Enter while the anchored pill is visible. Enter-to-focus SHALL preserve other controls’ normal Enter behavior and SHALL NOT trigger during IME composition. This preserves native copy actions and avoids an unsolicited mobile keyboard.
 
 WHEN focus cannot be set (element not yet rendered)
 THE SYSTEM SHALL retry focus on the next animation frame

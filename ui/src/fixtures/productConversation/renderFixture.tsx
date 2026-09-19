@@ -1,6 +1,4 @@
-import { ReactionPresentationContext } from '../../components/reactionPresentation';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
-import { ReactionPill } from './ReactionPill';
 import { useEffect, useRef, useState } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ChainProvider } from '../../chain';
@@ -93,24 +91,22 @@ function ProductConversationFixtureBody({ scenario }: Props) {
     >
       <MemoryRouter initialEntries={[`/product-conversations/fixture-product-conversation${fixtureHash}`]}>
         <FocusScopeProvider>
-          <ReactionPresentationContext.Provider value={scenario.id === 'inline-message-reactions' ? ReactionPill : null}>
-            <ConversationProvider>
-              {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
-                <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
-              )}
-              <ConversationReadinessProvider>
-                <ChainProvider>
-                  <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
-                    <FileExplorerProvider>
-                      <Routes>
-                        <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
-                      </Routes>
-                    </FileExplorerProvider>
-                  </ViewerSlotProvider>
-                </ChainProvider>
-              </ConversationReadinessProvider>
-            </ConversationProvider>
-          </ReactionPresentationContext.Provider>
+          <ConversationProvider>
+            {scenario.initialDraft && scenario.snapshot?.latest_transcript_row_id && (
+              <SeedReactionDraft slug={scenario.snapshot.latest_transcript_row_id} text={scenario.initialDraft} />
+            )}
+            <ConversationReadinessProvider>
+              <ChainProvider>
+                <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
+                  <FileExplorerProvider>
+                    <Routes>
+                      <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+                    </Routes>
+                  </FileExplorerProvider>
+                </ViewerSlotProvider>
+              </ChainProvider>
+            </ConversationReadinessProvider>
+          </ConversationProvider>
         </FocusScopeProvider>
       </MemoryRouter>
     </main>
