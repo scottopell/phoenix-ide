@@ -5450,14 +5450,6 @@ fn linux_inventory_diagnostic(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_descriptor_target_is_live(target: &Path) -> bool {
-    !target
-        .as_os_str()
-        .as_encoded_bytes()
-        .ends_with(b" (deleted)")
-}
-
-#[cfg(target_os = "linux")]
 fn canonicalize_quarantine_for_descriptor_scan(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
@@ -5469,6 +5461,7 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::fs::MetadataExt as _;
     let canonical = canonicalize_quarantine_for_descriptor_scan(path)?;
     let effective_uid = unsafe { libc::geteuid() };
     let processes = std::fs::read_dir(proc_root).map_err(|error| {
@@ -5516,12 +5509,6 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
-            if !linux_descriptor_target_is_live(&target) {
-                continue;
-            }
-            if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
-                continue;
-            }
             let Some(target_metadata) = linux_read_leaf_after_capture(
                 &process_path,
                 &before_incarnation,
@@ -5531,6 +5518,12 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
+            if target_metadata.nlink() == 0 {
+                continue;
+            }
+            if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
+                continue;
+            }
             let access_mode = match linux_descriptor_access_mode(
                 &process_path,
                 &before_incarnation,
