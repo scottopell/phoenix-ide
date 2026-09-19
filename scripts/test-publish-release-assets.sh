@@ -122,12 +122,12 @@ if args and args[0] == "api":
     endpoint = filtered[0]
     release = load()
     if method == "GET" and "/releases/tags/" in endpoint:
-        if release is None or release["draft"]:
+        if release is None:
             raise SystemExit(1)
         print(json.dumps(api_release(release)))
         raise SystemExit(0)
     if method == "GET" and endpoint.endswith("/releases?per_page=100"):
-        page = [] if release is None or not release["draft"] else [api_release(release)]
+        page = [] if release is None else [api_release(release)]
         print(json.dumps([page] if slurp else page))
         raise SystemExit(0)
     if method == "GET" and endpoint.endswith("/releases/42"):
@@ -249,7 +249,12 @@ assert_draft
 unset FAKE_UPLOAD_FAIL_AFTER
 publish
 assert_published_exact
+test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$FAKE_STATE/release.json")" = 42
 grep -F -- '--method DELETE repos/owner/repo/releases/assets/' "$FAKE_STATE/gh.log" >/dev/null
+if grep -F -- '/releases/tags/' "$FAKE_STATE/gh.log" >/dev/null; then
+  echo "draft recovery must classify visibility from the release inventory, not the ambiguous tag endpoint" >&2
+  exit 1
+fi
 if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log" >/dev/null; then
   echo "partial draft recovery must not delete the release" >&2
   exit 1

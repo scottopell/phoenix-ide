@@ -13,11 +13,21 @@ required=("$@")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 metadata="$work/release.json"
-gh api "repos/$repo/releases/tags/$tag" >"$metadata"
-[[ $(jq -r '.draft // false' "$metadata") == false ]] || {
-  echo "error: $tag is not public" >&2
-  exit 1
-}
+releases="$work/releases.json"
+gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$releases"
+if jq -ce --arg tag "$tag" \
+  '[.[][] | select(.draft == false and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end' \
+  "$releases" >"$metadata"
+then
+  :
+else
+  status=$?
+  if [[ $status -eq 4 ]]; then
+    echo "public release $tag is absent" >&2
+    exit 3
+  fi
+  exit "$status"
+fi
 
 printf '%s\n' "${required[@]}" SHA256SUMS | sort >"$work/expected-names"
 jq -r '.assets[].name' "$metadata" | sort >"$work/actual-names"
@@ -26,7 +36,16 @@ cmp -s "$work/expected-names" "$work/actual-names" || {
   exit 1
 }
 
-gh release download "$tag" --repo "$repo" --dir "$work/assets"
+mkdir -p "$work/assets"
+while IFS=$'\t' read -r asset_id asset_name; do
+  [[ "$asset_id" =~ ^[0-9]+$ ]] || { echo "error: invalid GitHub asset id for $asset_name" >&2; exit 1; }
+  [[ "$asset_name" != */* && "$asset_name" != . && "$asset_name" != .. ]] || {
+    echo "error: unsafe GitHub asset name: $asset_name" >&2
+    exit 1
+  }
+  gh api "repos/$repo/releases/assets/$asset_id" \
+    -H 'Accept: application/octet-stream' >"$work/assets/$asset_name"
+done < <(jq -r '.assets[] | [.id, .name] | @tsv' "$metadata")
 (
   cd "$work/assets"
   sha256sum --check SHA256SUMS
