@@ -2591,7 +2591,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-1", "row-2"],
             contentsByConversationId: ["row-1": .entries([]), "row-2": .entries([])],
-            aggregateMembersById: ["pc-1": ["row-1", "row-2"]])
+            aggregateMembersById: ["pc-1": ["row-1"]])
         store.persistHardDeleteFenceGate = gate
         let probe = SendProbe()
         let (api, registration) = makeHTTPAPI(probe: probe)
@@ -2610,14 +2610,17 @@ final class AppModelProductConversationTests: XCTestCase {
 
         first.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
         await gate.waitForEntry()
+        store.aggregateMembersById["pc-1"] = ["row-1", "row-2"]
         second.receive(.conversationHardDeleted(seq: 1, conversationId: "row-2"))
         await second.awaitHardDeleteReportForTesting()
         XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
 
         await gate.release()
         await first.awaitHardDeleteReportForTesting()
-        XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
-        XCTAssertEqual(store.persistedHardDeleteFenceHistory.map(\.aggregateAuthority), ["pc-1"])
+        XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 2)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(store.persistedHardDeleteFenceHistory.last).memberConversationIds),
+            ["row-1", "row-2"])
     }
 
     func testHardDeleteFenceFailureLeavesAuthoritativeStateAndOutboxIntact() async throws {

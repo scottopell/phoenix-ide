@@ -74,6 +74,14 @@ private struct HardDeleteFenceRetryObligation: Hashable, Sendable {
     let fence: PersistedHardDeleteFence
 }
 
+private struct PendingHardDeleteCleanup {
+    let configurationEpoch: Int
+    let configurationIdentity: APIConfigurationIdentity
+    var triggerConversationId: String?
+    var memberConversationIds: Set<String>
+    var fenceState: HardDeleteFenceState
+}
+
 enum HardDeleteFenceState: Sendable {
     case needsCommit
     case committed(PersistedHardDeleteFence)
@@ -770,7 +778,7 @@ final class AppModel {
     private var hardDeletedConversationIds: Set<String> = []
     private var hardDeletedAggregateAuthorities: Set<String> = []
     private var hardDeleteFenceRetryObligations: Set<HardDeleteFenceRetryObligation> = []
-    private var hardDeleteCleanupAuthorities: Set<String> = []
+    private var pendingHardDeleteCleanups: [String: PendingHardDeleteCleanup] = [:]
 
     private var nextHardDeleteCleanupGeneration = 0
 
@@ -1301,38 +1309,62 @@ final class AppModel {
     }
 
     private func runHardDeleteCleanup(_ context: HardDeleteCleanupContext) async {
-        guard hardDeleteCleanupAuthorities.insert(context.aggregateAuthority).inserted else { return }
-        defer { hardDeleteCleanupAuthorities.remove(context.aggregateAuthority) }
+        if var pending = pendingHardDeleteCleanups[context.aggregateAuthority] {
+            guard pending.configurationEpoch == context.configurationEpoch,
+                  pending.configurationIdentity == context.configurationIdentity
+            else { return }
+            let expanded = !context.memberConversationIds.isSubset(of: pending.memberConversationIds)
+            pending.memberConversationIds.formUnion(context.memberConversationIds)
+            if expanded {
+                pending.fenceState = .needsCommit
+            }
+            if pending.triggerConversationId == nil {
+                pending.triggerConversationId = context.triggerConversationId
+            }
+            pendingHardDeleteCleanups[context.aggregateAuthority] = pending
+            hardDeletedConversationIds.formUnion(context.memberConversationIds)
+            return
+        }
+        pendingHardDeleteCleanups[context.aggregateAuthority] = .init(
+            configurationEpoch: context.configurationEpoch,
+            configurationIdentity: context.configurationIdentity,
+            triggerConversationId: context.triggerConversationId,
+            memberConversationIds: context.memberConversationIds,
+            fenceState: context.fenceState)
+        defer { pendingHardDeleteCleanups.removeValue(forKey: context.aggregateAuthority) }
 
         func contextIsCurrent() -> Bool {
             apiGeneration == context.configurationEpoch
                 && api?.configurationIdentity == context.configurationIdentity
         }
-        let fence: PersistedHardDeleteFence
-        switch context.fenceState {
-        case .needsCommit:
-            fence = PersistedHardDeleteFence(
-                persistenceScope: context.configurationIdentity.persistenceScope,
-                aggregateAuthority: context.aggregateAuthority,
-                memberConversationIds: context.memberConversationIds.sorted())
-            guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
-                NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
-                hardDeleteFenceRetryObligations.insert(.init(fence: fence))
-                hardDeletedConversationIds.formUnion(fence.memberConversationIds)
-                persistedOutboxHydrated = false
-                return
-            }
-            guard contextIsCurrent() else {
-                finishStartupHydration()
-                return
-            }
-        case .committed(let persisted):
-            fence = persisted
-        }
 
-        guard contextIsCurrent() else { return }
+        while let pending = pendingHardDeleteCleanups[context.aggregateAuthority] {
+            let fence: PersistedHardDeleteFence
+            switch pending.fenceState {
+            case .needsCommit:
+                fence = PersistedHardDeleteFence(
+                    persistenceScope: pending.configurationIdentity.persistenceScope,
+                    aggregateAuthority: context.aggregateAuthority,
+                    memberConversationIds: pending.memberConversationIds.sorted())
+                guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                    NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
+                    hardDeleteFenceRetryObligations.insert(.init(fence: fence))
+                    hardDeletedConversationIds.formUnion(fence.memberConversationIds)
+                    persistedOutboxHydrated = false
+                    return
+                }
+                guard contextIsCurrent() else {
+                    finishStartupHydration()
+                    return
+                }
+            case .committed(let persisted):
+                fence = persisted
+            }
 
-        let memberIds = Set(fence.memberConversationIds)
+            let memberIds = Set(fence.memberConversationIds)
+            guard pendingHardDeleteCleanups[context.aggregateAuthority]?.memberConversationIds == memberIds else {
+                continue
+            }
         let cleanupGeneration = beginHardDeleteCleanup(conversationIds: memberIds)
         productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
         productConversationDetails.removeValue(forKey: context.aggregateAuthority)
@@ -1363,6 +1395,9 @@ final class AppModel {
             completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
             return
         }
+        guard pendingHardDeleteCleanups[context.aggregateAuthority]?.memberConversationIds == memberIds else {
+            continue
+        }
         await conversationPersistenceStore.retireHardDeleteFence(fence)
         guard contextIsCurrent() else { return }
         if pendingOpenConversationId == context.aggregateAuthority
@@ -1375,6 +1410,8 @@ final class AppModel {
             withIdentifiers: ["attention-\(context.aggregateAuthority)"])
         UNUserNotificationCenter.current().removePendingNotificationRequests(
             withIdentifiers: ["attention-\(context.aggregateAuthority)"])
+            return
+        }
     }
 
     private func clearPersistedState(for conversationId: String) async {
@@ -1387,26 +1424,38 @@ final class AppModel {
         else { return }
         hardDeletedConversationIds.insert(report.conversationId)
         hardDeletedAggregateAuthorities.insert(report.aggregateAuthority)
+        if var pending = pendingHardDeleteCleanups[report.aggregateAuthority] {
+            if pending.memberConversationIds.insert(report.conversationId).inserted {
+                pending.fenceState = .needsCommit
+                pendingHardDeleteCleanups[report.aggregateAuthority] = pending
+            }
+        }
         let persistedMembers = conversationPersistenceStore.persistedConversationIds(
             aggregateId: report.aggregateAuthority,
             scope: report.configurationIdentity.persistenceScope,
             legacyScope: legacySnapshotPersistenceScope)
-        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
-            aggregateId: report.aggregateAuthority,
-            scope: report.configurationIdentity.persistenceScope)
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
             aggregate == report.aggregateAuthority ? id : nil
         })
+        let knownMembers = persistedMembers.union(listMembers).union([report.conversationId])
         await runHardDeleteCleanup(.init(
             configurationEpoch: apiGeneration,
             configurationIdentity: report.configurationIdentity,
             aggregateAuthority: report.aggregateAuthority,
             triggerConversationId: report.conversationId,
-            memberConversationIds: persistedMembers
+            memberConversationIds: knownMembers,
+            fenceState: .needsCommit))
+        let discovery = await conversationPersistenceStore.persistedMemberDiscovery(
+            aggregateId: report.aggregateAuthority,
+            scope: report.configurationIdentity.persistenceScope)
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: report.configurationIdentity,
+            aggregateAuthority: report.aggregateAuthority,
+            triggerConversationId: report.conversationId,
+            memberConversationIds: knownMembers
                 .union(discovery.currentAuthorityMemberIds)
-                .union(discovery.persistedOutboxOwnerIds)
-                .union(listMembers)
-                .union([report.conversationId]),
+                .union(discovery.persistedOutboxOwnerIds),
             fenceState: .needsCommit))
     }
 
