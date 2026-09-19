@@ -211,10 +211,23 @@ async fn automatic_continuation_view(
                     "automatic continuation summary has the wrong message type".to_string(),
                 ));
             };
+            let persisted_winner = state
+                .db
+                .continuation_dispatch_intent(&admission.predecessor_conversation_id)
+                .await
+                .map_err(db_to_app)?;
+            let (first_message_id, accepted_handoff) = persisted_winner
+                .map(|intent| (intent.message_id.as_str().to_string(), intent.handoff))
+                .unwrap_or_else(|| {
+                    (
+                        admission.first_message_id.as_str().to_string(),
+                        summary.summary,
+                    )
+                });
             Some(AutomaticContinuationFailureView {
                 message,
-                first_message_id: admission.first_message_id.as_str().to_string(),
-                accepted_handoff: summary.summary,
+                first_message_id,
+                accepted_handoff,
             })
         } else {
             None
@@ -1428,7 +1441,7 @@ mod tests {
         );
         assert_eq!(
             failed["admission"]["actionable_failure"]["first_message_id"],
-            "automatic-continuation-auto-api-auto-api-operation"
+            "auto-api-opening"
         );
     }
 

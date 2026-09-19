@@ -1447,15 +1447,13 @@ rule AutomaticContinuationBreakerPersistsActionableFailure {
     ensures: SafeManualContinuationRetryOffered(admission)
 }
 
-rule FailedAutomaticContinuationUsesAcceptedManualPayload {
+rule FailedAutomaticContinuationUsesPersistedWinner {
     when: UserRetriesFailedAutomaticContinuation(admission, new_conv)
     requires: admission.phase = failed
-    ensures: ContinuationSuccessorOperationRuns(
+    ensures: ContinuationSuccessorOperationRunsWithPersistedWinner(
         admission.predecessor,
         new_conv,
-        accepted_auto_continuation_payload(admission),
-        admission.first_message_id,
-        generated_predecessor_context)
+        admission)
 }
 
 rule ServerRestartResumesAdmittedAutomaticContinuation {
@@ -2364,6 +2362,16 @@ rule ModeChangeNotification {
 --       successor topology reservation; exact-once transfer of predecessor work
 --       ownership; runtime acceptance of dispatch; or settlement of the opening
 --       message. It never infers progress from an in-memory attempt.
+--
+--   ContinuationSuccessorOperationRunsWithPersistedWinner(
+--       predecessor: Conversation,
+--       new_conv: Conversation,
+--       admission: AutoContinuationAdmission
+--   ) -> Boolean
+--       Runs or rearms the persisted winning continuation intent with its exact
+--       handoff bytes, message identity, opening authority, user agent, and
+--       matching expansion policy. If no winner has been reserved, it uses the
+--       admission's immutable generated payload and identity.
 --
 --   accepted_auto_continuation_payload(
 --       admission: AutoContinuationAdmission

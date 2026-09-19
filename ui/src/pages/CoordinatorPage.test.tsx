@@ -50,7 +50,8 @@ function renderPage(initialEntry = '/global/conv-coordinator') {
 }
 
 function CurrentPath() {
-  return <div>{useLocation().pathname}</div>;
+  const location = useLocation();
+  return <div>{`${location.pathname}${location.search}${location.hash}`}</div>;
 }
 
 const coordinatorConversation = (): Conversation => ({
@@ -149,14 +150,14 @@ describe('CoordinatorPage', () => {
 
   it('canonicalizes a historical Coordinator chain member without exposing aggregate controls', async () => {
     render(
-      <MemoryRouter initialEntries={['/global/old-coordinator#message-source']}>
+      <MemoryRouter initialEntries={['/global/old-coordinator?view=history#message-source']}>
         <Routes>
           <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
         </Routes>
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('/global/conv-coordinator')).toBeInTheDocument();
+    expect(await screen.findByText('/global/conv-coordinator?view=history#message-source')).toBeInTheDocument();
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('old-coordinator');
     expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
   });
