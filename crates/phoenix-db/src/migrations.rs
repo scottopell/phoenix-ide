@@ -731,17 +731,15 @@ CREATE TABLE product_conversation_coordinator_profile_revisions (
 );
 
 CREATE TABLE product_conversation_coordinator_profiles (
-    product_conversation_id TEXT PRIMARY KEY NOT NULL,
-    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision > 0),
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+        ON DELETE CASCADE,
     charter TEXT NOT NULL
         CHECK (typeof(charter) = 'text'
                AND instr(charter, char(0)) = 0
                AND length(CAST(charter AS BLOB)) <= 32768),
     updated_at_unix_micros INTEGER NOT NULL
-        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
-    FOREIGN KEY (product_conversation_id, revision)
-        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id, revision)
-        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0)
 );
 
 CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
@@ -772,6 +770,41 @@ FOR EACH ROW WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+
+CREATE TRIGGER product_conversation_coordinator_profiles_require_positive_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND revision > 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+
+CREATE TRIGGER product_conversation_coordinator_profiles_require_positive_revision_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND revision > 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
+BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN NEW.revision <= 0 AND EXISTS (
+    SELECT 1
+    FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
 END;
 ";
 
@@ -15290,7 +15323,6 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_project_coordinator_profiles'),
                     (101, 'temporarily_skip_project_coordinator_profiles')",
         )
         .execute(&pool)
@@ -16185,7 +16217,6 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_project_coordinator_profiles'),
                     (101, 'temporarily_skip_project_coordinator_profiles')",
         )
         .execute(pool)

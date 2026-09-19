@@ -3,6 +3,7 @@ use phoenix_core::domain::product_conversation::{
     PROJECT_COORDINATOR_CHARTER_MAX_BYTES,
 };
 use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{Database, DbResult};
 
@@ -163,15 +164,9 @@ impl Database {
             validate_charter(charter)?;
         }
         let now = chrono::Utc::now().timestamp_micros();
+        let write_token = Uuid::new_v4().to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let kind: Option<String> =
-            sqlx::query_scalar("SELECT kind FROM product_conversations WHERE id = ?1")
-                .bind(product_conversation_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        if kind.as_deref() != Some("ordinary") {
-            return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
-        }
+        ensure_project_coordinator_profile_writable(&mut tx, product_conversation_id).await?;
 
         let retained_revision: i64 = sqlx::query_scalar(
             "SELECT revision FROM product_conversation_coordinator_profile_revisions
@@ -186,12 +181,14 @@ impl Database {
         }
         sqlx::query(
             "INSERT INTO product_conversation_coordinator_profile_revisions
-                 (product_conversation_id, revision)
-             VALUES (?1, 1)
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 1, ?2)
              ON CONFLICT(product_conversation_id)
-             DO UPDATE SET revision = revision + 1",
+             DO UPDATE SET revision = revision + 1,
+                           last_write_token = excluded.last_write_token",
         )
         .bind(product_conversation_id.as_str())
+        .bind(&write_token)
         .execute(&mut *tx)
         .await?;
         let new_revision: i64 = sqlx::query_scalar(
@@ -242,6 +239,7 @@ impl Database {
                     expected_revision,
                     new_revision,
                     now,
+                    &write_token,
                 )
                 .await
             {
@@ -260,9 +258,11 @@ impl Database {
         expected_revision: i64,
         revision: i64,
         updated_at_unix_micros: i64,
+        write_token: &str,
     ) -> Option<bool> {
-        let classified: Result<Option<(i64, Option<i64>)>, _> = sqlx::query_as(
+        let classified: Result<Option<(i64, String, Option<i64>)>, _> = sqlx::query_as(
             "SELECT fence.revision,
+                    fence.last_write_token,
                     CASE
                       WHEN profile.product_conversation_id IS NOT NULL
                        AND profile.charter IS ?2
@@ -279,7 +279,8 @@ impl Database {
         .bind(updated_at_unix_micros)
         .fetch_optional(&self.pool)
         .await;
-        let Some((persisted_revision, intended_match)) = classified.ok()? else {
+        let Some((persisted_revision, persisted_write_token, intended_match)) = classified.ok()?
+        else {
             return (expected_revision == 0).then_some(false);
         };
         if persisted_revision == expected_revision {
@@ -288,11 +289,35 @@ impl Database {
         if persisted_revision != revision {
             return None;
         }
+        if persisted_write_token != write_token {
+            return None;
+        }
         match charter {
             Some(_) => intended_match.map(|value| value == 1),
             None => Some(intended_match == Some(0)),
         }
     }
+}
+
+async fn ensure_project_coordinator_profile_writable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    product_conversation_id: &ProductConversationId,
+) -> Result<(), ProjectCoordinatorProfileWriteDbError> {
+    let aggregate: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+            .bind(product_conversation_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((kind, ordinary_lifecycle)) = aggregate else {
+        return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
+    };
+    if kind != "ordinary" {
+        return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
+    }
+    if ordinary_lifecycle.as_deref() != Some("open") {
+        return Err(ProjectCoordinatorProfileWriteError::NotOpen.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -459,6 +484,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_profile_stores_no_parallel_revision() {
+        let db = Database::open_in_memory().await.expect("database");
+        let columns = sqlx::query(
+            "SELECT name FROM pragma_table_info('product_conversation_coordinator_profiles')",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("columns");
+        assert!(!columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "revision"));
+    }
+
+    #[tokio::test]
+    async fn active_profile_requires_positive_retained_revision() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-positive-revision").await;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 0, 'seed')",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("zero retained revision");
+        let insert_error = sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profiles
+                 (product_conversation_id, charter, updated_at_unix_micros)
+             VALUES (?1, 'invalid active charter', 1)",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("active profile must require a positive retained revision");
+        assert!(insert_error
+            .to_string()
+            .contains("Project Coordinator active profile requires positive revision"));
+
+        sqlx::query(
+            "UPDATE product_conversation_coordinator_profile_revisions
+             SET revision = 1
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("positive revision");
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profiles
+                 (product_conversation_id, charter, updated_at_unix_micros)
+             VALUES (?1, 'valid active charter', 2)",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("active profile");
+        let update_error = sqlx::query(
+            "UPDATE product_conversation_coordinator_profile_revisions
+             SET revision = 0
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("active profile must keep a positive retained revision");
+        assert!(update_error
+            .to_string()
+            .contains("Project Coordinator active profile requires positive revision"));
+    }
+
+    #[tokio::test]
+    async fn moving_active_profile_requires_destination_positive_revision() {
+        let db = Database::open_in_memory().await.expect("database");
+        let source = ordinary(&db, "pc-project-coordinator-move-source").await;
+        let destination = ordinary(&db, "pc-project-coordinator-move-destination").await;
+        db.write_project_coordinator_profile(&source, Some("source charter"), 0)
+            .await
+            .expect("source profile");
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 0, 'destination-seed')",
+        )
+        .bind(destination.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("destination zero retained revision");
+
+        let move_error = sqlx::query(
+            "UPDATE product_conversation_coordinator_profiles
+             SET product_conversation_id = ?1
+             WHERE product_conversation_id = ?2",
+        )
+        .bind(destination.as_str())
+        .bind(source.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("active profile move must require destination positive revision");
+        assert!(move_error
+            .to_string()
+            .contains("Project Coordinator active profile requires positive revision"));
+    }
+
+    #[tokio::test]
+    async fn disable_commit_classification_requires_write_token_identity() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-disable-token").await;
+        db.write_project_coordinator_profile(&id, Some("enabled"), 0)
+            .await
+            .expect("enable");
+        sqlx::query(
+            "DELETE FROM product_conversation_coordinator_profiles
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("simulate disabled profile");
+        sqlx::query(
+            "UPDATE product_conversation_coordinator_profile_revisions
+             SET revision = 2, last_write_token = 'other-disable'
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("simulate concurrent retained disable revision");
+
+        assert_eq!(
+            db.classify_project_coordinator_write(&id, None, 1, 2, 1, "this-disable")
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn disable_and_reenable_never_reuse_revision() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-aba").await;
@@ -549,6 +711,43 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Project Coordinator profile must remain ordinary"));
+    }
+
+    #[tokio::test]
+    async fn history_product_conversation_cannot_mutate_profile() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-history").await;
+        db.write_project_coordinator_profile(&id, Some("open charter"), 0)
+            .await
+            .expect("open profile");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("close to History");
+
+        let enable_error = db
+            .write_project_coordinator_profile(&id, Some("history edit"), 1)
+            .await
+            .expect_err("History profile edit must be rejected");
+        assert!(matches!(
+            enable_error,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::NotOpen
+            )
+        ));
+        let disable_error = db
+            .write_project_coordinator_profile(&id, None, 1)
+            .await
+            .expect_err("History profile disable must be rejected");
+        assert!(matches!(
+            disable_error,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::NotOpen
+            )
+        ));
     }
 
     #[tokio::test]

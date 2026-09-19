@@ -7809,16 +7809,28 @@ mod scope_liveness_tests {
             );
             std::fs::remove_file(socket).unwrap();
         }
-        let replacement = manager
-            .tmux_registry()
-            .ensure_live(
-                &ResourceScopeKey::Work(scope.clone()),
-                owner.path(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        let replacement_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let replacement = loop {
+            match manager
+                .tmux_registry()
+                .ensure_live(
+                    &ResourceScopeKey::Work(scope.clone()),
+                    owner.path(),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(replacement) => break replacement,
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < replacement_deadline,
+                        "replacement tmux server was not admitted after stale owner retirement: {error:?}"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
         let replacement_token = replacement.read().await.server_token.clone();
         assert_ne!(replacement_token, stale_token);
         replacement_token

@@ -1,6 +1,6 @@
 # ADR-049: Compaction protects accepted handoffs and Coordinator context
 
-- **Status:** Partially superseded by ADR-055
+- **Status:** Partially superseded by ADR-056
 - **Date:** 2026-09-13
 - **Affects:** REQ-BED-020, REQ-GR-011, REQ-GR-013
 
@@ -41,6 +41,6 @@ No purpose setting, ad-hoc project-coordinator classification, new persistence f
 - [Coordinator requirements](../global-recall/requirements.md), REQ-GR-011 and REQ-GR-013
 - [ADR-025](025_continuation-compaction-is-an-idempotent-durable-operation.md): durable continuation operation
 - [ADR-045](045_provider-prompts-use-persisted-generation-fenced-projections.md): prompt projection authority
-- [ADR-055](055_project-coordinator-is-an-ordinary-productconversation-profile.md): supersedes the exclusions on ordinary coordination profiles, persistence, and specialized compaction
+- [ADR-056](056_project-coordinator-is-an-ordinary-productconversation-profile.md): supersedes the exclusions on ordinary coordination profiles, persistence, and specialized compaction
 - [Compatibility requirements](../compatibility/requirements.md)
 - `ConversationRuntime::request_continuation`, `plan_continuation_history`, `ProductConversation`

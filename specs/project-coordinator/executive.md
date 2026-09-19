@@ -2,7 +2,7 @@
 
 ## Status
 
-The opt-in profile is implemented as a feature-branch candidate. ADR-055 records the bounded supersession of ADR-049 for ordinary Project Coordinator profiles. Exact-head qualification requires green local and hosted gates plus fresh review on the published head.
+The opt-in profile is implemented as a feature-branch candidate. ADR-056 records the bounded supersession of ADR-049 for ordinary Project Coordinator profiles. Exact-head qualification requires green local and hosted gates plus fresh review on the published head.
 
 ## Scope
 
@@ -24,4 +24,4 @@ Persisted edits are available through the human-facing HTTP settings action and 
 
 ## Qualification
 
-ADR-055 and migration 101 were allocated against the rebased mainline. ADR-055 supersedes ADR-049’s exclusions of an ordinary-conversation purpose setting, Project Coordinator classification, durable profile persistence, and profile-specific ordinary compaction while preserving ADR-049’s protected-handoff and durable-operation decisions. Exact-head qualification requires green local and hosted gates plus fresh review.
+ADR-056 and migration 101 were allocated against the rebased mainline. ADR-056 supersedes ADR-049’s exclusions of an ordinary-conversation purpose setting, Project Coordinator classification, durable profile persistence, and profile-specific ordinary compaction while preserving ADR-049’s protected-handoff and durable-operation decisions. Exact-head qualification requires green local and hosted gates plus fresh review.

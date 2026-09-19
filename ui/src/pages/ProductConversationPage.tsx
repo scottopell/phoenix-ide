@@ -671,9 +671,11 @@ function RecallDisclosure({
 
 function ProjectCoordinatorSettings({
   snapshot,
+  editable,
   onSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
+  editable: boolean;
   onSaved: (
     productConversationId: string,
     profile: ProductConversationSnapshotView['project_coordinator_profile'],
@@ -697,7 +699,7 @@ function ProjectCoordinatorSettings({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (!dirty || saving || (enabled && charterBytes > 32_768)) return;
+    if (!editable || !dirty || saving || (enabled && charterBytes > 32_768)) return;
     setSaving(true);
     setError(null);
     try {
@@ -732,7 +734,7 @@ function ProjectCoordinatorSettings({
             type="checkbox"
             checked={enabled}
             onChange={(event) => setEnabled(event.target.checked)}
-            disabled={saving}
+            disabled={!editable || saving}
           />
           Use Project Coordinator guidance
         </label>
@@ -741,21 +743,25 @@ function ProjectCoordinatorSettings({
           id="project-coordinator-charter"
           value={charter}
           onChange={(event) => setCharter(event.target.value)}
-          disabled={!enabled || saving}
+          disabled={!editable || !enabled || saving}
           rows={8}
           aria-describedby="project-coordinator-charter-help"
         />
         <p id="project-coordinator-charter-help">
-          Plain text loaded fresh for every turn. Not editable by assistant tools or chat. {charterBytes.toLocaleString()} / 32,768 bytes.
+          Plain text loaded fresh for every turn. Supported LLM tools and chat cannot mutate it. Revision {profile?.revision ?? 0}. {charterBytes.toLocaleString()} / 32,768 bytes.
         </p>
         {charterBytes > 32_768 && <p role="alert">Charter exceeds 32,768 UTF-8 bytes.</p>}
         {error && <p role="alert">{error}</p>}
-        <div className="product-conversation-page__coordinator-actions">
-          <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
-          <button type="submit" className="btn-primary" disabled={!dirty || saving || (enabled && charterBytes > 32_768)}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
-        </div>
+        {editable ? (
+          <div className="product-conversation-page__coordinator-actions">
+            <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
+            <button type="submit" className="btn-primary" disabled={!dirty || saving || (enabled && charterBytes > 32_768)}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        ) : (
+          <p>History is read-only; retained Project Coordinator guidance is shown for inspection.</p>
+        )}
       </form>
     </details>
   );
@@ -813,8 +819,13 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
-        {snapshot.project_coordinator_eligible && (
-          <ProjectCoordinatorSettings snapshot={snapshot} onSaved={onCoordinatorProfileSaved} />
+        {(snapshot.project_coordinator_eligible || snapshot.project_coordinator_profile?.enabled) && (
+          <ProjectCoordinatorSettings
+            key={`coordinator-${snapshot.product_conversation_id}`}
+            snapshot={snapshot}
+            editable={snapshot.project_coordinator_eligible}
+            onSaved={onCoordinatorProfileSaved}
+          />
         )}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
@@ -1181,11 +1192,12 @@ function ProductConversationPageInner() {
         onCoordinatorProfileSaved={(savedProductConversationId, profile) => {
           snapshotRequestRef.current += 1;
           paginationRequestRef.current += 1;
-          setOwnedSnapshot((current) => (
-            current?.productConversationId === savedProductConversationId
-              ? { ...current, value: { ...current.value, project_coordinator_profile: profile } }
-              : current
-          ));
+          setOwnedSnapshot((current) => {
+            if (current?.productConversationId !== savedProductConversationId) return current;
+            const currentProfile = current.value.project_coordinator_profile;
+            if (currentProfile && profile && currentProfile.revision > profile.revision) return current;
+            return { ...current, value: { ...current.value, project_coordinator_profile: profile } };
+          });
           setSnapshotRetry((retry) => retry + 1);
         }}
       />
