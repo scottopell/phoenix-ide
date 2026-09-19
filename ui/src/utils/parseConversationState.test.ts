@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { parseConversationState } from '../utils';
+import { canChangeModelInState } from '../api';
+import { parseConversationState, canCancelConversationState, isAgentWorking } from '../utils';
 
 describe('parseConversationState recovery', () => {
   it('allows manual recovery of a persisted invalid-request error', () => {
@@ -21,10 +22,11 @@ describe('parseConversationState recovery', () => {
   ])('does not infer recovery authority from unreadable state $type', (raw) => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      expect(parseConversationState(raw)).toMatchObject({
-        type: 'error',
-        error: { can_auto_retry: false, can_user_resume: false },
-      });
+      const state = parseConversationState(raw);
+      expect(state).toEqual({ type: 'client_decode_error', message: expect.any(String) });
+      expect(canChangeModelInState(state)).toBe(false);
+      expect(canCancelConversationState(state)).toBe(false);
+      expect(isAgentWorking(state)).toBe(false);
     } finally {
       warning.mockRestore();
     }

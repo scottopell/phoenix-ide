@@ -674,6 +674,17 @@ describe('ConversationPage message delivery reconciliation', () => {
     expect(sendMessage.mock.calls[0]?.[1]).toBe('continue');
   });
 
+  it('shows unreadable state without provider recovery actions or composer', async () => {
+    renderPage(makeConversation({ state: { type: 'client_decode_error', message: 'Unknown state' } }));
+
+    await screen.findByText('Unable to read conversation state');
+    expect(screen.getByText('Reload Phoenix to retrieve the conversation state.')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry.*continue/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
+  });
+
   it('does not expose a composer for a terminal content-filter error', async () => {
     const errorState = {
       type: 'error' as const,

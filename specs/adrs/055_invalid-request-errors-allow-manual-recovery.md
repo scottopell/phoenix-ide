@@ -22,7 +22,9 @@ Choose option 3. Both provider and persisted conversation error policies treat I
 
 The policy also applies to existing persisted invalid-request states. It changes no stored encoding, adds no migration, and does not depend on the error message. The SSE projection and client-side presentation must agree. Content-filter, context-exhaustion, and lifecycle-terminal policies remain unchanged.
 
-Provider content-filter outcomes retain their category through the executor and state machine. Client-side state decoding failures do not infer recovery authority from a synthetic error presentation: an unreadable state is not evidence of a resumable server-side request error.
+In-process runtime recreation preserves every persisted user-resumable error, including its diagnostic, reset time, and state-entry time. Model-change eviction must not reinterpret a completed tool tail as authority to retry before the user acts, or replace the error with Idle before a queued dismissal arrives. Full process startup retains its separate database-reset semantics.
+
+Provider content-filter outcomes retain their category through the executor and state machine. Client-side state decoding failures use a distinct client-only state without a provider error kind or recovery presentation. The client offers reload guidance and withholds chat, model-change, retry, dismissal, and cancellation controls until it can read authoritative state. An unreadable state is not evidence of a resumable server-side request error.
 
 ## Consequences
 

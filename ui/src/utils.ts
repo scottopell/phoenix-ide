@@ -54,7 +54,7 @@ export function formatShortDateTime(isoStr: string): string {
 
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
-    case 'idle': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
+    case 'idle': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
     case 'awaiting_task_approval': case 'awaiting_user_response':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
@@ -71,7 +71,7 @@ export function canCancelConversationState(state: ConversationState): boolean {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_recovery': case 'provisioning':
       return true;
-    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return false;
@@ -83,7 +83,7 @@ export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
-    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -152,6 +152,8 @@ export function getStateDescription(state: ConversationState): string {
       // agent-posed question. Direct address ("your") makes the
       // expected next action unmistakable.
       return 'awaiting your reply';
+    case 'client_decode_error':
+      return 'unreadable state';
     case 'error':
       return 'error';
     case 'recoverable_continuation_failure':
@@ -169,12 +171,7 @@ function stringOr(value: unknown, fallback: string): string {
 }
 
 function invalidStateError(message: string): ConversationState {
-  return {
-    type: 'error',
-    message,
-    error_kind: 'invalid_request',
-    error: { kind: 'invalid_request', can_auto_retry: false, can_user_resume: false },
-  };
+  return { type: 'client_decode_error', message };
 }
 
 function serverError(message: string): ConversationState {
