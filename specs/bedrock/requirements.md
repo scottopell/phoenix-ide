@@ -340,6 +340,11 @@ AND SHALL NOT accept a chat request that the state machine will later discard
 WHEN conversation state changes
 THE SYSTEM SHALL persist the new state before executing effects
 
+WHEN a conversation runtime is recreated within the running server process while its persisted error policy is user-resumable
+THE SYSTEM SHALL restore the persisted error, diagnostic, reset time, and state-entry time
+AND SHALL preserve the error's existing retry and dismissal policy
+AND SHALL NOT infer automatic continuation from the transcript tail
+
 WHEN server restarts
 THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
 AND preserve complete message history

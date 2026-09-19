@@ -269,8 +269,11 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertTrue(
             ConversationState.error(message: "retryable", kind: .serverError)
                 .acceptsChatMessage)
+        XCTAssertTrue(
+            ConversationState.error(message: "Bad request (400)", kind: .invalidRequest)
+                .acceptsChatMessage)
         XCTAssertFalse(
-            ConversationState.error(message: "terminal", kind: .invalidRequest)
+            ConversationState.error(message: "terminal", kind: .contentFilter)
                 .acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.error(message: "unknown", kind: .unknown)

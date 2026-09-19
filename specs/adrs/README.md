@@ -66,6 +66,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
+| [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
 
 ## For agents: which decisions bind your task
 

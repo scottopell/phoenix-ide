@@ -54,7 +54,7 @@ export function formatShortDateTime(isoStr: string): string {
 
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
-    case 'idle': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
+    case 'idle': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
     case 'awaiting_task_approval': case 'awaiting_user_response':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
@@ -71,7 +71,7 @@ export function canCancelConversationState(state: ConversationState): boolean {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_recovery': case 'provisioning':
       return true;
-    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return false;
@@ -83,7 +83,7 @@ export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
-    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -152,6 +152,8 @@ export function getStateDescription(state: ConversationState): string {
       // agent-posed question. Direct address ("your") makes the
       // expected next action unmistakable.
       return 'awaiting your reply';
+    case 'client_decode_error':
+      return 'unreadable state';
     case 'error':
       return 'error';
     case 'recoverable_continuation_failure':
@@ -168,14 +170,8 @@ function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
 }
 
-function invalidRequestError(message: string): ConversationState {
-  const error = getErrorPresentation('invalid_request')!;
-  return { type: 'error', message, error_kind: error.kind, error };
-}
-
-function serverError(message: string): ConversationState {
-  const error = getErrorPresentation('server_error')!;
-  return { type: 'error', message, error_kind: error.kind, error };
+function invalidStateError(message: string): ConversationState {
+  return { type: 'client_decode_error', message };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -229,7 +225,7 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'seeded_llm_requesting': {
       const seed = obj['seed_message_id'];
       if (typeof seed !== 'string' || seed.trim() === '') {
-        return invalidRequestError('Invalid seeded request state: missing seed message');
+        return invalidStateError('Invalid seeded request state: missing seed message');
       }
       return {
         type: 'seeded_llm_requesting',
@@ -270,13 +266,18 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'recoverable_continuation_failure': {
       const failure = obj['failure'];
       if (!failure || typeof failure !== 'object' || Array.isArray(failure)) {
-        return serverError('Invalid recoverable continuation failure');
+        return invalidStateError('Invalid recoverable continuation failure');
       }
       const value = failure as Record<string, unknown>;
+      const errorKind = value['error_kind'];
+      const presentation = typeof errorKind === 'string' ? getErrorPresentation(errorKind as ErrorKind) : undefined;
+      if (!presentation || typeof value['message'] !== 'string' || !isRecord(value['request'])) {
+        return invalidStateError('Invalid recoverable continuation failure');
+      }
       return {
         type: 'recoverable_continuation_failure',
         message: stringOr(value['message'], 'Continuation summary generation failed'),
-        error_kind: stringOr(value['error_kind'], 'server_error') as ErrorKind,
+        error_kind: presentation.kind,
         operation_id: stringOr(
           (value['request'] as Record<string, unknown> | undefined)?.['operation_id'],
           'legacy-continuation-operation',
@@ -289,18 +290,18 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'handed_off': {
       const successor = obj['successor_conv_id'];
       if (typeof successor !== 'string' || successor.trim() === '') {
-        return invalidRequestError('Invalid handed-off state: missing successor conversation');
+        return invalidStateError('Invalid handed-off state: missing successor conversation');
       }
       return { type: 'handed_off', successor_conv_id: successor };
     }
     case 'error': {
       const errorKind = obj['error_kind'];
       if (typeof errorKind !== 'string' || errorKind.length === 0) {
-        return serverError(stringOr(obj['message'], 'Unknown error'));
+        return invalidStateError(stringOr(obj['message'], 'Unknown error'));
       }
       const presentation = getErrorPresentation(errorKind as ErrorKind);
       if (!presentation) {
-        return serverError(`Unknown error kind: ${errorKind}`);
+        return invalidStateError(`Unknown error kind: ${errorKind}`);
       }
       return {
         type: 'error',
@@ -320,7 +321,7 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);
-      return invalidRequestError(`Unknown state: ${String(type)}`);
+      return invalidStateError(`Unknown state: ${String(type)}`);
   }
 }
 

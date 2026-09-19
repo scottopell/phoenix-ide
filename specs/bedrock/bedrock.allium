@@ -2314,8 +2314,8 @@ rule ModeChangeNotification {
 --
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,
---       prompt_rejected, invalid_response, server_error, server_overloaded,
---       and timed_out. False exactly for invalid_request, cancelled,
+--       prompt_rejected, invalid_request, invalid_response, server_error,
+--       server_overloaded, and timed_out. False exactly for cancelled,
 --       sub_agent_error, context_exhausted, turn_limit_exhausted, and
 --       content_filter.
 --
@@ -2475,6 +2475,19 @@ rule ModeChangeNotification {
 
 -- REQ-BED-007: ordinary interrupted turns restart from idle. Durable
 -- continuation operations retain their operation identity and recovery state.
+rule RuntimeRecreatesUserResumableError {
+    when: RuntimeStarts(conversation)
+    requires: conversation.core_status = error
+    requires: user_resumable(conversation.error_kind)
+    ensures: conversation.core_status = error
+    ensures: conversation.error_kind = previous(conversation.error_kind)
+
+    @guidance
+        -- Reconstruct the persisted error payload and state-entry timestamp
+        -- without transcript-based automatic continuation. Process startup's
+        -- database reset is distinct from recreating a runtime after eviction.
+}
+
 rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy

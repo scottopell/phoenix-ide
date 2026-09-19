@@ -1769,6 +1769,7 @@ function ConversationPageContent({
 
   const convStateForChildren = atom.phase;
   const ordinaryComposerEligible = !isArchived
+    && convStateForChildren.type !== 'client_decode_error'
     && convStateForChildren.type !== 'provisioning'
     && convStateForChildren.type !== 'creation_failed'
     && convStateForChildren.type !== 'creation_cancelled'
@@ -2490,6 +2491,16 @@ function ConversationPageContent({
         />
         </RenderProfiler>
         </>
+      ) : convStateForChildren.type === 'client_decode_error' ? (
+        <div className="error-input-area" role="alert">
+          <div className="error-body">
+            <div className="error-body-content">
+              <div className="error-body-title">Unable to read conversation state</div>
+              <div className="error-body-details">{convStateForChildren.message}</div>
+              <div className="error-body-details">Reload Phoenix to retrieve the conversation state.</div>
+            </div>
+          </div>
+        </div>
       ) : convStateForChildren.type === 'error' ? (
         <>
         <ErrorBanner

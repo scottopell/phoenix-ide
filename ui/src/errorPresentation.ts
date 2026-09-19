@@ -20,8 +20,8 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     case 'server_overloaded':
     case 'usage_limit_reached':
     case 'prompt_rejected':
-      return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'invalid_request':
+      return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'cancelled':
     case 'sub_agent_error':
     case 'context_exhausted':

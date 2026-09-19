@@ -495,7 +495,7 @@ mod tests {
             (InvalidResponse, AutoRetryable, Resumable),
             (ServerOverloaded, NoAutoRetry, Resumable),
             (Auth, NoAutoRetry, Resumable),
-            (InvalidRequest, NoAutoRetry, NotResumable),
+            (InvalidRequest, NoAutoRetry, Resumable),
             (ContentFilter, NoAutoRetry, NotResumable),
             (ContextWindowExceeded, NoAutoRetry, NotResumable),
         ];
