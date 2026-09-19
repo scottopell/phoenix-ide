@@ -122,6 +122,7 @@ export function Sidebar({
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
+  const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
@@ -330,6 +331,8 @@ export function Sidebar({
 
   const handleProductClose = useCallback(async () => {
     if (!productCloseTarget) return;
+    if (productCloseSubmittingId === productCloseTarget.product_conversation_id) return;
+    setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
       setProductCloseTarget((current) =>
@@ -340,6 +343,8 @@ export function Sidebar({
       notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
       setProductCloseError((current) =>
         current?.productId === productCloseTarget.product_conversation_id ? null : current);
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         const confirmationRoute = productCloseTarget.canonical_route;
@@ -353,9 +358,11 @@ export function Sidebar({
           message: err instanceof Error ? err.message : 'Failed to close product conversation',
         });
       }
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
       console.error('Failed to close product conversation:', err);
     }
-  }, [productCloseTarget, onConversationCreated, navigate]);
+  }, [productCloseTarget, productCloseSubmittingId, onConversationCreated, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -570,6 +577,7 @@ export function Sidebar({
         confirmText="Close"
         danger
         onConfirm={handleProductClose}
+        submitting={productCloseSubmittingId === productCloseTarget?.product_conversation_id}
         {...(productCloseError && productCloseError.productId === productCloseTarget?.product_conversation_id
           ? { error: productCloseError.message }
           : {})}

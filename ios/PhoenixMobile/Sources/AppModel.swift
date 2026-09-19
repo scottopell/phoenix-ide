@@ -380,6 +380,7 @@ final class AppModel {
             lastActionError = "This conversation has queued or unreadable messages. Resolve them before closing."
             return false
         }
+        guard apiGeneration == startedGeneration else { return false }
         let aggregateSessions = transcriptIds.compactMap { transcriptId in
             session(for: transcriptId).map { (transcriptId, $0) }
         }
