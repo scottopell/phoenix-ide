@@ -415,10 +415,81 @@ export const productConversationScenarios = [
     snapshot: makeLongSnapshot(),
     olderSnapshot: makeOlderPage(),
   },
+  {
+    ...productConversationScenarioDefinitions[9],
+    initialDraft: 'Let’s keep the first version focused.',
+    snapshot: makeSnapshot({
+      product_conversation_id: 'pc-inline-reactions',
+      presentation: { kind: 'state', display_name: 'Conversation recovery review', presentation_mode: 'idle' },
+      latest_transcript_row_id: 'reaction-work',
+      writable_transcript_row_id: 'reaction-work',
+      segments: [
+        segment(1, 'reaction-history', 'Earlier exploration', [
+          textMessage('reaction-question-older', 1, 'user', 'What should survive an interruption?'),
+          textMessage('reaction-answer-older', 2, 'agent', 'Preserve the user’s draft and every completed tool result. Recovery must not duplicate a finalized answer or silently move feedback to a different conversation.'),
+        ], 'Keep conversation identity stable and test interrupted work.'),
+        segment(2, 'reaction-work', 'Recovery test plan', [
+          textMessage('reaction-question', 1, 'user', 'How should we test the conversation recovery flow? Give me a concrete plan to review.'),
+          textMessage('reaction-answer', 2, 'agent', [
+            'I’d split verification into two layers, with most coverage close to the state machine.',
+            '',
+            '## 1. Make the important transitions deterministic',
+            '',
+            'Start with deterministic state patterns: feed the same events into the reducer and assert both the resulting state and the emitted effects. That gives us a repeatable way to check interruption, retry, and recovery without relying on a browser timing window.',
+            '',
+            'The same input should always produce the same outcome, including when a completion arrives just before cancellation. Keep the accepted result attached to its original conversation and reject a stale completion from a superseded attempt.',
+            '',
+            '- Recover an interrupted tool without duplicating its completed result.',
+            '- Retain the user’s draft while the conversation reconnects.',
+            '- Keep feedback on earlier messages attached to the correct source.',
+            '',
+            '## 2. Exercise a concrete interruption',
+            '',
+            'Use `recoverConversation` with a fixed event sequence:',
+            '',
+            '```ts',
+            'const events = [toolStarted("read-1"), toolFinished("read-1"), connectionLost()];',
+            'const recovered = replay(events);',
+            'expect(recovered.results).toHaveLength(1);',
+            'expect(recovered.draft).toBe("Please check the recovery path.");',
+            '```',
+            '',
+            '## 3. Check the browser seams',
+            '',
+            '| Journey | Observable outcome |',
+            '| --- | --- |',
+            '| Reconnect after a tool finishes | Exactly one result |',
+            '| Review an older answer | Feedback appends to the current draft |',
+            '| Add a second reaction | Both quotes and reactions remain editable |',
+            '',
+            'A small set of browser journeys should verify the seams that reducer tests cannot see: restoring the visible transcript, preserving the reading position, and keeping native selection and copying comfortable.',
+            '',
+            '## 4. Decide what to ship first',
+            '',
+            'Ship the deterministic coverage and one representative recovery journey together. Keep the mobile keyboard and selection-handle checks explicit; desktop emulation alone cannot establish that native phone selection works.',
+          ].join('\n'), state('idle')),
+        ], null),
+      ],
+    }),
+  },
 ] as const satisfies readonly ProductConversationScenario[];
 
 export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario {
   const scenario = productConversationScenarios.find((item) => item.id === id);
   if (!scenario) throw new Error(`Unknown ProductConversation scenario: ${id}`);
   return scenario;
+}
+
+export function makeVirtualizedReactionScenario(): ProductConversationScenario {
+  const base = getProductConversationScenario('inline-message-reactions');
+  const snapshot = base.snapshot!;
+  const subjects = ['interrupted tools', 'draft preservation', 'stale completions', 'retry identity', 'continuation boundaries', 'reconnect timing'];
+  const history = Array.from({ length: 36 }, (_, index) => {
+    const subject = subjects[index % subjects.length]!;
+    return [
+      textMessage(`recovery-question-${index}`, index * 2 + 3, 'user', `How would you verify ${subject} in the recovery flow?`),
+      textMessage(`recovery-answer-${index}`, index * 2 + 4, 'agent', `### Verifying ${subject}\n\nStart from a saved conversation with a completed tool result and an unfinished user draft. Interrupt the connection at the transition boundary, then replay the accepted events in order.\n\nAssert the recovered state before retrying: the original result remains attached to its conversation, the draft is unchanged, and no duplicate completion is accepted.\n\n- Compare emitted effects with the expected sequence.\n- Repeat with cancellation before and after completion.\n- Check the visible transcript after reconnecting.`),
+    ];
+  }).flat();
+  return { ...base, snapshot: { ...snapshot, segments: snapshot.segments.map((segment, index) => index === 0 ? { ...segment, messages: [...segment.messages, ...history] } : segment) } };
 }

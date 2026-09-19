@@ -43,10 +43,10 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     listRef.current?.scrollToUnitIndex(unitIndex);
   }, []);
 
-  const handleLoadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
+  const handleLoadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!onLoadOlderMessages) return;
     const list = listRef.current;
-    onLoadOlderMessages(
+    return onLoadOlderMessages(
       restoreBasis ?? (list ? list.captureHistoryRestoreBasis() : undefined),
     );
   }, [onLoadOlderMessages]);

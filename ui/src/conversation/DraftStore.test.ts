@@ -55,10 +55,10 @@ describe('draftReducer', () => {
       expect(next.draft).toBe('first content');
     });
 
-    it('replaces (no separator) when existing draft is whitespace-only', () => {
+    it('preserves whitespace-only draft text when appending', () => {
       const atom = { draft: '   \n  ' };
       const next = draftReducer(atom, { type: 'append_draft', text: 'first content' });
-      expect(next.draft).toBe('first content');
+      expect(next.draft).toBe('   \n  \n\nfirst content');
     });
 
     it('is a no-op when the appended text is empty', () => {

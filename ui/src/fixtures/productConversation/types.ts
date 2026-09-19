@@ -55,6 +55,12 @@ export const productConversationScenarioDefinitions = [
     viewport: 'desktop',
     state: 'ready',
   },
+  {
+    id: 'inline-message-reactions',
+    title: 'Read and react / selected passages append to an existing draft',
+    viewport: 'desktop',
+    state: 'ready',
+  },
 ] as const satisfies readonly {
   id: string;
   title: string;
@@ -65,6 +71,7 @@ export const productConversationScenarioDefinitions = [
 export type ProductConversationScenarioId = (typeof productConversationScenarioDefinitions)[number]['id'];
 
 export interface ProductConversationScenario {
+  initialDraft?: string;
   id: ProductConversationScenarioId;
   title: string;
   viewport: 'desktop' | 'mobile';

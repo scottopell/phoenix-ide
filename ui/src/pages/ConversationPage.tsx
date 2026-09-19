@@ -190,6 +190,7 @@ export interface EmbeddedConversationProjection {
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
   appendReviewNotesToComposer?: ((formattedNotes: string) => void) | undefined;
+  appendInlineReactionToComposer?: ((text: string) => void) | undefined;
   filePathRootDir: string;
   systemPrompt?: string | undefined;
   modelContextWindow?: number | undefined;
@@ -1087,7 +1088,7 @@ function ConversationPageContent({
   }, [slug, conversationId, historyExpansion, dispatch, eventCursorRef]);
 
   const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
-    void loadOlderMessagesForIntent({
+    return loadOlderMessagesForIntent({
       kind: 'reader_expansion',
       restore: restoreBasis ?? { kind: 'following_tail' },
     });
@@ -1798,7 +1799,7 @@ function ConversationPageContent({
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
       ...(writableComposerMounted
-        ? { appendReviewNotesToComposer: handleSendFocusedNotes }
+        ? { appendReviewNotesToComposer: handleSendFocusedNotes, appendInlineReactionToComposer: appendDraftCb }
         : {}),
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
@@ -1821,6 +1822,7 @@ function ConversationPageContent({
     handleCancelSteering,
     handleOpenFileFromPatch,
     handleSendFocusedNotes,
+    appendDraftCb,
     writableComposerMounted,
     conversation?.worktree_path,
     conversation?.cwd,
@@ -2260,6 +2262,7 @@ function ConversationPageContent({
             workScopeKey={isArchived ? undefined : conversation.work_scope_key}
             enableMessageSidepanel={canOpenMessageSidepanel}
             enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
+            reactionDestination={writableComposerMounted ? { append: appendDraftCb } : undefined}
             conversationId={conversationId}
             slug={slug}
             systemPrompt={atom.systemPrompt ?? undefined}
