@@ -2082,6 +2082,34 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(coordinatorStore.receiptsByPersistenceScope.count, 1)
     }
 
+    func testPersistedMemberDiscoveryIncludesVisibleFailedV2OutboxWithoutMakingItDrainable() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let store = DiskConversationPersistenceStore(
+            baseDirectory: baseDirectory,
+            context: DiskStore.versionedContext(baseDirectory: baseDirectory))
+        var failed = makePendingOutboxEntry(conversationId: "row-failed")
+        failed.status = .failed
+        failed.lastError = "server rejected request"
+        let handle = store.outboxPersistence(
+            conversationId: "row-failed",
+            aggregateAuthority: "pc-1",
+            scope: defaultPersistenceScope)
+        let saved = await handle.save(
+            PersistedOutboxEnvelope(
+                scope: defaultPersistenceScope,
+                aggregateAuthority: "pc-1",
+                entries: [failed]),
+            revision: handle.reserveRevision())
+        XCTAssertTrue(saved)
+
+        let discovery = await store.persistedMemberDiscovery(
+            aggregateId: "pc-1", scope: defaultPersistenceScope)
+        let drainOwners = await store.pendingOutboxOwners(scope: defaultPersistenceScope)
+
+        XCTAssertEqual(discovery.persistedOutboxOwnerIds, ["row-failed"])
+        XCTAssertFalse(drainOwners.contains("row-failed"))
+    }
+
     func testLegacyCoordinatorIdentityImportsOnceIntoCurrentPersistenceScope() {
         let key = "phoenix.coordinatorConversationId"
         UserDefaults.standard.set("legacy-coordinator", forKey: key)

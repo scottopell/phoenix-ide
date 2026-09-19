@@ -436,7 +436,6 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                     envelope.aggregateAuthority == aggregateId,
                     envelope.entries.contains(where: {
                         $0.conversationId == conversationId && $0.isVisible
-                            && $0.status == .pending && !$0.acceptedByServer
                     })
                 else { return nil }
                 return conversationId
