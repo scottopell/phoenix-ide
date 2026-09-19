@@ -375,7 +375,7 @@ class PreparationTests(unittest.TestCase):
             (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
             release_commit = "abc123def456" + "0" * 28
             run.side_effect = [
-                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": False}), ""),
                 subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
@@ -451,7 +451,7 @@ class PreparationTests(unittest.TestCase):
             (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
             release_commit = "abc123def456" + "0" * 28
             run.side_effect = [
-                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": False}), ""),
                 subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
@@ -465,6 +465,19 @@ class PreparationTests(unittest.TestCase):
         )
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
 
+    def test_release_rejects_private_draft_before_download(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess(
+                     [], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": True}), ""
+                 ),
+             ) as run:
+            with self.assertRaisesRegex(SystemExit, "private drafts are not deployable"):
+                self.dev._prepare_release_candidate("v1.2.3", Path(td))
+        self.assertEqual("view", run.call_args.args[0][2])
+
     def test_release_rejects_asset_from_different_commit(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
@@ -475,7 +488,7 @@ class PreparationTests(unittest.TestCase):
             asset.write_bytes(b"release")
             (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
             run.side_effect = [
-                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": False}), ""),
                 subprocess.CompletedProcess([], 0, "abc123" + "0" * 34 + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
@@ -492,7 +505,7 @@ class PreparationTests(unittest.TestCase):
             asset.write_bytes(b"release")
             (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
             run.side_effect = [
-                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": False}), ""),
                 subprocess.CompletedProcess([], 0, "abc123def456" + "0" * 28 + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
@@ -555,7 +568,7 @@ class PreparationTests(unittest.TestCase):
             asset.write_bytes(b"release")
             (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
             run.side_effect = [
-                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False, "isDraft": False}), ""),
                 subprocess.CompletedProcess([], 0, "abc123" + "0" * 34 + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]

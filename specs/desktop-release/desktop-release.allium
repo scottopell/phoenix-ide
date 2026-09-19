@@ -163,6 +163,8 @@ surface DesktopReleaseWorkflow {
 -- desktop_signature_valid(pair) -> Boolean
 --   the outer app has the required hardened-runtime signature and passes strict
 --   complete-bundle verification.
+-- apple_notarization_accepted(pair) -> Boolean
+--   Apple returned terminal notary status Accepted for pair before stapling.
 -- notarization_ticket_and_gatekeeper_valid(pair) -> Boolean
 --   the stapled ticket validates and Gatekeeper accepts the app.
 -- exact_inaccessible_assets_and_digests(publication) -> Boolean
@@ -236,6 +238,7 @@ rule NotarizationRequiresVerifiedApp {
 rule AcceptedNotarizationRequiresAppleAcceptance {
     when: NotarizationAccepted(pair)
     requires: pair.notarization = submitted
+    requires: apple_notarization_accepted(pair)
     ensures: pair.notarization = accepted
 }
 

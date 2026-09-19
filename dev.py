@@ -9456,16 +9456,18 @@ def _prepare_release_candidate(
         raise SystemExit("controller mode requires an exact release tag, not 'latest'")
     if requested == "latest":
         view = subprocess.run(
-            ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
+            ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease,isDraft"],
             capture_output=True, text=True, check=True,
         )
     else:
         view = subprocess.run(
-            ["gh", "release", "view", requested, "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
+            ["gh", "release", "view", requested, "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease,isDraft"],
             capture_output=True, text=True, check=True,
         )
     release = json.loads(view.stdout)
     tag = release["tagName"]
+    if release.get("isDraft"):
+        raise SystemExit("release candidate must be public; private drafts are not deployable")
     if requested == "latest" and release.get("isPrerelease"):
         raise SystemExit("latest resolved to a prerelease; name an exact prerelease tag to opt in")
     if requested != "latest" and tag != requested:

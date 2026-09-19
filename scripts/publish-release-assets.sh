@@ -84,14 +84,14 @@ verify_tag() {
 published_release_metadata() {
   gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
   jq -ce --arg tag "$tag" \
-    '[.[][] | select(.draft == false and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end' \
+    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease == true) then error("stable release tag is already a prerelease") else [$matching[] | select(.draft == false)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end end' \
     "$release_inventory"
 }
 
 draft_release_metadata() {
   gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
   jq -ce --arg tag "$tag" \
-    '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end' \
+    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease == true) then error("stable release tag is already a prerelease") else [$matching[] | select(.draft == true)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end end' \
     "$release_inventory"
 }
 

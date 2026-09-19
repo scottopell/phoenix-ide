@@ -23,6 +23,7 @@ print(json.dumps({
     "id": 42,
     "tag_name": "v1.2.3",
     "draft": False,
+    "prerelease": False,
     "assets": [
         {
             "id": index,
@@ -81,6 +82,31 @@ set -e
 test "$status" -ne 0
 test "$status" -ne 3 || { echo "API failure must not be classified as release absence" >&2; exit 1; }
 unset FAKE_API_FAILURE
+
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["prerelease"] = True
+path.write_text(json.dumps(release))
+PY
+set +e
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -ne 0
+test "$status" -ne 3 || { echo "prerelease must be rejected, not classified as stable-release absence" >&2; exit 1; }
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["prerelease"] = False
+path.write_text(json.dumps(release))
+PY
 
 python3 - "$tmp/release.json" <<'PY'
 import json
