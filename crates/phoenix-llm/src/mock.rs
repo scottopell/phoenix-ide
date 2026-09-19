@@ -7,7 +7,8 @@
 //! Test-driver markers (parsed from the latest user message text):
 //! - `[[scenario:NAME]]` — force a specific scripted response
 //!   (`plain_text`, `markdown`, `mermaid`, `bash`, `read_file`, `think`,
-//!   `multi_tool`, `long`, `patch`, `spawn_agents`, `context_window_exceeded`).
+//!   `multi_tool`, `long`, `patch`, `present_svg`, `spawn_agents`, `context_window_exceeded`).
+//! - `[[svg_path:PATH]]` — absolute staging filename for `present_svg`.
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
 //! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
@@ -71,6 +72,9 @@ enum Scenario {
     /// overwrites `e2e-mock-patch-out.txt` in the conversation's cwd.
     /// Authored for E2E tests; see `[[scenario:patch]]` callers.
     PatchToolCall,
+    PresentSvg {
+        path: String,
+    },
     /// Marker-only (not in hash rotation): emits a `spawn_agents` `tool_use`
     /// that spawns two short read-only sub-agents on the mock model. Fires
     /// once per conversation (see `Scenario::from_message`); the follow-up
@@ -137,7 +141,7 @@ impl Scenario {
 /// forces selection of a specific scripted response, bypassing the hash-based
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
-/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `spawn_agents`,
+/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `present_svg`, `spawn_agents`,
 /// `context_window_exceeded`. Dev-only: mock is opt-in
 /// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
@@ -170,6 +174,12 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         "multi_tool" => Some(Scenario::MultiToolCall),
         "long" => Some(Scenario::LongStreaming),
         "patch" => Some(Scenario::PatchToolCall),
+        "present_svg" => {
+            let path = text.split_once("[[svg_path:")?.1.split_once("]]")?.0;
+            Some(Scenario::PresentSvg {
+                path: path.to_owned(),
+            })
+        }
         "spawn_agents" => Some(Scenario::SpawnAgents),
         "context_window_exceeded" => Some(Scenario::ContextWindowExceeded),
         _ => None,
@@ -637,6 +647,51 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
             )
         }
 
+        Scenario::PresentSvg { path } => {
+            let text = "I'll generate the chart with code and publish its snapshot.".to_owned();
+            let encoded_path = serde_json::to_string(path).expect("string JSON");
+            let command = format!(
+                r##"python3 - <<'PHOENIX_SVG_PY'
+from pathlib import Path
+import json
+output = Path(json.loads({encoded_path:?}))
+rows = [("Projects", 48), ("Caches", 24), ("Free space", 36)]
+parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400">']
+for index, (label, size) in enumerate(rows):
+    y = 70 + index * 110
+    color = "#609878" if label == "Free space" else "#3268a8"
+    if label == "Free space":
+        parts.append('<line x1="20" y1="260" x2="780" y2="260" stroke="#aaa"/>')
+    parts.append(f'<rect x="180" y="{{y}}" width="{{size * 10}}" height="40" fill="{{color}}"/>')
+    parts.append(f'<text x="20" y="{{y + 28}}" font-size="20">{{label}}</text>')
+    parts.append(f'<text x="{{200 + size * 10}}" y="{{y + 28}}" font-size="20">{{size}} GiB</text>')
+parts.append('</svg>')
+output.write_text(''.join(parts), encoding='utf-8')
+print(output)
+PHOENIX_SVG_PY"##
+            );
+            (
+                vec![
+                    ContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse {
+                        id: tool_use_id(),
+                        name: "bash".to_owned(),
+                        input: serde_json::json!({ "op": "run", "cmd": command }),
+                    },
+                    ContentBlock::ToolUse {
+                        id: tool_use_id(),
+                        name: "present_svg".to_owned(),
+                        input: serde_json::json!({
+                            "path": path,
+                            "title": "Measured disk usage",
+                            "description": "Directory sizes: Projects 48 GiB, Caches 24 GiB. Free space 36 GiB is separate."
+                        }),
+                    },
+                ],
+                text,
+            )
+        }
+
         Scenario::SpawnAgents => {
             let text =
                 "I'll spawn two read-only sub-agents to investigate in parallel.".to_string();
@@ -913,6 +968,12 @@ mod tests {
             ("[[scenario:multi_tool]]", Scenario::MultiToolCall),
             ("[[scenario:long]]", Scenario::LongStreaming),
             ("[[scenario:patch]]", Scenario::PatchToolCall),
+            (
+                "[[scenario:present_svg]] [[svg_path:/tmp/chart.svg]]",
+                Scenario::PresentSvg {
+                    path: "/tmp/chart.svg".to_owned(),
+                },
+            ),
             ("[[scenario:spawn_agents]]", Scenario::SpawnAgents),
             (
                 "[[scenario:context_window_exceeded]]",
