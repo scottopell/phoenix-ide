@@ -121,6 +121,7 @@ export function Sidebar({
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
@@ -364,6 +365,19 @@ export function Sidebar({
     }
   }, [productCloseTarget, productCloseSubmittingId, onConversationCreated, navigate]);
 
+  const handleProductDelete = useCallback(async () => {
+    if (!productDeleteTarget) return;
+    const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+    try {
+      if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
+      else await api.deleteChain(rootId);
+      setProductDeleteTarget(null);
+      notifyProductConversationListMayHaveChanged();
+    } catch (error) {
+      console.error('Failed to delete product conversation:', error);
+    }
+  }, [productDeleteTarget]);
+
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
   }, []);
@@ -557,6 +571,7 @@ export function Sidebar({
           onProductConversationClick={(row) => navigate(row.canonical_route)}
           onProductConversationRename={handleSetProductRenameTarget}
           onProductConversationClose={handleSetProductCloseTarget}
+          onProductConversationDelete={setProductDeleteTarget}
           activeSlug={activeSlug}
           sidebarMode
         />
@@ -582,6 +597,15 @@ export function Sidebar({
           ? { error: productCloseError.message }
           : {})}
         onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
+      />
+      <ConfirmDialog
+        visible={productDeleteTarget !== null}
+        title="Delete Product Conversation"
+        message="Permanently delete this product conversation and its transcript history? This cannot be undone."
+        confirmText="Delete"
+        danger
+        onConfirm={handleProductDelete}
+        onCancel={() => setProductDeleteTarget(null)}
       />
       <RenameDialog
         visible={productRenameTarget !== null}

@@ -66,6 +66,15 @@ export function ConversationListPage() {
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
   const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
   const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
+  const handleProductDelete = async () => {
+    if (!productDeleteTarget) return;
+    const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+    if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
+    else await api.deleteChain(rootId);
+    setProductDeleteTarget(null);
+    notifyProductConversationListMayHaveChanged();
+  };
+
   const visibleConversationCount = effectiveVisibleConversationCount({
     showArchived,
     productListError,
@@ -134,6 +143,7 @@ export function ConversationListPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
@@ -480,6 +490,7 @@ export function ConversationListPage() {
                 setProductCloseError(null);
                 setProductCloseTarget(row);
               } } : {})}
+              {...(isOnline ? { onProductConversationDelete: setProductDeleteTarget } : {})}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(
@@ -520,6 +531,15 @@ export function ConversationListPage() {
           ? { error: productCloseError.message }
           : {})}
         onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
+      />
+      <ConfirmDialog
+        visible={productDeleteTarget !== null}
+        title="Delete Product Conversation"
+        message="Permanently delete this product conversation and its transcript history? This cannot be undone."
+        confirmText="Delete"
+        danger
+        onConfirm={() => void handleProductDelete()}
+        onCancel={() => setProductDeleteTarget(null)}
       />
       <RenameDialog
         visible={productRenameTarget !== null}
