@@ -1,4 +1,4 @@
-# ADR-055: Inline reactions append without taking selection focus
+# ADR-056: Inline reactions append without taking selection focus
 
 - **Status:** Accepted
 - **Date:** 2026-09-19

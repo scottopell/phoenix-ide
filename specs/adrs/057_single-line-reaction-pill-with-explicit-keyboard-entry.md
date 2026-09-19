@@ -1,4 +1,4 @@
-# ADR-056: Single-line reaction pill with explicit keyboard entry
+# ADR-057: Single-line reaction pill with explicit keyboard entry
 
 - **Status:** Accepted
 - **Date:** 2026-09-19
@@ -10,7 +10,7 @@ User testing of the inline reaction fixture favored an always-small input over a
 
 ## Options considered
 
-- Retain the larger input from ADR-055 and require clicking it to type.
+- Retain the larger input from ADR-056 and require clicking it to type.
 - Automatically focus the input on selection, sacrificing native selection interaction.
 - Keep a single-line pill unfocused on selection and use explicit Enter to begin typing.
 
@@ -20,7 +20,7 @@ Choose explicit keyboard entry. Unmodified Enter focuses an anchored pill only w
 
 Keep unfinished text conversation-scoped outside virtualized rows. A docked preview returns to the source occurrence through production transcript navigation, reconstructs its selected range after mounting, and restores the pill. Manual return also restores it. Both presentations offer explicit dismissal with Keep/Discard confirmation.
 
-This refines ADR-055's input presentation and click-only entry while preserving its no-autofocus, native-selection, draft ownership, and append semantics.
+This refines ADR-056's input presentation and click-only entry while preserving its no-autofocus, native-selection, draft ownership, and append semantics.
 
 ## Consequences
 
