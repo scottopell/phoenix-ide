@@ -90,6 +90,12 @@ export type { ProductConversationCreationRecoveryResponse } from './generated/Pr
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
 import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
 
+export type { AutomaticContinuationAdmissionPhaseView as AutomaticContinuationAdmissionPhase } from './generated/AutomaticContinuationAdmissionPhaseView';
+export type { AutomaticContinuationAdmissionView as AutomaticContinuationAdmission } from './generated/AutomaticContinuationAdmissionView';
+export type { AutomaticContinuationAggregateView as AutomaticContinuationAggregate } from './generated/AutomaticContinuationAggregateView';
+export type { AutomaticContinuationView } from './generated/AutomaticContinuationView';
+import type { AutomaticContinuationView } from './generated/AutomaticContinuationView';
+
 export interface ConversationContentSearchHit {
   conversation_id: string;
   slug: string;
@@ -1699,6 +1705,41 @@ export const api = {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve product conversation route');
     }
+    return resp.json();
+  },
+
+  async getProductConversationAutomaticContinuation(reference: string): Promise<AutomaticContinuationView> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/automatic-continuation`);
+    if (!resp.ok) throw new Error('Failed to load automatic continuation setting');
+    return resp.json();
+  },
+
+  async updateProductConversationAutomaticContinuation(
+    reference: string,
+    enabled: boolean,
+  ): Promise<AutomaticContinuationView> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/automatic-continuation`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_continue_on_context_exhaustion: enabled }),
+    });
+    if (!resp.ok) throw new Error('Failed to save automatic continuation setting');
+    return resp.json();
+  },
+
+  async getCoordinatorAutomaticContinuation(): Promise<AutomaticContinuationView> {
+    const resp = await fetch('/api/global/coordinator/automatic-continuation');
+    if (!resp.ok) throw new Error('Failed to load automatic continuation setting');
+    return resp.json();
+  },
+
+  async updateCoordinatorAutomaticContinuation(enabled: boolean): Promise<AutomaticContinuationView> {
+    const resp = await fetch('/api/global/coordinator/automatic-continuation', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_continue_on_context_exhaustion: enabled }),
+    });
+    if (!resp.ok) throw new Error('Failed to save automatic continuation setting');
     return resp.json();
   },
 

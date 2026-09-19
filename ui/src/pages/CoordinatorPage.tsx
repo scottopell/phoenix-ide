@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 
@@ -23,6 +24,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   useEffect(() => {
     if (fixtureData) return;
     setLoading(true);
+    setResolvedCoordinatorId(null);
     let cancelled = false;
     api.ensureGlobalCoordinator()
       .then((coordinator) => {
@@ -37,8 +39,11 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
               if (cancelled) return;
-              if (coordinator_id) setResolvedCoordinatorId(slug);
-              else navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              if (coordinator_id === slug && slug === coordinator.conversation.id) {
+                setResolvedCoordinatorId(coordinator_id);
+              } else {
+                navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              }
             })
             .catch(() => {
               if (!cancelled) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
@@ -59,6 +64,12 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     <main className="coordinator-page">
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
+
+      {!loading && !error && resolvedCoordinatorId && slug === resolvedCoordinatorId && (
+        <div className="coordinator-page__automatic-continuation">
+          <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
+        </div>
+      )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (

@@ -127,6 +127,7 @@ pub fn create_router(state: AppState) -> Router {
 
     let router = router
         // Static assets (embedded or filesystem fallback)
+        .merge(crate::api::product_conversations::automatic_continuation_routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))
@@ -5396,12 +5397,26 @@ async fn cancel_steering_message(
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
+fn continuation_expansion_policy(
+    authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+) -> crate::send_chat_service::MessageExpansionPolicy {
+    match authority {
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        }
+        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        }
+    }
+}
+
 async fn dispatch_continuation_handoff(
     state: &AppState,
     intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {
     let parent_id = intent.parent_conversation_id.clone();
     let conversation_id = intent.successor_conversation_id.clone();
+    let expansion_policy = continuation_expansion_policy(intent.opening_authority);
     let dispatch = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
@@ -5413,7 +5428,7 @@ async fn dispatch_continuation_handoff(
         images: Vec::new(),
         files: Vec::new(),
         user_agent: intent.user_agent,
-        expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+        expansion_policy,
     })
     .await;
     match dispatch {
@@ -5480,6 +5495,26 @@ fn continuation_message_id(
     })
 }
 
+fn automatic_retry_intent_matches_admission(
+    admission: &crate::db::AutomaticContinuationAdmission,
+    intent: &crate::db::ContinuationDispatchIntent,
+) -> bool {
+    intent.message_id == admission.first_message_id
+}
+
+fn automatic_retry_phase_for_turn_state(
+    state: crate::send_chat_service::AutomaticRetryTurnState,
+    reserved_phase: phoenix_core::domain::product_conversation::AutomaticContinuationPhase,
+) -> Option<phoenix_core::domain::product_conversation::AutomaticContinuationPhase> {
+    match state {
+        crate::send_chat_service::AutomaticRetryTurnState::RearmedWithAdmission => None,
+        crate::send_chat_service::AutomaticRetryTurnState::AlreadyAccepted => Some(
+            phoenix_core::domain::product_conversation::AutomaticContinuationPhase::DispatchAccepted,
+        ),
+        crate::send_chat_service::AutomaticRetryTurnState::NoAcceptedTurn => Some(reserved_phase),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn continue_conversation(
     State(state): State<AppState>,
@@ -5493,18 +5528,95 @@ async fn continue_conversation(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
-    let message_id = continuation_message_id(req.message_id.clone())?;
+    let mut automatic_retry_phase = None;
+    let failed_admission = state
+        .runtime
+        .db()
+        .automatic_continuation_admission(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .filter(|admission| {
+            admission.phase
+                == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Failed
+        });
+    let (message_id, handoff, user_agent, opening_authority) = if let Some(admission) =
+        failed_admission
+    {
+        let summary = state
+            .runtime
+            .db()
+            .get_message_by_id_in_conversation(&id, &admission.summary_message_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let crate::db::MessageContent::Continuation(summary) = summary.content else {
+            return Err(AppError::Internal(
+                "automatic continuation summary has the wrong message type".to_string(),
+            ));
+        };
+        let mut retry_phase = admission.resume_phase;
+        if let Some(intent) = state
+            .runtime
+            .db()
+            .continuation_dispatch_intent(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            if retry_phase
+                == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Admitted
+            {
+                retry_phase = phoenix_core::domain::product_conversation::AutomaticContinuationPhase::SuccessorReserved;
+            }
+            if !automatic_retry_intent_matches_admission(&admission, &intent) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "a different continuation opening already won",
+                    "continuation_superseded",
+                ))));
+            }
+            let service = crate::send_chat_service::SendChatApplicationService::new(
+                state.runtime.db().clone(),
+                state.runtime.clone(),
+            );
+            let turn_state = service
+                .rearm_exact_terminal_turn(
+                    &id,
+                    &intent.successor_conversation_id,
+                    &admission.first_message_id,
+                    &summary.summary,
+                    intent.user_agent.clone(),
+                    crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            automatic_retry_phase = automatic_retry_phase_for_turn_state(turn_state, retry_phase);
+        } else {
+            automatic_retry_phase = Some(retry_phase);
+        }
+        (
+            admission.first_message_id,
+            summary.summary,
+            Some("phoenix-automatic-continuation".to_string()),
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        )
+    } else {
+        (
+            continuation_message_id(req.message_id.clone())?,
+            req.handoff,
+            req.user_agent,
+            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        )
+    };
 
     let (outcome, intent) = state
         .runtime
         .db()
         .continue_conversation_with_intent(
             &id,
-            crate::db::NewContinuationDispatchIntent::user_authorized(
+            crate::db::NewContinuationDispatchIntent {
                 message_id,
-                req.handoff,
-                req.user_agent,
-            ),
+                handoff,
+                user_agent,
+                opening_authority,
+            },
         )
         .await
         .map_err(|e| match e {
@@ -5528,6 +5640,15 @@ async fn continue_conversation(
             }
             other => AppError::Internal(other.to_string()),
         })?;
+
+    if let Some(retry_phase) = automatic_retry_phase {
+        state
+            .runtime
+            .db()
+            .retry_failed_automatic_continuation(&id, retry_phase)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    }
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
@@ -9331,6 +9452,83 @@ pub(crate) mod hard_delete_cascade_tests {
         fn model_id(&self) -> &str {
             "claude-sonnet-5"
         }
+    }
+
+    #[test]
+    fn automatic_retry_matches_persisted_identity_not_proposed_authority() {
+        use phoenix_core::domain::product_conversation::{
+            AutomaticContinuationPhase, ContinuationOpeningAuthority, ProductConversationId,
+        };
+        let admission = crate::db::AutomaticContinuationAdmission {
+            predecessor_conversation_id: "parent".to_string(),
+            product_conversation_id: ProductConversationId::new(),
+            summary_message_id: "summary".to_string(),
+            operation_id: "operation".to_string(),
+            first_message_id: phoenix_workflow::ClientTurnKey::try_from("opening").unwrap(),
+            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            phase: AutomaticContinuationPhase::Failed,
+            resume_phase: AutomaticContinuationPhase::SuccessorReserved,
+            no_progress_attempts: 5,
+            last_error: Some("failed".to_string()),
+            admitted_at_unix_micros: 1,
+            updated_at_unix_micros: 1,
+        };
+        let intent = crate::db::ContinuationDispatchIntent {
+            parent_conversation_id: "parent".to_string(),
+            successor_conversation_id: "successor".to_string(),
+            message_id: admission.first_message_id.clone(),
+            handoff: "summary".to_string(),
+            user_agent: None,
+            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        };
+
+        assert!(automatic_retry_intent_matches_admission(
+            &admission, &intent
+        ));
+    }
+
+    #[test]
+    fn automatic_retry_resumes_from_highest_durable_turn_phase() {
+        use crate::send_chat_service::AutomaticRetryTurnState;
+        use phoenix_core::domain::product_conversation::AutomaticContinuationPhase;
+
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::AlreadyAccepted,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            Some(AutomaticContinuationPhase::DispatchAccepted)
+        );
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::NoAcceptedTurn,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            Some(AutomaticContinuationPhase::SuccessorReserved)
+        );
+        assert_eq!(
+            automatic_retry_phase_for_turn_state(
+                AutomaticRetryTurnState::RearmedWithAdmission,
+                AutomaticContinuationPhase::SuccessorReserved,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn continuation_dispatch_preserves_persisted_opening_authority() {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        assert_eq!(
+            continuation_expansion_policy(ContinuationOpeningAuthority::UserAuthorizedInstruction),
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        );
+        assert_eq!(
+            continuation_expansion_policy(
+                ContinuationOpeningAuthority::GeneratedPredecessorContext
+            ),
+            crate::send_chat_service::MessageExpansionPolicy::GeneratedPredecessorContext
+        );
     }
 
     /// Construct a minimal `AppState` backed by an in-memory database.
