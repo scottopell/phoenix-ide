@@ -156,7 +156,7 @@ ADR-000 (adopt spEARS v2 for new work)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
       │           └── ADR-051 (Predecessor recall is bound to the executing transcript)
       ├── ADR-059 (Legacy FK787 Close retries use typed runtime reconciliation)
-      │   └── narrows ADR-054 under ADR-034 for one persisted compatibility shape
+      │   └── narrows ADR-058 under ADR-034 for one persisted compatibility shape
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)

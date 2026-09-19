@@ -4263,42 +4263,40 @@ fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
 
 #[cfg(target_os = "linux")]
 fn linux_writable_shared_mapping_path(
-    mapping: &str,
+    mapping: &[u8],
     canonical: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     use std::os::unix::ffi::OsStrExt;
 
     let mut fields = mapping
-        .splitn(6, char::is_whitespace)
+        .splitn(6, u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty());
     let _address = fields.next();
     let permissions = fields.next().unwrap_or_default();
     let _offset = fields.next();
     let _device = fields.next();
-    let _inode = fields.next();
-    let mapped_path = fields.next().unwrap_or_default().trim_start();
-    if mapped_path.as_bytes().ends_with(b" (deleted)") {
+    let inode = fields.next().unwrap_or_default();
+    let mut mapped_path = fields.next().unwrap_or_default();
+    while mapped_path.first().is_some_and(u8::is_ascii_whitespace) {
+        mapped_path = &mapped_path[1..];
+    }
+    if permissions.get(1) != Some(&b'w') || permissions.get(3) != Some(&b's') {
         return Ok(None);
     }
-    if permissions.as_bytes().get(1) != Some(&b'w') || permissions.as_bytes().get(3) != Some(&b's')
-    {
+    if inode == b"0" && mapped_path.ends_with(b" (deleted)") {
         return Ok(None);
     }
     let canonical_display = linux_procfs_display_path(canonical);
     if !path_is_within(
-        Path::new(std::ffi::OsStr::from_bytes(mapped_path.as_bytes())),
+        Path::new(std::ffi::OsStr::from_bytes(mapped_path)),
         Path::new(std::ffi::OsStr::from_bytes(&canonical_display)),
     ) {
         return Ok(None);
     }
-    if mapped_path
-        .as_bytes()
-        .windows(4)
-        .any(|bytes| bytes == b"\\012")
-    {
+    if mapped_path.windows(4).any(|bytes| bytes == b"\\012") {
         return Err("matching process mapping pathname has ambiguous procfs escaping".to_string());
     }
-    Ok(Some(mapped_path.to_string()))
+    Ok(Some(mapped_path.to_vec()))
 }
 
 #[cfg(target_os = "linux")]
@@ -4334,7 +4332,7 @@ fn linux_mapping_writer_evidence(
     process: &std::fs::DirEntry,
     before_incarnation: String,
     executable: &Path,
-    mapped_path: String,
+    mapped_path: Vec<u8>,
 ) -> Result<ExternalWriterEvidence, String> {
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -4349,7 +4347,7 @@ fn linux_mapping_writer_evidence(
             process_id,
             process_incarnation: before_incarnation,
             executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
-            matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
+            matched_path: GitPathIdentity::from_bytes(mapped_path),
             authority: AmbientWriterAuthority::WritableSharedMapping,
         },
     ))
@@ -4360,7 +4358,7 @@ fn linux_mapping_writer_evidence_if_stable(
     process: &std::fs::DirEntry,
     before_incarnation: &str,
     canonical: &Path,
-    mapped_path: String,
+    mapped_path: Vec<u8>,
 ) -> Result<Option<ExternalWriterEvidence>, String> {
     let process_path = process.path();
     let Some(executable) = linux_read_leaf_after_capture(
@@ -4384,15 +4382,15 @@ fn linux_mapping_writer_evidence_if_stable(
         &process_path,
         before_incarnation,
         AmbientWriterDiagnosticOperation::ReadMappings,
-        || std::fs::read_to_string(process_path.join("maps")),
+        || std::fs::read(process_path.join("maps")),
     )?
     else {
         return Ok(None);
     };
     let mut mapping_still_matches = false;
-    for current_mapping in current_mappings.lines() {
+    for current_mapping in current_mappings.split(|byte| *byte == b'\n') {
         if linux_writable_shared_mapping_path(current_mapping, canonical)?.as_deref()
-            == Some(mapped_path.as_str())
+            == Some(mapped_path.as_slice())
         {
             mapping_still_matches = true;
             break;
@@ -4466,12 +4464,12 @@ fn quarantine_has_writable_mappings_in(
             &process_path,
             &before_incarnation,
             AmbientWriterDiagnosticOperation::ReadMappings,
-            || std::fs::read_to_string(process_path.join("maps")),
+            || std::fs::read(process_path.join("maps")),
         )?
         else {
             continue;
         };
-        for mapping in mappings.lines() {
+        for mapping in mappings.split(|byte| *byte == b'\n') {
             let Some(mapped_path) = linux_writable_shared_mapping_path(mapping, &canonical)? else {
                 continue;
             };
@@ -9025,7 +9023,35 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deleted_writable_shared_mapping_is_not_live_path_authority() {
-        let mapping = "7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/quarantine/file (deleted)";
+        let mapping = b"7f000000-7f001000 rw-s 00000000 00:00 0 /tmp/quarantine/file (deleted)";
+        assert_eq!(
+            super::linux_writable_shared_mapping_path(
+                mapping,
+                std::path::Path::new("/tmp/quarantine"),
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_mapping_filename_ending_deleted_remains_authority() {
+        let mapping = b"7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/quarantine/file (deleted)";
+        assert_eq!(
+            super::linux_writable_shared_mapping_path(
+                mapping,
+                std::path::Path::new("/tmp/quarantine"),
+            )
+            .unwrap(),
+            Some(b"/tmp/quarantine/file (deleted)".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_mapping_outside_quarantine_is_ignored() {
+        let mapping = b"7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/outside/\xff";
         assert_eq!(
             super::linux_writable_shared_mapping_path(
                 mapping,
@@ -9042,7 +9068,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let canonical = Path::new(std::ffi::OsStr::from_bytes(b"/quarantine/line\nbreak"));
-        let mapping = "1000-2000 rw-s 0 00:00 0 /quarantine/line\\012break/file";
+        let mapping = b"1000-2000 rw-s 0 00:00 0 /quarantine/line\\012break/file";
         assert!(
             super::linux_writable_shared_mapping_path(mapping, canonical)
                 .unwrap_err()

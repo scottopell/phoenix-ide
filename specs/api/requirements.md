@@ -164,7 +164,7 @@ THE SYSTEM SHALL either resume retirement for that same exact attempt when safe
 OR SHALL return a typed conflict containing `attempt_id`, `active_transcript_id`, and a structured `recovery_action`
 AND the recovery action SHALL identify the exact retry-retirement method and route only when retry is permitted
 AND a persistence-evidence conflict SHALL additionally contain stable `failed_invariant` and `failed_relation` identifiers
-AND pre-feature `NeedsRepair` rows that do not carry typed evidence-conflict data SHALL return generic repair output rather than fabricated `failed_invariant` or `failed_relation` identifiers
+AND `NeedsRepair` rows that do not carry typed evidence-conflict data SHALL return generic repair output rather than fabricated `failed_invariant` or `failed_relation` identifiers
 AND the actionable response SHALL NOT expose or require parsing a raw storage-engine error code
 
 THE SYSTEM SHALL NOT expose `archive`, `unarchive`, `abandon`, or `mark_merged` as current ordinary lifecycle write operations

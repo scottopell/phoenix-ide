@@ -457,16 +457,15 @@ pub(crate) async fn confirm_close_loss_retirement(
             ))));
         }
     }
-    state
+    if let Err(error) = state
         .runtime
-        .retire_close_runtime_resources(attempt_id)
+        .retire_close_runtime_resources(attempt_id.clone())
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error,
-                "close_retirement_needs_repair",
-            )))
-        })?;
+    {
+        return Err(AppError::Conflict(Box::new(
+            close_retirement_conflict(&state.db, error, attempt_id.as_str(), &id).await?,
+        )));
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
