@@ -147,7 +147,8 @@ struct ConversationListView: View {
                                 Label("Delete", systemImage: "trash")
                             }
                             .disabled(!model.connectivity.isOnline)
-                        } else if !isCoordinator && conversation.product_close_action == .available {
+                        } else if !isCoordinator && conversation.product_close_action == .available
+                            && conversation.presentation_mode != "working" {
                             Button {
                                 Task { await model.closeProductConversation(conversation) }
                             } label: {
