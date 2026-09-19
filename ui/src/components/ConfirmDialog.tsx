@@ -8,6 +8,7 @@ interface ConfirmDialogProps {
   confirmText?: string;
   cancelText?: string;
   danger?: boolean;
+  error?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -19,6 +20,7 @@ export function ConfirmDialog({
   confirmText = 'Confirm',
   cancelText = 'Cancel',
   danger = false,
+  error,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -53,6 +55,7 @@ export function ConfirmDialog({
       >
         <h3>{title}</h3>
         <p className="confirm-message">{message}</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
         <div className="modal-actions">
           <button className="btn-secondary" onClick={onCancel} title={cancelText}>
             {cancelText}
