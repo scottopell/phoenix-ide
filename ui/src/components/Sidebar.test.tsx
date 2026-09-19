@@ -307,6 +307,38 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(queryByRole('button', { name: /Close product conversation/ })).toBeNull();
   });
 
+  it('keeps History Delete open with an error and gates duplicate submissions', async () => {
+    let rejectDelete!: (error: Error) => void;
+    apiMock.deleteChain.mockReturnValueOnce(new Promise((_, reject) => { rejectDelete = reject; }));
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-history', {
+        lifecycle: { state: 'history' },
+        canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
+        latest_transcript_row_id: 'history-latest',
+      })],
+    });
+
+    const { getByRole, findByText, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    const confirm = getByRole('button', { name: 'Delete' });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+
+    expect(apiMock.deleteChain).toHaveBeenCalledTimes(1);
+    expect(confirm).toBeDisabled();
+    rejectDelete(new Error('server refused deletion'));
+
+    expect(await findByText('server refused deletion')).toBeInTheDocument();
+    expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).not.toBeNull();
+    expect(getByRole('button', { name: 'Delete' })).not.toBeDisabled();
+  });
+
   it('publishes the successful authoritative title to the active aggregate snapshot', async () => {
     const renamed = makeProductConversation('pc-rename', {
       canonical_root: { transcript_row_id: 'root-rename', slug: 'old-product', title: 'New Product' },

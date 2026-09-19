@@ -125,6 +125,8 @@ export function Sidebar({
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
+  const [productDeleteSubmittingId, setProductDeleteSubmittingId] = useState<string | null>(null);
+  const [productDeleteError, setProductDeleteError] = useState<{ productId: string; message: string } | null>(null);
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
@@ -330,6 +332,11 @@ export function Sidebar({
     setProductCloseTarget(row);
   }, []);
 
+  const handleSetProductDeleteTarget = useCallback((row: ProductConversationListRow) => {
+    setProductDeleteError(null);
+    setProductDeleteTarget(row);
+  }, []);
+
   const handleProductClose = useCallback(async () => {
     if (!productCloseTarget) return;
     if (productCloseSubmittingId === productCloseTarget.product_conversation_id) return;
@@ -367,22 +374,33 @@ export function Sidebar({
 
   const handleProductDelete = useCallback(async () => {
     if (!productDeleteTarget) return;
+    const productId = productDeleteTarget.product_conversation_id;
+    if (productDeleteSubmittingId === productId) return;
     const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+    setProductDeleteSubmittingId(productId);
+    setProductDeleteError(null);
     try {
       if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
       else await api.deleteChain(rootId);
-      setProductDeleteTarget(null);
+      setProductDeleteTarget((current) =>
+        current?.product_conversation_id === productId ? null : current);
       notifyProductConversationListMayHaveChanged();
-      if (activeSlug === productDeleteTarget.product_conversation_id
+      if (activeSlug === productId
         || activeSlug === productDeleteTarget.canonical_root.slug
-        || activeSlug === productDeleteTarget.canonical_root.transcript_row_id
+        || activeSlug === rootId
         || activeSlug === productDeleteTarget.latest_transcript_row_id) {
         navigate('/');
       }
     } catch (error) {
+      setProductDeleteError({
+        productId,
+        message: error instanceof Error ? error.message : 'Failed to delete product conversation',
+      });
       console.error('Failed to delete product conversation:', error);
+    } finally {
+      setProductDeleteSubmittingId((current) => current === productId ? null : current);
     }
-  }, [productDeleteTarget, activeSlug, navigate]);
+  }, [productDeleteTarget, productDeleteSubmittingId, activeSlug, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -577,7 +595,7 @@ export function Sidebar({
           onProductConversationClick={(row) => navigate(row.canonical_route)}
           onProductConversationRename={handleSetProductRenameTarget}
           onProductConversationClose={handleSetProductCloseTarget}
-          onProductConversationDelete={setProductDeleteTarget}
+          onProductConversationDelete={handleSetProductDeleteTarget}
           activeSlug={activeSlug}
           sidebarMode
         />
@@ -611,7 +629,11 @@ export function Sidebar({
         confirmText="Delete"
         danger
         onConfirm={handleProductDelete}
-        onCancel={() => setProductDeleteTarget(null)}
+        submitting={productDeleteSubmittingId === productDeleteTarget?.product_conversation_id}
+        {...(productDeleteError && productDeleteError.productId === productDeleteTarget?.product_conversation_id
+          ? { error: productDeleteError.message }
+          : {})}
+        onCancel={() => { setProductDeleteTarget(null); setProductDeleteError(null); }}
       />
       <RenameDialog
         visible={productRenameTarget !== null}

@@ -279,6 +279,31 @@ struct StateDot: View {
     }
 }
 
+extension ProductConversationHandoff {
+    var displaySummary: String {
+        switch self {
+        case .completed(_, _, _, _, let summary),
+             .historical(_, _, _, let summary):
+            summary
+        }
+    }
+}
+
+private struct ProductHistoryHandoffView: View {
+    let handoff: ProductConversationHandoff
+
+    var body: some View {
+        Label {
+            Text(handoff.displaySummary)
+        } icon: {
+            Image(systemName: "arrow.down.right.circle")
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("productHistory.handoff")
+    }
+}
+
 private struct ProductHistoryView: View {
     @Environment(AppModel.self) private var model
     let productConversationId: String
@@ -292,6 +317,9 @@ private struct ProductHistoryView: View {
                     Section(segment.title ?? segment.slug ?? "Conversation") {
                         ForEach(segment.messages, id: \.id) { message in
                             MessageView(message: message)
+                        }
+                        if let handoff = segment.handoff {
+                            ProductHistoryHandoffView(handoff: handoff)
                         }
                     }
                 }
