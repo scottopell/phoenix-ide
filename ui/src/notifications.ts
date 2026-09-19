@@ -211,8 +211,9 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_inspection_failed',
     'close_retirement_needs_repair',
     'stale_close_inspection',
+    'inactive_close_transcript',
   ].includes(error.detail.error_type)) return null;
-  const target = closeRecoveryGuidance(error)?.activeTranscriptId ?? conversationId;
+  const target = error.detail.active_transcript_id ?? conversationId;
   notifyCloseSnapshotChanged(target);
   notifyProductConversationListMayHaveChanged();
   return target;

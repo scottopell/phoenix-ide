@@ -165,6 +165,11 @@ describe('archive close conflict notifications', () => {
         error_type,
       }))).toBe('conv-1');
     }
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'inactive Close transcript',
+      error_type: 'inactive_close_transcript',
+      active_transcript_id: 'active-2',
+    }))).toBe('active-2');
     expect(closeListener).toHaveBeenCalledTimes(6);
 
     vi.runAllTimers();
