@@ -355,12 +355,12 @@ final class AppModel {
             lastActionError = "Closing needs a connection — it can't be queued."
             return false
         }
-        closeActionGeneration += 1
-        let startedCloseActionGeneration = closeActionGeneration
         guard closingProductConversationIds.insert(conversation.aggregateIdentity).inserted else {
             return false
         }
         defer { closingProductConversationIds.remove(conversation.aggregateIdentity) }
+        closeActionGeneration += 1
+        let startedCloseActionGeneration = closeActionGeneration
         let hasInMemoryMessages = transcriptIds.contains {
             sessions[$0]?.outbox.visibleEntries.isEmpty == false
         }
@@ -400,11 +400,10 @@ final class AppModel {
             closed = true
             for (transcriptId, session) in aggregateSessions {
                 session.stop()
-                await session.clearCachedSnapshotAndWait()
-                await session.outbox.clearAndWait()
-                sessions[transcriptId] = nil
+                if sessions[transcriptId] === session {
+                    sessions[transcriptId] = nil
+                }
             }
-            guard apiGeneration == startedGeneration else { return false }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
             UNUserNotificationCenter.current().removeDeliveredNotifications(
                 withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
