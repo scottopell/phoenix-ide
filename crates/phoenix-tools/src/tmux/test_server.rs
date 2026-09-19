@@ -3858,8 +3858,18 @@ mod tests {
         let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
         let task = tokio::spawn(adopted.commit_publication());
-        while !acknowledged.exists() {
-            tokio::task::yield_now().await;
+        if tokio::time::timeout(Duration::from_secs(120), async {
+            while !acknowledged.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+            owner.shutdown();
+            panic!("publication hook was not acknowledged");
         }
         task.abort();
         let _ = task.await;
