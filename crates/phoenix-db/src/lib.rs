@@ -6659,10 +6659,30 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<Option<AutomaticContinuationAdmission>> {
         let predecessor: Option<String> = sqlx::query_scalar(
-            "SELECT predecessor_conversation_id
-             FROM automatic_continuation_admissions
-             WHERE product_conversation_id = ?1
-             ORDER BY admitted_at_unix_micros DESC, predecessor_conversation_id DESC
+            "WITH RECURSIVE transcript(id, ordinal) AS (
+                 SELECT conversation.id, 0
+                 FROM conversations AS conversation
+                 WHERE conversation.product_conversation_id = ?1
+                   AND conversation.parent_conversation_id IS NULL
+                   AND conversation.runtime_role = 'user'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations AS candidate
+                       WHERE candidate.continued_in_conv_id = conversation.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, transcript.ordinal + 1
+                 FROM transcript
+                 JOIN conversations AS predecessor ON predecessor.id = transcript.id
+                 JOIN conversations AS successor ON successor.id = predecessor.continued_in_conv_id
+                 WHERE successor.product_conversation_id = ?1
+                   AND successor.parent_conversation_id IS NULL
+                   AND successor.runtime_role = 'user'
+             )
+             SELECT admission.predecessor_conversation_id
+             FROM transcript
+             JOIN automatic_continuation_admissions AS admission
+               ON admission.predecessor_conversation_id = transcript.id
+             ORDER BY transcript.ordinal DESC
              LIMIT 1",
         )
         .bind(product_conversation_id.as_str())
@@ -6718,7 +6738,7 @@ impl Database {
                  last_error = NULL,
                  updated_at_unix_micros = ?4
              WHERE predecessor_conversation_id = ?1
-               AND phase NOT IN ('message_settled', 'superseded', 'failed')
+               AND phase NOT IN ('message_settled', 'superseded')
                AND EXISTS(
                    SELECT 1 FROM completed_continuation_handoffs
                    WHERE predecessor_conversation_id = ?1

@@ -47,6 +47,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     setFeedback(null);
     savePending.current = false;
     setFailedValue(null);
+    setRetrying(false);
     const refresh = (initial: boolean) => {
       if (refreshPending || savePending.current) return;
       refreshPending = true;
@@ -109,6 +110,8 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const retryFailedAdmission = useCallback(async () => {
     const admission = view?.admission;
     if (!admission?.actionable_failure) return;
+    const generation = requestGeneration.current;
+    const authorityLabel = admission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated' : 'manual';
     setRetrying(true);
     setFeedback(null);
     try {
@@ -120,13 +123,17 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         },
       );
       if (response.status === 'dispatch_failed') {
-        throw new Error(response.error ?? 'Failed to retry generated handoff');
+        throw new Error(response.error ?? `Failed to retry ${authorityLabel} handoff`);
       }
-      setFeedback('Generated handoff retry accepted');
+      if (requestGeneration.current === generation) {
+        setFeedback(`${authorityLabel === 'generated' ? 'Generated' : 'Manual'} handoff retry accepted`);
+      }
     } catch (error) {
-      setFeedback(errorMessage(error, 'Failed to retry generated handoff'));
+      if (requestGeneration.current === generation) {
+        setFeedback(errorMessage(error, `Failed to retry ${authorityLabel} handoff`));
+      }
     } finally {
-      setRetrying(false);
+      if (requestGeneration.current === generation) setRetrying(false);
     }
   }, [view]);
 

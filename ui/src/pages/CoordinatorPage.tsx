@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
@@ -17,6 +17,8 @@ interface CoordinatorPageFixtureData {
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const { slug } = useParams<{ slug: string }>();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
@@ -37,7 +39,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         }));
         if (!slug || slug === coordinator.conversation.id) {
           setResolvedCoordinatorId(coordinator.conversation.id);
-          if (!slug) navigate(`/global/${coordinator.conversation.id}${location.search}${location.hash}`, { replace: true });
+          if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else {
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
@@ -45,11 +47,11 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
               if (coordinator_id) {
                 setResolvedCoordinatorId(slug);
               } else {
-                navigate(`/global/${coordinator.conversation.id}${location.search}${location.hash}`, { replace: true });
+                navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
               }
             })
             .catch(() => {
-              if (!cancelled) navigate(`/global/${coordinator.conversation.id}${location.search}${location.hash}`, { replace: true });
+              if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
             });
         }
         setError(null);
@@ -61,7 +63,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, location.hash, location.search, navigate, slug]);
+  }, [fixtureData, navigate, slug]);
 
   return (
     <main className="coordinator-page">
