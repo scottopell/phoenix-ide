@@ -154,18 +154,18 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .awaitingUserResponse(let questions):
+        case .awaitingUserResponse(let questions, let toolUseId):
             if questions.isEmpty {
-                emptyQuestionCard
+                emptyQuestionCard(toolUseId: toolUseId)
             } else {
                 QuestionCardBody(
                     questions: questions,
                     isOnline: isOnline,
                     acceptsActions: acceptsActions,
                     busy: busy,
-                    onAnswer: { onAction(.respondToQuestions(answers: $0)) },
-                    onDismiss: { onAction(.dismissQuestion) })
-                    .id(questions)
+                    onAnswer: { onAction(.respondToQuestions(toolUseId: toolUseId, answers: $0)) },
+                    onDismiss: { onAction(.dismissQuestion(toolUseId: toolUseId)) })
+                    .id(toolUseId)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
@@ -302,7 +302,7 @@ struct StateDetailBody: View {
             onDismiss: { onAction(.dismissError) })
     }
 
-    private var emptyQuestionCard: some View {
+    private func emptyQuestionCard(toolUseId: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("The agent is waiting for a response", systemImage: "questionmark.bubble")
                 .font(.callout.bold())
@@ -338,7 +338,7 @@ struct StateDetailBody: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                onAction(.dismissQuestion)
+                onAction(.dismissQuestion(toolUseId: toolUseId))
             }
         }
     }

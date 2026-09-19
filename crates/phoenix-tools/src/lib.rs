@@ -1003,6 +1003,10 @@ impl ToolRegistry {
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
         tools.append(&mut global_read_tools);
+        debug_assert!(
+            tools.iter().any(|tool| tool.name() == "ask_user_question"),
+            "authenticated Coordinator registry must include existing AUQ capability"
+        );
         Self { tools }
     }
 
@@ -1551,6 +1555,24 @@ mod tests {
                 "Explore-no-sandbox should not have {tool}"
             );
         }
+
+        let coordinator = names(&ToolRegistry::coordinator(vec![Arc::new(
+            AskUserQuestionTool,
+        )]));
+        assert!(coordinator.contains("think"));
+        assert!(coordinator.contains("ask_user_question"));
+        assert!(!coordinator.contains("spawn_agents"));
+        assert!(!coordinator.contains("propose_task"));
+        assert!(!coordinator.contains("patch"));
+        assert!(!coordinator.contains("tmux_run"));
+        assert!(!coordinator.contains("submit_result"));
+        let coordinator_definitions =
+            ToolRegistry::coordinator(vec![Arc::new(AskUserQuestionTool)]).definitions();
+        let coordinator_auq = coordinator_definitions
+            .iter()
+            .find(|definition| definition.name == "ask_user_question")
+            .expect("Coordinator registry includes AUQ");
+        assert!(coordinator_auq.defer_loading);
 
         // Sub-agent Explore with sandbox: read-only + sandboxed bash + submit.
         // no ask_user, no propose_task, no parent-terminal tools.

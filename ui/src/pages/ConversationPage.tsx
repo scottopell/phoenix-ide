@@ -2550,8 +2550,10 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
+          key={convStateForChildren.tool_use_id ?? ''}
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
+          toolUseId={convStateForChildren.tool_use_id ?? ''}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}

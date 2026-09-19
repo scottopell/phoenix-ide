@@ -234,19 +234,20 @@ class PhoenixClient:
         return resp.json().get('hits', [])
 
 
-    def respond_to_question(self, conv_id: str, answers: dict[str, str]) -> dict:
+    def respond_to_question(self, conv_id: str, tool_use_id: str, answers: dict[str, str]) -> dict:
         """Answer a pending user question (AwaitingUserResponse state)."""
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/respond",
-            json={"answers": answers},
+            json={"tool_use_id": tool_use_id, "answers": answers},
         )
         resp.raise_for_status()
         return resp.json()
 
-    def dismiss_question(self, conv_id: str) -> dict:
+    def dismiss_question(self, conv_id: str, tool_use_id: str) -> dict:
         """Dismiss a pending user question without answering."""
         resp = self.http.post(
-            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question"
+            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question",
+            json={"tool_use_id": tool_use_id},
         )
         resp.raise_for_status()
         return resp.json()
@@ -770,6 +771,20 @@ def print_search_hits(hits: list[dict]) -> None:
         if prov:
             prov += ']'
         click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{prov}{archived}")
+
+
+def _pending_question_tool_use_id(state: object) -> str:
+    if not isinstance(state, dict):
+        raise click.UsageError("Conversation is not awaiting a structured question.")
+    state_kind = state.get('type') or state.get('kind') or ''
+    if state_kind != 'awaiting_user_response':
+        raise click.UsageError("Conversation is not awaiting a structured question.")
+    tool_use_id = state.get('tool_use_id')
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        raise click.UsageError(
+            "Pending question is missing tool_use_id; refresh the conversation before answering."
+        )
+    return tool_use_id
 
 
 def print_diff(diff: dict) -> None:
@@ -1334,11 +1349,13 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                         f"left unanswered: {', '.join(repr(q) for q in sorted(unanswered))}. "
                         f"The server irreversibly skips unanswered questions."
                     )
-            client.respond_to_question(conv['id'], answers)
+            tool_use_id = _pending_question_tool_use_id(conv.get('state'))
+            client.respond_to_question(conv['id'], tool_use_id, answers)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_question:
-            client.dismiss_question(conv['id'])
+            tool_use_id = _pending_question_tool_use_id(conv.get('state'))
+            client.dismiss_question(conv['id'], tool_use_id)
             click.echo(f"Dismissed question for {conv.get('slug', conv['id'])}.")
             return
         if dismiss_error:
