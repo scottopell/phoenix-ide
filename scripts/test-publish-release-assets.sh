@@ -64,6 +64,7 @@ def api_release(release):
         "id": release["id"],
         "tag_name": release["tag_name"],
         "draft": release["draft"],
+        "prerelease": release.get("prerelease", False),
         "upload_url": "repos/owner/repo/releases/42/assets{?name,label}",
         "assets": [
             {"id": asset["id"], "name": asset["name"], "digest": digest(asset)}
