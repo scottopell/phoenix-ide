@@ -8400,24 +8400,24 @@ mod scope_liveness_tests {
                 .find(|resource| resource.scope == scope && resource.resource.kind() == kind)
                 .unwrap()
                 .resource;
+            manager
+                .db()
+                .record_close_retirement_dispatch(
+                    phoenix_db::RecordCloseRetirementDispatchRequest {
+                        attempt_id: attempt_id.clone(),
+                        scope: scope.clone(),
+                        snapshot: retry_snapshot.clone(),
+                        resource: resource.clone(),
+                    },
+                )
+                .await
+                .unwrap();
             let outcome = if kind == phoenix_core::domain::close::RetiredResourceKind::Worktree {
                 phoenix_core::domain::close::RetirementOutcome::AbsenceAdopted {
                     absence_basis:
                         phoenix_core::domain::close::AbsenceBasis::SameAttemptPriorRetirement,
                 }
             } else {
-                manager
-                    .db()
-                    .record_close_retirement_dispatch(
-                        phoenix_db::RecordCloseRetirementDispatchRequest {
-                            attempt_id: attempt_id.clone(),
-                            scope: scope.clone(),
-                            snapshot: retry_snapshot.clone(),
-                            resource: resource.clone(),
-                        },
-                    )
-                    .await
-                    .unwrap();
                 phoenix_core::domain::close::RetirementOutcome::Retired
             };
             manager

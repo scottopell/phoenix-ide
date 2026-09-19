@@ -834,8 +834,7 @@ fn close_needs_repair_conflict(
             }
         }
         Some(phoenix_db::CloseNeedsRepairCause::AmbientWriterIndeterminate(cause)) => {
-            let diagnostic = crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic::from_durable_cause(&cause)
-                .expect("database constrains durable ambient-writer diagnostic identifiers");
+            let diagnostic = crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic::from_durable_cause(&cause);
             CloseRetirementError::Message(diagnostic.marker())
         }
         None => CloseRetirementError::Message(

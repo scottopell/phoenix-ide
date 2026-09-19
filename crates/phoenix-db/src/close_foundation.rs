@@ -791,6 +791,19 @@ impl AmbientWriterIndeterminateCause {
     pub fn error_kind(&self) -> &str {
         self.error_kind.as_str()
     }
+
+    /// Decodes one schema-constrained durable diagnostic.
+    ///
+    /// # Errors
+    /// Returns a serialization error when persisted identifiers are outside the closed domain.
+    pub fn from_persisted(detector: &str, operation: &str, error_kind: &str) -> DbResult<Self> {
+        Self::new(
+            detector.to_string(),
+            operation.to_string(),
+            error_kind.to_string(),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

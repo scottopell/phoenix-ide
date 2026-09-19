@@ -2930,23 +2930,21 @@ impl AmbientWriterIndeterminateDiagnostic {
         .expect("diagnostic identifiers are non-empty")
     }
 
-    pub(crate) fn from_durable_cause(
-        cause: &crate::db::AmbientWriterIndeterminateCause,
-    ) -> Option<Self> {
-        Some(Self {
+    pub(crate) fn from_durable_cause(cause: &crate::db::AmbientWriterIndeterminateCause) -> Self {
+        Self {
             detector: serde_json::from_value(serde_json::Value::String(
                 cause.detector().to_string(),
             ))
-            .ok()?,
+            .expect("durable diagnostic constructor validates detector literals"),
             operation: serde_json::from_value(serde_json::Value::String(
                 cause.operation().to_string(),
             ))
-            .ok()?,
+            .expect("durable diagnostic constructor validates operation literals"),
             error_kind: serde_json::from_value(serde_json::Value::String(
                 cause.error_kind().to_string(),
             ))
-            .ok()?,
-        })
+            .expect("durable diagnostic constructor validates error-kind literals"),
+        }
     }
 }
 
