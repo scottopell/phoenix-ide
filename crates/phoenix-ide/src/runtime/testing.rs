@@ -549,9 +549,13 @@ pub struct MaterializeAuthoritativeUserMessageCall {
     pub now: Timestamp,
 }
 
+type StoredSvgArtifacts =
+    HashMap<(String, String), (crate::tools::present_svg::SvgArtifactReference, Vec<u8>)>;
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    svg_artifacts: Mutex<StoredSvgArtifacts>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -622,6 +626,7 @@ pub struct InMemoryStorage {
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
+            svg_artifacts: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2405,6 +2410,48 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[async_trait]
+impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
+        Ok(self
+            .svg_artifacts
+            .lock()
+            .unwrap()
+            .get(&(conversation_id.to_string(), tool_use_id.to_string()))
+            .map(|(reference, _)| reference.clone()))
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
+        use crate::tools::present_svg::{SvgArtifactReference, SvgValidationOutcome};
+        let mut artifacts = self.svg_artifacts.lock().unwrap();
+        let (reference, _) = artifacts
+            .entry((conversation_id.to_string(), tool_use_id.to_string()))
+            .or_insert_with(|| {
+                (
+                    SvgArtifactReference {
+                        artifact_id: uuid::Uuid::new_v4().to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        title: draft.title,
+                        description: draft.description,
+                        width: draft.svg.width(),
+                        height: draft.svg.height(),
+                        validation: SvgValidationOutcome::AcceptedStaticSvg,
+                    },
+                    draft.svg.into_bytes(),
+                )
+            });
+        Ok(reference.clone())
+    }
+}
 
 #[cfg(test)]
 mod tests {

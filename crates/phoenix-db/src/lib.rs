@@ -7,6 +7,8 @@ mod coordinator_query;
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;
+mod svg_artifacts;
+pub use svg_artifacts::SvgArtifact;
 mod migrations;
 mod product_creation;
 pub use product_creation::*;

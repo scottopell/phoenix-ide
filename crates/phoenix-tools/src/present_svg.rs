@@ -1,0 +1,467 @@
+pub mod validation;
+
+use super::{Tool, ToolContext, ToolExecutionEnvironment, ToolOutput};
+use async_trait::async_trait;
+use phoenix_core::domain::sm_state::PresentSvgInput;
+use phoenix_core::work_scope::ResourceAuthority;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
+
+pub const MAX_TITLE_CHARS: usize = 200;
+pub const MAX_DESCRIPTION_CHARS: usize = 2000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SvgArtifactReference {
+    pub artifact_id: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub description: String,
+    pub width: f64,
+    pub height: f64,
+    pub validation: SvgValidationOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SvgValidationOutcome {
+    AcceptedStaticSvg,
+}
+
+pub struct SvgArtifactDraft {
+    pub title: String,
+    pub description: String,
+    pub svg: validation::ValidatedSvg,
+}
+
+#[async_trait]
+pub trait SvgArtifactStore: Send + Sync {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<Option<SvgArtifactReference>, String>;
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        draft: SvgArtifactDraft,
+    ) -> Result<SvgArtifactReference, String>;
+}
+
+#[async_trait]
+impl<T: SvgArtifactStore + ?Sized> SvgArtifactStore for Arc<T> {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<Option<SvgArtifactReference>, String> {
+        (**self).lookup(conversation_id, tool_use_id).await
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        draft: SvgArtifactDraft,
+    ) -> Result<SvgArtifactReference, String> {
+        (**self).publish(conversation_id, tool_use_id, draft).await
+    }
+}
+
+pub struct PresentSvgTool;
+
+fn failure(category: &str, message: &str) -> ToolOutput {
+    ToolOutput::error(format!("present_svg {category}: {message}"))
+}
+
+fn reference_output(reference: &SvgArtifactReference) -> ToolOutput {
+    match serde_json::to_string(reference) {
+        Ok(output) => ToolOutput::success(output),
+        Err(_) => failure(
+            "persistence_failure",
+            "Could not encode the published reference.",
+        ),
+    }
+}
+
+fn valid_text(value: &str, max: usize) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
+}
+
+fn read_regular_file(path: &Path) -> Result<Vec<u8>, (&'static str, &'static str)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|_| {
+        (
+            "read_failure",
+            "Cannot open source. Use a readable regular file, not a symlink.",
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ("read_failure", "Cannot inspect opened source."))?;
+    if !metadata.is_file() {
+        return Err((
+            "invalid_input",
+            "Source must be a regular file, not a directory, device, or pipe.",
+        ));
+    }
+    if metadata.len() > validation::MAX_BYTES as u64 {
+        return Err(("limit", "SVG exceeds the 2 MiB byte limit."));
+    }
+    let mut bytes = Vec::new();
+    file.take(validation::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ("read_failure", "Could not read source bytes."))?;
+    if bytes.len() > validation::MAX_BYTES {
+        return Err(("limit", "SVG exceeds the 2 MiB byte limit."));
+    }
+    Ok(bytes)
+}
+
+#[async_trait]
+impl Tool for PresentSvgTool {
+    fn name(&self) -> &'static str {
+        "present_svg"
+    }
+
+    fn description(&self) -> String {
+        "Publish a static SVG file as a durable inline visual for the user. Generate SVG with code or chart libraries, then pass its resolved absolute SERVER filename; never paste markup into arguments. Direct/Work only. Stage with artifact_dir=$(mktemp -d \"${TMPDIR:-/tmp}/phoenix-svg.XXXXXX\"); print the generated filename and call present_svg separately. Delete staging only after success (this tool leaves it intact). Max 2 MiB, title 200 characters, description 2000; both nonempty plain text. Static shapes/text, safe styling, local glyph/use/clip/gradient references only; no DOCTYPE, scripts, links, animation, embedded HTML, images or external resources. Library output must omit DOCTYPE/metadata. Max 20,000 elements, depth 64, 100,000 attributes/path segments, 10,000 references, 500,000 expanded complexity; dimensions <=16,384 px and area <=64 million px. Validation is not visual inspection. Success returns a compact reference, never SVG bytes. Revisions require another invocation.".into()
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type":"object", "additionalProperties":false,
+        "required":["path","title","description"], "properties":{
+            "path":{"type":"string","maxLength":4096,"description":"Resolved absolute server filename. No ~ or shell-variable expansion."},
+            "title":{"type":"string","minLength":1,"maxLength":MAX_TITLE_CHARS},
+            "description":{"type":"string","minLength":1,"maxLength":MAX_DESCRIPTION_CHARS,"description":"Plain-text accessible description of what the visual communicates."}
+        }})
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        if !matches!(
+            ctx.execution_environment,
+            ToolExecutionEnvironment::Filesystem(_)
+        ) || ctx.resource_access.authority() != ResourceAuthority::Work
+        {
+            return failure(
+                "policy_rejection",
+                "Publication requires Direct or Work filesystem authority; Explore is unsupported.",
+            );
+        }
+        let Some(store) = &ctx.svg_artifact_store else {
+            return failure(
+                "persistence_failure",
+                "Durable publication is unavailable in this execution context.",
+            );
+        };
+        let Some(tool_use_id) = ctx.tool_use_id() else {
+            return failure(
+                "persistence_failure",
+                "Invocation identity is missing; retry through the conversation runtime.",
+            );
+        };
+        match store.lookup(&ctx.conversation_id, tool_use_id).await {
+            Ok(Some(reference)) => return reference_output(&reference),
+            Ok(None) => {}
+            Err(_) => {
+                return failure(
+                    "persistence_failure",
+                    "Could not check durable publication identity; retry later.",
+                )
+            }
+        }
+        let Ok(input) = serde_json::from_value::<PresentSvgInput>(input) else {
+            return failure(
+                "invalid_input",
+                "Provide path, title, and description as strings.",
+            );
+        };
+        if !Path::new(&input.path).is_absolute()
+            || input.path.len() > 4096
+            || input.path.contains('\0')
+        {
+            return failure("invalid_input", "Use a resolved absolute server filename of at most 4096 bytes; shell expressions are not expanded.");
+        }
+        if !valid_text(&input.title, MAX_TITLE_CHARS)
+            || !valid_text(&input.description, MAX_DESCRIPTION_CHARS)
+        {
+            return failure("invalid_input", "Title and description must be nonempty plain text without control characters, at most 200 and 2000 characters respectively.");
+        }
+        if ctx.cancel.is_cancelled() {
+            return failure("cancelled", "Publication cancelled before reading.");
+        }
+        let path = input.path;
+        let validated = tokio::task::spawn_blocking(move || {
+            let bytes = read_regular_file(Path::new(&path))?;
+            validation::validate(&bytes).map_err(|error| {
+                let category = match error.category {
+                    validation::ValidationCategory::InvalidInput => "invalid_input",
+                    validation::ValidationCategory::Policy => "policy_rejection",
+                    validation::ValidationCategory::Limit => "limit",
+                };
+                (category, error.message)
+            })
+        })
+        .await;
+        let svg = match validated {
+            Ok(Ok(svg)) => svg,
+            Ok(Err((category, message))) => return failure(category, message),
+            Err(_) => return failure("read_failure", "Source validation could not complete."),
+        };
+        if ctx.cancel.is_cancelled() {
+            return failure("cancelled", "Publication cancelled before persistence.");
+        }
+        match store
+            .publish(
+                &ctx.conversation_id,
+                tool_use_id,
+                SvgArtifactDraft {
+                    title: input.title,
+                    description: input.description,
+                    svg,
+                },
+            )
+            .await
+        {
+            Ok(reference) => reference_output(&reference),
+            Err(_) => failure(
+                "persistence_failure",
+                "Could not commit SVG snapshot and ownership; retry later.",
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    type StoredArtifacts = HashMap<(String, String), (SvgArtifactReference, Vec<u8>)>;
+    #[derive(Default)]
+    struct Store(Mutex<StoredArtifacts>);
+    #[async_trait]
+    impl SvgArtifactStore for Store {
+        async fn lookup(
+            &self,
+            conversation_id: &str,
+            tool_use_id: &str,
+        ) -> Result<Option<SvgArtifactReference>, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(conversation_id.into(), tool_use_id.into()))
+                .map(|(r, _)| r.clone()))
+        }
+        async fn publish(
+            &self,
+            conversation_id: &str,
+            tool_use_id: &str,
+            draft: SvgArtifactDraft,
+        ) -> Result<SvgArtifactReference, String> {
+            let mut entries = self.0.lock().unwrap();
+            let entry = entries
+                .entry((conversation_id.into(), tool_use_id.into()))
+                .or_insert_with(|| {
+                    (
+                        SvgArtifactReference {
+                            artifact_id: uuid::Uuid::new_v4().to_string(),
+                            conversation_id: conversation_id.into(),
+                            title: draft.title,
+                            description: draft.description,
+                            width: draft.svg.width(),
+                            height: draft.svg.height(),
+                            validation: SvgValidationOutcome::AcceptedStaticSvg,
+                        },
+                        draft.svg.into_bytes(),
+                    )
+                });
+            Ok(entry.0.clone())
+        }
+    }
+    fn context(store: Arc<dyn SvgArtifactStore>, id: &str) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "owner".into(),
+            std::env::temp_dir(),
+            Arc::new(crate::BrowserSessionManager::default()),
+            Arc::new(crate::BashHandleRegistry::new()),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("svg-test").unwrap(),
+        )
+        .with_tool_use_id(id)
+        .with_svg_artifact_store(store)
+    }
+    fn input(path: &Path) -> Value {
+        json!({"path":path,"title":"Disk usage","description":"Measured directory sizes in GiB"})
+    }
+    const SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='80' height='20'/></svg>";
+
+    #[tokio::test]
+    async fn replay_retains_snapshot_after_source_deleted() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), SVG).unwrap();
+        let store = Arc::new(Store::default());
+        let ctx = context(store.clone(), "first");
+        let args = input(file.path());
+        let first = PresentSvgTool.run(args.clone(), ctx.clone()).await;
+        assert!(first.is_success(), "{}", first.output());
+        assert!(!first.output().contains("<svg"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), SVG);
+        file.close().unwrap();
+        let replay = PresentSvgTool.run(args, ctx).await;
+        assert_eq!(first.output(), replay.output());
+        let entries = store.0.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.values().next().unwrap().1, SVG.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn invalid_inputs_and_cancel_do_not_publish() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), SVG).unwrap();
+        let store = Arc::new(Store::default());
+        for args in [
+            json!({}),
+            json!({"path":"relative.svg","title":"x","description":"y"}),
+            json!({"path":file.path(),"title":" ","description":"y"}),
+            json!({"path":file.path(),"title":"x","description":"z".repeat(MAX_DESCRIPTION_CHARS+1)}),
+        ] {
+            assert!(!PresentSvgTool
+                .run(args, context(store.clone(), "input"))
+                .await
+                .is_success());
+        }
+        let ctx = context(store.clone(), "cancelled");
+        ctx.cancel.cancel();
+        assert!(!PresentSvgTool
+            .run(input(file.path()), ctx)
+            .await
+            .is_success());
+        let ctx = context(store.clone(), "explore")
+            .with_resource_authority(ResourceAuthority::Restricted);
+        assert!(!PresentSvgTool
+            .run(input(file.path()), ctx)
+            .await
+            .is_success());
+        assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    struct FailingStore;
+    #[async_trait]
+    impl SvgArtifactStore for FailingStore {
+        async fn lookup(&self, _: &str, _: &str) -> Result<Option<SvgArtifactReference>, String> {
+            Ok(None)
+        }
+        async fn publish(
+            &self,
+            _: &str,
+            _: &str,
+            _: SvgArtifactDraft,
+        ) -> Result<SvgArtifactReference, String> {
+            Err("simulated storage failure with private details".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_and_policy_failures_are_bounded_without_source_leaks() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), SVG).unwrap();
+        let failure = PresentSvgTool
+            .run(
+                input(file.path()),
+                context(Arc::new(FailingStore), "failed"),
+            )
+            .await;
+        assert!(!failure.is_success());
+        assert!(failure.output().contains("persistence_failure"));
+        assert!(!failure.output().contains("private details"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), SVG);
+        std::fs::write(file.path(), "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><script>SECRET CONTENT</script></svg>").unwrap();
+        let store = Arc::new(Store::default());
+        let failure = PresentSvgTool
+            .run(input(file.path()), context(store.clone(), "invalid"))
+            .await;
+        assert!(!failure.is_success());
+        assert!(failure.output().contains("policy_rejection"));
+        assert!(!failure.output().contains("SECRET"));
+        assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_limits_count_unicode_characters() {
+        assert!(valid_text(&"é".repeat(MAX_TITLE_CHARS), MAX_TITLE_CHARS));
+        assert!(!valid_text(
+            &"é".repeat(MAX_TITLE_CHARS + 1),
+            MAX_TITLE_CHARS
+        ));
+        assert!(!valid_text("\n", MAX_DESCRIPTION_CHARS));
+        assert!(!valid_text("x\0y", MAX_DESCRIPTION_CHARS));
+    }
+
+    #[test]
+    fn file_boundary_rejects_directory_device_symlink_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_regular_file(dir.path()).unwrap_err().0,
+            "invalid_input"
+        );
+        let path = dir.path().join("large.svg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(validation::MAX_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(read_regular_file(&path).unwrap_err().0, "limit");
+        assert_eq!(
+            read_regular_file(&dir.path().join("missing"))
+                .unwrap_err()
+                .0,
+            "read_failure"
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(read_regular_file(&link).unwrap_err().0, "read_failure");
+            assert_eq!(
+                read_regular_file(Path::new("/dev/null")).unwrap_err().0,
+                "invalid_input"
+            );
+            let fifo = dir.path().join("fifo");
+            let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            assert_eq!(read_regular_file(&fifo).unwrap_err().0, "invalid_input");
+        }
+    }
+
+    #[test]
+    fn mode_exposure_matches_cross_call_staging_support() {
+        let has = |registry: crate::ToolRegistry| {
+            registry
+                .definitions()
+                .iter()
+                .any(|tool| tool.name == "present_svg")
+        };
+        assert!(has(crate::ToolRegistry::direct(Vec::new())));
+        assert!(has(crate::ToolRegistry::for_subagent_work()));
+        assert!(!has(crate::ToolRegistry::coordinator(Vec::new())));
+        assert!(!has(crate::ToolRegistry::for_subagent_explore_no_sandbox()));
+        assert!(!has(
+            crate::ToolRegistry::for_subagent_explore_with_sandbox()
+        ));
+    }
+}
