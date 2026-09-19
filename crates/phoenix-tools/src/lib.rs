@@ -1511,7 +1511,7 @@ mod tests {
             &["terminal_last_command", "terminal_command_history"];
 
         // Coordinator: bounded global tools only; no task-management authority.
-        let coordinator = names(&ToolRegistry::coordinator(Vec::new()));
+        let coordinator = names(&ToolRegistry::coordinator(Vec::new(), None));
         assert!(!coordinator.contains("propose_task"));
 
         // Direct: full suite, no propose_task, no sub-agent submission tools.
