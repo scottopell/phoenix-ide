@@ -8873,6 +8873,10 @@ CREATE TABLE close_worktree_cleanup_adoptions (
     identity_value TEXT NOT NULL,
     adopted_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(adopted_at_unix_micros) = 'integer' AND adopted_at_unix_micros >= 0),
+    CHECK (
+        source_inspection_generation <> target_inspection_generation
+        OR source_inspection_fingerprint <> target_inspection_fingerprint
+    ),
     PRIMARY KEY (
         attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
         resource_kind, identity_kind, identity_codec, identity_value
@@ -9024,6 +9028,7 @@ CREATE TABLE close_ambient_writer_evidence (
         OR (match_kind = 'mapping' AND access_mode = 'writable_shared_mapping')
         OR (match_kind = 'namespace_directory' AND access_mode = 'namespace_write')
     ),
+    CHECK (identity_codec = 'worktree_id_v1'),
     PRIMARY KEY (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_codec, identity_value,

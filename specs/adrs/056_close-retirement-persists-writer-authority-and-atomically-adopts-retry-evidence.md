@@ -1,10 +1,4 @@
-<<<<<<<< HEAD:specs/adrs/056_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md
 # ADR-056: Close retirement persists writer authority and atomically adopts retry evidence
-|||||||| parent of b1bad7f1b (docs: reconcile close ADR numbering after rebase):specs/adrs/054_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md
-# ADR-054: Close retirement persists writer authority and atomically adopts retry evidence
-========
-# ADR-055: Close retirement persists writer authority and atomically adopts retry evidence
->>>>>>>> b1bad7f1b (docs: reconcile close ADR numbering after rebase):specs/adrs/055_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md
 
 - **Status:** Accepted
 - **Date:** 2026-09-13

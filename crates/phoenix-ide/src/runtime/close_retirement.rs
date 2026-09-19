@@ -5503,6 +5503,13 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
+            if target
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)")
+            {
+                continue;
+            }
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
                 continue;
             }
