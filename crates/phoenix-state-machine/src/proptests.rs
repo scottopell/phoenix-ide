@@ -679,14 +679,20 @@ proptest! {
         }
     }
 
-    // Invariant 6: PersistState effect always emitted on state change
+    // Invariant 6: every state change has exactly one persistence owner.
     #[test]
     fn prop_state_changes_persist(state in arb_state(), event in arb_event()) {
         if let Ok(result) = transition(&state, &test_context(), event) {
             if result.new_state != state {
-                prop_assert!(
-                    result.effects.iter().any(|e| matches!(e, Effect::PersistState)),
-                    "State changed but no PersistState effect: {:?} -> {:?}",
+                let persistence_owners = result.effects.iter().filter(|effect| matches!(
+                    effect,
+                    Effect::PersistState | Effect::ApproveTask { .. }
+                )).count();
+                prop_assert_eq!(
+                    persistence_owners,
+                    1,
+                    "State change has {} persistence owners: {:?} -> {:?}",
+                    persistence_owners,
                     state,
                     result.new_state
                 );

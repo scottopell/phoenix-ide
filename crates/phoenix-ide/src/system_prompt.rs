@@ -118,6 +118,23 @@ pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
     prompt
 }
 
+#[must_use]
+pub(crate) fn explore_bash_prompt_capability(
+    authority: crate::work_scope::ResourceAuthority,
+    mode: Option<&ModeContext>,
+    restricted_bash: ExploreBashCapability,
+) -> phoenix_core::llm_language::ExploreBashPromptCapability {
+    match (authority, mode) {
+        (crate::work_scope::ResourceAuthority::Work, Some(ModeContext::Explore { .. })) => {
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+        }
+        (crate::work_scope::ResourceAuthority::Restricted, Some(ModeContext::Explore { .. })) => {
+            restricted_bash.into()
+        }
+        _ => phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
+    }
+}
+
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -126,7 +143,7 @@ pub fn build_system_prompt(
     mode: Option<&ModeContext>,
     language: LlmLanguage,
     persona: Option<&str>,
-    explore_bash: ExploreBashCapability,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
@@ -138,7 +155,7 @@ pub fn build_system_prompt(
         builtin_dir.as_deref(),
         language,
         persona,
-        explore_bash,
+        explore_bash.into(),
     )
 }
 
@@ -156,8 +173,10 @@ pub fn build_system_prompt_with_options(
     builtin_dir: Option<&Path>,
     language: LlmLanguage,
     persona: Option<&str>,
-    explore_bash: ExploreBashCapability,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
 ) -> String {
+    let explore_bash = explore_bash.into();
+
     // REQ-AG-006: a named agent's persona replaces the generic assistant
     // preamble at the head of the prompt. Everything below (guidance, skills,
     // mode context, sub-agent suffix) is appended regardless of persona.
@@ -216,6 +235,7 @@ pub fn build_system_prompt_with_options(
             ModeContext::Work { .. }
                 | ModeContext::Branch { .. }
                 | ModeContext::DetachedApprovedTask { .. }
+                | ModeContext::AttachedWorkChild { .. }
         )
     );
     if !mode_states_worktree_boundary
@@ -235,17 +255,26 @@ pub fn build_system_prompt_with_options(
             ModeContext::Explore {
                 next_taskmd_id_hint,
             } => {
-                prompt.push_str(&llm_language::mode_explore(
-                    language,
-                    tasks_dir_name,
-                    explore_bash,
-                ));
-                if let Some(next_id) = next_taskmd_id_hint {
-                    prompt.push_str(&llm_language::next_taskmd_id_hint(
+                if explore_bash
+                    == phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+                {
+                    prompt.push_str(&llm_language::mode_approved_explore_work(
+                        language,
+                        &working_dir.display().to_string(),
+                    ));
+                } else {
+                    prompt.push_str(&llm_language::mode_explore(
                         language,
                         tasks_dir_name,
-                        next_id,
+                        explore_bash,
                     ));
+                    if let Some(next_id) = next_taskmd_id_hint {
+                        prompt.push_str(&llm_language::next_taskmd_id_hint(
+                            language,
+                            tasks_dir_name,
+                            next_id,
+                        ));
+                    }
                 }
             }
             ModeContext::Work {
@@ -272,6 +301,12 @@ pub fn build_system_prompt_with_options(
                     worktree_path,
                     task_id,
                     task_title,
+                ));
+            }
+            ModeContext::AttachedWorkChild { worktree_path } => {
+                prompt.push_str(&llm_language::mode_attached_work_child(
+                    language,
+                    worktree_path,
                 ));
             }
             ModeContext::Direct => {
@@ -857,6 +892,56 @@ mod tests {
         // The Work block no longer hands out a taskmd ID prefix — task files
         // need not be taskmd files at all (task 13009).
         assert!(!prompt.contains("task ID prefix"));
+    }
+
+    #[test]
+    fn provider_and_introspection_share_approved_explore_projection() {
+        let mode = ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        };
+        assert_eq!(
+            explore_bash_prompt_capability(
+                crate::work_scope::ResourceAuthority::Work,
+                Some(&mode),
+                ExploreBashCapability::Sandboxed,
+            ),
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+        );
+        assert_eq!(
+            explore_bash_prompt_capability(
+                crate::work_scope::ResourceAuthority::Restricted,
+                Some(&mode),
+                ExploreBashCapability::Sandboxed,
+            ),
+            phoenix_core::llm_language::ExploreBashPromptCapability::Sandboxed
+        );
+    }
+
+    #[test]
+    fn approved_explore_prompt_describes_unsandboxed_bash() {
+        let temp = TempDir::new().unwrap();
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            }),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            None,
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed,
+        );
+
+        assert!(prompt
+            .contains("`bash` is available with the approved WorkScope's full write authority"));
+        assert!(prompt.contains("retains Explore provenance"));
+        assert!(prompt.contains("approved WorkScope grants full write authority"));
+        assert!(prompt.contains("Execute the approved task directly"));
+        assert!(!prompt.contains("`bash` is unavailable"));
+        assert!(!prompt.contains("The conversation mode remains Explore"));
+        assert!(!prompt.contains("you cannot modify code"));
     }
 
     #[test]
