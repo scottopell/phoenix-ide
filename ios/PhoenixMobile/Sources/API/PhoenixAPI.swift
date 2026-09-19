@@ -394,9 +394,16 @@ struct PhoenixAPI: Sendable {
             "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
     }
 
-    func deleteConversation(reference: String) async throws {
-        struct OkResponse: Codable { var ok: Bool? }
-        _ = try await post("api/conversations/\(reference)/delete", body: [:], as: OkResponse.self)
+    func deleteConversation(reference: String, chainRootId: String?) async throws {
+        let path = if let chainRootId {
+            "api/chains/\(chainRootId)"
+        } else {
+            "api/conversations/\(reference)"
+        }
+        var request = URLRequest(url: baseURL.appending(path: path))
+        request.httpMethod = "DELETE"
+        let (data, response) = try await session.data(for: request)
+        try validateStatus(response, data: data)
     }
 
     func archive(conversationId: String) async throws {
@@ -467,6 +474,17 @@ struct PhoenixAPI: Sendable {
     func ensureCoordinator() async throws -> Conversation {
         try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
             .conversation
+    }
+
+    private func validateStatus(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport(underlying: URLError(.badServerResponse))
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(
+                status: http.statusCode,
+                body: String(data: data, encoding: .utf8) ?? "")
+        }
     }
 
     func validateCwd(path: String) async throws -> ValidateCwdResponse {

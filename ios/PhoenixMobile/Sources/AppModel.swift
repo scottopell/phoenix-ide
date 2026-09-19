@@ -427,7 +427,9 @@ final class AppModel {
             return false
         }
         do {
-            try await api.deleteConversation(reference: conversation.transcriptRowIdentity)
+            try await api.deleteConversation(
+                reference: conversation.transcriptRowIdentity,
+                chainRootId: conversation.chain_root_id)
             listStore.remove(aggregateId: conversation.aggregateIdentity)
             return true
         } catch {
