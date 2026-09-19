@@ -21,6 +21,7 @@ assets=("$@")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 expected_digests="$work/expected-digests.tsv"
+release_inventory="$work/releases.json"
 "$PYTHON3" - "$expected_digests" "${assets[@]}" <<'PY'
 import hashlib
 import re
@@ -81,13 +82,17 @@ verify_tag() {
 }
 
 published_release_metadata() {
-  gh api "repos/$repo/releases/tags/$tag"
+  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory"
+  jq -ce --arg tag "$tag" \
+    '[.[][] | select(.draft == false and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end' \
+    "$release_inventory"
 }
 
 draft_release_metadata() {
-  gh api --paginate --slurp "repos/$repo/releases?per_page=100" \
-    | jq -ce --arg tag "$tag" \
-      '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end'
+  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory"
+  jq -ce --arg tag "$tag" \
+    '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end' \
+    "$release_inventory"
 }
 
 release_metadata_by_id() {
@@ -96,7 +101,15 @@ release_metadata_by_id() {
 }
 
 current_release_metadata() {
-  published_release_metadata 2>/dev/null || draft_release_metadata
+  local metadata status
+  if metadata=$(published_release_metadata); then
+    printf '%s\n' "$metadata"
+    return 0
+  else
+    status=$?
+    [[ $status -eq 4 ]] || return "$status"
+  fi
+  draft_release_metadata
 }
 
 verify_release_assets() {
@@ -183,12 +196,15 @@ upload_asset_to_draft() {
 }
 
 verify_tag
-metadata=$(published_release_metadata 2>/dev/null || true)
-if [[ -n "$metadata" ]]; then
+if metadata=$(published_release_metadata); then
   verify_release_assets false
   verify_tag
   echo "release $tag is already published with the exact asset set"
   exit 0
+else
+  status=$?
+  [[ $status -eq 4 ]] || exit "$status"
+  metadata=
 fi
 
 if metadata=$(draft_release_metadata); then
