@@ -1983,23 +1983,22 @@ pub fn transition_parent(
         ) => {
             let answers_text = questions
                 .iter()
-                .filter_map(|q| {
-                    let answer_key = q.id.as_deref().unwrap_or(q.question.as_str());
+                .enumerate()
+                .filter_map(|(index, q)| {
+                    let generated_key = format!("q{}", index + 1);
+                    let answer_key = q.id.as_deref().unwrap_or(generated_key.as_str());
                     let a = answers
                         .get(answer_key)
                         .or_else(|| answers.get(&q.question))?;
                     let q_text = &q.question;
                     let mut parts = vec![format!("\"{}\" = \"{}\"", q_text, a)];
-                    let question_data = questions.iter().find(|qq| qq.question == *q_text);
-                    if let Some(qd) = question_data {
-                        let selected_preview = qd
-                            .options
-                            .iter()
-                            .find(|o| o.label == *a)
-                            .and_then(|o| o.preview.as_deref());
-                        if let Some(preview) = selected_preview {
-                            parts.push(format!("selected preview:\n{preview}"));
-                        }
+                    let selected_preview = q
+                        .options
+                        .iter()
+                        .find(|o| o.label == *a)
+                        .and_then(|o| o.preview.as_deref());
+                    if let Some(preview) = selected_preview {
+                        parts.push(format!("selected preview:\n{preview}"));
                     }
                     if let Some(ref anns) = annotations {
                         if let Some(ann) =
@@ -5897,6 +5896,79 @@ mod tests {
             assert!(transition(&first, &test_context(), event.clone()).is_ok());
             assert!(transition(&next, &test_context(), event).is_err());
         }
+    }
+
+    #[test]
+    fn user_question_response_uses_stable_generated_keys_for_duplicate_question_text() {
+        use crate::state::{QuestionAnnotation, QuestionOption, UserQuestion};
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![
+                UserQuestion {
+                    id: None,
+                    question: "Choose?".to_string(),
+                    header: "First".to_string(),
+                    options: vec![QuestionOption {
+                        label: "Alpha".to_string(),
+                        description: None,
+                        preview: Some("alpha preview".to_string()),
+                    }],
+                    multi_select: false,
+                },
+                UserQuestion {
+                    id: None,
+                    question: "Choose?".to_string(),
+                    header: "Second".to_string(),
+                    options: vec![QuestionOption {
+                        label: "Beta".to_string(),
+                        description: None,
+                        preview: Some("beta preview".to_string()),
+                    }],
+                    multi_select: false,
+                },
+            ],
+            tool_use_id: "tool-auq-1".to_string(),
+            request_id: "request-1".into(),
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("q1".to_string(), "Alpha".to_string());
+        answers.insert("q2".to_string(), "Beta".to_string());
+        let mut annotations = std::collections::HashMap::new();
+        annotations.insert(
+            "q2".to_string(),
+            QuestionAnnotation {
+                preview: None,
+                notes: Some("second note".to_string()),
+            },
+        );
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserQuestionResponse {
+                request_id: "request-1".to_string(),
+                answers,
+                annotations: Some(annotations),
+            },
+        )
+        .expect("stable generated keys should answer duplicate question text");
+
+        let answer_text = result
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::CommitQuestionRequest {
+                    resolution: crate::effect::QuestionResolution::Answer { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("answer commit effect");
+        assert!(answer_text.contains("\"Choose?\" = \"Alpha\""));
+        assert!(answer_text.contains("alpha preview"));
+        assert!(answer_text.contains("\"Choose?\" = \"Beta\""));
+        assert!(answer_text.contains("beta preview"));
+        assert!(answer_text.contains("user notes: second note"));
     }
 
     #[test]
