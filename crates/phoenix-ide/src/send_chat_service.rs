@@ -120,7 +120,7 @@ impl SendChatApplicationService {
             files: Vec::new(),
             user_agent,
             skill_invocation: None,
-            expansion_policy: SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext,
+            expansion_policy: submitted_expansion_policy(expansion_policy),
         };
         let repo = self.db.workflow_repository();
         let lookup = repo
@@ -642,6 +642,20 @@ async fn lookup_durable_replay(
     }
 }
 
+fn submitted_expansion_policy(
+    expansion_policy: MessageExpansionPolicy,
+) -> SubmittedDirectTurnExpansionPolicy {
+    match expansion_policy {
+        MessageExpansionPolicy::ExpandReferences => {
+            SubmittedDirectTurnExpansionPolicy::ExpandReferences
+        }
+        MessageExpansionPolicy::LiteralText => SubmittedDirectTurnExpansionPolicy::LiteralText,
+        MessageExpansionPolicy::GeneratedPredecessorContext => {
+            SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
+        }
+    }
+}
+
 fn submitted_identity_from_request(req: &SendChatRequest) -> SubmittedDirectTurnIdentity {
     SubmittedDirectTurnIdentity {
         text: req.text.clone(),
@@ -668,15 +682,7 @@ fn submitted_identity_from_request(req: &SendChatRequest) -> SubmittedDirectTurn
         message_id: req.message_id.clone(),
         user_agent: req.user_agent.clone(),
         skill_invocation: None,
-        expansion_policy: match req.expansion_policy {
-            MessageExpansionPolicy::ExpandReferences => {
-                SubmittedDirectTurnExpansionPolicy::ExpandReferences
-            }
-            MessageExpansionPolicy::LiteralText => SubmittedDirectTurnExpansionPolicy::LiteralText,
-            MessageExpansionPolicy::GeneratedPredecessorContext => {
-                SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
-            }
-        },
+        expansion_policy: submitted_expansion_policy(req.expansion_policy),
     }
 }
 
