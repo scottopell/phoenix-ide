@@ -422,6 +422,7 @@ final class AppModel {
 
     @discardableResult
     func deleteHistoryConversation(_ conversation: Conversation) async -> Bool {
+        guard ClientOperation.delete.policy == .onlineOnly else { return false }
         guard let api, connectivity.isOnline else {
             lastActionError = "Deleting needs a connection — it can't be queued."
             return false
