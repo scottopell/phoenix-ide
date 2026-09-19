@@ -3858,9 +3858,18 @@ mod tests {
         let processes = adopted.processes.clone();
         fs::hard_link(&control, &socket).unwrap();
         let task = tokio::spawn(adopted.commit_publication());
-        while !acknowledged.exists() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !acknowledged.exists() && !task.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "publication hook was not acknowledged"
+            );
             tokio::task::yield_now().await;
         }
+        assert!(
+            !task.is_finished(),
+            "publication commit completed before cancellation"
+        );
         task.abort();
         let _ = task.await;
         wait_until(
