@@ -9049,14 +9049,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_mapping_filename_ending_deleted_remains_authority() {
-        let mapping = b"7f000000-7f001000 rw-s 00000000 00:00 1 /tmp/quarantine/file (deleted)";
+        let quarantine = tempfile::tempdir().unwrap();
+        let live = quarantine.path().join("file");
+        std::fs::write(&live, b"live").unwrap();
+        let displayed = format!("{} (deleted)", live.display());
+        let mapping = format!("7f000000-7f001000 rw-s 00000000 00:00 1 {displayed}");
         assert_eq!(
-            super::linux_writable_shared_mapping_path(
-                mapping,
-                std::path::Path::new("/tmp/quarantine"),
-            )
-            .unwrap(),
-            Some(b"/tmp/quarantine/file (deleted)".to_vec())
+            super::linux_writable_shared_mapping_path(mapping.as_bytes(), quarantine.path(),)
+                .unwrap(),
+            Some(displayed.as_bytes().to_vec())
         );
     }
 
