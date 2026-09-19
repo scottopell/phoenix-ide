@@ -616,6 +616,9 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
     var persistHardDeleteFenceResult = true
     private(set) var persistedHardDeleteFences: [PersistedHardDeleteFence] = []
+    fileprivate var persistHardDeleteFenceGate: AsyncCandidateGate?
+    private(set) var hardDeleteFencePersistAttemptCount = 0
+
     private var deliveryPreparationGate: (entered: AsyncCandidateGate, completed: AsyncCandidateGate)?
     private var removeAllGate: AsyncCandidateGate?
     private(set) var hardDeleteFenceLoadCount = 0
@@ -719,6 +722,11 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+        hardDeleteFencePersistAttemptCount += 1
+        if let persistHardDeleteFenceGate {
+            await persistHardDeleteFenceGate.markEntered()
+            await persistHardDeleteFenceGate.awaitRelease()
+        }
         guard persistHardDeleteFenceResult else { return false }
         persistedHardDeleteFences.append(fence)
         return true
@@ -2506,6 +2514,40 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("expected outbox-only member removal")
         }
+    }
+
+    func testConcurrentAggregateHardDeletesCommitOneFence() async throws {
+        let gate = AsyncCandidateGate()
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1", "row-2"],
+            contentsByConversationId: ["row-1": .entries([]), "row-2": .entries([])],
+            aggregateMembersById: ["pc-1": ["row-1", "row-2"]])
+        store.persistHardDeleteFenceGate = gate
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.connectivity.setOnlineForTesting(false)
+        model.replaceAPIForTesting(api)
+        let first = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+        let second = try XCTUnwrap(model.session(for: "row-2", aggregateAuthority: "pc-1"))
+        for (session, id) in [(first, "row-1"), (second, "row-2")] {
+            session.receive(.initSnapshot(.init(
+                conversation: conversation(id: id, aggregateId: "pc-1"), messages: [],
+                agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
+                pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        }
+
+        first.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await gate.waitForEntry()
+        second.receive(.conversationHardDeleted(seq: 1, conversationId: "row-2"))
+        await second.awaitHardDeleteReportForTesting()
+        XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
+
+        await gate.release()
+        await first.awaitHardDeleteReportForTesting()
+        XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
+        XCTAssertEqual(store.persistedHardDeleteFences.map(\.aggregateAuthority), ["pc-1"])
     }
 
     func testHardDeleteFenceFailureLeavesAuthoritativeStateAndOutboxIntact() async throws {

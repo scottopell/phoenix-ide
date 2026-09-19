@@ -771,6 +771,8 @@ final class AppModel {
     private var hardDeletedConversationIds: Set<String> = []
     private var hardDeletedAggregateAuthorities: Set<String> = []
     private var hardDeleteFenceRetryObligations: Set<HardDeleteFenceRetryObligation> = []
+    private var hardDeleteCleanupAuthorities: Set<String> = []
+
     private var nextHardDeleteCleanupGeneration = 0
 
     static func randomCredentialGenerationForTestsAndDefaults() -> String {
@@ -1298,6 +1300,9 @@ final class AppModel {
     }
 
     private func runHardDeleteCleanup(_ context: HardDeleteCleanupContext) async {
+        guard hardDeleteCleanupAuthorities.insert(context.aggregateAuthority).inserted else { return }
+        defer { hardDeleteCleanupAuthorities.remove(context.aggregateAuthority) }
+
         func contextIsCurrent() -> Bool {
             apiGeneration == context.configurationEpoch
                 && api?.configurationIdentity == context.configurationIdentity
