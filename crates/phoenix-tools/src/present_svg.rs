@@ -496,7 +496,7 @@ mod tests {
         };
         assert!(has(crate::ToolRegistry::direct(Vec::new())));
         assert!(has(crate::ToolRegistry::for_subagent_work()));
-        assert!(!has(crate::ToolRegistry::coordinator(Vec::new())));
+        assert!(!has(crate::ToolRegistry::coordinator(Vec::new(), None)));
         assert!(!has(crate::ToolRegistry::for_subagent_explore_no_sandbox()));
         assert!(!has(
             crate::ToolRegistry::for_subagent_explore_with_sandbox()
