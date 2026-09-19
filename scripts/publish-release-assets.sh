@@ -34,7 +34,7 @@ by_name = {}
 for path in paths:
     if not path.is_file():
         raise SystemExit(f"error: release asset is not a file: {path}")
-    if "\t" in path.name or "\n" in path.name:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", path.name):
         raise SystemExit(f"error: unsupported release asset name: {path.name!r}")
     if path.name in by_name:
         raise SystemExit(f"error: duplicate release asset name: {path.name}")
@@ -82,14 +82,14 @@ verify_tag() {
 }
 
 published_release_metadata() {
-  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory"
+  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
   jq -ce --arg tag "$tag" \
     '[.[][] | select(.draft == false and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end' \
     "$release_inventory"
 }
 
 draft_release_metadata() {
-  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory"
+  gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
   jq -ce --arg tag "$tag" \
     '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end' \
     "$release_inventory"
@@ -169,19 +169,6 @@ actual = {asset.get("name"): asset.get("digest") for asset in assets}
 if len(actual) != len(assets) or actual != expected:
     raise SystemExit("error: private release asset names or digests are not exact")
 PY
-}
-
-asset_path_by_name() {
-  local wanted=$1
-  local path
-  for path in "${assets[@]}"; do
-    if [[ $(basename "$path") == "$wanted" ]]; then
-      printf '%s\n' "$path"
-      return 0
-    fi
-  done
-  echo "error: no local asset path for $wanted" >&2
-  return 1
 }
 
 upload_asset_to_draft() {

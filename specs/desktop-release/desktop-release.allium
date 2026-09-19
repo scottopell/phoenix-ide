@@ -114,6 +114,28 @@ entity ReleasePublication {
 }
 
 surface DesktopReleaseWorkflow {
+    context gate: ReleaseGate
+    context pair: ArchitecturePair
+    context publication: ReleasePublication
+
+    provides:
+        ReleaseTagCreated(gate)
+        ExactReleaseTagFound(gate)
+        ReleaseGateRejected(gate)
+        StandaloneHelperVerified(pair)
+        DesktopAppVerified(pair)
+        NotarizationSubmitted(pair)
+        NotarizationAccepted(pair)
+        NotarizationStapled(pair)
+        NotarizationValidated(pair)
+        InaccessiblePublicationCreated(gate, publication)
+        InaccessiblePublicationResumed(gate, publication)
+        InaccessibleUploadStarted(publication)
+        InaccessibleUploadInterrupted(publication)
+        InaccessiblePublicationVerified(publication)
+        InaccessiblePublicationPublished(gate, publication)
+        PublishedReleaseRetried(gate, publication)
+        PublishedReleaseMismatchFound(publication)
 }
 
 -- Helpers
@@ -147,8 +169,9 @@ surface DesktopReleaseWorkflow {
 --   consumer-inaccessible publication work contains exactly the eight required
 --   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
 -- required_architecture_pairs_validated(publication) -> Boolean
---   the publication has distinct Apple Silicon and Intel pairs with matching
---   release identities, verified helper/app artifacts, and validated notarization.
+--   publication.apple_silicon_pair and publication.intel_pair have distinct
+--   targets, matching release identities, verified helper/app artifacts, and
+--   validated notarization.
 -- public_release_is_exact(publication) -> Boolean
 --   the public release contains exactly the required names and matching digests.
 -- public_release_differs(publication) -> Boolean

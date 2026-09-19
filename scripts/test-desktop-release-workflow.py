@@ -63,6 +63,10 @@ for forbidden in [
     if forbidden in workflow:
         raise SystemExit(f'forbidden release workflow contract: {forbidden}')
 
+publish_job = workflow.split('\n  publish:\n', 1)[1]
+if not publish_job.startswith('    needs: [gate, build-linux, build-macos]\n    environment: macos-release-signing\n'):
+    raise SystemExit('release publication must use the protected macos-release-signing environment')
+
 stable_check = workflow.index("printf '%s' \"$VERSION\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'")
 bundle_check = workflow.index('validate_bundle_version "$VERSION"', stable_check)
 tag_creation = workflow.index('git tag -a "$TAG"', bundle_check)

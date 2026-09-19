@@ -39,6 +39,8 @@ log_path = state / "gh.log"
 args = sys.argv[1:]
 with log_path.open("a", encoding="utf-8") as log:
     log.write(" ".join(args) + "\n")
+if os.environ.get("FAKE_API_FAILURE") == "1" and args[:1] == ["api"]:
+    raise SystemExit("simulated API failure")
 
 
 def load():
@@ -200,7 +202,7 @@ publish() {
 reset_state() {
   rm -rf "$FAKE_STATE"
   mkdir -p "$FAKE_STATE"
-  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER
+  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE
 }
 
 assert_draft() {
@@ -279,6 +281,20 @@ if publish >/dev/null 2>&1; then
 fi
 assert_draft
 unset FAKE_PUBLISH_FAIL
+
+# Inventory API failure is not release absence and performs no mutation.
+reset_state
+export FAKE_API_FAILURE=1
+if publish >/dev/null 2>&1; then
+  echo "expected release inventory API failure" >&2
+  exit 1
+fi
+test ! -e "$FAKE_STATE/release.json"
+if grep -E 'release create|--method (POST|DELETE|PATCH)' "$FAKE_STATE/gh.log" >/dev/null; then
+  echo "release inventory API failure must not mutate release state" >&2
+  exit 1
+fi
+unset FAKE_API_FAILURE
 
 # A moved tag fails before the first release mutation.
 reset_state
