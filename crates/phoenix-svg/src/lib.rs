@@ -1328,9 +1328,9 @@ mod tests {
     #[test]
     fn references_require_compatible_target_elements() {
         for body in [
-            r##"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" fill="url(#p)"/>"##,
-            r##"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" style="stroke: url(#p)"/>"##,
-            r##"<linearGradient id="p"/><rect width="10" height="10" clip-path="url(#p)"/>"##,
+            r#"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" fill="url(#p)"/>"#,
+            r#"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" style="stroke: url(#p)"/>"#,
+            r#"<linearGradient id="p"/><rect width="10" height="10" clip-path="url(#p)"/>"#,
             r##"<rect id="p" width="1" height="1"/><linearGradient href="#p"/>"##,
             r##"<clipPath id="p"/><radialGradient href="#p"/>"##,
             r##"<linearGradient id="p"/><use href="#p"/>"##,

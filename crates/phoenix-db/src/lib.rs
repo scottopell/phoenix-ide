@@ -21986,27 +21986,22 @@ mod tests {
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::LlmRequesting { attempt: 1 }
         ));
-        let earlier = db
-            .get_messages(parent_id)
-            .await
-            .unwrap()
-            .into_iter()
+        let messages = db.get_messages(parent_id).await.unwrap();
+        let earlier = messages
+            .iter()
             .find(|message| message.message_id == "earlier-spawn-result")
             .unwrap();
         assert!(
             matches!(&earlier.content, MessageContent::Tool(content) if content.content == "Earlier completed result")
         );
-        let message = db
-            .get_messages(parent_id)
-            .await
-            .unwrap()
-            .into_iter()
+        let message = messages
+            .iter()
             .find(|message| {
                 message.message_id
                     == tool_result_message_id("current-spawn-assistant", "spawn-fan-in")
             })
             .unwrap();
-        let MessageContent::Tool(content) = message.content else {
+        let MessageContent::Tool(content) = &message.content else {
             unreachable!()
         };
         assert!(content.content.contains("exact sibling result"));
