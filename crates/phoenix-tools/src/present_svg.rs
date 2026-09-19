@@ -294,7 +294,7 @@ mod tests {
         ToolContext::new(
             CancellationToken::new(),
             "owner".into(),
-            std::env::temp_dir(),
+            std::env::current_dir().unwrap(),
             Arc::new(crate::BrowserSessionManager::default()),
             Arc::new(crate::BashHandleRegistry::new()),
             Arc::new(crate::NoLlm),
