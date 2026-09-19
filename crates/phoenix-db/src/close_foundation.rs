@@ -3957,15 +3957,15 @@ impl Database {
         let current_matches = current
             .as_ref()
             .is_some_and(|(phase, generation, fingerprint)| {
-                phase == "needs_repair"
+                matches!(phase.as_str(), "retirement_requested" | "needs_repair")
                     && generation.as_deref() == Some(request.snapshot.generation())
                     && fingerprint.as_deref() == Some(request.snapshot.fingerprint())
             });
         if !current_matches {
             return Err(DbError::CloseEvidenceInvariant {
-                invariant: "ambient_writer_evidence_requires_active_repair_snapshot",
+                invariant: "ambient_writer_evidence_requires_active_retirement_snapshot",
                 relation: "close_obligations+close_ambient_writer_evidence",
-                detail: "ambient-writer evidence does not match the active needs-repair snapshot"
+                detail: "ambient-writer evidence does not match the active retirement snapshot"
                     .to_string(),
             });
         }
@@ -4047,6 +4047,18 @@ impl Database {
                 detail: "ambient-writer insert did not produce the exact authority row".to_string(),
             });
         }
+        route_close_attempt_to_repair_tx(
+            &mut tx,
+            &RouteCloseAttemptToRepairRequest {
+                attempt_id: request.attempt_id.clone(),
+                scope: request.scope.clone(),
+                residual: request.resource.clone(),
+                reason: RetirementFailureReason::ResidualProcessAlive,
+                detail: "stable ambient writer".to_string(),
+                cause: None,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -4154,6 +4166,15 @@ impl Database {
                        AND target.inspection_generation=?5 AND target.inspection_fingerprint=?6
                        AND source.resource_kind=?7 AND source.identity_kind=?8
                        AND source.identity_codec=?9 AND source.identity_value=?10
+                       AND source.administrative_dir_codec=target.administrative_dir_codec
+                       AND source.administrative_dir_value=target.administrative_dir_value
+                       AND source.administrative_dir_incarnation=target.administrative_dir_incarnation
+                       AND source.final_tombstone_root_codec IS target.final_tombstone_root_codec
+                       AND source.final_tombstone_root_value IS target.final_tombstone_root_value
+                       AND source.final_tombstone_root_device IS target.final_tombstone_root_device
+                       AND source.final_tombstone_root_inode IS target.final_tombstone_root_inode
+                       AND source.final_tombstone_object_device IS target.final_tombstone_object_device
+                       AND source.final_tombstone_object_inode IS target.final_tombstone_object_inode
                  )",
             )
             .bind(request.attempt_id.as_str())

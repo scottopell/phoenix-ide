@@ -1719,16 +1719,7 @@ impl RuntimeManager {
                                     )
                                     .await
                                     .map_err(map_close_retirement_db_error)?;
-                                return self
-                                    .record_close_residual(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::ResidualProcessAlive,
-                                        &residual.detail,
-                                    )
-                                    .await;
+                                return Err(CloseRetirementError::Message(residual.detail));
                             }
                             Err(reason) => {
                                 return self
@@ -4540,7 +4531,12 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                     != i32::try_from(size_of::<ProcRegionWithPathInfo>())
                         .expect("region path info size fits i32")
                 {
-                    continue;
+                    return Err(AmbientWriterIndeterminateDiagnostic {
+                        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                        operation: AmbientWriterDiagnosticOperation::ReadMappings,
+                        error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                    }
+                    .marker());
                 }
                 let revalidated = unsafe { revalidated.assume_init() };
                 let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
@@ -5721,7 +5717,12 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     != i32::try_from(size_of::<VnodeFdInfoWithPath>())
                         .expect("vnode info size fits i32")
                 {
-                    continue;
+                    return Err(AmbientWriterIndeterminateDiagnostic {
+                        detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                        operation: AmbientWriterDiagnosticOperation::EnumerateDescriptor,
+                        error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                    }
+                    .marker());
                 }
                 let revalidated = unsafe { revalidated.assume_init() };
                 let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();

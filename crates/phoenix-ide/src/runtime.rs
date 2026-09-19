@@ -8287,7 +8287,7 @@ mod scope_liveness_tests {
         };
 
         manager
-            .retire_close_runtime_resources(attempt_id.clone())
+            .retry_close_retirement(attempt_id.clone())
             .await
             .unwrap_err();
         let ambient_evidence: (String, String) = sqlx::query_as(
