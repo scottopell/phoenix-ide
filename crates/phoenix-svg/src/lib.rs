@@ -1230,16 +1230,14 @@ mod tests {
             ("100%", "100%"),
             ("1em", "1em"),
         ] {
-            assert!(
-                validate(
-                    format!(
-                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"/>"#,
-                        pair.0, pair.1
-                    )
-                    .as_bytes()
+            assert!(validate(
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"/>"#,
+                    pair.0, pair.1
                 )
-                .is_err()
-            );
+                .as_bytes()
+            )
+            .is_err());
         }
         let by_viewbox =
             validate(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480"/>"#)
@@ -1379,10 +1377,10 @@ mod tests {
         ] {
             assert_eq!(rejected(body).category, ValidationCategory::Limit);
         }
-        assert!(
-            validate(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-300 1e-300"/>"#)
-                .is_err()
-        );
+        assert!(validate(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-300 1e-300"/>"#
+        )
+        .is_err());
     }
 
     #[test]
