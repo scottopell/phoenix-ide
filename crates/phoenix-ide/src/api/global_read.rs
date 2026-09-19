@@ -1,6 +1,9 @@
 use super::AppState;
 use crate::db::MessageContent;
-use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalScope};
+use crate::db::{
+    Conversation, DbError, FreshRetrieval, FreshRetrievalRequest, MessageType, RetrievalRequest,
+    RetrievalScope,
+};
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
@@ -791,17 +794,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         };
         let predecessor_ids: Vec<String> =
             predecessors.iter().map(|conv| conv.id.clone()).collect();
-        let index_fresh = self.message_retriever.index_reconciled()
-            && match self.message_retriever.is_fresh_for(&predecessor_ids).await {
-                Ok(fresh) => fresh,
-                Err(error) => {
-                    return PreviousTranscriptsOutput::SearchUnavailable {
-                        reason_code: "coverage_check_failed",
-                        message: format!("predecessor index coverage check failed: {error}"),
-                    }
-                }
-            };
-        if !index_fresh {
+        if !self.message_retriever.index_reconciled() {
             return PreviousTranscriptsOutput::SearchUnavailable {
                 reason_code: "index_not_current",
                 message: "the message index is not current for these predecessors; list or read predecessors directly".to_string(),
@@ -809,14 +802,20 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         }
         let hits = match self
             .message_retriever
-            .retrieve(RetrievalRequest::natural_language(
+            .retrieve_if_fresh(FreshRetrievalRequest::natural_language(
                 query,
-                RetrievalScope::Conversations(predecessor_ids),
+                predecessor_ids,
                 PREVIOUS_SEARCH_TOP_K,
             ))
             .await
         {
-            Ok(hits) => hits,
+            Ok(FreshRetrieval::Fresh(hits)) => hits,
+            Ok(FreshRetrieval::Stale) => {
+                return PreviousTranscriptsOutput::SearchUnavailable {
+                    reason_code: "index_not_current",
+                    message: "the message index is not current for these predecessors; list or read predecessors directly".to_string(),
+                }
+            }
             Err(error) => {
                 return PreviousTranscriptsOutput::SearchUnavailable {
                     reason_code: "search_failed",
@@ -824,6 +823,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                 }
             }
         };
+        let index_fresh = true;
         if hits.is_empty() {
             return PreviousTranscriptsOutput::NoMatches { index_fresh };
         }
@@ -872,14 +872,6 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         transcript_ref: &str,
         cursor: Option<&str>,
     ) -> PreviousTranscriptsOutput {
-        let target = match resolve_conversation_read_target(self, transcript_ref).await {
-            Ok(target) => target,
-            Err(error) => {
-                return PreviousTranscriptsOutput::InvalidTarget {
-                    message: error.clone(),
-                }
-            }
-        };
         let scope = ConversationReadCursorScope::StrictPredecessors {
             product_conversation_id: binding.product_conversation_id.clone(),
             executing_transcript_id: binding.executing_transcript_id.clone(),
@@ -890,6 +882,10 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
             }
             Ok(predecessors) => predecessors,
             Err(output) => return output,
+        };
+        let target = match resolve_predecessor_read_target(&predecessors, transcript_ref) {
+            Ok(target) => target,
+            Err(message) => return PreviousTranscriptsOutput::InvalidTarget { message },
         };
         let Some((ordinal, conv)) = predecessors
             .iter()
@@ -1493,6 +1489,44 @@ async fn render_message_page_bounded_as(
         content: out,
         next_cursor,
         truncated,
+    })
+}
+
+fn resolve_predecessor_read_target(
+    predecessors: &[Conversation],
+    raw: &str,
+) -> Result<ConversationReadTarget, String> {
+    let reference = raw.trim().trim_start_matches('#');
+    let (candidate, encoded_message_id) = if let Some(rest) = reference.strip_prefix("@conv:") {
+        let (id, message_id) = parse_conv_handle(rest);
+        (id, message_id)
+    } else if let Some(rest) = reference
+        .strip_prefix("/c/")
+        .or_else(|| reference.strip_prefix("/global/"))
+    {
+        let (candidate, fragment) = split_fragment(rest);
+        (candidate, fragment.and_then(message_id_fragment))
+    } else {
+        parse_conv_handle(reference)
+    };
+    if candidate.is_empty() {
+        return Err(
+            "requested transcript is not a predecessor of the executing transcript".to_string(),
+        );
+    }
+    let Some(conversation) = predecessors.iter().find(|conversation| {
+        conversation.id == candidate || conversation.slug.as_deref() == Some(candidate)
+    }) else {
+        return Err(
+            "requested transcript is not a predecessor of the executing transcript".to_string(),
+        );
+    };
+    let message_id = encoded_message_id
+        .map(percent_decode_url_component)
+        .transpose()?;
+    Ok(ConversationReadTarget {
+        conversation_id: conversation.id.clone(),
+        message_id,
     })
 }
 
@@ -2676,6 +2710,41 @@ mod tests {
             output,
             PreviousTranscriptsOutput::InvalidTarget { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_makes_missing_and_nonmember_conversations_indistinguishable() {
+        let (service, binding) = predecessor_service().await;
+        service
+            .db
+            .create_conversation("unrelated", "unrelated-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let nonmember = service
+            .read_predecessor_conversation(&binding, "/c/unrelated-slug", None)
+            .await;
+        let missing = service
+            .read_predecessor_conversation(&binding, "/c/missing-slug", None)
+            .await;
+
+        let PreviousTranscriptsOutput::InvalidTarget {
+            message: nonmember_message,
+        } = nonmember
+        else {
+            panic!("nonmember must be rejected");
+        };
+        let PreviousTranscriptsOutput::InvalidTarget {
+            message: missing_message,
+        } = missing
+        else {
+            panic!("missing target must be rejected");
+        };
+        assert_eq!(nonmember_message, missing_message);
+        assert_eq!(
+            nonmember_message,
+            "requested transcript is not a predecessor of the executing transcript"
+        );
     }
 
     #[tokio::test]

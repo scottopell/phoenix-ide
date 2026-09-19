@@ -84,11 +84,13 @@ Read continuation uses one shared versioned opaque string cursor bound to host
 scope, target, persisted message identity, intra-message offset, and rendered
 source freshness. Numeric cursor calls fail with restart guidance.
 Search uses the shared `MessageRetriever` with a `Conversations` scope over the
-strict predecessor prefix before ranking and limiting, and reports index coverage
-problems as typed search-unavailable outcomes. Runtime reconstruction and
-continuation prompt assembly use the same host-authored orientation source, which
-names the current transcript and immediate predecessor without injecting
-predecessor bodies.
+strict predecessor prefix before ranking and limiting. Index coverage validation
+and ranked retrieval use one SQLite snapshot, and coverage problems are typed
+search-unavailable outcomes. Read targets are resolved only within the validated
+predecessor set, so missing and out-of-scope identities are indistinguishable.
+Runtime reconstruction and continuation prompt assembly use the same host-authored
+orientation source, which names the current transcript and immediate predecessor
+without injecting predecessor bodies.
 
 ## Scope
 

@@ -24,6 +24,13 @@ struct SourceSnapshotTestBarrier {
     release: tokio::sync::Notify,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FreshRetrievalTestBarrier {
+    freshness_checked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 use crate::sqlite_telemetry::{
     ParentSqliteObserver, SqliteOperation, SqlitePhase, SqliteTelemetry,
 };
@@ -150,6 +157,26 @@ impl RetrievalRequest {
     }
 }
 
+/// A retrieval request that structurally carries only a bounded conversation
+/// scope and requires coverage validation in the same snapshot as ranking.
+#[derive(Debug, Clone)]
+pub struct FreshRetrievalRequest(RetrievalRequest);
+
+impl FreshRetrievalRequest {
+    #[must_use]
+    pub fn natural_language(
+        query: impl Into<String>,
+        conversation_ids: Vec<String>,
+        limit: usize,
+    ) -> Self {
+        Self(RetrievalRequest::natural_language(
+            query,
+            RetrievalScope::Conversations(conversation_ids),
+            limit,
+        ))
+    }
+}
+
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
 /// message in the lexical backend (`ordinal` 0, `char_range` `None`); a
 /// chunking backend assigns a distinct ordinal/range per chunk. Present
@@ -181,6 +208,17 @@ pub struct RetrievedChunk {
     pub score: f64,
     pub transcript_generation: i64,
     pub message_count: i64,
+}
+
+/// Result of a scoped retrieval whose index coverage was checked in the same
+/// database snapshot as ranking.
+#[derive(Debug)]
+#[must_use]
+pub enum FreshRetrieval {
+    /// Coverage was complete and these hits came from the same snapshot.
+    Fresh(Vec<RetrievedChunk>),
+    /// The scoped index was incomplete or stale in the retrieval snapshot.
+    Stale,
 }
 
 /// Error from a retrieval or index-maintenance operation.
@@ -224,6 +262,13 @@ pub trait MessageRetriever: Send + Sync {
     /// # Errors
     /// Returns [`RetrievalError`] if a backing query fails.
     async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError>;
+
+    /// Retrieve only when the scoped index is complete, evaluating coverage
+    /// and ranked hits against one database snapshot.
+    async fn retrieve_if_fresh(
+        &self,
+        request: FreshRetrievalRequest,
+    ) -> Result<FreshRetrieval, RetrievalError>;
 }
 
 /// Counts from a reconciliation pass, for logging.
@@ -257,6 +302,8 @@ pub struct Fts5Retriever {
     sqlite_workload_collector: SqliteWorkloadCollector,
     #[cfg(test)]
     source_snapshot_test_barrier: Option<Arc<SourceSnapshotTestBarrier>>,
+    #[cfg(test)]
+    fresh_retrieval_test_barrier: Option<Arc<FreshRetrievalTestBarrier>>,
 }
 
 impl Fts5Retriever {
@@ -270,12 +317,32 @@ impl Fts5Retriever {
             sqlite_workload_collector,
             #[cfg(test)]
             source_snapshot_test_barrier: None,
+            #[cfg(test)]
+            fresh_retrieval_test_barrier: None,
         }
     }
 
     #[cfg(test)]
     fn install_source_snapshot_test_barrier(&mut self, barrier: Arc<SourceSnapshotTestBarrier>) {
         self.source_snapshot_test_barrier = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn install_fresh_retrieval_test_barrier(&mut self, barrier: Arc<FreshRetrievalTestBarrier>) {
+        self.fresh_retrieval_test_barrier = Some(barrier);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_fresh_retrieval_test_barrier(&self) {
+        if let Some(barrier) = &self.fresh_retrieval_test_barrier {
+            barrier.freshness_checked.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                barrier.release.notified(),
+            )
+            .await
+            .expect("release fresh retrieval snapshot");
+        }
     }
 
     #[cfg(test)]
@@ -501,6 +568,7 @@ impl Fts5Retriever {
     #[allow(clippy::too_many_lines)]
     async fn retrieve_match_expr(
         &self,
+        connection: &mut sqlx::SqliteConnection,
         request: &RetrievalRequest,
         match_expr: &str,
         raw_prefix_guard: Option<(&str, Option<&str>)>,
@@ -610,7 +678,7 @@ impl Fts5Retriever {
         q = q.bind(limit);
 
         q.try_map(parse_chunk_row)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
             .map_err(Into::into)
     }
@@ -643,45 +711,11 @@ fn freshness_witnesses_match(messages: &[Message], witnesses: &[FreshnessWitness
     })
 }
 
-#[async_trait]
-impl MessageRetriever for Fts5Retriever {
-    fn index_reconciled(&self) -> bool {
-        self.index_reconciled()
-    }
-
-    async fn retrieve(
-        &self,
-        request: RetrievalRequest,
-    ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
-            return Ok(Vec::new());
-        };
-        let terms = content_terms(&request.query);
-        let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
-            terms.last().and_then(|term| {
-                raw_prefix_guard(term).map(|guard| {
-                    let earlier = terms[..terms.len() - 1]
-                        .iter()
-                        .map(|term| format!("\"{term}\""))
-                        .collect::<Vec<_>>()
-                        .join(" OR ");
-                    (guard, (!earlier.is_empty()).then_some(earlier))
-                })
-            })
-        } else {
-            None
-        };
-        self.retrieve_match_expr(
-            &request,
-            &match_expr,
-            raw_prefix_guard
-                .as_ref()
-                .map(|(guard, earlier)| (guard.as_str(), earlier.as_deref())),
-        )
-        .await
-    }
-
-    async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
+impl Fts5Retriever {
+    async fn is_fresh_for_conn(
+        connection: &mut sqlx::SqliteConnection,
+        conversation_ids: &[String],
+    ) -> Result<bool, RetrievalError> {
         const FRESHNESS_BATCH: i64 = 128;
         if conversation_ids.is_empty() {
             return Ok(true);
@@ -689,7 +723,6 @@ impl MessageRetriever for Fts5Retriever {
         let scope_json = serde_json::to_string(conversation_ids).map_err(|error| {
             RetrievalError::MessageDecode(crate::DbError::Serialization(error.to_string()))
         })?;
-        let mut tx = self.pool.begin().await?;
         let mut after_message_id = String::new();
         let mut source_count = 0_i64;
         let started = std::time::Instant::now();
@@ -706,12 +739,12 @@ impl MessageRetriever for Fts5Retriever {
             .bind(&after_message_id)
             .bind(FRESHNESS_BATCH)
             .try_map(crate::parse_message_row)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *connection)
             .await?;
             if messages.is_empty() {
                 break;
             }
-            crate::hydrate_attachments_conn(&mut tx, &mut messages).await?;
+            crate::hydrate_attachments_conn(&mut *connection, &mut messages).await?;
             source_count =
                 source_count.saturating_add(i64::try_from(messages.len()).unwrap_or(i64::MAX));
             after_message_id = messages
@@ -746,7 +779,7 @@ impl MessageRetriever for Fts5Retriever {
                     row.try_get("physical_match")?,
                 ))
             })
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *connection)
             .await?;
             if !freshness_witnesses_match(&messages, &witnesses) {
                 return Ok(false);
@@ -757,9 +790,8 @@ impl MessageRetriever for Fts5Retriever {
              WHERE conversation_id IN (SELECT value FROM json_each(?1))",
         )
         .bind(scope_json)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
-        tx.rollback().await?;
         tracing::debug!(
             conversation_count = conversation_ids.len(),
             source_rows = source_count,
@@ -767,6 +799,80 @@ impl MessageRetriever for Fts5Retriever {
             "verified scoped message-index freshness in bounded batches",
         );
         Ok(locator_count == source_count)
+    }
+}
+
+#[async_trait]
+impl MessageRetriever for Fts5Retriever {
+    fn index_reconciled(&self) -> bool {
+        self.index_reconciled()
+    }
+
+    async fn retrieve(
+        &self,
+        request: RetrievalRequest,
+    ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
+        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
+            return Ok(Vec::new());
+        };
+        let terms = content_terms(&request.query);
+        let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
+            terms.last().and_then(|term| {
+                raw_prefix_guard(term).map(|guard| {
+                    let earlier = terms[..terms.len() - 1]
+                        .iter()
+                        .map(|term| format!("\"{term}\""))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    (guard, (!earlier.is_empty()).then_some(earlier))
+                })
+            })
+        } else {
+            None
+        };
+        let mut connection = self.pool.acquire().await?;
+        self.retrieve_match_expr(
+            &mut connection,
+            &request,
+            &match_expr,
+            raw_prefix_guard
+                .as_ref()
+                .map(|(guard, earlier)| (guard.as_str(), earlier.as_deref())),
+        )
+        .await
+    }
+
+    async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
+        let mut tx = self.pool.begin().await?;
+        let fresh = Self::is_fresh_for_conn(&mut tx, conversation_ids).await?;
+        tx.rollback().await?;
+        Ok(fresh)
+    }
+
+    async fn retrieve_if_fresh(
+        &self,
+        request: FreshRetrievalRequest,
+    ) -> Result<FreshRetrieval, RetrievalError> {
+        let request = request.0;
+        let RetrievalScope::Conversations(conversation_ids) = &request.scope else {
+            unreachable!("fresh retrieval requests are conversation-scoped")
+        };
+        let mut tx = self.pool.begin().await?;
+        if !Self::is_fresh_for_conn(&mut tx, conversation_ids).await? {
+            tx.rollback().await?;
+            return Ok(FreshRetrieval::Stale);
+        }
+        #[cfg(test)]
+        self.wait_at_fresh_retrieval_test_barrier().await;
+        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
+            tx.rollback().await?;
+            return Ok(FreshRetrieval::Fresh(Vec::new()));
+        };
+        let hits = self
+            .retrieve_match_expr(&mut tx, &request, &match_expr, None)
+            .await?;
+        tx.rollback().await?;
+        Ok(FreshRetrieval::Fresh(hits))
     }
 }
 
@@ -2425,6 +2531,75 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].conversation_id, "c-c");
+    }
+
+    #[tokio::test]
+    async fn retrieve_if_fresh_uses_one_snapshot_for_coverage_and_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic-fresh-retrieval.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.create_conversation("c-a", "a", "/tmp/a", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "m-atomic",
+            "c-a",
+            &MessageContent::user("snapshot alpha evidence"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+        let mut retriever = db.fts_retriever();
+        retriever.reconcile().await.unwrap();
+        let barrier = Arc::new(FreshRetrievalTestBarrier::default());
+        retriever.install_fresh_retrieval_test_barrier(barrier.clone());
+        let retrieval = tokio::spawn(async move {
+            retriever
+                .retrieve_if_fresh(FreshRetrievalRequest::natural_language(
+                    "snapshot alpha",
+                    vec!["c-a".to_string()],
+                    8,
+                ))
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            barrier.freshness_checked.notified(),
+        )
+        .await
+        .expect("freshness check completed inside retrieval snapshot");
+
+        sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = 'm-atomic'")
+            .bind(
+                serde_json::to_string(&MessageContent::user("replacement beta evidence")).unwrap(),
+            )
+            .execute(writer.pool())
+            .await
+            .unwrap();
+        barrier.release.notify_one();
+
+        let FreshRetrieval::Fresh(hits) = retrieval.await.unwrap().unwrap() else {
+            panic!("snapshot-consistent retrieval must remain fresh");
+        };
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("snapshot alpha"));
+        let verifier = db.fts_retriever();
+        assert!(matches!(
+            verifier
+                .retrieve_if_fresh(FreshRetrievalRequest::natural_language(
+                    "snapshot alpha",
+                    vec!["c-a".to_string()],
+                    8,
+                ))
+                .await
+                .unwrap(),
+            FreshRetrieval::Stale
+        ));
     }
 
     #[tokio::test]
