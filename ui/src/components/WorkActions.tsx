@@ -554,6 +554,7 @@ export function WorkControlBar({
     if (
       code === 'close_loss_confirmation_required'
       || code === 'close_inspection_failed'
+      || code === 'continuation_state_changed'
       || code === 'close_retirement_needs_repair'
       || code === 'close_stop_work_confirmation_required'
       || code === 'close_settlement_in_progress'
