@@ -20,6 +20,7 @@ import process from 'node:process';
  * @property {{width:number,height:number}} [viewport]   Capture viewport; defaults to 960x900.
  * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
+ * @property {(context:{page:import('playwright').Page}) => Promise<void>} [preparePage] Optional request setup before navigation.
  * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
  * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
  * @property {(outDir:string) => Promise<void>} [onComplete] Optional report writer after every scenario succeeds.
@@ -144,6 +145,7 @@ export async function captureSurface(config) {
     viewportMatrix,
     expectedConsoleErrors = new Map(),
     captureStory,
+    preparePage,
     urlForStory,
     onComplete,
   } = config;
@@ -198,6 +200,7 @@ export async function captureSurface(config) {
   });
 
   try {
+    await preparePage?.({ page });
     for (const { storyKey, id } of stories) {
       for (const currentViewport of captureViewports) {
         consoleErrors.length = 0;

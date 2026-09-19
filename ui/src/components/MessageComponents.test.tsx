@@ -3688,3 +3688,20 @@ describe('AgentMessage compact find reveal', () => {
     expect(highlight).toHaveTextContent('alpha target');
   });
 });
+
+describe('published SVG placement', () => {
+  it.each(['full', 'compact'] as const)('keeps one artifact visible in %s tool groups and inspection', (density) => {
+    mockDensity = density;
+    const owner = agentMessage('svg-owner', [{ type: 'tool_use', id: 'svg-use', name: 'present_svg', input: { path: '/staging/chart.svg' } }]);
+    const output = toolMessage('svg-use', JSON.stringify({ artifact_id: 'svg-1', conversation_id: 'agent-1', title: 'Sizes', description: 'Measured directory sizes.', width: 800, height: 400, validation: 'accepted_static_svg' }));
+    Element.prototype.scrollIntoView = vi.fn();
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[{ kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map([['svg-use', output]]), isFirstInTurn: true }]} /></MemoryRouter>);
+    expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+    if (density === 'compact') {
+      fireEvent.click(screen.getByRole('button', { name: /present_svg:.*expand tool detail/i }));
+      expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+      fireEvent.click(screen.getByRole('button', { name: 'Collapse expanded tool detail' }));
+      expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+    }
+  });
+});
