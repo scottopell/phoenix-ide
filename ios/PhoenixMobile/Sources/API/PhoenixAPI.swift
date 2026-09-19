@@ -403,7 +403,12 @@ struct PhoenixAPI: Sendable {
         } else {
             "api/conversations/\(reference)"
         }
-        var request = URLRequest(url: baseURL.appending(path: path))
+        var request = try request(path: path)
+        if chainRootId == nil {
+            struct OkResponse: Codable { var ok: Bool? }
+            _ = try await post("api/conversations/\(reference)/delete", body: [:], as: OkResponse.self)
+            return
+        }
         request.httpMethod = "DELETE"
         let (data, response) = try await session.data(for: request)
         try validateStatus(response, data: data)

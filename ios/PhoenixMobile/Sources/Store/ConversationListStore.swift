@@ -161,6 +161,7 @@ final class ConversationListStore {
             return Conversation(
                 id: incoming.id,
                 product_conversation_id: incoming.product_conversation_id,
+                chain_root_id: incoming.chain_root_id,
                 slug: incoming.slug,
                 title: incoming.title,
                 model: incoming.model,

@@ -132,6 +132,7 @@ final class AppModel {
         Conversation(
             id: existing.id == liveUpdate.id ? liveUpdate.id : existing.id,
             product_conversation_id: aggregateIdentity,
+            chain_root_id: existing.chain_root_id,
             slug: existing.slug,
             title: existing.title,
             model: liveUpdate.model,
