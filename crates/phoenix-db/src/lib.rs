@@ -17794,12 +17794,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_receives_restricted_authority() {
+    fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
-        assert_eq!(
-            Database::authority_for_mode(&cm),
-            AuthorityKind::RestrictedExplore
-        );
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
     }
 
     #[tokio::test]

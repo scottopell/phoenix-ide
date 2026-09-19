@@ -4902,17 +4902,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { .. }
-                | ModeContext::Direct
-                | ModeContext::Branch { .. }
-                | ModeContext::AttachedWorkChild { .. }
-                | ModeContext::DetachedApprovedTask { .. },
-            ) => true,
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let parent_allows_work =
+            self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -4920,9 +4911,8 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in a write-capable mode \
-                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
-                         for read-only sub-agents."
+                        "Work sub-agents require Work authority on the parent WorkScope. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -4965,17 +4955,12 @@ where
         // `cwd` must stay inside the parent's worktree. Without this guard
         // a Work sub-agent could write outside the worktree because its
         // own runtime would see a different working_dir than the parent.
-        // Direct parents have no worktree to scope against -- writes there
-        // are unscoped by design -- so the check only fires for parents
-        // that own a worktree (Work/Branch).
-        let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { worktree_path, .. }
-                | ModeContext::Branch { worktree_path, .. }
-                | ModeContext::DetachedApprovedTask { worktree_path, .. },
-            ) => Some(worktree_path.as_str()),
-            _ => None,
-        };
+        // Direct parents have no WorkScope worktree, so writes there are unscoped by design.
+        let parent_worktree_path = self
+            .context
+            .work_scope_worktree
+            .as_ref()
+            .map(|path| path.to_string_lossy());
         // Resolve and validate every spec BEFORE sending any spawn request.
         // Model validation can fail per-task; doing it inside the send loop
         // would leave earlier tasks already spawned (and untracked, since the
@@ -5020,9 +5005,11 @@ where
             };
 
             if mode == SubAgentMode::Work
-                && parent_worktree_path.is_some_and(|root| !path_is_within(&cwd, root))
+                && parent_worktree_path
+                    .as_deref()
+                    .is_some_and(|root| !path_is_within(&cwd, root))
             {
-                let worktree_root = parent_worktree_path.expect("checked as present");
+                let worktree_root = parent_worktree_path.as_deref().expect("checked as present");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
                     format!(
@@ -8581,7 +8568,10 @@ where
             usage_data: None,
             created_at: Utc::now(),
         };
-        self.storage
+        let approved_state = ConvState::LlmRequesting { attempt: 1 };
+        let state_updated_at = Utc::now();
+        let establishment = self
+            .storage
             .persist_approved_task_authority_and_state(
                 &self.context.conversation_id,
                 &TaskApprovalHandoffData {
@@ -8594,11 +8584,22 @@ where
                     artifact_body: reviewed.artifact_body,
                 },
                 &message,
-                &self.state,
-                self.state_updated_at,
+                &approved_state,
+                state_updated_at,
             )
             .await
             .map_err(FollowUpApprovalError::AuthorityLost)?;
+        if matches!(
+            establishment,
+            crate::db::LocalAuthorityResult::DurableFactUnclassified
+        ) {
+            admitted.close("follow_up_approval_authority_establishment");
+            return Err(FollowUpApprovalError::AuthorityLost(
+                "approval authority establishment is unclassified".to_string(),
+            ));
+        }
+        self.state = approved_state;
+        self.state_updated_at = state_updated_at;
 
         let _ = self
             .broadcast_tx
@@ -15791,6 +15792,45 @@ mod approved_explore_follow_up_tests {
     }
 
     #[tokio::test]
+    async fn follow_up_unclassified_commit_closes_authority_fence() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-unclassified",
+            "task-72003-existing-unclassified",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_approval_authority_unclassified(true);
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, plan, storage, broadcast_tx);
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = authority_fence.subscribe();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect_err("unclassified follow-up must fail stop");
+
+        assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("follow_up_approval_authority_establishment")
+        );
+    }
+
+    #[tokio::test]
     async fn follow_up_approval_preserves_existing_branch_and_replaces_objective() {
         let (_tmp, repo_root) = init_repo();
         let worktree = PathBuf::from(add_worktree(
@@ -15871,6 +15911,11 @@ mod approved_explore_follow_up_tests {
             "unrelated staged work must remain staged"
         );
         assert_eq!(storage.recorded_messages().len(), 1);
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        assert_eq!(
+            storage.get_current_state("approved-explore-follow-up"),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        );
         let replacement = storage
             .approved_task_authority("approved-explore-follow-up")
             .expect("replacement objective");
@@ -19786,6 +19831,14 @@ mod work_subagent_cwd_guard_tests {
             "gpt-5.6-sol",
             200_000,
         );
+        context.resource_authority = match &mode_context {
+            ModeContext::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        };
+        context.work_scope_worktree = match &mode_context {
+            ModeContext::Direct => None,
+            _ => Some(working_dir.to_path_buf()),
+        };
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
 
@@ -19979,6 +20032,41 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(
             rt.active_work_subagents, 0,
             "rejected spawn must not increment active_work_subagents"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_explore_origin_accepts_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_mode(
+            worktree.path(),
+            ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            },
+        )
+        .with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "implement the fix".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    execution: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
+        assert_eq!(
+            spawn_rx.try_recv().expect("Work spawn request").spec.mode,
+            SubAgentMode::Work
         );
     }
 
