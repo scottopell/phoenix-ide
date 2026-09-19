@@ -5457,11 +5457,16 @@ fn canonicalize_quarantine_for_descriptor_scan(path: &Path) -> Result<PathBuf, S
 }
 
 #[cfg(target_os = "linux")]
+fn linux_descriptor_is_deleted(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.nlink() == 0
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
-    use std::os::unix::fs::MetadataExt as _;
     let canonical = canonicalize_quarantine_for_descriptor_scan(path)?;
     let effective_uid = unsafe { libc::geteuid() };
     let processes = std::fs::read_dir(proc_root).map_err(|error| {
@@ -5518,7 +5523,7 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
-            if target_metadata.nlink() == 0 {
+            if linux_descriptor_is_deleted(&target_metadata) {
                 continue;
             }
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
