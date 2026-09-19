@@ -59,8 +59,9 @@ class FakeLaunchctl:
 
 
 def make_manifest(root: Path, *, expected=None, previous=None):
-    expected = expected or helper.Identity("2.0.0", "newsha")
-    previous = previous or helper.Identity("1.0.0", "oldsha")
+    source_commit = "b" * 40
+    expected = expected or helper.Identity("2.0.0", source_commit)
+    previous = previous or helper.Identity("1.0.0", "a" * 12)
     files = {}
     for name, content in {
         "candidate_binary": b"new binary",
@@ -73,10 +74,10 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         files[name] = path
     return helper.Manifest(
         manifest_version=helper.HANDOFF_PROTOCOL_VERSION,
-        transaction_id="tx", source_kind="published_release", source_commit="newsha",
-        release_tag="v2.0.0", release_commit="newsha0000000000000000000000000000000000",
+        transaction_id="tx", source_kind="published_release", source_commit=source_commit,
+        release_tag="v2.0.0", release_commit=source_commit,
         expected=expected, previous=previous,
-        previous_deployed_sha="old-full-sha" if previous is not None else None,
+        previous_deployed_sha="a" * 40 if previous is not None else None,
         candidate_binary=str(files["candidate_binary"]), candidate_binary_sha256=helper.sha256(files["candidate_binary"]),
         candidate_plist=str(files["candidate_plist"]), candidate_plist_sha256=helper.sha256(files["candidate_plist"]),
         rollback_binary=str(files["rollback_binary"]), rollback_binary_sha256=helper.sha256(files["rollback_binary"]),
@@ -93,6 +94,28 @@ def make_manifest(root: Path, *, expected=None, previous=None):
 
 
 class ActivationTests(unittest.TestCase):
+    def test_manifest_rejects_short_candidate_before_disruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(
+                Path(td), expected=helper.Identity("2.0.0", "b" * 12)
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "exact full source commit"):
+                helper.activate(manifest)
+            self.assertFalse(Path(manifest.status_path).exists() and "activating" in Path(manifest.status_path).read_text())
+
+    def test_manifest_accepts_legacy_previous_only_in_rollback_role(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            helper.validate_manifest_identities(manifest)
+            self.assertEqual(12, len(manifest.previous.git_sha))
+
+    def test_manifest_rejects_malformed_previous_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(
+                Path(td), previous=helper.Identity("1.0.0", "a" * 13)
+            )
+            with self.assertRaisesRegex(helper.ActivationError, "previous runtime identity"):
+                helper.validate_manifest_identities(manifest)
     def test_missing_service_text_is_treated_as_unloaded(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -133,8 +156,8 @@ class ActivationTests(unittest.TestCase):
                  mock.patch.object(helper.os, "replace", wraps=os.replace) as replace:
                 state = helper.activate(manifest)
             self.assertEqual("committed", state)
-            self.assertEqual("newsha\n", Path(manifest.deployed_sha_path).read_text())
-            self.assertEqual(["stop", "start", "verified:newsha"], events)
+            self.assertEqual("b" * 40 + "\n", Path(manifest.deployed_sha_path).read_text())
+            self.assertEqual(["stop", "start", f"verified:{'b' * 40}"], events)
             live_binary_replaces = [call for call in replace.call_args_list if Path(call.args[1]) == Path(manifest.target_binary)]
             self.assertEqual(1, len(live_binary_replaces))
             self.assertNotEqual(Path(manifest.target_binary), Path(live_binary_replaces[0].args[0]))
@@ -173,8 +196,8 @@ class ActivationTests(unittest.TestCase):
                  mock.patch.object(helper, "wait_for_identity", side_effect=verify):
                 state = helper.activate(manifest)
             self.assertEqual("activation_failed_rolled_back", state)
-            self.assertEqual(["newsha", "oldsha"], identities)
-            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
+            self.assertEqual(["b" * 40, "a" * 12], identities)
+            self.assertEqual("a" * 40 + "\n", Path(manifest.deployed_sha_path).read_text())
             self.assertEqual(b"old binary", Path(manifest.target_binary).read_bytes())
             self.assertEqual(state, json.loads(Path(manifest.status_path).read_text())["state"])
 
@@ -185,7 +208,7 @@ class ActivationTests(unittest.TestCase):
             launchctl = FakeLaunchctl(manifest)
             with mock.patch.object(helper, "wait_for_identity"):
                 helper.restore(manifest, launchctl)
-            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
+            self.assertEqual("a" * 40 + "\n", Path(manifest.deployed_sha_path).read_text())
 
     def test_failed_rollback_is_explicit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -343,7 +366,7 @@ class PreparationTests(unittest.TestCase):
     def test_controller_release_revalidates_exact_tag_to_expected_commit(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456" + "0" * 28}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
@@ -419,7 +442,7 @@ class PreparationTests(unittest.TestCase):
     def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456" + "0" * 28}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
@@ -437,7 +460,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(candidate.binary.stat().st_mode & 0o100)
         self.assertEqual(self.dev.ProdSourceKind.PUBLISHED_RELEASE, candidate.source_kind)
         self.assertEqual(
-            ("v1.2.3", "abc123def456", release_commit),
+            ("v1.2.3", release_commit, release_commit),
             (candidate.release_tag, candidate.identity.git_sha, candidate.release_commit),
         )
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
@@ -478,7 +501,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_local_candidate_binds_exact_head_to_typed_identity(self):
         commit = "abc123def456" + "0" * 28
-        identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+        identity = self.dev.RuntimeIdentity("2.0.0", commit)
         with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")) as build, \
              mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
              mock.patch.object(
@@ -499,14 +522,14 @@ class PreparationTests(unittest.TestCase):
              mock.patch.object(
                  self.dev,
                  "_binary_identity",
-                 return_value=self.dev.RuntimeIdentity("2.0.0", "bbbbbbbbbbbb"),
+                 return_value=self.dev.RuntimeIdentity("2.0.0", "b" * 40),
              ), \
              mock.patch.object(
                  self.dev.subprocess,
                  "run",
                  return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
              ):
-            with self.assertRaisesRegex(SystemExit, "does not match selected HEAD"):
+            with self.assertRaisesRegex(SystemExit, "does not exactly match selected HEAD"):
                 self.dev._prepare_local_candidate(target=None)
 
     def test_claim_release_is_transaction_owned(self):
@@ -831,11 +854,12 @@ class PreparationTests(unittest.TestCase):
             candidate.write_bytes(b"candidate")
             active_path = root / "deploy" / "active"
             status_path = root / "deploy" / "status.json"
-            identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+            commit = "abc123def456" + "0" * 28
+            identity = self.dev.RuntimeIdentity("2.0.0", commit)
             prepared = self.dev.PreparedCandidate(
                 binary=candidate,
                 source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
-                source_commit="abc123def456" + "0" * 28,
+                source_commit=commit,
                 identity=identity,
             )
 

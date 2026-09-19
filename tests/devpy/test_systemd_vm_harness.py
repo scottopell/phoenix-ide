@@ -72,7 +72,7 @@ class ProductionGuardTests(unittest.TestCase):
         self.assertIn('run(["limactl", "restart"', source)
         self.assertIn("reboot unit diagnostics", source)
         self.assertIn("/api/version", source)
-        self.assertIn("bbbbbbbbbbbb", source)
+        self.assertIn('== "b" * 40', source)
         self.assertIn("new_pid == previous_pid", source)
         self.assertIn('state != "committed"', source)
 

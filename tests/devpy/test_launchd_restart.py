@@ -40,7 +40,7 @@ def make_manifest(root: Path) -> helper.Manifest:
     return helper.Manifest(
         manifest_version=helper.HANDOFF_PROTOCOL_VERSION,
         transaction_id="restart-tx",
-        expected=helper.Identity("2.0.0", "aaaaaaaaaaaa"),
+        expected=helper.Identity("2.0.0", "a" * 40),
         previous_pid=100,
         binary_path=str(binary),
         binary_sha256=helper.sha256(binary),
@@ -141,10 +141,40 @@ class RestartHelperTests(unittest.TestCase):
             ):
                 helper.Launchctl(manifest, run=run).inspect()
 
+    def test_short_restart_identity_is_rejected_before_target_disruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = dataclasses.replace(
+                make_manifest(root),
+                expected=helper.Identity("2.0.0", "a" * 12),
+            )
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+            argv = [
+                "launchd_restart_helper.py",
+                "restart",
+                "--manifest",
+                str(manifest_path),
+                "--helper-label",
+                manifest.helper_label,
+                "--uid",
+                str(manifest.uid),
+            ]
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "restart") as restart, \
+                 mock.patch.object(helper, "request_helper_bootout"), \
+                 mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(1, helper.main())
+
+            restart.assert_not_called()
+            self.assertIn("requires a full lowercase git SHA", stderr.getvalue())
+            self.assertFalse(Path(manifest.status_path).exists())
+
     def test_identity_probe_requires_runtime_socket_activation(self):
         response = io.BytesIO(json.dumps({
             "version": "2.0.0",
-            "git_sha": "aaaaaaaaaaaa",
+            "git_sha": "a" * 40,
             "socket_activated": False,
         }).encode())
         with mock.patch.object(helper.urllib.request, "urlopen", return_value=response):
@@ -531,7 +561,7 @@ class RestartCommandTests(unittest.TestCase):
             deploy_dir.mkdir()
             deploy_status = deploy_dir / "status.json"
             deploy_status.write_text('{"state":"committed","source_kind":"published_release"}\n')
-            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
             commands = []
 
             def run(command, **_kwargs):
@@ -601,7 +631,7 @@ class RestartCommandTests(unittest.TestCase):
             plist.write_bytes(self._installed_plist(binary))
             deployed_sha = root / "deployed.sha"
             deployed_sha.write_text("a" * 40 + "\n")
-            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
             commands = []
 
             def run(command, **_kwargs):
@@ -663,7 +693,7 @@ class RestartCommandTests(unittest.TestCase):
             plist.write_bytes(self._installed_plist(binary))
             deployed_sha = root / "deployed.sha"
             deployed_sha.write_text("a" * 40 + "\n")
-            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            identity = self.dev.RuntimeIdentity("2.0.0", "a" * 40)
             installed = self.dev.InstalledLaunchdRuntime(
                 binary=self.dev.ValidatedLaunchdArtifact(
                     binary,
@@ -1015,7 +1045,7 @@ class RestartCommandTests(unittest.TestCase):
     def test_restart_identity_probe_rejects_non_socket_runtime(self):
         response = io.BytesIO(json.dumps({
             "version": "2.0.0",
-            "git_sha": "aaaaaaaaaaaa",
+            "git_sha": "a" * 40,
             "socket_activated": False,
         }).encode())
         with mock.patch.object(

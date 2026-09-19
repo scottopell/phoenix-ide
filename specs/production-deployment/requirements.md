@@ -12,7 +12,7 @@ When an operator invokes a production command, the system shall select launchd o
 
 ### REQ-PD-002 — Explicit candidate sources
 
-The local deployment command shall run required checks, build exact local `HEAD`, require the embedded identity to match that commit, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum and embedded identity, and shall not run repository checks, install dependencies, mutate the worktree, or compile.
+The local deployment command shall run required checks, build exact local `HEAD`, require the candidate to embed that complete 40-character lowercase commit SHA, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum, and require the candidate's complete 40-character lowercase embedded SHA to equal the selected commit exactly; it shall not run repository checks, install dependencies, mutate the worktree, or compile.
 
 ### REQ-PD-003 — Complete preparation before disruption
 
@@ -40,11 +40,15 @@ When installing a candidate or restoring rollback state, the activation owner sh
 
 ### REQ-PD-009 — Exact runtime verification
 
-A deployment shall commit only after observing a new backend-owned runtime process and verifying that its credential-free version endpoint reports the exact expected package version and full embedded git SHA. Bare Linux shall additionally bind verification to the supervisor's direct child PID and `/proc` start time.
+A deployment shall commit only after observing a new backend-owned runtime process and verifying that its credential-free version endpoint reports the exact expected package version and complete 40-character lowercase embedded git SHA. The candidate SHA shall equal the transaction's selected full source commit exactly; prefix equality shall not establish candidate identity. Bare Linux shall additionally bind verification to the supervisor's direct child PID and `/proc` start time.
 
 ### REQ-PD-010 — Verified rollback
 
-If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the previous exact identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful rollback from rollback failure.
+If activation fails after disruption, the activation owner shall stop the candidate, atomically restore the previous binary, backend configuration, environment snapshot, and service state, verify the captured previous runtime identity at its previous endpoint, restore the previous deployed SHA, and durably distinguish successful runtime-artifact rollback from rollback failure.
+
+Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit a 12-character identity for a candidate, controller, release asset, newly installed runtime, or general downgrade path, and shall not establish cross-version deployment compatibility.
+
+Automated rollback shall restore runtime artifacts only. It shall not restore a database or guarantee that the restored binary can use a database changed by the failed candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
 
 ### REQ-PD-011 — Truthful durable status and recovery
 
@@ -61,6 +65,13 @@ Each backend shall support `prod deploy`, `prod deploy --release TAG|latest`, `p
 ### REQ-PD-014 — Persistent bare-Linux ownership
 
 On bare Linux, an owner-only supervisor shall directly parent Phoenix, authenticate clients through an owner-only Unix socket and Linux peer credentials, accept only a transaction ID plus manifest hash, and reject stale, replayed, concurrent, malformed, or tampered handoffs. `prod stop` shall stop the managed child without stopping the supervisor.
+
+WHEN a bare supervisor is already running
+AND the startup-bound digest reported by that running supervisor is not byte-for-byte the selected supervisor artifact digest
+THE SYSTEM SHALL refuse deployment before disrupting production
+EVEN WHEN both supervisors report the same protocol version.
+
+THE SYSTEM SHALL NOT replace, restart, or reuse a changed running supervisor as a general controller-compatibility mechanism.
 
 ### REQ-PD-015 — Honest bare-Linux reboot persistence
 

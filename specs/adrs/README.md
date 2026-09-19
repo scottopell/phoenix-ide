@@ -74,6 +74,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
 | [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
 | [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
+| [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
+| [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 
 ## For agents: which decisions bind your task
 
@@ -112,7 +114,8 @@ Consult the relevant ADRs before starting work of each kind.
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
-| Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-058 (non-binding), then 034, 018, and 017 |
+| Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-063 (non-binding), then 034, 018, and 017 |
+| Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
@@ -146,7 +149,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
-      │   │       └── ADR-058 [Proposed] (direct distribution uses protected signing and private draft publication)
+      │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
+      │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)

@@ -9,7 +9,7 @@ mkdir -p "$tmp/bin" "$tmp/out" "$tmp/runner" "$tmp/tmpdir"
 cat >"$tmp/sidecar" <<'EOF'
 #!/bin/sh
 if [ "$1" = --build-identity ]; then
-  printf '{"version":"1.2.3","git_sha":"%s"}\n' "${FAKE_EMBEDDED_SHA:-0123456789ab}"
+  printf '{"version":"1.2.3","git_sha":"%s"}\n' "${FAKE_EMBEDDED_SHA:-0123456789abcdef0123456789abcdef01234567}"
 fi
 EOF
 chmod +x "$tmp/sidecar"
@@ -19,8 +19,6 @@ cat >"$tmp/bin/git" <<'EOF'
 set -euo pipefail
 if [[ "$*" == *"rev-parse HEAD" ]]; then
   printf '%s\n' "${FAKE_CHECKOUT_COMMIT:-0123456789abcdef0123456789abcdef01234567}"
-elif [[ "$*" == *"rev-parse 0123456789ab^{commit}" ]]; then
-  printf '%s\n' "${FAKE_RESOLVED_COMMIT:-0123456789abcdef0123456789abcdef01234567}"
 else
   exit 2
 fi
@@ -189,7 +187,14 @@ if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567-dirty >/dev/null
   exit 1
 fi
 
-export FAKE_EMBEDDED_SHA=0123456789ab-dirty
+export FAKE_EMBEDDED_SHA=0123456789ab
+if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
+  echo "expected 12-character embedded SHA to fail" >&2
+  exit 1
+fi
+unset FAKE_EMBEDDED_SHA
+
+export FAKE_EMBEDDED_SHA=0123456789abcdef0123456789abcdef01234567-dirty
 if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
   echo "expected dirty embedded SHA to fail" >&2
   exit 1
@@ -203,12 +208,12 @@ if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1;
 fi
 unset FAKE_EMBEDDED_SHA
 
-export FAKE_RESOLVED_COMMIT=ffffffffffffffffffffffffffffffffffffffff
+export FAKE_EMBEDDED_SHA=0123456789abffffffffffffffffffffffffffff
 if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
-  echo "expected resolved sidecar commit mismatch to fail" >&2
+  echo "expected same-prefix sidecar commit with a mismatched tail to fail" >&2
   exit 1
 fi
-unset FAKE_RESOLVED_COMMIT
+unset FAKE_EMBEDDED_SHA
 
 export FAKE_CHECKOUT_COMMIT=ffffffffffffffffffffffffffffffffffffffff
 if run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then

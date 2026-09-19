@@ -67,7 +67,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             binary.write_text("binary")
             helper_source = base / "helper.py"
             helper_source.write_text("print(1)\n")
-            identity = self.dev.RuntimeIdentity("2.0.0", "b" * 12)
+            identity = self.dev.RuntimeIdentity("2.0.0", "b" * 40)
             candidate = self.dev.PreparedCandidate(
                 binary=binary,
                 source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,

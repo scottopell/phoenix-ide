@@ -22,6 +22,7 @@ import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
 import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
 import type { ManagedResourceCategory } from '../generated/ManagedResourceCategory';
+import { formatGitShaForDisplay } from '../utils';
 import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
 import './AboutDeploymentPage.css';
 
@@ -207,7 +208,9 @@ function DeploymentSummary({ info }: { info: DeploymentInfo }) {
           <span className="about-deployment-summary__eyebrow">Running Phoenix</span>
           <h3 id="deployment-summary-title">Version {info.build.version}</h3>
         </div>
-        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{info.build.git_sha}</code>
+        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>
+          {formatGitShaForDisplay(info.build.git_sha)}
+        </code>
       </div>
       <div className="about-deployment-summary__facts">
         <div className="about-deployment-summary__fact">

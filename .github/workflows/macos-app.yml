@@ -61,7 +61,6 @@ jobs:
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           full_commit=$(git rev-parse HEAD)
-          short_commit=$(git rev-parse --short=12 HEAD)
           host_arch=$(uname -m)
           case "$host_arch" in
             arm64) target=aarch64-apple-darwin ;;
@@ -79,7 +78,7 @@ jobs:
             return 0;
           }
           EOF
-          python3 - "$RUNNER_TEMP/phoenix_fixture.c" "$version" "$short_commit" <<'PY'
+          python3 - "$RUNNER_TEMP/phoenix_fixture.c" "$version" "$full_commit" <<'PY'
           import sys
           from pathlib import Path
           path = Path(sys.argv[1])
