@@ -1514,9 +1514,15 @@ fn resolve_predecessor_read_target(
             "requested transcript is not a predecessor of the executing transcript".to_string(),
         );
     }
-    let Some(conversation) = predecessors.iter().find(|conversation| {
-        conversation.id == candidate || conversation.slug.as_deref() == Some(candidate)
-    }) else {
+    let Some(conversation) = predecessors
+        .iter()
+        .find(|conversation| conversation.id == candidate)
+        .or_else(|| {
+            predecessors
+                .iter()
+                .find(|conversation| conversation.slug.as_deref() == Some(candidate))
+        })
+    else {
         return Err(
             "requested transcript is not a predecessor of the executing transcript".to_string(),
         );
@@ -2745,6 +2751,38 @@ mod tests {
             nonmember_message,
             "requested transcript is not a predecessor of the executing transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn predecessor_read_prefers_stable_id_over_another_predecessors_slug() {
+        let (service, binding) = predecessor_service().await;
+        let predecessors = service.predecessor_conversations(&binding).await.unwrap();
+        let later = &predecessors[1];
+        sqlx::query("UPDATE conversations SET slug = ?1 WHERE id = ?2")
+            .bind(&later.id)
+            .bind(&predecessors[0].id)
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+
+        let output = service
+            .read_predecessor_conversation(
+                &binding,
+                &format!("@conv:{}#message-b-msg", later.id),
+                None,
+            )
+            .await;
+
+        let PreviousTranscriptsOutput::ReadPage {
+            transcript,
+            starts_at,
+            ..
+        } = output
+        else {
+            panic!("stable ID must resolve before a colliding slug");
+        };
+        assert_eq!(transcript.conversation_id, later.id);
+        assert_eq!(starts_at.unwrap().message_id, "b-msg");
     }
 
     #[tokio::test]
