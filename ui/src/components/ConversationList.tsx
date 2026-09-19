@@ -40,6 +40,7 @@ interface ConversationListProps {
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
   onProductConversationClose?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationDelete?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -182,6 +183,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   effectiveCwd,
   onClick,
   onProductConversationClose,
+  onProductConversationDelete,
   onProductConversationRename,
 }: {
   row: ProductConversationListRow;
@@ -190,6 +192,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   effectiveCwd?: string | undefined;
   onClick: (row: ProductConversationListRow) => void;
   onProductConversationClose?: (row: ProductConversationListRow) => void;
+  onProductConversationDelete?: (row: ProductConversationListRow) => void;
   onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
   const classes = [
@@ -243,7 +246,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {(onProductConversationRename || onProductConversationClose) && (
+      {(onProductConversationRename || onProductConversationClose || onProductConversationDelete) && (
         <div className="conv-actions">
           {onProductConversationRename && row.lifecycle.state === 'open'
             && !(row.lifecycle.close_action.availability === 'unavailable'
@@ -256,6 +259,17 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               title="Rename"
             >
               ✎
+            </button>
+          )}
+          {onProductConversationDelete && row.lifecycle.state === 'history' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              onClick={(event) => { event.stopPropagation(); onProductConversationDelete(row); }}
+              aria-label={`Delete product conversation ${displayTitle}`}
+              title="Delete permanently"
+            >
+              ×
             </button>
           )}
           {onProductConversationClose && closeAction?.availability === 'available' && (
@@ -657,6 +671,7 @@ export function ConversationList({
   onProductConversationRename,
   onProductConversationClose,
   activeSlug,
+  onProductConversationDelete,
   sidebarMode,
   listDensity,
   authChip,
@@ -907,6 +922,7 @@ export function ConversationList({
                 else navigate(productRow.canonical_route);
               }}
               {...(onProductConversationClose ? { onProductConversationClose } : {})}
+              {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
               {...(onProductConversationRename ? { onProductConversationRename } : {})}
             />
           ))
