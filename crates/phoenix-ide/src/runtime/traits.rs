@@ -442,6 +442,7 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String>;
 
+    #[allow(dead_code)]
     async fn persist_approved_task_authority(
         &self,
         conv_id: &str,

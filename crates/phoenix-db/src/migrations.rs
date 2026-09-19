@@ -515,6 +515,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
+    Migration {
+        version: 101,
+        name: "repair_direct_execution_authority",
+        sql: MIGRATION_101,
+    },
+    Migration {
+        version: 102,
+        name: "enforce_authority_timestamp_storage_class",
+        sql: MIGRATION_102,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -1320,8 +1330,7 @@ CREATE TABLE product_conversation_sources (
     relation_kind TEXT NOT NULL CHECK (relation_kind IN ('approved_task')),
     relation_key TEXT NOT NULL
         CHECK (typeof(relation_key) = 'text' AND relation_key <> ''),
-    created_at_us INTEGER NOT NULL
-        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
     CHECK (target_product_conversation_id <> source_product_conversation_id)
 );
 
@@ -10318,14 +10327,12 @@ CREATE TABLE conversation_approved_task_objectives (
     task_id TEXT NOT NULL CHECK (trim(task_id) <> ''), task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
     approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''), approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
     approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''), approved_artifact_body TEXT NOT NULL,
-    created_at_us INTEGER NOT NULL
-        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0)
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
 );
 CREATE TABLE work_scope_approved_task_authorities (
     work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
     objective_conversation_id TEXT NOT NULL UNIQUE REFERENCES conversation_approved_task_objectives(conversation_id) ON DELETE CASCADE,
-    created_at_us INTEGER NOT NULL
-        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0)
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
 );";
 
 const MIGRATION_093: &str = r"ALTER TABLE product_creation_resource_reservations
@@ -10347,6 +10354,57 @@ WHERE type = 'table'
   AND name = 'llm_request_metrics'
   AND instr(sql, '''network_error'', ''token_budget_exceeded''') > 0
   AND instr(sql, '''timed_out''') = 0
+";
+
+const MIGRATION_101: &str = r"
+UPDATE work_scopes
+SET authority_kind = 'direct'
+WHERE id IN (
+    SELECT work_scope_id
+    FROM conversations
+    WHERE cm_kind = 'direct'
+      AND work_scope_id IS NOT NULL
+)
+  AND authority_kind = 'restricted_explore';
+";
+
+const MIGRATION_102: &str = r"
+CREATE TABLE conversation_approved_task_objectives_v2 (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
+    task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),
+    approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL,
+    approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''),
+    approved_artifact_body TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0)
+);
+INSERT INTO conversation_approved_task_objectives_v2
+SELECT conversation_id, task_id, task_title, approved_title, approved_priority,
+       approved_plan, approved_task_file, approved_artifact_body,
+       max(CAST(created_at_us AS INTEGER), 0)
+FROM conversation_approved_task_objectives;
+
+CREATE TABLE work_scope_approved_task_authorities_v2 (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    objective_conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversation_approved_task_objectives_v2(conversation_id) ON DELETE CASCADE,
+    created_at_us INTEGER NOT NULL
+        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0)
+);
+INSERT INTO work_scope_approved_task_authorities_v2
+SELECT work_scope_id, objective_conversation_id,
+       max(CAST(created_at_us AS INTEGER), 0)
+FROM work_scope_approved_task_authorities;
+
+DROP TABLE work_scope_approved_task_authorities;
+DROP TABLE conversation_approved_task_objectives;
+ALTER TABLE conversation_approved_task_objectives_v2
+    RENAME TO conversation_approved_task_objectives;
+ALTER TABLE work_scope_approved_task_authorities_v2
+    RENAME TO work_scope_approved_task_authorities;
 ";
 
 #[cfg(test)]
@@ -10591,6 +10649,56 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+    }
+
+    #[test]
+    fn capability_migrations_are_forward_only_and_unique() {
+        let ledger = compiled_migration_ledger();
+        assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(
+            ledger.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            vec![
+                (102, "enforce_authority_timestamp_storage_class"),
+                (101, "repair_direct_execution_authority"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_101_repairs_only_stale_direct_authority() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (id TEXT PRIMARY KEY, authority_kind TEXT NOT NULL);
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 cm_kind TEXT,
+                 work_scope_id TEXT REFERENCES work_scopes(id)
+             );
+             INSERT INTO work_scopes VALUES ('direct', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('explore', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('work', 'work');
+             INSERT INTO conversations VALUES ('d', 'direct', 'direct');
+             INSERT INTO conversations VALUES ('e', 'explore', 'explore');
+             INSERT INTO conversations VALUES ('w', 'work', 'work');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, authority_kind FROM work_scopes ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("direct".to_string(), "direct".to_string()),
+                ("explore".to_string(), "restricted_explore".to_string()),
+                ("work".to_string(), "work".to_string()),
+            ]
+        );
     }
 
     #[test]

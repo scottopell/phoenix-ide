@@ -1994,16 +1994,17 @@ pub enum SseEvent {
     },
 }
 
-fn approved_detached_product_registry(
+fn approved_managed_registry(
     mode: &ConvMode,
-    approved_task_objective_present: bool,
     authority: crate::work_scope::ResourceAuthority,
     agents: Vec<phoenix_agents::AgentDefinition>,
     writing_tools: crate::tools::WritingConversationTools,
 ) -> Result<Option<ToolRegistry>, String> {
     if authority != crate::work_scope::ResourceAuthority::Work
-        || !approved_task_objective_present
-        || !matches!(mode, ConvMode::DetachedProductCreation { .. })
+        || !matches!(
+            mode,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+        )
     {
         return Ok(None);
     }
@@ -3833,7 +3834,18 @@ impl RuntimeManager {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
             },
-            SubAgentMode::Work => parent_conv.conv_mode.clone(),
+            SubAgentMode::Work => match &parent_conv.conv_mode {
+                ConvMode::Explore {
+                    worktree_path: Some(worktree_path),
+                    ..
+                }
+                | ConvMode::DetachedProductCreation { worktree_path, .. } => {
+                    ConvMode::AttachedWorkChild {
+                        worktree_path: worktree_path.clone(),
+                    }
+                }
+                mode => mode.clone(),
+            },
         };
 
         let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
@@ -4934,11 +4946,7 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
-        let approved_task_objective = self
-            .db
-            .get_approved_task_objective(conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
+
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -5111,9 +5119,8 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-                let approved_registry = approved_detached_product_registry(
+                let approved_registry = approved_managed_registry(
                     &conv.conv_mode,
-                    approved_task_objective.is_some(),
                     context.resource_authority,
                     agent_catalog.to_vec(),
                     writing_tools.clone(),
@@ -6413,7 +6420,7 @@ mod bash_lifecycle_bridge_tests {
 
 #[cfg(test)]
 mod approved_objective_registry_tests {
-    use super::approved_detached_product_registry;
+    use super::approved_managed_registry;
     use crate::tools::{ToolContext, ToolOutput};
     use crate::work_scope::ResourceAuthority;
     use async_trait::async_trait;
@@ -6455,15 +6462,11 @@ mod approved_objective_registry_tests {
             Arc::new(WritingMarker("send_conversation_message")),
         )
         .unwrap();
-        assert!(approved_detached_product_registry(
-            &mode,
-            true,
-            ResourceAuthority::Work,
-            vec![],
-            writing_tools,
-        )
-        .unwrap()
-        .is_some());
+        assert!(
+            approved_managed_registry(&mode, ResourceAuthority::Work, vec![], writing_tools,)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -6472,9 +6475,8 @@ mod approved_objective_registry_tests {
             worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
         };
-        let registry = approved_detached_product_registry(
+        let registry = approved_managed_registry(
             &mode,
-            true,
             ResourceAuthority::Work,
             vec![],
             crate::tools::WritingConversationTools::new(
@@ -6500,7 +6502,7 @@ mod approved_objective_registry_tests {
     }
 
     #[test]
-    fn detached_product_creation_requires_both_work_authority_and_approved_objective() {
+    fn detached_product_creation_requires_work_authority() {
         let mode = ConvMode::DetachedProductCreation {
             worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
@@ -6514,18 +6516,8 @@ mod approved_objective_registry_tests {
             )
             .unwrap()
         };
-        assert!(approved_detached_product_registry(
+        assert!(approved_managed_registry(
             &mode,
-            false,
-            ResourceAuthority::Work,
-            vec![],
-            writing_tools(),
-        )
-        .unwrap()
-        .is_none());
-        assert!(approved_detached_product_registry(
-            &mode,
-            true,
             ResourceAuthority::Restricted,
             vec![],
             writing_tools(),

@@ -3214,6 +3214,10 @@ where
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_task_approval_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ApproveTask { .. }));
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
@@ -3222,6 +3226,9 @@ where
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
             });
+        } else if is_task_approval_adoption {
+            // Approval persists the proposed state atomically with its objective and
+            // WorkScope authority before this state becomes live.
         } else {
             let state_changed = result.new_state != old_state;
             let retry_has_durable_fact = matches!(
@@ -6877,11 +6884,6 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
-        let has_approved_task_write_authority =
-            matches!(
-                self.context.resource_authority,
-                crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -6923,13 +6925,12 @@ where
             tool.input_schema = catalog.schema();
             self.spawn_catalog = Some(catalog);
         }
-        let explore_bash_capability =
-            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
-                explore_bash
-            } else {
-                phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-            };
-        let mut system_prompt = if is_coordinator {
+        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
+            self.context.resource_authority,
+            mode_context.as_ref(),
+            explore_bash,
+        );
+        let system_prompt = if is_coordinator {
             crate::system_prompt::build_coordinator_system_prompt(llm_language)
         } else {
             build_system_prompt(
@@ -6944,11 +6945,6 @@ where
                 explore_bash_capability,
             )
         };
-        if has_approved_task_write_authority {
-            system_prompt.push_str(
-                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
-            );
-        }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -8657,8 +8653,31 @@ where
 
         match result {
             Ok(approval_result) => {
+                let branch_msg = format!(
+                    "Task approved. You are on branch {} in {}.\n\n\
+                     ## Approved plan: {}\n\n\
+                     Priority: {}\n\n\
+                     {}",
+                    approval_result.branch_name,
+                    approval_result.worktree_path,
+                    title_backup,
+                    priority_backup,
+                    plan_backup,
+                );
+                let msg = crate::db::Message {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: crate::db::MessageType::User,
+                    content: MessageContent::User(crate::db::UserContent::meta(&branch_msg)),
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                };
+                let approved_state = ConvState::LlmRequesting { attempt: 1 };
+                let state_updated_at = Utc::now();
                 storage
-                    .persist_approved_task_authority(
+                    .persist_approved_task_authority_and_state(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
                             task_id: approval_result.task_id.clone(),
@@ -8669,8 +8688,13 @@ where
                             task_file: task_file_backup.clone(),
                             artifact_body: approval_result.artifact_body.clone(),
                         },
+                        &msg,
+                        &approved_state,
+                        state_updated_at,
                     )
                     .await?;
+                self.state = approved_state;
+                self.state_updated_at = state_updated_at;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Upgrade tool registry from Explore to Work mode so the agent
@@ -8687,35 +8711,6 @@ where
                     "Task approved — worktree created"
                 );
 
-                // Persist as a user message so the LLM sees the approval + plan context.
-                // This must be the last message before the next LLM call to avoid ending
-                // on an assistant message (Anthropic rejects trailing assistant as
-                // "prefill").
-                let branch_msg = format!(
-                    "Task approved. You are on branch {} in {}.\n\n\
-                     ## Approved plan: {}\n\n\
-                     Priority: {}\n\n\
-                     {}",
-                    approval_result.branch_name,
-                    approval_result.worktree_path,
-                    title_backup,
-                    priority_backup,
-                    plan_backup,
-                );
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &msg_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        None,
-                        None,
-                    )
-                    .await?;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)

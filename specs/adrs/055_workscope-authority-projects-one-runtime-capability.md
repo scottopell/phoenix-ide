@@ -1,10 +1,4 @@
-<<<<<<<< HEAD:specs/adrs/055_workscope-authority-projects-one-runtime-capability.md
 # ADR-055: WorkScope authority projects one runtime capability
-|||||||| parent of 07af41155 (fix: reserve capability migration chronology):specs/adrs/051_workscope-authority-projects-one-runtime-capability.md
-# ADR-051: WorkScope authority projects one runtime capability
-========
-# ADR-053: WorkScope authority projects one runtime capability
->>>>>>>> 07af41155 (fix: reserve capability migration chronology):specs/adrs/053_workscope-authority-projects-one-runtime-capability.md
 
 - **Status:** Accepted
 - **Date:** 2026-09-13
@@ -22,7 +16,7 @@ The transition crosses a durable commit boundary. Once WorkScope authority is pe
 
 Persisted WorkScope authority is the sole capability authority for an attached conversation. Conversation mode remains provenance and lifecycle context; it does not independently grant or deny execution capabilities.
 
-A runtime uses one typed capability projection containing authority-dependent tool definitions, dispatch policy, Bash isolation, tool context, and sub-agent admission. Approval constructs and validates the complete Work projection, then publishes it as one actor-local transition before post-approval execution resumes.
+A runtime uses one typed capability projection containing authority-dependent tool definitions, dispatch policy, Bash isolation, provider-facing prompt context, tool context, and sub-agent admission. Approval atomically persists the approved-task objective and Work authority, then constructs and publishes the complete Work projection before post-approval execution resumes. The objective records reviewed intent; it is not a prerequisite for capability already granted to Direct, Work, Branch, or other valid creation paths.
 
 A failed projection or publication does not resume with mixed capabilities. Runtime reconstruction derives the complete projection from persisted WorkScope authority. Precreated provider/tool work remains bound to the authority under which it was admitted and cannot cross the publication boundary as newly privileged work.
 
@@ -46,7 +40,7 @@ Rejected as the primary structure. Repeated checks can support defense, but they
 
 ## Compatibility
 
-The authority projection change is forward-only. Migration 099 repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
+The authority projection change is forward-only. A forward migration repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore and strengthens timestamp storage-class checks without changing an already-applied migration; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
 
 ## Consequences
 
