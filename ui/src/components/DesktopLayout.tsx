@@ -144,9 +144,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   useEffect(() => {
     let cancelled = false;
     let inFlight: Promise<void> | null = null;
+    let refreshPending = false;
     let controller: AbortController | null = null;
     const refresh = () => {
-      if (inFlight) return inFlight;
+      if (inFlight) {
+        refreshPending = true;
+        return inFlight;
+      }
       controller = new AbortController();
       const timeout = window.setTimeout(() => controller?.abort(), 15_000);
       inFlight = api.listProductConversations(controller.signal)
@@ -158,6 +162,10 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           window.clearTimeout(timeout);
           controller = null;
           inFlight = null;
+          if (refreshPending && !cancelled) {
+            refreshPending = false;
+            void refresh();
+          }
         });
       return inFlight;
     };
