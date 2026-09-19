@@ -74,8 +74,10 @@ pub enum LlmOutcome {
         message: String,
         recovery_in_progress: bool,
     },
-    /// Request rejected (400, content filter, etc.) — non-retryable
+    /// Request rejected (400) — not automatically retried.
     RequestRejected { message: String },
+    /// Provider content filtering rejected the request.
+    ContentFiltered { message: String },
     /// Provider rejected the assembled prompt. This does not retry the same
     /// request automatically, but persists a user-resumable conversation error.
     PromptRejected { message: String },

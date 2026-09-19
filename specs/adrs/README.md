@@ -66,7 +66,11 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
-| [055](055_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
+| [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
+| [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
+| [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
+| [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
 
 ## For agents: which decisions bind your task
 

@@ -294,10 +294,16 @@ THE SYSTEM SHALL classify it as a prompt-rejection category distinct from a malf
 AND SHALL NOT automatically replay the identical rejected request
 AND SHALL classify the persisted error as user-resumable so a revised message or explicit continuation can recover within the same conversation
 
+WHEN a request fails with an invalid-request classification
+THE SYSTEM SHALL stop automatic retries of that request
+AND SHALL allow the user to retry or dismiss the error within the same conversation
+AND SHALL preserve the conversation identity and persisted transcript through that recovery
+AND SHALL apply this user-resume policy to persisted invalid-request errors without requiring an error-text match or a server restart
+
 WHEN a new error condition is encountered
 THE SYSTEM SHALL require an explicit classification decision before it can be handled
 
-**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion, overloaded-model errors, and prompt rejection are distinct from transient failures — automatically replaying them is wasted work or repeats a request the provider has already refused. Automatic retry safety is not the same capability as user-triggered resume after external action or revised input; auth failures and prompt rejections are non-auto-retryable but remain recoverable in place.
+**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion, overloaded-model errors, and prompt rejection are distinct from transient failures — automatically replaying them is wasted work or repeats a request the provider has already refused. Automatic retry safety is not the same capability as user-triggered resume after external action or revised input. A provider can reject a request because of temporary routing or entitlement state; a bad-request classification alone does not establish that the conversation is permanently unusable.
 
 ---
 

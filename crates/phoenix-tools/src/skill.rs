@@ -9,6 +9,25 @@ use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone)]
+pub struct TrustedInstructions {
+    output: String,
+}
+
+impl TrustedInstructions {
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn into_output(self) -> String {
+        self.output
+    }
+}
+
+fn trusted_builtin_instructions(output: String) -> ToolOutput {
+    ToolOutput::TrustedInstructions(TrustedInstructions { output })
+}
+
 /// Tool that lets the LLM invoke a discovered skill by name.
 ///
 /// Delivers the skill body as a tool result (not a user-role message).
@@ -16,36 +35,63 @@ use serde_json::{json, Value};
 /// instructions autonomously; tool result is the correct delivery weight.
 /// The user `/skill` slash path delivers as a user-role message because
 /// the user is issuing a directive. See REQ-SK-002 in specs/skills/.
-pub struct SkillTool;
+pub struct SkillTool {
+    audience: phoenix_skills::SkillAudience,
+    coordinator_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+}
+
+impl Default for SkillTool {
+    fn default() -> Self {
+        Self {
+            audience: phoenix_skills::SkillAudience::Conversation,
+            coordinator_catalog: None,
+        }
+    }
+}
+
+impl SkillTool {
+    #[must_use]
+    pub fn for_global_coordinator(
+        catalog: phoenix_skills::AuthenticatedCoordinatorSkillCatalog,
+    ) -> Self {
+        Self {
+            audience: phoenix_skills::SkillAudience::GlobalCoordinator,
+            coordinator_catalog: Some(catalog),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for SkillTool {
     fn name(&self) -> &'static str {
         "skill"
     }
+    fn clearable(&self) -> bool {
+        self.audience == phoenix_skills::SkillAudience::GlobalCoordinator
+    }
 
     fn description(&self) -> String {
-        "Invoke a skill by name. Skills are project-specific or user-level \
-         capabilities discovered from .claude/skills/ and .agents/skills/ \
-         directories. Use this when a skill would help accomplish the current task."
-            .to_string()
+        match self.audience {
+            phoenix_skills::SkillAudience::Conversation => "Invoke a project or user skill by name. Use this when a skill would help accomplish the current task.".to_string(),
+            phoenix_skills::SkillAudience::GlobalCoordinator => "Invoke an authenticated built-in Coordinator skill by name. Available skills are listed in the system prompt.".to_string(),
+        }
     }
 
     fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["skill_name"],
-            "properties": {
-                "skill_name": {
-                    "type": "string",
-                    "description": "Name of the skill to invoke (e.g., 'build', 'lint', 'deploy')"
-                },
-                "args": {
-                    "type": "string",
-                    "description": "Optional arguments to pass to the skill"
-                }
-            }
-        })
+        let skill_name = json!({
+            "type": "string",
+            "description": "Name of an available skill"
+        });
+        match self.audience {
+            phoenix_skills::SkillAudience::Conversation => json!({
+                "type": "object", "required": ["skill_name"],
+                "properties": {"skill_name": skill_name, "args": {"type": "string", "description": "Optional arguments to pass to the skill"}}
+            }),
+            phoenix_skills::SkillAudience::GlobalCoordinator => json!({
+                "type": "object", "required": ["skill_name"],
+                "properties": {"skill_name": skill_name}
+            }),
+        }
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
@@ -58,11 +104,34 @@ impl Tool for SkillTool {
         if skill_name.is_empty() {
             return ToolOutput::error("skill_name is required");
         }
+        if self.audience == phoenix_skills::SkillAudience::GlobalCoordinator && !args.is_empty() {
+            return ToolOutput::error("authenticated built-in skills do not accept arguments");
+        }
 
-        let skills = phoenix_skills::discover_skills(ctx.working_dir());
-        match phoenix_skills::invoke_skill(skill_name, args, &skills) {
-            Ok(invocation) => ToolOutput::success(invocation.body),
-            Err(e) => ToolOutput::error(e),
+        let result = match self.audience {
+            phoenix_skills::SkillAudience::Conversation => {
+                let skills = phoenix_skills::discover_skills_for_audience(
+                    ctx.working_dir(),
+                    phoenix_skills::SkillAudience::Conversation,
+                );
+                phoenix_skills::invoke_skill(skill_name, args, self.audience, &skills)
+                    .map(|invocation| invocation.body)
+            }
+            phoenix_skills::SkillAudience::GlobalCoordinator => {
+                phoenix_skills::invoke_trusted_coordinator_builtin(
+                    skill_name,
+                    self.coordinator_catalog
+                        .as_ref()
+                        .expect("Coordinator SkillTool requires authenticated catalog"),
+                )
+            }
+        };
+        match (self.audience, result) {
+            (phoenix_skills::SkillAudience::GlobalCoordinator, Ok(body)) => {
+                trusted_builtin_instructions(body)
+            }
+            (phoenix_skills::SkillAudience::Conversation, Ok(body)) => ToolOutput::success(body),
+            (_, Err(e)) => ToolOutput::error(e),
         }
     }
 }
@@ -103,9 +172,64 @@ mod tests {
     // -- Input validation (tool-level concerns) --
 
     #[tokio::test]
+    async fn coordinator_skill_returns_authenticated_embedded_instructions() {
+        let temp = TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
+        let result = tool
+            .run(
+                json!({"skill_name": "phoenix-api"}),
+                test_context(temp.path().to_path_buf()),
+            )
+            .await;
+
+        assert!(result.is_success());
+        assert!(!result.output().contains("<trusted_builtin_skill"));
+        assert!(result.output().contains("Embedded reference"));
+        assert!(result
+            .output()
+            .contains("Supported Phoenix HTTP API reference"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_skill_rejects_arguments_before_authenticated_invocation() {
+        let temp = TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
+
+        let result = tool
+            .run(
+                json!({"skill_name": "phoenix-api", "args": "untrusted input"}),
+                test_context(temp.path().to_path_buf()),
+            )
+            .await;
+
+        assert!(!result.is_success());
+        assert!(result.output().contains("do not accept arguments"));
+    }
+
+    #[test]
+    fn coordinator_skill_schema_omits_arguments_and_filesystem_claims() {
+        let temp = TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let tool = SkillTool::for_global_coordinator(
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()))
+                .unwrap(),
+        );
+        assert!(tool.input_schema()["properties"].get("args").is_none());
+        assert!(!tool.description().contains(".claude/skills"));
+    }
+
+    #[tokio::test]
     async fn test_skill_empty_name() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": ""}),
@@ -119,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_missing_name() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(json!({}), test_context(tmp.path().to_path_buf()))
             .await;
@@ -132,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_not_found() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "nonexistent"}),
@@ -148,7 +272,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_skill(tmp.path(), "build", "build", "Build stuff", "Build body.");
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "deploy"}),
@@ -170,7 +294,7 @@ mod tests {
             "Run cargo build.",
         );
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "build"}),
@@ -195,7 +319,7 @@ mod tests {
             "Please review $ARGUMENTS carefully.",
         );
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "review", "args": "src/main.rs"}),

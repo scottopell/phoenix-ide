@@ -1,6 +1,14 @@
 # Prose Feedback UI - Executive Summary
 
+## Approved pill integration
+
+The approved single-line `ReactionPill` is integrated into ordinary conversation transcripts. The production-component fixture retains its long virtualized history. Enter focuses an anchored pill without automatic focus on selection; Cmd/Ctrl+Enter appends. The dock loads older history when needed and restores the exact source occurrence and its unfinished reaction, and explicit dismissal offers Keep/Discard. The fixture-only presentation override and the earlier large bubble have been removed.
+
 ## Requirements Summary
+
+Inline conversation reactions (REQ-PF-018–021) are implemented by `InlineMessageReaction`, with a conversation-keyed, session-local `InlineReactionStore` for unfinished text and the existing `DraftStore` for appended feedback. The production-page fixture `product-conversation--inline-message-reactions` includes a long answer, code, a table, historical messages with repeated sequence numbers, and an existing draft. The action uses ListPlus with the label Add to draft; `MessageReviewAction` provides explicit message-review entry on touch and desktop.
+
+Focused tests cover source pinning, draft edits during reaction entry, duplicate activation, destination loss, navigation/remount retention, native context-menu pass-through, IME handling, Escape, and lossless fenced quotations. Browser verification in Chromium covers actual mouse selection, draft append with unchanged transcript scroll position, native copying of a multiline code selection, repeated appends, and the existing historical-message reviewer and older-answer append at 390px width. The required `./dev.py check` passed all 16 checks. Native iOS Safari/PWA and Android selection-menu, handle, and software-keyboard acceptance is **not yet verified on devices**; desktop viewport emulation is not a substitute.
 
 The Prose Feedback feature enables users to browse project files and provide structured, line-level feedback to the AI agent. On mobile/tablet, users open a file browser overlay from the conversation interface, navigate directories, and select text files to review. On desktop, the File Explorer Panel (`specs/file-explorer/`) provides persistent file browsing. Selected files display in a reading view with appropriate formatting (rendered markdown, syntax-highlighted code, or plain text). Long-pressing on any line opens an annotation dialog where users type a note about that specific content. Notes accumulate in a session-local collection, visible via a badge and expandable notes panel. Users can review, delete, or jump to annotated lines before sending. When ready, tapping Send formats all notes into a structured message showing the absolute file path, line numbers, and complete raw line content (for greppability), then injects this into the message input. Additionally, patch tool output displays a summary of modified files with change counts, allowing users to click any file to review it with all modifications highlighted. Closing the reader with unsaved notes prompts for confirmation.
 
@@ -46,3 +54,5 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 
 - `specs/file-explorer/` — Desktop File Explorer Panel (supersedes overlay file browsing on desktop)
 - `specs/viewer-find/` — Shared in-viewer find behavior for MetaViewer surfaces and task approval readers
+
+Paged-return regression coverage includes successive pages, failed-load retry, exhaustion, cancellation on discard/navigation, and a production-page fixture with a retained source absent from the initially loaded snapshot. Pagination completion is carried through the existing history loader; the virtual transcript remains the physical positioning owner.

@@ -44,6 +44,7 @@ function phaseFocusDisposition(state: ConversationState): PhaseFocusDisposition 
     case 'cancelling':
     case 'provisioning':
       return 'defer';
+    case 'client_decode_error':
     case 'recoverable_continuation_failure':
     case 'awaiting_task_approval':
     case 'awaiting_user_response':

@@ -3,6 +3,7 @@ import { ConversationStore } from './ConversationStore';
 import { ConversationContext } from './ConversationContext';
 import { DraftStore } from './DraftStore';
 import { DraftContext } from './DraftContext';
+import { InlineReactionContext, InlineReactionStore } from './InlineReactionStore';
 import { useConversationsRefreshDriver } from './useConversationsRefresh';
 
 /**
@@ -24,6 +25,8 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
     storeRef.current = new ConversationStore();
   }
   const draftStoreRef = useRef<DraftStore | null>(null);
+  const reactionStoreRef = useRef<InlineReactionStore | null>(null);
+  if (reactionStoreRef.current === null) reactionStoreRef.current = new InlineReactionStore();
   if (draftStoreRef.current === null) {
     draftStoreRef.current = new DraftStore();
   }
@@ -31,8 +34,10 @@ export function ConversationProvider({ children }: { children: React.ReactNode }
   return (
     <ConversationContext.Provider value={storeRef.current}>
       <DraftContext.Provider value={draftStoreRef.current}>
-        <ConversationsRefreshDriver />
-        {children}
+        <InlineReactionContext.Provider value={reactionStoreRef.current}>
+          <ConversationsRefreshDriver />
+          {children}
+        </InlineReactionContext.Provider>
       </DraftContext.Provider>
     </ConversationContext.Provider>
   );

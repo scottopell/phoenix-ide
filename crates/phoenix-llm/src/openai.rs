@@ -5087,6 +5087,25 @@ mod tests {
     }
 
     #[test]
+    fn access_program_rejection_allows_manual_recovery_on_http_and_websocket() {
+        let message = "The access_programs parameter is not enabled for this organization.";
+        let error =
+            serde_json::json!({"message": message, "type": "invalid_request_error", "code": null});
+        let http = responses_http_error(400, &serde_json::json!({"error": error}).to_string());
+        let websocket = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error", "status": 400, "error": error
+        }))
+        .expect("provider rejection");
+
+        for rejection in [http, websocket] {
+            assert_eq!(rejection.kind, super::super::LlmErrorKind::InvalidRequest);
+            assert!(rejection.message.contains(message));
+            assert!(!rejection.kind.is_auto_retryable());
+            assert!(rejection.kind.is_user_resumable());
+        }
+    }
+
+    #[test]
     fn responses_http_error_routes_provider_code_through_classifier() {
         use super::super::LlmErrorKind;
 
@@ -5102,7 +5121,7 @@ mod tests {
             r#"{"error":{"message":"unsupported input","type":"invalid_request_error","code":"invalid_request_error"}}"#,
         );
         assert_eq!(generic_invalid.kind, LlmErrorKind::InvalidRequest);
-        assert!(!generic_invalid.kind.is_user_resumable());
+        assert!(generic_invalid.kind.is_user_resumable());
 
         let unknown_client_code = responses_http_error(
             404,

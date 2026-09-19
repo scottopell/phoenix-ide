@@ -18,6 +18,7 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
+mod svg_artifacts;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
@@ -5104,10 +5105,18 @@ impl RuntimeManager {
                         self.db.clone(),
                         self.clone(),
                     ));
+                let coordinator_catalog =
+                    crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
+                        crate::skills::builtin::default_extract_dir().as_deref(),
+                    );
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(
+                        crate::coordinator_tools::tools(service, send_chat),
+                        coordinator_catalog.clone(),
+                    ),
                     agent_catalog.clone(),
                 )
+                .with_coordinator_skill_catalog(coordinator_catalog)
             } else {
                 let global_read = crate::api::global_read::GlobalReadService::new(
                     self.db.clone(),
@@ -6096,22 +6105,11 @@ impl RuntimeManager {
                 );
                 return Ok((conv.state, row_state_updated_at, false));
             }
-            // A usage-limit Error must be restored faithfully so the auto-clear
-            // sweep's DismissError lands on an executor that is actually in
-            // Error. A model-upgrade eviction (see get_or_create) can drop the
-            // live Error executor mid-run; without this, the recreate would
-            // derive a non-Error state via the recovery heuristic and silently
-            // reject the queued DismissError, leaving the row stuck in
-            // UsageLimitReached and the sweep re-firing every tick. (Across a
-            // process restart the row is already reset to Idle by
-            // reset_all_to_idle, so this arm only matters within one process.)
-            ConvState::Error {
-                error_kind: crate::db::ErrorKind::UsageLimitReached,
-                ..
-            } => {
+            ConvState::Error { error_kind, .. } if error_kind.is_user_resumable() => {
                 tracing::debug!(
                     conv_id = %conversation_id,
-                    "Restoring persisted usage-limit Error (cleared by the auto-clear sweep)"
+                    ?error_kind,
+                    "Restoring persisted user-resumable Error"
                 );
                 return Ok((conv.state, row_state_updated_at, false));
             }
@@ -11313,32 +11311,146 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn determine_resume_state_does_not_preserve_other_errors() {
-        // Only usage-limit Error is preserved; other error kinds keep the
-        // recovery-heuristic path (here, no messages -> derived to non-Error).
+    async fn determine_resume_state_preserves_user_resumable_errors() {
+        use crate::db::ErrorKind;
+
         let mgr = test_manager().await;
         mgr.db()
             .create_conversation("net", "slug", "/tmp", true, None, None)
             .await
             .expect("create");
-        mgr.db()
-            .update_conversation_state(
-                "net",
-                &ConvState::Error {
-                    message: "network".into(),
-                    error_kind: crate::db::ErrorKind::Network,
-                    resets_at: None,
-                },
-            )
-            .await
-            .expect("set error");
-
-        let (state, _ts, _needs) = mgr.determine_resume_state("net").await.expect("resume");
-
-        assert!(
-            !matches!(state, ConvState::Error { .. }),
-            "a non-usage-limit Error must not be preserved, got {state:?}"
+        for error_kind in [
+            ErrorKind::Auth,
+            ErrorKind::RateLimit,
+            ErrorKind::UsageLimitReached,
+            ErrorKind::Network,
+            ErrorKind::InvalidRequest,
+            ErrorKind::PromptRejected,
+            ErrorKind::InvalidResponse,
+            ErrorKind::ServerError,
+            ErrorKind::ServerOverloaded,
+            ErrorKind::TimedOut,
+        ] {
+            let expected = ConvState::Error {
+                message: "provider failure".into(),
+                error_kind,
+                resets_at: None,
+            };
+            mgr.db()
+                .update_conversation_state("net", &expected)
+                .await
+                .unwrap();
+            let persisted = mgr.db().get_conversation("net").await.unwrap();
+            let (state, timestamp, needs) = mgr.determine_resume_state("net").await.unwrap();
+            assert_eq!(state, expected);
+            assert_eq!(timestamp, persisted.state_updated_at);
+            assert!(!needs);
+        }
+        mgr.db().reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            mgr.db().get_conversation("net").await.unwrap().state,
+            ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn recreated_invalid_request_error_preserves_manual_dismiss_and_retry() {
+        for dismiss in [true, false] {
+            let llm = Arc::new(RecordingLlm {
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mgr = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+            let id = "recreated-invalid-request";
+            mgr.db()
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            seed_recovery_tool_tail(&mgr, id).await;
+            let expected = ConvState::Error {
+                message: "The access_programs parameter is not enabled for this organization."
+                    .into(),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            };
+            mgr.db()
+                .update_conversation_state(id, &expected)
+                .await
+                .unwrap();
+            let original = mgr.get_or_create(id).await.unwrap();
+            assert_eq!(*original.state_rx.borrow(), expected);
+            mgr.evict_runtime(id, EvictionReason::ModelUpgrade).await;
+            let recreated = mgr.get_or_create(id).await.unwrap();
+            assert!(!Arc::ptr_eq(&original.identity, &recreated.identity));
+            assert_eq!(*recreated.state_rx.borrow(), expected);
+            assert_eq!(mgr.db().get_messages(id).await.unwrap().len(), 2);
+            assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let event = if dismiss {
+                Event::DismissError
+            } else {
+                Event::UserMessage {
+                    text: "continue".into(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "manual-retry".into(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }
+            };
+            mgr.send_event(id, event)
+                .await
+                .expect("manual recovery settles after recreation");
+            if dismiss {
+                assert_eq!(
+                    mgr.db().get_conversation(id).await.unwrap().state,
+                    ConvState::Idle
+                );
+                assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                let mut states = recreated.state_rx.clone();
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if *states.borrow_and_update() == ConvState::Idle {
+                            break;
+                        }
+                        states
+                            .changed()
+                            .await
+                            .expect("runtime stays live until completion");
+                    }
+                })
+                .await
+                .expect("manual request completes");
+                assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(mgr
+                    .db()
+                    .get_messages(id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.message_id == "manual-retry"));
+            }
+        }
+    }
+
+    async fn seed_recovery_tool_tail(mgr: &RuntimeManager, id: &str) {
+        use crate::db::MessageContent;
+        let agent = MessageContent::agent(vec![phoenix_llm::ContentBlock::ToolUse {
+            id: "completed-tool".into(),
+            name: "think".into(),
+            input: serde_json::json!({"thought": "done"}),
+        }]);
+        let tool = MessageContent::tool("completed-tool", "done", false);
+        for (message_id, content) in [("agent-before-error", agent), ("tool-before-error", tool)] {
+            mgr.db()
+                .add_message(message_id, id, &content, None, None)
+                .await
+                .unwrap();
+        }
+        let messages = mgr.db().get_recovery_messages(id).await.unwrap();
+        let tail = mgr.db().get_recovery_tail_status(id).await.unwrap();
+        assert!(recovery::decide_recovery(&messages, &tail).needs_auto_continue);
     }
 
     #[tokio::test]

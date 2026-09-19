@@ -1,3 +1,6 @@
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
+import { SvgArtifactCard } from './SvgArtifactCard';
+import { svgArtifactFromResult } from './svgArtifact';
 /**
  * Shared message rendering components used by both MessageList and VirtualizedMessageList.
  * 
@@ -14,6 +17,7 @@
 
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -21,7 +25,7 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
-import type { AgentTurnUnit } from '../conversation/renderUnits';
+import { agentTurnsInHistoricalUnit, buildHistoricalUnits, type AgentTurnUnit } from '../conversation/renderUnits';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -713,6 +717,7 @@ function CompactToolStripImpl({
           item.isError ? 'error' : '',
           !item.hasResult ? 'pending' : '',
           item.name === 'bash' ? 'wide' : '',
+          item.svgArtifact ? 'svg-artifact-tool' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError
@@ -766,6 +771,7 @@ function CompactToolStripImpl({
                 <span className="compact-tool-card-summary" title={summary}>{summary}</span>
               )}
             </button>
+            {item.svgArtifact && <SvgArtifactCard artifact={item.svgArtifact} />}
             {isFirstCardForOwner && (
               <span className="compact-tool-owner-copy message-mobile-copy-row">
                 <MessageCopyButton
@@ -1300,9 +1306,17 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }
 
   return (
-    <div id={`message-${message.message_id}`} className="message agent" data-sequence-id={message.sequence_id}>
+    <div
+      id={`message-${message.message_id}`}
+      className="message agent"
+      data-sequence-id={message.sequence_id}
+      data-message-id={message.message_id}
+      data-inline-reaction-message={message.message_id}
+      data-message-occurrence={(message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken}
+    >
       {!suppressMessageCopy && !isFirstInTurn && (
         <div className="message-mobile-copy-row">
+          <MessageReviewAction message={message} />
           <MessageCopyButton message={message} title="Copy Phoenix message" />
         </div>
       )}
@@ -1317,6 +1331,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           <AgentRetryBadge message={message} />
           {!suppressMessageCopy && (
             <span className="message-header-actions">
+              <MessageReviewAction message={message} />
               <MessageCopyButton message={message} title="Copy Phoenix message" />
             </span>
           )}
@@ -2868,7 +2883,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
     : 'Copy command';
 
 
+  const svgArtifact = svgArtifactFromResult(name, result);
   return (
+    <>
+    {svgArtifact && <SvgArtifactCard artifact={svgArtifact} />}
     <div className="tool-block" data-tool-id={toolId}>
       {/* Tool header with name */}
       <div className="tool-block-header">
@@ -3030,6 +3048,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
       {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
       {forkProposalId && <ForkProposalAffordance proposalId={forkProposalId} />}
     </div>
+    </>
   );
 }
 
@@ -3072,16 +3091,6 @@ function summarizeToolInput(name: string, input: Record<string, unknown>, displa
   return formatted.length > 120 ? `${formatted.slice(0, 119)}…` : formatted;
 }
 
-function buildToolResults(messages: Message[]): Map<string, Message> {
-  const map = new Map<string, Message>();
-  for (const msg of messages) {
-    if (msg.message_type !== 'tool' && msg.type !== 'tool') continue;
-    const content = msg.content as ToolResultContent;
-    if (content?.tool_use_id) map.set(content.tool_use_id, msg);
-  }
-  return map;
-}
-
 function countToolUses(messages: Message[]): number {
   let count = 0;
   for (const msg of messages) {
@@ -3102,6 +3111,7 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
 
 function ChildToolActivity({ block, result, liveProgress }: { block: ContentBlock; result: Message | undefined; liveProgress?: import('../generated/sse').BashToolProgress | undefined }) {
   const name = block.name || 'tool';
+  const artifact = svgArtifactFromResult(name, result);
   const input = (block.input || {}) as Record<string, unknown>;
   const output = getToolResultText(result);
   const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
@@ -3113,14 +3123,17 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
   const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
 
   return (
-    <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
-      <span className="subagent-activity-tag">{name}</span>
-      <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
-      <span className="subagent-activity-arrow">→</span>
-      <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
-        {outputPreview}
-      </span>
-    </div>
+    <>
+      <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
+        <span className="subagent-activity-tag">{name}</span>
+        <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
+        <span className="subagent-activity-arrow">→</span>
+        <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
+          {outputPreview}
+        </span>
+      </div>
+      {artifact && <SvgArtifactAccessContext.Provider value={{ kind: 'owner' }}><SvgArtifactCard artifact={artifact} /></SvgArtifactAccessContext.Provider>}
+    </>
   );
 }
 
@@ -3130,7 +3143,7 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
 // `toolResults` map are referentially stable across token-only atom updates, so
 // a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
 // memoization for the same re-parse-on-unchanged-content problem.
-const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: Map<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: ReadonlyMap<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -3174,20 +3187,15 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
 export function SubAgentTranscript({ inline, running, full = false, finalResult }: { inline: InlineStreamState; running: boolean; full?: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const { atom } = inline;
   const messages = atom.messages;
-  // Derived once per messages change, not per streaming token. `sse_token`
-  // preserves `atom.messages` identity (only `streamingBuffer` grows), so a
-  // stable `toolResults` map lets the memoized ChildAgentActivity rows bail
-  // while the active step's buffer streams.
-  const toolResults = useMemo(() => buildToolResults(messages), [messages]);
-  const agentMessages = useMemo(
-    () => messages.filter((m) => m.message_type === 'agent' || m.type === 'agent'),
+  const agentTurns = useMemo(
+    () => buildHistoricalUnits({ messages, pendingMessages: [] }).historicalUnits.flatMap(agentTurnsInHistoricalUnit),
     [messages],
   );
-  const visibleAgentMessages = useMemo(
-    () => (full ? agentMessages : agentMessages.slice(-12)),
-    [full, agentMessages],
+  const visibleAgentTurns = useMemo(
+    () => (full ? agentTurns : agentTurns.slice(-12)),
+    [full, agentTurns],
   );
-  const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
+  const hiddenCount = Math.max(0, agentTurns.length - visibleAgentTurns.length);
   const toolCount = useMemo(() => countToolUses(messages), [messages]);
   const rootDir = atom.conversation?.worktree_path ?? atom.conversation?.cwd ?? undefined;
   const markdownComponents = useMemo(
@@ -3205,17 +3213,17 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
       {inline.type === 'connecting' && <div className="subagent-activity-placeholder">Loading sub-agent activity…</div>}
       {inline.type === 'error' && <div className="subagent-activity-error">{inline.error}</div>}
       {hiddenCount > 0 && (
-        <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
+        <div className="subagent-activity-placeholder">Showing latest {visibleAgentTurns.length} agent steps ({hiddenCount} earlier hidden)</div>
       )}
-      {visibleAgentMessages.map((message) => (
-        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
+      {visibleAgentTurns.map((turn) => (
+        <ChildAgentActivity key={turn.key} message={turn.agent} toolResults={turn.toolResultsByUseId} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
           <StreamingBlocks text={atom.streamingBuffer.text} rootDir={rootDir} />
         </div>
       )}
-      {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
+      {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentTurns.length === 0 && !atom.streamingBuffer?.text && (
         <div className="subagent-activity-placeholder">No sub-agent activity yet.</div>
       )}
       {finalResult?.text && (

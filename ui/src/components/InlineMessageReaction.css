@@ -1,0 +1,13 @@
+.inline-reaction-notice:not(:empty) {
+  position: fixed;
+  z-index: 950;
+  right: 16px;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  pointer-events: none;
+  font-size: 13px;
+}

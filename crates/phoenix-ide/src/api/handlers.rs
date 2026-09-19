@@ -165,6 +165,18 @@ pub fn create_router(state: AppState) -> Router {
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
         .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id",
+            get(super::svg_artifacts::image),
+        )
+        .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id/source",
+            get(super::svg_artifacts::source),
+        )
+        .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id/download",
+            get(super::svg_artifacts::download),
+        )
+        .route(
             "/api/product-conversations/new",
             post(create_product_conversation).layer(DefaultBodyLimit::max(
                 MAX_MULTIPART_BODY_BYTES + 8 * 1024 * 1024,
@@ -575,7 +587,19 @@ pub fn create_router(state: AppState) -> Router {
             "/api/share/:token/conversation",
             get(get_shared_conversation),
         )
-        .route("/api/share/:token/events", get(shared_sse_stream));
+        .route("/api/share/:token/events", get(shared_sse_stream))
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id",
+            get(super::share_svg_artifacts::image),
+        )
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id/source",
+            get(super::share_svg_artifacts::source),
+        )
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id/download",
+            get(super::share_svg_artifacts::download),
+        );
 
     // Register every SPA client route to serve the index.html shell, from the
     // single source of truth. These must be added before the auth layer below
@@ -4103,7 +4127,11 @@ async fn get_system_prompt(
         crate::tools::ExploreToolPolicy::from_platform(&state.platform).bash(),
     );
     let system_prompt = if is_coordinator {
-        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
+        let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
+        crate::system_prompt::build_coordinator_system_prompt(
+            conversation.llm_language,
+            catalog.as_ref(),
+        )
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)

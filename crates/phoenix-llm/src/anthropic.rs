@@ -1171,7 +1171,7 @@ mod tests {
     use crate::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     #[test]
-    fn generic_anthropic_invalid_request_remains_non_resumable() {
+    fn generic_anthropic_invalid_request_allows_manual_recovery() {
         let error = parse_anthropic_sse_error(&serde_json::json!({
             "error": {
                 "type": "invalid_request_error",
@@ -1181,7 +1181,7 @@ mod tests {
 
         assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
         assert!(!error.kind.is_auto_retryable());
-        assert!(!error.kind.is_user_resumable());
+        assert!(error.kind.is_user_resumable());
     }
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {

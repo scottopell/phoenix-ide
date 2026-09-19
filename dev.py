@@ -3462,6 +3462,11 @@ def cmd_qa_message_list() -> None:
     )
 
 
+def cmd_qa_svg_artifacts() -> None:
+    """Verify SVG artifact controls at desktop and mobile sizes."""
+    subprocess.run(["pnpm", "qa:svg-artifacts"], cwd=ROOT / "ui", check=True, env=node_env())
+
+
 def cmd_qa_tool_results() -> None:
     """Capture comprehensive tool-result Ladle screenshots at desktop and mobile sizes."""
     subprocess.run(
@@ -5141,7 +5146,7 @@ def cmd_check(
             out += ["-p", c]
         return out
 
-    def run_step(name, cmd, cwd=ROOT, env_extra=None):
+    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -5231,7 +5236,7 @@ def cmd_check(
 
         timed_out = False
         try:
-            rc = proc.wait(timeout=CHECK_TIMEOUT)
+            rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
@@ -5260,7 +5265,7 @@ def cmd_check(
 
         tail = "\n".join(buf).strip()
         if timed_out:
-            header = f"TIMEOUT after {CHECK_TIMEOUT}s \u2014 last {len(buf)} lines of output"
+            header = f"TIMEOUT after {timeout}s \u2014 last {len(buf)} lines of output"
             if truncated:
                 header += " (earlier lines dropped)"
             output = header + ("\n" + tail if tail else "\n(no output captured before timeout)")
@@ -5332,10 +5337,9 @@ def cmd_check(
         check. Build-time bundling of UI assets belongs to `prod_build`,
         which runs vite in its own worktree.
 
-        Test compile and the later steps are split so each gets its own
-        CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
-        approach 300s on their own, and when bundled with ~50s of test runtime
-        the combined step exceeds the timeout even though nothing is wrong.
+        Test compilation, codegen, and execution each have separate subprocess
+        budgets. The full test execution step has a fifteen-minute bound;
+        compilation and codegen retain the default ten-minute bound.
 
         Codegen runs here, but never touches `ui/src/generated/`: the ts-rs
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
@@ -5359,7 +5363,7 @@ def cmd_check(
                           env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
             if rc == 0:
                 codegen_stale_step()
-        run_step("cargo test", test_cmd)
+        run_step("cargo test", test_cmd, timeout=900)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -10807,6 +10811,7 @@ def main():
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("product-conversation", help="Capture ProductConversation Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
+    qa_sub.add_parser("svg-artifacts", help="Verify SVG artifact Ladle controls and capture browser evidence")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
 
@@ -10984,6 +10989,8 @@ def main():
             cmd_qa_product_conversation()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
+        elif args.qa_command == "svg-artifacts":
+            cmd_qa_svg_artifacts()
         elif args.qa_command == "tool-results":
             cmd_qa_tool_results()
         elif args.qa_command == "work-actions":

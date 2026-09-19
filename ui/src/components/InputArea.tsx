@@ -109,6 +109,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
     case 'cancelling_tool':
     case 'cancelling_sub_agents':
       return true;
+    case 'client_decode_error':
     case 'awaiting_llm':
     case 'awaiting_continuation':
     case 'recoverable_continuation_failure':

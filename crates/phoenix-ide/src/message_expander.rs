@@ -334,13 +334,21 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
         // back from the same paths.
         let skills_view = root.skills_view();
         let skills = discover_skills(&skills_view.dir);
-        if skills.iter().any(|s| s.name == skill_ref.token) {
+        if skills.iter().any(|skill| {
+            skill.name == skill_ref.token
+                && skill.audience == crate::skills::SkillAudience::Conversation
+        }) {
             // Safety: `skill_ref.span.end` is produced by the tokenizer from
             // `char_indices()` on `text`, so it is always a valid UTF-8
             // boundary.
             #[allow(clippy::string_slice)]
             let arguments = text[skill_ref.span.end..].trim_start();
-            match crate::skills::invoke_skill(&skill_ref.token, arguments, &skills) {
+            match crate::skills::invoke_skill(
+                &skill_ref.token,
+                arguments,
+                crate::skills::SkillAudience::Conversation,
+                &skills,
+            ) {
                 Ok(invocation) => {
                     return Ok(ExpandedMessage {
                         display_text: text.to_string(),

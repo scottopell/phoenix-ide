@@ -41,12 +41,19 @@ export interface VirtualTranscriptAnchor {
   offset: number;
 }
 
+export type VirtualTranscriptTarget = string | ((row: HTMLElement) => Range | null);
+
+function resolveTarget(row: HTMLElement | undefined, target: VirtualTranscriptTarget | undefined): Element | Range | null {
+  if (!row || !target) return null;
+  return typeof target === 'string' ? row.querySelector(target) : target(row);
+}
+
 export interface VirtualTranscriptHandle {
   scrollToIndex(
     index: number,
     align: 'start' | 'end',
     viewportStartOffset?: number,
-    targetSelector?: string,
+    targetSelector?: VirtualTranscriptTarget,
   ): void;
   scrollToTail(): void;
   /** Grant or withdraw tail-following. The scroll policy owns this intent;
@@ -108,7 +115,7 @@ interface PhysicalStore<T> {
     key: string;
     align: 'start' | 'end';
     viewportStartOffset: number;
-    selector: string;
+    selector: VirtualTranscriptTarget;
   } | null;
   pinned: boolean;
   revision: number;
@@ -212,7 +219,7 @@ function buildPhysicalSnapshot<T>(
   if (targetIndex === undefined) return baseSnapshot;
   const key = store.keys[targetIndex] ?? '';
   const row = store.rowElements.get(key);
-  const targetElement = targetSelector ? row?.querySelector(targetSelector) : null;
+  const targetElement = resolveTarget(row, targetSelector);
   const rowOffset = itemPhysicalOffset(store, targetIndex);
   const intraRowOffset = targetElement && row
     ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
@@ -621,7 +628,7 @@ function VirtualTranscriptInner<T>(
       }
       const pending = current.pendingTarget;
       if (pending?.key === key) {
-        const targetElement = element.querySelector(pending.selector);
+        const targetElement = resolveTarget(element, pending.selector);
         const unit = current.layout.itemAt(pending.index);
         if (targetElement && unit) {
           current.pendingTarget = null;
@@ -797,7 +804,7 @@ function VirtualTranscriptInner<T>(
       const unit = current.layout.itemAt(index);
       if (!unit) return;
       const row = current.rowElements.get(unit.key);
-      const targetElement = targetSelector ? row?.querySelector(targetSelector) : null;
+      const targetElement = resolveTarget(row, targetSelector);
       const intraRowOffset = targetElement && row
         ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
         : 0;

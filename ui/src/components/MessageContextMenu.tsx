@@ -60,6 +60,7 @@ export function MessageContextMenu({
       const target = e.target as HTMLElement | null;
       if (
         e.shiftKey ||
+        Boolean(window.getSelection()?.toString()) ||
         target?.closest('a[href], img, input, textarea, [contenteditable]')
       ) {
         return;

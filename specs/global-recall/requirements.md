@@ -128,6 +128,13 @@ own predecessors through that bound capability without receiving global tools
 
 WHILE the singleton Global Coordinator is answering a user request
 THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
+AND MAY provide a Coordinator-only built-in skill documenting supported Phoenix HTTP APIs
+
+WHEN the user authorizes a Coordinator lifecycle action supported by a documented Phoenix HTTP API
+THE Coordinator MAY invoke that API through explicitly WorkScope-targeted Bash
+AND SHALL preserve normal API authorization
+AND SHALL verify both the HTTP response and the resulting Phoenix state
+AND SHALL distinguish request acceptance from observed execution
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
 
@@ -139,24 +146,12 @@ AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or c
 AND SHALL NOT infer a default repository or cwd
 AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
-WHEN the user authorizes continuation of an existing ordinary conversation
-AND the explicitly WorkScope-targeted Bash context already has usable authenticated server transport
-THE Coordinator MAY inspect its authoritative transcript state and invoke the supported idempotent `POST /api/conversations/{id}/continue`
-AND SHALL invoke it only when `conversation.state.type == "context_exhausted"`
-AND SHALL reconcile an existing continuation before retrying an uncertain request
-AND SHALL preserve and report the returned successor identity, including when status is `dispatch_failed`, and reconcile `already_exists` or the returned successor before retrying
-AND SHALL recognize that the endpoint may create only the successor transcript within the existing ProductConversation
-
-THE Coordinator SHALL NOT create unrelated or new-work conversations, perform arbitrary lifecycle mutation, or monitor in the background
-
-THE SYSTEM MAY provide exactly one cross-conversation message mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
-
-The separately specified continuation exception is not a cross-conversation message mutation capability and SHALL remain limited to the existing ProductConversation's successor transcript
+THE SYSTEM MAY provide exactly one dedicated cross-conversation mutation tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other lifecycle mutation tools to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
 
 ---
 

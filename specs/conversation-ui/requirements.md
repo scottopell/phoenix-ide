@@ -534,9 +534,17 @@ WHEN a persisted conversation enters an error state whose typed error policy is 
 THE SYSTEM SHALL display a retry/resume affordance in the conversation error banner
 AND that affordance SHALL send `continue` through the normal chat message path
 
-WHEN a persisted conversation error is not user-resumable (for example a malformed request or context exhaustion)
+WHEN a persisted conversation error is not user-resumable (for example content filtering or context exhaustion)
 THE SYSTEM SHALL NOT display the same retry/resume affordance
 AND SHALL display recovery guidance appropriate to that error kind
+
+WHEN a provider invalid-request error enters a persisted error state
+THE SYSTEM SHALL retain the diagnostic and offer manual retry, dismissal, and revised input in the same conversation
+AND SHALL NOT automatically retry the rejected request
+
+WHEN the client detects that it cannot decode a conversation state or its error classification
+THE SYSTEM SHALL represent that failure separately from provider error states
+AND SHALL display reload guidance without inferring chat, retry, dismissal, cancellation, or model-change authority
 
 WHEN an authentication failure enters a persisted error state
 THE SYSTEM SHALL treat it as non-auto-retryable but user-resumable after credentials are refreshed or fixed

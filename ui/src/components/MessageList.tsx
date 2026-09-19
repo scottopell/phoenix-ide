@@ -50,6 +50,10 @@ import {
 import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
+import { InlineMessageReaction, type ReactionDraftDestination } from './InlineMessageReaction';
+import { restoreReactionRange } from './reactionRange';
+import { useReactionSourceReturn } from './useReactionSourceReturn';
+import { MessageReviewEnabledContext } from './MessageReviewAction';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
@@ -181,6 +185,8 @@ interface MessageListProps {
   workScopeKey?: string | undefined;
   enableMessageSidepanel?: boolean | undefined;
   enableMessageFullscreen?: boolean | undefined;
+  reactionScopeKey?: string | undefined;
+  reactionDestination?: ReactionDraftDestination | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
    *  indices currently rendered. Fired as the user scrolls. The conversation nav
    *  uses it to highlight the active chapter. */
@@ -191,7 +197,7 @@ interface MessageListProps {
    *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
-  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
+  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => Promise<void>) | undefined;
   onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
@@ -541,6 +547,8 @@ function MessageListImpl({
   workScopeKey,
   enableMessageSidepanel = true,
   enableMessageFullscreen = false,
+  reactionScopeKey,
+  reactionDestination,
   onVisibleRangeChange,
   onChaptersChange,
   hasOlderMessages = false,
@@ -1478,6 +1486,31 @@ function MessageListImpl({
     if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;
   }, [hasOlderMessages, olderHistoryError]);
 
+  const returnToReactionSource = useReactionSourceReturn({
+    scopeKey: reactionScopeKey ?? conversationId ?? slug ?? '__empty__',
+    historyKey: currentHistoryViewKey,
+    loading: loadingOlderMessages,
+    hasOlder: hasOlderMessages,
+    error: olderHistoryError,
+    locate: (source) => {
+      const matches = (message: Message) => source.occurrenceToken
+        ? (message.display_data as { productOccurrenceToken?: string } | null)?.productOccurrenceToken === source.occurrenceToken
+        : message.message_id === source.messageId;
+      const index = historicalUnits.findIndex((unit) => agentTurnsInHistoricalUnit(unit).some((turn) => matches(turn.agent)));
+      if (index < 0) return false;
+      dispatchScrollEvent({ type: 'navigationJumped' });
+      transcriptRef.current?.scrollToIndex(index, 'start', 72, (row) => restoreReactionRange(source, row));
+      return true;
+    },
+    loadOlder: onLoadOlderMessages ? async () => {
+      cancelScheduledEarlierHistoryRef.current?.();
+      cancelScheduledEarlierHistoryRef.current = null;
+      earlierHistoryRequestScheduledRef.current = true;
+      transcriptRef.current?.preserveViewportOnNextItemsChange();
+      await onLoadOlderMessages({ kind: 'reader_viewport' });
+    } : undefined,
+  });
+
   useImperativeHandle(
     ref,
     () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
@@ -1791,33 +1824,35 @@ function MessageListImpl({
         {olderHistoryError && !hasOlderMessages && (
           <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
-        <VirtualTranscript
-          key={conversationId ?? '__empty__'}
-          ref={transcriptRef}
-          scrollerId="messages"
-          ariaLabel="Conversation transcript"
-          scrollerRef={handleScrollerRef}
-          items={allUnits}
-          renderItem={itemContent}
-          getKey={computeItemKey}
-          initialTail={allUnits.length > 0}
-          estimatedExtent={120}
-          overscan={600}
-          onPinnedChange={handlePinnedStateChange}
-          onTotalExtentChange={handleTotalListHeightChanged}
-          onRangeChange={handleRangeChanged}
-          header={systemPrompt ? (
-            <SystemPromptHeader
-              systemPrompt={systemPrompt}
-              expanded={systemPromptExpanded}
-              onToggle={toggleSystemPrompt}
-              contentRef={systemPromptRef}
-              activeHighlight={activeSystemPromptHighlight}
-            />
-          ) : null}
-          empty={<EmptyTranscriptState />}
-          className="message-virtual-transcript"
-        />
+        <MessageReviewEnabledContext.Provider value={enableMessageSidepanel}>
+          <VirtualTranscript
+            key={conversationId ?? '__empty__'}
+            ref={transcriptRef}
+            scrollerId="messages"
+            ariaLabel="Conversation transcript"
+            scrollerRef={handleScrollerRef}
+            items={allUnits}
+            renderItem={itemContent}
+            getKey={computeItemKey}
+            initialTail={allUnits.length > 0}
+            estimatedExtent={120}
+            overscan={600}
+            onPinnedChange={handlePinnedStateChange}
+            onTotalExtentChange={handleTotalListHeightChanged}
+            onRangeChange={handleRangeChanged}
+            header={systemPrompt ? (
+              <SystemPromptHeader
+                systemPrompt={systemPrompt}
+                expanded={systemPromptExpanded}
+                onToggle={toggleSystemPrompt}
+                contentRef={systemPromptRef}
+                activeHighlight={activeSystemPromptHighlight}
+              />
+            ) : null}
+            empty={<EmptyTranscriptState />}
+            className="message-virtual-transcript"
+          />
+        </MessageReviewEnabledContext.Provider>
       </section>
       {!isEmpty && hasUnreadTailContent && (
         <button className="jump-to-newest" onClick={scrollToNewest}>
@@ -1825,6 +1860,12 @@ function MessageListImpl({
         </button>
       )}
       <FilePathContextMenu />
+      <InlineMessageReaction
+        scopeKey={reactionScopeKey ?? conversationId ?? slug ?? '__empty__'}
+        messages={messages}
+        destination={reactionDestination}
+        returnToSource={returnToReactionSource}
+      />
       <MessageContextMenu
         messages={messages}
         enableMessageSidepanel={enableMessageSidepanel}

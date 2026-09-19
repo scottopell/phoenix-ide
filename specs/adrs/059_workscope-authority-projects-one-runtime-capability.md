@@ -1,4 +1,4 @@
-# ADR-055: WorkScope authority projects one runtime capability
+# ADR-059: WorkScope authority projects one runtime capability
 
 - **Status:** Accepted
 - **Date:** 2026-09-13

@@ -809,6 +809,10 @@ export function StateBar({
             // is waiting on.
             stateText = "awaiting your reply";
             break;
+          case "client_decode_error":
+            dotClass += " error";
+            stateText = "unreadable state";
+            break;
           case "error":
             dotClass += " error";
             stateText = "error";

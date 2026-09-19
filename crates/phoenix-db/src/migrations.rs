@@ -517,15 +517,41 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 101,
-        name: "repair_direct_execution_authority",
+        name: "create_conversation_svg_artifacts",
         sql: MIGRATION_101,
     },
     Migration {
         version: 102,
-        name: "enforce_authority_timestamp_storage_class",
+        name: "repair_direct_execution_authority",
         sql: MIGRATION_102,
     },
+    Migration {
+        version: 103,
+        name: "enforce_authority_timestamp_storage_class",
+        sql: MIGRATION_103,
+    },
+    Migration {
+        version: 104,
+        name: "persist_approval_request_obligation",
+        sql: MIGRATION_104,
+    },
 ];
+
+const MIGRATION_101: &str = r"
+CREATE TABLE conversation_svg_artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    width REAL NOT NULL CHECK(width > 0 AND width <= 16384),
+    height REAL NOT NULL CHECK(height > 0 AND height <= 16384),
+    bytes BLOB NOT NULL CHECK(typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 2097152),
+    CHECK(width * height <= 64000000),
+    UNIQUE(conversation_id, assistant_message_id, tool_use_id)
+);
+";
 
 const MIGRATION_100: &str = r"
 ALTER TABLE product_conversations
@@ -10356,7 +10382,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_101: &str = r"
+const MIGRATION_102: &str = r"
 UPDATE work_scopes
 SET authority_kind = 'direct'
 WHERE id IN (
@@ -10368,7 +10394,7 @@ WHERE id IN (
   AND authority_kind = 'restricted_explore';
 ";
 
-const MIGRATION_102: &str = r"
+const MIGRATION_103: &str = r"
 CREATE TABLE conversation_approved_task_objectives_v2 (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
@@ -10665,7 +10691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_101_repairs_only_stale_direct_authority() {
+    async fn migration_102_repairs_only_stale_direct_authority() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE work_scopes (id TEXT PRIMARY KEY, authority_kind TEXT NOT NULL);
@@ -10684,7 +10710,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT id, authority_kind FROM work_scopes ORDER BY id",
         )
