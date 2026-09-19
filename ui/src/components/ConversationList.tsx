@@ -245,7 +245,9 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
       </button>
       {(onProductConversationRename || onProductConversationClose) && (
         <div className="conv-actions">
-          {onProductConversationRename && row.lifecycle.state === 'open' && (
+          {onProductConversationRename && row.lifecycle.state === 'open'
+            && !(row.lifecycle.close_action.availability === 'unavailable'
+              && row.lifecycle.close_action.reason === 'active_close_attempt') && (
             <button
               type="button"
               className="conv-action-btn"

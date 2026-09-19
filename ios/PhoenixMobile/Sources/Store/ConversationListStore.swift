@@ -101,10 +101,9 @@ final class ConversationListStore {
         excluding exclusions: Set<String> = []
     ) -> [Conversation] {
         var byId = Dictionary(uniqueKeysWithValues: fresh
-            .filter { $0.archived != true && !exclusions.contains($0.aggregateIdentity) }
+            .filter { !exclusions.contains($0.aggregateIdentity) }
             .map { ($0.aggregateIdentity, $0) })
-        for (id, conversation) in upserts
-        where conversation.archived != true && !exclusions.contains(id) {
+        for (id, conversation) in upserts where !exclusions.contains(id) {
             byId[id] = conversation
         }
         return Array(byId.values)

@@ -24,6 +24,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var branch_name: String?
     var task_title: String?
     var archived: Bool?
+    // Additive optional for pre-aggregate persisted list/session caches (REQ-IOS-014).
     var product_close_action: ProductConversationCloseAction?
     var project_name: String?
     var conv_mode_label: String?

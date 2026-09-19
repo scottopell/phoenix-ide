@@ -122,6 +122,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
   // Stable boolean for downstream consumers — true when inside a conversation route.
   const hasActiveConversation = activeConvId !== null;
 
+  const closingProductIdsRef = useRef(new Set<string>());
   const actions: PaletteAction[] = useMemo(
     () =>
       createBuiltInActions({
@@ -149,8 +150,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
               return async () => {
                 try {
                   if (activeProduct) {
-                    await api.closeProductConversation(activeProduct.product_conversation_id);
-                    notifyProductConversationListMayHaveChanged();
+                    const productId = activeProduct.product_conversation_id;
+                    if (closingProductIdsRef.current.has(productId)) return;
+                    closingProductIdsRef.current.add(productId);
+                    try {
+                      await api.closeProductConversation(productId);
+                      notifyProductConversationListMayHaveChanged();
+                    } finally {
+                      closingProductIdsRef.current.delete(productId);
+                    }
                   } else if (chainRootId != null) {
                     await api.archiveChain(chainRootId);
                   } else {
