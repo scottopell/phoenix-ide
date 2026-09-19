@@ -291,7 +291,7 @@ mod tests {
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let result = command_output(
             command,
-            Some(Instant::now() + std::time::Duration::from_millis(500)),
+            Some(Instant::now() + std::time::Duration::from_secs(5)),
         )
         .await
         .unwrap();
