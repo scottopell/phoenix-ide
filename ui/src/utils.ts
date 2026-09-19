@@ -174,11 +174,6 @@ function invalidStateError(message: string): ConversationState {
   return { type: 'client_decode_error', message };
 }
 
-function serverError(message: string): ConversationState {
-  const error = getErrorPresentation('server_error')!;
-  return { type: 'error', message, error_kind: error.kind, error };
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -271,13 +266,18 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'recoverable_continuation_failure': {
       const failure = obj['failure'];
       if (!failure || typeof failure !== 'object' || Array.isArray(failure)) {
-        return serverError('Invalid recoverable continuation failure');
+        return invalidStateError('Invalid recoverable continuation failure');
       }
       const value = failure as Record<string, unknown>;
+      const errorKind = value['error_kind'];
+      const presentation = typeof errorKind === 'string' ? getErrorPresentation(errorKind as ErrorKind) : undefined;
+      if (!presentation || typeof value['message'] !== 'string' || !isRecord(value['request'])) {
+        return invalidStateError('Invalid recoverable continuation failure');
+      }
       return {
         type: 'recoverable_continuation_failure',
         message: stringOr(value['message'], 'Continuation summary generation failed'),
-        error_kind: stringOr(value['error_kind'], 'server_error') as ErrorKind,
+        error_kind: presentation.kind,
         operation_id: stringOr(
           (value['request'] as Record<string, unknown> | undefined)?.['operation_id'],
           'legacy-continuation-operation',
@@ -297,11 +297,11 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'error': {
       const errorKind = obj['error_kind'];
       if (typeof errorKind !== 'string' || errorKind.length === 0) {
-        return serverError(stringOr(obj['message'], 'Unknown error'));
+        return invalidStateError(stringOr(obj['message'], 'Unknown error'));
       }
       const presentation = getErrorPresentation(errorKind as ErrorKind);
       if (!presentation) {
-        return serverError(`Unknown error kind: ${errorKind}`);
+        return invalidStateError(`Unknown error kind: ${errorKind}`);
       }
       return {
         type: 'error',

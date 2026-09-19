@@ -15,10 +15,34 @@ describe('parseConversationState recovery', () => {
     });
   });
 
+  it('retains typed continuation failure recovery', () => {
+    expect(parseConversationState({
+      type: 'recoverable_continuation_failure',
+      failure: {
+        message: 'Summary failed',
+        error_kind: 'server_error',
+        request: { operation_id: 'summary-op', attempt: 2, rejected_tool_calls: [] },
+      },
+    })).toEqual({
+      type: 'recoverable_continuation_failure',
+      message: 'Summary failed',
+      error_kind: 'server_error',
+      operation_id: 'summary-op',
+      attempt: 2,
+    });
+  });
+
   it.each([
     { type: 'seeded_llm_requesting' },
     { type: 'handed_off' },
     { type: 'unrecognized_state' },
+    { type: 'error' },
+    { type: 'error', error_kind: '' },
+    { type: 'error', error_kind: 'unrecognized_error' },
+    { type: 'recoverable_continuation_failure' },
+    { type: 'recoverable_continuation_failure', failure: [] },
+    { type: 'recoverable_continuation_failure', failure: {} },
+    { type: 'recoverable_continuation_failure', failure: { message: 'failed', error_kind: 'unrecognized_error', request: {} } },
   ])('does not infer recovery authority from unreadable state $type', (raw) => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
