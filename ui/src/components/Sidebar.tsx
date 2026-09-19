@@ -121,7 +121,7 @@ export function Sidebar({
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
-  const [productCloseError, setProductCloseError] = useState<string | undefined>();
+  const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
@@ -319,7 +319,7 @@ export function Sidebar({
   }, []);
 
   const handleSetProductCloseTarget = useCallback((row: ProductConversationListRow) => {
-    setProductCloseError(undefined);
+    setProductCloseError(null);
     setProductCloseTarget(row);
   }, []);
 
@@ -332,14 +332,17 @@ export function Sidebar({
       setProductConversationsRetry((revision) => revision + 1);
       notifyProductConversationListMayHaveChanged();
       notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
-      setProductCloseError(undefined);
+      setProductCloseError(null);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
         const confirmationRoute = productCloseTarget.canonical_route;
         setProductCloseTarget(null);
         navigate(confirmationRoute);
       } else {
-        setProductCloseError(err instanceof Error ? err.message : 'Failed to close product conversation');
+        setProductCloseError({
+          productId: productCloseTarget.product_conversation_id,
+          message: err instanceof Error ? err.message : 'Failed to close product conversation',
+        });
       }
       console.error('Failed to close product conversation:', err);
     }
@@ -558,8 +561,10 @@ export function Sidebar({
         confirmText="Close"
         danger
         onConfirm={handleProductClose}
-        {...(productCloseError ? { error: productCloseError } : {})}
-        onCancel={() => { setProductCloseTarget(null); setProductCloseError(undefined); }}
+        {...(productCloseError && productCloseError.productId === productCloseTarget?.product_conversation_id
+          ? { error: productCloseError.message }
+          : {})}
+        onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
       />
       <RenameDialog
         visible={productRenameTarget !== null}
