@@ -7,7 +7,7 @@ struct ConversationListView: View {
     @Environment(AppModel.self) private var model
     @State private var showNewConversation = false
     @State private var showSettings = false
-    @State private var navPath: [String] = []
+    @State private var navPath: [ConversationNavigationDestination] = []
     @State private var openingCoordinator = false
 
     var body: some View {
@@ -17,11 +17,19 @@ struct ConversationListView: View {
                 list
             }
             .navigationTitle("Conversations")
-            .navigationDestination(for: String.self) { conversationId in
-                if let session = model.session(for: conversationId) {
-                    ConversationView(session: session)
-                } else {
-                    Text("Configure a server first")
+            .navigationDestination(for: ConversationNavigationDestination.self) { destination in
+                switch destination {
+                case .aggregate(let aggregateId, let initialTranscriptRowId):
+                    ProductConversationDetailView(
+                        aggregateId: aggregateId,
+                        initialTranscriptRowId: initialTranscriptRowId,
+                        model: model)
+                case .ordinary(let transcriptRowId):
+                    if let session = model.session(for: transcriptRowId) {
+                        ConversationView(session: session)
+                    } else {
+                        Text("Configure a server first")
+                    }
                 }
             }
             .toolbar {
@@ -43,7 +51,7 @@ struct ConversationListView: View {
                         Task {
                             defer { openingCoordinator = false }
                             if let id = await model.openCoordinator() {
-                                navPath.append(id)
+                                navPath.append(.ordinary(transcriptRowId: id))
                             }
                         }
                     } label: {
@@ -130,10 +138,10 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
-                    let navigationId = model.navigationConversationId(for: conversation)
+                    let destination = model.navigationDestination(for: conversation)
                     let isCoordinator = conversation.isCoordinator
                         || transcriptRowId == model.coordinatorConversationId
-                    NavigationLink(value: navigationId) {
+                    NavigationLink(value: destination) {
                         ConversationRow(
                             conversation: conversation,
                             isCoordinator: isCoordinator)
@@ -141,13 +149,21 @@ struct ConversationListView: View {
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator {
-                            Button {
-                                Task { await model.archive(conversationId: transcriptRowId) }
-                            } label: {
-                                Label("Archive", systemImage: "archivebox")
+                            if let explanation = model.closeUnavailableExplanation(for: conversation) {
+                                Button {} label: {
+                                    Label("Close unavailable", systemImage: "archivebox")
+                                }
+                                .disabled(true)
+                                .accessibilityHint(explanation)
+                            } else {
+                                Button {
+                                    Task { await model.archive(conversationId: transcriptRowId) }
+                                } label: {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
+                                .tint(.orange)
+                                .disabled(!model.connectivity.isOnline)
                             }
-                            .tint(.orange)
-                            .disabled(!model.connectivity.isOnline)
                         }
                     }
                 }
@@ -166,9 +182,9 @@ struct ConversationListView: View {
         guard let id = model.pendingOpenConversationId else { return }
         model.pendingOpenConversationId = nil
         let aggregateId = model.listStore.aggregateId(forTranscriptRowId: id)
-        navPath = [model.resolvedNavigationConversationId(
+        navPath = [model.navigationDestination(
             aggregateId: aggregateId,
-            latestTranscriptRowId: id)]
+            transcriptRowId: id)]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.

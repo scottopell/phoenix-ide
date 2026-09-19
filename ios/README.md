@@ -107,6 +107,26 @@ it does not take over the Mac's mouse or keyboard. It covers first-run
 self-signed TLS setup, explicit mock-model conversation creation, optimistic
 send reconciliation without duplicate bubbles, and cold-launch persistence.
 
+### Signed physical-device build gate
+
+Simulator success is not enough for primary-use readiness. Before claiming a
+build is physical-device-testable, connect the device, use a locally installed
+Apple Development identity, and run:
+
+```bash
+PHOENIX_IOS_DEVELOPMENT_TEAM=<apple-team-id> \
+PHOENIX_IOS_DEVICE_DESTINATION='platform=iOS,id=<device-udid>' \
+./scripts/physical_device_gate.sh
+```
+
+This gate is intentionally separate from Phoenix macOS signing. The team ID and
+device UDID are operator-local inputs and are not checked into the repository.
+After installing the signed build, smoke the primary-use path on the physical
+device: launch; auth/server setup; ProductConversation list/detail;
+send/stream/cancel; background/foreground/reconnect; continuation; offline
+outbox exactly once across reconnect/relaunch; and sign-out/server switch with
+no stale tenant, credential, list, transcript, or outbox data.
+
 **The testing pattern:** pure components get *contract tests* — one test
 per rule of the contract they implement, named after that rule. One focused
 XCUITest covers the highest-risk live UI journey; the remaining views stay

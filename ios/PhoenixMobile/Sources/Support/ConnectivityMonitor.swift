@@ -17,6 +17,9 @@ final class ConnectivityMonitor {
     private var onLoss: [UUID: () -> Void] = [:]
 
     private let monitor = NWPathMonitor()
+    #if DEBUG
+    private var testingOverride = false
+    #endif
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
@@ -28,6 +31,9 @@ final class ConnectivityMonitor {
     }
 
     private func apply(_ path: NWPath) {
+        #if DEBUG
+        guard !testingOverride else { return }
+        #endif
         let nowOnline = path.status == .satisfied
         isConstrained = path.isConstrained || path.isExpensive
         let wasOnline = isOnline
@@ -68,6 +74,7 @@ final class ConnectivityMonitor {
 
     #if DEBUG
     func setOnlineForTesting(_ online: Bool) {
+        testingOverride = true
         let wasOnline = isOnline
         isOnline = online
         if !wasOnline && online {
