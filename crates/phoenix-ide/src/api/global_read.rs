@@ -345,9 +345,7 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
                 truncated: retained.len() < results.len(),
             };
             if serde_json::to_string_pretty(&candidate)?.len() > PREVIOUS_TOOL_RESULT_BYTES {
-                if retained.len() > 1 || hit.message_id.len() <= PREVIOUS_TITLE_BYTES {
-                    retained.pop();
-                }
+                retained.pop();
                 break;
             }
         }
@@ -2467,6 +2465,38 @@ mod tests {
         assert!(json.len() <= PREVIOUS_TOOL_RESULT_BYTES);
         assert!(json.contains("serialized_result_too_large"));
         assert!(json.contains("read_page"));
+    }
+
+    #[test]
+    fn predecessor_search_never_exceeds_host_ceiling_for_legacy_message_id() {
+        let output = PreviousTranscriptsOutput::SearchResults {
+            results: vec![super::PreviousTranscriptSearchHit {
+                transcript_ref: "@conv:pred".to_string(),
+                conversation_id: "pred".to_string(),
+                message_id: "m".repeat(PREVIOUS_TOOL_RESULT_BYTES),
+                message_ref: format!(
+                    "@conv:pred#message-{}",
+                    "m".repeat(PREVIOUS_TOOL_RESULT_BYTES)
+                ),
+                href: format!("/c/pred#message-{}", "m".repeat(PREVIOUS_TOOL_RESULT_BYTES)),
+                role: "user".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                snippet: "evidence".to_string(),
+                chunk: super::PreviousTranscriptChunkRef {
+                    ordinal: 0,
+                    char_range: None,
+                },
+                relevance_score: 0.0,
+            }],
+            index_fresh: true,
+            truncated: false,
+        };
+
+        let json = serialize_previous_transcripts_output_bounded(&output).unwrap();
+        assert!(json.len() <= PREVIOUS_TOOL_RESULT_BYTES);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["truncated"], true);
     }
 
     #[test]

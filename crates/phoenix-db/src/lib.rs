@@ -8007,6 +8007,15 @@ impl Database {
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
+        if let Some(intent) = intent {
+            let persisted_message_id = format!("{new_id}:{}", intent.message_id.as_str());
+            if persisted_message_id.len() > 256 {
+                return Err(DbError::ContinuationPrecondition(
+                    "continuation message_id produces a persisted identity longer than 256 UTF-8 bytes"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Sequential slug: walk to chain root, count existing members, then
         // assign `{root_slug}-{N}` where N = member_count + 1 (e.g. root-only
@@ -23334,6 +23343,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(authority, "generated_predecessor_context");
+    }
+
+    #[tokio::test]
+    async fn oversized_continuation_identity_is_rejected_before_successor_commit() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "parent-oversized-intent",
+            "parent-oversized-intent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let error = db
+            .continue_conversation_with_intent(
+                "parent-oversized-intent",
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("m".repeat(256)).unwrap(),
+                    "handoff".to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DbError::ContinuationPrecondition(message)
+                if message.contains("longer than 256 UTF-8 bytes")
+        ));
+        let parent = db
+            .get_conversation("parent-oversized-intent")
+            .await
+            .unwrap();
+        assert!(parent.continued_in_conv_id.is_none());
+        assert!(db
+            .continuation_dispatch_intent("parent-oversized-intent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
