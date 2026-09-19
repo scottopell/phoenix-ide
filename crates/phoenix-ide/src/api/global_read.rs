@@ -1069,7 +1069,7 @@ struct BoundedMessagePage {
     content: String,
     next_cursor: Option<PreviousReadPosition>,
     truncated: bool,
-    preserves_legacy_message_id: bool,
+    legacy_identity_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -1382,10 +1382,10 @@ async fn render_message_page_bounded_as(
         let messages = if let Some(messages) = target_only.take() {
             messages
         } else if let Some(after_sequence) = after_sequence {
-            db.get_messages_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
+            db.get_message_rows_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
                 .await?
         } else {
-            db.get_messages_first_limited(&conv.id, READ_MESSAGE_BATCH)
+            db.get_message_rows_first_limited(&conv.id, READ_MESSAGE_BATCH)
                 .await?
         };
         #[cfg(test)]
@@ -1483,15 +1483,16 @@ async fn render_message_page_bounded_as(
     }
     finish_read_content(&mut out, next_cursor.as_ref());
     let truncated = next_cursor.is_some();
-    let preserves_legacy_message_id = page_start
+    let legacy_identity_bytes = page_start
         .as_ref()
-        .is_some_and(|start| start.message_id.len() > PREVIOUS_TITLE_BYTES);
+        .filter(|start| start.message_id.len() > PREVIOUS_TITLE_BYTES)
+        .map_or(0, |start| start.message_id.len());
     Ok(BoundedMessagePage {
         start: page_start,
         content: out,
         next_cursor,
         truncated,
-        preserves_legacy_message_id,
+        legacy_identity_bytes,
     })
 }
 
@@ -1661,7 +1662,7 @@ fn render_global_read_page(
         )
         .map_err(|error| error.to_string())?;
     }
-    if output.len() > PREVIOUS_TOOL_RESULT_BYTES && !page.preserves_legacy_message_id {
+    if output.len() > PREVIOUS_TOOL_RESULT_BYTES.saturating_add(page.legacy_identity_bytes) {
         return Err(
             "read_conversation result metadata exceeded the host byte ceiling; use a conversation with bounded metadata"
                 .to_string(),
@@ -1767,6 +1768,15 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
     };
+    if message.message_id.len() > PREVIOUS_TITLE_BYTES {
+        return format!(
+            "[{} · {}] @conv:{}\n{}\n\n",
+            role,
+            message.created_at.format("%Y-%m-%d %H:%M"),
+            conv.id,
+            render_full_message_text(message)
+        );
+    }
     let base = format!("/c/{}", conv.id);
     let href = if message_type_has_rendered_anchor(message.message_type) {
         format!(
@@ -2707,7 +2717,11 @@ mod tests {
             .await
             .unwrap();
 
-        let encoded = format!("message-{}", &message_id);
+        let encoded = format!("starts_at: /c/legacy-id#message-{message_id}");
+        assert!(global.len() <= PREVIOUS_TOOL_RESULT_BYTES + message_id.len());
+        assert!(chain.len() <= PREVIOUS_TOOL_RESULT_BYTES + message_id.len());
+        assert_eq!(global.matches(&message_id).count(), 1);
+        assert_eq!(chain.matches(&message_id).count(), 1);
         assert!(global.contains(&encoded));
         assert!(chain.contains(&encoded));
     }

@@ -77,13 +77,12 @@ fn persisted_message_id(req: &SendChatRequest) -> String {
     format!("{}:{}", req.conversation_id, req.message_id)
 }
 
-async fn validate_persisted_message_id(
+async fn validate_message_identity(
     db: &crate::db::Database,
-    req: &SendChatRequest,
+    message_id: &str,
 ) -> Result<(), SendChatServiceError> {
-    let message_id = persisted_message_id(req);
     let legacy_allowed = db
-        .is_legacy_oversized_message_id(&message_id)
+        .is_legacy_oversized_message_id(message_id)
         .await
         .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
     if message_id.len() <= 256 || legacy_allowed {
@@ -91,6 +90,13 @@ async fn validate_persisted_message_id(
     } else {
         Err(SendChatServiceError::MessageIdTooLong)
     }
+}
+
+async fn validate_persisted_message_id(
+    db: &crate::db::Database,
+    req: &SendChatRequest,
+) -> Result<(), SendChatServiceError> {
+    validate_message_identity(db, &persisted_message_id(req)).await
 }
 
 #[derive(Clone)]
@@ -139,7 +145,6 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
-        validate_persisted_message_id(&self.db, &req).await?;
         let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
 
         // The pre-lock lookup is only a fast path. A concurrent request with
@@ -250,6 +255,7 @@ impl SendChatApplicationService {
                 }
             }
 
+            validate_message_identity(&self.db, &req.message_id).await?;
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
                 llm_text: expanded.llm_text,
@@ -292,6 +298,7 @@ impl SendChatApplicationService {
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
 
+        validate_persisted_message_id(&self.db, &req).await?;
         let images = map_images(req.images);
         let delivery = PreparedDirectTurnDelivery {
             text: expanded.display_text.clone(),
@@ -962,8 +969,9 @@ mod tests {
         lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
         map_direct_turn_accept_error, pending_queue_fences_direct_acceptance, persisted_message_id,
         persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
-        submitted_identity_from_request, validate_persisted_message_id, DurableReplayOutcome,
-        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
+        submitted_identity_from_request, validate_message_identity, validate_persisted_message_id,
+        DurableReplayOutcome, MessageExpansionPolicy, SendChatOutcome, SendChatRequest,
+        SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
@@ -988,6 +996,21 @@ mod tests {
 
         req.message_id.push('m');
         assert_eq!(persisted_message_id(&req).len(), 257);
+    }
+
+    #[tokio::test]
+    async fn steering_identity_validates_raw_id_not_direct_turn_derivation() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let mut req = request();
+        req.message_id = "m".repeat(250);
+
+        assert!(validate_message_identity(&db, &req.message_id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            validate_persisted_message_id(&db, &req).await,
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
     }
 
     #[tokio::test]

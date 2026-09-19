@@ -11732,6 +11732,58 @@ impl Database {
         .await
     }
 
+    /// Get the first message rows without hydrating attachment payloads.
+    /// Text-only bounded read renderers use this to avoid loading files/images
+    /// for messages that may not fit the current page.
+    ///
+    /// # Errors
+    /// Returns an error if the message query fails.
+    pub async fn get_message_rows_first_limited(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY sequence_id ASC
+             LIMIT ?2",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get message rows after a sequence without hydrating attachment payloads.
+    ///
+    /// # Errors
+    /// Returns an error if the message query fails.
+    pub async fn get_message_rows_after_limited(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id > ?2
+             ORDER BY sequence_id ASC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(after_sequence)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Get messages after a sequence ID, capped by `limit`.
     ///
     /// # Errors
