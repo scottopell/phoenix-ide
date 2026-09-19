@@ -774,6 +774,24 @@ impl RuntimeManager {
             })
             .map(|evidence| (evidence.scope, resource_key(&evidence.resource)))
             .collect::<std::collections::BTreeSet<_>>();
+        if obligation.phase() == ClosePhase::NeedsRepair {
+            let active_residuals = self
+                .db()
+                .list_close_retirement_evidence(attempt_id.as_str())
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|item| {
+                    item.snapshot == snapshot
+                        && matches!(item.outcome, RetirementOutcome::Residual { .. })
+                })
+                .count();
+            if active_residuals == 0 {
+                return Err(CloseRetirementError::Message(
+                    "Close needs-repair phase has no active residual evidence".to_string(),
+                ));
+            }
+        }
         self.validate_close_worktrees_before_runtime_retirement(
             &attempt_id,
             &snapshot,
@@ -1690,9 +1708,18 @@ impl RuntimeManager {
                                     .return_close_attempt_to_reinspection(attempt_id)
                                     .await
                                     .map_err(|error| error.to_string())?;
-                                Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
-                                    .await?;
-                                return Err(CloseRetirementError::Message(detail));
+                                match Box::pin(
+                                    self.inspect_close_retirement_only(attempt_id.clone()),
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        return Err(CloseRetirementError::Message(detail));
+                                    }
+                                    Err(error) => {
+                                        return Err(CloseRetirementError::Message(error));
+                                    }
+                                }
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
