@@ -10841,6 +10841,12 @@ BEGIN
     SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
 END;
 
+CREATE TRIGGER close_ambient_writer_cause_reject_key_update
+BEFORE UPDATE OF attempt_id ON close_ambient_writer_indeterminate_causes
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause identity is immutable');
+END;
+
 CREATE TRIGGER close_needs_repair_cause_reject_ambient_writer_cause
 BEFORE INSERT ON close_needs_repair_causes
 WHEN EXISTS (
@@ -10849,6 +10855,12 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
+END;
+
+CREATE TRIGGER close_needs_repair_cause_reject_key_update
+BEFORE UPDATE OF attempt_id ON close_needs_repair_causes
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause identity is immutable');
 END;
 ";
 

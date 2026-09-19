@@ -169,6 +169,15 @@ impl RuntimeManager {
                 let snapshot = resumed.snapshot().cloned().ok_or_else(|| {
                     "resumed Close retirement has no inspection snapshot".to_string()
                 })?;
+                let scopes = self
+                    .db()
+                    .list_close_attempt_scopes(attempt_id.as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for captured in scopes {
+                    self.acquire_close_resource_lease(&attempt_id, captured.scope)
+                        .await?;
+                }
                 self.retire_close_runtime_resources(attempt_id)
                     .await
                     .map_err(String::from)?;
@@ -4267,11 +4276,11 @@ fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn linux_mapping_path_is_deleted(path: &[u8]) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
-    let Some(candidate) = path.strip_suffix(b" (deleted)") else {
+    let full_path = Path::new(std::ffi::OsStr::from_bytes(path));
+    if std::fs::metadata(full_path).is_ok() {
         return false;
-    };
-    let candidate = Path::new(std::ffi::OsStr::from_bytes(candidate));
-    std::fs::metadata(candidate).is_err()
+    }
+    path.ends_with(b" (deleted)")
 }
 
 #[cfg(target_os = "linux")]
@@ -4858,13 +4867,14 @@ fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, S
                 "cannot reprove process {pid} working-directory executable identity"
             ));
         };
+        let after_cwd = macos_process_working_directory(pid)?;
         if after_uid != uid {
             return Err("matching writer identity changed during inspection".to_string());
         }
         if !revalidated_writer_identity(
             &before_incarnation,
             &before_executable,
-            true,
+            after_cwd.as_deref() == Some(cwd_path),
             &after_incarnation,
             &after_executable,
         )? {
@@ -5285,10 +5295,7 @@ fn linux_descriptor_writer_evidence(
 fn linux_namespace_path_is_deleted(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     let bytes = path.as_os_str().as_bytes();
-    let Some(candidate) = bytes.strip_suffix(b" (deleted)") else {
-        return false;
-    };
-    std::fs::metadata(Path::new(std::ffi::OsStr::from_bytes(candidate))).is_err()
+    bytes.ends_with(b" (deleted)") && std::fs::metadata(path).is_err()
 }
 
 #[cfg(target_os = "linux")]
@@ -5626,6 +5633,38 @@ fn macos_process_owner_incarnation(pid: i32) -> Result<Option<(libc::uid_t, Stri
         info.pbi_uid,
         format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
     )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_working_directory(pid: i32) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>())
+                .expect("vnode path info size fits i32"),
+        )
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if bytes
+        != i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>())
+            .expect("vnode path info size fits i32")
+    {
+        return Err(format!("cannot re-read process {pid} working directory"));
+    }
+    let info = unsafe { info.assume_init() };
+    let bytes = info.pvi_cdir.vip_path.as_flattened();
+    let path = unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) };
+    Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+        path.to_bytes(),
+    ))))
 }
 
 #[cfg(target_os = "macos")]
