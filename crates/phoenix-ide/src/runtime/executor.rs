@@ -18412,6 +18412,66 @@ mod steer_drain_detector_tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    async fn build_cancelling_runtime(
+        conv_id: &str,
+        agent_ids: &[&str],
+        cause: crate::state_machine::event::CancelCause,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        Arc<InMemoryStorage>,
+    ) {
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            conv_id,
+            mk_cancelling_sub_agents(agent_ids, cause),
+            vec![],
+        );
+        let assistant = AssistantMessage::new(
+            format!("{conv_id}-spawn-assistant"),
+            vec![ContentBlock::tool_use(
+                "spawn-1",
+                "spawn_agents",
+                serde_json::json!({"tasks": agent_ids.iter().map(|id| serde_json::json!({"task": format!("task {id}"), "mode": "work"})).collect::<Vec<_>>()}),
+            )],
+            None,
+            None,
+        );
+        let checkpoint = CheckpointData::tool_round(
+            assistant,
+            vec![ToolResult::success(
+                "spawn-1".into(),
+                "Spawning sub-agents".into(),
+            )],
+        )
+        .unwrap();
+        runtime
+            .execute_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .await
+            .unwrap();
+        (runtime, storage)
+    }
+
+    fn assert_cancellation_fan_in_persisted(storage: &InMemoryStorage, conv_id: &str) {
+        let messages = storage.get_all_messages(conv_id);
+        let message = messages
+            .iter()
+            .find(|message| {
+                matches!(&message.content,
+            MessageContent::Tool(content) if content.tool_use_id == "spawn-1")
+            })
+            .expect("spawn checkpoint must retain its tool result");
+        assert!(matches!(&message.content, MessageContent::Tool(content)
+            if content.content.starts_with("Sub-agent results")));
+        assert_eq!(
+            message
+                .display_data
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("subagent_summary")
+        );
+    }
+
     /// Test 4 (part A): the one-writer reservation is released ONLY when a
     /// `SubAgentResult` for the in-flight Work agent is actually processed — not
     /// merely because the parent is in `CancellingSubAgents`. Seed the counter at
@@ -18419,14 +18479,12 @@ mod steer_drain_detector_tests {
     /// drops to 0.
     #[tokio::test]
     async fn one_writer_released_on_confirmed_stop() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-onewriter-release",
-            mk_cancelling_sub_agents(
-                &["w1"],
-                crate::state_machine::event::CancelCause::UserRequested,
-            ),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         // Before the result drains, the reservation is still held.
@@ -18454,6 +18512,7 @@ mod steer_drain_detector_tests {
             "the last drained result resolves CancellingSubAgents -> Idle, got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-release");
     }
 
     /// Test 4 (part B): after the 6s last-resort presumes a silent Work agent
@@ -18461,11 +18520,12 @@ mod steer_drain_detector_tests {
     /// — no leak. Drives the backstop directly (no real 6s wait).
     #[tokio::test]
     async fn one_writer_released_by_last_resort_backstop() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-onewriter-backstop",
-            mk_cancelling_sub_agents(&["w1"], crate::state_machine::event::CancelCause::Timeout),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::Timeout,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         // Fire the last-resort backstop directly (the deadline arm would call
@@ -18481,6 +18541,7 @@ mod steer_drain_detector_tests {
             "a Timeout teardown resumes the parent (LlmRequesting), got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-backstop");
     }
 
     /// Test 5 (mixed drain): two pending Work agents — one reports a real result,
@@ -18488,14 +18549,12 @@ mod steer_drain_detector_tests {
     /// decrement each (no double-release, no leak); the parent reaches Idle.
     #[tokio::test]
     async fn mixed_drain_real_result_then_backstop_no_double_release() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-mixed-drain",
-            mk_cancelling_sub_agents(
-                &["real", "silent"],
-                crate::state_machine::event::CancelCause::Timeout,
-            ),
-            vec![],
-        );
+            &["real", "silent"],
+            crate::state_machine::event::CancelCause::Timeout,
+        )
+        .await;
         rt.active_work_subagents = 2;
 
         // "real" reports a genuine Success — fidelity preserved, counter -> 1.
@@ -18517,7 +18576,6 @@ mod steer_drain_detector_tests {
             "still draining the silent agent, got {}",
             rt.state.variant_name()
         );
-
         // "silent" never reports; the backstop presumes it dead and drains it.
         rt.handle_cancelling_sub_agents_timeout().await;
 
@@ -18530,6 +18588,7 @@ mod steer_drain_detector_tests {
             "Timeout teardown resumes the parent after both agents drain, got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-mixed-drain");
     }
 
     /// Double-release / underflow probe: a real result drains a Work agent
@@ -18539,14 +18598,12 @@ mod steer_drain_detector_tests {
     /// `saturating_sub` floor is never even reached because the guard fires first.
     #[tokio::test]
     async fn late_duplicate_result_for_same_agent_does_not_double_release() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-dup-nounder",
-            mk_cancelling_sub_agents(
-                &["w1"],
-                crate::state_machine::event::CancelCause::UserRequested,
-            ),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         rt.process_event(Event::SubAgentResult {
@@ -18577,6 +18634,7 @@ mod steer_drain_detector_tests {
             rt.active_work_subagents, 0,
             "a late duplicate for an already-drained agent must not decrement again"
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-dup-nounder");
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.
