@@ -581,6 +581,7 @@ impl WorkflowRepository {
         };
         let turn = row_to_turn_tx(&mut tx.tx, row).await?;
         let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn.id).await?;
+        require_product_conversation_admission_tx(&mut tx.tx, &turn.conversation.0).await?;
         let mut turns = vec![turn.clone()];
         if let Some(owner) =
             load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &turn.conversation).await?
@@ -629,7 +630,16 @@ impl WorkflowRepository {
                         TurnConflict::RearmRequiresTerminal,
                     ));
                 }
-                tx.commit().await?;
+                if let Err(commit_error) = tx.commit().await {
+                    return self
+                        .classify_rearmed_turn_after_commit_error(
+                            input,
+                            workflow_id,
+                            automatic_continuation_predecessor,
+                            commit_error,
+                        )
+                        .await;
+                }
             } else {
                 tx.rollback().await?;
             }
@@ -765,8 +775,55 @@ impl WorkflowRepository {
         let rearmed = load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn.id, workflow_id)
             .await?
             .ok_or_else(|| DbError::Serialization("rearmed direct turn missing".to_string()))?;
-        tx.commit().await?;
+        if let Err(commit_error) = tx.commit().await {
+            return self
+                .classify_rearmed_turn_after_commit_error(
+                    input,
+                    workflow_id,
+                    automatic_continuation_predecessor,
+                    commit_error,
+                )
+                .await;
+        }
         Ok(RearmAuthoritativeTurnOutcome::Rearmed { turn: rearmed })
+    }
+
+    async fn classify_rearmed_turn_after_commit_error(
+        &self,
+        input: &RearmAuthoritativeTurnInput,
+        workflow_id: WorkflowId,
+        automatic_continuation_predecessor: Option<&str>,
+        commit_error: DbError,
+    ) -> DbResult<RearmAuthoritativeTurnOutcome> {
+        let mut classification = self.begin_tx().await?;
+        let exact = load_exact_rearmed_turn_tx(
+            &mut classification.tx,
+            input.turn_id,
+            workflow_id,
+            input.expected_generation.saturating_add(1),
+        )
+        .await?;
+        let admission_rearmed = if let Some(predecessor) = automatic_continuation_predecessor {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM automatic_continuation_admissions
+                     WHERE predecessor_conversation_id = ?1
+                       AND phase = 'dispatch_accepted'
+                       AND last_error IS NULL
+                 )",
+            )
+            .bind(predecessor)
+            .fetch_one(&mut *classification.tx)
+            .await?
+                != 0
+        } else {
+            true
+        };
+        classification.rollback().await?;
+        match exact {
+            Some(turn) if admission_rearmed => Ok(RearmAuthoritativeTurnOutcome::Rearmed { turn }),
+            _ => Err(commit_error),
+        }
     }
 
     #[cfg(test)]
@@ -2510,7 +2567,10 @@ async fn ensure_rearmed_automatic_continuation_tx(
            AND phase IN ('failed', 'dispatch_accepted')",
     )
     .bind(predecessor_conversation_id)
-    .bind(to_i64(rearmed_at.0, "rearmed_at")?)
+    .bind(to_i64(
+        rearmed_at.0.saturating_mul(1_000_000),
+        "rearmed_at_unix_micros",
+    )?)
     .execute(&mut **tx)
     .await?
     .rows_affected()

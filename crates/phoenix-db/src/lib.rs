@@ -6664,7 +6664,7 @@ impl Database {
                  FROM conversations AS conversation
                  WHERE conversation.product_conversation_id = ?1
                    AND conversation.parent_conversation_id IS NULL
-                   AND conversation.runtime_role = 'user'
+                   AND conversation.runtime_role IN ('user', 'coordinator')
                    AND NOT EXISTS (
                        SELECT 1 FROM conversations AS candidate
                        WHERE candidate.continued_in_conv_id = conversation.id
@@ -6676,7 +6676,7 @@ impl Database {
                  JOIN conversations AS successor ON successor.id = predecessor.continued_in_conv_id
                  WHERE successor.product_conversation_id = ?1
                    AND successor.parent_conversation_id IS NULL
-                   AND successor.runtime_role = 'user'
+                   AND successor.runtime_role IN ('user', 'coordinator')
              )
              SELECT admission.predecessor_conversation_id
              FROM transcript
@@ -6798,14 +6798,18 @@ impl Database {
         let predecessors: Vec<String> = sqlx::query_scalar(
             "SELECT predecessor_conversation_id
              FROM automatic_continuation_admissions
-             WHERE phase NOT IN ('message_settled', 'superseded', 'failed')
-               AND updated_at_unix_micros <= ?1 - CASE no_progress_attempts
+             WHERE phase NOT IN ('message_settled', 'superseded')
+               AND ((phase = 'failed' AND EXISTS (
+                       SELECT 1 FROM completed_continuation_handoffs AS completed
+                       WHERE completed.predecessor_conversation_id =
+                             automatic_continuation_admissions.predecessor_conversation_id
+                   )) OR (phase != 'failed' AND updated_at_unix_micros <= ?1 - CASE no_progress_attempts
                    WHEN 0 THEN 0
                    WHEN 1 THEN 5000000
                    WHEN 2 THEN 10000000
                    WHEN 3 THEN 20000000
                    ELSE 40000000
-               END
+               END))
              ORDER BY admitted_at_unix_micros, predecessor_conversation_id",
         )
         .bind(Utc::now().timestamp_micros())
