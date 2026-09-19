@@ -3462,6 +3462,11 @@ def cmd_qa_message_list() -> None:
     )
 
 
+def cmd_qa_svg_artifacts() -> None:
+    """Verify SVG artifact controls at desktop and mobile sizes."""
+    subprocess.run(["pnpm", "qa:svg-artifacts"], cwd=ROOT / "ui", check=True, env=node_env())
+
+
 def cmd_qa_tool_results() -> None:
     """Capture comprehensive tool-result Ladle screenshots at desktop and mobile sizes."""
     subprocess.run(
@@ -10806,6 +10811,7 @@ def main():
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("product-conversation", help="Capture ProductConversation Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
+    qa_sub.add_parser("svg-artifacts", help="Verify SVG artifact Ladle controls and capture browser evidence")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
 
@@ -10983,6 +10989,8 @@ def main():
             cmd_qa_product_conversation()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
+        elif args.qa_command == "svg-artifacts":
+            cmd_qa_svg_artifacts()
         elif args.qa_command == "tool-results":
             cmd_qa_tool_results()
         elif args.qa_command == "work-actions":
