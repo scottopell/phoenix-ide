@@ -1363,6 +1363,54 @@ impl RuntimeManager {
                         .as_ref()
                         .filter(|plan| plan.final_tombstone.is_some())
                     {
+                        let tombstone = cleanup_plan
+                            .final_tombstone
+                            .as_ref()
+                            .expect("filtered above");
+                        if tombstone.object_device.is_none()
+                            && quarantine_path
+                                .try_exists()
+                                .map_err(|error| error.to_string())?
+                        {
+                            let observe = std::sync::Arc::clone(&self.ambient_writer_observer);
+                            let observed_path = quarantine_path.clone();
+                            match tokio::task::spawn_blocking(move || observe(&observed_path))
+                                .await
+                                .map_err(|error| error.to_string())?
+                            {
+                                Ok(Some(evidence)) => {
+                                    self.db()
+                                        .record_close_ambient_writer_evidence(
+                                            RecordCloseAmbientWriterEvidenceRequest {
+                                                attempt_id: attempt_id.clone(),
+                                                scope: scope.clone(),
+                                                snapshot: snapshot.clone(),
+                                                resource: target.resource.clone(),
+                                                evidence,
+                                            },
+                                        )
+                                        .await
+                                        .map_err(map_close_retirement_db_error)?;
+                                    self.cancel_close_resource_leases(attempt_id)
+                                        .await
+                                        .map_err(CloseRetirementError::Message)?;
+                                    return Err(CloseRetirementError::Message(
+                                        "stable ambient writer appeared before final tombstone recovery"
+                                            .to_string(),
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(reason) => {
+                                    let error = CloseRetirementError::Message(format!(
+                                        "worktree cannot be reinspected before final tombstone recovery: {reason}"
+                                    ));
+                                    self.persist_close_error_repair(attempt_id, &scope, &error)
+                                        .await
+                                        .map_err(CloseRetirementError::Message)?;
+                                    return Err(error);
+                                }
+                            }
+                        }
                         let identity = identity.clone();
                         let cleanup_plan = cleanup_plan.clone();
                         let db = self.db().clone();
@@ -1750,18 +1798,13 @@ impl RuntimeManager {
                                 return Err(CloseRetirementError::Message(residual.detail));
                             }
                             Err(reason) => {
-                                return self
-                                    .record_close_residual(
-                                        attempt_id,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        &format!(
-                                        "worktree cannot be reinspected before removal: {reason}"
-                                    ),
-                                    )
-                                    .await;
+                                let error = CloseRetirementError::Message(format!(
+                                    "worktree cannot be reinspected before removal: {reason}"
+                                ));
+                                self.persist_close_error_repair(attempt_id, &scope, &error)
+                                    .await
+                                    .map_err(CloseRetirementError::Message)?;
+                                return Err(error);
                             }
                         };
                         if let Some(fresh_snapshot) = fresh_snapshot {
@@ -4049,25 +4092,26 @@ fn inspect_ambient_writer_until_quiescent(
     mut wait: impl FnMut(std::time::Duration),
 ) -> Result<Option<AmbientWriterEvidence>, String> {
     let mut consecutive_clean = 0;
-    let mut last_writer = None;
+    let mut final_writer = None;
     for observation in 0..policy.max_observations.get() {
         match observe()? {
             ExternalWriterEvidence::NoPositiveEvidence => {
                 consecutive_clean += 1;
+                final_writer = None;
                 if consecutive_clean == policy.required_clean.get() {
                     return Ok(None);
                 }
             }
             ExternalWriterEvidence::PositiveWriterFound(evidence) => {
                 consecutive_clean = 0;
-                last_writer = Some(evidence);
+                final_writer = Some(evidence);
             }
         }
         if observation + 1 < policy.max_observations.get() {
             wait(policy.spacing);
         }
     }
-    last_writer.map_or_else(
+    final_writer.map_or_else(
         || {
             Err(
                 "ambient writer observation budget ended without two clean observations"
@@ -8506,6 +8550,22 @@ mod tests {
         assert!(
             super::AmbientWriterObservationPolicy::new(1, 2, std::time::Duration::ZERO,).is_err()
         );
+    }
+
+    #[test]
+    fn exhausted_clean_streak_does_not_replay_an_earlier_writer() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("transient")),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        ];
+        let error = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 0),
+            || Ok(observations.pop().unwrap()),
+            |_| {},
+        )
+        .expect_err("one final clean observation does not establish quiescence");
+        assert!(error.contains("budget ended without two clean observations"));
     }
 
     #[test]
