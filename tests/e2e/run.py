@@ -14,7 +14,7 @@ battery of scripted conversations using the same HTTP/SSE surface that
 phoenix-client.py uses.
 
 Tests select mock scenarios with the `[[scenario:NAME]]` marker
-(see crates/phoenix-ide/src/llm/mock.rs).
+(see crates/phoenix-llm/src/mock.rs).
 
 Exit code 0 if all scenarios pass; 1 otherwise.
 
@@ -24,7 +24,7 @@ Adding a new scenario
 1. If you can express the test with one of the existing mock variants,
    skip to step 3. Grep `[[scenario:` in this file for what already
    exists; the marker name is the source-of-truth pointer — grep the
-   same string in `crates/phoenix-ide/src/llm/mock.rs` to see the
+   same string in `crates/phoenix-llm/src/mock.rs` to see the
    scripted response.
 
 2. If you need a new mock response shape:
@@ -1457,6 +1457,84 @@ def scenario_patch(base_url: str) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def scenario_present_svg(base_url: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-svg-") as work_dir:
+        staging = Path(work_dir).resolve() / "chart.svg"
+        conv = _new_conv_in(
+            base_url, work_dir,
+            f"[[scenario:present_svg]] [[svg_path:{staging}]] visualize measured disk usage",
+        )
+        conv_id = conv["id"]
+        final = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: _has_tool_use(messages, "present_svg"),
+            "SVG publication", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        messages = final["messages"]
+        assert _count_tool_use(messages, "bash") == 1
+        assert _count_tool_use(messages, "present_svg") == 1
+        uses = [
+            block for message in messages if isinstance(message.get("content"), list)
+            for block in message["content"] if block.get("type") == "tool_use"
+        ]
+        assert [block["name"] for block in uses] == ["bash", "present_svg"]
+        publication = next(block for block in uses if block["name"] == "present_svg")
+        assert publication["input"]["path"] == str(staging)
+        assert set(publication["input"]) == {"path", "title", "description"}
+        results = [m for m in messages if m.get("message_type") == "tool"]
+        assert len(results) == 2, results
+        for message in results:
+            assert message["content"].get("is_error") is False, message["content"]
+        result = next(m for m in results if m["content"]["tool_use_id"] == publication["id"])
+        reference_text = result["content"]["content"]
+        reference = json.loads(reference_text)
+        assert reference["conversation_id"] == conv_id
+        assert reference["validation"] == "accepted_static_svg"
+        assert reference["title"] == "Measured disk usage"
+        assert reference["width"] == 800 and reference["height"] == 400
+        assert "<svg" not in reference_text and len(reference_text) < 2048
+        accepted = staging.read_bytes()
+        assert b"48 GiB" in accepted and b"24 GiB" in accepted and b"36 GiB" in accepted
+        artifact_path = f"/api/conversations/{conv_id}/svg-artifacts/{reference['artifact_id']}"
+
+        def check_representations() -> None:
+            for suffix in ("", "/source", "/download"):
+                response = httpx.get(f"{base_url}{artifact_path}{suffix}", timeout=10.0)
+                response.raise_for_status()
+                assert response.content == accepted
+                assert response.headers["x-content-type-options"] == "nosniff"
+                assert "sandbox" in response.headers["content-security-policy"]
+                assert response.headers["cross-origin-resource-policy"] == "same-origin"
+                if suffix == "/source":
+                    assert response.headers["content-type"].startswith("text/plain")
+                else:
+                    assert response.headers["content-type"].startswith("image/svg+xml")
+                    assert "attachment" in response.headers["content-disposition"]
+
+        check_representations()
+        staging.write_text("<svg>replaced after publication</svg>")
+        check_representations()
+        staging.unlink()
+        check_representations()
+        reloaded = _get_conv(base_url, conv_id)
+        assert [m for m in reloaded["messages"] if m["message_id"] == result["message_id"]] == [result]
+        _wait_for_sse_signal(
+            base_url, conv_id,
+            lambda event, data: event == "init" and reference["artifact_id"] in data,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        replayed = _get_conv(base_url, conv_id)
+        assert _count_tool_use(replayed["messages"], "present_svg") == 1
+        assert [m for m in replayed["messages"] if m["message_id"] == result["message_id"]] == [result]
+        other = _new_conv(base_url, "[[scenario:plain_text]] unrelated SVG ownership check")
+        for suffix in ("", "/source", "/download"):
+            response = httpx.get(
+                f"{base_url}/api/conversations/{other['id']}/svg-artifacts/{reference['artifact_id']}{suffix}",
+                timeout=10.0,
+            )
+            assert response.status_code == 404, response.text
+
+
 def scenario_perf_stream(base_url: str) -> None:
     # Uses the [[perf:N]] marker (see mock.rs `parse_perf_words`) — emits
     # exactly N whitespace-separated deterministic words. Catches stream
@@ -1487,6 +1565,7 @@ SCENARIOS = [
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
     ("patch", scenario_patch),
+    ("present_svg", scenario_present_svg),
     ("continuation", scenario_continuation),
     (
         "product_conversation_context_continuation",
