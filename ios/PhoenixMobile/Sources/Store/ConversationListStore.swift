@@ -37,6 +37,7 @@ final class ConversationListStore {
     private let cacheSource: URL
     private let cacheWriter: VersionedDiskWriter
     private let snapshotDirectory: URL
+    private var cachePersistenceTask: Task<Void, Never>?
 
     /// Reset invalidates an in-flight refresh. Row-level changes are folded
     /// into its result so the refresh can still update unrelated rows.
@@ -387,16 +388,21 @@ final class ConversationListStore {
         await cacheWriter.remove(revision: revision)
     }
 
+    func awaitCachePersistence() async {
+        await cachePersistenceTask?.value
+    }
+
     private func persistCache() {
         guard let lastRefreshed else { return }
         let revision = cacheWriter.reserveRevision()
-        Task { await cacheWriter.save(
-            Cache(
-                conversations: conversations,
-                transcriptToAggregate: transcriptToAggregate,
-                aggregateToCachedTranscript: aggregateToCachedTranscript,
-                lastRefreshed: lastRefreshed),
-            revision: revision)
+        cachePersistenceTask = Task { [cacheWriter] in
+            _ = await cacheWriter.save(
+                Cache(
+                    conversations: conversations,
+                    transcriptToAggregate: transcriptToAggregate,
+                    aggregateToCachedTranscript: aggregateToCachedTranscript,
+                    lastRefreshed: lastRefreshed),
+                revision: revision)
         }
     }
 }
