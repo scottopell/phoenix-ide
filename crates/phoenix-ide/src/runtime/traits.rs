@@ -2337,7 +2337,7 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec());
+        let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task();
         for tool in self.host_bound_tools.iter().cloned() {
             if registry.find_tool(tool.name()).is_none() {
                 registry = registry
