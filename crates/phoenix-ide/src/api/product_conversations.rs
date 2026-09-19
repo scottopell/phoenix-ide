@@ -196,6 +196,11 @@ async fn write_project_coordinator_profile(
             "Project Coordinator profile requires an ordinary ProductConversation".to_string(),
         )),
         Err(ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::NotOpen,
+        )) => Err(AppError::BadRequest(
+            "Project Coordinator profile requires an Open ProductConversation".to_string(),
+        )),
+        Err(ProjectCoordinatorProfileWriteDbError::Domain(
             ProjectCoordinatorProfileWriteError::RevisionConflict,
         )) => Err(AppError::Conflict(Box::new(
             super::types::ConflictErrorResponse::new(
@@ -432,6 +437,9 @@ async fn snapshot_view(
         project_coordinator_eligible: matches!(
             aggregate.product_conversation.kind(),
             phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary
+        ) && matches!(
+            lifecycle,
+            phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::Open
         ),
 
         requested_transcript_row_id,

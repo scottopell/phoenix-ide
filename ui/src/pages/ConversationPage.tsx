@@ -1173,6 +1173,7 @@ function ConversationPageContent({
       .catch((err) => {
         if (systemPromptRequestRef.current === requestGeneration) {
           console.warn('Failed to load system prompt:', err);
+          dispatch({ type: 'set_system_prompt', systemPrompt: null, expectedConversationId: conversationId });
         }
       });
     return () => {

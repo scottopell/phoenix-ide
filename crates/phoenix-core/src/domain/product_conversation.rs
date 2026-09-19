@@ -327,6 +327,7 @@ pub enum ProjectCoordinatorProfileWriteError {
     InvalidCharter,
     InvalidProfile,
     NotOrdinary,
+    NotOpen,
     RevisionConflict,
 }
 
@@ -337,6 +338,9 @@ impl fmt::Display for ProjectCoordinatorProfileWriteError {
             Self::InvalidProfile => f.write_str("project coordinator profile is invalid"),
             Self::NotOrdinary => {
                 f.write_str("project coordinator profile requires an ordinary ProductConversation")
+            }
+            Self::NotOpen => {
+                f.write_str("project coordinator profile requires an Open ProductConversation")
             }
             Self::RevisionConflict => f.write_str("project coordinator profile revision conflict"),
         }

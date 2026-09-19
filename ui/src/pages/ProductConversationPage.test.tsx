@@ -447,6 +447,52 @@ describe('ProductConversationPage', () => {
     expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
   });
 
+  it('does not let a delayed save response overwrite a newer profile revision', async () => {
+    const { api } = await import('../api');
+    let resolveSave!: (profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']>) => void;
+    const save = new Promise<NonNullable<ProductConversationSnapshotView['project_coordinator_profile']>>((resolve) => {
+      resolveSave = resolve;
+    });
+    const savedRevisionOne = {
+      enabled: true,
+      charter: 'Saved revision one',
+      revision: 1,
+      updated_at_unix_micros: 1,
+    };
+    const newerRevision = {
+      enabled: true,
+      charter: 'Concurrent revision two',
+      revision: 2,
+      updated_at_unix_micros: 2,
+    };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: newerRevision }))
+      .mockRejectedValueOnce(new Error('post-save refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockReturnValue(save);
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedRevisionOne.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledTimes(1));
+
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText('Coordinator ✓')).toBeInTheDocument());
+
+    await act(async () => {
+      resolveSave(savedRevisionOne);
+      await save;
+    });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue(newerRevision.charter);
+  });
+
   it('retains unsaved charter text and surfaces save failure', async () => {
     const { api } = await import('../api');
     vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('Profile changed elsewhere'));
@@ -551,6 +597,23 @@ describe('ProductConversationPage', () => {
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
     expect(screen.queryByText(/^Coordinator/)).not.toBeInTheDocument();
+  });
+
+  it('omits Project Coordinator settings for History aggregates', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      project_coordinator_eligible: false,
+      project_coordinator_profile: { enabled: true, charter: 'retained charter', revision: 7, updated_at_unix_micros: 7 },
+    }));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(screen.queryByText(/^Coordinator/)).not.toBeInTheDocument();
+    expect(api.putProjectCoordinatorProfile).not.toHaveBeenCalled();
   });
 
   it('reports hidden-at-start opens without waiting for or fabricating paint', async () => {
