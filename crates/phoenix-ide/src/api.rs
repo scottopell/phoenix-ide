@@ -24,6 +24,7 @@ mod release_updates;
 mod resource_monitor;
 mod spa_routes;
 mod sse;
+mod svg_artifacts;
 mod terminal_ws;
 mod types;
 pub(crate) mod usage;

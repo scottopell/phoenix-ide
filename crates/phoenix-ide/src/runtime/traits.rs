@@ -596,8 +596,8 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// Combined storage trait for convenience
-pub trait Storage: MessageStore + StateStore {}
-impl<T: MessageStore + StateStore> Storage for T {}
+pub trait Storage: MessageStore + StateStore + crate::tools::present_svg::SvgArtifactStore {}
+impl<T: MessageStore + StateStore + crate::tools::present_svg::SvgArtifactStore> Storage for T {}
 
 // ============================================================================
 // Arc implementations for trait objects
@@ -2461,5 +2461,54 @@ mod registry_llm_client_tests {
             mismatch.continuation_request_limits(),
             phoenix_llm::ContinuationRequestLimits::TokenWindowOnly
         );
+    }
+}
+
+#[async_trait]
+impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
+        self.db
+            .svg_artifact_for_invocation(conversation_id, tool_use_id)
+            .await
+            .map(|artifact| artifact.map(svg_reference))
+            .map_err(|error| error.to_string())
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
+        self.db
+            .publish_svg_artifact(
+                conversation_id,
+                tool_use_id,
+                &draft.title,
+                &draft.description,
+                draft.svg.width(),
+                draft.svg.height(),
+                draft.svg.bytes(),
+            )
+            .await
+            .map(svg_reference)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn svg_reference(
+    artifact: crate::db::SvgArtifact,
+) -> crate::tools::present_svg::SvgArtifactReference {
+    crate::tools::present_svg::SvgArtifactReference {
+        artifact_id: artifact.artifact_id,
+        conversation_id: artifact.conversation_id,
+        title: artifact.title,
+        description: artifact.description,
+        width: artifact.width,
+        height: artifact.height,
+        validation: crate::tools::present_svg::SvgValidationOutcome::AcceptedStaticSvg,
     }
 }

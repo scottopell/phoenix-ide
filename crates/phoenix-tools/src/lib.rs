@@ -9,6 +9,7 @@ pub mod browser;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
+pub mod present_svg;
 pub mod process_inspection;
 mod propose_task;
 mod read_file;
@@ -37,6 +38,7 @@ pub use browser::{
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
+pub use present_svg::PresentSvgTool;
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
@@ -426,6 +428,7 @@ pub struct ToolContext {
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
+    svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -517,6 +520,7 @@ impl ToolContext {
             work_scope: ResourceScopeKey::Coordinator,
             bash_progress_sink: None,
             tool_use_id: None,
+            svg_artifact_store: None,
             wake_registrar: None,
             llm_metrics_tx: None,
         }
@@ -572,8 +576,18 @@ impl ToolContext {
             work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
+            svg_artifact_store: None,
             wake_registrar: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_svg_artifact_store(
+        mut self,
+        store: Arc<dyn present_svg::SvgArtifactStore>,
+    ) -> Self {
+        self.svg_artifact_store = Some(store);
+        self
     }
 
     #[must_use]
@@ -1165,6 +1179,7 @@ impl ToolRegistry {
     #[must_use]
     pub fn for_subagent_work() -> Self {
         let mut tools = read_only_tools();
+        tools.push(Arc::new(PresentSvgTool));
         tools.push(Arc::new(BashTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
@@ -1185,6 +1200,7 @@ impl ToolRegistry {
     /// unused for sub-agents (which cannot spawn).
     fn new_with_options(is_sub_agent: bool, agents: Vec<phoenix_agents::AgentDefinition>) -> Self {
         let mut tools = read_only_tools();
+        tools.push(Arc::new(PresentSvgTool));
         tools.extend(write_tools());
         tools.extend(browser_tools());
 

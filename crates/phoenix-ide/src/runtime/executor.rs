@@ -7498,6 +7498,7 @@ where
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
+        .with_svg_artifact_store(Arc::new(self.storage.clone()))
         .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
 

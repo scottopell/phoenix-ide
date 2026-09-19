@@ -165,6 +165,18 @@ pub fn create_router(state: AppState) -> Router {
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
         .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id",
+            get(super::svg_artifacts::image),
+        )
+        .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id/source",
+            get(super::svg_artifacts::source),
+        )
+        .route(
+            "/api/conversations/:id/svg-artifacts/:artifact_id/download",
+            get(super::svg_artifacts::download),
+        )
+        .route(
             "/api/product-conversations/new",
             post(create_product_conversation).layer(DefaultBodyLimit::max(
                 MAX_MULTIPART_BODY_BYTES + 8 * 1024 * 1024,
