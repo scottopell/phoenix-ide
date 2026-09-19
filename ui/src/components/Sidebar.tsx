@@ -374,7 +374,9 @@ export function Sidebar({
       setProductDeleteTarget(null);
       notifyProductConversationListMayHaveChanged();
       if (activeSlug === productDeleteTarget.product_conversation_id
-        || activeSlug === productDeleteTarget.canonical_root.slug) {
+        || activeSlug === productDeleteTarget.canonical_root.slug
+        || activeSlug === productDeleteTarget.canonical_root.transcript_row_id
+        || activeSlug === productDeleteTarget.latest_transcript_row_id) {
         navigate('/');
       }
     } catch (error) {

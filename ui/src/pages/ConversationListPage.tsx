@@ -66,14 +66,6 @@ export function ConversationListPage() {
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
   const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
   const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
-  const handleProductDelete = async () => {
-    if (!productDeleteTarget) return;
-    const rootId = productDeleteTarget.canonical_root.transcript_row_id;
-    if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
-    else await api.deleteChain(rootId);
-    setProductDeleteTarget(null);
-    notifyProductConversationListMayHaveChanged();
-  };
 
   const visibleConversationCount = effectiveVisibleConversationCount({
     showArchived,
@@ -144,11 +136,30 @@ export function ConversationListPage() {
   const [renameError, setRenameError] = useState<string | undefined>();
   const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
   const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteSubmitting, setProductDeleteSubmitting] = useState(false);
+  const [productDeleteError, setProductDeleteError] = useState<string | undefined>();
   const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
   const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
   const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
+
+  const handleProductDelete = async () => {
+    if (!productDeleteTarget || productDeleteSubmitting) return;
+    setProductDeleteSubmitting(true);
+    try {
+      const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+      if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
+      else await api.deleteChain(rootId);
+      setProductDeleteTarget(null);
+      setProductDeleteError(undefined);
+      notifyProductConversationListMayHaveChanged();
+    } catch (error) {
+      setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
+    } finally {
+      setProductDeleteSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     productCloseTargetRef.current = productCloseTarget;
@@ -490,7 +501,10 @@ export function ConversationListPage() {
                 setProductCloseError(null);
                 setProductCloseTarget(row);
               } } : {})}
-              {...(isOnline ? { onProductConversationDelete: setProductDeleteTarget } : {})}
+              {...(isOnline ? { onProductConversationDelete: (row: ProductConversationListRow) => {
+                setProductDeleteError(undefined);
+                setProductDeleteTarget(row);
+              } } : {})}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(
@@ -539,6 +553,8 @@ export function ConversationListPage() {
         confirmText="Delete"
         danger
         onConfirm={() => void handleProductDelete()}
+        submitting={productDeleteSubmitting}
+        {...(productDeleteError ? { error: productDeleteError } : {})}
         onCancel={() => setProductDeleteTarget(null)}
       />
       <RenameDialog
