@@ -9029,6 +9029,14 @@ CREATE TABLE close_ambient_writer_evidence (
         OR (match_kind = 'namespace_directory' AND access_mode = 'namespace_write')
     ),
     CHECK (identity_codec = 'worktree_id_v1'),
+    CHECK (executable_codec = 'git_path_bytes_hex_v1'),
+    CHECK (executable_value GLOB 'git_path_bytes_hex_v1:*'),
+    CHECK (length(substr(executable_value, 23)) > 0 AND length(substr(executable_value, 23)) % 2 = 0),
+    CHECK (substr(executable_value, 23) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (matched_path_codec = 'git_path_bytes_hex_v1'),
+    CHECK (matched_path_value GLOB 'git_path_bytes_hex_v1:*'),
+    CHECK (length(substr(matched_path_value, 23)) > 0 AND length(substr(matched_path_value, 23)) % 2 = 0),
+    CHECK (substr(matched_path_value, 23) NOT GLOB '*[^0-9a-f]*'),
     PRIMARY KEY (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_codec, identity_value,
@@ -9118,6 +9126,16 @@ CREATE TABLE close_ambient_writer_indeterminate_causes (
         CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
 );
 
+CREATE TRIGGER close_ambient_writer_cause_reject_evidence_cause
+BEFORE INSERT ON close_ambient_writer_indeterminate_causes
+WHEN EXISTS (
+    SELECT 1 FROM close_needs_repair_causes cause
+    WHERE cause.attempt_id = NEW.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
+END;
+
 CREATE TRIGGER close_ambient_writer_indeterminate_cause_phase_changed
 AFTER UPDATE OF phase ON close_obligations
 WHEN OLD.phase <> NEW.phase
@@ -9147,6 +9165,16 @@ CREATE TABLE close_needs_repair_causes (
     recorded_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
 );
+
+CREATE TRIGGER close_needs_repair_cause_reject_ambient_writer_cause
+BEFORE INSERT ON close_needs_repair_causes
+WHEN EXISTS (
+    SELECT 1 FROM close_ambient_writer_indeterminate_causes cause
+    WHERE cause.attempt_id = NEW.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
+END;
 
 CREATE TRIGGER close_needs_repair_cause_phase_changed
 AFTER UPDATE OF phase ON close_obligations
