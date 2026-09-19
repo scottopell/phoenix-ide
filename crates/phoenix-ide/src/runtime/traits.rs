@@ -582,6 +582,12 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        None
+    }
+
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
     fn upgrade_to_work_mode(&self) {
@@ -1112,6 +1118,12 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
         (**self).clearable_tool_names()
+    }
+
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        (**self).coordinator_skill_catalog()
     }
 }
 
@@ -2148,6 +2160,7 @@ pub struct ToolRegistryExecutor {
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     writing_tools: Option<WritingConversationTools>,
+    coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
 impl ToolRegistryExecutor {
@@ -2163,6 +2176,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
     }
 
@@ -2179,7 +2193,17 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_coordinator_skill_catalog(
+        mut self,
+        catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Self {
+        self.coordinator_skill_catalog = catalog;
+        self
     }
 
     #[must_use]
@@ -2224,6 +2248,12 @@ impl ToolExecutor for ToolRegistryExecutor {
         }
 
         None
+    }
+
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        self.coordinator_skill_catalog.clone()
     }
 
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {

@@ -190,6 +190,33 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_compaction_request_removes_lifecycle_contradictions() {
+        let policy = CompactionPolicy::for_coordinator(true);
+        let system_prompt = policy.system_prompt();
+        let instruction = policy.instruction(&[]);
+
+        assert!(system_prompt.contains("You are writing a handoff for Phoenix Coordinator"));
+        assert!(!system_prompt.contains("cannot create conversations"));
+        assert!(!system_prompt.contains("NEVER call Phoenix HTTP API through Bash"));
+        assert!(!instruction.contains("cannot create conversations"));
+        assert!(!instruction.contains("NEVER call Phoenix HTTP API through Bash"));
+    }
+
+    #[test]
+    fn continued_coordinator_uses_corrected_generated_prompt() {
+        let temp = tempfile::TempDir::new().unwrap();
+        crate::skills::builtin::extract_to(temp.path()).unwrap();
+        let prompt = crate::system_prompt::build_coordinator_system_prompt_with_options(
+            phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+            Some(temp.path()),
+        );
+        assert!(prompt.contains("Documented Phoenix API operations through scoped Bash"));
+        assert!(prompt.contains("phoenix-api"));
+        assert!(!prompt.contains("cannot create conversations"));
+        assert!(!prompt.contains("NEVER call Phoenix HTTP API through Bash"));
+    }
+
+    #[test]
     fn accepted_seed_is_selected_by_id_not_first_message_or_equal_text() {
         let history = ContinuationHistory::from_projection(
             &[

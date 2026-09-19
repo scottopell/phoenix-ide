@@ -7962,6 +7962,18 @@ impl Database {
         // `continued_in_conv_id` still being NULL at UPDATE time.
         let parent = self.get_conversation(parent_id).await?;
 
+        let lifecycle = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+        )
+        .bind(parent.product_conversation_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        if matches!(lifecycle.as_deref(), Some("history")) {
+            return Err(DbError::ProductConversationUnavailable(
+                parent.product_conversation_id.clone(),
+            ));
+        }
+
         // Idempotent shortcut: parent already has a continuation.
         if let Some(ref existing_id) = parent.continued_in_conv_id {
             tracing::info!(
@@ -23133,6 +23145,29 @@ mod tests {
             worktree_path: NonEmptyString::new("/tmp/wt/parent-branch").unwrap(),
             base_branch: NonEmptyString::new("feature-login").unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn history_product_conversation_cannot_be_continued() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = setup_exhausted_parent(
+            &db,
+            "history-continuation-parent",
+            "history-continuation-parent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(parent.product_conversation_id.as_str())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let error = db.continue_conversation(&parent.id).await.unwrap_err();
+        assert!(matches!(error, DbError::ProductConversationUnavailable(_)));
     }
 
     #[tokio::test]

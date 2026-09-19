@@ -845,6 +845,10 @@ pub enum ToolOutcome {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolContentImage>,
     },
+    /// Authenticated instructions from an audience-bound immutable built-in skill.
+    TrustedInstructions {
+        output: String,
+    },
     Error {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -938,13 +942,18 @@ impl ToolResult {
     #[allow(dead_code)] // Used in tests; main code uses is_error()
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(self.outcome, ToolOutcome::Success { .. })
+        matches!(
+            self.outcome,
+            ToolOutcome::Success { .. } | ToolOutcome::TrustedInstructions { .. }
+        )
     }
 
     #[must_use]
     pub fn output(&self) -> &str {
         match &self.outcome {
-            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => output,
+            ToolOutcome::Success { output, .. }
+            | ToolOutcome::TrustedInstructions { output }
+            | ToolOutcome::Error { output, .. } => output,
             ToolOutcome::Cancelled { message } => message,
         }
     }
@@ -955,7 +964,7 @@ impl ToolResult {
             ToolOutcome::Success { display_data, .. } | ToolOutcome::Error { display_data, .. } => {
                 display_data.as_ref()
             }
-            ToolOutcome::Cancelled { .. } => None,
+            ToolOutcome::TrustedInstructions { .. } | ToolOutcome::Cancelled { .. } => None,
         }
     }
 
@@ -963,7 +972,7 @@ impl ToolResult {
     pub fn images(&self) -> &[ToolContentImage] {
         match &self.outcome {
             ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
-            ToolOutcome::Cancelled { .. } => &[],
+            ToolOutcome::TrustedInstructions { .. } | ToolOutcome::Cancelled { .. } => &[],
         }
     }
 }
@@ -2145,7 +2154,9 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"type":"success","output":"ok"}"#).unwrap();
         match success {
             ToolOutcome::Success { images, .. } => assert!(images.is_empty()),
-            other @ (ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. }) => {
+            other @ (ToolOutcome::Error { .. }
+            | ToolOutcome::TrustedInstructions { .. }
+            | ToolOutcome::Cancelled { .. }) => {
                 panic!("expected Success, got {other:?}")
             }
         }
@@ -2153,7 +2164,9 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"type":"error","output":"boom"}"#).unwrap();
         match error {
             ToolOutcome::Error { images, .. } => assert!(images.is_empty()),
-            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+            other @ (ToolOutcome::Success { .. }
+            | ToolOutcome::TrustedInstructions { .. }
+            | ToolOutcome::Cancelled { .. }) => {
                 panic!("expected Error, got {other:?}")
             }
         }

@@ -234,6 +234,8 @@ pub enum ToolOutput {
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
     },
+    /// Instructions from an authenticated audience-bound built-in skill.
+    TrustedInstructions(skill::TrustedInstructions),
     Error {
         output: String,
         images: Vec<ToolImage>,
@@ -267,6 +269,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 *display_data = Some(data);
             }
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -274,6 +277,7 @@ impl ToolOutput {
     #[must_use]
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
+            Self::TrustedInstructions(_) => {}
             Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
         }
         self
@@ -286,6 +290,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 *llm_usage = Some(Box::new(usage));
             }
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -295,6 +300,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 llm_usage.take().map(|usage| *usage)
             }
+            Self::TrustedInstructions(_) => None,
         }
     }
 
@@ -302,6 +308,7 @@ impl ToolOutput {
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,
+            Self::TrustedInstructions(_) => {}
         }
         self
     }
@@ -309,7 +316,7 @@ impl ToolOutput {
     /// Whether the tool reported success.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
+        matches!(self, Self::Success { .. } | Self::TrustedInstructions(_))
     }
 
     /// The tool's textual output — success payload or error message.
@@ -321,6 +328,7 @@ impl ToolOutput {
     #[must_use]
     pub fn output(&self) -> &str {
         match self {
+            Self::TrustedInstructions(instructions) => instructions.output(),
             Self::Success { output, .. } | Self::Error { output, .. } => output,
         }
     }
@@ -331,6 +339,7 @@ impl ToolOutput {
     pub fn images(&self) -> &[ToolImage] {
         match self {
             Self::Success { images, .. } | Self::Error { images, .. } => images,
+            Self::TrustedInstructions(_) => &[],
         }
     }
 
@@ -342,6 +351,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 display_data.as_ref()
             }
+            Self::TrustedInstructions(_) => None,
         }
     }
 }
@@ -917,12 +927,15 @@ fn parent_coordination_tools(agents: Vec<phoenix_agents::AgentDefinition>) -> Ve
     vec![
         Arc::new(SpawnAgentsTool::with_agents(agents)),
         Arc::new(AskUserQuestionTool),
-        Arc::new(SkillTool),
+        Arc::new(SkillTool::default()),
     ]
 }
 
 fn explore_coordination_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(AskUserQuestionTool), Arc::new(SkillTool)]
+    vec![
+        Arc::new(AskUserQuestionTool),
+        Arc::new(SkillTool::default()),
+    ]
 }
 
 /// Sub-agent terminal tools — how a sub-agent reports its result or error
@@ -998,10 +1011,17 @@ impl ToolRegistry {
     /// read tools, explicitly WorkScope-targeted unsandboxed Bash, and the
     /// singular cross-conversation text-message action. Browser, MCP, dedicated
     /// task/project/workspace mutation, creation, approval, and other lifecycle
-    /// tools are absent.
+    /// tools are absent; the existing skill tool exposes Coordinator-only reference
+    /// material.
     #[must_use]
-    pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn coordinator(
+        mut global_read_tools: Vec<Arc<dyn Tool>>,
+        coordinator_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        if let Some(catalog) = coordinator_catalog {
+            tools.push(Arc::new(SkillTool::for_global_coordinator(catalog)));
+        }
         tools.append(&mut global_read_tools);
         Self { tools }
     }
@@ -1309,7 +1329,6 @@ mod tests {
         assert!(out.is_success());
         assert!(matches!(out, ToolOutput::Success { .. }));
     }
-
     #[test]
     fn error_constructor_is_always_an_error() {
         let out = ToolOutput::error("ok, completed successfully");
@@ -1358,6 +1377,23 @@ mod tests {
         ExploreToolPolicy {
             bash: ExploreBashCapability::Unavailable,
         }
+    }
+
+    #[test]
+    fn coordinator_registry_registers_skill_only_with_authenticated_catalog() {
+        let no_catalog = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)], None);
+        assert_eq!(
+            names(&no_catalog),
+            BTreeSet::from(["read_file".to_string(), "think".to_string()])
+        );
+
+        let temp = tempfile::TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let catalog =
+            phoenix_skills::AuthenticatedCoordinatorSkillCatalog::discover(Some(temp.path()));
+        let with_catalog = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)], catalog);
+        assert!(names(&with_catalog).contains("skill"));
+        assert!(!names(&with_catalog).contains("phoenix_operator"));
     }
 
     #[test]
@@ -1475,7 +1511,7 @@ mod tests {
             &["terminal_last_command", "terminal_command_history"];
 
         // Coordinator: bounded global tools only; no task-management authority.
-        let coordinator = names(&ToolRegistry::coordinator(Vec::new()));
+        let coordinator = names(&ToolRegistry::coordinator(Vec::new(), None));
         assert!(!coordinator.contains("propose_task"));
 
         // Direct: full suite, no propose_task, no sub-agent submission tools.
