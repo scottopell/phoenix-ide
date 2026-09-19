@@ -8694,9 +8694,12 @@ where
                     )?;
                     Err(error)
                 }
-                Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
-                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
-                )),
+                Err(FollowUpApprovalError::AuthorityLost(error)) => {
+                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                    Err(format!(
+                        "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
+                    ))
+                }
             };
         }
         if matches!(
@@ -8798,7 +8801,7 @@ where
                 };
                 let approved_state = ConvState::LlmRequesting { attempt: 1 };
                 let state_updated_at = Utc::now();
-                let establishment = storage
+                let establishment = match storage
                     .persist_approved_task_authority_and_state(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
@@ -8814,7 +8817,15 @@ where
                         &approved_state,
                         state_updated_at,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(establishment) => establishment,
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
+                };
                 if matches!(
                     establishment,
                     crate::db::LocalAuthorityResult::DurableFactUnclassified
@@ -15792,6 +15803,44 @@ mod approved_explore_follow_up_tests {
     }
 
     #[tokio::test]
+    async fn follow_up_persistence_failure_retires_post_git_actor() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-persist-failure",
+            "task-72003-existing-persist-failure",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_approval_authority_persistence(true);
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, plan, storage, broadcast_tx);
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                &mut admitted,
+            )
+            .await
+            .expect_err("post-Git persistence failure must retire actor");
+
+        assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+        assert_eq!(
+            runtime.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+    }
+
+    #[tokio::test]
     async fn follow_up_unclassified_commit_closes_authority_fence() {
         let (_tmp, repo_root) = init_repo();
         let worktree = PathBuf::from(add_worktree(
@@ -16995,6 +17044,59 @@ mod approve_task_failure_effect_tests {
         .expect("fresh handoff approval should succeed");
 
         assert_eq!(waiter.await.unwrap(), conv_id);
+    }
+
+    #[tokio::test]
+    async fn approval_persistence_failure_retires_post_git_actor() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "approval-persistence-failure";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--persist-failure.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Persist failure\n").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.desired_base_branch = Some(base_branch.to_string());
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_approval_authority_persistence(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Persist failure".to_string(),
+                priority: crate::task_source::Priority::P2,
+                plan: "# Persist failure\n".to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect_err("post-Git persistence failure must retire actor");
+
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
     }
 
     #[tokio::test]

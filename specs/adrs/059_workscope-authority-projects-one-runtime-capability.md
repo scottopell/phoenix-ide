@@ -1,4 +1,10 @@
+<<<<<<<< HEAD:specs/adrs/059_workscope-authority-projects-one-runtime-capability.md
 # ADR-059: WorkScope authority projects one runtime capability
+|||||||| parent of 4565f3129 (fix: retire failed approval actors):specs/adrs/055_workscope-authority-projects-one-runtime-capability.md
+# ADR-055: WorkScope authority projects one runtime capability
+========
+# ADR-058: WorkScope authority projects one runtime capability
+>>>>>>>> 4565f3129 (fix: retire failed approval actors):specs/adrs/058_workscope-authority-projects-one-runtime-capability.md
 
 - **Status:** Accepted
 - **Date:** 2026-09-13
