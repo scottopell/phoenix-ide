@@ -277,6 +277,10 @@ struct PhoenixAPI: Sendable {
         return response.product_conversations.map(productConversationListRowToConversation)
     }
 
+    func getProductConversation(reference: String) async throws -> ProductConversationSnapshot {
+        try await get("api/product-conversations/\(reference)", as: ProductConversationSnapshot.self)
+    }
+
     func listProductConversations() async throws -> ProductConversationListResponse {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
     }

@@ -18,7 +18,11 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if let session = model.session(for: conversationId) {
+                if let history = model.listStore.conversations.first(where: {
+                    $0.archived == true && $0.aggregateIdentity == conversationId
+                }) {
+                    ProductHistoryView(productConversationId: history.aggregateIdentity)
+                } else if let session = model.session(for: conversationId) {
                     ConversationView(session: session)
                 } else {
                     Text("Configure a server first")
@@ -271,6 +275,35 @@ struct StateDot: View {
         case "terminal", "context_exhausted", "handed_off": return .gray
         case nil: return .gray
         default: return .orange  // any in-flight state
+        }
+    }
+}
+
+private struct ProductHistoryView: View {
+    @Environment(AppModel.self) private var model
+    let productConversationId: String
+    @State private var snapshot: ProductConversationSnapshot?
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if let snapshot {
+                List(snapshot.segments, id: \.segment_ordinal) { segment in
+                    Section(segment.title ?? segment.slug ?? "Conversation") {
+                        ForEach(segment.messages, id: \.id) { message in
+                            MessageView(message: message)
+                        }
+                    }
+                }
+            } else if let error {
+                ContentUnavailableView("Unable to load history", systemImage: "exclamationmark.triangle", description: Text(error))
+            } else {
+                ProgressView("Loading history…")
+            }
+        }
+        .task {
+            do { snapshot = try await model.loadProductHistory(productConversationId: productConversationId) }
+            catch { self.error = error.localizedDescription }
         }
     }
 }
