@@ -1874,25 +1874,6 @@ final class AppModel {
             ?? productConversationDetails.first(where: {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
-        let chainRootId: String?
-        if let aggregateId {
-            guard let detail = productConversationDetails[aggregateId],
-                  detail.closeCardinalityKnown,
-                  let snapshot = detail.snapshot
-            else {
-                lastActionError = "Open the conversation before closing it."
-                return false
-            }
-            chainRootId = snapshot.segments.count > 1
-                ? snapshot.canonical_root.transcript_row_id
-                : nil
-        } else {
-            chainRootId = nil
-        }
-        let archiveConversationId = aggregateId.flatMap { aggregate in
-            productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
-                ?? listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
-        } ?? conversationId
         let memberIds = if let aggregateId {
             await authoritativeAggregateMemberIds(
                 aggregateId: aggregateId,
@@ -1903,6 +1884,21 @@ final class AppModel {
         guard self.api?.configurationIdentity == api.configurationIdentity else {
             lastActionError = "Conversation settings changed before archiving. Try again."
             return false
+        }
+        let archiveTarget: (chainRootId: String?, conversationId: String)
+        if let aggregateId {
+            guard let detail = productConversationDetails[aggregateId],
+                  detail.closeCardinalityKnown,
+                  let snapshot = detail.snapshot
+            else {
+                lastActionError = "Conversation changed before archiving. Try again."
+                return false
+            }
+            archiveTarget = (
+                snapshot.segments.count > 1 ? snapshot.canonical_root.transcript_row_id : nil,
+                snapshot.canonical_root.transcript_row_id)
+        } else {
+            archiveTarget = (nil, conversationId)
         }
         for memberId in memberIds {
             if sessions[memberId]?.outbox.visibleEntries.isEmpty == false {
@@ -1936,10 +1932,10 @@ final class AppModel {
             if !archived { session.endArchiving() }
         }
         do {
-            if let chainRootId {
+            if let chainRootId = archiveTarget.chainRootId {
                 try await api.archiveChain(rootId: chainRootId)
             } else {
-                try await api.archive(conversationId: archiveConversationId)
+                try await api.archive(conversationId: archiveTarget.conversationId)
             }
             archived = true
             session.stop()

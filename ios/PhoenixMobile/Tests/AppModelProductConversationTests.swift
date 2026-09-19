@@ -3273,6 +3273,31 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(probe.archivePostPaths.isEmpty)
     }
 
+    func testArchiveRechecksCardinalityAfterPersistedMemberDiscovery() async {
+        let store = MutableTestConversationPersistenceStore(contentsByConversationId: [:])
+        let discoveryGate = AsyncCandidateGate()
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        let detail = model.productConversationDetailModel(
+            for: "pc-1", initialTranscriptRowId: "row-1")
+        detail.applyForTesting(testSingleSegmentProductConversationSnapshot())
+        store.persistedMemberDiscoveryGate = discoveryGate
+
+        let archive = Task { @MainActor in await model.archive(conversationId: "row-1") }
+        await discoveryGate.waitForEntry()
+        detail.applyForTesting(testProductConversationSnapshot())
+        await discoveryGate.release()
+
+        let archived = await archive.value
+        XCTAssertTrue(archived)
+        XCTAssertEqual(probe.archivePostPaths, ["/api/chains/row-1/archive"])
+    }
+
     func testArchiveContinuedAggregateUsesCanonicalChainEndpoint() async {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-root", "row-successor"],
