@@ -786,9 +786,9 @@ impl RuntimeManager {
                         && matches!(item.outcome, RetirementOutcome::Residual { .. })
                 })
                 .count();
-            if active_residuals == 0 {
+            if active_residuals > 0 {
                 return Err(CloseRetirementError::Message(
-                    "Close needs-repair phase has no active residual evidence".to_string(),
+                    "Close needs-repair phase retains active residual evidence".to_string(),
                 ));
             }
         }
@@ -3481,6 +3481,13 @@ where
     if let Err(error) = bind_root(&tombstone_root, verified_root, None) {
         let _ = std::fs::remove_dir(&tombstone_root);
         return Err(error);
+    }
+    if observe_identity(deletion_target)? != expected_identity {
+        let _ = std::fs::remove_dir(&tombstone_root);
+        return Err(format!(
+            "{description} identity changed before final deletion; replacement preserved at {}",
+            deletion_target.display()
+        ));
     }
     if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
         let _ = std::fs::remove_dir(&tombstone_root);
@@ -7517,14 +7524,8 @@ mod tests {
 
         assert!(error.contains("identity changed before final deletion"));
         assert!(displaced.exists());
-        let preserved = std::fs::read_dir(temp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("object/replacement-marker"))
-            .find(|candidate| candidate.is_file())
-            .expect("swapped admin replacement must remain in the private tombstone");
         assert_eq!(
-            std::fs::read_to_string(preserved).unwrap(),
+            std::fs::read_to_string(quarantine.join("replacement-marker")).unwrap(),
             replacement_marker
         );
     }
