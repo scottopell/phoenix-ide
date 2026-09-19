@@ -3870,6 +3870,10 @@ mod tests {
             owner.shutdown();
             panic!("publication hook was not acknowledged; task result: {task_result:?}");
         }
+        assert!(
+            !task.is_finished(),
+            "publication commit completed before cancellation"
+        );
         task.abort();
         let _ = task.await;
         wait_until(
