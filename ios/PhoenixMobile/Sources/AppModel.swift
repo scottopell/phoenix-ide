@@ -377,9 +377,11 @@ final class AppModel {
             lastActionError = "This conversation has queued or unreadable messages. Resolve them before closing."
             return false
         }
-        let aggregateSessions = transcriptIds.compactMap { session(for: $0) }
+        let aggregateSessions = transcriptIds.compactMap { transcriptId in
+            session(for: transcriptId).map { (transcriptId, $0) }
+        }
         var fencedSessions: [ConversationSession] = []
-        for session in aggregateSessions {
+        for (_, session) in aggregateSessions {
             guard session.beginArchiving() else {
                 fencedSessions.forEach { $0.endArchiving() }
                 lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
@@ -393,12 +395,18 @@ final class AppModel {
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
             closed = true
-            for session in aggregateSessions {
+            for (transcriptId, session) in aggregateSessions {
                 session.stop()
                 await session.clearCachedSnapshotAndWait()
                 await session.outbox.clearAndWait()
+                sessions[transcriptId] = nil
             }
+            guard apiGeneration == startedGeneration else { return false }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
+            UNUserNotificationCenter.current().removeDeliveredNotifications(
+                withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
+            UNUserNotificationCenter.current().removePendingNotificationRequests(
+                withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
             await listStore.refresh(api: api)
             return true
         } catch {
