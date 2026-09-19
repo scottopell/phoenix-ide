@@ -1,4 +1,5 @@
 use crate::{Database, DbResult};
+use phoenix_svg::{SvgInvocationId, ValidatedSvg};
 use sqlx::Row;
 
 /// Immutable accepted SVG bytes and their conversation-owned presentation metadata.
@@ -33,11 +34,12 @@ impl Database {
     pub async fn svg_artifact_for_invocation(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
     ) -> DbResult<Option<SvgArtifact>> {
-        sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND tool_use_id = ?")
+        sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND assistant_message_id = ? AND tool_use_id = ?")
             .bind(conversation_id)
-            .bind(tool_use_id)
+            .bind(&invocation.assistant_message_id)
+            .bind(&invocation.tool_use_id)
             .fetch_optional(self.pool())
             .await?
             .as_ref().map(artifact_from_row)
@@ -49,38 +51,44 @@ impl Database {
     ///
     /// # Errors
     /// Returns a database error for missing owners, invalid metadata or failed persistence.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Unvalidated bytes cannot be passed to the publication boundary:
+    /// ```compile_fail
+    /// async fn reject_raw_bytes(db: &phoenix_db::Database, id: &phoenix_svg::SvgInvocationId) {
+    ///     db.publish_svg_artifact("owner", id, "Chart", "Description", b"<svg/>").await.unwrap();
+    /// }
+    /// ```
     pub async fn publish_svg_artifact(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
         title: &str,
         description: &str,
-        width: f64,
-        height: f64,
-        bytes: &[u8],
+        svg: &ValidatedSvg,
     ) -> DbResult<SvgArtifact> {
         let mut transaction = self.pool().begin().await?;
         sqlx::query(
             "INSERT INTO conversation_svg_artifacts
-             (artifact_id, conversation_id, tool_use_id, title, description, width, height, bytes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(conversation_id, tool_use_id) DO NOTHING",
+             (artifact_id, conversation_id, assistant_message_id, tool_use_id, title, description, width, height, bytes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(conversation_id, assistant_message_id, tool_use_id) DO NOTHING",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(conversation_id)
-        .bind(tool_use_id)
+        .bind(&invocation.assistant_message_id)
+        .bind(&invocation.tool_use_id)
         .bind(title)
         .bind(description)
-        .bind(width)
-        .bind(height)
-        .bind(bytes)
+        .bind(svg.width())
+        .bind(svg.height())
+        .bind(svg.bytes())
         .execute(&mut *transaction)
         .await?;
         let artifact = artifact_from_row(
-            &sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND tool_use_id = ?")
+            &sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND assistant_message_id = ? AND tool_use_id = ?")
                 .bind(conversation_id)
-                .bind(tool_use_id)
+                .bind(&invocation.assistant_message_id)
+                .bind(&invocation.tool_use_id)
                 .fetch_one(&mut *transaction)
                 .await?,
         )?;
@@ -111,6 +119,16 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#;
+
+    fn invocation(tool_use_id: &str) -> SvgInvocationId {
+        SvgInvocationId::new("assistant-message", tool_use_id)
+    }
+
+    fn validated() -> ValidatedSvg {
+        phoenix_svg::validate(SVG).unwrap()
+    }
 
     #[tokio::test]
     async fn snapshot_survives_worktree_removal_and_scope_retirement() {
@@ -145,16 +163,14 @@ mod tests {
             .unwrap();
         let scope = conversation.attached_work_scope_id.unwrap();
         let staging = worktree.path().join("chart.svg");
-        std::fs::write(&staging, b"<svg/>").unwrap();
+        std::fs::write(&staging, SVG).unwrap();
         let artifact = db
             .publish_svg_artifact(
                 "retained-owner",
-                "call",
+                &invocation("call"),
                 "Title",
                 "Description",
-                100.0,
-                50.0,
-                &std::fs::read(&staging).unwrap(),
+                &phoenix_svg::validate(&std::fs::read(&staging).unwrap()).unwrap(),
             )
             .await
             .unwrap();
@@ -182,7 +198,7 @@ mod tests {
             Some(artifact.clone()),
         );
         assert_eq!(
-            db.svg_artifact_for_invocation("retained-owner", "call")
+            db.svg_artifact_for_invocation("retained-owner", &invocation("call"))
                 .await
                 .unwrap(),
             Some(artifact),
@@ -194,7 +210,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("artifacts.db");
         let staging = directory.path().join("chart.svg");
-        std::fs::write(&staging, b"<svg/>").unwrap();
+        std::fs::write(&staging, SVG).unwrap();
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
         crate::migrations::run_pending_migrations(db.pool())
             .await
@@ -205,12 +221,10 @@ mod tests {
         let artifact = db
             .publish_svg_artifact(
                 "owner",
-                "call",
+                &invocation("call"),
                 "Title",
                 "Description",
-                100.0,
-                50.0,
-                &std::fs::read(&staging).unwrap(),
+                &phoenix_svg::validate(&std::fs::read(&staging).unwrap()).unwrap(),
             )
             .await
             .unwrap();
@@ -236,24 +250,31 @@ mod tests {
             .await
             .unwrap();
         let first = db
-            .publish_svg_artifact("svg-owner", "call", "Chart", "Bars", 100.0, 50.0, b"<svg/>")
+            .publish_svg_artifact(
+                "svg-owner",
+                &invocation("call"),
+                "Chart",
+                "Bars",
+                &validated(),
+            )
             .await
             .unwrap();
         let replay = db
             .publish_svg_artifact(
                 "svg-owner",
-                "call",
+                &invocation("call"),
                 "Changed",
                 "Changed",
-                200.0,
-                100.0,
-                b"changed",
+                &phoenix_svg::validate(
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"/>"#,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(first, replay);
         assert_eq!(
-            db.svg_artifact_for_invocation("svg-owner", "call")
+            db.svg_artifact_for_invocation("svg-owner", &invocation("call"))
                 .await
                 .unwrap(),
             Some(first.clone())
@@ -266,16 +287,37 @@ mod tests {
         let separate = db
             .publish_svg_artifact(
                 "svg-owner",
-                "call-2",
+                &invocation("call-2"),
                 "Chart",
                 "Bars",
-                100.0,
-                50.0,
-                b"<svg/>",
+                &validated(),
             )
             .await
             .unwrap();
         assert_ne!(first.artifact_id, separate.artifact_id);
+        let later_assistant = SvgInvocationId::new("later-assistant-message", "call");
+        assert!(db
+            .svg_artifact_for_invocation("svg-owner", &later_assistant)
+            .await
+            .unwrap()
+            .is_none());
+        let reused_provider_id = db
+            .publish_svg_artifact(
+                "svg-owner",
+                &later_assistant,
+                "Later chart",
+                "Bars",
+                &validated(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.artifact_id, reused_provider_id.artifact_id);
+        assert_eq!(
+            db.svg_artifact_for_invocation("svg-owner", &later_assistant)
+                .await
+                .unwrap(),
+            Some(reused_provider_id)
+        );
         db.delete_conversation("svg-owner").await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_svg_artifacts")
             .fetch_one(db.pool())
@@ -288,20 +330,32 @@ mod tests {
     async fn rejected_publication_leaves_no_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         assert!(db
-            .publish_svg_artifact("missing", "call", "Chart", "Bars", 100.0, 50.0, b"<svg/>")
+            .publish_svg_artifact(
+                "missing",
+                &invocation("call"),
+                "Chart",
+                "Bars",
+                &validated()
+            )
             .await
             .is_err());
         db.create_conversation("svg-owner", "svg-owner", "/tmp", true, None, None)
             .await
             .unwrap();
-        for width in [0.0, -1.0, f64::NAN, f64::INFINITY, 16385.0] {
+        for title in [String::new(), "x".repeat(201)] {
             assert!(db
-                .publish_svg_artifact("svg-owner", "call", "Chart", "Bars", width, 50.0, b"<svg/>")
+                .publish_svg_artifact(
+                    "svg-owner",
+                    &invocation("call"),
+                    &title,
+                    "Bars",
+                    &validated()
+                )
                 .await
                 .is_err());
         }
         assert!(db
-            .svg_artifact_for_invocation("svg-owner", "call")
+            .svg_artifact_for_invocation("svg-owner", &invocation("call"))
             .await
             .unwrap()
             .is_none());
@@ -314,12 +368,13 @@ mod tests {
             .await
             .unwrap();
         let mut transaction = db.pool().begin().await.unwrap();
-        sqlx::query("INSERT INTO conversation_svg_artifacts VALUES ('id', 'owner', 'call', 'Title', 'Description', 100, 50, X'3c7376672f3e')")
+        sqlx::query("INSERT INTO conversation_svg_artifacts VALUES ('id', 'owner', 'assistant-message', 'call', 'Title', 'Description', 100, 50, ?)")
+            .bind(SVG)
             .execute(&mut *transaction).await.unwrap();
         // Dropping a cancelled publication's transaction schedules rollback.
         drop(transaction);
         assert!(db
-            .svg_artifact_for_invocation("owner", "call")
+            .svg_artifact_for_invocation("owner", &invocation("call"))
             .await
             .unwrap()
             .is_none());

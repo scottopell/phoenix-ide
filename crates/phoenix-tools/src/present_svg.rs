@@ -1,4 +1,5 @@
-pub mod validation;
+pub use phoenix_svg as validation;
+pub use phoenix_svg::SvgInvocationId;
 
 use super::{Tool, ToolContext, ToolExecutionEnvironment, ToolOutput};
 use async_trait::async_trait;
@@ -41,12 +42,12 @@ pub trait SvgArtifactStore: Send + Sync {
     async fn lookup(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
     ) -> Result<Option<SvgArtifactReference>, String>;
     async fn publish(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
         draft: SvgArtifactDraft,
     ) -> Result<SvgArtifactReference, String>;
 }
@@ -56,17 +57,17 @@ impl<T: SvgArtifactStore + ?Sized> SvgArtifactStore for Arc<T> {
     async fn lookup(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
     ) -> Result<Option<SvgArtifactReference>, String> {
-        (**self).lookup(conversation_id, tool_use_id).await
+        (**self).lookup(conversation_id, invocation).await
     }
     async fn publish(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &SvgInvocationId,
         draft: SvgArtifactDraft,
     ) -> Result<SvgArtifactReference, String> {
-        (**self).publish(conversation_id, tool_use_id, draft).await
+        (**self).publish(conversation_id, invocation, draft).await
     }
 }
 
@@ -162,13 +163,16 @@ impl Tool for PresentSvgTool {
                 "Durable publication is unavailable in this execution context.",
             );
         };
-        let Some(tool_use_id) = ctx.tool_use_id() else {
+        let (Some(assistant_message_id), Some(tool_use_id)) =
+            (&ctx.svg_assistant_message_id, ctx.tool_use_id())
+        else {
             return failure(
                 "persistence_failure",
                 "Invocation identity is missing; retry through the conversation runtime.",
             );
         };
-        match store.lookup(&ctx.conversation_id, tool_use_id).await {
+        let invocation = SvgInvocationId::new(assistant_message_id, tool_use_id);
+        match store.lookup(&ctx.conversation_id, &invocation).await {
             Ok(Some(reference)) => return reference_output(&reference),
             Ok(None) => {}
             Err(_) => {
@@ -222,7 +226,7 @@ impl Tool for PresentSvgTool {
         match store
             .publish(
                 &ctx.conversation_id,
-                tool_use_id,
+                &invocation,
                 SvgArtifactDraft {
                     title: input.title,
                     description: input.description,
@@ -247,7 +251,7 @@ mod tests {
     use std::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
-    type StoredArtifacts = HashMap<(String, String), (SvgArtifactReference, Vec<u8>)>;
+    type StoredArtifacts = HashMap<(String, SvgInvocationId), (SvgArtifactReference, Vec<u8>)>;
     #[derive(Default)]
     struct Store(Mutex<StoredArtifacts>);
     #[async_trait]
@@ -255,24 +259,24 @@ mod tests {
         async fn lookup(
             &self,
             conversation_id: &str,
-            tool_use_id: &str,
+            invocation: &SvgInvocationId,
         ) -> Result<Option<SvgArtifactReference>, String> {
             Ok(self
                 .0
                 .lock()
                 .unwrap()
-                .get(&(conversation_id.into(), tool_use_id.into()))
+                .get(&(conversation_id.into(), invocation.clone()))
                 .map(|(r, _)| r.clone()))
         }
         async fn publish(
             &self,
             conversation_id: &str,
-            tool_use_id: &str,
+            invocation: &SvgInvocationId,
             draft: SvgArtifactDraft,
         ) -> Result<SvgArtifactReference, String> {
             let mut entries = self.0.lock().unwrap();
             let entry = entries
-                .entry((conversation_id.into(), tool_use_id.into()))
+                .entry((conversation_id.into(), invocation.clone()))
                 .or_insert_with(|| {
                     (
                         SvgArtifactReference {
@@ -304,6 +308,7 @@ mod tests {
             phoenix_core::work_scope::WorkScopeId::parse("svg-test").unwrap(),
         )
         .with_tool_use_id(id)
+        .with_svg_assistant_message_id("assistant-first")
         .with_svg_artifact_store(store)
     }
     fn input(path: &Path) -> Value {
@@ -328,6 +333,35 @@ mod tests {
         let entries = store.0.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries.values().next().unwrap().1, SVG.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn reused_provider_id_in_another_assistant_message_publishes_new_snapshot() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), SVG).unwrap();
+        let store = Arc::new(Store::default());
+        let first = PresentSvgTool
+            .run(input(file.path()), context(store.clone(), "reused"))
+            .await;
+        let revised = SVG.replace("80", "60");
+        std::fs::write(file.path(), &revised).unwrap();
+        let second_context =
+            context(store.clone(), "reused").with_svg_assistant_message_id("assistant-second");
+        let second = PresentSvgTool
+            .run(input(file.path()), second_context.clone())
+            .await;
+        assert!(first.is_success());
+        assert!(second.is_success());
+        assert_ne!(first.output(), second.output());
+        let args = input(file.path());
+        file.close().unwrap();
+        let replay = PresentSvgTool.run(args, second_context).await;
+        assert_eq!(second.output(), replay.output());
+        let entries = store.0.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .values()
+            .any(|(_, bytes)| bytes == revised.as_bytes()));
     }
 
     #[tokio::test]
@@ -364,13 +398,17 @@ mod tests {
     struct FailingStore;
     #[async_trait]
     impl SvgArtifactStore for FailingStore {
-        async fn lookup(&self, _: &str, _: &str) -> Result<Option<SvgArtifactReference>, String> {
+        async fn lookup(
+            &self,
+            _: &str,
+            _: &SvgInvocationId,
+        ) -> Result<Option<SvgArtifactReference>, String> {
             Ok(None)
         }
         async fn publish(
             &self,
             _: &str,
-            _: &str,
+            _: &SvgInvocationId,
             _: SvgArtifactDraft,
         ) -> Result<SvgArtifactReference, String> {
             Err("simulated storage failure with private details".into())

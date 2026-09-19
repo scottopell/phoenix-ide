@@ -549,8 +549,10 @@ pub struct MaterializeAuthoritativeUserMessageCall {
     pub now: Timestamp,
 }
 
-type StoredSvgArtifacts =
-    HashMap<(String, String), (crate::tools::present_svg::SvgArtifactReference, Vec<u8>)>;
+type StoredSvgArtifacts = HashMap<
+    (String, crate::tools::present_svg::SvgInvocationId),
+    (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
+>;
 
 /// In-memory storage for testing
 #[allow(dead_code)]
@@ -2416,25 +2418,25 @@ impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
     async fn lookup(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
     ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
         Ok(self
             .svg_artifacts
             .lock()
             .unwrap()
-            .get(&(conversation_id.to_string(), tool_use_id.to_string()))
+            .get(&(conversation_id.to_string(), invocation.clone()))
             .map(|(reference, _)| reference.clone()))
     }
     async fn publish(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
         draft: crate::tools::present_svg::SvgArtifactDraft,
     ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
         use crate::tools::present_svg::{SvgArtifactReference, SvgValidationOutcome};
         let mut artifacts = self.svg_artifacts.lock().unwrap();
         let (reference, _) = artifacts
-            .entry((conversation_id.to_string(), tool_use_id.to_string()))
+            .entry((conversation_id.to_string(), invocation.clone()))
             .or_insert_with(|| {
                 (
                     SvgArtifactReference {

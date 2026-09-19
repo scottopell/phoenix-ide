@@ -99,6 +99,9 @@ pub(super) async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::present_svg::validation::{self, SvgInvocationId};
+
+    const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"/>"#;
     use std::sync::Arc;
 
     async fn authenticated_state() -> AppState {
@@ -165,12 +168,10 @@ mod tests {
             .db
             .publish_svg_artifact(
                 "owner",
-                "call",
+                &SvgInvocationId::new("assistant-message", "call"),
                 "Title",
                 "Description",
-                100.0,
-                50.0,
-                b"<svg/>",
+                &validation::validate(SVG).unwrap(),
             )
             .await
             .unwrap();
@@ -221,12 +222,10 @@ mod tests {
         let artifact = db
             .publish_svg_artifact(
                 "owner",
-                "call",
+                &SvgInvocationId::new("assistant-message", "call"),
                 "Title",
                 "Description",
-                100.0,
-                50.0,
-                b"<svg/>",
+                &validation::validate(SVG).unwrap(),
             )
             .await
             .unwrap();
@@ -276,7 +275,7 @@ mod tests {
                     .await
                     .unwrap()
                     .as_ref(),
-                b"<svg/>"
+                SVG
             );
         }
     }

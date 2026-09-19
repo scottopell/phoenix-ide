@@ -28,7 +28,33 @@ The root must be SVG in the SVG namespace. Shapes, paths, text/tspan, groups, de
 
 Scripts, event handlers, links, embedded HTML, animation, images/data payloads, external URLs, DTD/entities, processing instructions, foreign metadata, nested SVG viewports, filters and patterns are rejected. Unsupported features produce an actionable error rather than a modified chart. Attribute entity encoding and namespace prefixes do not bypass policy. CSS escapes, comments, at-rules and complex selectors are outside the supported styling subset.
 
-Matplotlib commonly emits a DOCTYPE and RDF metadata by default. Export without them, or explicitly remove just those nonvisual nodes before publication; do not remove unsupported visual content to force a pass. The representative generator and fixture live under `crates/phoenix-tools/src/present_svg/fixtures/`. They preserve glyph paths, styling, clipping and local references.
+Matplotlib commonly emits a DOCTYPE and RDF metadata by default. Export without them, or explicitly remove just those nonvisual nodes before publication; do not remove unsupported visual content to force a pass. The representative generator and fixture live under `crates/phoenix-svg/src/fixtures/`. They preserve glyph paths, styling, clipping and local references.
+
+## Reference and geometry rules
+
+References must resolve to a compatible element: fill/stroke paints and gradient `href` target linear or radial gradients; `clip-path` targets `clipPath`; `use` targets a group, shape, path, text, or another `use`. A matching ID alone is insufficient. Both gradient types may inherit shared gradient properties and stops from either gradient type.
+
+Geometry attributes are element-specific:
+
+| Attributes | Supported elements |
+| --- | --- |
+| `x`, `y` | `rect`, `text`, `tspan`, `use` |
+| `dx`, `dy` | `text`, `tspan` |
+| `x1`, `y1`, `x2`, `y2` | `line`, `linearGradient` |
+| `cx`, `cy` | `circle`, `ellipse`, `radialGradient` |
+| `fx`, `fy`, `fr` | `radialGradient` |
+| `width`, `height` | Root `svg`, `rect` |
+| `rx`, `ry` | `rect`, `ellipse` |
+| `r` | `circle`, `radialGradient` |
+| `d` | `path` |
+| `points` | `polyline`, `polygon` |
+| `pathLength` (unitless) | `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon` |
+| `transform` | Root `svg`, `g`, shapes/paths, `text`, `tspan`, `use`, `clipPath` |
+| `gradientTransform`, `gradientUnits`, `spreadMethod` | `linearGradient`, `radialGradient` |
+| `clipPathUnits` | `clipPath` |
+| `offset` | `stop` |
+
+Do not put geometry attributes on other elements: browsers may silently ignore them and produce a different visual from the one intended.
 
 ## Limits
 
@@ -52,3 +78,5 @@ Use explicit dimensions in pixels or common absolute units (pt/in/cm/mm/pc), or 
 Supported style properties are `fill`, `stroke`, `stop-color`, `color`, `clip-path`, `opacity`, `fill-opacity`, `stroke-opacity`, `stop-opacity`, `stroke-width`, `stroke-dashoffset`, `stroke-miterlimit`, `stroke-dasharray`, `stroke-linecap`, `stroke-linejoin`, `fill-rule`, `clip-rule`, `font-size`, `letter-spacing`, `word-spacing`, `font-family`, `font-style`, `font-weight`, `text-anchor`, `dominant-baseline`, `alignment-baseline`, `display`, `visibility`, `overflow`, `vector-effect`, `shape-rendering`, and `text-rendering`. Values are restricted static keywords, bounded numbers/lengths, colors, and local font names. Stylesheet selectors are comma-separated simple `*`, element, `.class`, or `#id` selectors; no combinators or pseudo-selectors. Local `url(#id)` is supported in fill/stroke/clip-path attributes and inline style, not stylesheet rules.
 
 Only XML 1.0 with absent or UTF-8 encoding declarations is accepted. Minimum viewport/viewBox dimensions are 0.000001. The numeric limit applies to individual numbers and composed transform coefficients; transformed positions can be larger. Relative em/ex lengths and percentage font sizes are unsupported to avoid inherited exponential scaling. Each element has at most 64 attributes and each attribute at most 512,000 bytes. Each transform has at most 64 operations; dash arrays have at most 256 numbers.
+
+Each selector contains exactly one universal selector, supported element name, class, or ID; compound selectors such as `rect.label` and `.a.b` are rejected. Selector class/ID names start with an ASCII letter or underscore, optionally preceded by one hyphen, then contain only ASCII letters, digits, underscores or hyphens. Dots inside an SVG ID remain allowed for fragment references, but those IDs cannot be selected in this CSS subset.

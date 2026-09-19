@@ -587,7 +587,19 @@ pub fn create_router(state: AppState) -> Router {
             "/api/share/:token/conversation",
             get(get_shared_conversation),
         )
-        .route("/api/share/:token/events", get(shared_sse_stream));
+        .route("/api/share/:token/events", get(shared_sse_stream))
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id",
+            get(super::share_svg_artifacts::image),
+        )
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id/source",
+            get(super::share_svg_artifacts::source),
+        )
+        .route(
+            "/api/share/:token/svg-artifacts/:artifact_id/download",
+            get(super::share_svg_artifacts::download),
+        );
 
     // Register every SPA client route to serve the index.html shell, from the
     // single source of truth. These must be added before the auth layer below

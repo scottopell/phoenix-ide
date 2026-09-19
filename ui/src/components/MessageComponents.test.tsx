@@ -2,7 +2,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -10,6 +10,7 @@ import { api, ConflictError, type ContentBlock, type ConversationState, type Mes
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
+import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
@@ -3703,5 +3704,41 @@ describe('published SVG placement', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Collapse expanded tool detail' }));
       expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
     }
+  });
+});
+
+
+describe('tool result ownership across repeated provider IDs', () => {
+  const rounds = () => [1, 2].flatMap((round) => [
+    agentMessage(`owner-${round}`, [{ type: 'tool_use', id: 'reused', name: 'present_svg', input: { path: `/chart-${round}.svg` } }], round * 2 - 1),
+    { ...toolMessage('reused', JSON.stringify({ artifact_id: `svg-${round}`, conversation_id: 'agent-1', title: `Chart ${round}`, description: `Measured sizes ${round}`, width: 800, height: 400, validation: 'accepted_static_svg' }), round * 2), message_id: `owner-${round}-result` },
+  ]);
+
+  it.each(['full', 'compact'] as const)('preserves distinct chronological SVG references in %s density on live append and reload', (density) => {
+    mockDensity = density;
+    const messages = rounds();
+    const grouped = (rows: Message[]) => {
+      const unit = buildRenderUnits({ messages: rows, pendingMessages: [], convState: { type: 'idle' }, streamingHandle: null }).historicalUnits[0];
+      if (unit?.kind !== 'tool_only_agent_turn_group') throw new Error('expected grouped tool turns');
+      return <MemoryRouter><ToolOnlyAgentTurnGroup members={unit.members} /></MemoryRouter>;
+    };
+    const { rerender, unmount } = render(grouped(messages.slice(0, 2)));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    rerender(grouped(messages));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    expect(screen.getByRole('img', { name: 'Measured sizes 2' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-2');
+    unmount();
+    render(grouped(messages));
+    expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
+  });
+
+  it('keeps subagent result summaries scoped to their assistant round', () => {
+    const messages = rounds();
+    const atom = { ...createInitialAtom(), messages };
+    render(<SubAgentTranscript inline={{ type: 'ready', atom, error: null }} running={false} full />);
+    const outputs = document.querySelectorAll('.subagent-activity-output');
+    expect(outputs).toHaveLength(2);
+    expect(outputs[0]?.getAttribute('title')).toContain('svg-1');
+    expect(outputs[1]?.getAttribute('title')).toContain('svg-2');
   });
 });

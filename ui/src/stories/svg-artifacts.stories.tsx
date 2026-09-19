@@ -1,4 +1,8 @@
-import { MemoryRouter } from 'react-router-dom';
+import { useMemo } from 'react';
+import { SharePage } from '../pages/SharePage';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { ConversationStore } from '../conversation/ConversationStore';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ToolOnlyAgentTurnGroup } from '../components/MessageComponents';
 import type { Message } from '../api';
 import { DensityContext, type Density } from '../hooks/useDensity';
@@ -29,3 +33,13 @@ export const Tall = () => <Fixture theme="light" density="full" shape="tall" />;
 Tall.storyName = 'tall';
 export const Wide = () => <Fixture theme="dark" density="compact" shape="wide" />;
 Wide.storyName = 'wide';
+
+export function Shared() {
+  const store = useMemo(() => new ConversationStore(), []);
+  return <div data-svg-artifacts-ready="shared">
+    <ConversationContext.Provider value={store}><MemoryRouter initialEntries={['/s/anonymous-svg']}>
+      <Routes><Route path="/s/:token" element={<SharePage />} /></Routes>
+    </MemoryRouter></ConversationContext.Provider>
+  </div>;
+}
+Shared.storyName = 'shared';

@@ -4,6 +4,9 @@ use std::str::FromStr;
 use roxmltree::{Document, Node, ParsingOptions};
 use svgtypes::{Length, LengthUnit, Number, NumberListParser, PathParser, PathSegment, Transform};
 
+mod invocation;
+pub use invocation::SvgInvocationId;
+
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_ELEMENTS: usize = 20_000;
 pub const MAX_DEPTH: usize = 64;
@@ -68,6 +71,41 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 type Result<T> = std::result::Result<T, ValidationError>;
+
+enum ReferenceKind {
+    Paint,
+    Clip,
+    Gradient,
+    Reuse,
+}
+
+struct LocalReference {
+    id: String,
+    kind: ReferenceKind,
+}
+
+impl LocalReference {
+    fn accepts(&self, element: &str) -> bool {
+        match self.kind {
+            ReferenceKind::Paint | ReferenceKind::Gradient => {
+                matches!(element, "linearGradient" | "radialGradient")
+            }
+            ReferenceKind::Clip => element == "clipPath",
+            ReferenceKind::Reuse => matches!(
+                element,
+                "g" | "path"
+                    | "rect"
+                    | "circle"
+                    | "ellipse"
+                    | "line"
+                    | "polyline"
+                    | "polygon"
+                    | "text"
+                    | "use"
+            ),
+        }
+    }
+}
 fn invalid(message: &'static str) -> ValidationError {
     ValidationError {
         category: ValidationCategory::InvalidInput,
@@ -225,6 +263,7 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
             }
             let name = attr.name();
             let value = attr.value().trim();
+            geometry_attribute(node.tag_name().name(), name)?;
             if attr.namespace().is_some() && !(attr.namespace() == Some(XLINK_NS) && name == "href")
             {
                 return Err(policy(
@@ -270,7 +309,17 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
                         "use" | "linearGradient" | "radialGradient"
                     ) =>
                 {
-                    references.push((i, fragment(value)?));
+                    references.push((
+                        i,
+                        LocalReference {
+                            id: fragment(value)?,
+                            kind: if node.tag_name().name() == "use" {
+                                ReferenceKind::Reuse
+                            } else {
+                                ReferenceKind::Gradient
+                            },
+                        },
+                    ));
                 }
                 "d" if node.tag_name().name() == "path" => {
                     let count = path(value)?;
@@ -297,8 +346,13 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
                 "x" | "y" | "dx" | "dy" | "x1" | "y1" | "x2" | "y2" | "cx" | "cy" | "fx" | "fy" => {
                     length(value, false)?;
                 }
-                "width" | "height" | "rx" | "ry" | "r" | "fr" | "pathLength" => {
+                "width" | "height" | "rx" | "ry" | "r" | "fr" => {
                     length(value, true)?;
+                }
+                "pathLength" => {
+                    if number(value)? < 0.0 {
+                        return Err(invalid("pathLength must be a nonnegative unitless number."));
+                    }
                 }
                 "gradientUnits" | "clipPathUnits" => {
                     keyword(value, &["userSpaceOnUse", "objectBoundingBox"])?;
@@ -326,10 +380,15 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedSvg> {
     if references.len() > MAX_REFERENCES {
         return Err(limit("SVG exceeds 10,000 local references."));
     }
-    for (from, name) in references {
+    for (from, reference) in references {
         let to = *ids
-            .get(name.as_str())
+            .get(reference.id.as_str())
             .ok_or_else(|| invalid("Local SVG reference has no matching ID."))?;
+        if !reference.accepts(elements[to].tag_name().name()) {
+            return Err(policy(
+                "Local reference targets the wrong element type: paints and gradient href require a gradient, clipping requires clipPath, and use requires a renderable element.",
+            ));
+        }
         edges[from].push(to);
     }
     let mut memo = vec![None; elements.len()];
@@ -390,6 +449,75 @@ fn supported_element(name: &str) -> bool {
             | "radialGradient"
             | "stop"
     )
+}
+
+fn geometry_attribute(element: &str, attribute: &str) -> Result<()> {
+    let supported = match attribute {
+        "transform" => matches!(
+            element,
+            "svg"
+                | "g"
+                | "path"
+                | "rect"
+                | "circle"
+                | "ellipse"
+                | "line"
+                | "polyline"
+                | "polygon"
+                | "text"
+                | "tspan"
+                | "use"
+                | "clipPath"
+        ),
+        "x" | "y" => matches!(element, "rect" | "text" | "tspan" | "use"),
+        "dx" | "dy" => matches!(element, "text" | "tspan"),
+        "x1" | "y1" | "x2" | "y2" => matches!(element, "line" | "linearGradient"),
+        "cx" | "cy" => matches!(element, "circle" | "ellipse" | "radialGradient"),
+        "fx" | "fy" | "fr" => element == "radialGradient",
+        "width" | "height" => matches!(element, "svg" | "rect"),
+        "rx" | "ry" => matches!(element, "rect" | "ellipse"),
+        "r" => matches!(element, "circle" | "radialGradient"),
+        "pathLength" => matches!(
+            element,
+            "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon"
+        ),
+        "gradientTransform" | "gradientUnits" | "spreadMethod" => {
+            matches!(element, "linearGradient" | "radialGradient")
+        }
+        "clipPathUnits" => element == "clipPath",
+        "offset" => element == "stop",
+        _ => true,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(policy(
+            "Geometry attribute is unsupported on this element; use the documented per-element geometry attributes.",
+        ))
+    }
+}
+
+fn css_selector(selector: &str) -> Result<()> {
+    if selector == "*" {
+        return Ok(());
+    }
+    if let Some(name) = selector.strip_prefix(['.', '#']) {
+        let name = name.strip_prefix('-').unwrap_or(name);
+        let mut characters = name.bytes();
+        if name.len() <= 256
+            && characters
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+            && characters.all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        {
+            return Ok(());
+        }
+    } else if supported_element(selector) {
+        return Ok(());
+    }
+    Err(policy(
+        "Use a single *, supported element name, .class or #id selector; selector names must start with a letter or underscore (optionally preceded by one hyphen), then contain only letters, digits, underscores or hyphens.",
+    ))
 }
 fn identifier(value: &str) -> Result<()> {
     if value.is_empty()
@@ -653,14 +781,17 @@ fn declarations(value: &str) -> Result<Vec<(&str, &str)>> {
     clippy::too_many_lines,
     reason = "The complete CSS property whitelist is one auditable match."
 )]
-fn presentation(name: &str, value: &str) -> Result<Option<String>> {
+fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
     match name {
         "fill" | "stroke" | "stop-color" | "color" => {
             if let Some(inner) = value.strip_prefix("url(").and_then(|s| s.strip_suffix(')')) {
                 if !matches!(name, "fill" | "stroke") {
                     return Err(policy("This color property cannot reference a resource."));
                 }
-                return Ok(Some(fragment(inner.trim())?));
+                return Ok(Some(LocalReference {
+                    id: fragment(inner.trim())?,
+                    kind: ReferenceKind::Paint,
+                }));
             }
             if !matches!(value, "none" | "currentColor" | "inherit") {
                 svgtypes::Color::from_str(value).map_err(|_| {
@@ -674,7 +805,10 @@ fn presentation(name: &str, value: &str) -> Result<Option<String>> {
                     .strip_prefix("url(")
                     .and_then(|s| s.strip_suffix(')'))
                     .ok_or_else(|| policy("clip-path supports only none or url(#id)."))?;
-                return Ok(Some(fragment(inner.trim())?));
+                return Ok(Some(LocalReference {
+                    id: fragment(inner.trim())?,
+                    kind: ReferenceKind::Clip,
+                }));
             }
         }
         "opacity" | "fill-opacity" | "stroke-opacity" | "stop-opacity" => unit_interval(value)?,
@@ -785,10 +919,7 @@ fn stylesheet(mut value: &str, budget: &mut [usize; 3]) -> Result<()> {
                     "SVG stylesheets support at most 256 selectors total.",
                 ));
             }
-            let selector = selector.trim();
-            if selector != "*" {
-                identifier(selector.strip_prefix(['.', '#']).unwrap_or(selector))?;
-            }
+            css_selector(selector.trim())?;
         }
         for (key, val) in declarations(body)? {
             budget[2] += 1;
@@ -1192,5 +1323,102 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn references_require_compatible_target_elements() {
+        for body in [
+            r##"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" fill="url(#p)"/>"##,
+            r##"<path id="p" d="M0 0L1 1"/><rect width="10" height="10" style="stroke: url(#p)"/>"##,
+            r##"<linearGradient id="p"/><rect width="10" height="10" clip-path="url(#p)"/>"##,
+            r##"<rect id="p" width="1" height="1"/><linearGradient href="#p"/>"##,
+            r##"<clipPath id="p"/><radialGradient href="#p"/>"##,
+            r##"<linearGradient id="p"/><use href="#p"/>"##,
+            r##"<defs id="p"/><use href="#p"/>"##,
+            r##"<style id="p">*{fill:red}</style><use href="#p"/>"##,
+        ] {
+            assert_eq!(
+                rejected(body).category,
+                ValidationCategory::Policy,
+                "accepted {body}"
+            );
+        }
+        validate(svg(r##"<defs><linearGradient id="a"><stop offset="0" stop-color="red"/></linearGradient><radialGradient id="b" href="#a"/><clipPath id="c"><circle r="3"/></clipPath><g id="g"><rect width="1" height="1"/></g></defs><rect width="10" height="10" fill="url(#b)" style="clip-path: url(#c)"/><use href="#g"/>"##).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn stylesheet_selectors_follow_the_exact_simple_grammar() {
+        for selector in [
+            "*",
+            "rect",
+            "linearGradient",
+            ".label",
+            "#chart_1",
+            ".-label",
+            "#_chart",
+            ".a-2",
+        ] {
+            validate(svg(&format!("<style>{selector}{{fill:red}}</style>")).as_bytes()).unwrap();
+        }
+        for selector in [
+            ".",
+            "#",
+            "..label",
+            "##chart",
+            "rect.label",
+            "#chart.label",
+            ".a.b",
+            "1rect",
+            ".1label",
+            "#-1chart",
+            ".--label",
+            "unknown",
+            "g rect",
+            "rect:hover",
+            "rect>path",
+            "*rect",
+            ".a,",
+            "",
+        ] {
+            assert_eq!(
+                rejected(&format!("<style>{selector}{{fill:red}}</style>")).category,
+                ValidationCategory::Policy,
+                "accepted {selector}"
+            );
+        }
+        validate(svg("<style>rect, .label, #chart {fill:red}</style>").as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn geometry_attributes_apply_only_to_their_supported_elements() {
+        for body in [
+            r#"<circle width="100" height="100"/>"#,
+            r#"<rect cx="100"/>"#,
+            r#"<ellipse r="5"/>"#,
+            r#"<path x="5"/>"#,
+            r#"<g dx="5"/>"#,
+            r#"<rect x1="5"/>"#,
+            r#"<linearGradient fx="5"/>"#,
+            r#"<circle fr="5"/>"#,
+            r#"<use width="5"/>"#,
+            r#"<rect gradientTransform="scale(2)"/>"#,
+            r#"<g clipPathUnits="userSpaceOnUse"/>"#,
+            r#"<rect gradientUnits="userSpaceOnUse"/>"#,
+            r#"<rect spreadMethod="repeat"/>"#,
+            r#"<circle offset="0.5"/>"#,
+            r#"<text pathLength="3"/>"#,
+            r#"<defs transform="scale(2)"/>"#,
+        ] {
+            assert_eq!(
+                rejected(body).category,
+                ValidationCategory::Policy,
+                "accepted {body}"
+            );
+        }
+        validate(svg(r#"<rect x="1" y="2" width="3" height="4" rx="1" ry="1" pathLength="5"/><circle cx="1" cy="2" r="3"/><ellipse cx="1" cy="2" rx="3" ry="4"/><line x1="1" y1="2" x2="3" y2="4"/><text x="1" y="2" dx="1" dy="2">Label</text><defs><linearGradient x1="0" y1="0" x2="1" y2="1" gradientUnits="objectBoundingBox" gradientTransform="scale(1)" spreadMethod="pad"><stop offset="0.5"/></linearGradient><radialGradient cx="1" cy="2" r="3" fx="1" fy="2" fr="0"/><clipPath clipPathUnits="userSpaceOnUse"><rect width="3" height="4"/></clipPath></defs>"#).as_bytes()).unwrap();
+        assert_eq!(
+            rejected(r#"<path pathLength="3px"/>"#).category,
+            ValidationCategory::InvalidInput
+        );
     }
 }

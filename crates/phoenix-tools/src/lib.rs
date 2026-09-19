@@ -428,6 +428,7 @@ pub struct ToolContext {
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
+    svg_assistant_message_id: Option<String>,
     svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
@@ -520,6 +521,7 @@ impl ToolContext {
             work_scope: ResourceScopeKey::Coordinator,
             bash_progress_sink: None,
             tool_use_id: None,
+            svg_assistant_message_id: None,
             svg_artifact_store: None,
             wake_registrar: None,
             llm_metrics_tx: None,
@@ -576,6 +578,7 @@ impl ToolContext {
             work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
+            svg_assistant_message_id: None,
             svg_artifact_store: None,
             wake_registrar: None,
         }
@@ -605,6 +608,12 @@ impl ToolContext {
     #[must_use]
     pub fn with_tool_use_id(mut self, tool_use_id: impl Into<String>) -> Self {
         self.tool_use_id = Some(tool_use_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_svg_assistant_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.svg_assistant_message_id = Some(message_id.into());
         self
     }
 

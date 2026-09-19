@@ -22,6 +22,7 @@ mod process_sample;
 mod product_conversations;
 mod release_updates;
 mod resource_monitor;
+mod share_svg_artifacts;
 mod spa_routes;
 mod sse;
 mod svg_artifacts;

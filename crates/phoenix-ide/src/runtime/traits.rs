@@ -2469,10 +2469,10 @@ impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
     async fn lookup(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
     ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
         self.db
-            .svg_artifact_for_invocation(conversation_id, tool_use_id)
+            .svg_artifact_for_invocation(conversation_id, invocation)
             .await
             .map(|artifact| artifact.map(svg_reference))
             .map_err(|error| error.to_string())
@@ -2480,18 +2480,16 @@ impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
     async fn publish(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
         draft: crate::tools::present_svg::SvgArtifactDraft,
     ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
         self.db
             .publish_svg_artifact(
                 conversation_id,
-                tool_use_id,
+                invocation,
                 &draft.title,
                 &draft.description,
-                draft.svg.width(),
-                draft.svg.height(),
-                draft.svg.bytes(),
+                &draft.svg,
             )
             .await
             .map(svg_reference)

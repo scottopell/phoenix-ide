@@ -2,6 +2,10 @@
 //!
 //! Provides persistence for conversations and messages.
 
+use phoenix_core::domain::tool_result_identity::{
+    latest_tool_result_message_id, tool_result_message_id,
+};
+
 mod close_foundation;
 mod coordinator_query;
 mod ddl;
@@ -10366,7 +10370,21 @@ impl Database {
         let (content, display_data) = build_sub_agent_fan_in(results);
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(tool_id);
+            let messages = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                 FROM messages WHERE conversation_id = ?1 AND message_type = 'tool'",
+            )
+            .bind(conversation_id)
+            .try_map(parse_message_row)
+            .fetch_all(&mut *tx)
+            .await?;
+            let message_id = latest_tool_result_message_id(&messages, tool_id)
+                .ok_or_else(|| {
+                    DbError::Serialization(format!(
+                        "startup sub-agent fan-in message missing for {conversation_id}"
+                    ))
+                })?
+                .to_owned();
             let stored_content = serde_json::to_string(
                 &MessageContent::tool(tool_id, content, false).to_stored_json(),
             )
@@ -13149,17 +13167,6 @@ async fn insert_conversation_tx(
     Ok(())
 }
 
-/// Insert a seed `Message` row inside a transaction, reusing the same column
-/// mapping as [`Database::add_message_with_seq`]. `INSERT OR IGNORE` keyed on
-/// `message_id` makes a crash-retry a no-op rather than a duplicate.
-/// Derive the message ID used to persist a tool result. Must match the
-/// runtime executor's convention (`phoenix-state-machine`'s
-/// `tool_result_message_id`) so the restart-materialized result shares identity
-/// with the row the live path would have written: `{tool_use_id}-result`.
-fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
-}
-
 /// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring
 /// the runtime executor's `merge_duration_into_display_data` so a
 /// restart-materialized tool result carries the same baked-in duration the
@@ -13490,7 +13497,7 @@ fn build_materialized_tool_round(
             result.images().to_vec(),
         );
         tool_msgs.push(Message {
-            message_id: tool_result_message_id(&result.tool_use_id),
+            message_id: tool_result_message_id(&assistant_message.message_id, &result.tool_use_id),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
             message_type: content.message_type(),
@@ -13511,7 +13518,7 @@ fn build_materialized_tool_round(
             true,
         );
         tool_msgs.push(Message {
-            message_id: tool_result_message_id(tool_id),
+            message_id: tool_result_message_id(&assistant_message.message_id, tool_id),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
             message_type: content.message_type(),
@@ -21784,6 +21791,17 @@ mod tests {
             .await
             .unwrap();
         let entered_at = Utc::now() - chrono::Duration::hours(1);
+        let earlier_result_id = tool_result_message_id("earlier-assistant", "think-stable");
+        db.add_message_with_seq(
+            &earlier_result_id,
+            conversation_id,
+            1,
+            &MessageContent::tool("think-stable", "Earlier result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "think-stable",
@@ -21828,10 +21846,14 @@ mod tests {
         .await
         .expect("replay uses the persisted state timestamp");
         let messages = db.get_messages(conversation_id).await.unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().any(|message| message.message_id == earlier_result_id
+            && matches!(&message.content, MessageContent::Tool(content) if content.content == "Earlier result")));
         let tool_result = messages
             .iter()
-            .find(|message| message.message_id == tool_result_message_id("think-stable"))
+            .find(|message| {
+                message.message_id == tool_result_message_id("stable-assistant", "think-stable")
+            })
             .unwrap();
         assert_eq!(tool_result.created_at, entered_at);
     }
@@ -21917,9 +21939,19 @@ mod tests {
             .await
             .unwrap();
         db.add_message_with_seq(
-            &tool_result_message_id("spawn-fan-in"),
+            "earlier-spawn-result",
             parent_id,
             1,
+            &MessageContent::tool("spawn-fan-in", "Earlier completed result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message_with_seq(
+            &tool_result_message_id("current-spawn-assistant", "spawn-fan-in"),
+            parent_id,
+            2,
             &MessageContent::tool("spawn-fan-in", "Spawning 2 sub-agents", false),
             None,
             None,
@@ -21954,12 +21986,25 @@ mod tests {
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::LlmRequesting { attempt: 1 }
         ));
+        let earlier = db
+            .get_messages(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.message_id == "earlier-spawn-result")
+            .unwrap();
+        assert!(
+            matches!(&earlier.content, MessageContent::Tool(content) if content.content == "Earlier completed result")
+        );
         let message = db
             .get_messages(parent_id)
             .await
             .unwrap()
             .into_iter()
-            .find(|message| message.message_id == tool_result_message_id("spawn-fan-in"))
+            .find(|message| {
+                message.message_id
+                    == tool_result_message_id("current-spawn-assistant", "spawn-fan-in")
+            })
             .unwrap();
         let MessageContent::Tool(content) = message.content else {
             unreachable!()

@@ -2963,6 +2963,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "phoenix-core",
+ "phoenix-svg",
  "phoenix-workflow",
  "rand 0.10.1",
  "serde",
@@ -3059,6 +3060,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-svg"
+version = "0.1.0"
+dependencies = [
+ "roxmltree",
+ "svgtypes",
+ "xmlparser",
+]
+
+[[package]]
 name = "phoenix-terminal"
 version = "0.1.0"
 dependencies = [
@@ -3103,16 +3113,15 @@ dependencies = [
  "phoenix-core",
  "phoenix-mcp",
  "phoenix-skills",
+ "phoenix-svg",
  "phoenix-terminal",
  "phoenix-workflow",
  "proptest",
  "regex",
- "roxmltree",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "similar 3.1.1",
- "svgtypes",
  "taskmd-core",
  "tempfile",
  "thiserror 2.0.18",
@@ -3122,7 +3131,6 @@ dependencies = [
  "unicode-security",
  "uuid",
  "which",
- "xmlparser",
 ]
 
 [[package]]

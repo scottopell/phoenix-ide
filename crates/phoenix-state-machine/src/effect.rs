@@ -98,16 +98,7 @@ impl CheckpointData {
     }
 }
 
-/// Derive the message ID used to persist a tool result.
-///
-/// Both `persist_checkpoint` and `persist_sub_agent_results` must agree on
-/// this ID: the former creates the message, the latter updates it in-place
-/// when sub-agent results arrive. Single-sourcing the convention here
-/// prevents silent divergence.
-#[must_use]
-pub fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
-}
+pub use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
@@ -407,7 +398,7 @@ impl Effect {
         images: Vec<ToolContentImage>,
     ) -> Self {
         let tool_use_id = tool_use_id.into();
-        let message_id = tool_result_message_id(&tool_use_id);
+        let message_id = uuid::Uuid::new_v4().to_string();
         Effect::PersistMessage {
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.clone(),

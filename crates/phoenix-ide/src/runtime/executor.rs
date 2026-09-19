@@ -7467,7 +7467,7 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
-        let tool_ctx = match &self.context.execution_environment {
+        let mut tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
             } => ToolContext::new_with_resource_scope(
@@ -7501,6 +7501,16 @@ where
         .with_svg_artifact_store(Arc::new(self.storage.clone()))
         .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
+
+        if let ConvState::ToolExecuting {
+            assistant_message, ..
+        }
+        | ConvState::CancellingTool {
+            assistant_message, ..
+        } = &self.state
+        {
+            tool_ctx = tool_ctx.with_svg_assistant_message_id(&assistant_message.message_id);
+        }
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -7629,7 +7639,7 @@ where
             .map(|(result, sequence_id)| {
                 let content = tool_result_message_content(&result);
                 crate::db::Message {
-                    message_id: tool_result_message_id(&result.tool_use_id),
+                    message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                     conversation_id: conv_id.clone(),
                     sequence_id,
                     message_type: content.message_type(),
@@ -7724,7 +7734,10 @@ where
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
-                        message_id: tool_result_message_id(&result.tool_use_id),
+                        message_id: tool_result_message_id(
+                            &agent_msg.message_id,
+                            &result.tool_use_id,
+                        ),
                         conversation_id: conv_id.clone(),
                         sequence_id: *tool_seq,
                         message_type: tool_content.message_type(),
@@ -7848,7 +7861,7 @@ where
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             tool_msgs.push(crate::db::Message {
-                message_id: tool_result_message_id(&result.tool_use_id),
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                 conversation_id: conv_id.clone(),
                 sequence_id: *tool_seq,
                 message_type: tool_content.message_type(),
@@ -7943,7 +7956,7 @@ where
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(&tool_id);
+            let message_id = self.latest_spawn_result_message_id(&tool_id).await?;
 
             // This summary replaces the initial "Spawning N sub-agents..."
             // acknowledgement so build_llm_messages_static feeds the actual
@@ -8031,6 +8044,21 @@ where
         Ok(None)
     }
 
+    async fn latest_spawn_result_message_id(&self, tool_use_id: &str) -> Result<String, String> {
+        let messages = self
+            .storage
+            .get_messages(&self.context.conversation_id)
+            .await?;
+        phoenix_core::domain::tool_result_identity::latest_tool_result_message_id(
+            &messages,
+            tool_use_id,
+        )
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "Awaited spawn result is missing from durable conversation history".to_owned()
+        })
+    }
+
     async fn persist_terminal_sub_agent_results(
         &mut self,
         spawn_tool_id: Option<String>,
@@ -8043,7 +8071,7 @@ where
         let evidence = if let Some(tool_id) = spawn_tool_id {
             TerminalSubAgentEvidence::Update {
                 conversation_id: self.context.conversation_id.clone(),
-                message_id: tool_result_message_id(&tool_id),
+                message_id: self.latest_spawn_result_message_id(&tool_id).await?,
                 content: MessageContent::tool(&tool_id, &llm_content, false),
                 display_data: display_data.clone(),
             }
@@ -18017,6 +18045,78 @@ mod steer_drain_detector_tests {
     /// assistant text summary that renders into LLM history. This pins that the
     /// orphan branch is gone.
     #[tokio::test]
+    async fn repeated_provider_ids_persist_distinct_rounds_and_fan_in_updates_latest() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "reused-provider-id",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        for assistant_id in ["first-assistant", "second-assistant"] {
+            let assistant = AssistantMessage::new(
+                assistant_id.to_owned(),
+                vec![phoenix_llm::ContentBlock::tool_use(
+                    "reused",
+                    "spawn_agents",
+                    serde_json::json!({"agents": []}),
+                )],
+                None,
+                None,
+            );
+            let data = CheckpointData::tool_round(
+                assistant,
+                vec![crate::db::ToolResult::success(
+                    "reused".into(),
+                    assistant_id.into(),
+                )],
+            )
+            .unwrap();
+            rt.execute_effect(Effect::PersistCheckpoint { data })
+                .await
+                .unwrap();
+        }
+        let messages = storage.get_all_messages("reused-provider-id");
+        assert_eq!(messages.len(), 4);
+        for assistant_id in ["first-assistant", "second-assistant"] {
+            assert!(messages.iter().any(
+                |message| message.message_id == tool_result_message_id(assistant_id, "reused")
+            ));
+        }
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_sub_agent_results(
+            vec![SubAgentResult {
+                agent_id: "child".into(),
+                task: "work".into(),
+                outcome: SubAgentOutcome::TimedOut,
+            }],
+            Some("reused".into()),
+            "unused-summary".into(),
+            &mut admitted,
+        )
+        .await
+        .unwrap();
+        let messages = storage.get_all_messages("reused-provider-id");
+        let old = messages
+            .iter()
+            .find(|message| {
+                message.message_id == tool_result_message_id("first-assistant", "reused")
+            })
+            .unwrap();
+        assert!(
+            matches!(&old.content, crate::db::MessageContent::Tool(content) if content.content == "first-assistant")
+        );
+        let latest = messages
+            .iter()
+            .find(|message| {
+                message.message_id == tool_result_message_id("second-assistant", "reused")
+            })
+            .unwrap();
+        assert!(
+            matches!(&latest.content, crate::db::MessageContent::Tool(content) if content.content.contains("Sub-agent results"))
+        );
+        assert!(rt.latest_spawn_result_message_id("missing").await.is_err());
+    }
+
+    #[tokio::test]
     async fn persist_sub_agent_results_none_emits_non_tool_message() {
         use crate::db::MessageContent;
 
@@ -19330,7 +19430,7 @@ mod steer_drain_detector_tests {
         loop {
             match rx.try_recv() {
                 Ok(SseEvent::Message { message }) => {
-                    if message.message_id == "tool-duration-1-result" {
+                    if message.message_id == tool_row.message_id {
                         saw_tool_message = true;
                     }
                 }
@@ -19339,7 +19439,7 @@ mod steer_drain_detector_tests {
                     duration_ms: Some(_),
                     ..
                 }) => {
-                    if message_id == "tool-duration-1-result" {
+                    if message_id == tool_row.message_id {
                         saw_duration_update = true;
                     }
                 }
@@ -20778,7 +20878,7 @@ mod fork_proposal_persist_tests {
         );
         let ack = msgs
             .iter()
-            .find(|m| m.message_id == tool_result_message_id("tool-fork-1"))
+            .find(|m| m.message_id == tool_result_message_id("asst-fork", "tool-fork-1"))
             .expect("synthetic success ack must be persisted");
         assert!(
             matches!(&ack.content, MessageContent::Tool(tc) if !tc.is_error),

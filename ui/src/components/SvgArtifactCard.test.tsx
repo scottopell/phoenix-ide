@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult, type SvgArtifact } from './svgArtifact';
 import type { Message } from '../api';
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 
 const artifact: SvgArtifact = { artifact_id: 'artifact-1', conversation_id: 'conv-1', title: 'Disk usage', description: 'Directory sizes in GiB.', width: 800, height: 400, validation: 'accepted_static_svg' };
 const result = (value: unknown): Message => ({ message_id: 'm', conversation_id: 'conv-1', sequence_id: 2, message_type: 'tool', content: { tool_use_id: 'tool-1', content: JSON.stringify(value), is_error: false }, display_data: null, created_at: '' });
@@ -21,6 +22,21 @@ describe('SVG artifact presentation', () => {
     const failed = result(artifact);
     failed.content = { tool_use_id: 'tool-1', content: JSON.stringify(artifact), is_error: true };
     expect(svgArtifactFromResult('present_svg', failed)).toBeNull();
+  });
+
+  it('uses only the share token and artifact ID for all shared representations', async () => {
+    const fetchSource = vi.fn().mockResolvedValue({ ok: true, text: async () => '<svg/>' });
+    vi.stubGlobal('fetch', fetchSource);
+    render(<SvgArtifactAccessContext.Provider value={{ kind: 'share', token: 'token/with space' }}><SvgArtifactCard artifact={artifact} /></SvgArtifactAccessContext.Provider>);
+    const url = '/api/share/token%2Fwith%20space/svg-artifacts/artifact-1';
+    expect(screen.getByRole('img')).toHaveAttribute('src', url);
+    expect(screen.getByRole('link', { name: 'Download SVG' })).toHaveAttribute('href', `${url}/download`);
+    fireEvent.click(screen.getByRole('button', { name: 'Expand visualization' }));
+    expect(screen.getAllByRole('img').every((img) => img.getAttribute('src') === url)).toBe(true);
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    fireEvent.click(screen.getByRole('button', { name: 'View source' }));
+    await screen.findByText('<svg/>');
+    expect(fetchSource).toHaveBeenCalledWith(`${url}/source`, expect.objectContaining({ credentials: 'same-origin' }));
   });
 
   it('shows dimensions, loading, failure fallback and ownership-scoped download', () => {

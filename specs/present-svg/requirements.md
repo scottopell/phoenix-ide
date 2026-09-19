@@ -23,6 +23,9 @@ AND SHALL accept only its documented static SVG element, attribute, and styling 
 AND SHALL reject scripts, event handlers, embedded HTML, navigation, animation, embedded image payloads, and external references in attributes or CSS
 AND SHALL preserve accepted visual content without silently stripping unsupported features.
 
+THE SYSTEM SHALL accept geometry attributes only on compatible elements, local references only to compatible resource types, and stylesheets only with the documented simple-selector grammar
+AND SHALL require a validation-backed value at the storage publication boundary so unvalidated bytes and independently supplied dimensions cannot be published.
+
 THE SYSTEM SHALL support bounded local references for glyph reuse, clipping, and gradients
 AND SHALL reject cycles, excessive expansion, invalid/non-finite geometry, extreme dimensions, and byte/structure/path/reference limits.
 
@@ -34,6 +37,9 @@ AND SHALL return only a compact reference and static-validation outcome, without
 
 WHEN the same invocation is replayed
 THE SYSTEM SHALL return its first committed snapshot without depending on staging-file availability.
+
+Invocation identity SHALL include the owning assistant-message identity and provider tool-use ID within the conversation
+AND SHALL distinguish separate assistant messages even when their provider tool-use IDs repeat.
 
 THE SYSTEM SHALL preserve snapshots across source replacement/deletion, process restart, reconnect, worktree removal, and workscope retirement while the publishing conversation is retained
 AND SHALL delete snapshots when that conversation is deleted.
@@ -49,6 +55,12 @@ THE SYSTEM SHALL retain the conversation-owned snapshot recoverable by invocatio
 WHEN a client requests preview, source, or download
 THE SYSTEM SHALL apply the instance's existing authentication policy and match both opaque artifact ID and owning conversation ID
 AND SHALL NOT resolve an arbitrary filesystem path from that request.
+
+WHEN a client requests an artifact through a read-only share
+THE SYSTEM SHALL validate the share token on every preview, source, and download request
+AND SHALL derive the owning conversation only from that token
+AND SHALL reject invalid or revoked tokens and artifacts outside that conversation with HTTP 404
+AND SHALL allow these reads without the instance password, using the same accepted snapshots and serving protections as owner access.
 
 THE SYSTEM SHALL serve only accepted bytes with explicit MIME, nosniff, private caching, same-origin resource policy, and restrictive sandbox CSP
 AND SHALL prevent direct SVG navigation from becoming an active same-origin document

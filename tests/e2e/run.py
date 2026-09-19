@@ -1526,6 +1526,24 @@ def scenario_present_svg(base_url: str) -> None:
         replayed = _get_conv(base_url, conv_id)
         assert _count_tool_use(replayed["messages"], "present_svg") == 1
         assert [m for m in replayed["messages"] if m["message_id"] == result["message_id"]] == [result]
+        _send_chat_and_stream(
+            base_url, conv_id,
+            f"[[scenario:present_svg]] [[svg_path:{staging}]] publish a separate revision",
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        revised = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: _count_tool_use(messages, "present_svg") == 2,
+            "SVG revision with reused provider tool ID", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        publications = [
+            m for m in revised["messages"] if m.get("message_type") == "tool"
+            and m["content"].get("tool_use_id") == publication["id"]
+        ]
+        assert len(publications) == 2, publications
+        references = [json.loads(m["content"]["content"]) for m in publications]
+        assert len({ref["artifact_id"] for ref in references}) == 2
+        check_representations()
         other = _new_conv(base_url, "[[scenario:plain_text]] unrelated SVG ownership check")
         for suffix in ("", "/source", "/download"):
             response = httpx.get(

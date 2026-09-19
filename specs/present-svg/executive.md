@@ -24,16 +24,17 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 
 ### Automated qualification
 
-- `cargo test -p phoenix-tools present_svg`: validator and publication tests cover supported library output, hostile XML/CSS/URLs, reference cycles/expansion, geometry/complexity limits, file boundaries, cancellation, replay and bounded persistence errors.
+- `cargo test -p phoenix-svg`: validator tests cover supported library output, hostile XML/CSS/URLs, compatible reference targets, exact selector grammar, per-element geometry, reference cycles/expansion and geometry/complexity limits.
+- `cargo test -p phoenix-tools present_svg`: publication tests cover file boundaries, cancellation, replay, reused provider IDs in separate assistant messages, and bounded persistence errors. The database publication API requires the validator's private-field `ValidatedSvg`; a compile-fail doctest rejects raw bytes.
 - `cargo test -p phoenix-db svg_artifact`: five tests cover immutable snapshots, reopen after staging deletion, actual workscope retirement after worktree-directory removal, separate invocations, owner isolation, cascade deletion, rejected writes and transaction rollback.
 - `cargo test -p phoenix_ide svg_artifact`: actual router authentication, ownership, accepted bytes and response headers for all three retrieval routes.
-- `uv run tests/e2e/run.py --scenario present_svg`: mock-provider turn dispatch generates a file with bash, publishes through the runtime, replaces/deletes staging, checks retrieval/ownership, and reloads persisted references through HTTP and SSE init.
+- `uv run tests/e2e/run.py --scenario present_svg`: mock-provider turn dispatch generates a file with bash, publishes through the runtime, replaces/deletes staging, checks retrieval/ownership, reloads persisted references through HTTP and SSE init, and publishes a separate revision when a later assistant round reuses the provider tool ID.
 - `./dev.py check`: Rust/UI/codegen/spec/task/integration checks. The first broad run caught a test-helper temp-path lint (corrected) and a tmux watchdog cleanup timeout. The exact watchdog test passed alone, and the final full Rust lane passed along with codegen, TypeScript and UI lint (seven checks, 493.6s). Final spec/task/fmt checks also passed (five checks).
 - The shared dialog Escape regression and full Vitest lane pass: dismissal consumes the event before global conversation navigation sees it.
 
 ### Browser and live-agent evidence
 
-`LADLE_PORT=61128 ./dev.py qa svg-artifacts` exercises 12 combinations covering light/dark, full/compact, desktop/mobile, very tall/wide charts and long titles. The capture script verifies controls and escaped source, and emits screenshots and `hostile-browser-evidence.json` under ignored `ui/qa-artifacts/svg-artifacts/`.
+`LADLE_PORT=61128 ./dev.py qa svg-artifacts` exercises 14 combinations covering light/dark, full/compact, desktop/mobile, very tall/wide charts, long titles and anonymous shared conversations. The shared page receives token-scoped artifacts while protected owner URLs return 401. The capture script verifies controls and escaped source, and emits screenshots and `hostile-browser-evidence.json` under ignored `ui/qa-artifacts/svg-artifacts/`.
 
 Hostile browser fixtures deliberately bypass ingestion to independently test image-context and serving-policy defenses. Script/event, external image/CSS and navigation payloads produce no external requests or application mutation in preview/expansion; direct navigation downloads and retains a blank document. Production ingestion separately rejects those payloads.
 

@@ -679,7 +679,7 @@ PHOENIX_SVG_PY"##
                         input: serde_json::json!({ "op": "run", "cmd": command }),
                     },
                     ContentBlock::ToolUse {
-                        id: tool_use_id(),
+                        id: "mock-present-svg".to_owned(),
                         name: "present_svg".to_owned(),
                         input: serde_json::json!({
                             "path": path,

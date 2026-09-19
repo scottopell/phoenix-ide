@@ -151,3 +151,7 @@ Implemented on `codex/45018-present-svg` in dedicated worktree `phoenix-present-
 - Local browser evidence is under ignored `ui/qa-artifacts/svg-artifacts/` and `ui/qa-artifacts/svg-artifacts-live/`; reproducible fixture scripts are committed.
 - Roadmap replacement [comment](https://github.com/scottopell/phoenix-ide/issues/651#issuecomment-5745147654) links the PR. Reducer run 35468168569 rejected projection because 19 workstreams exceeded the 12-entry display limit; no other owner's ordering was changed. Registration is submitted but not visible in the generated body.
 - Unrelated model/auth advertisement mismatch discovered during real-agent qualification is captured in task 45019. No production deployment.
+
+## Review follow-up
+
+Codex's first review raised six findings: an unvalidated database publication boundary, provider-ID replay collisions, missing share-token retrieval, and insufficient reference-type, selector-grammar and element-attribute validation. The fixes introduce a shared validation capability, assistant-message-scoped publication identity, token-scoped reads, and stricter static validation with regression tests. The repeated-provider-ID runtime regression also exposed existing transcript result-ID collisions; checkpoint/recovery identities and sub-agent transcript association are being corrected together. Review convergence remains in progress until the replacement commit passes checks and a fresh Codex review.
