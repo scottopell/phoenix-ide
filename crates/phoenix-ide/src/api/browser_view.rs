@@ -286,13 +286,7 @@ mod tests {
             .expect("conversation");
         state
             .db
-            .persist_approved_task_authority(
-                id,
-                &crate::resource_authority::tests::approval(),
-                &crate::resource_authority::tests::approval_message(id),
-                &phoenix_core::domain::sm_state::ConvState::Idle,
-                chrono::Utc::now(),
-            )
+            .persist_approved_task_authority(id, &crate::resource_authority::tests::approval())
             .await
             .expect("approved authority");
 

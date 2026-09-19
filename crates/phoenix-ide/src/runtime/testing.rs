@@ -193,12 +193,6 @@ pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
-    capability: Mutex<(
-        phoenix_core::work_scope::ResourceAuthority,
-        crate::runtime::traits::ToolCapabilityGeneration,
-    )>,
-    model_ids: Arc<[String]>,
-    fail_capability_upgrade: bool,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -210,12 +204,6 @@ impl MockToolExecutor {
             outputs: HashMap::new(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
-            capability: Mutex::new((
-                phoenix_core::work_scope::ResourceAuthority::Restricted,
-                crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
-            )),
-            model_ids: Arc::from(Vec::new()),
-            fail_capability_upgrade: false,
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -239,29 +227,6 @@ impl MockToolExecutor {
         self
     }
 
-    pub fn with_authority(
-        mut self,
-        authority: phoenix_core::work_scope::ResourceAuthority,
-    ) -> Self {
-        self.capability.get_mut().unwrap().0 = authority;
-        self
-    }
-
-    pub fn with_failed_capability_upgrade(mut self) -> Self {
-        self.fail_capability_upgrade = true;
-        self
-    }
-
-    pub fn advance_capability_generation_for_test(&self) {
-        let mut capability = self.capability.lock().unwrap();
-        capability.1 = capability.1.next();
-    }
-
-    pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
-        self.model_ids = Arc::from(model_ids);
-        self
-    }
-
     /// Get recorded executions
     pub fn recorded_executions(&self) -> Vec<(String, Value)> {
         self.executions.lock().unwrap().clone()
@@ -276,48 +241,22 @@ impl Default for MockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for MockToolExecutor {
-    async fn execute_at_generation(
+    async fn execute(
         &self,
-        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         _ctx: ToolContext,
-    ) -> Result<Option<ToolOutput>, String> {
-        if self.capability_snapshot().generation != expected {
-            return Err("stale tool capability generation".to_string());
-        }
+    ) -> Option<ToolOutput> {
         let (name, input) = call.into_parts();
         self.executions.lock().unwrap().push((name.clone(), input));
-        Ok(self.outputs.get(&name).cloned())
+        self.outputs.get(&name).cloned()
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
     }
 
-    fn subagent_model_ids(&self) -> Arc<[String]> {
-        self.model_ids.clone()
-    }
-
-    fn capability_snapshot(&self) -> crate::runtime::traits::ToolCapabilitySnapshot {
-        let (authority, generation) = *self.capability.lock().unwrap();
-        crate::runtime::traits::ToolCapabilitySnapshot {
-            generation,
-            authority,
-            clearable_names: Arc::new(self.clearable.clone()),
-        }
-    }
-
-    async fn upgrade_to_work_mode(
-        &self,
-    ) -> Result<crate::runtime::traits::ToolCapabilitySnapshot, String> {
-        if self.fail_capability_upgrade {
-            return Err("injected capability publication failure".to_string());
-        }
-        let mut capability = self.capability.lock().unwrap();
-        capability.0 = phoenix_core::work_scope::ResourceAuthority::Work;
-        capability.1 = capability.1.next();
-        drop(capability);
-        Ok(self.capability_snapshot())
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        self.clearable.clone()
     }
 }
 
@@ -399,15 +338,11 @@ impl DelayedMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DelayedMockToolExecutor {
-    async fn execute_at_generation(
+    async fn execute(
         &self,
-        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Result<Option<ToolOutput>, String> {
-        if self.capability_snapshot().generation != expected {
-            return Err("stale tool capability generation".to_string());
-        }
+    ) -> Option<ToolOutput> {
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -417,14 +352,14 @@ impl ToolExecutor for DelayedMockToolExecutor {
         self.execution_started.notify_waiters();
 
         // Race between delay and cancellation
-        Ok(tokio::select! {
+        tokio::select! {
             () = tokio::time::sleep(self.delay) => {
                 self.inner.outputs.get(&name).cloned()
             }
             () = ctx.cancel.cancelled() => {
                 Some(ToolOutput::error("[command cancelled]"))
             }
-        })
+        }
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -480,15 +415,11 @@ impl Default for UncooperativeMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for UncooperativeMockToolExecutor {
-    async fn execute_at_generation(
+    async fn execute(
         &self,
-        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Result<Option<ToolOutput>, String> {
-        if self.capability_snapshot().generation != expected {
-            return Err("stale tool capability generation".to_string());
-        }
+    ) -> Option<ToolOutput> {
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -505,7 +436,7 @@ impl ToolExecutor for UncooperativeMockToolExecutor {
         // Block until explicitly released, with a long backstop so a forgotten
         // release can't hang the suite indefinitely.
         let _ = tokio::time::timeout(Duration::from_secs(3600), self.release.notified()).await;
-        Ok(self.inner.outputs.get(&name).cloned())
+        self.inner.outputs.get(&name).cloned()
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -559,17 +490,12 @@ impl Default for FirstCallUncooperativeToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for FirstCallUncooperativeToolExecutor {
-    async fn execute_at_generation(
+    async fn execute(
         &self,
-        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Result<Option<ToolOutput>, String> {
+    ) -> Option<ToolOutput> {
         use std::sync::atomic::Ordering;
-
-        if self.capability_snapshot().generation != expected {
-            return Err("stale tool capability generation".to_string());
-        }
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -585,12 +511,12 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
             let _ignored_cancel = &ctx.cancel;
             // test-timing-allow: first-call latency models a wedged tool task that must be aborted
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok(self.inner.outputs.get(&name).cloned())
+            self.inner.outputs.get(&name).cloned()
         } else {
             // Subsequent calls: cooperative and immediate.
             let out = self.inner.outputs.get(&name).cloned();
             self.cooperative_completed.notify_waiters();
-            Ok(out)
+            out
         }
     }
 
@@ -633,8 +559,6 @@ pub struct InMemoryStorage {
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
-    fail_approved_task_authority: Mutex<bool>,
-    unclassify_approved_task_authority: Mutex<bool>,
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
@@ -704,8 +628,6 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
-            fail_approved_task_authority: Mutex::new(false),
-            unclassify_approved_task_authority: Mutex::new(false),
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
@@ -758,21 +680,6 @@ impl InMemoryStorage {
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
-    }
-
-    pub fn approved_task_authority_persisted(&self, conv_id: &str) -> bool {
-        self.approved_task_authorities
-            .lock()
-            .unwrap()
-            .contains_key(conv_id)
-    }
-
-    pub fn set_fail_approved_task_authority(&self, fail: bool) {
-        *self.fail_approved_task_authority.lock().unwrap() = fail;
-    }
-
-    pub fn set_unclassify_approved_task_authority(&self, unclassify: bool) {
-        *self.unclassify_approved_task_authority.lock().unwrap() = unclassify;
     }
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
@@ -1037,6 +944,17 @@ impl InMemoryStorage {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    pub fn approved_task_authority(
+        &self,
+        conv_id: &str,
+    ) -> Option<phoenix_core::task_handoff::ApprovedTaskSnapshot> {
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
     }
 
     pub fn queue_complete_creation_job_result(
@@ -1858,6 +1776,19 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn persist_tool_round_and_state(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_tool_round(conv_id, assistant, tool_results)
+            .await?;
+        self.update_state(conv_id, state, state_updated_at).await
+    }
+
     async fn persist_tool_round_with_terminal_obligation(
         &self,
         conv_id: &str,
@@ -2112,38 +2043,32 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        approved_state: &ConvState,
-        _state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
+    ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        if *self.fail_approved_task_authority.lock().unwrap() {
-            return Err("injected approved authority failure".to_string());
-        }
-        if *self.unclassify_approved_task_authority.lock().unwrap() {
-            return Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified);
-        }
-        self.states
+        self.approved_task_authorities
             .lock()
             .unwrap()
-            .insert(conv_id.to_string(), approved_state.clone());
+            .insert(conv_id.to_string(), snapshot);
+        Ok(())
+    }
+
+    async fn persist_approved_task_authority_and_state(
+        &self,
+        conv_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.persist_approved_task_authority(conv_id, approval)
+            .await?;
         self.messages
             .lock()
             .unwrap()
             .entry(conv_id.to_string())
             .or_default()
             .push(approval_message.clone());
-        let mut authorities = self.approved_task_authorities.lock().unwrap();
-        match authorities.get(conv_id) {
-            Some(existing) if existing != &snapshot => {
-                return Err("approved task conflicts with the committed objective".to_string());
-            }
-            Some(_) => {}
-            None => {
-                authorities.insert(conv_id.to_string(), snapshot);
-            }
-        }
-        Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(()))
+        self.update_state(conv_id, state, state_updated_at).await
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
@@ -2477,26 +2402,6 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_tool_context_for_authority(
-    authority: phoenix_core::work_scope::ResourceAuthority,
-    cwd: std::path::PathBuf,
-) -> ToolContext {
-    ToolContext::new_with_resource_access(
-        tokio_util::sync::CancellationToken::new(),
-        "test-capability-conversation".to_string(),
-        cwd,
-        Arc::new(BrowserSessionManager::default()),
-        Arc::new(crate::tools::BashHandleRegistry::new()),
-        Arc::new(ModelRegistry::new_empty()),
-        crate::terminal::ActiveTerminals::new(),
-        Arc::new(crate::tools::TmuxRegistry::default()),
-        None,
-        crate::work_scope::WorkScopeId::new(),
-        authority,
-    )
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2560,26 +2465,21 @@ mod tests {
         use crate::runtime::deny_gate::CheckedToolCall;
         let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
-        let generation = executor.capability_snapshot().generation;
         let result = executor
-            .execute_at_generation(
-                generation,
+            .execute(
                 CheckedToolCall::cleared_for_test("bash", serde_json::json!({ "cmd": "ls" })),
                 test_context(),
             )
-            .await
-            .unwrap();
+            .await;
         assert!(result.is_some());
         assert!(result.unwrap().is_success());
 
         let result = executor
-            .execute_at_generation(
-                generation,
+            .execute(
                 CheckedToolCall::cleared_for_test("unknown", serde_json::json!({})),
                 test_context(),
             )
-            .await
-            .unwrap();
+            .await;
         assert!(result.is_none());
     }
 
@@ -3649,7 +3549,7 @@ mod tests {
                 task: format!("task {i}"),
                 cwd: None,
                 mode: None,
-                model: None,
+                execution: None,
                 max_turns: None,
                 agent_type: None,
             })

@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+mod agent_execution;
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -500,8 +501,6 @@ pub struct RuntimeManager {
     conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
-    #[cfg(test)]
-    runtime_materialization_failures: AsyncMutex<HashMap<String, usize>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -1995,6 +1994,22 @@ pub enum SseEvent {
     },
 }
 
+fn approved_detached_product_registry(
+    mode: &ConvMode,
+    approved_task_objective_present: bool,
+    authority: crate::work_scope::ResourceAuthority,
+    agents: Vec<phoenix_agents::AgentDefinition>,
+    writing_tools: crate::tools::WritingConversationTools,
+) -> Result<Option<ToolRegistry>, String> {
+    if authority != crate::work_scope::ResourceAuthority::Work
+        || !approved_task_objective_present
+        || !matches!(mode, ConvMode::DetachedProductCreation { .. })
+    {
+        return Ok(None);
+    }
+    ToolRegistry::git_backed_writing_parent(agents, writing_tools).map(Some)
+}
+
 fn sub_agent_registry_for_authority(
     authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
@@ -2004,76 +2019,6 @@ fn sub_agent_registry_for_authority(
             ToolRegistry::for_subagent_explore(policy)
         }
         crate::work_scope::ResourceAuthority::Work => ToolRegistry::for_subagent_work(),
-    }
-}
-
-struct RuntimeRegistryProjection<'a> {
-    mode: ConvMode,
-    tasks_dir_name: &'a str,
-    agent_catalog: &'a [phoenix_agents::AgentDefinition],
-    model_ids: &'a [String],
-    explore_policy: ExploreToolPolicy,
-    writing_tools: crate::tools::WritingConversationTools,
-    filesystem_root: &'a std::path::Path,
-}
-
-fn registry_for_runtime_authority(
-    authority: crate::work_scope::ResourceAuthority,
-    projection: RuntimeRegistryProjection<'_>,
-) -> Result<(ToolRegistry, Option<crate::tools::WritingConversationTools>), String> {
-    let RuntimeRegistryProjection {
-        mode,
-        tasks_dir_name,
-        agent_catalog,
-        model_ids,
-        explore_policy,
-        writing_tools,
-        filesystem_root,
-    } = projection;
-    let agents = agent_catalog.to_vec();
-    let models = model_ids.to_vec();
-    match (authority, mode) {
-        (
-            crate::work_scope::ResourceAuthority::Restricted,
-            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. },
-        ) => Ok((
-            ToolRegistry::explore(tasks_dir_name, agents, models, explore_policy),
-            Some(writing_tools),
-        )),
-        (
-            crate::work_scope::ResourceAuthority::Work,
-            ConvMode::Explore { .. }
-            | ConvMode::AttachedWorkChild { .. }
-            | ConvMode::DetachedProductCreation { .. },
-        ) => Ok((
-            ToolRegistry::direct(agents, models)
-                .try_with_writing_conversation_tools(writing_tools)?,
-            None,
-        )),
-        (crate::work_scope::ResourceAuthority::Work, ConvMode::Direct) => {
-            let registry = ToolRegistry::direct(agents, models);
-            let registry = if phoenix_core::git::detect_git_repo_root(filesystem_root).is_some() {
-                registry.with_propose_task()
-            } else {
-                registry
-            };
-            Ok((
-                registry.try_with_writing_conversation_tools(writing_tools)?,
-                None,
-            ))
-        }
-        (
-            crate::work_scope::ResourceAuthority::Work,
-            ConvMode::Work { .. } | ConvMode::Branch { .. } | ConvMode::DetachedApprovedTask { .. },
-        ) => Ok((
-            ToolRegistry::direct(agents, models)
-                .with_propose_task()
-                .try_with_writing_conversation_tools(writing_tools)?,
-            None,
-        )),
-        (crate::work_scope::ResourceAuthority::Restricted, _) => {
-            Err("persisted Restricted authority conflicts with write-only conversation mode".into())
-        }
     }
 }
 
@@ -2273,8 +2218,6 @@ impl RuntimeManager {
             conversation_admissions: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
-            #[cfg(test)]
-            runtime_materialization_failures: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3815,25 +3758,6 @@ impl RuntimeManager {
         }
     }
 
-    #[must_use]
-    fn persisted_subagent_mode(parent_mode: &ConvMode, execution_mode: SubAgentMode) -> ConvMode {
-        match execution_mode {
-            SubAgentMode::Explore => ConvMode::Explore {
-                worktree_path: None,
-                next_taskmd_id_hint: None,
-            },
-            SubAgentMode::Work => match parent_mode {
-                ConvMode::Explore {
-                    worktree_path: Some(worktree_path),
-                    ..
-                } => ConvMode::AttachedWorkChild {
-                    worktree_path: worktree_path.clone(),
-                },
-                mode => mode.clone(),
-            },
-        }
-    }
-
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
@@ -3884,25 +3808,33 @@ impl RuntimeManager {
             return;
         }
 
-        if let Some(effort) = parent_conv.effort {
-            if !self.llm_registry.supports_effort(&spec.model_id, effort) {
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!(
-                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
-                                spec.model_id
-                            ),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
-                return;
-            }
+        if let Err(error) = self.llm_registry.validate_execution_route(
+            &spec.model_id,
+            &spec.connection,
+            spec.effort,
+        ) {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error,
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
         }
 
-        let sub_conv_mode = Self::persisted_subagent_mode(&parent_conv.conv_mode, spec.mode);
+        // Derive sub-agent conv_mode from spec.mode + parent's mode.
+        // Explore sub-agents are always Explore. Work sub-agents inherit
+        // the parent's Work mode (branch, base_branch, worktree_path).
+        let sub_conv_mode = match spec.mode {
+            SubAgentMode::Explore => ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            SubAgentMode::Work => parent_conv.conv_mode.clone(),
+        };
 
         let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
             Ok(cwd) => cwd,
@@ -3977,6 +3909,11 @@ impl RuntimeManager {
                 &sub_conv_mode,
                 parent_conv.llm_language,
                 parent_scope.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: &spec.connection,
+                    effort: spec.effort,
+                    persona: spec.persona.as_deref(),
+                },
             )
             .await
         {
@@ -3997,21 +3934,6 @@ impl RuntimeManager {
                 return;
             }
         };
-
-        // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
-        // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
-        // falling back to the generic prompt. Best-effort: the live
-        // conv_context built below carries the persona regardless, so a write
-        // failure only degrades a subsequent resume — logged, not fatal.
-        if let Some(persona) = spec.persona.as_deref() {
-            if let Err(e) = self.db.set_sub_agent_persona(&conv.id, persona).await {
-                tracing::warn!(
-                    error = %e,
-                    conv_id = %conv.id,
-                    "Failed to persist sub-agent persona; a resumed runtime would fall back to the generic prompt"
-                );
-            }
-        }
 
         // 2. Insert initial task as synthetic user message
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -4058,7 +3980,7 @@ impl RuntimeManager {
             || crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone()),
             crate::work_scope::ResourceScopeKey::Work,
         );
-        let resource_authority = match spec.mode {
+        conv_context.resource_authority = match spec.mode {
             SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
             SubAgentMode::Work => crate::work_scope::ResourceAuthority::Work,
         };
@@ -4096,7 +4018,8 @@ impl RuntimeManager {
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone());
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone())
+            .with_connection(Some(spec.connection.clone()));
         // Select tool registry based on sub-agent mode (REQ-PROJ-008).
         // Sub-agents get MCP access via the parent's MCP manager.
         let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
@@ -4106,10 +4029,8 @@ impl RuntimeManager {
         };
         // Sub-agents cannot spawn, so they carry an empty agent catalog.
         let tool_executor = ToolRegistryExecutor::with_mcp(
-            resource_authority,
             registry,
             self.mcp_manager.clone(),
-            Arc::from(Vec::new()),
             Arc::from(Vec::new()),
         );
 
@@ -4283,66 +4204,6 @@ impl RuntimeManager {
                     .await;
             }
         }
-    }
-
-    async fn remove_finished_runtime(
-        &self,
-        conversation_id: &str,
-        identity: &Arc<()>,
-        disposition: executor::RuntimeExitDisposition,
-    ) -> bool {
-        let mut runtimes = self.runtimes.write().await;
-        let mut reservations = self.evicted_broadcasters.write().await;
-        let Some(handle) = runtimes.get(conversation_id) else {
-            return false;
-        };
-        if !Arc::ptr_eq(&handle.identity, identity) {
-            return false;
-        }
-        let handle = runtimes
-            .remove(conversation_id)
-            .expect("identity-checked runtime remains present");
-        if disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-            reservations.insert(conversation_id.to_string(), handle.broadcast_tx);
-        }
-        true
-    }
-
-    fn recreate_runtime_from_database(
-        self: &Arc<Self>,
-        conversation_id: String,
-    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
-        let manager = Arc::clone(self);
-        Box::pin(async move {
-            const ATTEMPTS: usize = 3;
-            manager.require_local_authority_admission()?;
-            let mut last_error = None;
-            for attempt in 1..=ATTEMPTS {
-                match manager.get_or_create_inner(&conversation_id, None).await {
-                    Ok(_) => return Ok(()),
-                    Err(error) => {
-                        tracing::warn!(
-                            conv_id = %conversation_id,
-                            attempt,
-                            max_attempts = ATTEMPTS,
-                            %error,
-                            "Durable authority rematerialization attempt failed"
-                        );
-                        last_error = Some(error);
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
-            Err(last_error.expect("at least one rematerialization attempt"))
-        })
-    }
-
-    async fn release_failed_rematerialization_stream(&self, conversation_id: &str) -> bool {
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id)
-            .is_some()
     }
 
     /// Get or materialize the in-memory runtime for a durable conversation.
@@ -4982,17 +4843,6 @@ impl RuntimeManager {
         }
 
         #[cfg(test)]
-        {
-            let mut failures = self.runtime_materialization_failures.lock().await;
-            if let Some(remaining) = failures.get_mut(conversation_id) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Err("injected runtime materialization failure".to_string());
-                }
-            }
-        }
-
-        #[cfg(test)]
         if self
             .runtime_materialization_panics
             .lock()
@@ -5084,6 +4934,11 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
+        let approved_task_objective = self
+            .db
+            .get_approved_task_objective(conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -5120,7 +4975,7 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        let resource_authority =
+        context.resource_authority =
             crate::resource_authority::resolve_resource_authority(self.db(), &conv)
                 .await
                 .map_err(|error| format!("Failed to load resource authority: {error}"))?
@@ -5191,82 +5046,116 @@ impl RuntimeManager {
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
+        let pinned_connection = if is_sub_agent {
+            self.db
+                .get_sub_agent_execution_connection(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
+        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id)
+            .with_connection(pinned_connection);
 
         // Tool registry selection -- sub-agents get a restricted tool set
         // (no spawn_agents, no ask_user_question, no skill); parent
         // conversations get the mode-appropriate registry. Both layers wrap
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
-        // Freeze the named-agent catalog once per conversation so the
-        // spawn_agents schema and the executor's agent_type resolution share a
-        // single catalog instead of independently re-discovering the filesystem
-        // (REQ-AG-008). Sub-agents cannot spawn, so theirs is empty.
+        let agent_config = if is_sub_agent || is_coordinator {
+            phoenix_agents::AgentConfig::default()
+        } else {
+            phoenix_agents::load_user_config().unwrap_or_else(|error| {
+                tracing::error!(%error, "Phoenix agent configuration unavailable; using generic workers only");
+                phoenix_agents::AgentConfig::default()
+            })
+        };
         let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> =
-            if is_sub_agent || is_coordinator {
-                Arc::from(Vec::new())
-            } else {
-                Arc::from(phoenix_agents::discover_agents(context.filesystem_root()))
-            };
-        let available_model_ids = self.llm_registry.available_models();
+            Arc::from(agent_config.agents.clone());
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_authority(
-                resource_authority,
+                context.resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
             ToolRegistryExecutor::with_mcp(
-                resource_authority,
                 registry,
                 self.mcp_manager.clone(),
-                agent_catalog.clone(),
-                Arc::from(available_model_ids.clone()),
-            )
-        } else if is_coordinator {
-            let service = crate::api::global_read::GlobalReadService::new(
-                self.db.clone(),
-                self.message_retriever.clone(),
-            );
-            let send_chat = Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                self.db.clone(),
-                self.clone(),
-            ));
-            ToolRegistryExecutor::builtin_only(
-                resource_authority,
-                ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
                 agent_catalog.clone(),
             )
         } else {
-            let global_read = crate::api::global_read::GlobalReadService::new(
-                self.db.clone(),
-                self.message_retriever.clone(),
-            );
-            let send_chat = Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                self.db.clone(),
-                self.clone(),
-            ));
-            let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-            let (registry, upgrade_writing_tools) = registry_for_runtime_authority(
-                resource_authority,
-                RuntimeRegistryProjection {
-                    mode: conv.conv_mode,
-                    tasks_dir_name: &context.tasks_dir_name,
-                    agent_catalog: agent_catalog.as_ref(),
-                    model_ids: &available_model_ids,
-                    explore_policy: ExploreToolPolicy::from_platform(&self.platform),
-                    writing_tools,
-                    filesystem_root: context.filesystem_root(),
-                },
-            )?;
-            ToolRegistryExecutor::with_mcp(
-                resource_authority,
-                registry,
-                self.mcp_manager.clone(),
-                agent_catalog.clone(),
-                Arc::from(available_model_ids.clone()),
-            )
-            .with_writing_tools(upgrade_writing_tools)
+            use crate::db::ConvMode;
+            if is_coordinator {
+                let service = crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                );
+                let send_chat =
+                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                        self.db.clone(),
+                        self.clone(),
+                    ));
+                ToolRegistryExecutor::builtin_only(
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    agent_catalog.clone(),
+                )
+            } else {
+                let global_read = crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                );
+                let send_chat =
+                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                        self.db.clone(),
+                        self.clone(),
+                    ));
+                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+                let approved_registry = approved_detached_product_registry(
+                    &conv.conv_mode,
+                    approved_task_objective.is_some(),
+                    context.resource_authority,
+                    agent_catalog.to_vec(),
+                    writing_tools.clone(),
+                )?;
+                let (registry, upgrade_writing_tools) = match (approved_registry, conv.conv_mode) {
+                    (Some(registry), _) => (registry, None),
+                    (None, ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }) => {
+                        (
+                            ToolRegistry::explore(
+                                &context.tasks_dir_name,
+                                agent_catalog.to_vec(),
+                                ExploreToolPolicy::from_platform(&self.platform),
+                            ),
+                            Some(writing_tools),
+                        )
+                    }
+                    (None, ConvMode::Direct) => (
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                            .try_with_writing_conversation_tools(writing_tools)?,
+                        None,
+                    ),
+                    (
+                        None,
+                        ConvMode::Work { .. }
+                        | ConvMode::Branch { .. }
+                        | ConvMode::AttachedWorkChild { .. }
+                        | ConvMode::DetachedApprovedTask { .. },
+                    ) => (
+                        ToolRegistry::git_backed_writing_parent(
+                            agent_catalog.to_vec(),
+                            writing_tools,
+                        )?,
+                        None,
+                    ),
+                };
+                ToolRegistryExecutor::with_mcp(
+                    registry,
+                    self.mcp_manager.clone(),
+                    agent_catalog.clone(),
+                )
+                .with_writing_tools(upgrade_writing_tools)
+            }
         };
 
         let recovery_started = std::time::Instant::now();
@@ -5380,7 +5269,7 @@ impl RuntimeManager {
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
-            .with_agent_catalog(agent_catalog);
+            .with_agent_config(agent_config);
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -5533,9 +5422,18 @@ impl RuntimeManager {
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
             // not evict that replacement.
-            let removed = manager_for_cleanup
-                .remove_finished_runtime(&conv_id, &cleanup_identity, disposition)
-                .await;
+            let removed = {
+                let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                if runtimes
+                    .get(&conv_id)
+                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
+                {
+                    runtimes.remove(&conv_id);
+                    true
+                } else {
+                    false
+                }
+            };
             if removed {
                 tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
             } else {
@@ -5552,20 +5450,7 @@ impl RuntimeManager {
                 }
             }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                if let Err(error) = manager_for_cleanup
-                    .recreate_runtime_from_database(conv_id.clone())
-                    .await
-                {
-                    let released = manager_for_cleanup
-                        .release_failed_rematerialization_stream(&conv_id)
-                        .await;
-                    tracing::error!(
-                        conv_id = %conv_id,
-                        %error,
-                        stream_released = released,
-                        "Exhausted durable authority rematerialization attempts after ambiguous commit"
-                    );
-                }
+                manager_for_cleanup.kick_direct_turn_worker();
             }
         });
 
@@ -5604,18 +5489,6 @@ impl RuntimeManager {
 
     /// Inject a fake live handle and return its event receiver so a handler
     /// test can assert executor notifications directly.
-    #[cfg(test)]
-    async fn fail_next_runtime_materializations_for_test(
-        &self,
-        conversation_id: &str,
-        count: usize,
-    ) {
-        self.runtime_materialization_failures
-            .lock()
-            .await
-            .insert(conversation_id.to_string(), count);
-    }
-
     #[cfg(test)]
     pub(crate) async fn inject_handle_with_event_capture_for_test(
         &self,
@@ -6176,14 +6049,9 @@ impl RuntimeManager {
         let row_state_updated_at = conv.state_updated_at;
 
         if matches!(conv.state, ConvState::LlmRequesting { .. })
-            && (self
+            && self
                 .has_persisted_llm_request_owner(conversation_id)
                 .await?
-                || self
-                    .db
-                    .has_pending_approval_request(conversation_id)
-                    .await
-                    .map_err(|error| error.to_string())?)
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -6478,45 +6346,6 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
 }
 
 #[cfg(test)]
-mod persisted_subagent_mode_tests {
-    use super::RuntimeManager;
-    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
-    use phoenix_core::domain::sm_state::SubAgentMode;
-
-    #[test]
-    fn attached_work_child_context_retains_inherited_worktree() {
-        let mode = ConvMode::AttachedWorkChild {
-            worktree_path: NonEmptyString::new("/tmp/approved-worktree").unwrap(),
-        };
-        assert!(matches!(
-            super::conv_mode_to_context(&mode),
-            phoenix_core::domain::mode_context::ModeContext::AttachedWorkChild { worktree_path }
-                if worktree_path == "/tmp/approved-worktree"
-        ));
-        assert_eq!(mode.worktree_path(), Some("/tmp/approved-worktree"));
-    }
-
-    #[test]
-    fn approved_explore_parent_persists_distinct_child_execution_modes() {
-        let parent = ConvMode::Explore {
-            worktree_path: Some(NonEmptyString::new("/tmp/approved-worktree").unwrap()),
-            next_taskmd_id_hint: None,
-        };
-
-        assert!(matches!(
-            RuntimeManager::persisted_subagent_mode(&parent, SubAgentMode::Explore),
-            ConvMode::Explore { .. }
-        ));
-        assert_eq!(
-            RuntimeManager::persisted_subagent_mode(&parent, SubAgentMode::Work),
-            ConvMode::AttachedWorkChild {
-                worktree_path: NonEmptyString::new("/tmp/approved-worktree").unwrap(),
-            }
-        );
-    }
-}
-
-#[cfg(test)]
 mod bash_lifecycle_bridge_tests {
     use super::{BashLifecycleBridgeAction, RuntimeManager};
     use crate::tools::{BashLifecycleEvent, BashLifecyclePhase, BashTerminalEffect};
@@ -6583,105 +6412,126 @@ mod bash_lifecycle_bridge_tests {
 }
 
 #[cfg(test)]
-mod runtime_capability_projection_tests {
-    use super::{registry_for_runtime_authority, RuntimeRegistryProjection};
-    use crate::db::ConvMode;
-    use crate::platform::PlatformCapability;
-    use crate::tools::{
-        ExploreToolPolicy, Tool, ToolContext, ToolOutput, WritingConversationTools,
-    };
+mod approved_objective_registry_tests {
+    use super::approved_detached_product_registry;
+    use crate::tools::{ToolContext, ToolOutput};
     use crate::work_scope::ResourceAuthority;
+    use async_trait::async_trait;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use serde_json::{json, Value};
     use std::sync::Arc;
 
-    struct NamedTool(&'static str);
+    struct WritingMarker(&'static str);
 
-    #[async_trait::async_trait]
-    impl Tool for NamedTool {
+    #[async_trait]
+    impl crate::tools::Tool for WritingMarker {
         fn name(&self) -> &'static str {
             self.0
         }
+
         fn description(&self) -> String {
-            "capability fixture".into()
+            "marker".to_string()
         }
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
         }
-        async fn run(&self, _input: serde_json::Value, _ctx: ToolContext) -> ToolOutput {
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
             ToolOutput::success("ok")
         }
     }
 
-    fn writing_tools() -> WritingConversationTools {
-        WritingConversationTools::new(
-            Arc::new(NamedTool("search_conversations")),
-            Arc::new(NamedTool("read_conversation")),
-            Arc::new(NamedTool("query_database")),
-            Arc::new(NamedTool("send_conversation_message")),
+    #[test]
+    fn detached_product_creation_with_approved_objective_rematerializes_as_work() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = crate::tools::WritingConversationTools::new(
+            Arc::new(WritingMarker("search_conversations")),
+            Arc::new(WritingMarker("read_conversation")),
+            Arc::new(WritingMarker("query_database")),
+            Arc::new(WritingMarker("send_conversation_message")),
+        )
+        .unwrap();
+        assert!(approved_detached_product_registry(
+            &mode,
+            true,
+            ResourceAuthority::Work,
+            vec![],
+            writing_tools,
         )
         .unwrap()
+        .is_some());
     }
 
-    fn detached_mode(path: &std::path::Path) -> ConvMode {
-        use phoenix_core::domain::db_schema::NonEmptyString;
-        ConvMode::DetachedProductCreation {
-            worktree_path: NonEmptyString::new(path.to_string_lossy()).unwrap(),
+    #[test]
+    fn detached_product_creation_restart_projects_work_filesystem_and_network_capability() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
             base_branch: NonEmptyString::new("main").unwrap(),
-        }
-    }
-
-    #[test]
-    fn detached_product_rematerialization_projects_workscope_authority() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let policy = ExploreToolPolicy::from_platform(&PlatformCapability::detect());
-        let (restricted, restricted_upgrade) = registry_for_runtime_authority(
-            ResourceAuthority::Restricted,
-            RuntimeRegistryProjection {
-                mode: detached_mode(temp.path()),
-                tasks_dir_name: "tasks",
-                agent_catalog: &[],
-                model_ids: &[],
-                explore_policy: policy,
-                writing_tools: writing_tools(),
-                filesystem_root: temp.path(),
-            },
-        )
-        .unwrap();
-        assert!(restricted.find_tool("bash").is_some());
-        assert!(restricted_upgrade.is_some());
-
-        let (work, work_upgrade) = registry_for_runtime_authority(
+        };
+        let registry = approved_detached_product_registry(
+            &mode,
+            true,
             ResourceAuthority::Work,
-            RuntimeRegistryProjection {
-                mode: detached_mode(temp.path()),
-                tasks_dir_name: "tasks",
-                agent_catalog: &[],
-                model_ids: &[],
-                explore_policy: policy,
-                writing_tools: writing_tools(),
-                filesystem_root: temp.path(),
-            },
+            vec![],
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap(),
         )
-        .unwrap();
-        assert!(work.find_tool("bash").is_some());
-        assert!(work.find_tool("spawn_agents").is_some());
-        assert!(work_upgrade.is_none());
+        .unwrap()
+        .expect("approved persisted authority projects a Work registry");
+        let names: std::collections::HashSet<_> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(names.contains("patch"));
+        assert!(names.contains("bash"));
+        assert!(!names.contains("sandboxed_bash"));
+        assert!(names.contains("send_conversation_message"));
+        assert_eq!(mode.worktree_path(), Some("/tmp/product-worktree"));
     }
 
     #[test]
-    fn restricted_authority_fails_closed_for_write_only_mode() {
-        assert!(registry_for_runtime_authority(
-            ResourceAuthority::Restricted,
-            RuntimeRegistryProjection {
-                mode: ConvMode::Direct,
-                tasks_dir_name: "tasks",
-                agent_catalog: &[],
-                model_ids: &[],
-                explore_policy: ExploreToolPolicy::from_platform(&PlatformCapability::detect()),
-                writing_tools: writing_tools(),
-                filesystem_root: std::path::Path::new("/tmp"),
-            },
+    fn detached_product_creation_requires_both_work_authority_and_approved_objective() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = || {
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap()
+        };
+        assert!(approved_detached_product_registry(
+            &mode,
+            false,
+            ResourceAuthority::Work,
+            vec![],
+            writing_tools(),
         )
-        .is_err());
+        .unwrap()
+        .is_none());
+        assert!(approved_detached_product_registry(
+            &mode,
+            true,
+            ResourceAuthority::Restricted,
+            vec![],
+            writing_tools(),
+        )
+        .unwrap()
+        .is_none());
     }
 }
 
@@ -7993,6 +7843,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 parent.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create subordinate participant");
@@ -8073,12 +7928,51 @@ mod scope_liveness_tests {
             .tmux_registry()
             .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
             .await;
+        let old_socket = std::fs::metadata(socket).unwrap();
+        let old_server_pid = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &socket.to_string_lossy(),
+                "display-message",
+                "-p",
+                "#{pid}",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(old_server_pid.status.success());
+        let old_server_pid = String::from_utf8(old_server_pid.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let old_server = phoenix_core::process_identity::current_process_identity(old_server_pid)
+            .expect("capture old tmux server identity");
         let output = tokio::process::Command::new("tmux")
             .args(["-S", &socket.to_string_lossy(), "kill-server"])
             .output()
             .await
             .unwrap();
         assert!(output.status.success(), "kill stale server: {output:?}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while phoenix_core::process_identity::process_identity_matches(old_server) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exact stale tmux server remained after successful kill-server"
+            );
+            tokio::task::yield_now().await;
+        }
+        if let Ok(observed) = std::fs::metadata(socket) {
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::dev(&observed),
+                std::os::unix::fs::MetadataExt::dev(&old_socket)
+            );
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::ino(&observed),
+                std::os::unix::fs::MetadataExt::ino(&old_socket)
+            );
+            std::fs::remove_file(socket).unwrap();
+        }
         let replacement = manager
             .tmux_registry()
             .ensure_live(
@@ -8809,7 +8703,12 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn subagent_persistence_keeps_one_owner_across_all_semantic_writes() {
-        let manager = Arc::new(test_manager().await);
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
         let parent = manager
             .db()
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
@@ -8835,7 +8734,9 @@ mod scope_liveness_tests {
                             cwd: "/tmp".to_string(),
                             timeout: std::time::Duration::from_secs(60),
                             mode: SubAgentMode::Explore,
-                            model_id: "gpt-5.4".to_string(),
+                            model_id: "gpt-5.6-sol".to_string(),
+                            connection: "openai_responses".into(),
+                            effort: None,
                             max_turns: 1,
                             agent_name: Some("fence-test".to_string()),
                             persona: Some("test persona".to_string()),
@@ -8943,6 +8844,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -8988,6 +8894,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -9027,6 +8938,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -9131,6 +9047,11 @@ mod scope_liveness_tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create unattached sub-agent");
@@ -9163,7 +9084,6 @@ mod scope_liveness_tests {
             .unwrap());
     }
 
-    #[derive(Default)]
     struct RecordingLlm {
         requests: std::sync::atomic::AtomicUsize,
     }
@@ -9936,6 +9856,7 @@ mod scope_liveness_tests {
                 "claude-sonnet-5",
                 Some(phoenix_core::domain::llm_types::ModelEffort::High),
                 ServiceTier::Standard,
+                "anthropic",
             )
             .await
             .expect("persist unsupported effort");
@@ -10835,117 +10756,6 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("inherited materialization succeeds");
         assert_eq!(handle.state_rx.borrow().presentation_mode(), "idle");
-    }
-
-    #[tokio::test]
-    async fn recreate_from_database_replaces_finished_actor_and_preserves_stream() {
-        let llm = Arc::new(RecordingLlm::default());
-        let mgr = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
-        let conversation_id = "recreate-finished-runtime";
-        mgr.db()
-            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
-            .await
-            .expect("create");
-        let approval = TaskApprovalHandoffData {
-            task_id: "12345".to_string(),
-            task_title: "Recreate".to_string(),
-            title: "Recreate".to_string(),
-            priority: crate::task_source::Priority::P0,
-            plan: "Plan".to_string(),
-            task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
-            artifact_body: "# Recreate\n\nPlan\n".to_string(),
-        };
-        mgr.db()
-            .persist_approved_task_authority(
-                conversation_id,
-                &approval,
-                &crate::db::Message {
-                    message_id: "approval-message".to_string(),
-                    conversation_id: conversation_id.to_string(),
-                    sequence_id: 1,
-                    message_type: crate::db::MessageType::User,
-                    content: crate::db::MessageContent::User(crate::db::UserContent::meta(
-                        "approved",
-                    )),
-                    display_data: None,
-                    usage_data: None,
-                    created_at: Utc::now(),
-                },
-                &ConvState::LlmRequesting { attempt: 1 },
-                Utc::now(),
-            )
-            .await
-            .expect("persist committed approval transaction");
-        let _stale_events = mgr
-            .inject_handle_with_event_capture_for_test(
-                conversation_id,
-                ConvState::AwaitingTaskApproval {
-                    task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
-                    title: "Recreate".to_string(),
-                    priority: crate::task_source::Priority::P0,
-                    plan: "Plan".to_string(),
-                },
-            )
-            .await;
-        let stale = mgr
-            .try_get_handle(conversation_id)
-            .await
-            .expect("stale handle");
-        let stale_identity = Arc::clone(&stale.identity);
-        let reserved_stream = stale.broadcast_tx.clone();
-
-        assert!(
-            mgr.remove_finished_runtime(
-                conversation_id,
-                &stale_identity,
-                executor::RuntimeExitDisposition::RecreateFromDatabase,
-            )
-            .await
-        );
-        mgr.fail_next_runtime_materializations_for_test(conversation_id, 2)
-            .await;
-        mgr.recreate_runtime_from_database(conversation_id.to_string())
-            .await
-            .expect("rematerialize from durable state");
-
-        let replacement = mgr
-            .try_get_handle(conversation_id)
-            .await
-            .expect("replacement handle");
-        assert!(!Arc::ptr_eq(&stale_identity, &replacement.identity));
-        assert!(reserved_stream.same_channel(&replacement.broadcast_tx));
-        assert!(matches!(
-            *replacement.state_rx.borrow(),
-            ConvState::LlmRequesting { attempt: 1 }
-        ));
-        let mut state_rx = replacement.state_rx.clone();
-        while matches!(*state_rx.borrow(), ConvState::LlmRequesting { .. }) {
-            state_rx.changed().await.expect("replacement remains live");
-        }
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn exhausted_rematerialization_releases_reserved_stream() {
-        let mgr = Arc::new(test_manager().await);
-        let conversation_id = "failed-rematerialization-stream";
-        let reserved = mgr.conversation_broadcaster(conversation_id).await;
-        let mut receiver = reserved.subscribe();
-        drop(reserved);
-
-        assert!(
-            mgr.release_failed_rematerialization_stream(conversation_id)
-                .await
-        );
-        assert!(!mgr
-            .evicted_broadcasters
-            .read()
-            .await
-            .contains_key(conversation_id));
-        assert!(matches!(
-            receiver.recv().await,
-            Err(tokio::sync::broadcast::error::RecvError::Closed)
-        ));
     }
 
     #[tokio::test]
