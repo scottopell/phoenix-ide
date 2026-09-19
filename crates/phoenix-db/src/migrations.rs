@@ -545,6 +545,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "guard_close_participant_deleted_settlement",
         sql: MIGRATION_105,
     },
+    Migration {
+        version: 106,
+        name: "exclude_conflicting_close_repair_causes",
+        sql: MIGRATION_106,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -9126,16 +9131,6 @@ CREATE TABLE close_ambient_writer_indeterminate_causes (
         CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
 );
 
-CREATE TRIGGER close_ambient_writer_cause_reject_evidence_cause
-BEFORE INSERT ON close_ambient_writer_indeterminate_causes
-WHEN EXISTS (
-    SELECT 1 FROM close_needs_repair_causes cause
-    WHERE cause.attempt_id = NEW.attempt_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
-END;
-
 CREATE TRIGGER close_ambient_writer_indeterminate_cause_phase_changed
 AFTER UPDATE OF phase ON close_obligations
 WHEN OLD.phase <> NEW.phase
@@ -9165,16 +9160,6 @@ CREATE TABLE close_needs_repair_causes (
     recorded_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
 );
-
-CREATE TRIGGER close_needs_repair_cause_reject_ambient_writer_cause
-BEFORE INSERT ON close_needs_repair_causes
-WHEN EXISTS (
-    SELECT 1 FROM close_ambient_writer_indeterminate_causes cause
-    WHERE cause.attempt_id = NEW.attempt_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
-END;
 
 CREATE TRIGGER close_needs_repair_cause_phase_changed
 AFTER UPDATE OF phase ON close_obligations
@@ -10810,6 +10795,28 @@ WHEN NEW.settlement_state = 'deleted'
  )
 BEGIN
     SELECT RAISE(ABORT, 'close participant deletion settlement requires active cleanup claim');
+END;
+";
+
+const MIGRATION_106: &str = r"
+CREATE TRIGGER close_ambient_writer_cause_reject_evidence_cause
+BEFORE INSERT ON close_ambient_writer_indeterminate_causes
+WHEN EXISTS (
+    SELECT 1 FROM close_needs_repair_causes cause
+    WHERE cause.attempt_id = NEW.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
+END;
+
+CREATE TRIGGER close_needs_repair_cause_reject_ambient_writer_cause
+BEFORE INSERT ON close_needs_repair_causes
+WHEN EXISTS (
+    SELECT 1 FROM close_ambient_writer_indeterminate_causes cause
+    WHERE cause.attempt_id = NEW.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Close repair cause alternatives are mutually exclusive');
 END;
 ";
 
@@ -15780,7 +15787,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard')",
+                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard'),
+                    (106, 'temporarily_skip_conflicting_close_repair_causes')",
         )
         .execute(&pool)
         .await
@@ -16674,7 +16682,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard')",
+                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard'),
+                    (106, 'temporarily_skip_conflicting_close_repair_causes')",
         )
         .execute(pool)
         .await
