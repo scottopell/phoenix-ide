@@ -1,0 +1,73 @@
+# Inline message reactions that append to the current draft
+
+## User need and agreed direction
+
+While reading an LLM answer in the normal conversation transcript, the user wants to select a passage, immediately see a small reaction input, type a response, and append the selected quotation plus response to the existing message draft. Each reaction goes directly to the draft; there is no separate pending-note batch and no message is sent to the agent. Preserve the existing sidepanel/fullscreen reviewer and its batching workflow.
+
+The user approved desktop and mobile mockups with one correction: the primary action must communicate appending, not copying to the clipboard. Use a text-lines-plus/list-plus icon and the explicit label **Add to draft** wherever space allows, with the same accessible name and tooltip for any compact icon-only rendering. Do not use a clipboard, paper plane, or send arrow for this action.
+
+Desktop mockup: immediately visible compact input near the selected passage, close control, Add to draft action, and Cmd/Ctrl+Enter shortcut. Mobile mockup: native selection controls above/around the selected passage, reaction input below with space for selection handles. Merely selecting text must not steal focus or summon the keyboard. Clicking/tapping the already-visible input begins typing.
+
+The mockups are exploratory interaction references, not production implementations. Their transient local files live in the originating Codex task's visualization directory; the behavioral requirements here must be sufficient to implement without those files.
+
+## Evidence and owning boundary
+
+- Existing `MessageContextMenu` resolves an owning message and handles `contextmenu` on the transcript container. It calls `preventDefault`, so native selection/menu coexistence must be considered at this shared boundary rather than by adding a second competing gesture handler.
+- `MessageViewer` supports message-scoped line/block notes and batches the shared review-note collection via `formatNotesForSend`. This is the existing reviewer, not the desired immediate-append interaction.
+- `ProductConversationPage` owns aggregate message identity and obtains the active/latest composer append capability from the latest embedded transcript projection. An older message's feedback must target the current conversation draft, not its historical transcript row.
+- `ConversationPage` uses `useDraftActions` / `appendDraft` and explicitly requests composer focus for current viewer send flows. Inline reactions should reuse the draft authority without inheriting viewer close or composer-focus side effects.
+- Browser-verified baseline: `product-conversation--desktop-multi-segment-qa-work` renders the real conversation page and composer; annotating older message #4, entering fullscreen with two notes, and sending feedback appends to an existing draft without submitting it.
+- Existing metaViewer fixtures exercise isolated viewer states but have no-op send callbacks. The full conversation fixture has short messages and needs richer review content.
+- The user reports no discoverable mobile entry to a conversation-message reviewer. The earlier browser pass verified desktop entry; touch-device/native-menu behavior remains unverified.
+
+Authority starting points: `specs/conversation-ui/requirements.md`, `specs/prose-feedback/requirements.md` (including REQ-PF-017), `specs/viewer_slot/` normative artifacts, and `specs/keyboard-interaction/`. Read actual current authorities before implementation; update requirements and executive coverage, and record any changed interaction policy in the shared ADR chain.
+
+## Scope and acceptance criteria
+
+### 1. Select and react directly in the transcript
+
+- [ ] A non-empty selection wholly within a finalized assistant message opens the small reaction input immediately, without a second click on an activation icon. Support prose, lists, inline code, and code blocks within that message.
+- [ ] Capture the exact selected visible text and stable source-message/occurrence identity before focus moves to the reaction input. Do not replace it with an entire source line or truncate it to a short preview in the appended output. A display preview may be abbreviated.
+- [ ] Ignore selection in editable controls, unrelated surfaces, and selections spanning multiple messages. Do not offer the mutation action when the current conversation has no eligible draft/composer destination. Streaming/incomplete assistant content is outside this first implementation.
+- [ ] Selection remains native: mouse drag, selection extension, keyboard selection, copying, right-click/system menus, mobile handles, and ordinary scrolling still work. Do not globally cancel pointer, selection, touch, or context-menu behavior to make the reaction UI work.
+- [ ] The input appears without autofocus. It does not cover the selected text or selection handles; placement follows available room and stays inside the visible viewport. On mobile, account for browser chrome, safe areas, and the on-screen keyboard after the user taps the input.
+- [ ] The user may enter a multiline reaction. Blank/whitespace-only reactions cannot be added. Cmd/Ctrl+Enter adds; Enter alone inserts a newline. IME composition must not trigger append.
+
+### 2. Append atomically and keep reading
+
+- [ ] Add to draft appends a readable source reference, the selected quotation, and the user's reaction with sensible blank-line separation. Preserve the existing draft exactly, including edits made while the reaction input is open. Use the current draft store at activation time rather than a captured draft string.
+- [ ] Handle multiline selections and Markdown delimiters correctly so selected code/quotes cannot corrupt the surrounding feedback format. Preserve complete quote text and reaction text.
+- [ ] Each activation appends exactly once. No model request, queued message, clipboard write, or separate review-note entry results. Repeated sequential reactions append in the user's action order.
+- [ ] On success, clear the reaction input, dismiss the bubble, and provide a quiet accessible acknowledgement such as “Added to draft.” Preserve transcript scroll/reading position; do not autofocus or scroll to the composer. The normal composer remains editable and its Send action remains the only submission step.
+- [ ] Do not silently lose a typed reaction or reattach it to another source when selection changes, a transcript row virtualizes, or a viewer opens. Pin the source snapshot for a non-empty reaction; replacing it requires adding or explicitly discarding that reaction first. Empty bubbles can dismiss when the selection clears. Explicit close discards the temporary reaction.
+- [ ] On route/conversation changes, never append an old reaction into the new conversation. Integrate dirty-reaction handling with existing navigation/focus conventions. If the destination becomes unavailable while composing, retain the reaction and explain why Add to draft is unavailable instead of reporting success.
+- [ ] Inline reactions do not clear or submit notes already collected in the existing file/message/diff reviewer.
+
+### 3. Mobile access and existing review workflows
+
+- [ ] Native text selection reveals the inline reaction input without intercepting scrolling or long-press selection. Selecting alone leaves the keyboard closed; tapping the input opens it. Touch targets are at least 44 by 44 CSS pixels.
+- [ ] Add a discoverable per-message touch action/menu entry, **Open message reviewer**, that opens the existing message review interface without requiring right-click. Keep its existing annotation and batch-to-draft behavior. Do not offer a meaningless pane/fullscreen choice on narrow screens.
+- [ ] Desktop Open in sidepanel/Open in fullscreen remain available. Native selected-text actions and the application's message actions must coexist; an explicit message action affordance may provide app actions when native selection owns the context menu.
+- [ ] Validate focus and Escape ordering so closing an inline reaction does not also close an unrelated viewer or navigate the conversation. Do not trap keyboard users; expose meaningful input/action names and announce successful append without excessive selection announcements.
+
+### 4. Realistic fixture and verification
+
+- [ ] Extend/add a deterministic full-conversation fixture using production transcript and composer components. Include a substantial assistant answer with several headings, long paragraphs, a list, inline code, a fenced code example, and a table, plus an older assistant message across a continuation boundary and a non-empty current draft. Avoid a separate imitation of the production interaction or no-op append callbacks.
+- [ ] Exercise two reactions to different passages, one older-message reaction, existing-draft preservation, editing the resulting draft, and no automatic submission. Verify source identity across historical segments, including repeated sequence numbers where applicable.
+- [ ] Cover selection changes during typing, dismissal, rapid/double activation, unavailable destination, conversation navigation, virtualization/re-render, and existing-reviewer notes remaining intact with focused tests at the owning boundaries.
+- [ ] Browser-verify the actual desktop selection-to-draft journey, multiline/code quoting, placement near viewport edges, no reading-position jump, and desktop native copy/context-menu behavior.
+- [ ] Validate real touch behavior on iOS Safari and the installed PWA when available: native menu/handles, scroll without false activation, keyboard opening only on input focus, keyboard viewport placement, append, and the new reviewer entry. Also check Android Chrome. Desktop device emulation or WebKit automation alone is not evidence of native mobile selection coexistence; record unavailable device checks explicitly and do not claim they passed.
+- [ ] Capture desktop/mobile fixture evidence, update spec executive verification coverage, run focused tests and the required `./dev.py check`, and review the final diff.
+
+## Suggested implementation sequence
+
+1. Read the selection/context-menu, aggregate-message identity, draft-store, focus-scope, and virtualized-transcript boundaries; extend the realistic fixture first.
+2. Implement a bounded selection/reaction lifecycle with a stable source snapshot and an explicit draft-append capability. Reuse the existing draft owner, not a second draft representation or the batch-note store.
+3. Wire desktop and mobile presentation, native-interaction coexistence, keyboard behavior, and the mobile message-review entry.
+4. Complete focused and real-browser/device acceptance, then update specifications/coverage and ship as one coherent feature.
+
+## Limits and risks
+
+This is a frontend selection-to-draft feature, not a new annotation persistence system. Do not add server APIs, database tables, cross-device pending reactions, refresh recovery for unfinished bubble text, permanent transcript highlights, threaded comments, or a redesign/removal of the existing reviewers. Once appended, text follows the existing draft's persistence contract.
+
+The main uncertainty is native mobile selection/menu positioning and focus behavior; qualify that early. The other material risks are stale source/draft ownership across continuations or navigation, virtualized rows disappearing while typing, and shared menu/focus handlers suppressing ordinary OS interactions. Resolve these at their owning boundaries rather than through global event suppression.
