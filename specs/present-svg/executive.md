@@ -25,10 +25,10 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 ### Automated qualification
 
 - `cargo test -p phoenix-tools present_svg`: validator and publication tests cover supported library output, hostile XML/CSS/URLs, reference cycles/expansion, geometry/complexity limits, file boundaries, cancellation, replay and bounded persistence errors.
-- `cargo test -p phoenix-db svg_artifact`: immutable snapshot, reopen after staging deletion, separate invocations, owner isolation, cascade deletion, rejected writes and transaction rollback.
+- `cargo test -p phoenix-db svg_artifact`: five tests cover immutable snapshots, reopen after staging deletion, actual workscope retirement after worktree-directory removal, separate invocations, owner isolation, cascade deletion, rejected writes and transaction rollback.
 - `cargo test -p phoenix_ide svg_artifact`: actual router authentication, ownership, accepted bytes and response headers for all three retrieval routes.
 - `uv run tests/e2e/run.py --scenario present_svg`: mock-provider turn dispatch generates a file with bash, publishes through the runtime, replaces/deletes staging, checks retrieval/ownership, and reloads persisted references through HTTP and SSE init.
-- `./dev.py check`: Rust/UI/codegen/spec/task/integration checks. The first broad run caught a test-helper temp-path lint (corrected) and a tmux watchdog cleanup timeout. The exact watchdog test passed alone; final Rust qualification is recorded in the task handoff.
+- `./dev.py check`: Rust/UI/codegen/spec/task/integration checks. The first broad run caught a test-helper temp-path lint (corrected) and a tmux watchdog cleanup timeout. The exact watchdog test passed alone, and the final full Rust lane passed along with codegen, TypeScript and UI lint (seven checks, 493.6s). Final spec/task/fmt checks also passed (five checks).
 - The shared dialog Escape regression and full Vitest lane pass: dismissal consumes the event before global conversation navigation sees it.
 
 ### Browser and live-agent evidence

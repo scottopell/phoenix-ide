@@ -115,19 +115,19 @@ Useful starting points already inspected:
 
 ## Acceptance criteria and verification
 
-- [ ] A real agent can generate a chart using code/a charting library, call `present_svg` with its resolved filename, and produce a visible inline card without pasting SVG into tool arguments.
-- [ ] A disk-usage horizontal bar chart shows exact GiB labels, keeps free space separate, and does not add nested breakdowns to their parent totals. This is an example/agent-guidance check, not a disk-specific tool feature.
-- [ ] At least one representative chart-library SVG and a hand-authored SVG render correctly, including supported internal references, labels, and styling.
-- [ ] Invalid/missing inputs, forbidden content, out-of-policy paths, and limit violations return actionable errors without publishing a successful artifact.
-- [ ] Security tests cover script/event handlers, embedded HTML, CSS/attribute external URLs, namespace variants, entity expansion, recursive references, extreme dimensions/complexity, and file-read boundary cases.
-- [ ] Browser tests show no injected script execution, application DOM access, navigation, or external resource requests from malicious SVG fixtures; test preview, expansion, direct artifact URL, and source view.
-- [ ] Preview/source/download are authorization-equivalent and cannot retrieve an unrelated conversation's artifact or arbitrary filesystem path beyond the caller's existing access authority.
-- [ ] Replacing or deleting the staging file after success does not change/break the artifact; reload, reconnect, runtime restart, and retained-conversation scope/worktree retirement preserve it.
-- [ ] Failure/cancellation between snapshot creation and association persistence does not report success or leave permanently unowned artifacts; replay does not duplicate a completed publication.
-- [ ] Card controls, description fallback, keyboard interaction, theme behavior, long titles, very wide/tall images, and narrow viewport layouts have automated coverage and actual browser verification.
-- [ ] Persisted older messages and clients without bespoke SVG support remain readable; Mermaid and SVG code-fence behavior are unchanged.
-- [ ] Tool descriptions document static-only policy, generation via code/libraries, temp staging lifetime, absolute paths, limits, and the distinction between validation and visual inspection.
-- [ ] Relevant Rust/UI/integration checks pass through the repository's supported workflow; document exact verification evidence and any environmental limitations.
+- [x] A real agent can generate a chart using code/a charting library, call `present_svg` with its resolved filename, and produce a visible inline card without pasting SVG into tool arguments.
+- [x] A disk-usage horizontal bar chart shows exact GiB labels, keeps free space separate, and does not add nested breakdowns to their parent totals. This is an example/agent-guidance check, not a disk-specific tool feature.
+- [x] At least one representative chart-library SVG and a hand-authored SVG render correctly, including supported internal references, labels, and styling.
+- [x] Invalid/missing inputs, forbidden content, out-of-policy paths, and limit violations return actionable errors without publishing a successful artifact.
+- [x] Security tests cover script/event handlers, embedded HTML, CSS/attribute external URLs, namespace variants, entity expansion, recursive references, extreme dimensions/complexity, and file-read boundary cases.
+- [x] Browser tests show no injected script execution, application DOM access, navigation, or external resource requests from malicious SVG fixtures; test preview, expansion, direct artifact URL, and source view.
+- [x] Preview/source/download are authorization-equivalent and cannot retrieve an unrelated conversation's artifact or arbitrary filesystem path beyond the caller's existing access authority.
+- [x] Replacing or deleting the staging file after success does not change/break the artifact; reload, reconnect, runtime restart, and retained-conversation scope/worktree retirement preserve it.
+- [x] Failure/cancellation between snapshot creation and association persistence does not report success or leave permanently unowned artifacts; replay does not duplicate a completed publication.
+- [x] Card controls, description fallback, keyboard interaction, theme behavior, long titles, very wide/tall images, and narrow viewport layouts have automated coverage and actual browser verification.
+- [x] Persisted older messages and clients without bespoke SVG support remain readable; Mermaid and SVG code-fence behavior are unchanged.
+- [x] Tool descriptions document static-only policy, generation via code/libraries, temp staging lifetime, absolute paths, limits, and the distinction between validation and visual inspection.
+- [x] Relevant Rust/UI/integration checks pass through the repository's supported workflow; document exact verification evidence and any environmental limitations.
 
 ## Explicit non-goals
 
@@ -137,3 +137,17 @@ Useful starting points already inspected:
 - A built-in chart grammar or Phoenix-owned disk-usage analyzer.
 - Automatically claiming visual correctness from parser success, or requiring every agent to visually inspect every chart.
 - A new global temp-directory/workscope lifecycle architecture or dedicated native SVG renderer.
+
+## Implementation and handoff
+
+Implemented on `codex/45018-present-svg` in dedicated worktree `phoenix-present-svg-45018`; PR [#793](https://github.com/scottopell/phoenix-ide/pull/793). Requirements and verification are recorded in `specs/present-svg/`; ADR-058 records the atomic SQLite snapshot decision.
+
+- Real GPT-5.5 agent generated hand-authored disk bars and a Matplotlib chart, called `present_svg`, then deleted both staging files. Actual browser cards, expansion/zoom, escaped source, downloads and reload passed. Accepted bytes remained identical across server restart.
+- Five database tests cover replay, immutable bytes, reopening, rollback, ownership and deletion, plus actual scope retirement after removing its owned worktree directory while retaining the transcript and artifact.
+- Tool/validator tests cover hostile content, numeric/reference/complexity boundaries, file types, cancellation and bounded failures. Actual router tests cover all three routes' authentication, owner matching and headers.
+- Runtime E2E publication passed, including source replacement/deletion and HTTP/SSE history reconstruction. `./dev.py qa svg-artifacts` passed 12 fixture journeys; hostile browser fixtures independently exercised serving/image boundaries with no app mutation or external requests.
+- Full UI tests passed, including a discovered shared-dialog Escape propagation regression. Native compatibility was checked through generic decoding/rendering code inspection, not an iOS device run.
+- First `./dev.py check`: 17/19 checks passed; corrected the SVG test-helper temp-path lint and passed its rerun. Existing tmux watchdog cleanup test timed out under suite load, then passed standalone. Final `./dev.py check --lanes rust,tsc,ui-lint` passed all seven checks (493.6s), including the entire Rust suite; final spec/task/fmt checks passed all five checks. No outstanding local check failures.
+- Local browser evidence is under ignored `ui/qa-artifacts/svg-artifacts/` and `ui/qa-artifacts/svg-artifacts-live/`; reproducible fixture scripts are committed.
+- Roadmap replacement [comment](https://github.com/scottopell/phoenix-ide/issues/651#issuecomment-5745147654) links the PR. Reducer run 35468168569 rejected projection because 19 workstreams exceeded the 12-entry display limit; no other owner's ordering was changed. Registration is submitted but not visible in the generated body.
+- Unrelated model/auth advertisement mismatch discovered during real-agent qualification is captured in task 45019. No production deployment.
