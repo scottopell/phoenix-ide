@@ -229,17 +229,6 @@ final class ConversationListStore {
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
         let aggregateIdentity = conversation.aggregateIdentity
-        if conversation.archived == true {
-            if isRefreshing {
-                upsertsDuringRefresh[aggregateIdentity] = nil
-                exclusionsDuringRefresh.insert(aggregateIdentity)
-            }
-            conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
-            transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateIdentity }
-            aggregateToCachedTranscript[aggregateIdentity] = nil
-            persistCache()
-            return
-        }
         if isRefreshing {
             exclusionsDuringRefresh.remove(aggregateIdentity)
             upsertsDuringRefresh[aggregateIdentity] = conversation

@@ -73,7 +73,9 @@ final class ConversationListStoreTests: XCTestCase {
             ],
             excluding: ["pc-removed"])
 
-        XCTAssertEqual(merged.map(\.aggregateIdentity), ["pc-active"])
+        XCTAssertEqual(
+            Set(merged.map(\.aggregateIdentity)),
+            ["pc-active", "pc-archived", "pc-pushed-archived"])
     }
 
     @MainActor
@@ -102,7 +104,7 @@ final class ConversationListStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testBackgroundExternalRefreshFiltersHistoryRows() throws {
+    func testBackgroundExternalRefreshPreservesHistoryRows() throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
         let store = ConversationListStore()
@@ -112,7 +114,9 @@ final class ConversationListStoreTests: XCTestCase {
             try conversation(id: "latest-open", aggregateId: "pc-open", title: "open"),
             try conversation(id: "latest-history", aggregateId: "pc-history", title: "history", archived: true),
         ], startedAt: token))
-        XCTAssertEqual(store.conversations.map(\.aggregateIdentity), ["pc-open"])
+        XCTAssertEqual(
+            Set(store.conversations.map(\.aggregateIdentity)),
+            ["pc-open", "pc-history"])
     }
 
     @MainActor
