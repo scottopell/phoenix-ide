@@ -1,4 +1,4 @@
-# ADR-058: Direct distribution uses protected signing and private draft publication
+# ADR-059: Direct distribution uses protected signing and private draft publication
 
 - **Status:** Proposed
 - **Date:** 2026-09-19

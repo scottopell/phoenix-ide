@@ -8,7 +8,8 @@ exactly is this running instance, where does it keep its data, and how much of
 the machine is it using right now?"
 
 **In scope:**
-- Build identity: version, git SHA, uptime, start time
+- Build identity: version, full embedded git SHA, uptime, start time; compact
+  presentation may abbreviate the SHA while title and accessibility text retain it
 - Authoritative runtime ownership from live socket-activation or authenticated
   bare-supervisor evidence
 - Network binding and TLS posture (mode, cert/key/CA paths, auto-mode hosts,
@@ -57,7 +58,7 @@ staying safe to open because ordinary inspection changes nothing.
 | Requirement | Status | Notes |
 |---|---|---|
 | **REQ-DEPLOY-001:** Reach "About this deployment" from settings | Implemented | `ui/src/components/SettingsDropdown.tsx` links to the route rendered by `ui/src/pages/AboutDeploymentPage.tsx`. The page is read-only apart from typed leftover-worktree cleanup actions. |
-| **REQ-DEPLOY-002:** Report build identity and uptime | Implemented | `crates/phoenix-ide/src/api/deployment.rs` builds `BuildInfo` from `env!("CARGO_PKG_VERSION")`, `env!("PHOENIX_GIT_SHA")`, and `crate::hot_restart::{started_at, uptime_secs}`. The UI renders version, git SHA, started time, and uptime. |
+| **REQ-DEPLOY-002:** Report build identity and uptime | Implemented | `crates/phoenix-ide/build.rs` embeds a full 40-character commit SHA for known modern builds; `crates/phoenix-ide/src/api/deployment.rs` exposes that complete value in `BuildInfo` with version and uptime facts. Compact UI surfaces render a 12-character prefix while retaining the complete identifier in title and accessibility text. |
 | **REQ-DEPLOY-002A:** Report authoritative runtime ownership | Implemented | `api::installation_ownership` classifies live launchd/systemd socket activation and authenticated bare-supervisor direct-child evidence into one typed snapshot. `/api/deployment` exposes it, and release-update backend eligibility derives from the same value; absent, conflicting, unreadable, development, and unsupported evidence remains explicit. |
 | **REQ-DEPLOY-002AA:** Expose optional launch-instance identity | Implemented | `crates/phoenix-ide/src/api/deployment.rs` threads the launcher-provided `PHOENIX_INSTANCE_ID` through `DeploymentInfo.instance_id` without synthesis, and `macos/Phoenix/Phoenix/Configuration.swift` decodes it as an optional typed field used by bundled-sidecar identity verification. Coverage: `ConfigurationTests.testDeploymentInfoDecodesOptionalInstanceID` verifies decoding and `ServerManagerHelpersTests.testBundledDeploymentMustMatchExactLaunchInstance` verifies acceptance/rejection against the exact launch UUID. |
 | **REQ-DEPLOY-002B:** Present deployment identity and browser access context | Implemented | The primary deployment summary presents running version/commit, proven ownership, and local-or-remote browser access as separate facts. Remote access retains diagnostics while explaining the host boundary before local-only actions. |

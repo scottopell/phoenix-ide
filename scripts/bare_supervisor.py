@@ -31,8 +31,9 @@ MAX_DIRECT_DIAGNOSTIC_BYTES = 64 * 1024
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
+SUPERVISOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class SupervisorError(RuntimeError):
@@ -298,9 +299,18 @@ def validate_health_url(value: str) -> None:
         raise SupervisorError("health endpoint has invalid port") from exc
 
 
-def validate_runtime_identity(identity: RuntimeIdentity) -> None:
-    if not VERSION_RE.fullmatch(identity.version) or not EMBEDDED_SHA_RE.fullmatch(identity.git_sha):
-        raise SupervisorError("runtime identity is malformed")
+def validate_candidate_identity(identity: RuntimeIdentity, source_commit: str) -> None:
+    if not VERSION_RE.fullmatch(identity.version) or not GIT_SHA_RE.fullmatch(identity.git_sha):
+        raise SupervisorError("candidate runtime identity is malformed")
+    if identity.git_sha != source_commit:
+        raise SupervisorError("source commit does not match expected identity")
+
+
+def validate_previous_identity(identity: RuntimeIdentity) -> None:
+    if not VERSION_RE.fullmatch(identity.version) or not (
+        LEGACY_GIT_SHA_RE.fullmatch(identity.git_sha) or GIT_SHA_RE.fullmatch(identity.git_sha)
+    ):
+        raise SupervisorError("previous runtime identity is malformed")
 
 
 def validate_artifact(transaction: Path, artifact: Artifact) -> Path:
@@ -385,9 +395,9 @@ class Supervisor:
         if self.child is not None and self.child_identity is not None and direct_child_matches(self.child, self.child_identity):
             child = dataclasses.asdict(self.child_identity)
             child["runtime"] = dataclasses.asdict(self.child_identity.runtime)
-            return {"protocol_version": PROTOCOL_VERSION, "supervisor_pid": os.getpid(), "child": child}
+            return {"protocol_version": PROTOCOL_VERSION, "supervisor_sha256": SUPERVISOR_SHA256, "supervisor_pid": os.getpid(), "child": child}
         self.child_identity = None
-        return {"protocol_version": PROTOCOL_VERSION, "supervisor_pid": os.getpid(), "child": None}
+        return {"protocol_version": PROTOCOL_VERSION, "supervisor_sha256": SUPERVISOR_SHA256, "supervisor_pid": os.getpid(), "child": None}
 
     def stop_child(self, timeout: float = 10) -> None:
         if self.child is not None and self.child.poll() is None:
@@ -519,12 +529,14 @@ class Supervisor:
         metadata = transaction.stat()
         if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o200:
             raise SupervisorError("transaction directory ownership or mode is unsafe")
-        validate_runtime_identity(manifest.expected)
+        if not GIT_SHA_RE.fullmatch(manifest.source_commit):
+            raise SupervisorError("source commit must be a full lowercase git SHA")
+        validate_candidate_identity(manifest.expected, manifest.source_commit)
         validate_health_url(manifest.expected_health_url)
-        if not GIT_SHA_RE.fullmatch(manifest.source_commit) or not manifest.source_commit.startswith(manifest.expected.git_sha):
-            raise SupervisorError("source commit does not match expected identity")
+        if manifest.previous_deployed_sha is not None and not GIT_SHA_RE.fullmatch(manifest.previous_deployed_sha):
+            raise SupervisorError("previous deployed SHA is malformed")
         if manifest.previous is not None:
-            validate_runtime_identity(manifest.previous)
+            validate_previous_identity(manifest.previous)
             if manifest.previous_health_url is None:
                 raise SupervisorError("previous runtime has no rollback endpoint")
             validate_health_url(manifest.previous_health_url)

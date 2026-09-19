@@ -92,7 +92,7 @@ class SystemdManifestValidationTests(unittest.TestCase):
             "source_commit": "b" * 40,
             "release_tag": None,
             "release_commit": None,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "expected": {"version": "2.0.0", "git_sha": "b" * 40},
             "previous": None,
             "expected_health_url": "http://127.0.0.1:49152/api/version",
             "previous_health_url": None,
@@ -117,6 +117,30 @@ class SystemdManifestValidationTests(unittest.TestCase):
 
     def test_accepts_root_owned_policy_bound_transaction(self):
         self.validate()
+
+    def test_candidate_identity_requires_full_source_commit_equality(self):
+        for git_sha in ("b" * 12, "c" * 40, "B" * 40):
+            with self.subTest(git_sha=git_sha):
+                self.raw["expected"]["git_sha"] = git_sha
+                self.write_manifest()
+                with self.assertRaisesRegex(helper.ValidationError, "candidate identity"):
+                    self.validate()
+
+    def test_previous_identity_accepts_legacy_or_full_sha(self):
+        self.raw["previous_health_url"] = "http://127.0.0.1:49151/api/version"
+        for git_sha in ("a" * 12, "a" * 40):
+            with self.subTest(git_sha=git_sha):
+                helper.validate_previous_identity(helper.Identity("1.0.0", git_sha))
+        for git_sha in ("a" * 11, "a" * 13, "A" * 40):
+            with self.subTest(git_sha=git_sha):
+                with self.assertRaisesRegex(helper.ValidationError, "previous identity"):
+                    helper.validate_previous_identity(helper.Identity("1.0.0", git_sha))
+
+    def test_previous_deployed_sha_remains_full_length(self):
+        self.raw["previous_deployed_sha"] = "a" * 12
+        self.write_manifest()
+        with self.assertRaisesRegex(helper.ValidationError, "previous deployed SHA"):
+            self.validate()
 
     def test_rejects_protocol_mismatch(self):
         self.raw["manifest_version"] = 99

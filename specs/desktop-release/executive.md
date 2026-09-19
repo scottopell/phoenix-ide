@@ -17,7 +17,7 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 
 ## Proposed protected configuration
 
-ADR-058 is Proposed. Its reuse of the Paperclip-proven TeamIdentifier/API-key mechanics and its Phoenix-specific private-draft publication choice require normative review before release activation.
+ADR-059 is Proposed. Its reuse of the Paperclip-proven TeamIdentifier/API-key mechanics and its Phoenix-specific private-draft publication choice require normative review before release activation.
 
 The proposed `macos-release-signing` GitHub Environment configuration is:
 

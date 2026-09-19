@@ -156,16 +156,12 @@ read -r embedded_version embedded_commit < <("$PYTHON3" -c 'import json,sys; d=j
   echo "error: sidecar version v$embedded_version does not match release $tag" >&2
   exit 1
 }
-[[ "$embedded_commit" =~ ^[0-9a-f]{12}$ ]] || {
-  echo "error: sidecar must expose a clean 12-character Git identity" >&2
+[[ "$embedded_commit" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: sidecar must expose a clean full lowercase Git SHA" >&2
   exit 1
 }
-resolved_embedded_commit=$($GIT -C "$repo_root" rev-parse "${embedded_commit}^{commit}" 2>/dev/null) || {
-  echo "error: sidecar Git identity does not resolve in the release checkout" >&2
-  exit 1
-}
-[[ "$resolved_embedded_commit" == "$expected_commit" ]] || {
-  echo "error: sidecar Git identity does not resolve to the release commit" >&2
+[[ "$embedded_commit" == "$expected_commit" ]] || {
+  echo "error: sidecar Git identity does not match the release commit" >&2
   exit 1
 }
 [[ "$(info_plist_string "$info_plist" CFBundleShortVersionString)" == "$release_version" ]] || {

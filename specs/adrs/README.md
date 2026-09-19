@@ -70,6 +70,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
+| [060](060_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 
 ## For agents: which decisions bind your task
 
@@ -106,6 +108,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
+| Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-059 (non-binding), then 034, 018, and 017 |
 | Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-058 (non-binding), then 034, 018, and 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
@@ -139,6 +142,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
+      │   │       └── ADR-059 [Proposed] (direct distribution uses protected signing and private draft publication)
+      │   │   └── ADR-060 (Modern build identity is full-length and legacy rollback is role-bound)
       │   │       └── ADR-058 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)

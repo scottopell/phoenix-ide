@@ -14,7 +14,7 @@ dummy_sidecar="$tmpdir/phoenix_ide"
 cat > "$dummy_sidecar" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "--build-identity" ]; then
-  printf '%s\n' '{"version":"0.11.2","git_sha":"0123456789abcdef0123456789abcdef01234567"}'
+  printf '{"version":"0.11.2","git_sha":"%s"}\n' "${FAKE_EMBEDDED_SHA:-0123456789abcdef0123456789abcdef01234567}"
   exit 0
 fi
 exit 0
@@ -98,6 +98,22 @@ unset PHOENIX_EXPECTED_BUILD_IDENTITY
 
 CONFIGURATION_OVERRIDE=Debug
 
+# modern build identities require the complete commit rather than its historical prefix
+export FAKE_EMBEDDED_SHA=0123456789ab
+if PHOENIX_SIDECAR_PATH="$dummy_sidecar" run_script >/dev/null 2>"$tmpdir/short-identity.err"; then
+  echo 'error: expected 12-character Phoenix build identity to be rejected' >&2
+  exit 1
+fi
+/usr/bin/grep 'invalid Phoenix build identity' "$tmpdir/short-identity.err" >/dev/null
+unset FAKE_EMBEDDED_SHA
+
+# dirty full SHAs and unknown remain valid generic sidecar identities
+for allowed_identity in 0123456789abcdef0123456789abcdef01234567-dirty unknown; do
+  export FAKE_EMBEDDED_SHA="$allowed_identity"
+  PHOENIX_SIDECAR_PATH="$dummy_sidecar" run_script >/dev/null
+  unset FAKE_EMBEDDED_SHA
+done
+
 # non-Phoenix executable is rejected before packaging succeeds
 non_phoenix="$tmpdir/not-phoenix"
 printf '#!/bin/sh\nexit 0\n' > "$non_phoenix"
@@ -141,5 +157,10 @@ fi
 /usr/bin/grep 'validate_packaged_sidecar "\$destination" "\$ARCHS" "\$expected_signing"' "$script" >/dev/null
 /usr/bin/grep 'codesign --verify --strict' "$script" >/dev/null
 /usr/bin/grep 'packaged sidecar is not signed with expected identity' "$script" >/dev/null
+/usr/bin/grep 'rev-parse HEAD' "$script" >/dev/null
+if /usr/bin/grep -F -- 'rev-parse --short' "$script" >/dev/null; then
+  echo 'error: sidecar identity derivation must not abbreviate the Git SHA' >&2
+  exit 1
+fi
 
 echo 'package-sidecar.sh regression checks passed'

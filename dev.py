@@ -8242,8 +8242,6 @@ def _start_bare_supervisor(
     layout: dict[str, Path],
     protocol: str,
     selected_source: Path,
-    *,
-    reuse_compatible: bool = False,
 ) -> None:
     if layout["socket"].exists():
         running = subprocess.run(
@@ -8253,17 +8251,17 @@ def _start_bare_supervisor(
         )
         if running.returncode == 0:
             try:
-                running_protocol = str(json.loads(running.stdout)["protocol_version"])
+                running_status = json.loads(running.stdout)
+                running_protocol = str(running_status["protocol_version"])
+                running_digest = str(running_status["supervisor_sha256"])
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise SystemExit("running bare supervisor did not report its protocol version") from exc
+                raise SystemExit("running bare supervisor did not report its protocol and source identity") from exc
             if running_protocol != protocol:
                 raise SystemExit(
                     "running bare supervisor uses an incompatible protocol; stop it from an external shell "
                     "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
                 )
-            if reuse_compatible:
-                return
-            if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
+            if running_digest == _file_sha256(selected_source):
                 return
             raise SystemExit(
                 "running bare supervisor differs from the selected deployment source; production was left running. "
@@ -8377,10 +8375,10 @@ def _prepare_installed_candidate(layout: dict[str, Path]) -> "PreparedCandidate"
     source_commit = layout["deployed_sha"].read_text().strip()
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise SystemExit("installed bare production has a malformed source commit; run './dev.py prod deploy' first")
-    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+    if re.fullmatch(r"[0-9a-f]{40}", identity.git_sha) is None or identity.git_sha != source_commit:
         raise SystemExit(
-            f"installed binary identity {identity.git_sha} does not match recorded commit "
-            f"{source_commit[:12]}; run './dev.py prod deploy' first"
+            f"installed binary identity {identity.git_sha} does not exactly match recorded commit "
+            f"{source_commit}; run './dev.py prod deploy' first"
         )
     return PreparedCandidate(
         binary=binary,
@@ -8499,12 +8497,7 @@ def prod_daemon_deploy(
         if protocol != "1":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
-        _start_bare_supervisor(
-            layout,
-            protocol,
-            supervisor_source,
-            reuse_compatible=controller.enabled,
-        )
+        _start_bare_supervisor(layout, protocol, supervisor_source)
         _configure_bare_reboot_persistence(layout)
         previous_running = _bare_child_running(layout)
         _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
@@ -9130,7 +9123,7 @@ def _rollback_identity_matches(
     rollback_identity = RuntimeIdentity.from_value(rollback_identity)
     previous_identity = RuntimeIdentity.from_value(previous_identity)
     rollback_sha = rollback_identity.git_sha
-    if re.fullmatch(r"[0-9a-f]{12}", rollback_sha) is None:
+    if re.fullmatch(r"(?:[0-9a-f]{12}|[0-9a-f]{40})", rollback_sha) is None:
         return False
     if previous_health_json:
         return rollback_identity == previous_identity
@@ -9354,9 +9347,9 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             "installed launchd runtime has a malformed source commit; "
             "run './dev.py prod deploy' first"
         )
-    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+    if re.fullmatch(r"[0-9a-f]{40}", identity.git_sha) is None or identity.git_sha != source_commit:
         raise SystemExit(
-            "installed launchd runtime identity does not match its recorded source commit; "
+            "installed launchd runtime identity does not exactly match its recorded source commit; "
             "run './dev.py prod deploy' first"
         )
     health_url, health_insecure_tls = _launchd_health_probe(env)
@@ -9536,11 +9529,11 @@ def _prepare_release_candidate(
         )
     if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
-    if not re.fullmatch(r"[0-9a-f]{12}", identity.git_sha):
+    if not re.fullmatch(r"[0-9a-f]{40}", identity.git_sha):
         raise SystemExit(
-            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 lowercase hex characters"
+            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 40 lowercase hex characters"
         )
-    if not release_commit.startswith(identity.git_sha):
+    if release_commit != identity.git_sha:
         raise SystemExit(
             f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
         )
@@ -9560,9 +9553,11 @@ def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout.strip()
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
-    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise SystemExit("selected HEAD is not a full lowercase git SHA")
+    if re.fullmatch(r"[0-9a-f]{40}", identity.git_sha) is None or identity.git_sha != source_commit:
         raise SystemExit(
-            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit[:12]}"
+            f"local candidate identity {identity.git_sha} does not exactly match selected HEAD {source_commit}"
         )
     return PreparedCandidate(
         binary=binary,

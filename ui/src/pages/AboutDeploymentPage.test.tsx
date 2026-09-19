@@ -499,7 +499,9 @@ describe('AboutDeploymentPage disk usage health', () => {
   });
 
   it('presents running identity, ownership, and remote access as separate primary facts', async () => {
+    const fullGitSha = '0123456789abcdef0123456789abcdef01234567-dirty';
     renderPage(deployment({
+      build: { ...deployment().build, git_sha: fullGitSha },
       installation_ownership: {
         kind: 'ambiguous',
         reason: 'supervisor status probe timed out',
@@ -508,7 +510,10 @@ describe('AboutDeploymentPage disk usage health', () => {
     }));
 
     const summary = await screen.findByRole('region', { name: 'Version 0.1.0' });
-    expect(within(summary).getByLabelText('Running git commit abc123')).toHaveAttribute('title', 'abc123');
+    const commit = within(summary).getByLabelText(`Running git commit ${fullGitSha}`);
+    expect(commit).toHaveAttribute('title', fullGitSha);
+    expect(commit).toHaveTextContent('0123456789ab-dirty');
+    expect(commit).not.toHaveTextContent(fullGitSha);
     expect(within(summary).getByText('Runtime manager is ambiguous')).toBeInTheDocument();
     expect(within(summary).getByText('supervisor status probe timed out')).toBeInTheDocument();
     expect(within(summary).getByText('Viewing remotely')).toBeInTheDocument();
@@ -530,10 +535,14 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.queryByText('No log output configured.')).not.toBeInTheDocument();
   });
 
-  it('refreshes the single deployment summary when updates report a different running identity', async () => {
-    const initial = deployment();
+  it('compares the full running identity when visible commit prefixes match', async () => {
+    const initialGitSha = '0123456789ab1111111111111111111111111111';
+    const restartedGitSha = '0123456789ab2222222222222222222222222222';
+    const initial = deployment({
+      build: { ...deployment().build, git_sha: initialGitSha },
+    });
     const restarted = deployment({
-      build: { ...initial.build, version: '1.1.0', git_sha: 'def456' },
+      build: { ...initial.build, git_sha: restartedGitSha },
     });
     const update = deferredReleaseSnapshot();
     apiMock.deploymentInfo
@@ -544,8 +553,8 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.releaseUpdateSnapshot.mockReturnValueOnce(update.promise);
     const updateSnapshot: ReleaseUpdateSnapshot = {
       installation_ownership: { kind: 'development' },
-      current_version: '1.1.0',
-      current_git_sha: 'def456',
+      current_version: initial.build.version,
+      current_git_sha: restartedGitSha,
       preview: { kind: 'unavailable', reason: 'not checked' },
       transaction: { kind: 'none' },
       authority: { kind: 'not_production' },
@@ -557,10 +566,11 @@ describe('AboutDeploymentPage disk usage health', () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('Version 0.1.0')).toBeInTheDocument();
+    const initialCommit = await screen.findByLabelText(`Running git commit ${initialGitSha}`);
+    expect(initialCommit).toHaveTextContent('0123456789ab');
     await act(async () => { update.resolve(updateSnapshot); });
-    expect(await screen.findByText('Version 1.1.0')).toBeInTheDocument();
-    expect(screen.getByLabelText('Running git commit def456')).toBeInTheDocument();
+    const restartedCommit = await screen.findByLabelText(`Running git commit ${restartedGitSha}`);
+    expect(restartedCommit).toHaveTextContent('0123456789ab');
     expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
   });
 

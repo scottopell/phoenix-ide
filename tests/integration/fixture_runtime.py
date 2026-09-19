@@ -13,7 +13,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 DEFAULT_VERSION = "2.0.0"
-DEFAULT_GIT_SHA = "bbbbbbbbbbbb"
+DEFAULT_GIT_SHA = "b" * 40
 
 
 class Handler(BaseHTTPRequestHandler):

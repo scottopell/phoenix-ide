@@ -118,4 +118,23 @@ for identity_path in [
 if 'PHOENIX_EXPECTED_BUILD_IDENTITY="$expected_build_identity"' not in package_script:
     raise SystemExit('desktop packaging must pass the complete helper identity into app assembly')
 
+for forbidden in ['rev-parse --short', r'^[0-9a-f]{12}$', '${embedded_commit}^{commit}']:
+    if forbidden in package_script:
+        raise SystemExit(f'desktop packaging must not accept or resolve abbreviated Git identity: {forbidden}')
+if '[[ "$embedded_commit" == "$expected_commit" ]]' not in package_script:
+    raise SystemExit('desktop packaging must compare the complete embedded and expected commits')
+
+build_script = Path('crates/phoenix-ide/build.rs').read_text()
+if 'git(&["rev-parse", "HEAD"])' not in build_script or '--short' in build_script:
+    raise SystemExit('Rust build identity producer must derive the full Git commit')
+
+sidecar_script = Path('macos/Phoenix/scripts/package-sidecar.sh').read_text()
+if 'rev-parse HEAD' not in sidecar_script or 'rev-parse --short' in sidecar_script:
+    raise SystemExit('generic sidecar packaging must derive the full Git commit')
+if '[0-9a-f]{40}(-dirty)?' not in sidecar_script:
+    raise SystemExit('generic sidecar validation must require a full Git commit')
+
+if '"$version" "$full_commit"' not in macos_workflow or 'short_commit' in macos_workflow:
+    raise SystemExit('real unsigned macOS workflow fixture must embed the full Git commit')
+
 print('desktop release workflow regression checks passed')
