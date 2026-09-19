@@ -8287,7 +8287,12 @@ mod scope_liveness_tests {
         };
 
         manager
-            .retry_close_retirement(attempt_id.clone())
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        manager
+            .inspect_close_retirement(attempt_id.clone())
             .await
             .unwrap_err();
         let ambient_evidence: (String, String) = sqlx::query_as(
