@@ -127,6 +127,7 @@ const makeQa = (
 
 const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   root_conv_id: ROOT_ID,
+  product_conversation_id: 'pc-chain',
   chain_name: 'auth refactor',
   display_name: 'auth refactor',
   archived: false,
@@ -537,7 +538,7 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
   it('Enter commits via setChainName; Esc cancels without an API call', async () => {
     const { api } = await import('../api');
     const initial = makeChain({ chain_name: 'old-name', display_name: 'old-name' });
-    const renamed = makeChain({ chain_name: 'new-name', display_name: 'new-name' });
+    const renamed = makeChain({ chain_name: null, display_name: 'new-name' });
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
     (api.setChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(renamed);
 
@@ -578,26 +579,62 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
     });
   });
 
-  it('clearing the input commits null (clear override)', async () => {
+  it('keeps the editor open and surfaces a lifecycle-race rename failure', async () => {
     const { api } = await import('../api');
-    const initial = makeChain({ chain_name: 'old', display_name: 'old' });
-    const cleared = makeChain({ chain_name: null, display_name: 'fallback-title' });
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+    (api.setChainName as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('ProductConversation is read-only in History'),
+    );
+
+    renderAt(ROOT_ID);
+    await screen.findByRole('button', { name: /old-name/ });
+    fireEvent.click(screen.getByRole('button', { name: /old-name/ }));
+    const input = screen.getByRole('textbox', { name: 'Chain name' });
+    fireEvent.change(input, { target: { value: 'new-name' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('ProductConversation is read-only in History');
+    expect(screen.getByRole('textbox', { name: 'Chain name' })).toHaveValue('new-name');
+  });
+
+  it('restores the authoritative title when a blank edit is committed', async () => {
+    const { api } = await import('../api');
+    const initial = makeChain({ chain_name: null, display_name: 'authoritative-title' });
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
-    (api.setChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(cleared);
+    (api.setChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
 
     renderAt(ROOT_ID);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /old/ })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
     });
-    fireEvent.click(screen.getByRole('button', { name: /old/ }));
+    fireEvent.click(screen.getByRole('button', { name: /authoritative-title/ }));
     const input = screen.getByRole('textbox', { name: 'Chain name' });
+    expect(input).toHaveValue('authoritative-title');
     fireEvent.change(input, { target: { value: '   ' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    await waitFor(() => {
-      expect(api.setChainName).toHaveBeenCalledWith(ROOT_ID, null);
-    });
+    expect(api.setChainName).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — History naming controls', () => {
+  it('hides rename and regeneration controls', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(makeChain({
+      archived: true,
+      chain_name: null,
+      display_name: 'History Chain',
+    }));
+
+    renderAt(ROOT_ID);
+
+    expect(await screen.findByText('History Chain')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /History Chain/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Regenerate name from chain content' })).toBeNull();
   });
 });
 
@@ -606,7 +643,7 @@ describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
     const { api } = await import('../api');
     const initial = makeChain({ chain_name: 'old-name', display_name: 'old-name' });
     const regenerated = makeChain({
-      chain_name: 'fresh-name',
+      chain_name: null,
       display_name: 'fresh-name',
     });
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);

@@ -16,7 +16,7 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
-import { notifyCloseSnapshotChanged } from '../notifications';
+import { notifyCloseSnapshotChanged, notifyProductConversationSnapshotChanged } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -267,6 +267,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
 function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   return {
     root_conv_id: 'root-chain',
+    product_conversation_id: 'pc-1',
     chain_name: null,
     display_name: 'Product Alpha',
     archived: false,
@@ -419,6 +420,38 @@ describe('ProductConversationPage', () => {
     await Promise.resolve();
     expect(screen.queryByRole('heading', { name: 'Stale Alpha' })).not.toBeInTheDocument();
     expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes the active title from the aggregate snapshot invalidation authority', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Renamed Product', presentation_mode: 'idle' },
+      }));
+    renderPage();
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Renamed Product' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes an alias route from canonical aggregate invalidation', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('starts a new measured open when revisiting a previously loaded product route', async () => {

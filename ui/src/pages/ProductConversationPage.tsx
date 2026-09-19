@@ -25,7 +25,7 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { subscribeCloseSnapshotChanged } from '../notifications';
+import { subscribeCloseSnapshotChanged, subscribeProductConversationSnapshotChanged } from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
@@ -352,6 +352,7 @@ function countSnapshotMessages(snapshot: ProductConversationSnapshotView): numbe
 function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
   return {
     root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
+    product_conversation_id: snapshot.product_conversation_id,
     chain_name: null,
     display_name: snapshot.presentation.display_name,
     archived: snapshot.ordinary_lifecycle === 'history',
@@ -843,6 +844,18 @@ function ProductConversationPageInner() {
       cancelled = true;
     };
   }, [productConversationId, snapshotRetry]);
+
+  useEffect(() => {
+    const identities = new Set([
+      productConversationId,
+      snapshot?.product_conversation_id,
+    ].filter((identity): identity is string => Boolean(identity)));
+    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    const unsubscribes = [...identities].map((identity) => (
+      subscribeProductConversationSnapshotChanged(identity, refresh)
+    ));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot?.product_conversation_id]);
 
   useEffect(() => {
     const notificationIds = new Set([

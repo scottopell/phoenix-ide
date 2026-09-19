@@ -6,7 +6,7 @@
 // open should close the menu WITHOUT triggering navigation.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactNode } from 'react';
 
@@ -20,7 +20,7 @@ vi.mock('react-router-dom', async () => {
   };
 });
 
-import { useGlobalKeyboardShortcuts } from './useKeyboardNav';
+import { useGlobalKeyboardShortcuts, useKeyboardNav } from './useKeyboardNav';
 
 function wrapper({ children }: { children: ReactNode }) {
   return <MemoryRouter initialEntries={['/c/test-conversation']}>{children}</MemoryRouter>;
@@ -66,5 +66,28 @@ describe('SIDE-03: global keyboard shortcut ownership', () => {
     expect(dispatchSpy.mock.calls.some(([event]) => event.type === 'toggle-shortcut-help')).toBe(false);
     dialog.remove();
     dispatchSpy.mockRestore();
+  });
+});
+
+
+describe('list keyboard navigation ownership', () => {
+  it('does not intercept Enter from a focused button after selecting a row', () => {
+    const onSelect = vi.fn();
+    renderHook(() => useKeyboardNav({
+      items: [{ id: 'row-1', slug: 'row-1' }],
+      onSelect,
+    }), { wrapper });
+    const button = document.createElement('button');
+    const onClick = vi.fn();
+    button.addEventListener('click', onClick);
+    document.body.appendChild(button);
+
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    fireEvent.keyDown(button, { key: 'Enter' });
+    fireEvent.click(button);
+
+    expect(onClick).toHaveBeenCalledOnce();
+    expect(onSelect).not.toHaveBeenCalled();
+    button.remove();
   });
 });

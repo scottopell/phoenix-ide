@@ -45,7 +45,11 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
-import { notifyArchiveCloseConflict } from '../notifications';
+import {
+  notifyArchiveCloseConflict,
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
+} from '../notifications';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
@@ -416,11 +420,12 @@ export function ChainPage() {
           try {
             const updated = await api.setChainName(rootConvId, name);
             dispatch({ type: 'LOAD_OK', view: updated });
+            notifyProductConversationListMayHaveChanged();
+            notifyProductConversationSnapshotChanged(updated.product_conversation_id);
           } catch (err) {
-            dispatch({
-              type: 'LOAD_FAIL',
-              error: err instanceof Error ? err.message : 'Failed to rename chain',
-            });
+            const message = err instanceof Error ? err.message : 'Failed to rename chain';
+            dispatch({ type: 'LOAD_FAIL', error: message });
+            throw err;
           }
         }}
         onRegenerate={async () => {
@@ -434,6 +439,8 @@ export function ChainPage() {
           try {
             const updated = await api.regenerateChainName(rootConvId);
             dispatch({ type: 'LOAD_OK', view: updated });
+            notifyProductConversationListMayHaveChanged();
+            notifyProductConversationSnapshotChanged(updated.product_conversation_id);
           } catch (err) {
             showError(
               err instanceof Error ? err.message : 'Failed to regenerate name',
@@ -623,10 +630,8 @@ function ChainPageHeader({
   onAutoEditConsumed,
 }: ChainPageHeaderProps) {
   const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
-  // The text input is pre-populated with the actual override (`chain_name`),
-  // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
-  // means "clear the override and fall back to title."
-  const [value, setValue] = useScopedState(chain.root_conv_id, chain.chain_name ?? '');
+  const [value, setValue] = useScopedState(chain.root_conv_id, chain.display_name);
+  const [renameError, setRenameError] = useScopedState<string | null>(chain.root_conv_id, null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Manual name regeneration (REQ-CHN-010). In-flight disables the button and
@@ -644,11 +649,9 @@ function ChainPageHeader({
     }
   };
 
-  // Keep the local value in sync if the prop changes while we're not editing
-  // (e.g., after a successful PATCH refresh).
   useEffect(() => {
-    if (!editing) setValue(chain.chain_name ?? '');
-  }, [chain.chain_name, editing, setValue]);
+    if (!editing) setValue(chain.display_name);
+  }, [chain.display_name, editing, setValue]);
 
   useEffect(() => {
     if (editing) {
@@ -668,19 +671,22 @@ function ChainPageHeader({
 
   const commit = async () => {
     const trimmed = value.trim();
-    // Mirror the server's null-on-empty rule client-side so we don't round-trip
-    // an empty string just to have it normalized on the other end.
-    const next: string | null = trimmed.length === 0 ? null : trimmed;
-    if (next === (chain.chain_name ?? null)) {
+    if (!trimmed || trimmed === chain.display_name) {
+      setValue(chain.display_name);
       setEditing(false);
       return;
     }
-    await onRename(next);
-    setEditing(false);
+    try {
+      await onRename(trimmed);
+      setRenameError(null);
+      setEditing(false);
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : 'Failed to rename chain');
+    }
   };
 
   const cancel = () => {
-    setValue(chain.chain_name ?? '');
+    setValue(chain.display_name);
     setEditing(false);
   };
 
@@ -696,18 +702,23 @@ function ChainPageHeader({
 
   return (
     <header className="chain-page-header">
-      {editing ? (
-        <input
-          ref={inputRef}
-          className="chain-page-name-input"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onBlur={() => void commit()}
-          onKeyDown={onKeyDown}
-          aria-label="Chain name"
-          placeholder="Name this chain…"
-          maxLength={200}
-        />
+      {editing && !chain.archived ? (
+        <>
+          <input
+            ref={inputRef}
+            className="chain-page-name-input"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={() => void commit()}
+            onKeyDown={onKeyDown}
+            aria-label="Chain name"
+            placeholder="Name this chain…"
+            maxLength={200}
+          />
+          {renameError && <span className="chain-page-name-error" role="alert">{renameError}</span>}
+        </>
+      ) : chain.archived ? (
+        <span className="chain-page-name">{chain.display_name}</span>
       ) : (
         <button
           type="button"
@@ -718,14 +729,14 @@ function ChainPageHeader({
           {chain.display_name}
         </button>
       )}
-      <button
+      {!chain.archived && <button
         type="button"
         className="chain-page-regenerate"
         onClick={() => void regenerate()}
         // Disabled while the name editor is open: otherwise clicking this would
         // blur-commit the typed draft (PATCH /name) and fire POST
-        // /regenerate-name concurrently — both write chain_name, last-writer
-        // wins. Editing must be committed/cancelled before regenerating.
+        // /regenerate-name concurrently — both write the aggregate title and
+        // last-writer wins. Editing must be committed/cancelled first.
         disabled={regenerating || editing}
         title="Regenerate the chain name from its conversations"
         aria-label="Regenerate name from chain content"
@@ -737,7 +748,7 @@ function ChainPageHeader({
           <Sparkles size={14} />
         )}
         <span>{regenerating ? 'Regenerating…' : 'Regenerate'}</span>
-      </button>
+      </button>}
       <span className="chain-page-meta">
         {chain.current_member_count}{' '}
         {chain.current_member_count === 1 ? 'conversation' : 'conversations'}

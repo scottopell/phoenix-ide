@@ -277,6 +277,10 @@ struct PhoenixAPI: Sendable {
         return response.product_conversations.map(productConversationListRowToConversation)
     }
 
+    func getProductConversation(reference: String) async throws -> ProductConversationSnapshot {
+        try await get("api/product-conversations/\(reference)", as: ProductConversationSnapshot.self)
+    }
+
     func listProductConversations() async throws -> ProductConversationListResponse {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
     }
@@ -309,6 +313,10 @@ struct PhoenixAPI: Sendable {
     }
 
     func productConversationListRowToConversation(_ row: ProductConversationListRow) -> Conversation {
+        let closeAction: ProductConversationCloseAction? = switch row.lifecycle {
+        case .open(let closeAction): closeAction
+        case .history: nil
+        }
         let (presentationMode, requiresAction): (String?, Bool?) = switch row.presentation {
         case .needsAction:
             ("needs_action", true)
@@ -319,6 +327,9 @@ struct PhoenixAPI: Sendable {
         return Conversation(
             id: row.latest_transcript_row_id,
             product_conversation_id: row.product_conversation_id,
+            chain_root_id: row.canonical_root.transcript_row_id == row.latest_transcript_row_id
+                ? nil
+                : row.canonical_root.transcript_row_id,
             slug: row.canonical_root.slug,
             title: row.canonical_root.title,
             model: nil,
@@ -330,7 +341,8 @@ struct PhoenixAPI: Sendable {
             state_updated_at: nil,
             branch_name: nil,
             task_title: nil,
-            archived: row.ordinary_lifecycle == .history,
+            archived: row.lifecycle == .history,
+            product_close_action: closeAction,
             project_name: nil,
             conv_mode_label: nil,
             presentation_mode: presentationMode,
@@ -381,6 +393,29 @@ struct PhoenixAPI: Sendable {
     func cancel(conversationId: String) async throws -> CancelResponse {
         try await post(
             "api/conversations/\(conversationId)/cancel", body: [:], as: CancelResponse.self)
+    }
+
+    func closeProductConversation(reference: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
+    }
+
+    func deleteConversation(reference: String, chainRootId: String?) async throws {
+        let path = if let chainRootId {
+            "api/chains/\(chainRootId)"
+        } else {
+            "api/conversations/\(reference)"
+        }
+        var request = try request(path: path)
+        if chainRootId == nil {
+            struct OkResponse: Codable { var ok: Bool? }
+            _ = try await post("api/conversations/\(reference)/delete", body: [:], as: OkResponse.self)
+            return
+        }
+        request.httpMethod = "DELETE"
+        let (data, response) = try await session.data(for: request)
+        try validateStatus(response, data: data)
     }
 
     func archive(conversationId: String) async throws {
@@ -451,6 +486,17 @@ struct PhoenixAPI: Sendable {
     func ensureCoordinator() async throws -> Conversation {
         try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
             .conversation
+    }
+
+    private func validateStatus(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport(underlying: URLError(.badServerResponse))
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(
+                status: http.statusCode,
+                body: String(data: data, encoding: .utf8) ?? "")
+        }
     }
 
     func validateCwd(path: String) async throws -> ValidateCwdResponse {

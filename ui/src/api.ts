@@ -80,10 +80,13 @@ export type { ResourceSample } from './generated/ResourceSample';
 export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
+export type { ProductConversationCloseActionView } from './generated/ProductConversationCloseActionView';
+export type { ProductConversationCloseUnavailableReasonView } from './generated/ProductConversationCloseUnavailableReasonView';
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
+import type { ProductConversationListRow as ProductConversationListRowType } from './generated/ProductConversationListRow';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
@@ -1702,8 +1705,10 @@ export const api = {
     return resp.json();
   },
 
-  async listProductConversations(): Promise<ProductConversationListResponseType> {
-    const resp = await fetch('/api/product-conversations');
+  async listProductConversations(signal?: AbortSignal): Promise<ProductConversationListResponseType> {
+    const resp = signal
+      ? await fetch('/api/product-conversations', { signal })
+      : await fetch('/api/product-conversations');
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversations');
     }
@@ -2114,6 +2119,33 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json();
       throw new Error(err.error || 'Failed to rename');
+    }
+    return resp.json();
+  },
+
+  async closeProductConversation(reference: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/close`, {
+      method: 'POST',
+    });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
+    if (!resp.ok) throw new Error('Failed to close product conversation');
+  },
+
+  async renameProductConversation(reference: string, title: string): Promise<ProductConversationListRowType> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/title`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409 && typeof err.error_type === 'string') {
+        throw new ConflictError(err as ConflictErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to rename product conversation');
     }
     return resp.json();
   },
@@ -2638,6 +2670,10 @@ export const api = {
       body: JSON.stringify({ name }),
     });
     if (resp.status === 404) throw new Error('Chain not found');
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to set chain name');

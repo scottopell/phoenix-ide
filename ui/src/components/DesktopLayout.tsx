@@ -34,6 +34,7 @@ import {
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
   registerCoordinatorForNotifications,
+  subscribeProductConversationListRevision,
   useNotificationClickNavigationBridge,
   setActiveNotificationConversationSlug,
 } from '../notifications';
@@ -142,12 +143,41 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
 
   useEffect(() => {
     let cancelled = false;
-    const refresh = () => api.listProductConversations()
-      .then((response) => { if (!cancelled) setProductConversations(response.product_conversations); })
-      .catch(() => {});
+    let inFlight: Promise<void> | null = null;
+    let refreshPending = false;
+    let controller: AbortController | null = null;
+    const refresh = () => {
+      if (inFlight) {
+        refreshPending = true;
+        return inFlight;
+      }
+      controller = new AbortController();
+      const timeout = window.setTimeout(() => controller?.abort(), 15_000);
+      inFlight = api.listProductConversations(controller.signal)
+        .then((response) => {
+          if (!cancelled) setProductConversations(response.product_conversations);
+        })
+        .catch(() => {})
+        .finally(() => {
+          window.clearTimeout(timeout);
+          controller = null;
+          inFlight = null;
+          if (refreshPending && !cancelled) {
+            refreshPending = false;
+            void refresh();
+          }
+        });
+      return inFlight;
+    };
     void refresh();
     const interval = window.setInterval(refresh, 5_000);
-    return () => { cancelled = true; window.clearInterval(interval); };
+    const unsubscribe = subscribeProductConversationListRevision(() => { void refresh(); });
+    return () => {
+      cancelled = true;
+      controller?.abort();
+      window.clearInterval(interval);
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {

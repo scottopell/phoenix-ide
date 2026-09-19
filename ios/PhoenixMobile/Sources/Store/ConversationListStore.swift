@@ -101,10 +101,9 @@ final class ConversationListStore {
         excluding exclusions: Set<String> = []
     ) -> [Conversation] {
         var byId = Dictionary(uniqueKeysWithValues: fresh
-            .filter { $0.archived != true && !exclusions.contains($0.aggregateIdentity) }
+            .filter { !exclusions.contains($0.aggregateIdentity) }
             .map { ($0.aggregateIdentity, $0) })
-        for (id, conversation) in upserts
-        where conversation.archived != true && !exclusions.contains(id) {
+        for (id, conversation) in upserts where !exclusions.contains(id) {
             byId[id] = conversation
         }
         return Array(byId.values)
@@ -162,6 +161,7 @@ final class ConversationListStore {
             return Conversation(
                 id: incoming.id,
                 product_conversation_id: incoming.product_conversation_id,
+                chain_root_id: incoming.chain_root_id,
                 slug: incoming.slug,
                 title: incoming.title,
                 model: incoming.model,
@@ -174,6 +174,7 @@ final class ConversationListStore {
                 branch_name: incoming.branch_name,
                 task_title: existing.task_title,
                 archived: incoming.archived,
+                product_close_action: incoming.product_close_action,
                 project_name: incoming.project_name,
                 conv_mode_label: incoming.conv_mode_label,
                 presentation_mode: incoming.presentation_mode,
@@ -229,17 +230,6 @@ final class ConversationListStore {
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
         let aggregateIdentity = conversation.aggregateIdentity
-        if conversation.archived == true {
-            if isRefreshing {
-                upsertsDuringRefresh[aggregateIdentity] = nil
-                exclusionsDuringRefresh.insert(aggregateIdentity)
-            }
-            conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
-            transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateIdentity }
-            aggregateToCachedTranscript[aggregateIdentity] = nil
-            persistCache()
-            return
-        }
         if isRefreshing {
             exclusionsDuringRefresh.remove(aggregateIdentity)
             upsertsDuringRefresh[aggregateIdentity] = conversation
@@ -280,6 +270,12 @@ final class ConversationListStore {
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
         transcriptToAggregate[transcriptRowId]
+    }
+
+    func transcriptRowIds(forAggregateId aggregateId: String) -> [String] {
+        transcriptToAggregate.compactMap { transcriptId, mappedAggregateId in
+            mappedAggregateId == aggregateId ? transcriptId : nil
+        }
     }
 
     func cachedTranscriptRowId(forAggregateId aggregateId: String) -> String? {

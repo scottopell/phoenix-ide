@@ -18,7 +18,11 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if let session = model.session(for: conversationId) {
+                if let history = model.listStore.conversations.first(where: {
+                    $0.archived == true && $0.aggregateIdentity == conversationId
+                }) {
+                    ProductHistoryView(productConversationId: history.aggregateIdentity)
+                } else if let session = model.session(for: conversationId) {
                     ConversationView(session: session)
                 } else {
                     Text("Configure a server first")
@@ -130,7 +134,9 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
-                    let navigationId = model.navigationConversationId(for: conversation)
+                    let navigationId = conversation.archived == true
+                        ? conversation.aggregateIdentity
+                        : model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
                         || transcriptRowId == model.coordinatorConversationId
                     NavigationLink(value: navigationId) {
@@ -140,11 +146,19 @@ struct ConversationListView: View {
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if !isCoordinator {
-                            Button {
-                                Task { await model.archive(conversationId: transcriptRowId) }
+                        if !isCoordinator && conversation.archived == true {
+                            Button(role: .destructive) {
+                                Task { await model.deleteHistoryConversation(conversation) }
                             } label: {
-                                Label("Archive", systemImage: "archivebox")
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .disabled(!model.connectivity.isOnline)
+                        } else if !isCoordinator && conversation.product_close_action == .available
+                            && conversation.presentation_mode != "working" {
+                            Button {
+                                Task { await model.closeProductConversation(conversation) }
+                            } label: {
+                                Label("Close", systemImage: "archivebox")
                             }
                             .tint(.orange)
                             .disabled(!model.connectivity.isOnline)
@@ -261,6 +275,35 @@ struct StateDot: View {
         case "terminal", "context_exhausted", "handed_off": return .gray
         case nil: return .gray
         default: return .orange  // any in-flight state
+        }
+    }
+}
+
+private struct ProductHistoryView: View {
+    @Environment(AppModel.self) private var model
+    let productConversationId: String
+    @State private var snapshot: ProductConversationSnapshot?
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if let snapshot {
+                List(snapshot.segments, id: \.segment_ordinal) { segment in
+                    Section(segment.title ?? segment.slug ?? "Conversation") {
+                        ForEach(segment.messages, id: \.id) { message in
+                            MessageView(message: message)
+                        }
+                    }
+                }
+            } else if let error {
+                ContentUnavailableView("Unable to load history", systemImage: "exclamationmark.triangle", description: Text(error))
+            } else {
+                ProgressView("Loading history…")
+            }
+        }
+        .task {
+            do { snapshot = try await model.loadProductHistory(productConversationId: productConversationId) }
+            catch { self.error = error.localizedDescription }
         }
     }
 }

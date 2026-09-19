@@ -32,6 +32,8 @@ import { effectiveVisibleConversationCount } from './conversationListCount';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
 } from '../notifications';
 
@@ -62,8 +64,9 @@ export function ConversationListPage() {
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
-  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
-  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
+  const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
+
   const visibleConversationCount = effectiveVisibleConversationCount({
     showArchived,
     productListError,
@@ -131,6 +134,36 @@ export function ConversationListPage() {
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+  const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteSubmitting, setProductDeleteSubmitting] = useState(false);
+  const [productDeleteError, setProductDeleteError] = useState<string | undefined>();
+  const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
+  const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
+  const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
+  const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameError, setProductRenameError] = useState<string | undefined>();
+
+  const handleProductDelete = async () => {
+    if (!productDeleteTarget || productDeleteSubmitting) return;
+    setProductDeleteSubmitting(true);
+    try {
+      const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+      if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
+      else await api.deleteChain(rootId);
+      setProductDeleteTarget(null);
+      setProductDeleteError(undefined);
+      notifyProductConversationListMayHaveChanged();
+    } catch (error) {
+      setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
+    } finally {
+      setProductDeleteSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    productCloseTargetRef.current = productCloseTarget;
+  }, [productCloseTarget]);
 
   const { credentialStatus } = useModels();
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -304,6 +337,54 @@ export function ConversationListPage() {
     }
   };
 
+  const handleProductRename = async (newName: string) => {
+    if (!productRenameTarget) return;
+    try {
+      const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      setProductConversations((rows) => rows.map((row) =>
+        row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
+      notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+      notifyProductConversationListMayHaveChanged();
+      setProductRenameTarget(null);
+      setProductRenameError(undefined);
+    } catch (err) {
+      setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
+    }
+  };
+
+  const handleProductClose = async () => {
+    if (!productCloseTarget) return;
+    if (productCloseSubmittingId === productCloseTarget.product_conversation_id) return;
+    setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
+    try {
+      await api.closeProductConversation(productCloseTarget.product_conversation_id);
+      setProductCloseTarget((current) =>
+        current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
+      setProductListRevision((revision) => revision + 1);
+      notifyProductConversationListMayHaveChanged();
+      setProductCloseError((current) =>
+        current?.productId === productCloseTarget.product_conversation_id ? null : current);
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
+    } catch (err) {
+      if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        const confirmationRoute = productCloseTarget.canonical_route;
+        if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
+          setProductCloseTarget(null);
+          navigate(confirmationRoute);
+        }
+      } else {
+        setProductCloseError({
+          productId: productCloseTarget.product_conversation_id,
+          message: err instanceof Error ? err.message : 'Failed to close product conversation',
+        });
+      }
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
+      console.error('Failed to close product conversation:', err);
+    }
+  };
+
   const handleToggleArchived = useCallback(() => {
     saveScrollPosition();
     setShowArchived((prev) => !prev);
@@ -409,9 +490,21 @@ export function ConversationListPage() {
               onNewConversation={handleNewConversation}
               onArchive={handleArchive}
               onDelete={handleSetDeleteTarget}
-              onRename={handleSetRenameTarget}
+              {...(!productListError ? { onRename: handleSetRenameTarget } : {})}
               onConversationClick={handleConversationClick}
               onProductConversationClick={(row) => navigate(row.canonical_route)}
+              onProductConversationRename={(row) => {
+                setProductRenameError(undefined);
+                setProductRenameTarget(row);
+              }}
+              {...(isOnline ? { onProductConversationClose: (row: ProductConversationListRow) => {
+                setProductCloseError(null);
+                setProductCloseTarget(row);
+              } } : {})}
+              {...(isOnline ? { onProductConversationDelete: (row: ProductConversationListRow) => {
+                setProductDeleteError(undefined);
+                setProductDeleteTarget(row);
+              } } : {})}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(
@@ -439,6 +532,44 @@ export function ConversationListPage() {
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ConfirmDialog
+        visible={productCloseTarget !== null}
+        title="Close Product Conversation"
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will move the entire product conversation to read-only History and stop its active work.`}
+        confirmText="Close"
+        danger
+        onConfirm={handleProductClose}
+        submitting={productCloseSubmittingId === productCloseTarget?.product_conversation_id}
+        {...(productCloseError && productCloseError.productId === productCloseTarget?.product_conversation_id
+          ? { error: productCloseError.message }
+          : {})}
+        onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
+      />
+      <ConfirmDialog
+        visible={productDeleteTarget !== null}
+        title="Delete Product Conversation"
+        message="Permanently delete this product conversation and its transcript history? This cannot be undone."
+        confirmText="Delete"
+        danger
+        onConfirm={() => void handleProductDelete()}
+        submitting={productDeleteSubmitting}
+        {...(productDeleteError ? { error: productDeleteError } : {})}
+        onCancel={() => setProductDeleteTarget(null)}
+      />
+      <RenameDialog
+        visible={productRenameTarget !== null}
+        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
+        error={productRenameError}
+        onRename={handleProductRename}
+        normalizeInput={(value) => value}
+        isValidName={(value) => value.trim().length > 0}
+        helpText="Enter a title"
+        maxLength={200}
+        onCancel={() => {
+          setProductRenameTarget(null);
+          setProductRenameError(undefined);
+        }}
       />
       <RenameDialog
         visible={renameTarget !== null}

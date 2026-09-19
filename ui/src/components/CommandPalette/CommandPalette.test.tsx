@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   openFile: vi.fn(),
   archiveConversation: vi.fn(),
   archiveChain: vi.fn(),
+  closeProductConversation: vi.fn(),
+  listProductConversations: vi.fn(),
 }));
 
 vi.mock('../../api', async (importOriginal) => {
@@ -28,6 +30,8 @@ vi.mock('../../api', async (importOriginal) => {
       searchConversationContent: mocks.searchConversationContent,
       archiveConversation: mocks.archiveConversation,
       archiveChain: mocks.archiveChain,
+      closeProductConversation: mocks.closeProductConversation,
+      listProductConversations: mocks.listProductConversations,
     },
   };
 });
@@ -85,12 +89,16 @@ function renderPalette(
 }
 
 beforeEach(() => {
+  mocks.listProductConversations.mockReset();
+  mocks.listProductConversations.mockResolvedValue({ product_conversations: [] });
   mocks.searchConversationFiles.mockReset();
   mocks.searchConversationCode.mockReset();
   mocks.searchConversationContent.mockReset();
   mocks.openFile.mockReset();
   mocks.archiveConversation.mockReset();
   mocks.archiveChain.mockReset();
+  mocks.closeProductConversation.mockReset();
+  mocks.closeProductConversation.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -135,7 +143,7 @@ describe('CommandPalette lifecycle availability', () => {
               product_conversation_id: 'product-1',
               canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'open',
+              lifecycle: { state: 'open', close_action: { availability: 'available' } },
               latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
@@ -150,7 +158,7 @@ describe('CommandPalette lifecycle availability', () => {
     expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
   });
 
-  it('closes an Open canonical aggregate from the active atom when drift hides its row', async () => {
+  it('closes an Open canonical aggregate through its root when drift hides its row', async () => {
     const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: true });
     render(
       <MemoryRouter initialEntries={['/product-conversations/product-1']}>
@@ -160,7 +168,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'latest-id', slug: 'latest', title: null },
-              ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}
@@ -174,8 +182,7 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
-    expect(mocks.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.closeProductConversation).toHaveBeenCalledWith('product-1'));
   });
 
   it('uses the canonical chain root when drift hides continuation members', async () => {
@@ -188,7 +195,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-id', canonical_route: '/product-conversations/product-id',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'open', close_action: { availability: 'available' } }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}
@@ -202,8 +209,32 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('root-id'));
-    expect(mocks.archiveConversation).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.closeProductConversation).toHaveBeenCalledWith('product-id'));
+  });
+
+  it('does not offer Close when the server-authoritative action projection blocks it', () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest' });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-1']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[latest]}
+            productConversations={[{
+              product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
+              latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    expect(screen.queryByText('Close Current Conversation')).toBeNull();
   });
 
   it('does not offer Close on a canonical History aggregate', () => {
@@ -216,7 +247,7 @@ describe('CommandPalette lifecycle availability', () => {
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
               canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
-              ordinary_lifecycle: 'history', latest_transcript_row_id: 'latest-id',
+              lifecycle: { state: 'history' }, latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
             }]}

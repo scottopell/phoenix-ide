@@ -1078,12 +1078,43 @@ impl Database {
         Ok(topology)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn begin_close_foundation(
         &self,
         product_conversation_id: &ProductConversationId,
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        self.begin_close_foundation_inner(
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id,
+            false,
+        )
+        .await
+    }
+
+    pub async fn begin_direct_close_foundation(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        self.begin_close_foundation_inner(
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn begin_close_foundation_inner(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &str,
+        require_idle_latest: bool,
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
@@ -1171,6 +1202,15 @@ impl Database {
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
+
+        if require_idle_latest
+            && CapturedConversationStateKind::from_db_str(conv_state_kind(&topology.latest.state))
+                .is_some_and(CapturedConversationStateKind::is_busy)
+        {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} latest transcript is working"
+            )));
+        }
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -6897,6 +6937,31 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn direct_close_rejects_busy_latest_without_creating_an_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        set_state(&db, "root", ConvState::LlmRequesting { attempt: 1 }).await;
+
+        let error = db
+            .begin_direct_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                "attempt-direct",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations WHERE attempt_id = 'attempt-direct'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

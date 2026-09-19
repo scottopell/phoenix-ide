@@ -49,7 +49,7 @@ use crate::state_machine::ConvState;
 /// — short enough that the value comfortably fits as a sidebar label and the
 /// chain page header without truncation, long enough that a reasonable label
 /// like "auth refactor — staged migration" is not rejected.
-const CHAIN_NAME_MAX_CHARS: usize = 200;
+pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Response/request shapes
@@ -68,13 +68,10 @@ const CHAIN_NAME_MAX_CHARS: usize = 200;
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ChainView {
     pub root_conv_id: String,
+    pub product_conversation_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
-    /// `true` when the chain is archived. Chain archive is a write-cascade
-    /// across all members, so any member's `archived` flag is authoritative;
-    /// we read it off the root for clarity. Archive is a terminal lifecycle
-    /// transition — archived chain roots 404 on the chain route, so the UI
-    /// has no unarchive affordance.
+    /// `true` when the owning `ProductConversation` is in History.
     pub archived: bool,
     pub members: Vec<ChainMemberSummary>,
     pub qa_history: Vec<ChainQaRow>,
@@ -214,7 +211,10 @@ pub async fn submit_chain_question(
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
 }
 
-/// `PATCH /api/chains/:rootId/name`
+/// Compatibility route for `PATCH /api/chains/:rootId/name`.
+///
+/// Non-empty names update the `ProductConversation` root title authority. A null or
+/// whitespace-only name clears only the legacy override so normal title fallback applies.
 pub async fn set_chain_name(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -228,14 +228,19 @@ pub async fn set_chain_name(
     // to a single state rather than persisting invisible names.
     let normalized = normalize_chain_name(req.name.as_deref())?;
 
-    state
-        .db
-        .set_chain_name(&root_id, normalized.as_deref())
-        .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+    if let Some(title) = normalized.as_deref() {
+        state
+            .db
+            .set_ordinary_product_conversation_title(&root_id, title)
+            .await
+            .map_err(db_to_app)?;
+    } else {
+        state
+            .db
+            .clear_ordinary_product_conversation_legacy_title(&root_id)
+            .await
+            .map_err(db_to_app)?;
+    }
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
@@ -244,10 +249,9 @@ pub async fn set_chain_name(
 /// `POST /api/chains/:rootId/regenerate-name` (REQ-CHN-010).
 ///
 /// Derives a prose display name by summarizing the first user message of each
-/// chain member (in chain order) via a cheap LLM, then persists it as the
-/// chain's `chain_name` override on the root — the same write path the typed
-/// PATCH uses. Takes no request body; the chain root id in the path is the only
-/// input.
+/// chain member (in chain order) via a cheap LLM, then updates the
+/// `ProductConversation` root title through the same authority as the typed PATCH.
+/// Takes no request body; the chain root id in the path is the only input.
 ///
 /// Status choices:
 /// - `<2` members or non-root: 404 via [`validate_chain_root`], matching every
@@ -337,12 +341,14 @@ pub async fn regenerate_chain_name(
 
     state
         .db
-        .set_chain_name(&root_id, normalized.as_deref())
+        .set_ordinary_product_conversation_title(
+            &root_id,
+            normalized
+                .as_deref()
+                .expect("empty generated name rejected"),
+        )
         .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+        .map_err(db_to_app)?;
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
@@ -608,6 +614,12 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         .ok_or_else(|| AppError::Internal("chain validation passed but members empty".to_string()))?
         .clone();
 
+    let product_conversation = state
+        .db
+        .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+
     let qa_history = state
         .chain_qa
         .list_history(root_id)
@@ -623,9 +635,11 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
 
     Ok(ChainView {
         root_conv_id: root_conv.id.clone(),
+        product_conversation_id: root_conv.product_conversation_id.to_string(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
-        archived: root_conv.archived,
+        archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
         members: summaries,
         qa_history,
         current_member_count,
@@ -725,6 +739,21 @@ fn resolve_display_name(root: &Conversation) -> String {
 fn db_to_app(e: DbError) -> AppError {
     match e {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!("ProductConversation {id} is read-only in History"),
+                "product_conversation_not_open",
+            )))
+        }
+        DbError::CloseAdmissionFenced(fence) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!(
+                    "ProductConversation {} has an active Close attempt {} in phase {:?}",
+                    fence.product_conversation_id, fence.attempt_id, fence.phase
+                ),
+                "close_admission_fenced",
+            )))
+        }
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -870,6 +899,10 @@ mod tests {
             members.push(db.get_conversation(id).await.map_err(db_to_app)?);
         }
         let root_conv = members.first().unwrap().clone();
+        let product_conversation = db
+            .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+            .await
+            .map_err(db_to_app)?;
         let qa_history = chain_qa
             .list_history(root_id)
             .await
@@ -881,9 +914,11 @@ mod tests {
         let work_identity = resolve_work_identity(&members);
         Ok(ChainView {
             root_conv_id: root_conv.id.clone(),
+            product_conversation_id: root_conv.product_conversation_id.to_string(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
-            archived: root_conv.archived,
+            archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
             members: summaries,
             qa_history,
             current_member_count,
@@ -954,6 +989,31 @@ mod tests {
         assert_eq!(view.current_member_count, 3);
         assert_eq!(view.current_total_messages, 3);
         assert!(view.qa_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_view_uses_product_lifecycle_when_legacy_archived_bit_drifts() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["history-a", "history-b"]).await;
+        let root = db.get_conversation("history-a").await.unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(db.fts_retriever()),
+        );
+        let view = build_view_for_test(&db, &chain_qa, "history-a")
+            .await
+            .unwrap();
+
+        assert!(view.archived);
     }
 
     /// REQ-CHN-008: the work identity is resolved from the chain's
