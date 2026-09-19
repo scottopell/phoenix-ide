@@ -19,7 +19,7 @@
   background: var(--bg-tertiary);
 }
 
-@media (hover: none), (width <= 768px) {
+@media (any-pointer: coarse), (hover: none), (width <= 768px) {
   .message-review-action {
     min-width: 44px;
     min-height: 44px;

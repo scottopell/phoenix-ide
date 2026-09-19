@@ -80,7 +80,7 @@
   clip-path: inset(50%);
 }
 
-@media (pointer: coarse), (width <= 768px) {
+@media (any-pointer: coarse), (width <= 768px) {
   .reaction-pill input {
     height: 44px;
     font-size: 16px;

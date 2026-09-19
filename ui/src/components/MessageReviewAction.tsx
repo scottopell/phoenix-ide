@@ -2,6 +2,7 @@
 import { createContext, useContext } from 'react';
 import { MessageSquareText } from 'lucide-react';
 import type { Message } from '../api';
+import { getMessageMarkdown } from '../utils/messageCopy';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from './MessageContextMenu';
 import './MessageReviewAction.css';
 
@@ -10,7 +11,7 @@ export const MessageReviewEnabledContext = createContext(false);
 export function MessageReviewAction({ message }: { message: Message }) {
   const enabled = useContext(MessageReviewEnabledContext);
   const data = message.display_data as { productOccurrenceToken?: string; productHistoricalHandoff?: unknown } | null;
-  if (!enabled || data?.productHistoricalHandoff) return null;
+  if (!enabled || data?.productHistoricalHandoff || !getMessageMarkdown(message).trim()) return null;
   return (
     <button
       type="button"
