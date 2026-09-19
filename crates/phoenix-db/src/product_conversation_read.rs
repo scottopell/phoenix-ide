@@ -538,7 +538,8 @@ impl Database {
                  GROUP BY transcript.product_conversation_id
              )
              SELECT product.id AS product_conversation_id, product.ordinary_lifecycle,
-                    root.id AS root_transcript_row_id, root.slug AS root_slug, root.title AS root_title,
+                    root.id AS root_transcript_row_id, root.slug AS root_slug,
+                    COALESCE(root.chain_name, root.title) AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
                     activity.updated_at, activity.has_awaiting_task_approval,
