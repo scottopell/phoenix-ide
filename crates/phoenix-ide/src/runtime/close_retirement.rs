@@ -5450,6 +5450,14 @@ fn linux_inventory_diagnostic(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_descriptor_target_is_live(target: &Path) -> bool {
+    !target
+        .as_os_str()
+        .as_encoded_bytes()
+        .ends_with(b" (deleted)")
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
@@ -5503,11 +5511,7 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
-            if target
-                .as_os_str()
-                .as_encoded_bytes()
-                .ends_with(b" (deleted)")
-            {
+            if !linux_descriptor_target_is_live(&target) {
                 continue;
             }
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
