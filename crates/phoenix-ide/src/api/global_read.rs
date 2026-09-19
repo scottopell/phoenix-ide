@@ -2884,10 +2884,14 @@ mod tests {
         let fragmented = service
             .read_predecessor_conversation(&binding, "@conv:pred-a#message-a-msg", None)
             .await;
-        assert!(matches!(
-            fragmented,
-            PreviousTranscriptsOutput::InvalidTarget { .. }
-        ));
+        let PreviousTranscriptsOutput::ReadPage {
+            starts_at, content, ..
+        } = fragmented
+        else {
+            panic!("expected targeted read page, got {fragmented:?}");
+        };
+        assert_eq!(starts_at.expect("targeted page start").message_id, "a-msg");
+        assert!(content.contains("alpha only predecessor evidence"));
 
         let invalid_cursor_output = service
             .read_predecessor_conversation(&binding, "@conv:pred-a", Some("123"))
