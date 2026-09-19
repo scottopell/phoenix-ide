@@ -147,9 +147,10 @@ impl RuntimeManager {
     pub(crate) async fn inspect_close_retirement_only(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<CloseRetirementSnapshot, String> {
+    ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
         self.inspect_close_retirement_with_continuation(attempt_id, false)
             .await
+            .map_err(|error| CloseRetirementError::Message(error.clone()))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1708,18 +1709,9 @@ impl RuntimeManager {
                                     .return_close_attempt_to_reinspection(attempt_id)
                                     .await
                                     .map_err(|error| error.to_string())?;
-                                match Box::pin(
-                                    self.inspect_close_retirement_only(attempt_id.clone()),
-                                )
-                                .await
-                                {
-                                    Ok(_) => {
-                                        return Err(CloseRetirementError::Message(detail));
-                                    }
-                                    Err(error) => {
-                                        return Err(CloseRetirementError::Message(error));
-                                    }
-                                }
+                                Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
+                                    .await?;
+                                return Err(CloseRetirementError::Message(detail));
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
@@ -7482,14 +7474,8 @@ mod tests {
 
         assert!(error.contains("identity changed before final deletion"));
         assert!(displaced.exists());
-        let preserved = std::fs::read_dir(temp.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("object/replacement-marker"))
-            .find(|candidate| candidate.is_file())
-            .expect("swapped worktree replacement must remain in the private tombstone");
         assert_eq!(
-            std::fs::read_to_string(preserved).unwrap(),
+            std::fs::read_to_string(quarantine.join("replacement-marker")).unwrap(),
             replacement_marker
         );
     }
