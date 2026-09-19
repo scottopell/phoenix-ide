@@ -164,6 +164,45 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(reopened.segments[0].messages.map(\.message_id), ["cached"])
     }
 
+    func testCachedProductHistoryIsAvailableBeforeNetworkRefresh() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
+        let snapshot = historySnapshot(segments: [
+            ProductConversationSegment(
+                segment_ordinal: 0,
+                transcript_row_id: "root",
+                slug: "root",
+                title: "Root",
+                messages: [message("cached", sequence: 1)],
+                handoff: nil),
+        ])
+        XCTAssertTrue(ProductHistorySnapshotStore.save(snapshot))
+
+        let model = AppModel()
+        let cached = model.cachedProductHistory(productConversationId: "pc-history")
+
+        XCTAssertEqual(cached?.segments[0].messages.map(\.message_id), ["cached"])
+    }
+
+    func testCloseCompletionGenerationsAreScopedByProduct() {
+        var tracker = ProductActionGenerationTracker()
+        let productA = tracker.begin(productConversationId: "product-a")
+        let productB = tracker.begin(productConversationId: "product-b")
+
+        XCTAssertTrue(tracker.isCurrent(productA, productConversationId: "product-a"))
+        XCTAssertTrue(tracker.isCurrent(productB, productConversationId: "product-b"))
+
+        let replacementA = tracker.begin(productConversationId: "product-a")
+        XCTAssertFalse(tracker.isCurrent(productA, productConversationId: "product-a"))
+        XCTAssertTrue(tracker.isCurrent(replacementA, productConversationId: "product-a"))
+        XCTAssertTrue(tracker.isCurrent(productB, productConversationId: "product-b"))
+
+        tracker.end(productA, productConversationId: "product-a")
+        XCTAssertTrue(tracker.isCurrent(replacementA, productConversationId: "product-a"))
+        tracker.end(replacementA, productConversationId: "product-a")
+        XCTAssertFalse(tracker.isCurrent(replacementA, productConversationId: "product-a"))
+    }
+
     func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {
         let historical = ProductConversationHandoff.historical(
             predecessorTranscriptRowId: "root",
