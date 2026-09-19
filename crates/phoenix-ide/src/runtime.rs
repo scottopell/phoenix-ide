@@ -8235,7 +8235,7 @@ mod scope_liveness_tests {
             .expect_err("mismatched current cleanup authority remains fail-closed");
         assert!(
             matches!(second_error, close_retirement::CloseRetirementError::Message(ref message)
-                if message.contains("administrative directory differs from durable cleanup plan")),
+                if message.contains("retains active residual evidence")),
             "unexpected second startup resume error: {second_error:?}"
         );
         assert_eq!(mutation_counts().await, after_first);

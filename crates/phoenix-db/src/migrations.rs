@@ -9061,6 +9061,25 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'ambient writer evidence can only be deleted with its Close aggregate');
 END;
+
+CREATE TRIGGER close_worktree_cleanup_adoptions_reject_update
+BEFORE UPDATE ON close_worktree_cleanup_adoptions
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption lineage is immutable');
+END;
+
+CREATE TRIGGER close_worktree_cleanup_adoptions_reject_delete
+BEFORE DELETE ON close_worktree_cleanup_adoptions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN close_hard_delete_claims claim
+      ON claim.product_conversation_id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup adoption lineage can only be deleted with its Close aggregate');
+END;
 ";
 
 const MIGRATION_104: &str = r"
@@ -17398,6 +17417,32 @@ mod tests {
             "CREATE TABLE close_ambient_writer_evidence (
                  match_kind TEXT NOT NULL,
                  access_mode TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE close_worktree_cleanup_adoptions (
+                 attempt_id TEXT NOT NULL,
+                 product_conversation_id TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE close_hard_delete_claims (
+                 product_conversation_id TEXT PRIMARY KEY
              )",
         )
         .execute(&pool)

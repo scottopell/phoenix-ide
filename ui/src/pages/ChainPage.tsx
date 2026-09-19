@@ -446,8 +446,9 @@ export function ChainPage() {
             await api.archiveChain(rootConvId);
             navigate('/');
           } catch (err) {
-            if (notifyArchiveCloseConflict(rootConvId, err)) {
-              navigate(`/c/${encodeURIComponent(rootConvId)}`);
+            const recoveryTarget = notifyArchiveCloseConflict(rootConvId, err);
+            if (recoveryTarget) {
+              navigate(`/c/${encodeURIComponent(recoveryTarget)}`);
             } else {
               showError(err instanceof Error ? err.message : 'Failed to archive chain');
             }

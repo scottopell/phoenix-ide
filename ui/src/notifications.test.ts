@@ -137,11 +137,11 @@ describe('archive close conflict notifications', () => {
     const unsubscribeList = subscribeProductConversationListRevision(listListener);
     const startRevision = getProductConversationListRevision();
 
-    expect(notifyArchiveCloseConflict('conv-1', new Error('boom'))).toBe(false);
+    expect(notifyArchiveCloseConflict('conv-1', new Error('boom'))).toBeNull();
     expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
       error: 'other conflict',
       error_type: 'proposal_resolved',
-    }))).toBe(false);
+    }))).toBeNull();
 
     expect(closeListener).toHaveBeenCalledTimes(0);
     expect(listListener).toHaveBeenCalledTimes(0);
@@ -150,7 +150,7 @@ describe('archive close conflict notifications', () => {
     expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
       error: 'close loss confirmation required',
       error_type: 'close_loss_confirmation_required',
-    }))).toBe(true);
+    }))).toBe('conv-1');
     expect(closeListener).toHaveBeenCalledTimes(1);
     expect(listListener).toHaveBeenCalledTimes(0);
     for (const error_type of [
@@ -163,7 +163,7 @@ describe('archive close conflict notifications', () => {
       expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
         error: 'durable Close requires attention',
         error_type,
-      }))).toBe(true);
+      }))).toBe('conv-1');
     }
     expect(closeListener).toHaveBeenCalledTimes(6);
 

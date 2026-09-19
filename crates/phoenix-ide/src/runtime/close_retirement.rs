@@ -775,24 +775,6 @@ impl RuntimeManager {
             })
             .map(|evidence| (evidence.scope, resource_key(&evidence.resource)))
             .collect::<std::collections::BTreeSet<_>>();
-        if obligation.phase() == ClosePhase::NeedsRepair {
-            let active_residuals = self
-                .db()
-                .list_close_retirement_evidence(attempt_id.as_str())
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|item| {
-                    item.snapshot == snapshot
-                        && matches!(item.outcome, RetirementOutcome::Residual { .. })
-                })
-                .count();
-            if active_residuals > 0 {
-                return Err(CloseRetirementError::Message(
-                    "Close needs-repair phase retains active residual evidence".to_string(),
-                ));
-            }
-        }
         self.validate_close_worktrees_before_runtime_retirement(
             &attempt_id,
             &snapshot,
@@ -1196,6 +1178,24 @@ impl RuntimeManager {
         Ok(())
     }
 
+    fn ensure_no_active_residuals(
+        obligation: &phoenix_core::domain::close::CloseObligation,
+        snapshot: &CloseRetirementSnapshot,
+        evidence: &[phoenix_core::domain::close::CloseRetiredResource],
+    ) -> Result<(), CloseRetirementError> {
+        if obligation.phase() == ClosePhase::NeedsRepair
+            && evidence.iter().any(|item| {
+                item.snapshot == *snapshot
+                    && matches!(item.outcome, RetirementOutcome::Residual { .. })
+            })
+        {
+            return Err(CloseRetirementError::Message(
+                "Close needs-repair phase retains active residual evidence".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn retire_close_worktrees_and_scopes(
         &self,
@@ -1213,6 +1213,12 @@ impl RuntimeManager {
             .list_close_retirement_evidence(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let obligation = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        Self::ensure_no_active_residuals(&obligation, snapshot, &evidence)?;
         let retired = evidence
             .into_iter()
             .filter(|evidence| {

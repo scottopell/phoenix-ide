@@ -200,8 +200,8 @@ export function closeRecoveryGuidance(error: unknown): CloseRecoveryGuidance | n
   };
 }
 
-export function notifyArchiveCloseConflict(conversationId: string, error: unknown): boolean {
-  if (!(error instanceof ConflictError)) return false;
+export function notifyArchiveCloseConflict(conversationId: string, error: unknown): string | null {
+  if (!(error instanceof ConflictError)) return null;
   if (![
     'close_loss_confirmation_required',
     'close_stop_work_confirmation_required',
@@ -211,10 +211,11 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_inspection_failed',
     'close_retirement_needs_repair',
     'stale_close_inspection',
-  ].includes(error.detail.error_type)) return false;
-  notifyCloseSnapshotChanged(closeRecoveryGuidance(error)?.activeTranscriptId ?? conversationId);
+  ].includes(error.detail.error_type)) return null;
+  const target = closeRecoveryGuidance(error)?.activeTranscriptId ?? conversationId;
+  notifyCloseSnapshotChanged(target);
   notifyProductConversationListMayHaveChanged();
-  return true;
+  return target;
 }
 
 export function subscribeCloseSnapshotChanged(
