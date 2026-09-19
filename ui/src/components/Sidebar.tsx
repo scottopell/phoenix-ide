@@ -373,10 +373,14 @@ export function Sidebar({
       else await api.deleteChain(rootId);
       setProductDeleteTarget(null);
       notifyProductConversationListMayHaveChanged();
+      if (activeSlug === productDeleteTarget.product_conversation_id
+        || activeSlug === productDeleteTarget.canonical_root.slug) {
+        navigate('/');
+      }
     } catch (error) {
       console.error('Failed to delete product conversation:', error);
     }
-  }, [productDeleteTarget]);
+  }, [productDeleteTarget, activeSlug, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);

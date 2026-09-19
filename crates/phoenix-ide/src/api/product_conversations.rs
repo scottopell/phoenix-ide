@@ -426,6 +426,12 @@ async fn snapshot_view(
         None => None,
     };
     let root_id = aggregate.root.conversation.id.clone();
+    let root_title = aggregate
+        .root
+        .conversation
+        .chain_name
+        .as_deref()
+        .or(aggregate.root.conversation.title.as_deref());
     let latest_id = aggregate.latest_transcript_row_id.clone();
     let segments = aggregate
         .segments
@@ -438,13 +444,17 @@ async fn snapshot_view(
         close,
 
         requested_transcript_row_id,
-        canonical_root: transcript_row_view(&aggregate.root),
+        canonical_root: ProductConversationTranscriptRowView {
+            transcript_row_id: aggregate.root.conversation.id.clone(),
+            slug: aggregate.root.conversation.slug.clone(),
+            title: root_title.map(str::to_owned),
+        },
         ordinary_lifecycle: lifecycle_view(lifecycle),
         latest_transcript_row_id: latest_id.clone(),
         writable_transcript_row_id: writable_transcript_row_id(state, lifecycle, &aggregate).await,
         updated_at: aggregate.updated_at.to_rfc3339(),
         presentation: presentation(
-            aggregate.root.conversation.title.as_deref(),
+            root_title,
             aggregate.root.conversation.slug.as_deref(),
             &aggregate
                 .segments
@@ -610,16 +620,6 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
             continuation_message_id: continuation_message_id.clone(),
             summary: summary.clone(),
         },
-    }
-}
-
-fn transcript_row_view(
-    row: &crate::db::ProductConversationTranscriptRow,
-) -> ProductConversationTranscriptRowView {
-    ProductConversationTranscriptRowView {
-        transcript_row_id: row.conversation.id.clone(),
-        slug: row.conversation.slug.clone(),
-        title: row.conversation.title.clone(),
     }
 }
 

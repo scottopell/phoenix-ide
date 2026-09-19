@@ -32,20 +32,20 @@ export function ConfirmDialog({
   useEffect(() => {
     if (visible) {
       const handleEscape = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') onCancel();
+        if (e.key === 'Escape' && !submitting) onCancel();
       };
       document.addEventListener('keydown', handleEscape);
       return () => document.removeEventListener('keydown', handleEscape);
     }
     return undefined;
-  }, [visible, onCancel]);
+  }, [visible, submitting, onCancel]);
 
   if (!visible) return null;
 
   return (
     <div
       className="modal-overlay"
-      onClick={onCancel}
+      onClick={() => { if (!submitting) onCancel(); }}
       title="Cancel and close dialog"
       aria-label="Cancel and close dialog"
     >

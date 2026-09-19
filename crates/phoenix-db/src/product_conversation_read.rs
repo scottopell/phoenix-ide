@@ -255,6 +255,10 @@ fn list_projection_from_row(
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation,
         )
+    } else if latest_state.is_busy() {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
+        )
     } else if row.try_get::<bool, _>("has_active_close_attempt")? {
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
