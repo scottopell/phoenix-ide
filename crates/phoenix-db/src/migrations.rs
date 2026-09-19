@@ -511,14 +511,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_098,
     },
     Migration {
-        version: 99,
-        name: "bound_new_message_ids",
-        sql: MIGRATION_099,
-    },
-    Migration {
         version: 100,
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
+    },
+    Migration {
+        version: 101,
+        name: "bound_new_message_ids",
+        sql: MIGRATION_101,
     },
 ];
 
@@ -721,42 +721,25 @@ BEGIN
 END;
 ";
 
-const MIGRATION_099: &str = r"
-CREATE TABLE legacy_oversized_creation_message_ids (
-    message_id TEXT PRIMARY KEY NOT NULL
-) STRICT;
-
-INSERT INTO legacy_oversized_creation_message_ids (message_id)
-SELECT DISTINCT message_id
-FROM conversation_creation_jobs
-WHERE message_id IS NOT NULL
-  AND length(CAST(message_id AS BLOB)) > 256;
-
-INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
-SELECT DISTINCT COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
-FROM durable_turns
-WHERE length(CAST(
-    COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key)
-    AS BLOB
-)) > 256;
-
-INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
-SELECT DISTINCT message_id
-FROM steering_messages
-WHERE length(CAST(message_id AS BLOB)) > 256;
-
-INSERT OR IGNORE INTO legacy_oversized_creation_message_ids (message_id)
-SELECT DISTINCT message_id
-FROM continuation_dispatch_intents
-WHERE length(CAST(message_id AS BLOB)) > 256;
-
+const MIGRATION_101: &str = r"
 CREATE TRIGGER messages_bound_new_message_id_bytes
 BEFORE INSERT ON messages
 FOR EACH ROW
 WHEN length(CAST(NEW.message_id AS BLOB)) > 256
  AND NOT EXISTS (
-     SELECT 1
-     FROM legacy_oversized_creation_message_ids
+     SELECT 1 FROM conversation_creation_jobs
+     WHERE message_id = NEW.message_id
+ )
+ AND NOT EXISTS (
+     SELECT 1 FROM durable_turns
+     WHERE COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key) = NEW.message_id
+ )
+ AND NOT EXISTS (
+     SELECT 1 FROM steering_messages
+     WHERE message_id = NEW.message_id
+ )
+ AND NOT EXISTS (
+     SELECT 1 FROM continuation_dispatch_intents
      WHERE message_id = NEW.message_id
  )
 BEGIN
@@ -10404,7 +10387,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_099_preserves_legacy_ids_and_bounds_new_utf8_bytes() {
+    async fn migration_101_preserves_legacy_ids_and_bounds_new_utf8_bytes() {
         let pool = test_pool().await;
         sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY)")
             .execute(&pool)
@@ -10473,7 +10456,7 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
 
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT message_id FROM messages")
@@ -10507,6 +10490,25 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+
+        sqlx::query("DELETE FROM durable_turns WHERE conversation_id = ?1")
+            .bind(&turn_conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM messages WHERE message_id = ?1")
+            .bind(&admitted_turn)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retired_error = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
+            .bind(&admitted_turn)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(retired_error
+            .to_string()
+            .contains("message id exceeds 256 UTF-8 bytes"));
 
         let error = sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind(format!("{}a", "é".repeat(128)))

@@ -991,23 +991,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_message_identity_allows_only_snapshotted_legacy_oversize() {
+    async fn persisted_message_identity_allows_only_live_legacy_owner() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let mut req = request();
         req.message_id = "m".repeat(257);
         let canonical = persisted_message_id(&req);
+        db.create_conversation(
+            &req.conversation_id,
+            "legacy-owner",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             validate_persisted_message_id(&db, &req).await,
             Err(SendChatServiceError::MessageIdTooLong)
         ));
 
-        sqlx::query("INSERT INTO legacy_oversized_creation_message_ids (message_id) VALUES (?1)")
+        sqlx::query(
+            "INSERT INTO steering_messages
+                (message_id, conversation_id, ordinal, text)
+             VALUES (?1, ?2, 0, 'legacy')",
+        )
+        .bind(&canonical)
+        .bind(&req.conversation_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(validate_persisted_message_id(&db, &req).await.is_ok());
+        sqlx::query("DELETE FROM steering_messages WHERE message_id = ?1")
             .bind(&canonical)
             .execute(db.pool())
             .await
             .unwrap();
-
-        assert!(validate_persisted_message_id(&db, &req).await.is_ok());
+        assert!(matches!(
+            validate_persisted_message_id(&db, &req).await,
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
     }
 
     fn request() -> SendChatRequest {

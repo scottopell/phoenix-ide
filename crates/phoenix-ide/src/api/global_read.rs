@@ -1071,6 +1071,7 @@ struct BoundedMessagePage {
     content: String,
     next_cursor: Option<PreviousReadPosition>,
     truncated: bool,
+    preserves_legacy_message_id: bool,
 }
 
 #[derive(Debug)]
@@ -1484,11 +1485,15 @@ async fn render_message_page_bounded_as(
     }
     finish_read_content(&mut out, next_cursor.as_ref());
     let truncated = next_cursor.is_some();
+    let preserves_legacy_message_id = page_start
+        .as_ref()
+        .is_some_and(|start| start.message_id.len() > PREVIOUS_TITLE_BYTES);
     Ok(BoundedMessagePage {
         start: page_start,
         content: out,
         next_cursor,
         truncated,
+        preserves_legacy_message_id,
     })
 }
 
@@ -1640,6 +1645,16 @@ fn render_global_read_page(
         conv.updated_at,
         page.content,
     );
+    if let Some(start) = &page.start {
+        write!(
+            output,
+            "\nstarts_at: /c/{}#message-{} byte_offset={}",
+            conv.id,
+            percent_encode_url_component(&start.message_id),
+            start.byte_offset,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if let Some(position) = page.next_cursor {
         let cursor = encode_conversation_read_cursor(scope, &conv.id, &position)?;
         write!(
@@ -1648,7 +1663,7 @@ fn render_global_read_page(
         )
         .map_err(|error| error.to_string())?;
     }
-    if output.len() > PREVIOUS_TOOL_RESULT_BYTES {
+    if output.len() > PREVIOUS_TOOL_RESULT_BYTES && !page.preserves_legacy_message_id {
         return Err(
             "read_conversation result metadata exceeded the host byte ceiling; use a conversation with bounded metadata"
                 .to_string(),
@@ -2627,6 +2642,41 @@ mod tests {
         assert!(output.len() <= PREVIOUS_TOOL_RESULT_BYTES);
         assert!(!output.contains(&"t".repeat(PREVIOUS_TITLE_BYTES + 1)));
         assert!(!output.contains(&"s".repeat(PREVIOUS_TITLE_BYTES + 1)));
+    }
+
+    #[tokio::test]
+    async fn global_and_chain_reads_preserve_legacy_oversized_message_identity() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("legacy-id", "legacy-id", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let message_id = "m".repeat(PREVIOUS_TOOL_RESULT_BYTES);
+        sqlx::query("DROP TRIGGER messages_bound_new_message_id_bytes")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            &message_id,
+            "legacy-id",
+            1,
+            &crate::db::MessageContent::user("legacy evidence"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let retriever = db.fts_retriever();
+        let service = GlobalReadService::new(db, Arc::new(retriever));
+
+        let global = service.read_conversation("legacy-id", None).await.unwrap();
+        let chain = service
+            .read_chain_conversation("legacy-id", "legacy-id", None)
+            .await
+            .unwrap();
+
+        let encoded = format!("message-{}", &message_id);
+        assert!(global.contains(&encoded));
+        assert!(chain.contains(&encoded));
     }
 
     #[test]

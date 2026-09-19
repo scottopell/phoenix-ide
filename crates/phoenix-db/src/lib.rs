@@ -11667,17 +11667,22 @@ impl Database {
         Ok(rows)
     }
 
-    /// Returns whether migration-owned recovery permits materializing an oversized message ID.
+    /// Returns whether a live pre-bound owner permits materializing an oversized message ID.
     ///
     /// # Errors
     ///
-    /// Returns an error if the compatibility snapshot cannot be queried.
+    /// Returns an error if the owner relations cannot be queried.
     pub async fn is_legacy_oversized_message_id(&self, message_id: &str) -> DbResult<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
-                 SELECT 1
-                 FROM legacy_oversized_creation_message_ids
-                 WHERE message_id = ?1
+                 SELECT 1 FROM conversation_creation_jobs WHERE message_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM durable_turns
+                 WHERE COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key) = ?1
+                 UNION ALL
+                 SELECT 1 FROM steering_messages WHERE message_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM continuation_dispatch_intents WHERE message_id = ?1
              )",
         )
         .bind(message_id)

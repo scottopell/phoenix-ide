@@ -5104,7 +5104,7 @@ impl RuntimeManager {
                 );
                 let registry = match conv.conv_mode {
                     ConvMode::Explore { .. } if approved_task_objective.is_some() => {
-                        ToolRegistry::direct(agent_catalog.to_vec())
+                        ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
                     }
                     ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                         ToolRegistry::explore(
@@ -5113,22 +5113,7 @@ impl RuntimeManager {
                             ExploreToolPolicy::from_platform(&self.platform),
                         )
                     }
-                    ConvMode::Direct => {
-                        // Full tool suite for Direct mode. `propose_task` (the
-                        // fork proposal) is offered only when the working dir is
-                        // inside a git repo — a fork cuts from the repository's
-                        // default branch (REQ-PROJ-036).
-                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
-                        let registry =
-                            if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
-                                .is_some()
-                            {
-                                registry.with_propose_task()
-                            } else {
-                                registry
-                            };
-                        registry
-                    }
+                    ConvMode::Direct => ToolRegistry::direct(agent_catalog.to_vec()),
                     ConvMode::Work { .. }
                     | ConvMode::Branch { .. }
                     | ConvMode::DetachedApprovedTask { .. } => {
