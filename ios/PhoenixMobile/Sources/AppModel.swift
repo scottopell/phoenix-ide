@@ -84,6 +84,7 @@ enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
     case segmentIdentityChanged
     case missingCursor
     case repeatedCursor
+    case staleServerGeneration
 
     var errorDescription: String? {
         switch self {
@@ -91,6 +92,27 @@ enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
         case .aggregateIdentityChanged: "Product History changed identity while loading."
         case .segmentIdentityChanged: "Product History lineage changed while loading."
         case .missingCursor, .repeatedCursor: "The server returned an invalid Product History page cursor."
+        case .staleServerGeneration: "Product History was invalidated while loading."
+        }
+    }
+}
+
+struct ProductActionGenerationTracker {
+    private var generations: [String: Int] = [:]
+
+    mutating func begin(productConversationId: String) -> Int {
+        let generation = (generations[productConversationId] ?? 0) + 1
+        generations[productConversationId] = generation
+        return generation
+    }
+
+    func isCurrent(_ generation: Int, productConversationId: String) -> Bool {
+        generations[productConversationId] == generation
+    }
+
+    mutating func end(_ generation: Int, productConversationId: String) {
+        if isCurrent(generation, productConversationId: productConversationId) {
+            generations[productConversationId] = nil
         }
     }
 }
@@ -147,7 +169,7 @@ final class AppModel {
     /// through the session's single drain task.
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
-    private var closeActionGeneration = 0
+    private var closeActionGenerations = ProductActionGenerationTracker()
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -319,49 +341,51 @@ final class AppModel {
             latestTranscriptRowId: latestTranscriptRowId)
     }
 
+    func cachedProductHistory(productConversationId: String) -> ProductConversationSnapshot? {
+        ProductHistorySnapshotStore.load(productConversationId: productConversationId)
+    }
+
     func loadProductHistory(productConversationId: String) async throws -> ProductConversationSnapshot {
         guard let api, connectivity.isOnline else {
-            if let cached = ProductHistorySnapshotStore.load(
-                productConversationId: productConversationId)
-            {
+            if let cached = cachedProductHistory(productConversationId: productConversationId) {
                 return cached
             }
             throw APIError.transport(underlying: URLError(.notConnectedToInternet))
         }
-
-        do {
-            var pages: [ProductConversationSnapshot] = []
-            var before: String?
-            var seenCursors: Set<String> = []
-            repeat {
-                let page = try await api.getProductConversation(
-                    reference: productConversationId,
-                    before: before)
-                guard page.product_conversation_id == productConversationId else {
-                    throw ProductHistoryLoadError.aggregateIdentityChanged
-                }
-                pages.append(page)
-                guard page.has_older else { break }
-                guard let next = page.before, !next.isEmpty else {
-                    throw ProductHistoryLoadError.missingCursor
-                }
-                guard seenCursors.insert(next).inserted else {
-                    throw ProductHistoryLoadError.repeatedCursor
-                }
-                before = next
-            } while true
-
-            let snapshot = try ProductHistorySnapshotStore.merge(pages)
-            ProductHistorySnapshotStore.save(snapshot)
-            return snapshot
-        } catch let error as APIError where error.isTransport {
-            if let cached = ProductHistorySnapshotStore.load(
-                productConversationId: productConversationId)
-            {
-                return cached
+        let startedGeneration = apiGeneration
+        var pages: [ProductConversationSnapshot] = []
+        var before: String?
+        var seenCursors: Set<String> = []
+        repeat {
+            let page = try await api.getProductConversation(
+                reference: productConversationId,
+                before: before)
+            guard !Task.isCancelled, apiGeneration == startedGeneration else {
+                throw ProductHistoryLoadError.staleServerGeneration
             }
-            throw error
+            guard page.product_conversation_id == productConversationId else {
+                throw ProductHistoryLoadError.aggregateIdentityChanged
+            }
+            pages.append(page)
+            guard page.has_older else { break }
+            guard let next = page.before, !next.isEmpty else {
+                throw ProductHistoryLoadError.missingCursor
+            }
+            guard seenCursors.insert(next).inserted else {
+                throw ProductHistoryLoadError.repeatedCursor
+            }
+            before = next
+        } while true
+
+        guard !Task.isCancelled, apiGeneration == startedGeneration else {
+            throw ProductHistoryLoadError.staleServerGeneration
         }
+        let snapshot = try ProductHistorySnapshotStore.merge(pages)
+        guard apiGeneration == startedGeneration else {
+            throw ProductHistoryLoadError.staleServerGeneration
+        }
+        ProductHistorySnapshotStore.save(snapshot)
+        return snapshot
     }
 
     func navigationConversationId(for conversation: Conversation) -> String {
@@ -498,9 +522,14 @@ final class AppModel {
         guard closingProductConversationIds.insert(conversation.aggregateIdentity).inserted else {
             return false
         }
-        defer { closingProductConversationIds.remove(conversation.aggregateIdentity) }
-        closeActionGeneration += 1
-        let startedCloseActionGeneration = closeActionGeneration
+        let startedCloseActionGeneration = closeActionGenerations.begin(
+            productConversationId: conversation.aggregateIdentity)
+        defer {
+            closingProductConversationIds.remove(conversation.aggregateIdentity)
+            closeActionGenerations.end(
+                startedCloseActionGeneration,
+                productConversationId: conversation.aggregateIdentity)
+        }
         let hasInMemoryMessages = transcriptIds.contains {
             sessions[$0]?.outbox.visibleEntries.isEmpty == false
         }
@@ -554,7 +583,10 @@ final class AppModel {
             return true
         } catch {
             guard apiGeneration == startedGeneration,
-                  closeActionGeneration == startedCloseActionGeneration else { return false }
+                  closeActionGenerations.isCurrent(
+                      startedCloseActionGeneration,
+                      productConversationId: conversation.aggregateIdentity)
+            else { return false }
             lastActionError = error.localizedDescription
             return false
         }

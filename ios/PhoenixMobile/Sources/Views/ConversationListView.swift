@@ -329,9 +329,16 @@ private struct ProductHistoryView: View {
                 ProgressView("Loading history…")
             }
         }
-        .task {
-            do { snapshot = try await model.loadProductHistory(productConversationId: productConversationId) }
-            catch { self.error = error.localizedDescription }
+        .task(id: productConversationId) {
+            snapshot = model.cachedProductHistory(productConversationId: productConversationId)
+            error = nil
+            do {
+                snapshot = try await model.loadProductHistory(productConversationId: productConversationId)
+            } catch is CancellationError {
+                return
+            } catch {
+                if snapshot == nil { self.error = error.localizedDescription }
+            }
         }
     }
 }
