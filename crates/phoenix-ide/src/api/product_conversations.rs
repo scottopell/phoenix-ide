@@ -61,10 +61,9 @@ pub async fn close_product_conversation(
             .await
             .map_err(db_to_app)?
             .aggregate;
-        match crate::api::lifecycle_handlers::close_legacy_compat(
+        match crate::api::lifecycle_handlers::close_product_conversation_direct(
             &state,
             &product_conversation.latest_transcript_row_id,
-            "archive",
         )
         .await
         {
