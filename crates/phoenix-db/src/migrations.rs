@@ -540,6 +540,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_close_ambient_writer_indeterminate_cause",
         sql: MIGRATION_104,
     },
+    Migration {
+        version: 105,
+        name: "guard_close_participant_deleted_settlement",
+        sql: MIGRATION_105,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -10756,6 +10761,25 @@ BEGIN
 END;
 ";
 
+const MIGRATION_105: &str = r"
+CREATE TRIGGER close_attempt_participants_reject_unclaimed_deleted_settlement
+BEFORE UPDATE OF settlement_state ON close_attempt_participants
+WHEN NEW.settlement_state = 'deleted'
+ AND OLD.settlement_state <> 'deleted'
+ AND NOT EXISTS (
+     SELECT 1 FROM conversation_creation_jobs job
+     WHERE job.conversation_id = NEW.conversation_id
+       AND job.status = 'deletion_pending'
+       AND job.cleanup_worker_id IS NOT NULL
+       AND job.cleanup_token IS NOT NULL
+       AND job.cleanup_lease_until IS NOT NULL
+       AND job.cleanup_lease_until > STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'close participant deletion settlement requires active cleanup claim');
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15722,7 +15746,8 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard')",
         )
         .execute(&pool)
         .await
@@ -16615,7 +16640,8 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard')",
         )
         .execute(pool)
         .await
@@ -17346,7 +17372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_101_allows_only_settled_legacy_member_delete() {
+    async fn migration_102_allows_only_claimed_deleted_participant_member_delete() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE close_obligations (
@@ -17366,6 +17392,10 @@ mod tests {
                  captured_work_scope_id TEXT,
                  PRIMARY KEY (attempt_id, conversation_id)
              );
+             CREATE TABLE conversation_creation_jobs (
+                 conversation_id TEXT, status TEXT, cleanup_worker_id TEXT,
+                 cleanup_token TEXT, cleanup_lease_until TEXT
+             );
              INSERT INTO close_obligations VALUES ('attempt', 'retirement_requested', 1);
              INSERT INTO close_attempt_scopes VALUES ('attempt', 'scope');
              INSERT INTO close_attempt_participants VALUES ('attempt', 'conversation', 'live');
@@ -17380,6 +17410,7 @@ mod tests {
         .unwrap();
 
         sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_105).execute(&pool).await.unwrap();
         let live_delete = sqlx::query(
             "DELETE FROM close_attempt_members
              WHERE attempt_id='attempt' AND conversation_id='conversation'",
@@ -17390,6 +17421,25 @@ mod tests {
         assert!(live_delete
             .to_string()
             .contains("captured member scope is targeted by close attempt"));
+
+        let unclaimed = sqlx::query(
+            "UPDATE close_attempt_participants SET settlement_state='deleted'
+             WHERE attempt_id='attempt' AND conversation_id='conversation'",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("deleted settlement requires the conversation deletion claim");
+        assert!(unclaimed
+            .to_string()
+            .contains("close participant deletion settlement requires active cleanup claim"));
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs VALUES (
+                 'conversation', 'deletion_pending', 'worker', 'token', '9999-01-01T00:00:00.000Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "UPDATE close_attempt_participants SET settlement_state='deleted'

@@ -6922,8 +6922,28 @@ mod tests {
         db.begin_close_active_work_settlement("deleted-a-attempt")
             .await
             .unwrap();
-        sqlx::query(
+        let unclaimed = sqlx::query(
             "UPDATE close_attempt_participants SET settlement_state = 'deleted'
+             WHERE attempt_id = 'deleted-a-attempt' AND conversation_id = 'deleted-a'",
+        )
+        .execute(db.pool())
+        .await
+        .expect_err("live participant cannot claim deletion settlement");
+        assert!(unclaimed
+            .to_string()
+            .contains("close participant deletion settlement requires active cleanup claim"));
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, generation, intent_json, accepted_at,
+                 deletion_requested_at, created_at, updated_at,
+                 cleanup_worker_id, cleanup_token, cleanup_lease_until
+             ) VALUES (
+                 'deleted-a-job', 'deleted-a', 'deletion_pending', 'validate_intent', 1, '{}',
+                 '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z',
+                 '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z',
+                 'worker', 'token', '9999-01-01T00:00:00.000Z'
+             );
+             UPDATE close_attempt_participants SET settlement_state = 'deleted'
              WHERE attempt_id = 'deleted-a-attempt' AND conversation_id = 'deleted-a'",
         )
         .execute(db.pool())

@@ -1744,6 +1744,9 @@ impl RuntimeManager {
                                     )
                                     .await
                                     .map_err(map_close_retirement_db_error)?;
+                                self.cancel_close_resource_leases(attempt_id)
+                                    .await
+                                    .map_err(CloseRetirementError::Message)?;
                                 return Err(CloseRetirementError::Message(residual.detail));
                             }
                             Err(reason) => {
@@ -4509,9 +4512,12 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 != i32::try_from(size_of::<ProcRegionWithPathInfo>())
                     .expect("region path info size fits i32")
             {
-                // Ambient process inspection is observational. A short kernel
-                // result proves nothing about this process, so skip it.
-                break;
+                return Err(AmbientWriterIndeterminateDiagnostic {
+                    detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                    operation: AmbientWriterDiagnosticOperation::ReadMappings,
+                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                }
+                .marker());
             }
             let info = unsafe { info.assume_init() };
             let Some(next) = info.region.address.checked_add(info.region.size) else {
