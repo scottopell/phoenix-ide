@@ -405,7 +405,8 @@ final class AppModel {
                     sessions[transcriptId] = nil
                 }
             }
-            listStore.remove(aggregateId: conversation.aggregateIdentity)
+            await listStore.refresh(api: api)
+            guard apiGeneration == startedGeneration else { return false }
             UNUserNotificationCenter.current().removeDeliveredNotifications(
                 withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
             UNUserNotificationCenter.current().removePendingNotificationRequests(
