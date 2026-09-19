@@ -243,7 +243,7 @@ describe('ReleaseUpdatePanel', () => {
       .mockImplementationOnce(() => json(previous))
       .mockImplementationOnce(() => json({ ...previous, transaction_id: 'tx-handoff', state: 'activating' }));
     render(<ReleaseUpdatePanel />);
-    await screen.findByText(/previous runtime artifacts restored and verified \(database unchanged\)/i);
+    await screen.findByText(/previous runtime artifacts restored and verified \(database not restored\)/i);
     fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
     fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
     expect(await screen.findByText(/approval handed off/i)).toBeInTheDocument();
@@ -552,7 +552,7 @@ describe('ReleaseUpdatePanel', () => {
     };
     vi.mocked(fetch).mockImplementation(() => json(rolledBack));
     const view = render(<ReleaseUpdatePanel />);
-    expect(await screen.findByText(/previous runtime artifacts restored and verified \(database unchanged\)/i)).toBeInTheDocument();
+    expect(await screen.findByText(/previous runtime artifacts restored and verified \(database not restored\)/i)).toBeInTheDocument();
 
     vi.mocked(fetch).mockImplementation(() => json({
       ...rolledBack,
