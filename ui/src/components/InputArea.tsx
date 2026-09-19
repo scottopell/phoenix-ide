@@ -436,6 +436,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // restore the draft if an ExpansionError comes back (user must fix the
     // broken @reference before re-sending).
     const previousVoiceBase = voiceBase;
+    const previousVoiceInterim = voiceInterim;
     if (voiceBase !== null) {
       setVoiceBase(null);
       setVoiceInterim('');
@@ -456,6 +457,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         }
         if (previousVoiceBase !== null) {
           setVoiceBase(previousVoiceBase);
+          setVoiceInterim(previousVoiceInterim);
         } else {
           setDraft(text);
         }

@@ -937,15 +937,13 @@ export class ExpansionError extends Error {
  *  Branch-mode conversation on the same branch). `continuation_id` is set
  *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
  *  route to the continuation without parsing the error message. */
-export interface ConflictErrorDetail {
+interface ConflictErrorDetailBase {
   attempt_id?: string;
   active_transcript_id?: string;
   recovery_action?: {
     method: 'POST';
     path: string;
   };
-  failed_invariant?: string;
-  failed_relation?: string;
   ambient_writer_indeterminate?: {
     detector: "native_process_inventory" | "macos_proc_pidinfo" | "linux_procfs";
     operation:
@@ -969,6 +967,11 @@ export interface ConflictErrorDetail {
   can_auto_stash?: boolean;
   continuation_id?: string;
 }
+
+export type ConflictErrorDetail = ConflictErrorDetailBase & (
+  | { failed_invariant: string; failed_relation: string }
+  | { failed_invariant?: never; failed_relation?: never }
+);
 
 /** Thrown by API methods that return 409 with a typed conflict payload. */
 export class ConflictError extends Error {
