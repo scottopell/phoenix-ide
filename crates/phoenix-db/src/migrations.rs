@@ -727,6 +727,10 @@ BEFORE INSERT ON messages
 FOR EACH ROW
 WHEN length(CAST(NEW.message_id AS BLOB)) > 256
  AND NOT EXISTS (
+     SELECT 1 FROM messages
+     WHERE message_id = NEW.message_id
+ )
+ AND NOT EXISTS (
      SELECT 1 FROM conversation_creation_jobs
      WHERE message_id = NEW.message_id
  )
@@ -10478,6 +10482,18 @@ mod tests {
                 .unwrap(),
             legacy
         );
+        sqlx::query("INSERT OR IGNORE INTO messages (message_id) VALUES (?1)")
+            .bind(&legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let exact_replay_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(&legacy)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(exact_replay_count, 1);
         sqlx::query("INSERT INTO messages (message_id) VALUES (?1)")
             .bind("é".repeat(128))
             .execute(&pool)

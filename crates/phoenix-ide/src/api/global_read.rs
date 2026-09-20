@@ -1606,17 +1606,19 @@ async fn format_global_search_hits(
             }
             Err(_) => (hit.conversation_id.clone(), None),
         };
-        let link =
-            href.unwrap_or_else(|| format!("@conv:{} msg:{}", hit.conversation_id, hit.message_id));
+        let encoded_message_id = percent_encode_url_component(&hit.message_id);
+        let link = href.unwrap_or_else(|| {
+            format!("@conv:{}#message-{encoded_message_id}", hit.conversation_id)
+        });
         let _ = writeln!(
             out,
-            "- [{} · {} · {}]({}) @conv:{} msg:{} — {}",
+            "- [{} · {} · {}]({}) @conv:{}#message-{} — {}",
             title,
             hit.message_type,
             hit.created_at.format("%Y-%m-%d"),
             link,
             hit.conversation_id,
-            hit.message_id,
+            encoded_message_id,
             hit.snippet.trim()
         );
     }
@@ -1778,22 +1780,19 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         );
     }
     let base = format!("/c/{}", conv.id);
+    let encoded_message_id = percent_encode_url_component(&message.message_id);
     let href = if message_type_has_rendered_anchor(message.message_type) {
-        format!(
-            "{base}#message-{}",
-            percent_encode_url_component(&message.message_id)
-        )
+        format!("{base}#message-{encoded_message_id}")
     } else {
         base
     };
     format!(
-        "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
+        "[{} · {}]({}) @conv:{}#message-{}\n{}\n\n",
         role,
         message.created_at.format("%Y-%m-%d %H:%M"),
-        message.message_id,
         href,
         conv.id,
-        message.message_id,
+        encoded_message_id,
         render_full_message_text(message)
     )
 }
@@ -1811,13 +1810,12 @@ fn render_previous_message_line(conv: &Conversation, message: &crate::db::Messag
     let href =
         previous_conversation_message_href(conv, Some((&message.message_id, message.message_type)));
     format!(
-        "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
+        "[{} · {}]({}) @conv:{}#message-{}\n{}\n\n",
         role,
         message.created_at.format("%Y-%m-%d %H:%M"),
-        message.message_id,
         href,
         conv.id,
-        message.message_id,
+        percent_encode_url_component(&message.message_id),
         render_full_message_text(message)
     )
 }
@@ -2310,13 +2308,14 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_conversation_read_cursor, encode_conversation_read_cursor, message_id_fragment,
-        message_is_hidden, parse_conv_handle, read_measurement, render_full_message_text,
-        render_previous_message_line, serialize_previous_transcripts_output_bounded,
-        split_fragment, ConversationReadCursorScope, GlobalMessageTargetError, GlobalReadService,
-        PreviousReadPosition, PreviousTranscriptReadStart, PreviousTranscriptsBinding,
-        PreviousTranscriptsOutput, PreviousTranscriptsRequest, PREVIOUS_READ_CONTENT_JSON_BYTES,
-        PREVIOUS_TITLE_BYTES, PREVIOUS_TOOL_RESULT_BYTES,
+        decode_conversation_read_cursor, encode_conversation_read_cursor,
+        format_global_search_hits, message_id_fragment, message_is_hidden, parse_conv_handle,
+        read_measurement, render_full_message_text, render_previous_message_line,
+        serialize_previous_transcripts_output_bounded, split_fragment, ConversationReadCursorScope,
+        GlobalMessageTargetError, GlobalReadService, PreviousReadPosition,
+        PreviousTranscriptReadStart, PreviousTranscriptsBinding, PreviousTranscriptsOutput,
+        PreviousTranscriptsRequest, PREVIOUS_READ_CONTENT_JSON_BYTES, PREVIOUS_TITLE_BYTES,
+        PREVIOUS_TOOL_RESULT_BYTES,
     };
     use std::sync::Arc;
 
@@ -2727,12 +2726,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_search_handles_percent_encode_message_ids() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("search-encoded", "search-encoded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let hits = vec![crate::db::RetrievedChunk {
+            conversation_id: "search-encoded".to_string(),
+            message_id: "id with%20 and#fragment".to_string(),
+            chunk: crate::db::ChunkRef {
+                ordinal: 0,
+                char_range: None,
+            },
+            message_type: crate::db::MessageType::User,
+            created_at: chrono::Utc::now(),
+            snippet: "evidence".to_string(),
+            score: 0.0,
+            transcript_generation: 0,
+            message_count: 1,
+        }];
+
+        let output = format_global_search_hits(&service, &hits).await;
+
+        assert!(output.contains("@conv:search-encoded#message-id%20with%2520%20and%23fragment"));
+        assert!(!output.contains("msg:id with%20"));
+    }
+
+    #[tokio::test]
     async fn global_and_chain_message_links_percent_encode_delimiters() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         db.create_conversation("encoded-link", "encoded-link", "/tmp", true, None, None)
             .await
             .unwrap();
-        let message_id = "message )#% with-space";
+        let message_id = "message ] )#% with-space";
         db.add_message_with_seq(
             message_id,
             "encoded-link",
@@ -2754,11 +2781,11 @@ mod tests {
             .await
             .unwrap();
 
-        let encoded = "message-message%20%29%23%25%20with-space";
+        let encoded = "message-message%20%5D%20%29%23%25%20with-space";
         assert!(global.contains(encoded));
         assert!(chain.contains(encoded));
-        assert!(!global.contains("#message-message )#% with-space"));
-        assert!(!chain.contains("#message-message )#% with-space"));
+        assert!(!global.contains("message ] )#% with-space"));
+        assert!(!chain.contains("message ] )#% with-space"));
     }
 
     #[test]

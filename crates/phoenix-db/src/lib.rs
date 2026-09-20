@@ -60,9 +60,9 @@ pub use product_conversation_read::{
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
-    FreshRetrieval, FreshRetrievalRequest, Fts5Retriever, MessageRetriever, ReconcileStats,
-    RetrievalError, RetrievalGrouping, RetrievalMatchMode, RetrievalRequest, RetrievalScope,
-    RetrievalVisibility, RetrievedChunk,
+    ChunkRef, FreshRetrieval, FreshRetrievalRequest, Fts5Retriever, MessageRetriever,
+    ReconcileStats, RetrievalError, RetrievalGrouping, RetrievalMatchMode, RetrievalRequest,
+    RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
 pub use sqlite_workload::{
