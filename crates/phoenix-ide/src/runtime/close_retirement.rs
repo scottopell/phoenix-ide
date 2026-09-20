@@ -3944,7 +3944,14 @@ where
         );
     }
     let object = tombstone.root.join("object");
-    let identity_still_present = object.join(".git").try_exists().unwrap_or(false);
+    let identity_still_present = match object.join(".git").try_exists() {
+        Ok(present) => present,
+        Err(error) => {
+            return FinalTombstoneRecovery::Residual(format!(
+                "cannot observe recorded final tombstone worktree identity; preserved for manual repair: {error}"
+            ))
+        }
+    };
     if identity_still_present
         && observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity)
     {
@@ -7482,6 +7489,44 @@ mod tests {
             FinalTombstoneRecovery::Completed
         ));
         assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_preserves_object_when_git_identity_is_ambiguous() {
+        use std::os::unix::fs::{symlink, MetadataExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        std::fs::write(target.join("original"), "original\n").unwrap();
+        run_git(&target, &["add", "original"]);
+        run_git(&target, &["commit", "--quiet", "-m", "original"]);
+        let identity = inspection_identity(&target);
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let object = root.join("object");
+        std::fs::rename(&target, &object).unwrap();
+        let root_metadata = std::fs::symlink_metadata(&root).unwrap();
+        let object_metadata = std::fs::symlink_metadata(&object).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: root_metadata.dev(),
+            inode: root_metadata.ino(),
+            object_device: Some(object_metadata.dev()),
+            object_inode: Some(object_metadata.ino()),
+        };
+        std::fs::remove_dir_all(object.join(".git")).unwrap();
+        symlink(".git", object.join(".git")).unwrap();
+
+        let recovery = resume_final_worktree_tombstone(&recorded, &identity);
+        assert!(matches!(
+            recovery,
+            FinalTombstoneRecovery::Residual(detail)
+                if detail.contains("cannot observe recorded final tombstone worktree identity")
+        ));
+        assert!(object.join("original").is_file());
+        assert!(std::fs::symlink_metadata(object.join(".git")).is_ok());
     }
 
     #[cfg(unix)]
