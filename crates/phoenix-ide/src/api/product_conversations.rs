@@ -1570,7 +1570,7 @@ mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
