@@ -13273,7 +13273,7 @@ async fn insert_conversation_tx(
 /// `tool_result_message_id`) so the restart-materialized result shares identity
 /// with the row the live path would have written: `{tool_use_id}-result`.
 fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
+    phoenix_core::domain::sm_event::persisted_tool_result_message_id(tool_use_id)
 }
 
 /// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring

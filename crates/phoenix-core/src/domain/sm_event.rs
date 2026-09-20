@@ -365,6 +365,21 @@ pub fn exact_payload_fingerprint(bytes: &[u8]) -> String {
     out
 }
 
+/// Derive a stable, persistence-safe message identity for a tool result.
+/// Provider IDs that fit retain the historical representation; oversized IDs
+/// map to a collision-resistant bounded identity before any tool effect runs.
+#[must_use]
+pub fn persisted_tool_result_message_id(tool_use_id: &str) -> String {
+    const SUFFIX: &str = "-result";
+    if tool_use_id.len().saturating_add(SUFFIX.len()) <= 256 {
+        return format!("{tool_use_id}{SUFFIX}");
+    }
+    format!(
+        "tool-{}{SUFFIX}",
+        exact_payload_fingerprint(tool_use_id.as_bytes())
+    )
+}
+
 /// A steering message queued for delivery when the conversation next reaches
 /// `Idle`. The in-memory form of a pending steer; persisted across the
 /// normalized `steering_messages` (+ attachment) tables by the DB layer.

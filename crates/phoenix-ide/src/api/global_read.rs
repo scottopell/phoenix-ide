@@ -325,7 +325,7 @@ pub(crate) fn serialize_previous_transcripts_output_bounded(
             PreviousTranscriptsOutput::ReadPage {
                 starts_at: Some(start),
                 ..
-            } if start.message_id.len() > PREVIOUS_TITLE_BYTES
+            } if start.message_ref.len() > PREVIOUS_TITLE_BYTES
         )
     {
         return Ok(json);
@@ -377,7 +377,6 @@ pub(crate) struct PreviousTranscriptSummary {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PreviousTranscriptReadStart {
-    message_id: String,
     message_ref: String,
     byte_offset: usize,
 }
@@ -963,7 +962,6 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                     conv.id,
                     percent_encode_url_component(&start.message_id)
                 ),
-                message_id: start.message_id,
                 byte_offset: start.byte_offset,
             }),
             content: page.content,
@@ -1373,7 +1371,7 @@ async fn render_message_page_bounded_as(
 ) -> Result<BoundedMessagePage, PreviousReadError> {
     let mut out = String::new();
     let mut encoded_content_bytes = 0usize;
-    let mut page_start = None;
+    let mut page_start: Option<PreviousReadPageStart> = None;
     let mut next_cursor = None;
     let mut after_sequence = None;
     let mut cursor_pending = cursor.message_id.is_some();
@@ -1412,6 +1410,19 @@ async fn render_message_page_bounded_as(
                     ));
                 }
                 continue;
+            }
+            if message.message_id.len() > PREVIOUS_TITLE_BYTES
+                && page_start
+                    .as_ref()
+                    .is_some_and(|start| start.message_id != message.message_id)
+            {
+                next_cursor = Some(PreviousReadPosition {
+                    message_sequence: message.sequence_id,
+                    byte_offset: 0,
+                    message_id: Some(message.message_id.clone()),
+                    rendered_sha256: None,
+                });
+                break;
             }
             let message = db
                 .get_message_by_id_in_conversation(&conv.id, &message.message_id)
@@ -1810,6 +1821,15 @@ fn render_previous_message_line(conv: &Conversation, message: &crate::db::Messag
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
     };
+    if message.message_id.len() > PREVIOUS_TITLE_BYTES {
+        return format!(
+            "[{} · {}] @conv:{}\n{}\n\n",
+            role,
+            message.created_at.format("%Y-%m-%d %H:%M"),
+            conv.id,
+            render_full_message_text(message)
+        );
+    }
     let href =
         previous_conversation_message_href(conv, Some((&message.message_id, message.message_type)));
     format!(
@@ -2124,7 +2144,11 @@ async fn resolve_message(
         ));
     }
     let href = Some(if global_href {
-        format!("/global/{}#message-{}", conv.id, message.message_id)
+        format!(
+            "/global/{}#message-{}",
+            conv.id,
+            percent_encode_url_component(&message.message_id)
+        )
     } else {
         conversation_message_href(&conv, Some((&message.message_id, message.message_type)))
     });
@@ -2469,7 +2493,6 @@ mod tests {
                 immediate_predecessor: true,
             },
             starts_at: Some(super::PreviousTranscriptReadStart {
-                message_id: "message".to_string(),
                 message_ref: "@conv:pred#message-message".to_string(),
                 byte_offset: 0,
             }),
@@ -2897,7 +2920,10 @@ mod tests {
             panic!("targeted predecessor read page");
         };
 
-        assert_eq!(starts_at.expect("page start").message_id, "a-msg");
+        assert!(starts_at
+            .expect("page start")
+            .message_ref
+            .ends_with("#message-a-msg"));
         assert!(content.contains("alpha only predecessor evidence"));
     }
 
@@ -2979,7 +3005,7 @@ mod tests {
             panic!("stable ID must resolve before a colliding slug");
         };
         assert_eq!(transcript.conversation_id, later.id);
-        assert_eq!(starts_at.unwrap().message_id, "b-msg");
+        assert!(starts_at.unwrap().message_ref.ends_with("#message-b-msg"));
     }
 
     #[tokio::test]
@@ -3017,8 +3043,7 @@ mod tests {
         };
 
         let starts_at = starts_at.as_ref().expect("legacy provenance");
-        assert_eq!(starts_at.message_id, long_id);
-        assert!(starts_at.message_ref.contains(&starts_at.message_id));
+        assert!(starts_at.message_ref.contains(&long_id));
         assert!(next_cursor.is_some());
     }
 
@@ -3180,7 +3205,6 @@ mod tests {
             panic!("expected read page, got {output:?}");
         };
         let starts_at = starts_at.expect("non-empty page start provenance");
-        assert_eq!(starts_at.message_id, "a-msg");
         assert_eq!(starts_at.message_ref, "@conv:pred-a#message-a-msg");
         assert_eq!(starts_at.byte_offset, 0);
         assert!(content.contains("\n\t  alpha only predecessor evidence  \n\n"));
@@ -3194,7 +3218,10 @@ mod tests {
         else {
             panic!("expected targeted read page, got {fragmented:?}");
         };
-        assert_eq!(starts_at.expect("targeted page start").message_id, "a-msg");
+        assert!(starts_at
+            .expect("targeted page start")
+            .message_ref
+            .ends_with("#message-a-msg"));
         assert!(content.contains("alpha only predecessor evidence"));
 
         let invalid_cursor_output = service
@@ -3264,7 +3291,7 @@ mod tests {
                 panic!("expected continuation read page, got {page:?}");
             };
             if let Some(start) = starts_at {
-                if start.message_id == "huge-msg" && start.byte_offset > 0 {
+                if start.message_ref.ends_with("#message-huge-msg") && start.byte_offset > 0 {
                     saw_intra_message_start = true;
                 }
             }
@@ -3406,12 +3433,11 @@ mod tests {
             continuation,
             PreviousTranscriptsOutput::ReadPage {
                 starts_at: Some(PreviousTranscriptReadStart {
-                    ref message_id,
+                    ref message_ref,
                     byte_offset: 1,
-                    ..
                 }),
                 ..
-            } if message_id == "large-target"
+            } if message_ref.ends_with("#message-large-target")
         ));
     }
 

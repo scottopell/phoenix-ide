@@ -106,7 +106,23 @@ impl CheckpointData {
 /// prevents silent divergence.
 #[must_use]
 pub fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
+    phoenix_core::domain::sm_event::persisted_tool_result_message_id(tool_use_id)
+}
+
+#[cfg(test)]
+mod tool_result_identity_tests {
+    use super::tool_result_message_id;
+
+    #[test]
+    fn oversized_provider_tool_ids_map_to_stable_bounded_message_ids() {
+        let provider_id = "t".repeat(300);
+        let first = tool_result_message_id(&provider_id);
+        let second = tool_result_message_id(&provider_id);
+        assert_eq!(first, second);
+        assert!(first.len() <= 256);
+        assert_ne!(first, tool_result_message_id(&format!("{provider_id}x")));
+        assert_eq!(tool_result_message_id("tool-1"), "tool-1-result");
+    }
 }
 
 /// Effects to be executed after state transition
