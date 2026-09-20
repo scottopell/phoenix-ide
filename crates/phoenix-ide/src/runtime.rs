@@ -4927,7 +4927,7 @@ impl RuntimeManager {
             .model
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id());
-        let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
+        let model_id = self.llm_registry.resolve_model_id(&stored_model_id)?;
         let context_window = self.llm_registry.context_window(&model_id);
         let approved_task_objective = self
             .db
