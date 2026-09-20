@@ -1271,6 +1271,10 @@ final class AppModel {
     }
 
     #if DEBUG
+    func installAPIForTesting(baseURL: URL = URL(string: "http://127.0.0.1:1")!) {
+        api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)
+    }
+
     func cancelAggregateReconciliationForTesting() {
         cancelAggregateReconciliation()
     }
