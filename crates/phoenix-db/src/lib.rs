@@ -8323,14 +8323,34 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database query fails.
     pub async fn product_conversation_member_ids(&self, root_id: &str) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT member.id
-             FROM conversations AS root
+            "WITH RECURSIVE parent_chain(id, next_id, depth) AS (
+                 SELECT root.id, root.continued_in_conv_id, 0
+                 FROM conversations AS requested
+                 JOIN conversations AS root
+                   ON root.product_conversation_id = requested.product_conversation_id
+                 WHERE requested.id = ?1
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations AS predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, successor.continued_in_conv_id, parent_chain.depth + 1
+                 FROM conversations AS successor
+                 JOIN parent_chain ON successor.id = parent_chain.next_id
+             )
+             SELECT member.id
+             FROM conversations AS requested
              JOIN conversations AS member
-               ON member.product_conversation_id = root.product_conversation_id
-             WHERE root.id = ?1
+               ON member.product_conversation_id = requested.product_conversation_id
+             LEFT JOIN parent_chain ON parent_chain.id = member.id
+             WHERE requested.id = ?1
              ORDER BY CASE WHEN member.runtime_role = 'sub_agent' THEN 0 ELSE 1 END,
-                      member.created_at,
-                      member.id",
+                      CASE WHEN member.runtime_role = 'sub_agent' THEN member.created_at END,
+                      CASE WHEN member.runtime_role = 'sub_agent' THEN member.id END,
+                      parent_chain.depth",
         )
         .bind(root_id)
         .fetch_all(&self.pool)
@@ -9942,6 +9962,14 @@ impl Database {
                 match commit {
                     Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())),
                     Err(commit_error) => {
+                        if sqlx::query("ROLLBACK")
+                            .execute(&mut *connection)
+                            .await
+                            .is_err()
+                        {
+                            return crate::workflow::LocalAuthorityResult::DurableFactUnclassified;
+                        }
+
                         let mut present = 0;
                         for id in ids {
                             let exists = sqlx::query_scalar::<_, bool>(
@@ -9959,7 +9987,6 @@ impl Database {
                             }
                         }
                         if present == ids.len() {
-                            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
                             crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
                                 commit_error,
                             ))
@@ -25076,10 +25103,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_conversation_members_include_subordinate_participants() {
+    async fn product_conversation_members_put_subordinates_first_and_parents_in_topology_order() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
             .create_conversation("member-root", "member-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let continuation = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        sqlx::query("UPDATE conversations SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1")
+            .bind(&continuation.id)
+            .execute(db.pool())
             .await
             .unwrap();
         let child = db
@@ -25105,7 +25152,39 @@ mod tests {
 
         let members = db.product_conversation_member_ids(&root.id).await.unwrap();
 
-        assert_eq!(members, vec![child.id, root.id]);
+        assert_eq!(members, vec![child.id, root.id, continuation.id]);
+    }
+
+    #[tokio::test]
+    async fn failed_commit_is_rolled_back_before_deleted_rows_are_classified() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("commit-root", "commit-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE commit_blocker (
+                 conversation_id TEXT NOT NULL,
+                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO commit_blocker (conversation_id) VALUES ('commit-root')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let result = db
+            .delete_conversations_atomically_with_authority(&["commit-root".to_string()])
+            .await;
+
+        assert!(matches!(
+            result,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(_))
+        ));
+        assert!(db.get_conversation("commit-root").await.is_ok());
     }
 
     #[tokio::test]

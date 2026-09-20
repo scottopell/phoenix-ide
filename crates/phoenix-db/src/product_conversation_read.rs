@@ -384,7 +384,23 @@ impl Database {
         reference: &str,
         title: &str,
     ) -> DbResult<ProductConversationId> {
-        self.mutate_ordinary_product_conversation_title_authority(reference, Some(title))
+        self.mutate_ordinary_product_conversation_title_authority(reference, title)
+            .await
+    }
+
+    /// Sets the compatibility chain-name override without replacing the aggregate title fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// [`DbError::ProductConversationUnavailable`] when the aggregate is in History,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn set_ordinary_product_conversation_legacy_title(
+        &self,
+        reference: &str,
+        title: &str,
+    ) -> DbResult<ProductConversationId> {
+        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, Some(title))
             .await
     }
 
@@ -399,14 +415,66 @@ impl Database {
         &self,
         reference: &str,
     ) -> DbResult<ProductConversationId> {
-        self.mutate_ordinary_product_conversation_title_authority(reference, None)
+        self.mutate_ordinary_product_conversation_legacy_title_authority(reference, None)
             .await
+    }
+
+    async fn mutate_ordinary_product_conversation_legacy_title_authority(
+        &self,
+        reference: &str,
+        title: Option<&str>,
+    ) -> DbResult<ProductConversationId> {
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let now = chrono::Utc::now();
+        let result = async {
+            let resolved =
+                Self::resolve_ordinary_product_conversation_on(&mut transaction, reference).await?;
+            crate::close_foundation::require_product_conversation_admission_tx(
+                &mut transaction,
+                &resolved.requested_transcript_row_id,
+            )
+            .await?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET chain_name = ?1, updated_at = ?2
+                 WHERE product_conversation_id = ?3
+                   AND user_initiated = 1
+                   AND runtime_role = 'user'
+                   AND parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = conversations.product_conversation_id
+                         AND predecessor.continued_in_conv_id = conversations.id
+                   )",
+            )
+            .bind(title)
+            .bind(now.to_rfc3339())
+            .bind(resolved.product_conversation_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            }
+            Ok::<ProductConversationId, DbError>(resolved.product_conversation_id)
+        }
+        .await;
+        match result {
+            Ok(product_conversation_id) => {
+                transaction.commit().await?;
+                Ok(product_conversation_id)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn mutate_ordinary_product_conversation_title_authority(
         &self,
         reference: &str,
-        title: Option<&str>,
+        title: &str,
     ) -> DbResult<ProductConversationId> {
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
@@ -441,28 +509,16 @@ impl Database {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             };
             let root_id: String = row.try_get("id")?;
-            let result = if let Some(title) = title {
-                sqlx::query(
-                    "UPDATE conversations
-                     SET title = ?1, chain_name = NULL, updated_at = ?2
-                     WHERE id = ?3",
-                )
-                .bind(title)
-                .bind(now.to_rfc3339())
-                .bind(&root_id)
-                .execute(&mut *transaction)
-                .await?
-            } else {
-                sqlx::query(
-                    "UPDATE conversations
-                     SET chain_name = NULL, updated_at = ?1
-                     WHERE id = ?2",
-                )
-                .bind(now.to_rfc3339())
-                .bind(&root_id)
-                .execute(&mut *transaction)
-                .await?
-            };
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET title = ?1, chain_name = NULL, updated_at = ?2
+                 WHERE id = ?3",
+            )
+            .bind(title)
+            .bind(now.to_rfc3339())
+            .bind(&root_id)
+            .execute(&mut *transaction)
+            .await?;
             if result.rows_affected() == 0 {
                 return Err(DbError::ConversationNotFound(reference.to_string()));
             }
@@ -1764,6 +1820,30 @@ mod tests {
                 ),
             },
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_title_clear_restores_original_title_fallback() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("legacy-title", "original-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let original_title = conversation.title.clone();
+
+        db.set_ordinary_product_conversation_legacy_title(&conversation.id, "Temporary Override")
+            .await
+            .unwrap();
+        let renamed = db.get_conversation(&conversation.id).await.unwrap();
+        assert_eq!(renamed.chain_name.as_deref(), Some("Temporary Override"));
+        assert_eq!(renamed.title, original_title);
+
+        db.clear_ordinary_product_conversation_legacy_title(&conversation.id)
+            .await
+            .unwrap();
+        let cleared = db.get_conversation(&conversation.id).await.unwrap();
+        assert_eq!(cleared.chain_name, None);
+        assert_eq!(cleared.title, original_title);
     }
 
     #[tokio::test]

@@ -217,8 +217,8 @@ pub async fn submit_chain_question(
 
 /// Compatibility route for `PATCH /api/chains/:rootId/name`.
 ///
-/// Non-empty names update the `ProductConversation` root title authority. A null or
-/// whitespace-only name clears only the legacy override so normal title fallback applies.
+/// Non-empty names set the compatibility override without replacing the root title. A null or
+/// whitespace-only name clears that override so the original title fallback applies.
 pub async fn set_chain_name(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -235,7 +235,7 @@ pub async fn set_chain_name(
     if let Some(title) = normalized.as_deref() {
         state
             .db
-            .set_ordinary_product_conversation_title(&root_id, title)
+            .set_ordinary_product_conversation_legacy_title(&root_id, title)
             .await
             .map_err(db_to_app)?;
     } else {
@@ -548,7 +548,7 @@ pub async fn delete_chain_handler(
     for conversation in &conversations {
         finalize_hard_deleted_conversation_resources(&state, conversation).await;
     }
-    broadcast_aggregate_hard_deleted(&state, &root_id, &product_conversation_id).await;
+    broadcast_aggregate_hard_deleted(&state, &root_id, &product_conversation_id, member_ids).await;
 
     Ok(Json(SuccessResponse { success: true }))
 }

@@ -1358,7 +1358,11 @@ impl SseBroadcaster {
         gate.hard_deleted = true;
     }
 
-    pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
+    pub fn send_hard_deleted_and_close(
+        &self,
+        conversation_id: String,
+        deleted_conversation_ids: Vec<String>,
+    ) -> Result<usize, ()> {
         let _fatal_guard = self.fatal_publication_guard()?;
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
@@ -1371,6 +1375,7 @@ impl SseBroadcaster {
             SseEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             },
             sequence_id,
             RingOp::BroadcastOnly,
@@ -1936,6 +1941,7 @@ pub enum SseEvent {
     ConversationHardDeleted {
         sequence_id: i64,
         conversation_id: String,
+        deleted_conversation_ids: Vec<String>,
     },
     /// Browser session liveness changed for this conversation. Emitted on
     /// the create edge (`active = true`, fired only on actual `HashMap`
@@ -6547,7 +6553,10 @@ mod broadcaster_tests {
             })
             .unwrap();
         broadcaster
-            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .send_hard_deleted_and_close(
+                "deleted-conversation".to_string(),
+                vec!["deleted-conversation".to_string()],
+            )
             .unwrap();
 
         assert!(matches!(events.try_recv(), Ok(SseEvent::Token { .. })));
@@ -6586,7 +6595,10 @@ mod broadcaster_tests {
             })
             .unwrap();
         broadcaster
-            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .send_hard_deleted_and_close(
+                "deleted-conversation".to_string(),
+                vec!["deleted-conversation".to_string()],
+            )
             .unwrap();
         drop(reserved);
 

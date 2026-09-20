@@ -6562,10 +6562,10 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
         let _ = handle
             .broadcast_tx
-            .send_hard_deleted_and_close(id.to_string());
+            .send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
-        let _ = tx.send_hard_deleted_and_close(id.to_string());
+        let _ = tx.send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
     }
 }
 
@@ -6573,14 +6573,19 @@ pub(super) async fn broadcast_aggregate_hard_deleted(
     state: &AppState,
     root_id: &str,
     product_conversation_id: &str,
+    deleted_conversation_ids: Vec<String>,
 ) {
     if let Some(handle) = state.runtime.try_get_handle(root_id).await {
-        let _ = handle
-            .broadcast_tx
-            .send_hard_deleted_and_close(product_conversation_id.to_string());
+        let _ = handle.broadcast_tx.send_hard_deleted_and_close(
+            product_conversation_id.to_string(),
+            deleted_conversation_ids.clone(),
+        );
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(root_id).await {
-        let _ = tx.send_hard_deleted_and_close(product_conversation_id.to_string());
+        let _ = tx.send_hard_deleted_and_close(
+            product_conversation_id.to_string(),
+            deleted_conversation_ids,
+        );
     }
 }
 
@@ -13974,8 +13979,13 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("aggregate hard-delete event");
         assert!(matches!(
             event,
-            SseEvent::ConversationHardDeleted { conversation_id, .. }
-                if conversation_id == root.product_conversation_id.as_str()
+            SseEvent::ConversationHardDeleted {
+                conversation_id,
+                deleted_conversation_ids,
+                ..
+            } if conversation_id == root.product_conversation_id.as_str()
+                && deleted_conversation_ids
+                    == vec!["cd-agent", "cd-a", "cd-b", "cd-c"]
         ));
         assert!(
             events.try_recv().is_err(),

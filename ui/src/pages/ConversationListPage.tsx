@@ -155,8 +155,7 @@ export function ConversationListPage() {
     setProductDeleteSubmitting(true);
     try {
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
-      if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
-      else await api.deleteChain(rootId);
+      await api.deleteChain(rootId);
       finishProductDelete();
     } catch (error) {
       if (error instanceof ApiResponseError && error.status === 404) {
