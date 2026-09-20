@@ -62,7 +62,6 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
           if (requestGeneration.current === generation && viewRevision.current === revision) {
             setView(next);
             setFeedback(null);
-            window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated'));
           }
         })
         .catch((error: unknown) => {
@@ -97,6 +96,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       if (requestGeneration.current === generation && viewRevision.current === revision) {
         setView(next);
         setFeedback('Saved');
+        window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated'));
       }
     } catch (error) {
       if (requestGeneration.current === generation && viewRevision.current === revision) {
@@ -134,6 +134,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       }
       if (requestGeneration.current === generation) {
         setFeedback(`${authorityLabel === 'generated' ? 'Generated' : 'Manual'} handoff retry accepted`);
+        window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated'));
       }
     } catch (error) {
       if (requestGeneration.current === generation) {
