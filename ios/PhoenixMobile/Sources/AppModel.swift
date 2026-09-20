@@ -57,6 +57,12 @@ enum HardDeleteFenceLoadResult: Equatable, Sendable {
     case accessible([PersistedHardDeleteFence])
     case inaccessible
 }
+enum HardDeleteFenceMutationOutcome: Equatable, Sendable {
+    case replaced
+    case expectationMismatch
+    case persistenceFailed
+}
+
 
 struct PersistedHardDeleteFence: Codable, Equatable, Hashable, Sendable {
     let persistenceScope: PersistenceScopeIdentity
@@ -156,9 +162,11 @@ protocol ConversationPersistenceStore {
         legacyScope: PersistenceScopeIdentity?
     ) async -> Bool
     func removeAllPersistedConversationState() async
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
+    func replaceHardDeleteFence(
+        expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence
+    ) async -> HardDeleteFenceMutationOutcome
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome
 }
 
 extension ConversationPersistenceStore {
@@ -619,12 +627,19 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return snapshotResolved && outboxResolved
     }
 
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+    func replaceHardDeleteFence(
+        expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence
+    ) async -> HardDeleteFenceMutationOutcome {
         let source = directory
-            .appendingPathComponent(fence.storageName)
+            .appendingPathComponent(replacement.storageName)
             .appendingPathExtension("json")
         let writer = context.writer(destinationURL: source, version: 1)
-        return await writer.save(fence, revision: writer.reserveRevision())
+        switch await writer.replace(
+            expected: expected, replacement: replacement, revision: writer.reserveRevision()) {
+        case .replaced: return .replaced
+        case .expectationMismatch: return .expectationMismatch
+        case .persistenceFailed: return .persistenceFailed
+        }
     }
 
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
@@ -649,10 +664,16 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return .accessible(fences)
     }
 
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
-        let source = directory.appendingPathComponent(fence.storageName).appendingPathExtension("json")
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        let source = directory.appendingPathComponent(expected.storageName).appendingPathExtension("json")
         let writer = context.writer(destinationURL: source, version: 1)
-        await writer.remove(revision: writer.reserveRevision())
+        switch await writer.replace(
+            expected: expected, replacement: Optional<PersistedHardDeleteFence>.none,
+            revision: writer.reserveRevision()) {
+        case .replaced: return .replaced
+        case .expectationMismatch: return .expectationMismatch
+        case .persistenceFailed: return .persistenceFailed
+        }
     }
 
     func removeAllPersistedConversationState() async {
@@ -921,7 +942,9 @@ final class AppModel {
             for fence in fences {
                 let retry = HardDeleteFenceRetryObligation(fence: fence)
                 if self.hardDeleteFenceRetryObligations.contains(retry) {
-                    guard await self.conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                    guard case .replaced = await self.conversationPersistenceStore.replaceHardDeleteFence(
+                        expected: nil, replacement: fence)
+                    else {
                         self.persistedOutboxHydrated = false
                         return
                     }
@@ -1346,7 +1369,9 @@ final class AppModel {
                     persistenceScope: pending.configurationIdentity.persistenceScope,
                     aggregateAuthority: context.aggregateAuthority,
                     memberConversationIds: pending.memberConversationIds.sorted())
-                guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                guard case .replaced = await conversationPersistenceStore.replaceHardDeleteFence(
+                    expected: nil, replacement: fence)
+                else {
                     NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
                     hardDeleteFenceRetryObligations.insert(.init(fence: fence))
                     hardDeletedConversationIds.formUnion(fence.memberConversationIds)
@@ -1398,7 +1423,10 @@ final class AppModel {
         guard pendingHardDeleteCleanups[context.aggregateAuthority]?.memberConversationIds == memberIds else {
             continue
         }
-        await conversationPersistenceStore.retireHardDeleteFence(fence)
+        guard case .replaced = await conversationPersistenceStore.retireHardDeleteFence(expected: fence) else {
+            persistedOutboxHydrated = false
+            return
+        }
         guard contextIsCurrent() else { return }
         if pendingOpenConversationId == context.aggregateAuthority
             || pendingOpenConversationId.map(memberIds.contains) == true

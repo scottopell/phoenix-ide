@@ -260,9 +260,11 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func replaceHardDeleteFence(expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        expected == nil ? .replaced : .expectationMismatch
+    }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome { .replaced }
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -469,9 +471,11 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func replaceHardDeleteFence(expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        expected == nil ? .replaced : .expectationMismatch
+    }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome { .replaced }
     func removeAllPersistedConversationState() async {
         await resetBlocker.block()
         await wrapped.removeAllPersistedConversationState()
@@ -525,9 +529,11 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func replaceHardDeleteFence(expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        expected == nil ? .replaced : .expectationMismatch
+    }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome { .replaced }
     func removeAllPersistedConversationState() async {}
 }
 
@@ -589,9 +595,11 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func replaceHardDeleteFence(expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        expected == nil ? .replaced : .expectationMismatch
+    }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome { .replaced }
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -722,16 +730,19 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+    func replaceHardDeleteFence(expected: PersistedHardDeleteFence?, replacement: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
         hardDeleteFencePersistAttemptCount += 1
         if let persistHardDeleteFenceGate {
             await persistHardDeleteFenceGate.markEntered()
             await persistHardDeleteFenceGate.awaitRelease()
         }
-        guard persistHardDeleteFenceResult else { return false }
-        persistedHardDeleteFences.append(fence)
-        persistedHardDeleteFenceHistory.append(fence)
-        return true
+        let current = persistedHardDeleteFences.first { $0.storageName == replacement.storageName }
+        guard current == expected else { return .expectationMismatch }
+        guard persistHardDeleteFenceResult else { return .persistenceFailed }
+        persistedHardDeleteFences.removeAll { $0.storageName == replacement.storageName }
+        persistedHardDeleteFences.append(replacement)
+        persistedHardDeleteFenceHistory.append(replacement)
+        return .replaced
     }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         hardDeleteFenceLoadCount += 1
@@ -744,8 +755,10 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
             })
         }
     }
-    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
-        persistedHardDeleteFences.removeAll { $0 == fence }
+    func retireHardDeleteFence(expected: PersistedHardDeleteFence) async -> HardDeleteFenceMutationOutcome {
+        guard persistedHardDeleteFences.contains(expected) else { return .expectationMismatch }
+        persistedHardDeleteFences.removeAll { $0 == expected }
+        return .replaced
     }
     func removeAllPersistedConversationState() async {
         if let gate = removeAllGate {
@@ -2759,11 +2772,12 @@ final class AppModelProductConversationTests: XCTestCase {
             memberConversationIds: ["row-1"])
 
         XCTAssertNotEqual(fenceA.storageName, fenceB.storageName)
-        let savedA = await store.persistHardDeleteFence(fenceA)
-        let savedB = await store.persistHardDeleteFence(fenceB)
-        XCTAssertTrue(savedA)
-        XCTAssertTrue(savedB)
-        await store.retireHardDeleteFence(fenceA)
+        let savedA = await store.replaceHardDeleteFence(expected: nil, replacement: fenceA)
+        let savedB = await store.replaceHardDeleteFence(expected: nil, replacement: fenceB)
+        XCTAssertEqual(savedA, .replaced)
+        XCTAssertEqual(savedB, .replaced)
+        let retiredA = await store.retireHardDeleteFence(expected: fenceA)
+        XCTAssertEqual(retiredA, .replaced)
 
         XCTAssertTrue(store.hardDeleteFences(persistenceScope: identityA.persistenceScope) == .accessible([]))
         XCTAssertEqual(store.hardDeleteFences(persistenceScope: identityB.persistenceScope), .accessible([fenceB]))
@@ -2802,7 +2816,7 @@ final class AppModelProductConversationTests: XCTestCase {
             persistenceScope: identity.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
-        _ = await store.persistHardDeleteFence(fence)
+        _ = await store.replaceHardDeleteFence(expected: nil, replacement: fence)
 
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
@@ -2918,7 +2932,7 @@ final class AppModelProductConversationTests: XCTestCase {
             persistenceScope: identityBeforeCrash.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
-        _ = await store.persistHardDeleteFence(fence)
+        _ = await store.replaceHardDeleteFence(expected: nil, replacement: fence)
         let entry = makePendingOutboxEntry(conversationId: "row-1")
         let outbox = store.outboxPersistence(
             conversationId: "row-1",
@@ -2973,7 +2987,7 @@ final class AppModelProductConversationTests: XCTestCase {
             persistenceScope: identity.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
-        _ = await store.persistHardDeleteFence(fence)
+        _ = await store.replaceHardDeleteFence(expected: nil, replacement: fence)
 
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
