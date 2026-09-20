@@ -405,6 +405,8 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
     for key in tuple(env):
         if key.startswith(("DD_", "OTEL_")):
             env.pop(key)
+        if key == "RUSTC_WRAPPER" or key.startswith(("KACHE_", "SCCACHE_")):
+            env.pop(key)
     for key in (
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
@@ -1649,6 +1651,9 @@ class HarnessIsolationTests(unittest.TestCase):
                 "ANTHROPIC_API_KEY": "secret",
                 "OPENAI_API_KEY": "secret",
                 "LLM_API_KEY_HELPER": "secret-helper",
+                "RUSTC_WRAPPER": "/bin/kache",
+                "KACHE_CACHE_DIR": "/cache/kache",
+                "SCCACHE_DIR": "/cache/sccache",
                 "E2E_RUST_LOG": "debug",
             }
             env = _server_env(tmpdir, parent)
@@ -1666,6 +1671,9 @@ class HarnessIsolationTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             self.assertNotIn("OPENAI_API_KEY", env)
             self.assertNotIn("LLM_API_KEY_HELPER", env)
+            self.assertNotIn("RUSTC_WRAPPER", env)
+            self.assertNotIn("KACHE_CACHE_DIR", env)
+            self.assertNotIn("SCCACHE_DIR", env)
             self.assertNotIn("PHOENIX_LOG_FILE", env)
             self.assertNotIn("DD_TRACE_ENABLED", env)
             self.assertNotIn("DD_TRACE_AGENT_URL", env)

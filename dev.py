@@ -4923,6 +4923,10 @@ def _ensure_kache_daemon(binary: str) -> str | None:
     return None
 
 
+def _absolute_executable(binary: str | None) -> str | None:
+    return str(Path(binary).resolve()) if binary else None
+
+
 def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
     base = (base or Path.cwd()).resolve()
     names = (
@@ -4970,8 +4974,8 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
     automatic = backend == "auto"
     wants_kache = automatic or backend == "kache"
-    kache_binary = _kache_binary() if wants_kache else None
-    sccache_binary = shutil.which("sccache")
+    kache_binary = _absolute_executable(_kache_binary()) if wants_kache else None
+    sccache_binary = _absolute_executable(shutil.which("sccache"))
     kache_version = None
     kache_error = None
     if wants_kache and _environment_flag("KACHE_DISABLED"):
@@ -5030,6 +5034,7 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             sccache_version, sccache_error = _usable_sccache(sccache_binary)
             if sccache_version:
                 assert sccache_binary is not None
+                _normalize_cache_paths("sccache")
                 print(f"  ⚠ kache unavailable; using sccache: {daemon_error}")
                 os.environ["RUSTC_WRAPPER"] = sccache_binary
                 os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")

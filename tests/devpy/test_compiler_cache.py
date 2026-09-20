@@ -189,7 +189,7 @@ class CompilerCacheTests(unittest.TestCase):
                 self.dev._configure_compiler_cache("sccache")
 
     def test_auto_falls_back_to_sccache_when_kache_daemon_fails(self):
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+        with mock.patch.dict(os.environ, {"SCCACHE_DIR": "cache"}, clear=True), mock.patch.object(
             self.dev.shutil, "which", side_effect=lambda name: f"/bin/{name}"
         ), mock.patch.object(
             self.dev, "_kache_version", return_value=("0.26.0", None)
@@ -199,6 +199,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("sccache", self.dev._configure_compiler_cache("auto"))
             self.assertEqual("/bin/sccache", os.environ["RUSTC_WRAPPER"])
             self.assertEqual("10G", os.environ["SCCACHE_CACHE_SIZE"])
+            self.assertTrue(self.dev.Path(os.environ["SCCACHE_DIR"]).is_absolute())
 
     def test_auto_falls_back_to_none_when_kache_daemon_fails(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -329,6 +330,12 @@ class CompilerCacheTests(unittest.TestCase):
         )
         self.assertFalse(self.dev._command_uses_compiler_cache(["uv", "run", "tests.py"]))
         self.assertFalse(self.dev._command_uses_compiler_cache([]))
+
+    def test_relative_wrapper_path_is_made_absolute(self):
+        with mock.patch.object(self.dev.Path, "resolve", return_value=self.dev.Path("/workspace/bin/kache")):
+            self.assertEqual(
+                "/workspace/bin/kache", self.dev._absolute_executable("bin/kache")
+            )
 
     def test_cache_paths_normalize_against_invoking_directory(self):
         with mock.patch.dict(
