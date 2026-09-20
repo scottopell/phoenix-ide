@@ -627,7 +627,7 @@ fn conversation_message_href(conv: &Conversation, message: Option<(&str, Message
 fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     matches!(
         message_type,
-        MessageType::User | MessageType::Agent | MessageType::Skill
+        MessageType::User | MessageType::Agent | MessageType::Skill | MessageType::Continuation
     )
 }
 

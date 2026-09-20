@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -716,6 +717,9 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
+        <AutomaticContinuationControl
+          scope={{ kind: 'ordinary', reference: snapshot.product_conversation_id }}
+        />
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -744,6 +748,11 @@ function ProductConversationPageInner() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
+  useEffect(() => {
+    const refresh = () => setSnapshotRetry((value) => value + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);

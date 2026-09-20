@@ -1104,6 +1104,10 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,

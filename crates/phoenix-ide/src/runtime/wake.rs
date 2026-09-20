@@ -544,6 +544,18 @@ async fn transfer_workflow_for_continuation(
     ))
 }
 
+pub(crate) async fn continuation_transfer_is_settled(
+    manager: &Arc<RuntimeManager>,
+    from_conversation_id: &str,
+) -> phoenix_db::DbResult<bool> {
+    Ok(manager
+        .db()
+        .wake_repository()
+        .list_workflows_owed_to_conversation(from_conversation_id)
+        .await?
+        .is_empty())
+}
+
 pub(crate) async fn transfer_active_for_continuation(
     manager: &Arc<RuntimeManager>,
     from_conversation_id: &str,

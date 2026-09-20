@@ -791,10 +791,15 @@ impl Database {
             let summary = continuation_summary(&row, "continuation_content")?;
             let accepted_content =
                 message_content_from_row(&row, "accepted_message_type", "accepted_content")?;
-            let accepted_is_duplicate_summary = matches!(
-                accepted_content,
-                MessageContent::User(user) if user.text == summary
-            );
+            let accepted_is_duplicate_summary = match accepted_content {
+                MessageContent::User(user) => user.text == summary,
+                MessageContent::Continuation(continuation) => continuation.summary == summary,
+                MessageContent::Agent(_)
+                | MessageContent::Tool(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Skill(_) => false,
+            };
             return Ok(Some(ProductConversationHandoff::Completed {
                 predecessor_transcript_row_id: predecessor.to_string(),
                 successor_transcript_row_id: successor.to_string(),

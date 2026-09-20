@@ -644,16 +644,13 @@ describe('buildRenderUnits', () => {
       );
     });
 
-    it('logs and skips an unknown message type', () => {
+    it('emits typed continuation history visibly', () => {
       const m: Message = {
         message_id: 'x1',
         sequence_id: 0,
         conversation_id: 'c1',
-        // `continuation` and `error` are in the typed union but the
-        // transform currently treats them as unknown (render path
-        // unimplemented). Cast to bypass the literal-union narrowing.
-        message_type: 'continuation' as Message['message_type'],
-        content: {} as Message['content'],
+        message_type: 'continuation',
+        content: { summary: 'persisted generated handoff' },
         created_at: '',
       };
       const out = buildRenderUnits({
@@ -662,15 +659,9 @@ describe('buildRenderUnits', () => {
         convState: IDLE,
         streamingHandle: null,
       });
-      expect(out.historicalUnits).toEqual([]);
-      expect(debugSpy).toHaveBeenCalledWith(
-        '[renderUnits] skipped unknown type',
-        expect.objectContaining({
-          message_id: 'x1',
-          message_type: 'continuation',
-          reason: 'unknown_type',
-        }),
-      );
+      expect(out.historicalUnits).toEqual([
+        expect.objectContaining({ kind: 'continuation', key: 'x1', message: m }),
+      ]);
     });
   });
 

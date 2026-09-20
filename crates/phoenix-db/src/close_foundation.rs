@@ -1191,6 +1191,22 @@ impl Database {
             )));
         }
 
+        let automatic_continuation_pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM automatic_continuation_admissions
+                 WHERE product_conversation_id = ?1
+                   AND phase NOT IN ('message_settled', 'superseded', 'failed')
+             )",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if automatic_continuation_pending != 0 {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} has pending automatic continuation"
+            )));
+        }
+
         let now_utc = Utc::now();
         let now = now_utc.to_rfc3339();
         let captured_at_unix_micros = now_utc.timestamp_micros();

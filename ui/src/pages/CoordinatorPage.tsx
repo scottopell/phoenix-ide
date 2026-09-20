@@ -1,6 +1,7 @@
-import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 
@@ -15,14 +16,26 @@ interface CoordinatorPageFixtureData {
 
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const { slug } = useParams<{ slug: string }>();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
+  const [topologyRevision, setTopologyRevision] = useState(0);
+  const consumedTopologyRevision = useRef(0);
+
+  useEffect(() => {
+    const refresh = () => setTopologyRevision((value) => value + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
 
   useEffect(() => {
     if (fixtureData) return;
     setLoading(true);
+    setResolvedCoordinatorId(null);
     let cancelled = false;
     api.ensureGlobalCoordinator()
       .then((coordinator) => {
@@ -30,18 +43,25 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        if (!slug || slug === coordinator.conversation.id) {
+        const topologyChanged = topologyRevision > consumedTopologyRevision.current;
+        consumedTopologyRevision.current = topologyRevision;
+        if (topologyChanged && slug !== coordinator.conversation.id) {
+          navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+        } else if (!slug || slug === coordinator.conversation.id) {
           setResolvedCoordinatorId(coordinator.conversation.id);
-          if (!slug) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+          if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else {
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
               if (cancelled) return;
-              if (coordinator_id) setResolvedCoordinatorId(slug);
-              else navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              if (coordinator_id) {
+                setResolvedCoordinatorId(slug);
+              } else {
+                navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+              }
             })
             .catch(() => {
-              if (!cancelled) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+              if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
             });
         }
         setError(null);
@@ -53,12 +73,18 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug]);
+  }, [fixtureData, navigate, slug, topologyRevision]);
 
   return (
     <main className="coordinator-page">
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
+
+      {!loading && !error && resolvedCoordinatorId === slug && (
+        <div className="coordinator-page__automatic-continuation">
+          <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
+        </div>
+      )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
