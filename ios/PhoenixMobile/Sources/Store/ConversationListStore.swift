@@ -225,9 +225,16 @@ final class ConversationListStore {
     }
 
     @discardableResult
-    func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
+    func applyExternal(
+        _ fresh: [Conversation],
+        preserving localRows: [Conversation] = [],
+        startedAt token: ExternalRefreshToken
+    ) -> Bool {
         guard canApplyExternal(startedAt: token) else { return false }
-        apply(Self.merging(fresh, preserving: [:]))
+        let preservedByAggregate = Dictionary(uniqueKeysWithValues: localRows.map {
+            ($0.aggregateIdentity, $0)
+        })
+        apply(Self.merging(fresh, preserving: preservedByAggregate))
         lastError = nil
         return true
     }

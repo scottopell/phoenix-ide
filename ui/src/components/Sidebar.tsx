@@ -15,8 +15,10 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
+  subscribeProductConversationDeleted,
   subscribeProductConversationListRevision,
 } from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
@@ -202,6 +204,21 @@ export function Sidebar({
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
   const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
+  useEffect(() => {
+    const unsubscribes = productConversations.map((row) => {
+      const productId = row.product_conversation_id;
+      return subscribeProductConversationDeleted(new Set([
+        productId,
+        row.canonical_root.transcript_row_id,
+        row.latest_transcript_row_id,
+      ]), () => {
+        setProductConversations((current) => current.filter((candidate) => (
+          candidate.product_conversation_id !== productId
+        )));
+      });
+    });
+    return () => { unsubscribes.forEach((unsubscribe) => unsubscribe()); };
+  }, [productConversations]);
   useEffect(() => {
     if (!activeSlug || !location.pathname.startsWith('/product-conversations/')) {
       setActiveProductSnapshot(null);
@@ -397,6 +414,7 @@ export function Sidebar({
       await api.deleteChain(rootId);
       setProductDeleteTarget((current) =>
         current?.product_conversation_id === productId ? null : current);
+      notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
       notifyProductConversationListMayHaveChanged();
       const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
         && activeProductSnapshot.segments.some((segment) => (
@@ -409,6 +427,7 @@ export function Sidebar({
       if (error instanceof ApiResponseError && error.status === 404) {
         setProductDeleteTarget((current) =>
           current?.product_conversation_id === productId ? null : current);
+        notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
         notifyProductConversationListMayHaveChanged();
         if (productRowMatchesRoute(productDeleteTarget, activeSlug)
           || activeProductSnapshot?.product_conversation_id === productId) {

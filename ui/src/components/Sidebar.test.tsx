@@ -333,6 +333,32 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.deleteConversation).not.toHaveBeenCalled();
   });
 
+  it('removes a deleted product row before a failed list refresh can retain it', async () => {
+    const row = makeProductConversation('pc-history', {
+      lifecycle: { state: 'history' },
+      canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
+      latest_transcript_row_id: 'history-latest',
+    });
+    apiMock.deleteChain.mockResolvedValueOnce({ ok: true });
+    apiMock.listProductConversations
+      .mockResolvedValueOnce({ product_conversations: [row] })
+      .mockRejectedValueOnce(new Error('refresh failed'));
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).toBeNull());
+    await waitFor(() => expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2));
+    expect(container.querySelector('[data-product-conversation-id="pc-history"]')).toBeNull();
+  });
+
   it('keeps History Delete open with an error and gates duplicate submissions', async () => {
     let rejectDelete!: (error: Error) => void;
     apiMock.deleteChain.mockReturnValueOnce(new Promise((_, reject) => { rejectDelete = reject; }));

@@ -12,6 +12,7 @@ final class AppModelProductConversationTests: XCTestCase {
         taskTitle: String? = nil,
         archived: Bool? = nil,
         mode: String? = nil,
+        state: JSONValue? = nil,
         updatedAt: String? = nil,
         runtimeRole: String? = nil,
         closeAction: ProductConversationCloseAction? = nil
@@ -26,7 +27,7 @@ final class AppModelProductConversationTests: XCTestCase {
             created_at: nil,
             updated_at: updatedAt,
             message_count: nil,
-            state: nil,
+            state: state,
             state_updated_at: nil,
             branch_name: nil,
             task_title: taskTitle,
@@ -307,6 +308,31 @@ final class AppModelProductConversationTests: XCTestCase {
             AppModel.removedAggregateIds(
                 authoritative: authoritative,
                 locallyOwned: ["pc-kept", "pc-deleted", "pc-coordinator"]),
+            ["pc-deleted"])
+    }
+
+    func testAggregateReconciliationPreservesProvisioningShellOmittedFromProductList() {
+        let model = AppModel()
+        model.installAPIForTesting()
+        let shell = conversation(
+            id: "shell-row",
+            aggregateId: "pc-shell",
+            state: .object([
+                "type": .string("provisioning"),
+                "job_id": .string("creation-job"),
+            ]))
+        model.listStore.upsert(shell)
+        let reconciliationId = model.prepareAggregateReconciliationForTesting()
+
+        XCTAssertTrue(model.applyAggregateListForReconciliationForTesting(
+            [],
+            reconciliationId: reconciliationId))
+        XCTAssertEqual(model.listStore.conversations, [shell])
+        XCTAssertEqual(
+            AppModel.removedAggregateIds(
+                authoritative: [],
+                locallyOwned: ["pc-shell", "pc-deleted"],
+                preserving: ["pc-shell"]),
             ["pc-deleted"])
     }
 
@@ -750,21 +776,25 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(model.closeConfirmationReconciliationIdsForTesting.contains("absent"))
     }
 
-    func testAggregateEventBackoffRequiresHealthyFrameAndCapsTotalDelay() {
-        var backoff = AggregateEventStreamBackoff()
+    func testAggregateEventBackoffKeepsJitterRangeBelowThirtySecondCap() {
+        var minimumBackoff = AggregateEventStreamBackoff()
+        var maximumBackoff = AggregateEventStreamBackoff()
 
+        let minimums = (0..<7).map { _ in
+            minimumBackoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 0)
+        }
+        let maximums = (0..<7).map { _ in
+            maximumBackoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 1)
+        }
+
+        XCTAssertEqual(minimums, [1, 2, 4, 8, 16, 21, 21])
+        XCTAssertEqual(maximums, [1.3, 2.6, 5.2, 10.4, 20.8, 30, 30])
+        XCTAssertLessThan(minimums.last!, maximums.last!)
+        XCTAssertLessThanOrEqual(maximums.last!, AggregateEventStreamBackoff.maximumDelay)
         XCTAssertEqual(
-            (0..<7).map { _ in
-                backoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 0)
-            },
-            [1, 2, 4, 8, 16, 30, 30])
-        XCTAssertEqual(
-            backoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 1),
-            30)
-        XCTAssertEqual(
-            backoff.delayAfterDisconnect(streamWasHealthy: true, jitterFraction: 0),
+            minimumBackoff.delayAfterDisconnect(streamWasHealthy: true, jitterFraction: 0),
             1)
-        XCTAssertEqual(backoff.baseDelay, 2)
+        XCTAssertEqual(minimumBackoff.baseDelay, 2)
     }
 
     func testForegroundAttentionSeedInvalidatesBackgroundEvidenceGeneration() {
