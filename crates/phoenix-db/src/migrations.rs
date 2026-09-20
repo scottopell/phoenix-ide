@@ -15543,7 +15543,9 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_automatic_continuation_superseded')",
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(&pool)
         .await
@@ -16437,7 +16439,9 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_automatic_continuation_superseded')",
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(pool)
         .await
