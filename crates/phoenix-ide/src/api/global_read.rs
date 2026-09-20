@@ -155,6 +155,13 @@ pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinatorWorkScopeTargetError {
+    Authority,
+    Persistence,
+    Read,
+}
+
 impl GlobalReadService {
     pub(crate) fn new(
         db: crate::db::Database,
@@ -246,7 +253,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
     pub(crate) async fn resolve_active_work_scope_bash_target(
         &self,
         requested_work_scope_id: &str,
-    ) -> Result<ValidatedCoordinatorBashSpawnTarget, String> {
+    ) -> Result<ValidatedCoordinatorBashSpawnTarget, CoordinatorWorkScopeTargetError> {
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
             "SELECT environment.id, environment.worktree_path, environment.cwd
              FROM work_scopes environment
@@ -276,26 +283,21 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         .bind(requested_work_scope_id)
         .fetch_optional(self.db.pool())
         .await
-        .map_err(|error| format!("failed to resolve Coordinator bash WorkScope: {error}"))?
-        .ok_or_else(|| {
-            "active persisted WorkScope with a live owner not found for Coordinator bash run"
-                .to_string()
-        })?;
+        .map_err(|_| CoordinatorWorkScopeTargetError::Persistence)?
+        .ok_or(CoordinatorWorkScopeTargetError::Authority)?;
         let (work_scope_id, worktree_path, cwd) = row;
         let preferred = worktree_path
             .as_deref()
             .filter(|path| !path.trim().is_empty())
             .or_else(|| cwd.as_deref().filter(|path| !path.trim().is_empty()))
-            .ok_or_else(|| {
-                "active persisted WorkScope is missing both worktree_path and cwd".to_string()
-            })?;
+            .ok_or(CoordinatorWorkScopeTargetError::Read)?;
         let canonical = crate::conversation_cwd::validate_conversation_cwd(preferred)
-            .map_err(|error| format!("invalid persisted Coordinator bash cwd: {error}"))?
+            .map_err(|_| CoordinatorWorkScopeTargetError::Read)?
             .path_buf();
         Ok(ValidatedCoordinatorBashSpawnTarget {
             path: canonical,
             work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
-                .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
+                .map_err(|_| CoordinatorWorkScopeTargetError::Persistence)?,
         })
     }
 
@@ -1141,7 +1143,7 @@ fn trim_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::{
         message_id_fragment, parse_conv_handle, render_full_message_text, split_fragment,
-        GlobalMessageTargetError, GlobalReadService,
+        CoordinatorWorkScopeTargetError, GlobalMessageTargetError, GlobalReadService,
     };
     use std::sync::Arc;
 
@@ -1383,11 +1385,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(service
-            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
-            .await
-            .unwrap_err()
-            .contains("live owner not found"));
+        assert_eq!(
+            service
+                .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+                .await
+                .unwrap_err(),
+            CoordinatorWorkScopeTargetError::Authority
+        );
         sqlx::query(
             "UPDATE product_conversations SET ordinary_lifecycle = 'open'
              WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'scope-owner')",
@@ -1408,11 +1412,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(service
-            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
-            .await
-            .unwrap_err()
-            .contains("active persisted WorkScope with a live owner not found"));
+        assert_eq!(
+            service
+                .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+                .await
+                .unwrap_err(),
+            CoordinatorWorkScopeTargetError::Authority
+        );
         let snapshot = service.coordinator_snapshot().await.unwrap();
         assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
         assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");
