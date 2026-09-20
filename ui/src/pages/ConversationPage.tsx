@@ -1267,6 +1267,7 @@ function ConversationPageContent({
       if (isArchived) return;
 
       sendingMessagesRef.current.add(localId);
+      const dismissSubmitted = dismissRef.current;
 
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
       const phaseBeforePost = atomRef.current.phase;
@@ -1336,7 +1337,7 @@ function ConversationPageContent({
         }
       } catch (err) {
         if (err instanceof ConflictError && err.detail.error_type === 'close_admission_fenced') {
-          dismissRef.current(localId);
+          dismissSubmitted(localId);
           rollbackOptimisticPhase();
           throw err;
         }
@@ -1345,7 +1346,7 @@ function ConversationPageContent({
           // an inline error so the user can fix or remove the broken
           // @reference (REQ-IR-007). Keeping the message in the queue as
           // "failed" would duplicate it alongside the restored draft.
-          dismissRef.current(localId);
+          dismissSubmitted(localId);
           rollbackOptimisticPhase();
           // Re-throw so InputArea can display inline error (REQ-IR-007)
           throw err;
