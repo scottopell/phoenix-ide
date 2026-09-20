@@ -187,8 +187,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
-  const scopeKeyRef = useRef(scopeKey);
-  scopeKeyRef.current = scopeKey;
   useEffect(() => {
     composerHasContentRef.current = draft.length > 0
       || images.length > 0
