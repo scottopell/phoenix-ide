@@ -5305,13 +5305,6 @@ fn linux_descriptor_writer_evidence(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_namespace_path_is_deleted(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    let bytes = path.as_os_str().as_bytes();
-    bytes.ends_with(b" (deleted)") && std::fs::metadata(path).is_err()
-}
-
-#[cfg(target_os = "linux")]
 fn linux_namespace_cwd_writer_evidence_if_stable(
     process: &std::fs::DirEntry,
     before_incarnation: &str,
