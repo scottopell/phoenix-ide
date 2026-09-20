@@ -236,6 +236,7 @@ describe('AutomaticContinuationControl', () => {
       {
         handoff: 'Persisted generated handoff',
         message_id: 'automatic-first-message',
+        retry_failed_automatic: true,
       },
     ));
     expect(await screen.findByText('Generated handoff retry accepted')).toBeInTheDocument();

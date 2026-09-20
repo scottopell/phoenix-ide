@@ -114,6 +114,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     const generation = requestGeneration.current;
     const authorityLabel = admission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated' : 'manual';
     setRetrying(true);
+    viewRevision.current += 1;
     setFeedback(null);
     try {
       const response = await api.continueConversation(
@@ -121,6 +122,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         {
           handoff: admission.actionable_failure.accepted_handoff,
           message_id: admission.actionable_failure.first_message_id,
+          retry_failed_automatic: true,
         },
       );
       if (response.status === 'dispatch_failed') {

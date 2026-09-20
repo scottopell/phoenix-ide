@@ -5550,16 +5550,20 @@ async fn continue_conversation(
         ));
     }
     let mut automatic_retry_phase = None;
-    let failed_admission = state
-        .runtime
-        .db()
-        .automatic_continuation_admission(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .filter(|admission| {
-            admission.phase
-                == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Failed
-        });
+    let failed_admission = if req.retry_failed_automatic {
+        state
+            .runtime
+            .db()
+            .automatic_continuation_admission(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .filter(|admission| {
+                admission.phase
+                    == phoenix_core::domain::product_conversation::AutomaticContinuationPhase::Failed
+            })
+    } else {
+        None
+    };
     let (message_id, handoff, user_agent, opening_authority) = if let Some(admission) =
         failed_admission
     {

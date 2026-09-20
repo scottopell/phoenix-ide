@@ -141,9 +141,6 @@ impl SendChatApplicationService {
         {
             return Ok(AutomaticRetryTurnState::AlreadyAccepted);
         }
-        let _authority = self.runtime.acquire_local_authority_pass().map_err(|()| {
-            SendChatServiceError::Internal("local authority is closed".to_string())
-        })?;
         let input = crate::db::workflow::RearmAuthoritativeTurnInput {
             turn_id: turn.id,
             expected_generation: turn.generation,
@@ -152,6 +149,11 @@ impl SendChatApplicationService {
         let predecessor_conversation_id = predecessor_conversation_id.to_string();
         let runtime = self.runtime.clone();
         let rearm = tokio::spawn(async move {
+            let _authority = runtime.acquire_local_authority_pass().map_err(|()| {
+                crate::db::workflow::RearmAuthoritativeTurnError::DurableFactUnclassified(
+                    "local authority closed before supervised rearm".to_string(),
+                )
+            })?;
             let result = repo
                 .rearm_terminal_runtime_direct_turn_for_automatic_continuation(
                     &input,

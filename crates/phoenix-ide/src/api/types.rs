@@ -677,6 +677,8 @@ pub struct ContinueConversationRequest {
     pub message_id: String,
     #[serde(default)]
     pub user_agent: Option<String>,
+    #[serde(default)]
+    pub retry_failed_automatic: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

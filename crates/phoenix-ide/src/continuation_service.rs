@@ -154,24 +154,16 @@ impl ContinuationApplicationService {
             .map_err(|error| error.to_string())?;
 
         if plan.transfer_ownership {
-            let parent = self
-                .runtime
-                .db()
-                .get_conversation(&admission.predecessor_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            if parent.attached_work_scope_id == successor.attached_work_scope_id {
-                crate::runtime::wake::transfer_active_for_continuation(
-                    &self.runtime,
-                    &admission.predecessor_conversation_id,
-                    &successor.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
+            crate::runtime::wake::transfer_active_for_continuation(
+                &self.runtime,
+                &admission.predecessor_conversation_id,
+                &successor.id,
+                phoenix_workflow::Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             let transfer_settled = crate::runtime::wake::continuation_transfer_is_settled(
                 &self.runtime,
                 &admission.predecessor_conversation_id,

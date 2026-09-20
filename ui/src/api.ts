@@ -2489,7 +2489,7 @@ export const api = {
    */
   async continueConversation(
     convId: string,
-    request: { handoff: string; message_id: string; user_agent?: string },
+    request: { handoff: string; message_id: string; user_agent?: string; retry_failed_automatic?: boolean },
   ): Promise<{
     conversation_id: string;
     slug?: string;
