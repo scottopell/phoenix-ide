@@ -121,6 +121,11 @@ mod tool_result_identity_tests {
         assert_eq!(first, second);
         assert!(first.len() <= 256);
         assert_ne!(first, tool_result_message_id(&format!("{provider_id}x")));
+        let colliding_provider_id = format!(
+            "phoenix-hashed-tool:{}",
+            phoenix_core::domain::sm_event::exact_payload_fingerprint(provider_id.as_bytes())
+        );
+        assert_ne!(first, tool_result_message_id(&colliding_provider_id));
         assert_eq!(tool_result_message_id("tool-1"), "tool-1-result");
     }
 }

@@ -10374,7 +10374,22 @@ impl Database {
         let (content, display_data) = build_sub_agent_fan_in(results);
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(tool_id);
+            let legacy_message_id = format!("{tool_id}-result");
+            let message_id = if sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages
+                     WHERE conversation_id = ?1 AND message_id = ?2
+                 )",
+            )
+            .bind(conversation_id)
+            .bind(&legacy_message_id)
+            .fetch_one(&mut *tx)
+            .await?
+            {
+                legacy_message_id
+            } else {
+                tool_result_message_id(tool_id)
+            };
             let stored_content = serde_json::to_string(
                 &MessageContent::tool(tool_id, content, false).to_stored_json(),
             )

@@ -371,11 +371,14 @@ pub fn exact_payload_fingerprint(bytes: &[u8]) -> String {
 #[must_use]
 pub fn persisted_tool_result_message_id(tool_use_id: &str) -> String {
     const SUFFIX: &str = "-result";
-    if tool_use_id.len().saturating_add(SUFFIX.len()) <= 256 {
+    const HASHED_PREFIX: &str = "phoenix-hashed-tool:";
+    if tool_use_id.len().saturating_add(SUFFIX.len()) <= 256
+        && !tool_use_id.starts_with(HASHED_PREFIX)
+    {
         return format!("{tool_use_id}{SUFFIX}");
     }
     format!(
-        "tool-{}{SUFFIX}",
+        "{HASHED_PREFIX}{}{SUFFIX}",
         exact_payload_fingerprint(tool_use_id.as_bytes())
     )
 }
