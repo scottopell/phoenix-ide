@@ -95,6 +95,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
+| Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 060, then 017 and 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
@@ -109,7 +110,6 @@ Consult the relevant ADRs before starting work of each kind.
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-059 (non-binding), then 034, 018, and 017 |
-| Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-058 (non-binding), then 034, 018, and 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
@@ -144,7 +144,6 @@ ADR-000 (adopt spEARS v2 for new work)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
       │   │       └── ADR-059 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   │   └── ADR-060 (Modern build identity is full-length and legacy rollback is role-bound)
-      │   │       └── ADR-058 [Proposed] (direct distribution uses protected signing and private draft publication)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
