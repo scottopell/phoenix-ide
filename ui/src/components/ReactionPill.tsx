@@ -57,6 +57,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     if (!el || !scroller) return;
     let frame = 0;
     let observedComposer: Element | null = null;
+    const layoutOwner = scroller.closest('.conversation-column') ?? document.body;
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
@@ -97,8 +98,14 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
-        const composerTop = composer?.getBoundingClientRect().top ?? bottom;
-        y = Math.min(bottom, composerTop) - height - 12;
+        let obstructionTop = composer?.getBoundingClientRect().top ?? bottom;
+        if (composer?.parentElement === layoutOwner) {
+          for (let sibling = composer.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
+            const siblingRect = sibling.getBoundingClientRect();
+            if (siblingRect.height > 0) obstructionTop = Math.min(obstructionTop, siblingRect.top);
+          }
+        }
+        y = Math.min(bottom, obstructionTop) - height - 12;
       } else if (visible && rect) {
         x = rect.left;
         y = rect.bottom + 16;
@@ -110,7 +117,6 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
     if (touchDocked) scroller.classList.add('reaction-dock-reserved');
     const mutations = new MutationObserver(schedule);
-    const layoutOwner = scroller.closest('.conversation-column') ?? document.body;
     mutations.observe(layoutOwner, { childList: true, subtree: true });
     const resize = new ResizeObserver(schedule);
     position();

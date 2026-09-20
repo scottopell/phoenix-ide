@@ -44,15 +44,22 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
       if (bubbleRef.current?.contains(document.activeElement)) return;
       const current = store.getSnapshot(scopeKey);
       if (current?.body) return;
-      const selected = readReactionSelection(window.getSelection(), messages);
+      const nativeSelection = window.getSelection();
+      const selected = readReactionSelection(nativeSelection, messages);
       if (selected) {
         selectedRange.current = selected.range.cloneRange();
-        const touchDocked = selectionInput === 'touch'
-          || (selectionInput === null && (window.matchMedia?.('(any-pointer: coarse)').matches ?? false));
+        const sameSource = current?.source.messageId === selected.source.messageId
+          && current.source.occurrenceToken === selected.source.occurrenceToken
+          && current.source.quote === selected.source.quote;
+        const touchDocked = sameSource
+          ? current.presentation === 'touch-docked'
+          : selectionInput === 'touch'
+            || (selectionInput === null && (window.matchMedia?.('(any-pointer: coarse)').matches ?? false));
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput = null;
         setNotice('');
-      } else if (current?.presentation === 'floating') {
+      } else if (current?.presentation === 'floating'
+        || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)) {
         store.dispatch(scopeKey, { type: 'clear' });
       }
     };

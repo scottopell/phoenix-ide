@@ -45,6 +45,7 @@ function Harness({ store, scope = 'conversation-a', append, sourceMounted = true
             </div>
           ))}
         </div>
+        <button type="button" data-testid="unrelated">Unrelated surface</button>
         <InlineMessageReaction scopeKey={scope} messages={messages} destination={append ? { append } : undefined} />
         <MessageContextMenu messages={messages} />
         <FilePathContextMenu />
@@ -188,6 +189,43 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')).toEqual(owned);
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
+  });
+
+  it('preserves touch presentation when source restoration emits selectionchange', async () => {
+    setCoarsePointer(false);
+    const store = new InlineReactionStore();
+    store.dispatch('conversation-a', {
+      type: 'select', presentation: 'touch-docked',
+      source: { messageId: 'old', sequenceId: 2, occurrenceToken: 'row-old:old', quote: 'Deterministic state patterns', textAnchor: { start: { fragmentId: 'text-0', offset: 0 }, end: { fragmentId: 'text-0', offset: 28 } } },
+    });
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    const restored = document.createRange();
+    restored.setStart(text, 0);
+    restored.setEnd(text, 28);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(restored);
+    fireEvent(document, new Event('selectionchange'));
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
+  });
+
+  it('clears an empty touch reaction when a live excluded selection replaces it', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    const unrelatedText = screen.getByTestId('unrelated').firstChild!;
+    const range = document.createRange();
+    range.selectNodeContents(unrelatedText);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')).toBeNull();
   });
 
   it('dismisses an empty reaction without reopening it on pointerup', async () => {

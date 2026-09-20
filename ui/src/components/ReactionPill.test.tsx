@@ -13,10 +13,12 @@ const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean 
 let offscreen = false;
 function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; composerKey?: string; composerTop?: number }) {
   return <FocusScopeProvider>
+    <div className="conversation-column">
     <div id="messages">
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
     <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />
+    </div>
     <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
@@ -227,6 +229,24 @@ describe('reaction pill', () => {
     act(() => listeners.get('resize')?.(new Event('resize')));
     await waitFor(() => expect(dock).toHaveStyle({ top: '434px' }));
     expect(input).not.toHaveFocus();
+  });
+
+  it('stays above visible bars that follow the composer', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 500, 390, 80);
+      if (this.id === 'state-bar') return new DOMRect(0, 470, 390, 30);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <div className="conversation-column">
+        <div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+        <footer id="input-area" />
+        <div id="state-bar" />
+      </div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '404px' }));
   });
 
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {

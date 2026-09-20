@@ -289,6 +289,7 @@ describe('VirtualTranscript', () => {
       />,
     );
     expect(scrollTopOf(scroller)).toBe(100);
+    scroller!.classList.add('reaction-dock-reserved');
     scroller!.style.paddingBottom = '40px';
     act(() => resizeObservers[0]!.triggerEntries([[scroller!, 60]]));
     expect(scrollTopOf(scroller)).toBe(140);
