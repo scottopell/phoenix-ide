@@ -47,6 +47,10 @@ enum APIError: Error, LocalizedError {
         return false
     }
 
+    var isCloseAlreadyHistory: Bool {
+        serverErrorType == "close_already_history"
+    }
+
     var serverErrorType: String? {
         guard case .http(_, let body) = self,
               let data = body.data(using: .utf8),

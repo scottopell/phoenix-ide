@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
-import { api } from '../api';
+import { ApiResponseError, api } from '../api';
 import { ConversationListPage } from './ConversationListPage';
 
 const pageMocks = vi.hoisted(() => ({
@@ -22,6 +22,8 @@ vi.mock('../api', async () => {
       codexLoginPreflight: vi.fn(),
       listProductConversations: vi.fn(),
       renameProductConversation: vi.fn(),
+      deleteChain: vi.fn(),
+      deleteConversation: vi.fn(),
     },
   };
 });
@@ -116,6 +118,25 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
 
     expect(await screen.findByText('Mobile Product')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Close product conversation Mobile Product' })).toBeNull();
+  });
+
+  it('treats an authoritative 404 while deleting History as completed', async () => {
+    const history = {
+      ...productConversation(),
+      lifecycle: { state: 'history' as const },
+      latest_transcript_row_id: 'successor-mobile',
+    };
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.deleteChain).mockRejectedValue(new ApiResponseError('gone', 404));
+    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
+
+    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(screen.getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
+    await waitFor(() => expect(screen.queryByText(/gone/)).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {
