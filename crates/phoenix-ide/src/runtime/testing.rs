@@ -565,6 +565,8 @@ pub struct InMemoryStorage {
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
+    approval_authority_unclassified: Mutex<bool>,
+    fail_approval_authority_persistence: Mutex<bool>,
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
@@ -635,6 +637,8 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
+            approval_authority_unclassified: Mutex::new(false),
+            fail_approval_authority_persistence: Mutex::new(false),
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
@@ -691,6 +695,14 @@ impl InMemoryStorage {
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
         *self.fail_continuation_commit.lock().unwrap() = fail;
+    }
+
+    pub fn set_approval_authority_unclassified(&self, unclassified: bool) {
+        *self.approval_authority_unclassified.lock().unwrap() = unclassified;
+    }
+
+    pub fn set_fail_approval_authority_persistence(&self, fail: bool) {
+        *self.fail_approval_authority_persistence.lock().unwrap() = fail;
     }
 
     pub fn set_accepted_continuation_handoff_message_id(&self, conv_id: &str, message_id: &str) {
@@ -2066,7 +2078,10 @@ impl StateStore for InMemoryStorage {
         approval_message: &Message,
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
+        if *self.fail_approval_authority_persistence.lock().unwrap() {
+            return Err("injected approval authority persistence failure".to_string());
+        }
         self.persist_approved_task_authority(conv_id, approval)
             .await?;
         self.messages
@@ -2075,7 +2090,12 @@ impl StateStore for InMemoryStorage {
             .entry(conv_id.to_string())
             .or_default()
             .push(approval_message.clone());
-        self.update_state(conv_id, state, state_updated_at).await
+        self.update_state(conv_id, state, state_updated_at).await?;
+        if *self.approval_authority_unclassified.lock().unwrap() {
+            Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified)
+        } else {
+            Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(()))
+        }
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {

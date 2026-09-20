@@ -8,6 +8,20 @@ use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
+const WORKTREE_WRITE_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_WRITE";
+const WORKTREE_ROOT_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_ROOT";
+const NETWORK_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
 
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
@@ -16,6 +30,7 @@ pub struct ExploreReadOnlyPolicy {
     home: PathBuf,
     platform_temp: PathBuf,
     path: OsString,
+    worktree_write_root: Option<PathBuf>,
 }
 
 impl ExploreReadOnlyPolicy {
@@ -51,6 +66,57 @@ impl ExploreReadOnlyPolicy {
             home,
             platform_temp,
             path,
+            worktree_write_root: None,
+        })
+    }
+
+    /// Build a policy that permits writes only within `worktree_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when either path cannot be canonicalized, the working
+    /// directory is outside the worktree, or the in-worktree scratch cannot be created.
+    pub fn discover_worktree_write(
+        working_dir: &Path,
+        worktree_root: &Path,
+    ) -> std::io::Result<Self> {
+        let runtime_env = PhoenixRuntimeEnvironment::detect();
+        let repo_root = working_dir.canonicalize()?;
+        let worktree_root = worktree_root.canonicalize()?;
+        if !repo_root.starts_with(&worktree_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "working directory is outside the inherited worktree",
+            ));
+        }
+        let scratch_root = worktree_root.join(".phoenix").join("bash-scratch");
+        std::fs::create_dir_all(&scratch_root)?;
+        let canonical_scratch_root = scratch_root.canonicalize()?;
+        if !canonical_scratch_root.starts_with(&worktree_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sandbox scratch resolves outside the inherited worktree",
+            ));
+        }
+        let scratch_dir = canonical_scratch_root.join(uuid::Uuid::new_v4().to_string());
+        let platform_temp = scratch_dir.join("platform-temp");
+        std::fs::create_dir_all(&platform_temp)?;
+        if !platform_temp
+            .canonicalize()?
+            .starts_with(&canonical_scratch_root)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sandbox temp resolves outside the inherited worktree",
+            ));
+        }
+        Ok(Self {
+            repo_root,
+            scratch_dir,
+            home: runtime_env.home().to_path_buf(),
+            platform_temp,
+            path: inherited_path(),
+            worktree_write_root: Some(worktree_root),
         })
     }
 
@@ -58,6 +124,13 @@ impl ExploreReadOnlyPolicy {
         command.env(REPO_ROOT_ENV, &self.repo_root);
         command.env(SCRATCH_ENV, &self.scratch_dir);
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
+        if let Some(worktree_root) = &self.worktree_write_root {
+            command.env(WORKTREE_WRITE_ENV, "1");
+            command.env(WORKTREE_ROOT_ENV, worktree_root);
+        }
+        if self.worktree_write_root.is_some() {
+            apply_network_env(command, std::env::vars_os());
+        }
         self.apply_child_env(command);
     }
 
@@ -66,6 +139,9 @@ impl ExploreReadOnlyPolicy {
         command.env("HOME", &self.home);
         command.env("TMPDIR", &self.platform_temp);
         command.env("PATH", &self.path);
+        if self.worktree_write_root.is_some() {
+            apply_network_env(command, std::env::vars_os());
+        }
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -82,12 +158,18 @@ impl ExploreReadOnlyPolicy {
         let home = env_path("HOME")?;
         let platform_temp = env_path(PLATFORM_TEMP_ENV)?;
         let path = inherited_path();
+        let worktree_write_root = if std::env::var_os(WORKTREE_WRITE_ENV).is_some() {
+            Some(env_path(WORKTREE_ROOT_ENV)?)
+        } else {
+            None
+        };
         Ok(Self {
             repo_root: repo_root.clone(),
             scratch_dir,
             home,
             platform_temp,
             path,
+            worktree_write_root,
         })
     }
 
@@ -95,9 +177,17 @@ impl ExploreReadOnlyPolicy {
         let mut caps = CapabilitySet::new()
             .set_signal_mode(SignalMode::Isolated)
             .allow_path("/", AccessMode::Read)
-            .map_err(|e| e.to_string())?
-            .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
+        if self.worktree_write_root.is_none() {
+            caps = caps
+                .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(worktree_root) = &self.worktree_write_root {
+            caps = caps
+                .allow_path(worktree_root, AccessMode::ReadWrite)
+                .map_err(|e| e.to_string())?;
+        }
 
         for path in system_writable_files() {
             if path.exists() {
@@ -110,7 +200,11 @@ impl ExploreReadOnlyPolicy {
                 .allow_path(&self.platform_temp, AccessMode::ReadWrite)
                 .map_err(|e| format!("{}: {e}", self.platform_temp.display()))?;
         }
-        Ok(caps.block_network())
+        if self.worktree_write_root.is_some() {
+            Ok(caps)
+        } else {
+            Ok(caps.block_network())
+        }
     }
 }
 
@@ -123,16 +217,25 @@ pub struct ExploreSandboxCommand {
 pub struct ExploreSandboxLauncher;
 
 impl ExploreSandboxLauncher {
-    /// Build the Phoenix child-process command that applies the Explore
-    /// sandbox and execs `bash -c cmd`.
+    /// Build a child-process command with writes confined to `worktree_root`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the policy cannot be constructed or the current
-    /// Phoenix executable cannot be resolved.
-    pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
-        let policy = ExploreReadOnlyPolicy::discover(working_dir)
-            .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
+    /// Returns an error when the policy or launcher command cannot be constructed.
+    pub fn worktree_write_command(
+        cmd: &str,
+        working_dir: &Path,
+        worktree_root: &Path,
+    ) -> Result<ExploreSandboxCommand, String> {
+        let policy = ExploreReadOnlyPolicy::discover_worktree_write(working_dir, worktree_root)
+            .map_err(|e| format!("failed to create worktree sandbox policy: {e}"))?;
+        Self::command_for_policy(cmd, &policy)
+    }
+
+    fn command_for_policy(
+        cmd: &str,
+        policy: &ExploreReadOnlyPolicy,
+    ) -> Result<ExploreSandboxCommand, String> {
         let exe = std::env::current_exe()
             .map_err(|e| format!("failed to resolve phoenix executable: {e}"))?;
         let mut command = Command::new(exe);
@@ -148,6 +251,19 @@ impl ExploreSandboxLauncher {
             command,
             scratch_dir,
         })
+    }
+
+    /// Build the Phoenix child-process command that applies the Explore
+    /// sandbox and execs `bash -c cmd`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy cannot be constructed or the current
+    /// Phoenix executable cannot be resolved.
+    pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
+        let policy = ExploreReadOnlyPolicy::discover(working_dir)
+            .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
+        Self::command_for_policy(cmd, &policy)
     }
 
     #[must_use]
@@ -196,6 +312,14 @@ fn env_path(name: &str) -> Result<PathBuf, String> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("missing {name}"))
+}
+
+fn apply_network_env(command: &mut Command, vars: impl IntoIterator<Item = (OsString, OsString)>) {
+    for (name, value) in vars {
+        if NETWORK_ENV_ALLOWLIST.iter().any(|allowed| name == *allowed) {
+            command.env(name, value);
+        }
+    }
 }
 
 fn inherited_path() -> OsString {
@@ -327,6 +451,68 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_policy_rejects_symlinked_scratch_root() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let outside = tempfile::TempDir::new().expect("outside");
+        std::fs::create_dir(worktree.path().join(".phoenix")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            worktree.path().join(".phoenix/bash-scratch"),
+        )
+        .unwrap();
+
+        assert!(
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path(),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn worktree_child_env_preserves_network_routing_allowlist() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let policy =
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
+                .expect("worktree policy");
+        let mut command = Command::new("bash");
+        command.env_clear();
+        apply_network_env(
+            &mut command,
+            [(
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:8080"),
+            )],
+        );
+        policy.apply_child_env(&mut command);
+        let value = command
+            .get_envs()
+            .find_map(|(name, value)| (name == "HTTPS_PROXY").then_some(value))
+            .flatten();
+        assert_eq!(value, Some(std::ffi::OsStr::new("http://proxy.test:8080")));
+    }
+
+    #[test]
+    fn worktree_write_policy_grants_only_worktree_and_scratch_writes() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let outside = tempfile::TempDir::new().expect("outside");
+        let child_cwd = worktree.path().join("nested");
+        std::fs::create_dir(&child_cwd).unwrap();
+        let policy = ExploreReadOnlyPolicy::discover_worktree_write(&child_cwd, worktree.path())
+            .expect("worktree policy");
+        let caps = policy.capability_set().expect("capabilities");
+
+        assert!(caps
+            .path_covered_with_access(&worktree.path().canonicalize().unwrap(), AccessMode::Write));
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+        assert!(policy.scratch_dir.starts_with(&canonical_worktree));
+        assert!(policy.platform_temp.starts_with(&canonical_worktree));
+        assert!(caps.path_covered_with_access(&policy.scratch_dir, AccessMode::Write));
+        assert_eq!(caps.network_mode(), &nono::NetworkMode::AllowAll);
+        assert!(!caps
+            .path_covered_with_access(&outside.path().canonicalize().unwrap(), AccessMode::Write));
+    }
 
     #[test]
     fn git_worktree_root_resolves_from_subdirectory() {

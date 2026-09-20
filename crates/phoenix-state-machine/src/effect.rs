@@ -241,13 +241,13 @@ pub enum Effect {
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
-    /// Execute git operations for task approval (REQ-BED-028).
+    /// Adopt an approved task in the current conversation (REQ-BED-028).
     ///
-    /// `task_file` (relative to the conversation cwd) is the canonical
-    /// source: the executor reads it from disk to derive task id, slug,
-    /// priority, and status, then sets up the branch and worktree. The
-    /// remaining fields are the snapshot the user approved and are used for
-    /// the user-facing branch announcement message.
+    /// `task_file` (relative to the conversation cwd) is the canonical source:
+    /// the executor reads it from disk to derive task id, slug, priority, and
+    /// status, then sets up the branch and worktree. The remaining fields are
+    /// the snapshot the user approved and are used for the user-facing branch
+    /// announcement message.
     ApproveTask {
         task_file: String,
         title: String,

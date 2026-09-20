@@ -1583,6 +1583,69 @@ impl BrowserSessionManager {
         manager
     }
 
+    /// Promote a restricted actor's existing session to the shared `WorkScope` key.
+    ///
+    /// Returns `true` when a live entry moved. If the destination is already
+    /// occupied, the restricted entry is left unchanged.
+    pub async fn promote_actor_to_work_scope(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor_conversation_id: &str,
+    ) -> bool {
+        let restricted =
+            EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let old_key = session_key(work_scope, &restricted);
+        let new_key = work_scope.stable_key();
+        let mut state = self.state.write().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &restricted).is_some()
+        {
+            return false;
+        }
+        if state.sessions.contains_key(&new_key) {
+            return false;
+        }
+        let Some(entry) = state.sessions.get(&old_key) else {
+            return false;
+        };
+        if entry
+            .current_kill
+            .lock()
+            .is_ok_and(|current| current.is_some())
+        {
+            return false;
+        }
+        let Some(mut entry) = state.sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.authority = ResourceAuthority::Work;
+        state.sessions.insert(new_key, entry);
+        true
+    }
+
+    /// Revert a prior actor-to-WorkScope promotion when the caller cannot
+    /// complete the authority transition.
+    pub async fn demote_work_scope_to_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor_conversation_id: &str,
+    ) -> bool {
+        let restricted =
+            EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let old_key = work_scope.stable_key();
+        let new_key = session_key(work_scope, &restricted);
+        let mut state = self.state.write().await;
+        if state.sessions.contains_key(&new_key) {
+            return false;
+        }
+        let Some(mut entry) = state.sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.authority = ResourceAuthority::Restricted;
+        state.sessions.insert(new_key, entry);
+        true
+    }
+
     /// Install the predicate that gates idle reaping on `ResourceScopeKey` liveness.
     ///
     /// Set-once: a second call is a no-op (returns the supplied hook unused via

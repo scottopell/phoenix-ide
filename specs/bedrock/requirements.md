@@ -143,11 +143,14 @@ THE SYSTEM SHALL configure tools to operate within the conversation's worktree d
 AND enable file-write tools within that worktree
 AND allow bash commands that read and write files within that worktree
 
-WHEN a tool with write authority attempts to write outside the worktree directory
+WHEN an attached Work sub-agent attempts to write outside the inherited worktree directory
 THE SYSTEM SHALL block the write
 AND return a descriptive error
 
-**Rationale:** Write authority is scoped to the disposable worktree, not to the whole filesystem and not to a lifecycle mode name. This preserves isolation without requiring a separate writing lifecycle label as a product concept.
+WHEN an owning WorkScope conversation requires Git common-directory, build-output, generated-output, or normal tool-cache writes to execute its approved objective
+THE SYSTEM SHALL allow those bounded external writes subject to operating-system permissions and command safety checks
+
+**Rationale:** An attached child is confined to its inherited disposable worktree. The owning conversation retains the bounded external write capabilities required to operate that worktree and its toolchain without making lifecycle mode names the authority source.
 
 ---
 
@@ -378,7 +381,7 @@ AND materialize the pending continuation operation at startup
 
 WHEN the owning execution boundary determines under REQ-DWF-043 that the durable
 fact needed to continue cannot be established
-THE SYSTEM SHALL stop admission and semantic publication
+THE SYSTEM SHALL stop admission and semantic publication before publishing any capability derived from the unclassified operation
 AND SHALL NOT perform database-backed cleanup that depends on the suspect
 persistence path
 AND SHALL attempt only bounded best-effort shutdown work
@@ -600,6 +603,10 @@ THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
 AND set the working directory to the target directory (not a Phoenix-owned worktree)
 AND SHALL NOT include `propose_task`
 AND NOT create worktrees, branches, or task files for the Direct conversation itself
+
+WHEN a database upgrade encounters a Direct conversation whose attached `WorkScope` has Restricted Explore authority
+THE SYSTEM SHALL transform that `WorkScope` to Direct authority
+AND SHALL NOT change authority on a `WorkScope` attached only to non-Direct conversations
 
 THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
 
@@ -987,6 +994,39 @@ AND SHALL leave the conversation's mode unchanged, including when the pre-approv
 AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state beyond the
   approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
   or branch/worktree provenance
+
+### REQ-BED-046: Publish Approved Capabilities as One Authority Projection
+
+WHEN task approval grants Work authority to a conversation's `WorkScope`
+THE SYSTEM SHALL derive the conversation runtime's tool surface, tool execution policy, Bash isolation policy, tool context, and sub-agent admission policy from that same `WorkScope` authority before accepting post-approval work
+AND SHALL NOT use conversation mode provenance as capability authority
+
+IF the system cannot project the granted authority to every runtime capability consumer
+THEN THE SYSTEM SHALL NOT resume the conversation with a partially updated capability surface
+
+WHEN same-conversation approval adopts Work authority
+THE SYSTEM SHALL persist the approved objective, `WorkScope` authority, post-approval conversation state, and approved-plan context message in one atomic transaction before publishing the runtime capability projection
+
+IF any post-mutation approval step fails
+THEN THE SYSTEM SHALL retire the live actor for reconstruction from durable authority
+AND SHALL immediately rematerialize the retired conversation from its persisted state without relying on unfinished-turn discovery
+AND IF bounded rematerialization attempts are exhausted THE SYSTEM SHALL release the reserved event stream so clients reconnect and can initiate reconstruction
+
+WHEN same-conversation approval commits a transition to `LlmRequesting`
+THE SYSTEM SHALL persist an operation-scoped obligation bound to the complete identity of that approval message
+AND SHALL derive the approval sequence from the referenced message rather than storing a parallel sequence representation
+AND SHALL preserve the requesting state across process restart while that obligation remains pending
+AND SHALL retire the obligation when the first later agent response is durably stored or the conversation leaves `LlmRequesting`
+AND SHALL NOT treat the lifetime approved-task objective as ownership of later requests
+
+WHEN approval performs Git or worktree mutation before adopting `LlmRequesting`
+THE SYSTEM SHALL capture the requesting-state timestamp after that mutation succeeds and immediately before atomic persistence and live-state adoption
+
+WHEN a runtime is reconstructed after interruption
+THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
+
+WHILE an Explore-origin conversation has not received approved `WorkScope` authority
+THE SYSTEM SHALL retain its Restricted tool surface, sandboxed Bash policy, and prohibition on Work sub-agents
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy

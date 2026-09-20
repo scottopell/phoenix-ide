@@ -442,6 +442,7 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String>;
 
+    #[allow(dead_code)]
     async fn persist_approved_task_authority(
         &self,
         conv_id: &str,
@@ -455,7 +456,7 @@ pub trait StateStore: Send + Sync {
         approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> Result<(), String>;
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String>;
 
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
@@ -1023,7 +1024,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
         (**self)
             .persist_approved_task_authority_and_state(
                 conv_id,
@@ -2004,7 +2005,7 @@ impl StateStore for DatabaseStorage {
         approval_message: &crate::db::Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
         self.db
             .persist_approved_task_authority_and_state(
                 conv_id,

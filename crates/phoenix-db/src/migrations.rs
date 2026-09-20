@@ -520,6 +520,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_svg_artifacts",
         sql: MIGRATION_101,
     },
+    Migration {
+        version: 102,
+        name: "repair_direct_execution_authority",
+        sql: MIGRATION_102,
+    },
+    Migration {
+        version: 103,
+        name: "enforce_authority_timestamp_storage_class",
+        sql: MIGRATION_103,
+    },
+    Migration {
+        version: 104,
+        name: "persist_approval_request_obligation",
+        sql: MIGRATION_104,
+    },
 ];
 
 const MIGRATION_101: &str = r"
@@ -10368,6 +10383,106 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
+const MIGRATION_102: &str = r"
+UPDATE work_scopes
+SET authority_kind = 'direct'
+WHERE id IN (
+    SELECT work_scope_id
+    FROM conversations
+    WHERE cm_kind = 'direct'
+      AND work_scope_id IS NOT NULL
+)
+  AND authority_kind = 'restricted_explore';
+";
+
+const MIGRATION_103: &str = r"
+UPDATE conversation_approved_task_objectives
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+UPDATE work_scope_approved_task_authorities
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+UPDATE product_conversation_sources
+SET created_at_us = max(CAST(created_at_us AS INTEGER), 0)
+WHERE typeof(created_at_us) <> 'integer' OR created_at_us < 0;
+
+CREATE TRIGGER conversation_approved_task_objective_timestamp_insert
+BEFORE INSERT ON conversation_approved_task_objectives
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER conversation_approved_task_objective_timestamp_update
+BEFORE UPDATE OF created_at_us ON conversation_approved_task_objectives
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER work_scope_approved_task_authority_timestamp_insert
+BEFORE INSERT ON work_scope_approved_task_authorities
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER work_scope_approved_task_authority_timestamp_update
+BEFORE UPDATE OF created_at_us ON work_scope_approved_task_authorities
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER product_conversation_source_timestamp_insert
+BEFORE INSERT ON product_conversation_sources
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+CREATE TRIGGER product_conversation_source_timestamp_update
+BEFORE UPDATE OF created_at_us ON product_conversation_sources
+WHEN typeof(NEW.created_at_us) <> 'integer' OR NEW.created_at_us < 0
+BEGIN
+    SELECT RAISE(ABORT, 'created_at_us must be a nonnegative integer');
+END;
+";
+
+const MIGRATION_104: &str = r"
+CREATE TABLE approval_request_obligations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE,
+    created_at_us INTEGER NOT NULL
+        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0),
+    FOREIGN KEY (conversation_id, approval_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE CASCADE
+);
+INSERT OR IGNORE INTO approval_request_obligations
+    (conversation_id, approval_message_id, created_at_us)
+SELECT c.id, m.message_id, CAST(strftime('%s', m.created_at) AS INTEGER) * 1000000
+FROM conversations c
+JOIN messages m ON m.conversation_id = c.id
+WHERE c.state_kind = 'llm_requesting'
+  AND m.message_type = 'user'
+  AND json_extract(m.content, '$.is_meta') = 1
+  AND (
+      json_extract(m.content, '$.text') LIKE 'Task approved%'
+      OR json_extract(m.content, '$.text') LIKE 'Follow-up task approved%'
+  )
+  AND m.sequence_id = (
+      SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
+  );
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id;
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10610,6 +10725,207 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+    }
+
+    #[test]
+    fn capability_migrations_are_forward_only_and_unique() {
+        let ledger = compiled_migration_ledger();
+        assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(
+            ledger.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            vec![
+                (104, "persist_approval_request_obligation"),
+                (103, "enforce_authority_timestamp_storage_class"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_102_repairs_only_stale_direct_authority() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (id TEXT PRIMARY KEY, authority_kind TEXT NOT NULL);
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 cm_kind TEXT,
+                 work_scope_id TEXT REFERENCES work_scopes(id)
+             );
+             INSERT INTO work_scopes VALUES ('direct', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('explore', 'restricted_explore');
+             INSERT INTO work_scopes VALUES ('work', 'work');
+             INSERT INTO conversations VALUES ('d', 'direct', 'direct');
+             INSERT INTO conversations VALUES ('e', 'explore', 'explore');
+             INSERT INTO conversations VALUES ('w', 'work', 'work');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, authority_kind FROM work_scopes ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("direct".to_string(), "direct".to_string()),
+                ("explore".to_string(), "restricted_explore".to_string()),
+                ("work".to_string(), "work".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_103_repairs_and_enforces_timestamp_storage_class() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE work_scopes (id TEXT PRIMARY KEY);
+             CREATE TABLE conversation_approved_task_objectives (
+                 conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+                 task_id TEXT NOT NULL, task_title TEXT NOT NULL,
+                 approved_title TEXT NOT NULL, approved_priority TEXT NOT NULL,
+                 approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL,
+                 approved_artifact_body TEXT NOT NULL, created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE work_scope_approved_task_authorities (
+                 work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id),
+                 objective_conversation_id TEXT NOT NULL UNIQUE
+                     REFERENCES conversation_approved_task_objectives(conversation_id),
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE product_conversation_sources (
+                 id INTEGER PRIMARY KEY,
+                 created_at_us INTEGER NOT NULL
+             );
+             INSERT INTO conversations VALUES ('c');
+             INSERT INTO work_scopes VALUES ('s');
+             INSERT INTO conversation_approved_task_objectives
+             VALUES ('c','t','T','A','\"p0\"','P','tasks/t.md','B','12');
+             INSERT INTO work_scope_approved_task_authorities VALUES ('s','c','13');
+             INSERT INTO product_conversation_sources VALUES (1, '14');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_103).execute(&pool).await.unwrap();
+        let kinds = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT typeof(o.created_at_us), typeof(a.created_at_us),
+                    typeof(s.created_at_us)
+             FROM conversation_approved_task_objectives o
+             JOIN work_scope_approved_task_authorities a
+               ON a.objective_conversation_id = o.conversation_id
+             JOIN product_conversation_sources s ON s.id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds,
+            (
+                "integer".to_string(),
+                "integer".to_string(),
+                "integer".to_string()
+            )
+        );
+        assert!(sqlx::query(
+            "UPDATE conversation_approved_task_objectives SET created_at_us = 'bad'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("UPDATE product_conversation_sources SET created_at_us = 1.5")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_104_binds_approval_message_to_conversation() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 state_kind TEXT NOT NULL DEFAULT 'idle'
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL DEFAULT 'user',
+                 sequence_id INTEGER NOT NULL DEFAULT 1,
+                 content TEXT NOT NULL DEFAULT '{}',
+                 created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+             );
+             CREATE UNIQUE INDEX messages_conversation_message_id_unique
+                 ON messages(conversation_id, message_id);
+             INSERT INTO conversations (id) VALUES ('a'), ('b');
+             INSERT INTO conversations (id, state_kind)
+             VALUES ('legacy', 'llm_requesting'), ('follow-up', 'llm_requesting');
+             INSERT INTO messages (message_id, conversation_id) VALUES ('approval', 'b');
+             INSERT INTO messages
+                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
+             VALUES
+                 ('legacy-approval', 'legacy', 'user', 7,
+                  '{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}',
+                  '2025-01-01T00:00:00Z');
+             INSERT INTO messages
+                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
+             VALUES
+                 ('follow-up-approval', 'follow-up', 'user', 8,
+                  '{\"text\":\"Follow-up task approved. Continue.\",\"is_meta\":true}',
+                  '2025-01-01T00:00:01Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_104).execute(&pool).await.unwrap();
+        let legacy_obligation = sqlx::query_as::<_, (String, String)>(
+            "SELECT conversation_id, approval_message_id
+             FROM approval_request_obligations
+             WHERE conversation_id = 'legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy_obligation,
+            ("legacy".to_string(), "legacy-approval".to_string())
+        );
+        sqlx::query("DELETE FROM approval_request_obligations WHERE conversation_id = 'legacy'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM approval_request_obligations
+                 WHERE conversation_id = 'follow-up'
+                   AND approval_message_id = 'follow-up-approval'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap());
+
+        assert!(sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('a', 'approval', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('b', 'approval', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -15251,7 +15567,10 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (102, 'temporarily_skip_direct_authority_repair'),
+                    (103, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (104, 'temporarily_skip_approval_request_obligation')",
         )
         .execute(&pool)
         .await
@@ -16144,7 +16463,10 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (102, 'temporarily_skip_direct_authority_repair'),
+                    (103, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (104, 'temporarily_skip_approval_request_obligation')",
         )
         .execute(pool)
         .await

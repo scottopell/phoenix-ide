@@ -500,6 +500,16 @@ rule HandleSpawned {
 -- REQ-BASH-005, REQ-BASH-WS-001: run rejected because the work scope is at
 -- its cap. Both conversations of a continuation chain count against the one
 -- per-ResourceScope cap. No handle is created.
+rule BashIsolationMatchesWorkScopeAuthority {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
+    ensures: BashIsolationDerivedFromWorkScopeAuthority(conversation)
+
+    @guidance
+        -- Restricted WorkScope authority selects the Explore OS sandbox;
+        -- Work authority selects unsandboxed Bash. Conversation mode is
+        -- provenance and does not override this selection.
+}
+
 rule RunRejectedByCap {
     when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 

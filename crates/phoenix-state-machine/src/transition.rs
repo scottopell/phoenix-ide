@@ -1825,7 +1825,6 @@ pub fn transition_parent(
                     priority: *priority,
                     plan: plan.clone(),
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
@@ -3618,6 +3617,40 @@ mod tests {
                 thoughts: "inspect".to_string(),
             }),
         )
+    }
+
+    #[test]
+    fn same_conversation_approval_has_one_atomic_state_owner() {
+        let state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--review.md".to_string(),
+            title: "Review".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Check the result".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            },
+        )
+        .expect("task approval transitions");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(matches!(
+            result.effects.first(),
+            Some(Effect::ApproveTask { .. })
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(matches!(result.effects.last(), Some(Effect::RequestLlm)));
     }
 
     #[test]
@@ -5501,8 +5534,8 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
             is_coordinator: false,

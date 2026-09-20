@@ -2011,7 +2011,10 @@ impl Database {
 
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
-            "work" | "branch" => AuthorityKind::Work,
+            "direct" => AuthorityKind::Direct,
+            "work" | "branch" | "attached_work_child" | "detached_approved_task" => {
+                AuthorityKind::Work
+            }
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -7279,6 +7282,7 @@ impl Database {
                 AuthorityKind::RestrictedExplore
             }
             ConvMode::Direct
+            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::Branch { .. }
             | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
@@ -7545,8 +7549,17 @@ impl Database {
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> DbResult<()> {
-        self.persist_approved_task_authority_inner(conversation_id, approval, None)
-            .await
+        match self
+            .persist_approved_task_authority_inner(conversation_id, approval, None)
+            .await?
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(()) => Ok(()),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "approved-task authority commit is unclassified".to_string(),
+                ))
+            }
+        }
     }
 
     /// Persist replacement task authority and the selected state atomically.
@@ -7561,7 +7574,7 @@ impl Database {
         approval_message: &Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
         self.persist_approved_task_authority_inner(
             conversation_id,
             approval,
@@ -7570,15 +7583,27 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn persist_approved_task_authority_inner(
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
         settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
-    ) -> DbResult<()> {
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let settlement_identity = settlement
+            .map(|(message, state, updated_at)| {
+                Ok::<_, DbError>((
+                    message.message_id.clone(),
+                    serde_json::to_string(state)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    conv_state_kind(state).to_string(),
+                    updated_at.to_rfc3339(),
+                ))
+            })
+            .transpose()?;
         let now_us = Utc::now().timestamp_micros();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let work_scope_id: Option<String> =
@@ -7640,6 +7665,19 @@ impl Database {
         .await?;
         if let Some((approval_message, state, state_updated_at)) = settlement {
             insert_message_tx(&mut tx, approval_message).await?;
+            sqlx::query(
+                "INSERT INTO approval_request_obligations
+                 (conversation_id, approval_message_id, created_at_us)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     approval_message_id = excluded.approval_message_id,
+                     created_at_us = excluded.created_at_us",
+            )
+            .bind(conversation_id)
+            .bind(&approval_message.message_id)
+            .bind(approval_message.created_at.timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
             let state_json = serde_json::to_string(state).unwrap();
             sqlx::query(
                 "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -7652,8 +7690,45 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
-        tx.commit().await?;
-        Ok(())
+        match tx.commit().await {
+            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(())),
+            Err(commit_error) => {
+                let Some((message_id, expected_state, expected_kind, expected_updated_at)) =
+                    settlement_identity
+                else {
+                    return Err(commit_error.into());
+                };
+                let established = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM conversations c
+                         JOIN conversation_approved_task_objectives o ON o.conversation_id = c.id
+                         JOIN work_scope_approved_task_authorities a
+                           ON a.objective_conversation_id = c.id
+                          AND a.work_scope_id = c.work_scope_id
+                         JOIN work_scopes s ON s.id = a.work_scope_id AND s.authority_kind = 'work'
+                         JOIN messages m ON m.message_id = ?2 AND m.conversation_id = c.id
+                         WHERE c.id = ?1 AND c.state = ?3 AND c.state_kind = ?4
+                           AND c.state_updated_at = ?5 AND o.task_id = ?6
+                     )",
+                )
+                .bind(conversation_id)
+                .bind(message_id)
+                .bind(expected_state)
+                .bind(expected_kind)
+                .bind(expected_updated_at)
+                .bind(&snapshot.task_id)
+                .fetch_one(&self.pool)
+                .await;
+                match established {
+                    Ok(true) => {
+                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()))
+                    }
+                    Ok(false) => Err(commit_error.into()),
+                    Err(_) => Ok(crate::workflow::LocalAuthorityResult::DurableFactUnclassified),
+                }
+            }
+        }
     }
 
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
@@ -9527,6 +9602,7 @@ impl Database {
                             AuthorityKind::RestrictedExplore
                         }
                         ConvMode::Direct
+                        | ConvMode::AttachedWorkChild { .. }
                         | ConvMode::Work { .. }
                         | ConvMode::Branch { .. }
                         | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
@@ -9996,9 +10072,30 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     ///
-    /// # Panics
+    /// Whether a committed approval owns the first post-approval provider request.
     ///
-    /// Panics if persisted JSON columns cannot be (de)serialized.
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn has_pending_approval_request(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM approval_request_obligations
+                 WHERE conversation_id = ?1
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Reset transient conversation states after restart.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when recovery persistence fails.
+    ///
+    /// # Panics
+    /// Panics only if the static `Idle` state cannot be serialized.
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -10081,6 +10178,10 @@ impl Database {
                            SELECT 1 FROM conversation_creation_jobs j
                            WHERE j.conversation_id = conversations.id
                              AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM approval_request_obligations approval
+                           WHERE approval.conversation_id = conversations.id
                        )
                        OR EXISTS (
                            SELECT 1 FROM durable_turns t
@@ -12568,6 +12669,15 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
+        ConvMode::AttachedWorkChild { worktree_path } => ConvModeCols {
+            kind: "attached_work_child",
+            branch_name: None,
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: None,
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
         ConvMode::DetachedProductCreation {
             worktree_path,
             base_branch,
@@ -12648,6 +12758,14 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("attached_work_child") => {
+            if let Some(worktree_path) = ne_env("env_worktree_path") {
+                ConvMode::AttachedWorkChild { worktree_path }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "attached Work child row missing worktree, defaulting to Explore");
                 ConvMode::default()
             }
         }
@@ -17676,12 +17794,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_receives_restricted_authority() {
+    fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
-        assert_eq!(
-            Database::authority_for_mode(&cm),
-            AuthorityKind::RestrictedExplore
-        );
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
     }
 
     #[tokio::test]

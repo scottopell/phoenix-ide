@@ -2298,7 +2298,7 @@ pub struct ConvContext {
     /// Resource namespace for this runtime. Ordinary conversations carry a
     /// persisted work scope; the Coordinator occupies its disjoint namespace.
     pub resource_scope: crate::work_scope::ResourceScopeKey,
-    /// Effective authority used for same-scope runtime resources.
+    /// Runtime authority projected from the persisted `WorkScope`.
     pub resource_authority: crate::work_scope::ResourceAuthority,
     /// Persisted worktree location, if this conversation has one. This is
     /// environment context only and never participates in resource identity.

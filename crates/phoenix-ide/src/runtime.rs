@@ -1995,15 +1995,36 @@ pub enum SseEvent {
     },
 }
 
+fn approved_managed_registry(
+    mode: &ConvMode,
+    authority: crate::work_scope::ResourceAuthority,
+    agents: Vec<phoenix_agents::AgentDefinition>,
+    writing_tools: crate::tools::WritingConversationTools,
+) -> Result<Option<ToolRegistry>, String> {
+    if authority != crate::work_scope::ResourceAuthority::Work
+        || !matches!(
+            mode,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+        )
+    {
+        return Ok(None);
+    }
+    ToolRegistry::git_backed_writing_parent(agents, writing_tools).map(Some)
+}
+
 fn sub_agent_registry_for_authority(
+    mode: &ConvMode,
     authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
-    match authority {
-        crate::work_scope::ResourceAuthority::Restricted => {
+    match (mode, authority) {
+        (_, crate::work_scope::ResourceAuthority::Restricted) => {
             ToolRegistry::for_subagent_explore(policy)
         }
-        crate::work_scope::ResourceAuthority::Work => ToolRegistry::for_subagent_work(),
+        (ConvMode::AttachedWorkChild { .. }, crate::work_scope::ResourceAuthority::Work) => {
+            ToolRegistry::for_attached_subagent_work()
+        }
+        (_, crate::work_scope::ResourceAuthority::Work) => ToolRegistry::for_subagent_work(),
     }
 }
 
@@ -2060,6 +2081,15 @@ fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<Resourc
     }
 }
 
+async fn accepts_browser_scope_event(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> bool {
+    crate::resource_authority::resolve_resource_authority(db, conv)
+        .await
+        .is_ok_and(|authority| authority.authority == crate::work_scope::ResourceAuthority::Work)
+}
+
 fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
     let owner_id = worktree_path.file_name()?.to_str()?;
     let id_prefix: String = owner_id.chars().take(8).collect();
@@ -2077,6 +2107,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
         | ConvMode::Direct
+        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
@@ -2560,7 +2591,7 @@ impl RuntimeManager {
                         continue;
                     }
                     if matches!(audience, BrowserSessionAudience::Scope)
-                        && matches!(conv.conv_mode, ConvMode::Explore { .. })
+                        && !accepts_browser_scope_event(&manager.db, &conv).await
                     {
                         continue;
                     }
@@ -3792,6 +3823,39 @@ impl RuntimeManager {
             return;
         }
 
+        let parent_resource =
+            match crate::resource_authority::resolve_resource_authority(&self.db, &parent_conv)
+                .await
+            {
+                Ok(resource) => resource,
+                Err(error) => {
+                    let _ = parent_event_tx
+                        .send(Event::SubAgentResult {
+                            agent_id: spec.agent_id,
+                            outcome: SubAgentOutcome::Failure {
+                                error: format!("failed to resolve parent capability: {error}"),
+                                error_kind: crate::db::ErrorKind::SubAgentError,
+                            },
+                        })
+                        .await;
+                    return;
+                }
+            };
+        if spec.mode == SubAgentMode::Work
+            && parent_resource.authority != crate::work_scope::ResourceAuthority::Work
+        {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Parent capability does not authorize a Work child".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         if let Err(error) = self.llm_registry.validate_execution_route(
             &spec.model_id,
             &spec.connection,
@@ -3817,8 +3881,34 @@ impl RuntimeManager {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
             },
-            SubAgentMode::Work => parent_conv.conv_mode.clone(),
+            SubAgentMode::Work => match &parent_conv.conv_mode {
+                ConvMode::Explore {
+                    worktree_path: Some(worktree_path),
+                    ..
+                }
+                | ConvMode::DetachedProductCreation { worktree_path, .. } => {
+                    ConvMode::AttachedWorkChild {
+                        worktree_path: worktree_path.clone(),
+                    }
+                }
+                mode => mode.clone(),
+            },
         };
+
+        if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. })
+            && !self.platform.has_sandbox()
+        {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Attached Work children require OS sandbox support".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
             Ok(cwd) => cwd,
@@ -3973,6 +4063,7 @@ impl RuntimeManager {
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
@@ -4008,6 +4099,9 @@ impl RuntimeManager {
         let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
         let registry = match spec.mode {
             SubAgentMode::Explore => ToolRegistry::for_subagent_explore(explore_policy),
+            SubAgentMode::Work if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. }) => {
+                ToolRegistry::for_attached_subagent_work()
+            }
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
         // Sub-agents cannot spawn, so they carry an empty agent catalog.
@@ -4917,11 +5011,7 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
-        let approved_task_objective = self
-            .db
-            .get_approved_task_objective(conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
+
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -4958,11 +5048,11 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority =
+        let authority_resolution =
             crate::resource_authority::resolve_resource_authority(self.db(), &conv)
                 .await
-                .map_err(|error| format!("Failed to load resource authority: {error}"))?
-                .authority;
+                .map_err(|error| format!("Failed to load resource authority: {error}"))?;
+        context.resource_authority = authority_resolution.authority;
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
         context.service_tier = self
@@ -4975,12 +5065,28 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
+        context.work_scope_worktree = match (&conv.conv_mode, &authority_resolution.environment) {
+            (
+                ConvMode::AttachedWorkChild { .. },
+                Some(phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
+                    worktree_path,
+                    ..
+                }),
+            ) => Some(PathBuf::from(worktree_path)),
+            (ConvMode::AttachedWorkChild { .. }, _) => None,
+            _ => conv.conv_mode.worktree_path().map(PathBuf::from),
+        };
+        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. })
+            && context.work_scope_worktree.is_none()
+        {
+            return Err("Attached Work child is missing its persisted worktree path".to_string());
+        }
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -5058,6 +5164,7 @@ impl RuntimeManager {
 
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_authority(
+                &conv.conv_mode,
                 context.resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
@@ -5101,30 +5208,36 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-                let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
-                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
-                        ToolRegistry::explore(
-                            &context.tasks_dir_name,
-                            agent_catalog.to_vec(),
-                            ExploreToolPolicy::from_platform(&self.platform),
-                        ),
-                        Some(writing_tools),
-                    ),
-                    ConvMode::Direct => (
+                let approved_registry = approved_managed_registry(
+                    &conv.conv_mode,
+                    context.resource_authority,
+                    agent_catalog.to_vec(),
+                    writing_tools.clone(),
+                )?;
+                let (registry, upgrade_writing_tools) = match (approved_registry, conv.conv_mode) {
+                    (Some(registry), _) => (registry, None),
+                    (None, ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }) => {
+                        (
+                            ToolRegistry::explore(
+                                &context.tasks_dir_name,
+                                agent_catalog.to_vec(),
+                                ExploreToolPolicy::from_platform(&self.platform),
+                            ),
+                            Some(writing_tools),
+                        )
+                    }
+                    (None, ConvMode::Direct) => (
                         ToolRegistry::direct(agent_catalog.to_vec())
                             .try_with_writing_conversation_tools(writing_tools)?,
                         None,
                     ),
-                    ConvMode::Work { .. }
-                    | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => (
+                    (
+                        None,
+                        ConvMode::Work { .. }
+                        | ConvMode::Branch { .. }
+                        | ConvMode::AttachedWorkChild { .. }
+                        | ConvMode::DetachedApprovedTask { .. },
+                    ) => (
                         ToolRegistry::git_backed_writing_parent(
                             agent_catalog.to_vec(),
                             writing_tools,
@@ -6176,6 +6289,15 @@ impl RuntimeManager {
 
         if self
             .db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
+
+        if self
+            .db
             .has_committed_steering_turn(conversation_id)
             .await
             .map_err(|e| e.to_string())?
@@ -6287,6 +6409,9 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
+        ConvMode::AttachedWorkChild { worktree_path } => ModeContext::AttachedWorkChild {
+            worktree_path: worktree_path.to_string(),
+        },
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -6381,14 +6506,179 @@ mod bash_lifecycle_bridge_tests {
 }
 
 #[cfg(test)]
+mod approved_objective_registry_tests {
+    use super::approved_managed_registry;
+    use crate::tools::{ToolContext, ToolOutput};
+    use crate::work_scope::ResourceAuthority;
+    use async_trait::async_trait;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    struct WritingMarker(&'static str);
+
+    #[async_trait]
+    impl crate::tools::Tool for WritingMarker {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            "marker".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    #[test]
+    fn detached_product_creation_with_approved_objective_rematerializes_as_work() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = crate::tools::WritingConversationTools::new(
+            Arc::new(WritingMarker("search_conversations")),
+            Arc::new(WritingMarker("read_conversation")),
+            Arc::new(WritingMarker("query_database")),
+            Arc::new(WritingMarker("send_conversation_message")),
+        )
+        .unwrap();
+        assert!(
+            approved_managed_registry(&mode, ResourceAuthority::Work, vec![], writing_tools,)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn detached_product_creation_restart_projects_work_filesystem_and_network_capability() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let registry = approved_managed_registry(
+            &mode,
+            ResourceAuthority::Work,
+            vec![],
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .expect("approved persisted authority projects a Work registry");
+        let names: std::collections::HashSet<_> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(names.contains("patch"));
+        assert!(names.contains("bash"));
+        assert!(!names.contains("sandboxed_bash"));
+        assert!(names.contains("send_conversation_message"));
+        assert_eq!(mode.worktree_path(), Some("/tmp/product-worktree"));
+    }
+
+    #[test]
+    fn detached_product_creation_requires_work_authority() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = || {
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap()
+        };
+        assert!(approved_managed_registry(
+            &mode,
+            ResourceAuthority::Restricted,
+            vec![],
+            writing_tools(),
+        )
+        .unwrap()
+        .is_none());
+    }
+}
+
+#[cfg(test)]
+mod browser_scope_event_authority_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approved_explore_accepts_scope_event_but_restricted_explore_does_not() {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let restricted = db
+            .create_conversation(
+                "restricted-browser",
+                "restricted",
+                "/tmp",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("restricted conversation");
+        assert!(!accepts_browser_scope_event(&db, &restricted).await);
+
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let approved = db
+            .create_conversation_with_project(
+                "approved-browser",
+                "approved",
+                worktree.path().to_str().unwrap(),
+                false,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Explore {
+                    worktree_path: Some(
+                        phoenix_core::domain::db_schema::NonEmptyString::new(
+                            worktree.path().to_str().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("approved conversation");
+        sqlx::query("UPDATE work_scopes SET authority_kind = 'work' WHERE id = ?1")
+            .bind(approved.attached_work_scope_id.as_ref().unwrap().as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(accepts_browser_scope_event(&db, &approved).await);
+    }
+}
+
+#[cfg(test)]
 mod sub_agent_registry_resume_tests {
     use super::sub_agent_registry_for_authority;
     use crate::platform::PlatformCapability;
     use crate::tools::ExploreToolPolicy;
     use crate::work_scope::ResourceAuthority;
 
-    fn registry_has(authority: ResourceAuthority, tool: &str) -> bool {
+    fn registry_has(mode: &crate::db::ConvMode, authority: ResourceAuthority, tool: &str) -> bool {
         sub_agent_registry_for_authority(
+            mode,
             authority,
             ExploreToolPolicy::from_platform(&PlatformCapability::None {
                 details: "test".into(),
@@ -6401,13 +6691,28 @@ mod sub_agent_registry_resume_tests {
 
     #[test]
     fn restricted_subagent_resume_excludes_patch() {
-        assert!(!registry_has(ResourceAuthority::Restricted, "patch"));
-        assert!(registry_has(ResourceAuthority::Restricted, "submit_result"));
+        let mode = crate::db::ConvMode::Explore {
+            worktree_path: None,
+            next_taskmd_id_hint: None,
+        };
+        assert!(!registry_has(&mode, ResourceAuthority::Restricted, "patch"));
+        assert!(registry_has(
+            &mode,
+            ResourceAuthority::Restricted,
+            "submit_result"
+        ));
     }
 
     #[test]
-    fn work_authority_subagent_resume_keeps_patch() {
-        assert!(registry_has(ResourceAuthority::Work, "patch"));
+    fn attached_work_child_resume_excludes_racy_patch_tool() {
+        assert!(!registry_has(
+            &crate::db::ConvMode::AttachedWorkChild {
+                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/worktree")
+                    .unwrap(),
+            },
+            ResourceAuthority::Work,
+            "patch"
+        ));
     }
 }
 
