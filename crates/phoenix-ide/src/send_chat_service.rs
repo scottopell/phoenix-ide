@@ -163,11 +163,15 @@ impl SendChatApplicationService {
             }
             result
         });
-        match rearm
-            .await
-            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-        {
+        let rearm = match rearm.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.runtime
+                    .signal_fatal_local_authority("automatic_continuation_rearm_supervisor");
+                return Err(SendChatServiceError::Internal(error.to_string()));
+            }
+        };
+        match rearm.map_err(|error| SendChatServiceError::Internal(error.to_string()))? {
             crate::db::workflow::RearmAuthoritativeTurnOutcome::Rearmed { .. }
             | crate::db::workflow::RearmAuthoritativeTurnOutcome::ExactReplay { .. } => {
                 Ok(AutomaticRetryTurnState::RearmedWithAdmission)

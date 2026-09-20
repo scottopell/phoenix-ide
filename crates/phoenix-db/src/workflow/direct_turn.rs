@@ -827,8 +827,8 @@ impl WorkflowRepository {
                 "SELECT EXISTS(
                      SELECT 1 FROM automatic_continuation_admissions
                      WHERE predecessor_conversation_id = ?1
-                       AND phase = 'dispatch_accepted'
-                       AND last_error IS NULL
+                       AND phase IN ('dispatch_accepted', 'message_settled', 'superseded')
+                       AND (phase != 'dispatch_accepted' OR last_error IS NULL)
                  )",
             )
             .bind(predecessor)

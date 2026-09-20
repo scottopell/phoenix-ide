@@ -1432,13 +1432,16 @@ fn render_messages<'a>(
                 });
             }
 
-            // Ignore system, error, and continuation messages.
-            // System messages are UI-only bookkeeping (restart markers, task
-            // file renames, diff snapshots). LLM-directed messages use
-            // MessageContent::User with is_meta (e.g., grace turn prompt).
-            MessageContent::System(_)
-            | MessageContent::Error(_)
-            | MessageContent::Continuation(_) => {}
+            MessageContent::Continuation(continuation) => {
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::text(continuation.summary.clone())],
+                });
+            }
+
+            // System and error messages are UI-only bookkeeping. LLM-directed
+            // messages use a typed content variant.
+            MessageContent::System(_) | MessageContent::Error(_) => {}
         }
     }
     messages

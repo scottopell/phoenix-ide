@@ -172,6 +172,15 @@ impl ContinuationApplicationService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
+            let transfer_settled = crate::runtime::wake::continuation_transfer_is_settled(
+                &self.runtime,
+                &admission.predecessor_conversation_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if !transfer_settled {
+                return Err("continuation ownership transfer remains pending".to_string());
+            }
             if automatic_intent {
                 self.advance_current(
                     &admission.predecessor_conversation_id,
@@ -200,9 +209,8 @@ impl ContinuationApplicationService {
                     .await
                     .map_err(|error| error.to_string())?;
             match outcome {
-                SendChatOutcome::Delivered
-                | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering => return Ok(true),
+                SendChatOutcome::AlreadyPersisted => return Ok(true),
+                SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering => return Ok(false),
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
         }
