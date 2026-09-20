@@ -242,6 +242,27 @@ struct ProductCloseResolutionTracker {
     }
 }
 
+struct AggregateEventStreamBackoff {
+    static let maximumDelay: TimeInterval = 30
+
+    private(set) var baseDelay: TimeInterval = 1
+
+    mutating func delayAfterDisconnect(
+        streamWasHealthy: Bool,
+        jitterFraction: Double
+    ) -> TimeInterval {
+        if streamWasHealthy {
+            baseDelay = 1
+        }
+        let boundedBase = min(baseDelay, Self.maximumDelay)
+        let jitter = min(
+            boundedBase * 0.3 * min(max(jitterFraction, 0), 1),
+            Self.maximumDelay - boundedBase)
+        baseDelay = min(boundedBase * 2, Self.maximumDelay)
+        return boundedBase + jitter
+    }
+}
+
 /// Root composition: server settings, connectivity, API client, stores, and
 /// the active per-conversation sessions.
 @MainActor
@@ -300,6 +321,7 @@ final class AppModel {
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
     private var closeAdmissionFencedProductConversationIds: Set<String> = []
+    private var closeAdmissionFencedTranscriptIds: [String: Set<String>] = [:]
     private var closeConfirmationReconciliationProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
     private var productHistoryGenerations = ProductActionGenerationTracker()
@@ -364,6 +386,12 @@ final class AppModel {
 
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
+        let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId)
+            ?? ConversationSession.cachedConversation(conversationId: conversationId)?
+                .product_conversation_id
+        guard !deletedProductHistoryIds.contains(conversationId),
+              aggregateId.map({ !deletedProductHistoryIds.contains($0) }) ?? true
+        else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
             self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
@@ -471,19 +499,28 @@ final class AppModel {
                     self?.aggregateEventTaskId = nil
                 }
             }
-            var retryDelay = 1.0
+            var backoff = AggregateEventStreamBackoff()
             while !Task.isCancelled {
                 guard let self, self.apiGeneration == generation, self.isForeground else { return }
                 if !self.connectivity.isOnline {
                     try? await Task.sleep(for: .seconds(30))
                     continue
                 }
+                var streamWasHealthy = false
                 do {
                     let bytes = try await api.openProductConversationEventStream()
-                    retryDelay = 1
                     var parser = SSEParser()
+                    var previousByteWasNewline = false
                     for try await byte in bytes {
                         if Task.isCancelled { return }
+                        if byte == 0x0A {
+                            if previousByteWasNewline {
+                                streamWasHealthy = true
+                            }
+                            previousByteWasNewline = true
+                        } else if byte != 0x0D {
+                            previousByteWasNewline = false
+                        }
                         if let frame = parser.consume(byte),
                            let deletion = ProductConversationDeletionEvent.decode(frame: frame)
                         {
@@ -505,9 +542,10 @@ final class AppModel {
                           await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
                     else { return }
                 }
-                let jitter = Double.random(in: 0...0.3) * retryDelay
-                try? await Task.sleep(for: .seconds(retryDelay + jitter))
-                retryDelay = min(retryDelay * 2, 30)
+                let retryDelay = backoff.delayAfterDisconnect(
+                    streamWasHealthy: streamWasHealthy,
+                    jitterFraction: Double.random(in: 0...1))
+                try? await Task.sleep(for: .seconds(retryDelay))
             }
         }
     }
@@ -596,24 +634,34 @@ final class AppModel {
         productConversationId: String,
         fenced: Bool
     ) {
+        let matchingOpenIds = Set(sessions.compactMap { transcriptId, session in
+            sessionBelongsToAggregate(
+                session,
+                transcriptId: transcriptId,
+                productConversationId: productConversationId) ? transcriptId : nil
+        })
+        let matchingDrainIds = Set(drainSessions.compactMap { transcriptId, session in
+            sessionBelongsToAggregate(
+                session,
+                transcriptId: transcriptId,
+                productConversationId: productConversationId) ? transcriptId : nil
+        })
+        let matchingTranscriptIds = matchingOpenIds.union(matchingDrainIds)
         if fenced {
             closeAdmissionFencedProductConversationIds.insert(productConversationId)
+            closeAdmissionFencedTranscriptIds[productConversationId, default: []]
+                .formUnion(matchingTranscriptIds)
         } else {
             closeAdmissionFencedProductConversationIds.remove(productConversationId)
         }
-        for (transcriptId, session) in sessions where sessionBelongsToAggregate(
-            session,
-            transcriptId: transcriptId,
-            productConversationId: productConversationId)
-        {
-            session.setCloseAdmissionFenced(fenced)
+        let affectedTranscriptIds = matchingTranscriptIds.union(
+            closeAdmissionFencedTranscriptIds[productConversationId] ?? [])
+        for transcriptId in affectedTranscriptIds {
+            sessions[transcriptId]?.setCloseAdmissionFenced(fenced)
+            drainSessions[transcriptId]?.setCloseAdmissionFenced(fenced)
         }
-        for (transcriptId, session) in drainSessions where sessionBelongsToAggregate(
-            session,
-            transcriptId: transcriptId,
-            productConversationId: productConversationId)
-        {
-            session.setCloseAdmissionFenced(fenced)
+        if !fenced {
+            closeAdmissionFencedTranscriptIds.removeValue(forKey: productConversationId)
         }
     }
 
@@ -629,7 +677,22 @@ final class AppModel {
         let activeCloseIds = Set(listStore.conversations.compactMap { row in
             row.product_close_action == .unavailable(reason: .active_close_attempt)
                 ? row.aggregateIdentity : nil
-        }).union(closeConfirmationReconciliationProductConversationIds)
+        })
+        let inactiveCloseIds = closeAdmissionFencedProductConversationIds
+            .union(closeConfirmationReconciliationProductConversationIds)
+            .subtracting(activeCloseIds)
+        for productConversationId in inactiveCloseIds {
+            closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
+            setProductCloseAdmissionFence(
+                productConversationId: productConversationId,
+                fenced: false)
+        }
+        if let pendingProductCloseConfirmation,
+           !activeCloseIds.contains(pendingProductCloseConfirmation.productConversationId)
+        {
+            self.pendingProductCloseConfirmation = nil
+            pendingProductCloseResolution.reset()
+        }
         for productConversationId in activeCloseIds {
             setProductCloseAdmissionFence(
                 productConversationId: productConversationId,
@@ -1304,8 +1367,11 @@ final class AppModel {
             lastActionError = "Deleting needs a connection — it can't be queued."
             return false
         }
+        let cachedIds = cachedProductHistory(productConversationId: conversation.aggregateIdentity)?
+            .snapshot.segments.map(\.transcript_row_id) ?? []
         let transcriptIds = Set(
             listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
+                + cachedIds
                 + [conversation.transcriptRowIdentity])
         do {
             let rootTranscriptRowId = conversation.chain_root_id ?? conversation.transcriptRowIdentity
@@ -1330,15 +1396,9 @@ final class AppModel {
     private func removeProductHistoryLocally(
         productConversationId: String,
         transcriptIds: Set<String>,
-        startedGeneration: Int
+        startedGeneration: Int,
+        tombstonesInstalled: (() -> Void)? = nil
     ) async -> Bool {
-        guard apiGeneration == startedGeneration else { return false }
-
-        _ = productHistoryGenerations.begin(productConversationId: productConversationId)
-        let historyWriter = ProductHistorySnapshotStore.writer(
-            productConversationId: productConversationId)
-        let revision = historyWriter.reserveRevision()
-        await historyWriter.remove(revision: revision)
         guard apiGeneration == startedGeneration else { return false }
 
         let retainedTranscriptIds = Set(sessions.compactMap { transcriptId, session in
@@ -1353,6 +1413,17 @@ final class AppModel {
                 productConversationId: productConversationId) ? transcriptId : nil
         })
         let allTranscriptIds = transcriptIds.union(retainedTranscriptIds)
+        deletedProductHistoryIds.insert(productConversationId)
+        deletedProductHistoryIds.formUnion(allTranscriptIds)
+        tombstonesInstalled?()
+
+        _ = productHistoryGenerations.begin(productConversationId: productConversationId)
+        let historyWriter = ProductHistorySnapshotStore.writer(
+            productConversationId: productConversationId)
+        let revision = historyWriter.reserveRevision()
+        await historyWriter.remove(revision: revision)
+        guard apiGeneration == startedGeneration else { return false }
+
         for transcriptId in allTranscriptIds {
             guard apiGeneration == startedGeneration else { return false }
             let openOwner = sessions.removeValue(forKey: transcriptId)
@@ -1373,7 +1444,6 @@ final class AppModel {
 
         guard apiGeneration == startedGeneration else { return false }
         listStore.remove(aggregateId: productConversationId)
-        deletedProductHistoryIds.insert(productConversationId)
         if pendingProductCloseConfirmation?.productConversationId == productConversationId {
             pendingProductCloseConfirmation = nil
             pendingProductCloseResolution.reset()
@@ -1514,12 +1584,14 @@ final class AppModel {
 
     func removeProductHistoryLocallyForTesting(
         productConversationId: String,
-        transcriptIds: Set<String>
+        transcriptIds: Set<String>,
+        tombstonesInstalled: (() -> Void)? = nil
     ) async -> Bool {
         await removeProductHistoryLocally(
             productConversationId: productConversationId,
             transcriptIds: transcriptIds,
-            startedGeneration: apiGeneration)
+            startedGeneration: apiGeneration,
+            tombstonesInstalled: tombstonesInstalled)
     }
 
     func handleAggregateHardDeletedForTesting(
@@ -1920,6 +1992,7 @@ final class AppModel {
         confirmationRehydrationGenerations.reset()
         closingProductConversationIds.removeAll()
         closeAdmissionFencedProductConversationIds.removeAll()
+        closeAdmissionFencedTranscriptIds.removeAll()
         closeConfirmationReconciliationProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
