@@ -8665,19 +8665,20 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_clean_streak_does_not_replay_an_earlier_writer() {
+    fn exhausted_clean_streak_preserves_the_last_writer() {
         let mut observations = vec![
             super::ExternalWriterEvidence::NoPositiveEvidence,
             super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("transient")),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         ];
-        let error = super::inspect_ambient_writer_until_quiescent(
+        let evidence = super::inspect_ambient_writer_until_quiescent(
             observation_policy(3, 2, 0),
             || Ok(observations.pop().unwrap()),
             |_| {},
         )
-        .expect_err("one final clean observation does not establish quiescence");
-        assert!(error.contains("budget ended without two clean observations"));
+        .unwrap()
+        .expect("one final clean observation does not erase stable writer evidence");
+        assert_eq!(evidence.process_incarnation, "transient");
     }
 
     #[test]
