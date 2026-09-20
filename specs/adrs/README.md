@@ -71,6 +71,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
+| [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
 
 ## For agents: which decisions bind your task
 
@@ -79,6 +80,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Task type | Relevant ADRs |
 | --- | --- |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -131,7 +133,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
-      │   └── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
