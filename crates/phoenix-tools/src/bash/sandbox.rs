@@ -177,8 +177,6 @@ impl ExploreReadOnlyPolicy {
         let mut caps = CapabilitySet::new()
             .set_signal_mode(SignalMode::Isolated)
             .allow_path("/", AccessMode::Read)
-            .map_err(|e| e.to_string())?
-            .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
         if let Some(worktree_root) = &self.worktree_write_root {
             caps = caps

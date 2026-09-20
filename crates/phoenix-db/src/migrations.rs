@@ -10460,8 +10460,8 @@ FROM conversations c
 JOIN messages m ON m.conversation_id = c.id
 WHERE c.state_kind = 'llm_requesting'
   AND m.message_type = 'user'
-  AND json_extract(m.content, '$.User.is_meta') = 1
-  AND json_extract(m.content, '$.User.text') LIKE 'Task approved%'
+  AND json_extract(m.content, '$.is_meta') = 1
+  AND json_extract(m.content, '$.text') LIKE 'Task approved%'
   AND m.sequence_id = (
       SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
   );
@@ -10866,7 +10866,7 @@ mod tests {
                  (message_id, conversation_id, message_type, sequence_id, content, created_at)
              VALUES
                  ('legacy-approval', 'legacy', 'user', 7,
-                  '{\"User\":{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}}',
+                  '{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}',
                   '2025-01-01T00:00:00Z');",
         )
         .execute(&pool)

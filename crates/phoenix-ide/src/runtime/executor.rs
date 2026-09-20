@@ -8839,6 +8839,12 @@ where
                 }
                 self.install_live_state(approved_state, state_updated_at, true)?;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+                self.browser_sessions
+                    .promote_actor_to_work_scope(
+                        &self.context.resource_scope,
+                        &self.context.conversation_id,
+                    )
+                    .await;
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
