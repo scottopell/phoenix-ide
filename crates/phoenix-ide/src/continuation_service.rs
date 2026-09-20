@@ -227,8 +227,8 @@ impl ContinuationApplicationService {
                     .await
                     .map_err(|error| error.to_string())?;
             match outcome {
-                SendChatOutcome::AlreadyPersisted => return Ok(true),
-                SendChatOutcome::Delivered | SendChatOutcome::QueuedAsSteering => return Ok(false),
+                SendChatOutcome::AlreadyPersisted | SendChatOutcome::Delivered => return Ok(true),
+                SendChatOutcome::QueuedAsSteering => return Ok(false),
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
         }
@@ -356,8 +356,9 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
     {
         Ok(admissions) => admissions,
         Err(error) => {
-            warn!(%error, "failed to discover automatic continuation admissions");
-            return true;
+            warn!(%error, "automatic continuation admission discovery is unclassified");
+            runtime.signal_fatal_local_authority("automatic_continuation_discovery_classification");
+            return false;
         }
     };
     let service = ContinuationApplicationService::new(runtime.clone());

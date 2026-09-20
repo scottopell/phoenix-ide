@@ -42,7 +42,9 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        if (!slug || slug === coordinator.conversation.id) {
+        if (topologyRevision > 0 && slug !== coordinator.conversation.id) {
+          navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+        } else if (!slug || slug === coordinator.conversation.id) {
           setResolvedCoordinatorId(coordinator.conversation.id);
           if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else {

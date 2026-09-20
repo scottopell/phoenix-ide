@@ -655,9 +655,11 @@ WHEN EXISTS (
       AND intent.successor_conversation_id = NEW.conversation_id
       AND (
           (intent.opening_authority = 'generated_predecessor_context'
-           AND NEW.message_type = 'continuation')
+           AND NEW.message_type = 'continuation'
+           AND json_extract(NEW.content, '$.summary') = intent.handoff)
           OR (intent.opening_authority = 'user_authorized_instruction'
-              AND NEW.message_type = 'user')
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = intent.handoff)
       )
 )
 BEGIN
@@ -676,9 +678,11 @@ BEGIN
       AND intent.successor_conversation_id = NEW.conversation_id
       AND (
           (intent.opening_authority = 'generated_predecessor_context'
-           AND NEW.message_type = 'continuation')
+           AND NEW.message_type = 'continuation'
+           AND json_extract(NEW.content, '$.summary') = intent.handoff)
           OR (intent.opening_authority = 'user_authorized_instruction'
-              AND NEW.message_type = 'user')
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = intent.handoff)
       )
     ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
     LIMIT 1;
@@ -689,9 +693,11 @@ BEGIN
            OR NEW.message_id = successor_conversation_id || ':' || message_id)
       AND (
           (opening_authority = 'generated_predecessor_context'
-           AND NEW.message_type = 'continuation')
+           AND NEW.message_type = 'continuation'
+           AND json_extract(NEW.content, '$.summary') = handoff)
           OR (opening_authority = 'user_authorized_instruction'
-              AND NEW.message_type = 'user')
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = handoff)
       );
 END;
 

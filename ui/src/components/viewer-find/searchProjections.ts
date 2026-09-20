@@ -714,8 +714,8 @@ export function buildConversationSearchProjection(
             unit.key,
             'system-message',
             summary,
-            undefined,
-            { kind: 'message-text', fragmentId: unit.message.message_id },
+            'message-text',
+            { kind: 'message-text', fragmentId: 'message-text' },
           );
         }
         break;
