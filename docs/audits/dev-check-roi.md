@@ -1,6 +1,6 @@
 # `./dev.py check` regression-ROI audit
 
-**Source audited:** `origin/main` `bed747b5bd231f495b8038163d63c72a9ebeb346` (the task commit was rebased above it as `da0fcf2d`). **Host:** `devmbp`, MacBookPro18,4, macOS 26.4.1, 10 logical CPUs, 64 GiB RAM, APFS. **Captured:** 2026-09-19. No cache was purged. No lane, test, gate, timeout, or workflow was changed.
+**Source audited:** `origin/main` `bed747b5bd231f495b8038163d63c72a9ebeb346` (the task commit was rebased above it as `da0fcf2d`). **Host:** `devmbp`, MacBookPro18,4, macOS 26.4.1, 10 logical CPUs, 64 GiB RAM, APFS. **Measured toolchain:** stable-aarch64 Rust with rustc/cargo 1.95.0, cargo-nextest 0.9.143, Node 26.7.0, pnpm 11.0.8, system Python 3.9.6, ast-grep 0.45.1, and Allium 3.5.3. Both optional CLIs were present for the measured runs; neither was absent. **Captured:** 2026-09-19. No cache was purged. No lane, test, gate, timeout, or workflow was changed.
 
 ## Result
 
@@ -26,7 +26,7 @@ Current profiled critical path was 1,073.8 s; lane records sum to 1,072.7 s (99.
 | `rust` | Nextest compile; ts-rs export/staleness; workspace tests excluding duplicate export tests (`lane_rust`). Protects compile/type contracts, generated Rust→TS parity, and ~4,043 unit/integration behaviors. | **≥289.7 s**: compile 19.3, codegen 17.8, tests ≥252.6. Profile: 695.7 s, **64.8%**. Cold: unknown. | 31/50 (62%) | Shares `target/debug` with E2E/focused Cargo work; no honest per-lane split. Current-source compilation/profile activity added 6.52 GiB to debug. Reused until sources/features/toolchain invalidate Cargo fingerprints. | CI `check (rust)`, PR path-gated and all main pushes; codegen overlaps UI only at typed boundary, not behavior. | **Conditional (retain current).** Avoids ≥290 s on non-Rust changes while retaining the broadest protection. Investigate tmux load sensitivity separately; do not weaken this gate. |
 | `cargo-fmt` | `cargo fmt --check`; syntactic formatting drift. | 2.8 s; profile 3.8 s, **0.4%**. Cold: effectively cache-independent but not separately measured. | 31/50 (62%) | Negligible persistent output. | Same `check (rust)` job; no behavioral-test substitute. | **Conditional (retain).** Only ~3 s when Rust changes and distinct deterministic protection. |
 | `clippy` | `cargo clippy --all-targets -- -D warnings`; static/pedantic defects including tests. | 60.8 s; profile 88.6 s, **8.3%**. Cold: unknown. | 31/50 (62%) | Dedicated non-incremental `target/clippy`: stale natural build allocated **937,040 KiB (915 MiB)**; current refresh added 47,044 KiB. Isolation prevents clippy-driver invalidating Rust-test fingerprints; source/toolchain changes rebuild. | CI `check (clippy)`; overlaps compilation but catches lint classes tests do not. | **Conditional (retain).** CI-only would save ~61 s on Rust changes but delay static feedback; dedicated target trades ~915 MiB for avoiding cross-lane invalidation. |
-| `tsc` | `pnpm run typecheck` (`tsc -b --noEmit`); project-reference and `exactOptionalPropertyTypes` errors. | 0.5 s warm; profile 15.1 s, **1.4%**. Cold: unknown. | 27/50 (54%) | No emitted build tree from `--noEmit`; shares installed UI dependencies. | CI `check (ui/specs)`; ESLint/Vitest do not prove TS project-reference correctness. | **Conditional (retain).** Warm cost is sub-second and protection is unique. |
+| `tsc` | `pnpm run typecheck` (`tsc -b --noEmit`); project-reference and `exactOptionalPropertyTypes` errors. | 0.5 s warm; profile 15.1 s, **1.4%**. Cold: unknown. | 27/50 (54%) | `--noEmit` emits no JS build tree, but composite mode persists `ui/node_modules/.tmp/{tsconfig.app,tsconfig.node}.tsbuildinfo` (422,879 + 51,919 bytes apparent in the measured state). These caches share `node_modules` and are invalidated/recomputed when TypeScript's tracked project inputs/options or the cache files change. | CI `check (ui/specs)`; ESLint/Vitest do not prove TS project-reference correctness. | **Conditional (retain).** The sub-second result is cache-assisted; protection remains unique. |
 | `ui-lint` | ESLint then Stylelint; TS/React hook/static rules and CSS validity/conventions. | 8.4 s (6.7 + 1.7); profile 12.8 s, **1.2%**. Cold: unknown. | 27/50 (54%) | No material lane artifact; shares `ui/node_modules`. | CI `check (ui/specs)`; partially overlaps tsc syntax, but lint/CSS rule classes are distinct. | **Conditional (retain).** ~8 s for two unique static surfaces. Keep consolidated as one lane. |
 | `vitest` | UI component/state/hook tests. | 39.5 s; profile 47.7 s, **4.4%**. Cold: unknown. | 27/50 (54%) | Transient workers only; shares `ui/node_modules`. | CI `check (ui/specs)`; overlaps code touched by tsc/lint, not asserted behavior. | **Conditional (retain).** CI-only saves ~40 s per UI change but loses the only broad UI behavioral feedback locally. |
 | `ast-grep` | One structural-rule scan over Rust/UI, then a static changed-test synchronization-smell lint (`check_ast_grep`). The latter rejects newly introduced sleeps and unbounded event waits; it does not execute or time tests and therefore does not detect arbitrary slow tests. | 4.0 s (0.9 + 3.1); profile lane 5.2 s, **0.5%**. Cold: near cache-independent, not separately measured. | 42/50 (84%) | Negligible persistent output. | Local protection is conditional on the optional `ast-grep` CLI: when absent, `check_ast_grep` records a successful skip before both the structural scan and timing-smell lint. CI `check (ui/specs)` installs the CLI. | **Conditional (retain).** With the optional CLI installed, repository-specific structural and synchronization-smell protection costs ~4 s. Keep the two steps consolidated. |
@@ -39,7 +39,7 @@ Current profiled critical path was 1,073.8 s; lane records sum to 1,072.7 s (99.
 
 ### Shared UI dependency footprint
 
-The naturally empty stale worktree installed `ui/node_modules` once: **528,144 KiB allocated (516 MiB)** versus 434,740 KiB apparent. This is shared by `tsc`, `ui-lint`, and `vitest`; it must not be charged three times. Lockfile changes invalidate package selection; ordinary source changes reuse it.
+The naturally empty stale worktree installed `ui/node_modules` once: **528,144 KiB allocated (516 MiB)** versus 434,740 KiB apparent. This is shared by `tsc`, `ui-lint`, and `vitest`; it must not be charged three times. The total includes TSC's persistent composite caches at `ui/node_modules/.tmp/`: `tsconfig.app.tsbuildinfo` (422,879 bytes apparent) and `tsconfig.node.tsbuildinfo` (51,919 bytes apparent). Lockfile changes invalidate package selection; TypeScript recomputes build-info when its tracked project inputs/options or cache files change, while unchanged inputs reuse it.
 
 ### Historical, non-current cross-checks
 
@@ -79,7 +79,8 @@ All jobs are merge-time PR checks subject to the current path plan; all groups r
 The raw files cited above are intentionally ignored, so the exact scripts used to produce their durable aggregate claims follow. Every instrumented command was preceded by:
 
 ```bash
-[ "$(hostname -s)" = devmbp ]
+set -euo pipefail
+[ "$(hostname -s)" = devmbp ] || exit 1
 case "$(git rev-parse --show-toplevel)" in
   /Users/sopell/git/phoenix-ide/.phoenix/worktrees/*) ;;
   *) exit 2 ;;
@@ -166,7 +167,8 @@ def categories(paths):
     if p.startswith('tests/e2e/') or p == 'phoenix-client.py': found.add('E2E')
   return found
 shas = subprocess.check_output(
-  ['git', 'rev-list', '--first-parent', '--max-count=50', 'origin/main'], text=True
+  ['git', 'rev-list', '--first-parent', '--max-count=50',
+   'bed747b5bd231f495b8038163d63c72a9ebeb346'], text=True
 ).split()
 counts = {lane: 0 for lane in lanes}; rows = []
 for sha in shas:
@@ -187,13 +189,26 @@ PY
 
 ### Latest 30 completed PR Actions runs
 
-The exact query requested 100 jobs for each of 30 runs; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persisted each run's job names/outcomes. The second extracted the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
+The sampled window is pinned to these exact 30 run IDs, ordered newest to oldest, from **2026-09-19T20:58:51Z through 2026-09-19T23:22:49Z**. The query requests 100 jobs for each run; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persists immutable run metadata and each run's job names/outcomes. The second extracts the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
 
 ```bash
-gh run list --repo scottopell/phoenix-ide --workflow CI \
-  --event pull_request --limit 30 --status completed \
-  --json databaseId,headSha,createdAt,conclusion,url \
-  > target/check-roi-audit/gh-pr-runs.json
+run_ids=(
+  35475964002 35475484251 35475440124 35474960980 35474944626
+  35474694703 35474651320 35474599742 35474532227 35474291809
+  35474219249 35473989772 35473502338 35473451771 35472910524
+  35472530750 35472389248 35471754617 35471686356 35471485123
+  35471393512 35471178535 35470682089 35470276834 35470114295
+  35470050709 35469704604 35469363717 35469198459 35469019544
+)
+printf '[]\n' > target/check-roi-audit/gh-pr-runs.json
+for run_id in "${run_ids[@]}"; do
+  gh api "repos/scottopell/phoenix-ide/actions/runs/$run_id" \
+    --jq '{databaseId:.id,headSha,createdAt:.created_at,conclusion,url:.html_url}' \
+    > target/check-roi-audit/run.json
+  jq -s '.[0] + [.[1]]' target/check-roi-audit/gh-pr-runs.json \
+    target/check-roi-audit/run.json > target/check-roi-audit/runs-next.json
+  mv target/check-roi-audit/runs-next.json target/check-roi-audit/gh-pr-runs.json
+done
 python3 - <<'PY'
 import json, subprocess
 runs = json.load(open('target/check-roi-audit/gh-pr-runs.json'))
