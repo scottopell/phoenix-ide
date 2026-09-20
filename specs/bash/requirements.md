@@ -825,10 +825,16 @@ THE SYSTEM SHALL execute Bash through the Explore OS sandbox
 AND SHALL isolate writes from source, task, Git metadata, build output, and user cache paths
 
 WHEN the same `WorkScope` has Work authority
+AND the conversation is not an `AttachedWorkChild`
 THE SYSTEM SHALL execute Bash without the Explore OS sandbox
 AND SHALL permit repository-owned task, Git common-directory, build/codegen, and normal tool-cache writes subject to operating-system permissions and command safety checks
 
-THE SYSTEM SHALL select Bash isolation from `WorkScope` authority rather than conversation mode provenance
+WHEN the conversation is an `AttachedWorkChild`
+THE SYSTEM SHALL execute Bash through an OS sandbox that permits writes only within the inherited worktree
+AND SHALL preserve ordinary Work network access
+AND SHALL NOT expose a pathname-based write tool whose validation and mutation can race
+
+THE SYSTEM SHALL select Bash isolation from `WorkScope` authority and the typed `AttachedWorkChild` discriminator rather than conversation mode provenance alone
 
 ### REQ-BASH-014: Stateless Tool with Per-WorkScope Handle Registry
 

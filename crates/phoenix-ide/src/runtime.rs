@@ -6610,8 +6610,8 @@ mod sub_agent_registry_resume_tests {
     }
 
     #[test]
-    fn work_authority_subagent_resume_keeps_patch() {
-        assert!(registry_has(
+    fn attached_work_child_resume_excludes_racy_patch_tool() {
+        assert!(!registry_has(
             &crate::db::ConvMode::AttachedWorkChild {
                 worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/worktree")
                     .unwrap(),

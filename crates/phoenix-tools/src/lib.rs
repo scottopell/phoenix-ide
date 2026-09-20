@@ -1203,7 +1203,6 @@ impl ToolRegistry {
         tools.push(Arc::new(WorktreeSandboxedBashTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
-        tools.push(Arc::new(PatchTool::for_worktree()));
         Self { tools }
     }
 

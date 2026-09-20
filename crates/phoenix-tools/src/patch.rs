@@ -90,7 +90,6 @@ fn bounded_diff(diff: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PatchScope {
     Unrestricted,
-    Worktree,
     TaskProposalDraft { tasks_dir_name: String },
 }
 
@@ -126,14 +125,6 @@ impl PatchTool {
         }
     }
 
-    #[must_use]
-    pub fn for_worktree() -> Self {
-        Self {
-            planner: Mutex::new(PatchPlanner::new()),
-            scope: PatchScope::Worktree,
-        }
-    }
-
     fn resolve_path(ctx: &ToolContext, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -149,109 +140,55 @@ impl PatchTool {
         raw_path: &str,
         resolved: &std::path::Path,
     ) -> Option<String> {
-        let allowed_root = match &self.scope {
-            PatchScope::Unrestricted => return None,
-            PatchScope::Worktree => {
-                let Some(worktree_path) = ctx.worktree_path.as_ref() else {
-                    return Some("patch requires an attached WorkScope worktree".to_string());
-                };
-                worktree_path.clone()
-            }
-            PatchScope::TaskProposalDraft { tasks_dir_name } => {
-                ctx.working_dir().join(tasks_dir_name)
-            }
+        let PatchScope::TaskProposalDraft { tasks_dir_name } = &self.scope else {
+            return None;
         };
 
-        if matches!(self.scope, PatchScope::TaskProposalDraft { .. })
-            && std::path::Path::new(raw_path)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
+        if std::path::Path::new(raw_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Some(format!(
-                "patch cannot use '..' outside its allowed WorkScope (got '{raw_path}')."
+                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
+                 '..' components are not allowed (got '{raw_path}')."
             ));
         }
 
-        if let PatchScope::TaskProposalDraft { tasks_dir_name } = &self.scope {
-            let filename = std::path::Path::new(raw_path)
-                .file_name()
-                .and_then(|name| name.to_str());
-            if filename
-                .is_none_or(|name| phoenix_core::task_source::TaskSource::detect(name).is_none())
-            {
-                return Some(format!(
-                    "patch is restricted to markdown task proposal drafts under '{tasks_dir_name}/' \
-                     in this mode (got '{raw_path}')."
-                ));
-            }
+        let filename = std::path::Path::new(raw_path)
+            .file_name()
+            .and_then(|name| name.to_str());
+        if filename.is_none_or(|name| phoenix_core::task_source::TaskSource::detect(name).is_none())
+        {
+            return Some(format!(
+                "patch is restricted to markdown task proposal drafts under '{tasks_dir_name}/' \
+                 in this mode (got '{raw_path}')."
+            ));
         }
 
-        let canon_allowed = match canonicalize_existing_ancestor(&allowed_root) {
-            Ok(path) => path,
-            Err(error) => {
-                return Some(format!(
-                    "patch could not resolve allowed WorkScope '{}': {error}",
-                    allowed_root.display()
-                ));
-            }
-        };
-        let canon_resolved = match canonicalize_existing_ancestor(resolved) {
-            Ok(path) => path,
-            Err(error) => {
-                return Some(format!(
-                    "patch could not safely resolve target '{}': {error}",
-                    resolved.display()
-                ));
-            }
-        };
+        let allowed_root = ctx.working_dir().join(tasks_dir_name);
+        let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
+        let canon_resolved =
+            std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
         if canon_resolved.starts_with(&canon_allowed) {
             None
         } else {
-            match &self.scope {
-                PatchScope::TaskProposalDraft { tasks_dir_name } => Some(format!(
-                    "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
-                     '{}' is outside the allowed directory.",
-                    resolved.display()
-                )),
-                PatchScope::Worktree => Some(format!(
-                    "patch is restricted to the allowed WorkScope; target '{}' is outside '{}'.",
-                    resolved.display(),
-                    canon_allowed.display()
-                )),
-                PatchScope::Unrestricted => None,
-            }
+            Some(format!(
+                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
+                 '{}' is outside the allowed directory.",
+                resolved.display()
+            ))
         }
     }
 
     fn proposal_next_step(&self, raw_path: &str) -> Option<String> {
         match &self.scope {
-            PatchScope::Unrestricted | PatchScope::Worktree => None,
+            PatchScope::Unrestricted => None,
             PatchScope::TaskProposalDraft { .. } => Some(format!(
                 "\n<next_step>Call propose_task with task_file=\"{}\" if this is the task you want the user to approve.</next_step>",
                 escape_xml_attribute(raw_path)
             )),
         }
     }
-}
-
-fn canonicalize_existing_ancestor(path: &std::path::Path) -> std::io::Result<PathBuf> {
-    let mut missing = Vec::new();
-    let mut existing = path;
-    while std::fs::symlink_metadata(existing).is_err() {
-        let Some(parent) = existing.parent() else {
-            return Ok(path.to_path_buf());
-        };
-        if let Some(name) = existing.file_name() {
-            missing.push(name.to_os_string());
-        }
-        existing = parent;
-    }
-
-    let mut canonical = existing.canonicalize()?;
-    for component in missing.iter().rev() {
-        canonical.push(component);
-    }
-    Ok(canonical)
 }
 
 fn escape_xml_attribute(value: &str) -> String {
@@ -504,112 +441,6 @@ mod tests {
 
         assert!(result.is_success(), "Error: {}", result.output());
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "Hello Rust");
-    }
-
-    #[tokio::test]
-    async fn worktree_patch_rejects_absolute_path_outside_worktree() {
-        let worktree = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let outside_file = outside.path().join("outside.txt");
-        fs::write(&outside_file, "original\n").unwrap();
-        let tool = PatchTool::for_worktree();
-        let mut ctx = test_context(worktree.path().to_path_buf());
-        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
-
-        let blocked = tool
-            .run(
-                json!({
-                    "path": outside_file,
-                    "patches": [{
-                        "operation": "overwrite",
-                        "newText": "escaped\n"
-                    }]
-                }),
-                ctx,
-            )
-            .await;
-
-        assert!(!blocked.is_success());
-        assert!(blocked.output().contains("outside"));
-        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "original\n");
-    }
-
-    #[tokio::test]
-    async fn worktree_patch_allows_parent_traversal_within_worktree() {
-        let worktree = tempdir().unwrap();
-        let nested = worktree.path().join("crate/src");
-        fs::create_dir_all(&nested).unwrap();
-        let tool = PatchTool::for_worktree();
-        let mut ctx = test_context(nested);
-        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
-
-        let result = tool
-            .run(
-                json!({
-                    "path": "../../Cargo.toml",
-                    "patches": [{
-                        "operation": "overwrite",
-                        "newText": "[package]\nname = \"safe\"\n"
-                    }]
-                }),
-                ctx,
-            )
-            .await;
-
-        assert!(result.is_success(), "{}", result.output());
-        assert!(worktree.path().join("Cargo.toml").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn worktree_patch_rejects_new_file_through_outside_symlink() {
-        let worktree = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), worktree.path().join("escape")).unwrap();
-        let tool = PatchTool::for_worktree();
-        let mut ctx = test_context(worktree.path().to_path_buf());
-        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
-
-        let blocked = tool
-            .run(
-                json!({
-                    "path": "escape/new.txt",
-                    "patches": [{
-                        "operation": "overwrite",
-                        "newText": "escaped\n"
-                    }]
-                }),
-                ctx,
-            )
-            .await;
-
-        assert!(!blocked.is_success());
-        assert!(!outside.path().join("new.txt").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn worktree_patch_rejects_dangling_symlink_escape() {
-        let worktree = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let missing_target = outside.path().join("new.txt");
-        std::os::unix::fs::symlink(&missing_target, worktree.path().join("escape")).unwrap();
-        let tool = PatchTool::for_worktree();
-        let mut ctx = test_context(worktree.path().to_path_buf());
-        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
-
-        let blocked = tool
-            .run(
-                json!({
-                    "path": "escape",
-                    "patches": [{"operation": "overwrite", "newText": "escaped\n"}]
-                }),
-                ctx,
-            )
-            .await;
-
-        assert!(!blocked.is_success());
-        assert!(!missing_target.exists());
     }
 
     #[tokio::test]
