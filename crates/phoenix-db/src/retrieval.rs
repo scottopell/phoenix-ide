@@ -765,6 +765,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::CloseFoundationPrecondition(_)
         | crate::DbError::CloseFoundationRepairRequired(_)
         | crate::DbError::CloseFoundationNotFound(_)
+        | crate::DbError::SubAgentLifecycleConflict(_)
         | crate::DbError::DirectTurnConflict(_)
         | crate::DbError::ForkProposalConflict(_)
         | crate::DbError::GitRepositoryWorkScopeProjectConflict { .. }

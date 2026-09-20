@@ -27,7 +27,9 @@ pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
+mod sub_agent_lifecycle;
 pub mod workflow;
+pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -228,6 +230,8 @@ pub enum DbError {
     CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]
     CloseFoundationNotFound(String),
+    #[error("Sub-agent lifecycle conflict: {0}")]
+    SubAgentLifecycleConflict(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
