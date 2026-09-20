@@ -187,7 +187,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
+  const composerContentRef = useRef({ draft, images, files });
   useEffect(() => {
+    composerContentRef.current = { draft, images, files };
     composerHasContentRef.current = draft.length > 0
       || images.length > 0
       || files.length > 0
@@ -461,12 +463,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } catch (err) {
       const closeFenced = err instanceof ConflictError
         && err.detail.error_type === 'close_admission_fenced';
-      if ((err instanceof ExpansionError || closeFenced)
+      if (err instanceof ExpansionError && scopeKeyRef.current === submittedScopeKey) {
+        setExpansionError(err.detail.error);
+        const current = composerContentRef.current;
+        setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+        setImages([...images, ...current.images]);
+        setFiles([...files, ...current.files]);
+      } else if (closeFenced
         && scopeKeyRef.current === submittedScopeKey
         && !composerHasContentRef.current) {
-        if (err instanceof ExpansionError) {
-          setExpansionError(err.detail.error);
-        }
         if (previousVoiceBase !== null) {
           setVoiceBase(previousVoiceBase);
           setVoiceInterim(previousVoiceInterim);
