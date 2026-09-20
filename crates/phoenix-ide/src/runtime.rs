@@ -9990,6 +9990,38 @@ mod scope_liveness_tests {
                         },
                 },
             ),
+            (
+                "ordinary-overload",
+                ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at: Utc::now() + chrono::Duration::minutes(1),
+                        },
+                        attempt: 2,
+                        started_at: Utc::now(),
+                        deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                    },
+                },
+            ),
+            (
+                "continuation-overload",
+                ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target:
+                            phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                                operation_id: "op-overload".to_string(),
+                                rejected_tool_calls: Vec::new(),
+                            },
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at: Utc::now() + chrono::Duration::minutes(1),
+                        },
+                        attempt: 2,
+                        started_at: Utc::now(),
+                        deadline_at: Utc::now() + chrono::Duration::minutes(2),
+                    },
+                },
+            ),
         ] {
             manager
                 .db()
@@ -10027,13 +10059,19 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 4);
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 6);
         let runtimes = manager.runtimes.read().await;
         assert!(runtimes.contains_key("awaiting-continuation"));
         assert!(runtimes.contains_key("recoverable-continuation"));
         assert!(runtimes.contains_key("awaiting-continuation-auth"));
+        assert!(runtimes.contains_key("ordinary-overload"));
+        assert!(runtimes.contains_key("continuation-overload"));
         assert!(runtimes.contains_key(&coordinator.id));
         assert!(!runtimes.contains_key("idle"));
+        let materialized_count = runtimes.len();
+        drop(runtimes);
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 6);
+        assert_eq!(manager.runtimes.read().await.len(), materialized_count);
     }
 
     #[tokio::test]

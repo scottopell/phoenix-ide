@@ -532,6 +532,23 @@ describe('parseEvent', () => {
       expect(res.ok).toBe(true);
     });
 
+    it('accepts the generated server_overloaded reason', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseLlmAttemptDataSchema,
+        makeEvent({
+          sequence_id: 10,
+          attempt: 2,
+          max_attempts: 5,
+          reason: 'server_overloaded',
+          backing_off_ms: 2000,
+        }),
+        'llm_attempt',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
     it('accepts a valid llm_attempt payload omitting optional resets_at', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(

@@ -226,7 +226,15 @@ export function parseConversationState(raw: unknown): ConversationState {
       return { type, attempt: (obj['attempt'] as number) ?? 1 };
     case 'server_overload_retrying': {
       const retry = isRecord(obj['retry']) ? obj['retry'] : obj;
-      return { type, attempt: typeof retry['attempt'] === 'number' ? retry['attempt'] : 1 };
+      const phase = isRecord(retry['phase']) ? retry['phase'] : null;
+      const retryAt = phase && typeof phase['retry_at'] === 'string'
+        ? Date.parse(phase['retry_at'])
+        : null;
+      return {
+        type,
+        attempt: typeof retry['attempt'] === 'number' ? retry['attempt'] : 1,
+        retryAt: retryAt !== null && Number.isFinite(retryAt) ? retryAt : null,
+      };
     }
     case 'seeded_llm_requesting': {
       const seed = obj['seed_message_id'];

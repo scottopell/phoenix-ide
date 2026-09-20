@@ -324,7 +324,7 @@ export const SseLlmAttemptDataSchema = v.looseObject({
   sequence_id: v.number(),
   attempt: v.number(),
   max_attempts: v.number(),
-  reason: v.picklist(['rate_limit', 'server_error', 'network', 'timed_out']),
+  reason: v.picklist(['rate_limit', 'server_error', 'server_overloaded', 'network', 'timed_out']),
   backing_off_ms: v.number(),
   /** RFC3339 string when known; omitted from JSON when None on the
    *  Rust side (`skip_serializing_if = "Option::is_none"`). */

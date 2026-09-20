@@ -2372,16 +2372,26 @@ where
                 overload_startup_action(&retry, now),
                 OverloadStartupAction::Expire
             ) {
-                if let Err(error) = self
-                    .process_event(Event::ServerOverloaded {
+                let expiry = match &retry.target {
+                    ServerOverloadTarget::Ordinary => Event::ServerOverloaded {
                         message: "Server overload retry deadline elapsed".to_string(),
                         detected_at: now,
                         guidance: Some(OverloadRetryGuidance::ExceedsLimit(
                             std::time::Duration::from_secs(31),
                         )),
-                    })
-                    .await
-                {
+                    },
+                    ServerOverloadTarget::Continuation { operation_id, .. } => {
+                        Event::ContinuationServerOverloaded {
+                            operation_id: operation_id.clone(),
+                            message: "Server overload retry deadline elapsed".to_string(),
+                            detected_at: now,
+                            guidance: Some(OverloadRetryGuidance::ExceedsLimit(
+                                std::time::Duration::from_secs(31),
+                            )),
+                        }
+                    }
+                };
+                if let Err(error) = self.process_event(expiry).await {
                     tracing::error!(%error, "Failed to expire recovered overload retry");
                     return RuntimeExitDisposition::Interrupted;
                 }
@@ -7325,12 +7335,16 @@ where
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let provider = llm_client.complete_streaming(&request, &chunk_tx);
             let result = if let Some(deadline) = overload_deadline {
+                let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
                 match tokio::time::timeout(remaining, provider).await {
                     Ok(result) => result,
-                    Err(_) => Err(phoenix_llm::LlmError::server_overloaded(
-                        "Server overload retry deadline elapsed",
-                    )),
+                    Err(_) => {
+                        let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                        Err(phoenix_llm::LlmError::server_overloaded(
+                            "Server overload retry deadline elapsed",
+                        ))
+                    }
                 }
             } else {
                 provider.await
@@ -8537,12 +8551,16 @@ where
             let _continuation_admission = continuation_admission;
             let provider = llm_client.complete(&request);
             let result = if let Some(deadline) = overload_deadline {
+                let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
                 match tokio::time::timeout(remaining, provider).await {
                     Ok(result) => result,
-                    Err(_) => Err(phoenix_llm::LlmError::server_overloaded(
-                        "Server overload retry deadline elapsed",
-                    )),
+                    Err(_) => {
+                        let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                        Err(phoenix_llm::LlmError::server_overloaded(
+                            "Server overload retry deadline elapsed",
+                        ))
+                    }
                 }
             } else {
                 provider.await
@@ -8609,7 +8627,8 @@ where
                                 )
                             }
                         });
-                        Event::ServerOverloaded {
+                        Event::ContinuationServerOverloaded {
+                            operation_id: operation_id.clone(),
                             message: e.message.clone(),
                             detected_at: Utc::now(),
                             guidance,

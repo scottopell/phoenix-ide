@@ -1806,6 +1806,38 @@ describe('conversationReducer', () => {
       expect(s2.lastAppliedEventSeq).toBe(2);
     });
 
+    it('accepts tokens during an in-flight ordinary overload retry', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'server_overload_retrying', attempt: 2, retryAt: null },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 1,
+        delta: 'resumed',
+        requestId: 'overload-attempt-2',
+      });
+
+      expect(next.streamingBuffer?.text).toBe('resumed');
+    });
+
+    it('drops tokens while an overload retry is still waiting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'server_overload_retrying', attempt: 2, retryAt: Date.now() + 10_000 },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 1,
+        delta: 'premature',
+        requestId: 'overload-attempt-2',
+      });
+
+      expect(next.streamingBuffer).toBeNull();
+    });
+
     it('is a no-op for duplicate or out-of-order sequence', () => {
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),

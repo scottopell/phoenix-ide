@@ -914,6 +914,17 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
             }
         }
     }
+    let wrapped_code = error.get("code").and_then(serde_json::Value::as_str);
+    if matches!(wrapped_code, Some("server_is_overloaded" | "slow_down")) {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Selected model is at capacity");
+        return Some(overload_retry_guidance(
+            LlmError::server_overloaded(message),
+            &headers,
+        ));
+    }
     parse_codex_error(status, &headers, &body).or_else(|| {
         let code = error.get("code").and_then(serde_json::Value::as_str);
         let message = error
@@ -3714,6 +3725,26 @@ mod tests {
             "error": {
                 "code": "server_is_overloaded",
                 "message": "at capacity"
+            },
+            "headers": { "retry-after": "12" }
+        }))
+        .expect("wrapped overload");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn wrapped_websocket_429_slow_down_preserves_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "code": "slow_down",
+                "message": "reduce request rate"
             },
             "headers": { "retry-after": "12" }
         }))

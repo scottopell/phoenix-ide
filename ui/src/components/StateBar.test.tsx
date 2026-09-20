@@ -1088,6 +1088,38 @@ describe('StateBar working-phase indicators', () => {
     expect(dot?.className).toMatch(/reconnecting/);
   });
 
+  it('renders and decrements the persisted overload countdown after reconnect (REQ-LRV-008)', () => {
+    const retryAt = T_NOW + 10_000;
+    const { rerender } = renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 2, retryAt },
+      phaseStateUpdatedAt: T_NOW,
+      lastSseEventAt: T_NOW,
+      turnRetryContext: { attempt: 2, maxAttempts: 5, reasonText: 'server overloaded' },
+    });
+    expect(screen.getByText(/model overloaded — retrying in 10s.*retry 2\/5/i)).toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(screen.getByText(/model overloaded — retrying in 7s.*retry 2\/5/i)).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'server_overload_retrying', attempt: 2, retryAt }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW}
+          lastSseEventAtRef={{ current: T_NOW + 3_000 }}
+          turnRetryContext={{ attempt: 2, maxAttempts: 5, reasonText: 'server overloaded' }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/model overloaded — retrying in 7s.*retry 2\/5/i)).toBeInTheDocument();
+  });
+
   // Disambiguation: llm_requesting and awaiting_user_response both
   // previously rendered the word "awaiting response", which conflated
   // "waiting on the LLM" with "waiting on the human user". The fix

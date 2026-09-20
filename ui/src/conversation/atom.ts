@@ -787,7 +787,10 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_sequence_consumed':
       return atom;
     case 'sse_token': {
-      if (atom.phase.type !== 'llm_requesting') return atom;
+      if (
+        atom.phase.type !== 'llm_requesting'
+        && !(atom.phase.type === 'server_overload_retrying' && atom.phase.retryAt === null)
+      ) return atom;
       const sameRequest = atom.streamingBuffer?.requestId === action.requestId;
       return {
         ...atom,

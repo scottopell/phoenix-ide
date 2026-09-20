@@ -707,6 +707,7 @@ pub enum CloseMemberRole {
 pub enum CapturedConversationStateKind {
     Idle,
     LlmRequesting,
+    ServerOverloadRetrying,
     ToolExecuting,
     CancellingTool,
     AwaitingSubAgents,
@@ -736,6 +737,7 @@ impl CapturedConversationStateKind {
         Some(match value {
             "idle" => Self::Idle,
             "llm_requesting" => Self::LlmRequesting,
+            "server_overload_retrying" => Self::ServerOverloadRetrying,
             "tool_executing" => Self::ToolExecuting,
             "cancelling_tool" => Self::CancellingTool,
             "awaiting_sub_agents" => Self::AwaitingSubAgents,
@@ -767,6 +769,7 @@ impl CapturedConversationStateKind {
         matches!(
             self,
             Self::LlmRequesting
+                | Self::ServerOverloadRetrying
                 | Self::SeededLlmRequesting
                 | Self::Provisioning
                 | Self::ToolExecuting
@@ -1204,6 +1207,20 @@ pub struct CloseRetiredResource {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn overload_retry_snapshot_round_trips_and_is_busy() {
+        let kind = CapturedConversationStateKind::from_db_str("server_overload_retrying")
+            .expect("known state kind");
+        assert_eq!(kind, CapturedConversationStateKind::ServerOverloadRetrying);
+        assert_eq!(
+            CapturedConversationStateKind::from_db_str("server_overload_retrying"),
+            Some(kind)
+        );
+        assert!(kind.is_busy());
+    }
+
     #[test]
     fn historical_commission_review_approval_snapshot_remains_readable() {
         assert_eq!(
@@ -1218,8 +1235,6 @@ mod tests {
             "\"awaiting_commission_review_approval\""
         );
     }
-
-    use super::*;
 
     #[test]
     fn transcript_conversation_id_is_distinct_and_round_trips() {

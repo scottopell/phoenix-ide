@@ -6496,6 +6496,7 @@ impl Database {
              WHERE archived = 0
                AND state_kind IN (
                    'awaiting_continuation',
+                   'server_overload_retrying',
                    'recoverable_continuation_failure',
                    'awaiting_recovery'
                )",
@@ -6511,6 +6512,7 @@ impl Database {
             if matches!(
                 state,
                 ConvState::AwaitingContinuation { .. }
+                    | ConvState::ServerOverloadRetrying { .. }
                     | ConvState::RecoverableContinuationFailure { .. }
                     | ConvState::AwaitingRecovery {
                     resume:

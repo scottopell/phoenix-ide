@@ -537,6 +537,17 @@ SET sql = replace(
 WHERE type = 'table'
   AND name = 'conversations'
   AND instr(sql, '''idle'', ''llm_requesting'', ''tool_executing''') > 0
+  AND instr(sql, '''server_overload_retrying''') = 0;
+
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    '''idle'', ''llm_requesting'', ''tool_executing''',
+    '''idle'', ''llm_requesting'', ''server_overload_retrying'', ''tool_executing'''
+)
+WHERE type = 'table'
+  AND name = 'close_attempt_members'
+  AND instr(sql, '''idle'', ''llm_requesting'', ''tool_executing''') > 0
   AND instr(sql, '''server_overload_retrying''') = 0
 ";
 
@@ -556,6 +567,11 @@ mod migration_102_tests {
             "CREATE TABLE conversations (
                 id TEXT PRIMARY KEY,
                 state_kind TEXT NOT NULL CHECK (state_kind IN ('idle', 'llm_requesting', 'tool_executing'))
+             );
+             CREATE TABLE close_attempt_members (
+                attempt_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                captured_state_kind TEXT NOT NULL CHECK (captured_state_kind IN ('idle', 'llm_requesting', 'tool_executing'))
              );
              CREATE TABLE _migrations (
                 version INTEGER PRIMARY KEY,
@@ -586,6 +602,13 @@ mod migration_102_tests {
                 .unwrap()
                 .get("sql");
         assert!(schema.contains("'server_overload_retrying'"));
+        let close_schema: String =
+            sqlx::query("SELECT sql FROM sqlite_schema WHERE name = 'close_attempt_members'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("sql");
+        assert!(close_schema.contains("'server_overload_retrying'"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 102")
                 .fetch_one(&pool)
@@ -597,6 +620,18 @@ mod migration_102_tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO close_attempt_members (attempt_id, conversation_id, captured_state_kind) VALUES ('close', 'retry', 'server_overload_retrying')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let captured: String = sqlx::query_scalar(
+            "SELECT captured_state_kind FROM close_attempt_members WHERE attempt_id = 'close'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(captured, "server_overload_retrying");
     }
 }
 
@@ -3732,7 +3767,7 @@ CREATE TABLE close_attempt_members (
     continuation_ordinal INTEGER NOT NULL CHECK (continuation_ordinal >= 0),
     captured_continued_in_conv_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     captured_state_kind TEXT NOT NULL CHECK (captured_state_kind IN (
-        'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+        'idle', 'llm_requesting', 'server_overload_retrying', 'tool_executing', 'cancelling_tool',
         'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
         'awaiting_continuation', 'recoverable_continuation_failure',
         'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
@@ -9663,11 +9698,35 @@ async fn run_migration_102(pool: &SqlitePool, migration: &Migration) -> DbResult
         )
         .fetch_one(&mut *tx)
         .await?;
-        if !schema.contains("'server_overload_retrying'") {
-            let changed = sqlx::query(migration.sql).execute(&mut *tx).await?;
-            if changed.rows_affected() != 1 {
+        let close_schema: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_attempt_members'",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let conversations_need_update = !schema.contains("'server_overload_retrying'");
+        let close_needs_update = close_schema
+            .as_deref()
+            .is_some_and(|schema| !schema.contains("'server_overload_retrying'"));
+        if conversations_need_update || close_needs_update {
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            let updated_conversations: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'conversations'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let updated_close: Option<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_attempt_members'",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if !updated_conversations.contains("'server_overload_retrying'")
+                || updated_close
+                    .as_deref()
+                    .is_some_and(|schema| !schema.contains("'server_overload_retrying'"))
+            {
                 return Err(DbError::Serialization(
-                    "migration 102 expected the migration-59 conversations schema".to_string(),
+                    "migration 102 expected overload-compatible conversation and Close schemas"
+                        .to_string(),
                 ));
             }
             sqlx::query(sqlx::AssertSqlSafe(format!(

@@ -445,43 +445,60 @@ pub fn transition(
     context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
-    let event = match event {
+    if matches!(
+        &event,
         Event::LlmError {
-            message,
+            error_kind: ErrorKind::ServerOverloaded,
+            ..
+        } | Event::ContinuationError {
             error_kind: ErrorKind::ServerOverloaded,
             ..
         }
-        | Event::ContinuationError {
-            message,
-            error_kind: ErrorKind::ServerOverloaded,
-            ..
-        } => Event::ServerOverloaded {
-            message,
-            detected_at: chrono::Utc::now(),
-            guidance: None,
-        },
-        event => event,
-    };
+    ) {
+        return Err(TransitionError::InvalidTransition {
+            state: state.variant_name(),
+            event: event.variant_name(),
+        });
+    }
     if let ConvState::ServerOverloadRetrying { retry } = state {
-        if matches!(retry.phase, ServerOverloadPhase::InFlight)
-            && matches!(event, Event::LlmError { .. })
-        {
-            let delegated = match &retry.target {
-                ServerOverloadTarget::Ordinary => ConvState::LlmRequesting {
-                    attempt: retry.attempt,
-                },
-                ServerOverloadTarget::Continuation {
-                    operation_id,
-                    rejected_tool_calls,
-                } => ConvState::AwaitingContinuation {
-                    request: ServerOverloadTarget::continuation_request_from_parts(
+        if matches!(retry.phase, ServerOverloadPhase::InFlight) {
+            if let Event::LlmResponse { .. } = event {
+                let delegated = match &retry.target {
+                    ServerOverloadTarget::Ordinary => ConvState::LlmRequesting {
+                        attempt: retry.attempt,
+                    },
+                    ServerOverloadTarget::Continuation {
                         operation_id,
                         rejected_tool_calls,
-                        retry.attempt,
-                    ),
-                },
-            };
-            return transition(&delegated, context, event);
+                    } => ConvState::AwaitingContinuation {
+                        request: ServerOverloadTarget::continuation_request_from_parts(
+                            operation_id,
+                            rejected_tool_calls,
+                            retry.attempt,
+                        ),
+                    },
+                };
+                return transition(&delegated, context, event);
+            }
+            if let Event::LlmError {
+                message,
+                error_kind,
+                ..
+            } = &event
+            {
+                if error_kind.is_auto_retryable() {
+                    return continue_overload_after_mixed_transient(
+                        retry,
+                        context,
+                        message.clone(),
+                        error_kind.clone(),
+                    );
+                }
+                let delegated = ConvState::LlmRequesting {
+                    attempt: retry.attempt,
+                };
+                return transition(&delegated, context, event);
+            }
         }
     }
     if let ConvState::ServerOverloadRetrying { retry } = state {
@@ -495,6 +512,10 @@ pub fn transition(
                     operation_id: event_operation_id,
                     ..
                 }
+                | Event::ContinuationServerOverloaded {
+                    operation_id: event_operation_id,
+                    ..
+                }
                 | Event::ContinuationResponse {
                     operation_id: event_operation_id,
                     ..
@@ -505,7 +526,36 @@ pub fn transition(
                 } => event_operation_id == operation_id,
                 _ => false,
             };
-            if matches!(retry.phase, ServerOverloadPhase::InFlight) && is_matching_continuation {
+            if !is_matching_continuation
+                && matches!(
+                    &event,
+                    Event::ContinuationError { .. }
+                        | Event::ContinuationServerOverloaded { .. }
+                        | Event::ContinuationResponse { .. }
+                        | Event::ContinuationFailed { .. }
+                )
+            {
+                return Ok(TransitionResult::new(state.clone()));
+            }
+            if matches!(retry.phase, ServerOverloadPhase::InFlight)
+                && is_matching_continuation
+                && !matches!(&event, Event::ContinuationServerOverloaded { .. })
+            {
+                if let Event::ContinuationError {
+                    message,
+                    error_kind,
+                    ..
+                } = &event
+                {
+                    if error_kind.is_auto_retryable() {
+                        return continue_overload_after_mixed_transient(
+                            retry,
+                            context,
+                            message.clone(),
+                            error_kind.clone(),
+                        );
+                    }
+                }
                 let delegated = ConvState::AwaitingContinuation {
                     request: ServerOverloadTarget::continuation_request_from_parts(
                         operation_id,
@@ -720,6 +770,13 @@ impl CoreTransitionResult {
             effects: self.effects,
         }
     }
+
+    fn into_conv_result(self) -> TransitionResult {
+        TransitionResult {
+            new_state: self.new_state.into(),
+            effects: self.effects,
+        }
+    }
 }
 
 // ============================================================================
@@ -826,13 +883,16 @@ pub fn transition_core(
             | CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
-        (
-            CoreState::LlmRequesting { .. } | CoreState::AwaitingContinuation { .. },
-            CoreEvent::ServerOverloaded { .. },
+        (CoreState::LlmRequesting { .. }, CoreEvent::ServerOverloaded { .. })
+        | (
+            CoreState::AwaitingContinuation { .. },
+            CoreEvent::ContinuationServerOverloaded { .. },
         )
         | (
             CoreState::ServerOverloadRetrying { .. },
-            CoreEvent::ServerOverloaded { .. } | CoreEvent::RetryTimeout { .. },
+            CoreEvent::ServerOverloaded { .. }
+            | CoreEvent::ContinuationServerOverloaded { .. }
+            | CoreEvent::RetryTimeout { .. },
         ) => handle_server_overload_retry(state, context, event),
 
         (
@@ -1224,6 +1284,7 @@ fn handle_core_tool_complete(
         | CoreEvent::LlmResponse { .. }
         | CoreEvent::LlmError { .. }
         | CoreEvent::ServerOverloaded { .. }
+        | CoreEvent::ContinuationServerOverloaded { .. }
         | CoreEvent::RetryTimeout { .. }
         | CoreEvent::ToolAborted { .. }
         | CoreEvent::SubAgentResult { .. }
@@ -1720,7 +1781,10 @@ fn schedule_server_overload(
         deadline_at,
     };
     if retry_at >= deadline_at {
-        return overload_terminal(&retry, message, ErrorKind::ServerOverloaded, None);
+        let mut last_dispatched = retry;
+        last_dispatched.attempt = last_dispatched.attempt.saturating_sub(1);
+        last_dispatched.phase = ServerOverloadPhase::InFlight;
+        return overload_terminal(&last_dispatched, message, ErrorKind::ServerOverloaded, None);
     }
     Ok(
         CoreTransitionResult::new(CoreState::ServerOverloadRetrying { retry })
@@ -1733,6 +1797,49 @@ fn schedule_server_overload(
                 resets_at: None,
             })
             .with_effect(Effect::notify_state_change()),
+    )
+}
+
+fn continue_overload_after_mixed_transient(
+    retry: &ServerOverloadRetry,
+    context: &ConvContext,
+    message: String,
+    error_kind: ErrorKind,
+) -> Result<TransitionResult, TransitionError> {
+    let next_attempt = retry.attempt + 1;
+    if next_attempt > OVERLOAD_MAX_ATTEMPTS {
+        return overload_terminal(retry, message, error_kind, None)
+            .map(CoreTransitionResult::into_conv_result);
+    }
+    let identity = match &retry.target {
+        ServerOverloadTarget::Ordinary => &context.conversation_id,
+        ServerOverloadTarget::Continuation { operation_id, .. } => operation_id,
+    };
+    let delay = overload_retry_delay(next_attempt, identity);
+    let elapsed = (2..=next_attempt)
+        .map(|attempt| overload_retry_delay(attempt, identity))
+        .map(|delay| chrono::Duration::from_std(delay).expect("overload delay fits chrono"))
+        .sum::<chrono::Duration>();
+    let retry_at = retry.started_at + elapsed;
+    if retry_at >= retry.deadline_at {
+        return overload_terminal(retry, message, error_kind, None)
+            .map(CoreTransitionResult::into_conv_result);
+    }
+    let mut next = retry.clone();
+    next.attempt = next_attempt;
+    next.phase = ServerOverloadPhase::Waiting { retry_at };
+    Ok(
+        CoreTransitionResult::new(CoreState::ServerOverloadRetrying { retry: next })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::ScheduleRetry {
+                delay,
+                attempt: next_attempt,
+                max_attempts: OVERLOAD_MAX_ATTEMPTS,
+                reason: error_kind_to_attempt_reason(&error_kind),
+                resets_at: None,
+            })
+            .with_effect(Effect::notify_state_change())
+            .into_conv_result(),
     )
 }
 
@@ -1764,12 +1871,13 @@ fn handle_server_overload_retry(
         }
         (
             CoreState::AwaitingContinuation { request },
-            CoreEvent::ServerOverloaded {
+            CoreEvent::ContinuationServerOverloaded {
+                operation_id,
                 message,
                 detected_at,
                 guidance,
             },
-        ) => {
+        ) if request.operation_id == operation_id => {
             let deadline_at = detected_at + chrono::Duration::seconds(120);
             schedule_server_overload(
                 ServerOverloadTarget::Continuation {
@@ -1809,10 +1917,37 @@ fn handle_server_overload_retry(
             CoreState::ServerOverloadRetrying { retry },
             CoreEvent::ServerOverloaded {
                 message,
-                guidance: Some(OverloadRetryGuidance::ExceedsLimit(_)),
+                guidance: Some(OverloadRetryGuidance::ExceedsLimit(duration)),
                 ..
             },
-        ) => overload_terminal(retry, message, ErrorKind::ServerOverloaded, None),
+        ) if matches!(retry.target, ServerOverloadTarget::Ordinary) => overload_terminal(
+            retry,
+            format!("{message} Retry-After was {duration:?}, beyond the automatic retry limit."),
+            ErrorKind::ServerOverloaded,
+            None,
+        ),
+        (
+            CoreState::ServerOverloadRetrying { retry },
+            CoreEvent::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                guidance: Some(OverloadRetryGuidance::ExceedsLimit(duration)),
+                ..
+            },
+        ) if matches!(
+            &retry.target,
+            ServerOverloadTarget::Continuation { operation_id: expected, .. } if expected == &operation_id
+        ) =>
+        {
+            overload_terminal(
+                retry,
+                format!(
+                    "{message} Retry-After was {duration:?}, beyond the automatic retry limit."
+                ),
+                ErrorKind::ServerOverloaded,
+                None,
+            )
+        }
         (
             CoreState::ServerOverloadRetrying { retry },
             CoreEvent::ServerOverloaded {
@@ -1833,6 +1968,31 @@ fn handle_server_overload_retry(
                 detected_at,
                 guidance,
                 identity,
+                message,
+            )
+        }
+        (
+            CoreState::ServerOverloadRetrying { retry },
+            CoreEvent::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+            },
+        ) if matches!(retry.phase, ServerOverloadPhase::InFlight)
+            && matches!(
+                &retry.target,
+                ServerOverloadTarget::Continuation { operation_id: expected, .. } if expected == &operation_id
+            ) =>
+        {
+            schedule_server_overload(
+                retry.target.clone(),
+                retry.attempt + 1,
+                retry.started_at,
+                retry.deadline_at,
+                detected_at,
+                guidance,
+                &operation_id,
                 message,
             )
         }
@@ -3112,6 +3272,7 @@ pub fn transition_parent(
             ParentState::Core(CoreState::RecoverableContinuationFailure { .. }),
             ParentEvent::Core(
                 CoreEvent::ServerOverloaded { .. }
+                | CoreEvent::ContinuationServerOverloaded { .. }
                 | CoreEvent::ContinuationResponse { .. }
                 | CoreEvent::ContinuationError { .. }
                 | CoreEvent::ContinuationFailed { .. },
@@ -3318,7 +3479,9 @@ pub fn transition_sub_agent(
         (
             SubAgentState::Core(core_state @ CoreState::ServerOverloadRetrying { .. }),
             SubAgentEvent::Core(
-                core_event @ (CoreEvent::ServerOverloaded { .. } | CoreEvent::RetryTimeout { .. }),
+                core_event @ (CoreEvent::ServerOverloaded { .. }
+                | CoreEvent::ContinuationServerOverloaded { .. }
+                | CoreEvent::RetryTimeout { .. }),
             ),
         ) => {
             let core_result = transition_core(core_state, context, core_event)?;
@@ -4169,6 +4332,107 @@ mod tests {
     }
 
     #[test]
+    fn overload_success_uses_parent_and_sub_agent_response_policies() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let retrying = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Ordinary,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: at,
+                deadline_at: at + chrono::Duration::seconds(120),
+            },
+        };
+        let response = || Event::LlmResponse {
+            content: vec![phoenix_core::domain::llm_types::ContentBlock::text("done")],
+            tool_calls: vec![],
+            end_turn: true,
+            usage: phoenix_core::domain::llm_types::Usage {
+                input_tokens: 10,
+                output_tokens: 1,
+                reasoning_tokens: None,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            request_id: "retry-success".to_string(),
+        };
+
+        let parent = transition(&retrying, &test_context(), response()).unwrap();
+        assert!(matches!(parent.new_state, ConvState::Idle));
+        assert!(parent
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+
+        let sub_agent = transition(&retrying, &sub_agent_context(), response()).unwrap();
+        assert!(
+            matches!(sub_agent.new_state, ConvState::Completed { ref result } if result == "done")
+        );
+        assert!(sub_agent.effects.iter().any(|effect| matches!(effect,
+            Effect::NotifyParent { outcome: SubAgentOutcome::Success { result } } if result == "done"
+        )));
+    }
+
+    #[test]
+    fn mixed_transient_failure_stays_in_original_overload_incident() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for target in [
+            ServerOverloadTarget::Ordinary,
+            ServerOverloadTarget::Continuation {
+                operation_id: "mixed-op".to_string(),
+                rejected_tool_calls: vec![],
+            },
+        ] {
+            let state = ConvState::ServerOverloadRetrying {
+                retry: ServerOverloadRetry {
+                    target: target.clone(),
+                    phase: ServerOverloadPhase::InFlight,
+                    attempt: 3,
+                    started_at: at,
+                    deadline_at: at + chrono::Duration::seconds(120),
+                },
+            };
+            let event = match target {
+                ServerOverloadTarget::Ordinary => Event::LlmError {
+                    message: "connection reset".to_string(),
+                    error_kind: ErrorKind::Network,
+                    attempt: 3,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                },
+                ServerOverloadTarget::Continuation { operation_id, .. } => {
+                    Event::ContinuationError {
+                        operation_id,
+                        message: "upstream 500".to_string(),
+                        error_kind: ErrorKind::ServerError,
+                        resets_at: None,
+                    }
+                }
+            };
+            let result = transition(&state, &test_context(), event).unwrap();
+            let ConvState::ServerOverloadRetrying { retry } = result.new_state else {
+                panic!("mixed transient must remain in overload incident")
+            };
+            assert_eq!(retry.started_at, at);
+            assert_eq!(retry.deadline_at, at + chrono::Duration::seconds(120));
+            assert_eq!(retry.attempt, 4);
+            assert!(matches!(retry.phase, ServerOverloadPhase::Waiting { .. }));
+            assert!(result.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ScheduleRetry {
+                    attempt: 4,
+                    max_attempts: 5,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
     fn sub_agent_overload_exhaustion_and_later_terminal_error_notify_parent() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4240,7 +4504,8 @@ mod tests {
         let expired = transition(
             &retrying,
             &test_context(),
-            Event::ServerOverloaded {
+            Event::ContinuationServerOverloaded {
+                operation_id: operation_id.clone(),
                 message: "continuation overload deadline elapsed".to_string(),
                 detected_at: at,
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
@@ -4258,7 +4523,8 @@ mod tests {
         ));
 
         for late in [
-            Event::ServerOverloaded {
+            Event::ContinuationServerOverloaded {
+                operation_id: operation_id.clone(),
                 message: "duplicate expiry".to_string(),
                 detected_at: at + chrono::Duration::seconds(1),
                 guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
@@ -4275,6 +4541,81 @@ mod tests {
     }
 
     #[test]
+    fn continuation_overload_rejects_stale_operation_outcomes() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Continuation {
+                    operation_id: "current-op".to_string(),
+                    rejected_tool_calls: vec![],
+                },
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 2,
+                started_at: at,
+                deadline_at: at + chrono::Duration::seconds(120),
+            },
+        };
+        for stale in [
+            Event::ContinuationServerOverloaded {
+                operation_id: "stale-op".to_string(),
+                message: "capacity".to_string(),
+                detected_at: at,
+                guidance: None,
+            },
+            Event::ContinuationResponse {
+                operation_id: "stale-op".to_string(),
+                summary: "stale".to_string(),
+            },
+            Event::ContinuationError {
+                operation_id: "stale-op".to_string(),
+                message: "network".to_string(),
+                error_kind: ErrorKind::Network,
+                resets_at: None,
+            },
+        ] {
+            let result = transition(&state, &test_context(), stale).unwrap();
+            assert_eq!(result.new_state, state);
+            assert!(result.effects.is_empty());
+        }
+    }
+
+    #[test]
+    fn continuation_deadline_stop_retains_last_dispatched_attempt() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Continuation {
+                    operation_id: "deadline-op".to_string(),
+                    rejected_tool_calls: vec![],
+                },
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 3,
+                started_at: at,
+                deadline_at: at + chrono::Duration::seconds(5),
+            },
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ContinuationServerOverloaded {
+                operation_id: "deadline-op".to_string(),
+                message: "capacity".to_string(),
+                detected_at: at + chrono::Duration::seconds(4),
+                guidance: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(result.new_state,
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request.attempt == 3 && failure.request.operation_id == "deadline-op"
+        ));
+    }
+
+    #[test]
     fn overload_retry_continuation_dispatches_and_serde_round_trips() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4287,7 +4628,12 @@ mod tests {
         let scheduled = transition(
             &ConvState::AwaitingContinuation { request },
             &test_context(),
-            overload_event(at),
+            Event::ContinuationServerOverloaded {
+                operation_id: "op-1".to_string(),
+                message: "capacity".to_string(),
+                detected_at: at,
+                guidance: None,
+            },
         )
         .unwrap();
         let json = serde_json::to_string(&scheduled.new_state).unwrap();
@@ -4734,7 +5080,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_overload_event_is_normalized_to_dedicated_retry_state() {
+    fn generic_overload_error_cannot_synthesize_a_wall_clock_retry_incident() {
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &test_context(),
@@ -4745,21 +5091,11 @@ mod tests {
                 recovery_in_progress: false,
                 resets_at: None,
             },
-        )
-        .unwrap();
+        );
         assert!(matches!(
-            result.new_state,
-            ConvState::ServerOverloadRetrying { .. }
+            result,
+            Err(TransitionError::InvalidTransition { .. })
         ));
-        assert!(result.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::ScheduleRetry {
-                attempt: 2,
-                max_attempts: MAX_OVERLOAD_ATTEMPTS,
-                reason: LlmAttemptReason::ServerOverloaded,
-                ..
-            }
-        )));
     }
 
     #[test]
@@ -4774,11 +5110,13 @@ mod tests {
                 request: request.clone(),
             },
             &test_context(),
-            Event::ContinuationError {
+            Event::ContinuationServerOverloaded {
                 operation_id: request.operation_id.clone(),
                 message: "selected model is at capacity".to_string(),
-                error_kind: ErrorKind::ServerOverloaded,
-                resets_at: None,
+                detected_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                guidance: None,
             },
         )
         .expect("capacity failure should remain recoverable");

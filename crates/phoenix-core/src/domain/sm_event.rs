@@ -479,6 +479,12 @@ pub enum Event {
         detected_at: DateTime<Utc>,
         guidance: Option<OverloadRetryGuidance>,
     },
+    ContinuationServerOverloaded {
+        operation_id: String,
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+    },
     RetryTimeout {
         attempt: u32,
     },
@@ -660,6 +666,7 @@ impl Event {
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
             Event::ServerOverloaded { .. } => "ServerOverloaded",
+            Event::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
@@ -740,6 +747,12 @@ pub enum CoreEvent {
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     ServerOverloaded {
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+    },
+    ContinuationServerOverloaded {
+        operation_id: String,
         message: String,
         detected_at: DateTime<Utc>,
         guidance: Option<OverloadRetryGuidance>,
@@ -941,6 +954,17 @@ impl TryFrom<Event> for ParentEvent {
                 detected_at,
                 guidance,
             })),
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+            } => Ok(ParentEvent::Core(CoreEvent::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+            })),
             Event::RetryTimeout { attempt } => {
                 Ok(ParentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1133,6 +1157,19 @@ impl TryFrom<Event> for SubAgentEvent {
                 detected_at,
                 guidance,
             })),
+            Event::ContinuationServerOverloaded {
+                operation_id,
+                message,
+                detected_at,
+                guidance,
+            } => Ok(SubAgentEvent::Core(
+                CoreEvent::ContinuationServerOverloaded {
+                    operation_id,
+                    message,
+                    detected_at,
+                    guidance,
+                },
+            )),
             Event::RetryTimeout { attempt } => {
                 Ok(SubAgentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1236,6 +1273,7 @@ impl CoreEvent {
             CoreEvent::LlmError { .. } => "LlmError",
             CoreEvent::RetryTimeout { .. } => "RetryTimeout",
             CoreEvent::ServerOverloaded { .. } => "ServerOverloaded",
+            CoreEvent::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",

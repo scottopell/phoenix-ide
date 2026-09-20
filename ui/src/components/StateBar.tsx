@@ -580,6 +580,9 @@ export function StateBar({
     }, 1000);
     return () => window.clearInterval(interval);
   }, [phaseIsWorking, phaseStateUpdatedAt]);
+  const overloadRetrySeconds = convState.type === 'server_overload_retrying' && convState.retryAt != null
+    ? Math.max(0, Math.ceil((convState.retryAt - Date.now()) / 1000))
+    : null;
 
   // Heartbeat watchdog (REQ-WPV-004). When the connection is healthy
   // AND the agent is working AND no SSE event of any kind (typed
@@ -866,6 +869,8 @@ export function StateBar({
               // so the user has the full context for "why has this
               // taken so long?".
               stateText = `streaming${retrySuffix}`;
+            } else if (convState.type === 'server_overload_retrying' && overloadRetrySeconds != null) {
+              stateText = `model overloaded — retrying in ${overloadRetrySeconds}s${retrySuffix}`;
             } else {
               stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }

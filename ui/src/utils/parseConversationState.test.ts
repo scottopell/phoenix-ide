@@ -13,7 +13,11 @@ describe('parseConversationState recovery', () => {
       },
     });
 
-    expect(state).toEqual({ type: 'server_overload_retrying', attempt: 3 });
+    expect(state).toEqual({
+      type: 'server_overload_retrying',
+      attempt: 3,
+      retryAt: Date.parse('2026-01-01T00:00:30Z'),
+    });
     expect(isAgentWorking(state)).toBe(true);
     expect(canCancelConversationState(state)).toBe(true);
     expect(canChangeModelInState(state)).toBe(false);
