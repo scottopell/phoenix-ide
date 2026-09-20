@@ -5,20 +5,26 @@ use super::{
 };
 use crate::db::{Message, MessageContent};
 use crate::state_machine::state::ToolCall;
-use phoenix_core::llm_language::COORDINATOR_CONTINUATION_SYSTEM_PROMPT;
+use phoenix_core::llm_language::{
+    project_coordinator_continuation_instruction, LlmLanguage,
+    COORDINATOR_CONTINUATION_SYSTEM_PROMPT,
+};
 
 #[cfg(test)]
 mod evaluation;
 
 pub(super) enum CompactionPolicy {
     Work,
+    ProjectCoordinator,
     Coordinator,
 }
 
 impl CompactionPolicy {
-    pub(super) fn for_coordinator(is_coordinator: bool) -> Self {
+    pub(super) fn for_profile(is_coordinator: bool, is_project_coordinator: bool) -> Self {
         if is_coordinator {
             Self::Coordinator
+        } else if is_project_coordinator {
+            Self::ProjectCoordinator
         } else {
             Self::Work
         }
@@ -26,14 +32,24 @@ impl CompactionPolicy {
 
     pub(super) fn system_prompt(&self) -> &'static str {
         match self {
-            Self::Work => CONTINUATION_SYSTEM_PROMPT,
+            Self::Work | Self::ProjectCoordinator => CONTINUATION_SYSTEM_PROMPT,
             Self::Coordinator => COORDINATOR_CONTINUATION_SYSTEM_PROMPT,
         }
     }
 
-    pub(super) fn instruction(&self, rejected_tool_calls: &[ToolCall]) -> String {
+    pub(super) fn instruction(
+        &self,
+        rejected_tool_calls: &[ToolCall],
+        language: LlmLanguage,
+    ) -> String {
         match self {
             Self::Work => build_continuation_prompt(rejected_tool_calls),
+            Self::ProjectCoordinator => {
+                let mut prompt =
+                    String::from(project_coordinator_continuation_instruction(language));
+                append_rejected_tool_calls(&mut prompt, rejected_tool_calls);
+                prompt
+            }
             Self::Coordinator => {
                 let mut prompt = String::from(
                     "Write a handoff for the next Phoenix Coordinator, the user's primary interface \
@@ -60,15 +76,21 @@ impl CompactionPolicy {
                      for retrieving detail. Do not interpret a stream's absence from recent messages \
                      as completion. Do not invent commitments. Write directly to the next Coordinator.",
                 );
-                if !rejected_tool_calls.is_empty() {
-                    prompt.push_str("\n\nThese pending tool calls did not run; preserve their intended next actions:\n");
-                    for call in rejected_tool_calls {
-                        prompt.push_str(&render_rejected_tool_call(call));
-                        prompt.push('\n');
-                    }
-                }
+                append_rejected_tool_calls(&mut prompt, rejected_tool_calls);
                 prompt
             }
+        }
+    }
+}
+
+fn append_rejected_tool_calls(prompt: &mut String, rejected_tool_calls: &[ToolCall]) {
+    if !rejected_tool_calls.is_empty() {
+        prompt.push_str(
+            "\n\nThese pending tool calls did not run; preserve their intended next actions:\n",
+        );
+        for call in rejected_tool_calls {
+            prompt.push_str(&render_rejected_tool_call(call));
+            prompt.push('\n');
         }
     }
 }
@@ -169,6 +191,51 @@ mod tests {
     use phoenix_llm::{ContentBlock, MessageRole};
     use proptest::prelude::*;
 
+    #[test]
+    fn project_coordinator_policy_is_role_appropriate_and_excludes_charter() {
+        let project =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::PhoenixNative);
+        assert!(project.contains("current mission"));
+        assert!(project.contains("unresolved commitments and their owners"));
+        assert!(project.contains("Do not reproduce or summarize the Project Coordinator charter"));
+        assert_eq!(
+            CompactionPolicy::for_profile(false, true).system_prompt(),
+            CONTINUATION_SYSTEM_PROMPT
+        );
+        assert!(!CompactionPolicy::for_profile(false, false)
+            .instruction(&[], LlmLanguage::PhoenixNative)
+            .contains("Project Coordinator charter"));
+    }
+
+    #[test]
+    fn project_coordinator_policy_uses_selected_llm_language() {
+        let phoenix =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::PhoenixNative);
+        let caveman =
+            CompactionPolicy::for_profile(false, true).instruction(&[], LlmLanguage::Caveman);
+
+        assert!(phoenix.starts_with("Write a compact handoff"));
+        assert!(caveman.starts_with("Write short handoff"));
+        assert!(caveman.contains("Do not copy or sum up Project Coordinator charter"));
+        assert!(!caveman.contains("Write a compact handoff"));
+    }
+
+    #[test]
+    fn project_coordinator_compaction_preserves_rejected_tool_intent() {
+        let call = ToolCall::new(
+            "call-1",
+            phoenix_core::domain::sm_state::ToolInput::Unknown {
+                name: "example".to_string(),
+                input: serde_json::json!({"scope": "bounded"}),
+            },
+        );
+        let prompt = CompactionPolicy::for_profile(false, true)
+            .instruction(&[call], LlmLanguage::PhoenixNative);
+        assert!(prompt.contains("These pending tool calls did not run"));
+        assert!(prompt.contains("example"));
+        assert!(prompt.contains("bounded"));
+    }
+
     fn user(text: &str) -> LlmMessage {
         LlmMessage {
             role: MessageRole::User,
@@ -191,9 +258,9 @@ mod tests {
 
     #[test]
     fn coordinator_compaction_request_removes_lifecycle_contradictions() {
-        let policy = CompactionPolicy::for_coordinator(true);
+        let policy = CompactionPolicy::for_profile(true, false);
         let system_prompt = policy.system_prompt();
-        let instruction = policy.instruction(&[]);
+        let instruction = policy.instruction(&[], LlmLanguage::PhoenixNative);
 
         assert!(system_prompt.contains("You are writing a handoff for Phoenix Coordinator"));
         assert!(!system_prompt.contains("cannot create conversations"));

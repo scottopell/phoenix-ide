@@ -204,11 +204,14 @@ def owner_alive():
             or (root / ".cleanup-request").exists()):
         return False
     try:
-        return time.time() - heartbeat.stat().st_mtime <= heartbeat_stale
+        heartbeat_age = time.time() - heartbeat.stat().st_mtime
     except FileNotFoundError:
         return False
     except OSError:
         return False
+    if os.getppid() == parent:
+        return True
+    return heartbeat_age <= heartbeat_stale
 
 def reserve_spawn(socket, control, token):
     if any(existing_socket == socket or existing_control == control
@@ -979,6 +982,15 @@ while time.monotonic() < cleanup_deadline:
     ]
     unconfirmed_state = (any(state != "absent" for state in states)
                          or bool(unconfirmed_obligations))
+    for record in list(owned):
+        if time.monotonic() >= cleanup_deadline:
+            break
+        socket, device, inode, control, processes = record
+        if any(identity_state(identity) != "absent" for identity in processes):
+            try:
+                retire_record(record, cleanup_deadline)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                pass
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -1134,6 +1146,12 @@ while time.monotonic() < cleanup_deadline:
             )
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
+if (not original_root_exists() and not original_control_root_exists()
+        and not unconfirmed_obligations
+        and all(identity_state(identity) == "absent"
+                for _socket, _device, _inode, _control, processes in owned
+                for identity in processes)):
+    sys.exit(0)
 print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
 sys.exit(1)
 "##;
@@ -1921,11 +1939,38 @@ fn wait_for_watchdog(watchdog: &mut Child) -> io::Result<std::process::ExitStatu
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::process::ExitStatus;
 
     use super::*;
+
+    struct TmuxFixtureLock(std::fs::File);
+
+    impl Drop for TmuxFixtureLock {
+        fn drop(&mut self) {
+            // test-timing-allow: release cross-process fixture serialization lock
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+
+    fn tmux_fixture_lock(name: &str) -> TmuxFixtureLock {
+        let target_dir = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(target_dir.join(format!("phoenix-tmux-{name}.lock")))
+            .expect("tmux fixture lock file");
+        // test-timing-allow: flock serializes watchdog-heavy cross-process fixtures; each fixture keeps its own liveness deadlines
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(result, 0, "tmux fixture lock");
+        TmuxFixtureLock(file)
+    }
 
     #[test]
     fn process_identity_parser_accepts_exact_tmux_form_and_rejects_malformed_output() {
@@ -2250,6 +2295,13 @@ mod tests {
         ));
         assert!(WATCHDOG_PROGRAM.contains(
             "not unconfirmed_state and not unconfirmed and not sockets and not creators"
+        ));
+    }
+
+    #[test]
+    fn vanished_roots_require_recorded_process_absence() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "not original_root_exists() and not original_control_root_exists()\n        and not unconfirmed_obligations\n        and all(identity_state(identity) == \"absent\""
         ));
     }
 
@@ -2684,6 +2736,7 @@ mod tests {
         let Ok(real_tmux) = which::which("tmux") else {
             return;
         };
+        let _fixture = tmux_fixture_lock("replacement-control");
         let fake_bin = TempDir::new().unwrap();
         let replaced = fake_bin.path().join("replaced");
         write_tmux_wrapper(
@@ -2892,6 +2945,13 @@ mod tests {
 
         assert_exact_processes_gone(&first);
         assert_exact_processes_gone(&second);
+    }
+
+    #[test]
+    fn live_parent_identity_outranks_a_delayed_heartbeat() {
+        assert!(WATCHDOG_PROGRAM.contains(
+            "heartbeat_age = time.time() - heartbeat.stat().st_mtime\n    except FileNotFoundError:\n        return False\n    except OSError:\n        return False\n    if os.getppid() == parent:\n        return True\n    return heartbeat_age <= heartbeat_stale"
+        ));
     }
 
     #[test]
@@ -3123,6 +3183,7 @@ mod tests {
     #[test]
     fn successful_cleanup_disarms_tempdir_before_foreign_path_reuse() {
         let hook_dir = TempDir::new().unwrap();
+        let _fixture = tmux_fixture_lock("replacement-control");
         let hook = hook_dir.path().join("replace-control-root");
         fs::write(
             &hook,
@@ -3217,11 +3278,7 @@ mod tests {
     fn final_root_quarantine_allows_late_non_socket_artifact() {
         let hook_dir = TempDir::new().unwrap();
         let hook = hook_dir.path().join("publish-late-entry");
-        fs::write(
-            &hook,
-            "#!/bin/sh\nmktemp \"$1/late-entry.XXXXXX\" >/dev/null\n",
-        )
-        .unwrap();
+        fs::write(&hook, "#!/bin/sh\ntouch \"$1/late-entry\"\n").unwrap();
         let mut permissions = fs::metadata(&hook).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&hook, permissions).unwrap();
@@ -3509,6 +3566,7 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
+        let _ack_fixture = tmux_fixture_lock("ack");
         let hook_dir = TempDir::new().unwrap();
         let hook = hook_dir.path().join("adopt-pending");
         fs::write(
@@ -3679,6 +3737,7 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
+        let _ack_fixture = tmux_fixture_lock("ack");
         let hook_dir = TempDir::new().unwrap();
         let hook = hook_dir.path().join("block-adoption-ack");
         fs::write(
@@ -3813,6 +3872,7 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
+        let _ack_fixture = tmux_fixture_lock("ack");
         let hook_dir = TempDir::new().unwrap();
         let acknowledged = hook_dir.path().join("acknowledged");
         let hook = hook_dir.path().join("ack-publication");
@@ -4080,6 +4140,7 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
+        let _ack_fixture = tmux_fixture_lock("ack");
         let hook_dir = TempDir::new().unwrap();
         let hook = hook_dir.path().join("late-adopt");
         fs::write(

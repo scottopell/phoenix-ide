@@ -323,6 +323,22 @@ afterEach(() => {
 
 hooksMockState.useConnection.mockImplementation(useConnectedConnection);
 
+describe('ConversationPage system prompt', () => {
+  it('clears a cached prompt when the current prompt refresh fails', async () => {
+    const conversation = makeConversation();
+    vi.mocked(api.getSystemPrompt).mockRejectedValueOnce(new Error('prompt refresh failed'));
+    const { store } = renderPage(conversation);
+    store.dispatch(conversation.slug, {
+      type: 'set_system_prompt',
+      systemPrompt: 'stale prompt before profile revision',
+      expectedConversationId: conversation.id,
+    });
+
+    await waitFor(() => expect(api.getSystemPrompt).toHaveBeenCalledWith(conversation.id));
+    await waitFor(() => expect(store.getSnapshot(conversation.slug).systemPrompt).toBeNull());
+  });
+});
+
 describe('ConversationPage message viewer layout', () => {
   it('keeps a direct fullscreen message open out of split-pane layout', async () => {
     const { container } = renderPage(

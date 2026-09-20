@@ -186,6 +186,18 @@ pub fn mermaid_rendering_hint(lang: LlmLanguage) -> &'static str {
 }
 
 #[must_use]
+pub fn project_coordinator_continuation_instruction(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => {
+            "Write a compact handoff for the next Project Coordinator context. Preserve the current mission; unresolved commitments and their owners; blockers and reactivation conditions; evidence and exact references; user corrections and authority limits; and the next concrete verification and stopping points. Distinguish requested, accepted, reported, and independently verified work. Preserve uncertainty when evidence conflicts. Record explicit retirement or supersession facts so completed work is not reopened. Do not reproduce or summarize the Project Coordinator charter: the next turn loads the current charter independently by ProductConversation identity. Forget repetitive history before unresolved commitments and do not invent completion, authority, evidence, or owners."
+        }
+        LlmLanguage::Caveman => {
+            "Write short handoff for next Project Coordinator cave context. Keep mission; unfinished promise and owner; blocker and wake condition; evidence and exact reference; user correction and authority limit; next check and stop point. Say what requested, accepted, reported, or checked true. If evidence fight, keep unknown. Say what retired or replaced so done work stay done. Do not copy or sum up Project Coordinator charter. Next turn load current charter by ProductConversation identity. Forget repeat old history before unfinished promise. Do not invent done, authority, evidence, or owner."
+        }
+    }
+}
+
+#[must_use]
 pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {

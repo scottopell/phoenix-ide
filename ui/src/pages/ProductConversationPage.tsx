@@ -14,6 +14,7 @@ import {
   type ConversationState,
   type Message,
   type ProductConversationSnapshotView,
+  type ProjectCoordinatorProfileWriteResponse,
 } from '../api';
 import { useChainAtom, type InflightQa } from '../chain';
 import { parseConversationState } from '../utils';
@@ -669,6 +670,127 @@ function RecallDisclosure({
   );
 }
 
+function ProjectCoordinatorSettings({
+  snapshot,
+  editable,
+  onSaved,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  editable: boolean;
+  onSaved: (productConversationId: string, response: ProjectCoordinatorProfileWriteResponse) => boolean;
+}) {
+  const profile = snapshot.project_coordinator_profile;
+  const retainedRevision = snapshot.project_coordinator_revision;
+  const snapshotEnabled = profile !== null;
+  const snapshotCharter = profile?.charter ?? '';
+  const snapshotRevision = retainedRevision;
+  const [open, setOpen] = useState(false);
+  const [enabled, setEnabled] = useState(snapshotEnabled);
+  const [charter, setCharter] = useState(snapshotCharter);
+  const [baseRevision, setBaseRevision] = useState(snapshotRevision);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reset = useCallback(() => {
+    setEnabled(snapshotEnabled);
+    setCharter(snapshotCharter);
+    setBaseRevision(snapshotRevision);
+    setError(null);
+  }, [snapshotCharter, snapshotEnabled, snapshotRevision]);
+  const dirty = enabled !== snapshotEnabled || charter !== snapshotCharter;
+  const charterBytes = new TextEncoder().encode(charter).length;
+
+  useEffect(() => {
+    if (editable && dirty) return;
+    setEnabled(snapshotEnabled);
+    setCharter(snapshotCharter);
+    setBaseRevision(snapshotRevision);
+    setError(null);
+  }, [dirty, editable, snapshotCharter, snapshotEnabled, snapshotRevision]);
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!editable || !dirty || saving || (enabled && charterBytes > 32_768)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const savedProfile = await api.putProjectCoordinatorProfile(
+        snapshot.product_conversation_id,
+        enabled
+          ? { type: 'enable', charter, expected_revision: baseRevision }
+          : { type: 'disable', expected_revision: baseRevision },
+      );
+      if (onSaved(snapshot.product_conversation_id, savedProfile)) {
+        setEnabled(savedProfile.profile !== null);
+        setCharter(savedProfile.profile?.charter ?? '');
+        setBaseRevision(savedProfile.revision);
+      } else {
+        setEnabled(snapshotEnabled);
+        setCharter(snapshotCharter);
+        setBaseRevision(snapshotRevision);
+      }
+      setError(null);
+      setOpen(false);
+    } catch (saveError) {
+      onSaved(snapshot.product_conversation_id, {
+        revision: retainedRevision,
+        profile,
+      });
+      setError(saveError instanceof Error ? saveError.message : 'Failed to save Project Coordinator profile');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details
+      className="product-conversation-page__coordinator-settings"
+      open={open}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        setOpen(nextOpen);
+        if (nextOpen && baseRevision < snapshotRevision) reset();
+      }}
+    >
+      <summary>Coordinator {profile ? '✓' : '+'}</summary>
+      <form onSubmit={(event) => void save(event)}>
+        <label className="product-conversation-page__coordinator-toggle">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => setEnabled(event.target.checked)}
+            disabled={!editable || saving}
+          />
+          Use Project Coordinator guidance
+        </label>
+        <label htmlFor="project-coordinator-charter">Charter</label>
+        <textarea
+          id="project-coordinator-charter"
+          value={charter}
+          onChange={(event) => setCharter(event.target.value)}
+          disabled={!editable || !enabled || saving}
+          rows={8}
+          aria-describedby="project-coordinator-charter-help"
+        />
+        <p id="project-coordinator-charter-help">
+          Plain text loaded fresh for every turn. Supported LLM tools and chat cannot mutate it. Revision {snapshotRevision}. {charterBytes.toLocaleString()} / 32,768 bytes.
+        </p>
+        {charterBytes > 32_768 && <p role="alert">Charter exceeds 32,768 UTF-8 bytes.</p>}
+        {error && <p role="alert">{error}</p>}
+        {editable ? (
+          <div className="product-conversation-page__coordinator-actions">
+            <button type="button" className="btn-secondary" onClick={() => { reset(); setOpen(false); }} disabled={saving}>Cancel</button>
+            <button type="submit" className="btn-primary" disabled={!dirty || saving || (enabled && charterBytes > 32_768)}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        ) : (
+          <p>History is read-only; retained Project Coordinator guidance is shown for inspection.</p>
+        )}
+      </form>
+    </details>
+  );
+}
+
 function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView['source']>): string {
   switch (source.relation) {
     case 'approved_task':
@@ -681,11 +803,16 @@ function ProductConversationHeader({
   productConversationId,
   messages,
   recallDisabled,
+  onCoordinatorProfileSaved,
 }: {
   snapshot: ProductConversationSnapshotView;
   productConversationId: string;
   messages: Message[];
   recallDisabled: boolean;
+  onCoordinatorProfileSaved: (
+    productConversationId: string,
+    response: ProjectCoordinatorProfileWriteResponse,
+  ) => boolean;
 }) {
   const source = snapshot.source;
   return (
@@ -714,6 +841,14 @@ function ProductConversationHeader({
             productConversationId={productConversationId}
             messages={messages}
             disabled={recallDisabled}
+          />
+        )}
+        {(snapshot.project_coordinator_eligible || snapshot.project_coordinator_profile) && (
+          <ProjectCoordinatorSettings
+            key={`coordinator-${snapshot.product_conversation_id}`}
+            snapshot={snapshot}
+            editable={snapshot.project_coordinator_eligible}
+            onSaved={onCoordinatorProfileSaved}
           />
         )}
         {snapshot.work_identity && (
@@ -766,6 +901,7 @@ function ProductConversationPageInner() {
     } : null;
   }
   const paginationRequestRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const currentLatestProjection = snapshot
     && latestProjection?.conversationId === snapshot.latest_transcript_row_id
@@ -800,6 +936,7 @@ function ProductConversationPageInner() {
   useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
+    const requestGeneration = ++snapshotRequestRef.current;
     const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
     if (!isBackgroundRefresh) setLoading(true);
     setError(null);
@@ -818,7 +955,7 @@ function ProductConversationPageInner() {
       : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
@@ -830,14 +967,14 @@ function ProductConversationPageInner() {
         if (!isBackgroundRefresh) setHistoryGeneration(0);
       })
       .catch((err) => {
-        if (cancelled) return;
+        if (cancelled || snapshotRequestRef.current !== requestGeneration) return;
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
         setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && snapshotRequestRef.current === requestGeneration) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -1076,6 +1213,27 @@ function ProductConversationPageInner() {
         productConversationId={snapshot.product_conversation_id}
         messages={messages}
         recallDisabled={!liveControlsEnabled}
+        onCoordinatorProfileSaved={(savedProductConversationId, response) => {
+          let accepted = false;
+          snapshotRequestRef.current += 1;
+          paginationRequestRef.current += 1;
+          setLoadingOlder(false);
+          setOwnedSnapshot((current) => {
+            if (current?.productConversationId !== savedProductConversationId) return current;
+            if (current.value.project_coordinator_revision > response.revision) return current;
+            accepted = true;
+            return {
+              ...current,
+              value: {
+                ...current.value,
+                project_coordinator_profile: response.profile,
+                project_coordinator_revision: response.revision,
+              },
+            };
+          });
+          setSnapshotRetry((retry) => retry + 1);
+          return accepted;
+        }}
       />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
@@ -1124,6 +1282,7 @@ function ProductConversationPageInner() {
             suppressTaskApprovalOwner={true}
             mutationEnabled={liveControlsEnabled}
             aggregateLifecycleOpen={isOpen}
+            systemPromptRevision={snapshot.project_coordinator_revision}
             onProjectionChange={setLatestProjection}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
