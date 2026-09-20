@@ -69,6 +69,16 @@ final class AppModelProductConversationTests: XCTestCase {
             created_at: nil)
     }
 
+    private func closeSnapshot(phase: ProductConversationClosePhase) -> ProductConversationClose {
+        ProductConversationClose(
+            attempt_id: "attempt",
+            phase: phase,
+            confirmation_snapshot: nil,
+            inspections: [],
+            losses: [],
+            residuals: [])
+    }
+
     private func historySnapshot(
         aggregateId: String = "pc-history",
         segments: [ProductConversationSegment],
@@ -285,6 +295,36 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertEqual(model.notificationNavigationId(for: "root-row"), "pc-history")
         XCTAssertEqual(model.notificationNavigationId(for: "latest-row"), "pc-history")
+    }
+
+    func testPendingCloseConfirmationKindsFollowAuthoritativePhase() {
+        let stopWork = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation))
+        let losses = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_loss_confirmation))
+        let settling = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .settling_active_work))
+
+        XCTAssertEqual(stopWork.kind, .stopWork)
+        XCTAssertEqual(losses.kind, .losses)
+        XCTAssertNil(settling.kind)
+    }
+
+    func testHistoryGenerationInvalidatesOnlyMatchingProduct() {
+        var tracker = ProductActionGenerationTracker()
+        let productA = tracker.begin(productConversationId: "product-a")
+        let productB = tracker.begin(productConversationId: "product-b")
+
+        _ = tracker.begin(productConversationId: "product-a")
+
+        XCTAssertFalse(tracker.isCurrent(productA, productConversationId: "product-a"))
+        XCTAssertTrue(tracker.isCurrent(productB, productConversationId: "product-b"))
     }
 
     func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {

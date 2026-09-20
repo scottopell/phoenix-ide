@@ -83,6 +83,21 @@ struct ConversationListView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .confirmationDialog(
+                closeConfirmationTitle,
+                isPresented: Binding(
+                    get: { model.pendingProductCloseConfirmation?.kind != nil },
+                    set: { _ in })
+            ) {
+                Button(closeConfirmationActionTitle, role: .destructive) {
+                    Task { await model.resolvePendingProductCloseConfirmation(confirm: true) }
+                }
+                Button("Cancel Close", role: .cancel) {
+                    Task { await model.resolvePendingProductCloseConfirmation(confirm: false) }
+                }
+            } message: {
+                Text(closeConfirmationMessage)
+            }
             .alert(
                 "Action failed",
                 isPresented: Binding(
@@ -100,6 +115,29 @@ struct ConversationListView: View {
             .onChange(of: model.pendingOpenConversationId) {
                 consumePendingNavigation()
             }
+        }
+    }
+
+    private var closeConfirmationTitle: String {
+        model.pendingProductCloseConfirmation?.kind == .stopWork
+            ? "Stop work and close?"
+            : "Confirm Close losses?"
+    }
+
+    private var closeConfirmationActionTitle: String {
+        model.pendingProductCloseConfirmation?.kind == .stopWork
+            ? "Stop Work"
+            : "Accept Losses"
+    }
+
+    private var closeConfirmationMessage: String {
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork:
+            "This conversation is still working. Stop its active work before Close continues."
+        case .losses:
+            "Close found tracked, untracked, submodule, or detached work loss. Accept these losses to retire the conversation."
+        case nil:
+            ""
         }
     }
 
@@ -158,8 +196,7 @@ struct ConversationListView: View {
                                 Label("Delete", systemImage: "trash")
                             }
                             .disabled(!model.connectivity.isOnline)
-                        } else if !isCoordinator && conversation.product_close_action == .available
-                            && conversation.presentation_mode != "working" {
+                        } else if !isCoordinator && conversation.product_close_action == .available {
                             Button {
                                 Task { await model.closeProductConversation(conversation) }
                             } label: {
