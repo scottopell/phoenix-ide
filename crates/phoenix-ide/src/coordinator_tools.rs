@@ -52,24 +52,44 @@ pub(crate) fn tools(
     tools
 }
 
+#[derive(Clone)]
+pub(crate) struct PredecessorHostBoundTools {
+    pub(crate) tools: [Arc<dyn Tool>; 3],
+}
+
+impl PredecessorHostBoundTools {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<dyn Tool>> + '_ {
+        self.tools.iter().cloned()
+    }
+}
+impl std::ops::Deref for PredecessorHostBoundTools {
+    type Target = [Arc<dyn Tool>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.tools
+    }
+}
+
 pub(crate) fn predecessor_host_bound_tools(
     service: GlobalReadService,
     binding: PreviousTranscriptsBinding,
-) -> Vec<Arc<dyn Tool>> {
-    vec![
-        Arc::new(PreviousTranscripts {
-            service: service.clone(),
-            binding: binding.clone(),
-        }),
-        Arc::new(SearchConversations {
-            service: service.clone(),
-            scope: ConversationRecallScope::StrictPredecessors(binding.clone()),
-        }),
-        Arc::new(ReadConversation {
-            service,
-            scope: ConversationRecallScope::StrictPredecessors(binding),
-        }),
-    ]
+) -> PredecessorHostBoundTools {
+    PredecessorHostBoundTools {
+        tools: [
+            Arc::new(PreviousTranscripts {
+                service: service.clone(),
+                binding: binding.clone(),
+            }),
+            Arc::new(SearchConversations {
+                service: service.clone(),
+                scope: ConversationRecallScope::StrictPredecessors(binding.clone()),
+            }),
+            Arc::new(ReadConversation {
+                service,
+                scope: ConversationRecallScope::StrictPredecessors(binding),
+            }),
+        ],
+    }
 }
 
 struct PreviousTranscripts {

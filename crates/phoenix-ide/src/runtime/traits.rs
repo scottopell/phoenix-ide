@@ -2160,7 +2160,7 @@ pub struct ToolRegistryExecutor {
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
-    host_bound_tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
+    predecessor_tools: Option<crate::coordinator_tools::PredecessorHostBoundTools>,
 }
 
 impl ToolRegistryExecutor {
@@ -2176,7 +2176,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             coordinator_skill_catalog: None,
-            host_bound_tools: Vec::new(),
+            predecessor_tools: None,
         }
     }
 
@@ -2193,7 +2193,7 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             coordinator_skill_catalog: None,
-            host_bound_tools: Vec::new(),
+            predecessor_tools: None,
         }
     }
 
@@ -2207,16 +2207,16 @@ impl ToolRegistryExecutor {
     }
 
     #[must_use]
-    pub fn with_host_bound_tools(
+    pub fn with_predecessor_tools(
         mut self,
-        tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
+        tools: crate::coordinator_tools::PredecessorHostBoundTools,
     ) -> Self {
         {
             let mut registry = self
                 .registry
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for tool in tools.iter().cloned() {
+            for tool in tools.iter() {
                 if registry.find_tool(tool.name()).is_none() {
                     registry
                         .try_add_host_bound_tool(tool)
@@ -2224,7 +2224,7 @@ impl ToolRegistryExecutor {
                 }
             }
         }
-        self.host_bound_tools = tools;
+        self.predecessor_tools = Some(tools);
         self
     }
 
@@ -2338,11 +2338,13 @@ impl ToolExecutor for ToolRegistryExecutor {
 
     fn upgrade_to_work_mode(&self) {
         let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task();
-        for tool in self.host_bound_tools.iter().cloned() {
-            if registry.find_tool(tool.name()).is_none() {
-                registry = registry
-                    .try_with_host_bound_tool(tool)
-                    .expect("fresh Work registry has no predecessor capability");
+        if let Some(tools) = &self.predecessor_tools {
+            for tool in tools.iter() {
+                if registry.find_tool(tool.name()).is_none() {
+                    registry = registry
+                        .try_with_host_bound_tool(tool)
+                        .expect("fresh Work registry has no predecessor capability");
+                }
             }
         }
         self.swap_registry(registry);
@@ -2428,20 +2430,22 @@ mod tool_registry_executor_tests {
             ),
             Arc::from(Vec::new()),
         )
-        .with_host_bound_tools(vec![
-            Arc::new(NamedMarker {
-                name: "previous_transcripts",
-                description: "predecessor list",
-            }),
-            Arc::new(NamedMarker {
-                name: "search_conversations",
-                description: "predecessor scoped search",
-            }),
-            Arc::new(NamedMarker {
-                name: "read_conversation",
-                description: "predecessor scoped read",
-            }),
-        ]);
+        .with_predecessor_tools(crate::coordinator_tools::PredecessorHostBoundTools {
+            tools: [
+                Arc::new(NamedMarker {
+                    name: "previous_transcripts",
+                    description: "predecessor list",
+                }),
+                Arc::new(NamedMarker {
+                    name: "search_conversations",
+                    description: "predecessor scoped search",
+                }),
+                Arc::new(NamedMarker {
+                    name: "read_conversation",
+                    description: "predecessor scoped read",
+                }),
+            ],
+        });
 
         assert!(executor
             .definitions()

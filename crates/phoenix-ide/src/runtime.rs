@@ -5128,7 +5128,7 @@ impl RuntimeManager {
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
                 )
-                .with_host_bound_tools(host_bound_tools)
+                .with_predecessor_tools(host_bound_tools)
             }
         };
 

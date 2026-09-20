@@ -1411,6 +1411,15 @@ async fn render_message_page_bounded_as(
                 }
                 continue;
             }
+            if encoded_content_bytes >= PREVIOUS_READ_CONTENT_JSON_BYTES {
+                next_cursor = Some(PreviousReadPosition {
+                    message_sequence: message.sequence_id,
+                    byte_offset: 0,
+                    message_id: Some(message.message_id.clone()),
+                    rendered_sha256: None,
+                });
+                break;
+            }
             if message.message_id.len() > PREVIOUS_TITLE_BYTES
                 && page_start
                     .as_ref()
@@ -1929,8 +1938,11 @@ async fn resolve_reference_impl(
             .await
             .map_err(map_db_not_found)?;
         if let Some(message_id) = message_id {
-            let message_id =
-                percent_decode_url_component(message_id).map_err(AppError::BadRequest)?;
+            let message_id = if rest.contains("#message-") {
+                percent_decode_url_component(message_id).map_err(AppError::BadRequest)?
+            } else {
+                message_id.to_string()
+            };
             return resolve_message(service, conv, &message_id, false).await;
         }
         return Ok(resolve_conversation(conv, false));
