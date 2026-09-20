@@ -3177,6 +3177,7 @@ dependencies = [
  "phoenix-llm",
  "phoenix-skills",
  "phoenix-state-machine",
+ "phoenix-svg",
  "phoenix-terminal",
  "phoenix-tls",
  "phoenix-tools",

@@ -1893,6 +1893,7 @@ where
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
@@ -1976,6 +1977,7 @@ where
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
+        let fatal_local_authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
 
         Self {
             context,
@@ -2028,8 +2030,10 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
-            fatal_local_authority_rx: None,
-            fatal_external_effect_cancellation: None,
+            fatal_local_authority_rx: Some(fatal_local_authority_fence.subscribe()),
+            fatal_external_effect_cancellation: Some(
+                fatal_local_authority_fence.external_effect_cancellation(),
+            ),
             #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
@@ -2043,7 +2047,8 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
-            fatal_local_authority_fence: crate::runtime::FatalLocalAuthorityFence::new(),
+            fatal_local_authority_fence,
+            svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
@@ -2473,6 +2478,7 @@ where
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.
                     if matches!(event, Event::Shutdown) {
+                        self.svg_publication_lifetime.coordinated_shutdown();
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
@@ -7498,7 +7504,13 @@ where
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
-        .with_svg_artifact_store(Arc::new(self.storage.clone()))
+        .with_svg_artifact_store(Arc::new(
+            super::svg_artifacts::RuntimeSvgArtifactStore::new(
+                self.storage.clone(),
+                self.fatal_local_authority_fence.clone(),
+                self.svg_publication_lifetime.clone(),
+            ),
+        ))
         .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
 

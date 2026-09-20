@@ -596,8 +596,45 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// Combined storage trait for convenience
-pub trait Storage: MessageStore + StateStore + crate::tools::present_svg::SvgArtifactStore {}
-impl<T: MessageStore + StateStore + crate::tools::present_svg::SvgArtifactStore> Storage for T {}
+pub trait Storage: MessageStore + StateStore + SvgArtifactRepository {}
+impl<T: MessageStore + StateStore + SvgArtifactRepository> Storage for T {}
+
+#[async_trait]
+pub trait SvgArtifactRepository: Send + Sync {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+    ) -> Result<Option<phoenix_svg::SvgArtifactReference>, String>;
+
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>;
+}
+
+#[async_trait]
+impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+    ) -> Result<Option<phoenix_svg::SvgArtifactReference>, String> {
+        (**self).lookup(conversation_id, invocation).await
+    }
+
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        (**self).publish(conversation_id, invocation, draft).await
+    }
+}
 
 // ============================================================================
 // Arc implementations for trait objects
@@ -2465,7 +2502,7 @@ mod registry_llm_client_tests {
 }
 
 #[async_trait]
-impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
+impl SvgArtifactRepository for DatabaseStorage {
     async fn lookup(
         &self,
         conversation_id: &str,
@@ -2482,17 +2519,24 @@ impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
         conversation_id: &str,
         invocation: &crate::tools::present_svg::SvgInvocationId,
         draft: crate::tools::present_svg::SvgArtifactDraft,
-    ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
-        self.db
-            .publish_svg_artifact(
-                conversation_id,
-                invocation,
-                &draft.title,
-                &draft.description,
-                &draft.svg,
-            )
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        match self
+            .db
+            .publish_svg_artifact(conversation_id, invocation, &draft.metadata, &draft.svg)
             .await
-            .map(crate::db::SvgArtifact::into_reference)
-            .map_err(|error| error.to_string())
+        {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(
+                    result
+                        .map(crate::db::SvgArtifact::into_reference)
+                        .map_err(|error| error.to_string()),
+                )
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
     }
 }

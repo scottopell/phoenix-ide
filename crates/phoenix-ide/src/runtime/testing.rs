@@ -2414,7 +2414,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 // ============================================================================
 
 #[async_trait]
-impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
+impl crate::runtime::traits::SvgArtifactRepository for InMemoryStorage {
     async fn lookup(
         &self,
         conversation_id: &str,
@@ -2432,7 +2432,8 @@ impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
         conversation_id: &str,
         invocation: &crate::tools::present_svg::SvgInvocationId,
         draft: crate::tools::present_svg::SvgArtifactDraft,
-    ) -> Result<crate::tools::present_svg::SvgArtifactReference, String> {
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
         use crate::tools::present_svg::{SvgArtifactReference, SvgValidationOutcome};
         let mut artifacts = self.svg_artifacts.lock().unwrap();
         let (reference, _) = artifacts
@@ -2442,8 +2443,8 @@ impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
                     SvgArtifactReference {
                         artifact_id: uuid::Uuid::new_v4().to_string(),
                         conversation_id: conversation_id.to_string(),
-                        title: draft.title,
-                        description: draft.description,
+                        title: draft.metadata.title().into(),
+                        description: draft.metadata.description().into(),
                         width: draft.svg.width(),
                         height: draft.svg.height(),
                         validation: SvgValidationOutcome::AcceptedStaticSvg,
@@ -2451,7 +2452,7 @@ impl crate::tools::present_svg::SvgArtifactStore for InMemoryStorage {
                     draft.svg.into_bytes(),
                 )
             });
-        Ok(reference.clone())
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(reference.clone()))
     }
 }
 
