@@ -3886,6 +3886,21 @@ impl RuntimeManager {
             },
         };
 
+        if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. })
+            && !self.platform.has_sandbox()
+        {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Attached Work children require OS sandbox support".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
             Ok(cwd) => cwd,
             Err(e) => {

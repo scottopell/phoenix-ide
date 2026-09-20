@@ -92,7 +92,7 @@ enum ParentWorkScopeKind { unattached | attached }
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
 -- the two variants and which mode picks which.
-enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable }
+enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable | attached_work_confined }
 
 ------------------------------------------------------------
 -- Config
@@ -403,8 +403,10 @@ rule SubAgentSpecsResolved {
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
 -- Explore => `subagent_read_only` (read-only information tools + browser +
 -- sandboxed bash when the platform capability is available +
--- submit_result/submit_error). Work => `subagent_write_capable`
--- (Explore set + Work bash + patch). Both modes get the parent's MCP tool set.
+-- submit_result/submit_error). Ordinary Work => `subagent_write_capable`
+-- (Explore set + Work bash + patch). AttachedWorkChild => `attached_work_confined`
+-- (Work bash confined to its inherited worktree, without patch). All modes get
+-- the parent's MCP tool set.
 --
 -- Top-level Explore delegation is independent of sandbox support: the parent may
 -- call `spawn_agents` even when platform capability omits bash. The spawned
@@ -417,7 +419,9 @@ rule SubAgentSpecsResolved {
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
     ensures:
-        if execution_authority = write_capable:
+        if sub_agent.mode = attached_work_child:
+            sub_agent.tool_registry = attached_work_confined
+        else if execution_authority = write_capable:
             sub_agent.tool_registry = subagent_write_capable
         else:
             sub_agent.tool_registry = subagent_read_only
@@ -433,7 +437,9 @@ rule SubAgentRegistryOnFreshSpawn {
 rule SubAgentRegistryOnResume {
     when: SubAgentRuntimeResumed(sub_agent)
     ensures:
-        if sub_agent.execution_authority = read_only:
+        if sub_agent.mode = attached_work_child:
+            sub_agent.tool_registry = attached_work_confined
+        else if sub_agent.execution_authority = read_only:
             sub_agent.tool_registry = subagent_read_only
         else:
             sub_agent.tool_registry = subagent_write_capable
@@ -456,10 +462,10 @@ rule SubAgentRegistryOnResume {
         --     and filesystem identity while distinguishing it from Explore.
         --
         -- So the resume mapping is: Explore variant -> subagent_read_only;
-        -- Direct / Work / Branch / DetachedApprovedTask / AttachedWorkChild ->
-        -- subagent_write_capable. A Work child of an approved Explore-origin
-        -- parent therefore keeps `patch` and its inherited worktree boundary
-        -- across runtime re-creation.
+        -- Direct / Work / Branch / DetachedApprovedTask -> subagent_write_capable;
+        -- AttachedWorkChild -> attached_work_confined. A Work child of an approved
+        -- Explore-origin parent therefore keeps its OS-enforced inherited worktree
+        -- boundary and does not regain the pathname-based patch tool on recreation.
 }
 
 ------------------------------------------------------------
@@ -507,6 +513,9 @@ invariant ToolRegistryMatchesMode {
         (sa.execution_authority = read_only
             implies sa.tool_registry = subagent_read_only)
         and
-        (sa.execution_authority = write_capable
+        (sa.execution_authority = write_capable and sa.mode = attached_work_child
+            implies sa.tool_registry = attached_work_confined)
+        and
+        (sa.execution_authority = write_capable and sa.mode != attached_work_child
             implies sa.tool_registry = subagent_write_capable)
 }
