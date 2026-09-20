@@ -8314,6 +8314,30 @@ impl Database {
         Ok(rows)
     }
 
+    /// Return every transcript participant owned by the root's product
+    /// conversation, including subordinate agents that are not continuation
+    /// chain members.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database query fails.
+    pub async fn product_conversation_member_ids(&self, root_id: &str) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT member.id
+             FROM conversations AS root
+             JOIN conversations AS member
+               ON member.product_conversation_id = root.product_conversation_id
+             WHERE root.id = ?1
+             ORDER BY CASE WHEN member.runtime_role = 'sub_agent' THEN 0 ELSE 1 END,
+                      member.created_at,
+                      member.id",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Forward chain members as fully-hydrated [`Conversation`] rows, ordered
     /// root-first by continuation depth.
     ///
@@ -9850,16 +9874,28 @@ impl Database {
         Ok(true)
     }
 
-    async fn delete_conversations_in_transaction(&self, ids: &[String]) -> DbResult<()> {
+    #[allow(clippy::too_many_lines)]
+    async fn delete_conversations_in_transaction(
+        &self,
+        ids: &[String],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
         let telemetry = self.sqlite_telemetry(
             SqliteOperation::ConversationDelete,
             SqliteWorkloadCategory::MessagePersistence,
             SqliteAccessKind::Write,
         );
-        let (mut connection, acquisition) = telemetry
+        let (mut connection, acquisition) = match telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
-            .await?;
-        let ((), timing) = telemetry
+            .await
+        {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                return crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                    DbError::from(error),
+                ));
+            }
+        };
+        let ((), timing) = match telemetry
             .observe_transaction_admission_db(acquisition, async {
                 sqlx::query("BEGIN IMMEDIATE")
                     .execute(&mut *connection)
@@ -9867,7 +9903,13 @@ impl Database {
                     .map(|_| ())
                     .map_err(DbError::from)
             })
-            .await?;
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error));
+            }
+        };
 
         let body = async {
             for id in ids {
@@ -9897,13 +9939,40 @@ impl Database {
                             .map_err(DbError::from)
                     })
                     .await;
-                if commit.is_err() {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                match commit {
+                    Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                    Err(commit_error) => {
+                        let mut present = 0;
+                        for id in ids {
+                            let exists = sqlx::query_scalar::<_, bool>(
+                                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                            )
+                            .bind(id)
+                            .fetch_one(&mut *connection)
+                            .await;
+                            match exists {
+                                Ok(true) => present += 1,
+                                Ok(false) => {}
+                                Err(_) => {
+                                    return crate::workflow::LocalAuthorityResult::DurableFactUnclassified;
+                                }
+                            }
+                        }
+                        if present == ids.len() {
+                            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                                commit_error,
+                            ))
+                        } else if present == 0 {
+                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                        } else {
+                            crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                        }
+                    }
                 }
-                commit
             }
             Err(error) => {
-                telemetry
+                let rollback = telemetry
                     .observe_failure_rollback_db(timing, async {
                         sqlx::query("ROLLBACK")
                             .execute(&mut *connection)
@@ -9911,8 +9980,11 @@ impl Database {
                             .map(|_| ())
                             .map_err(DbError::from)
                     })
-                    .await?;
-                Err(error)
+                    .await;
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                })
             }
         }
     }
@@ -9926,8 +9998,28 @@ impl Database {
     ///
     /// Returns a [`DbError`] if any conversation is missing or the underlying
     /// database operation fails.
-    pub async fn delete_conversations_atomically(&self, ids: &[String]) -> DbResult<()> {
+    pub async fn delete_conversations_atomically_with_authority(
+        &self,
+        ids: &[String],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
         self.delete_conversations_in_transaction(ids).await
+    }
+
+    /// Delete conversations while collapsing an unclassifiable commit outcome
+    /// into a database error for legacy callers without authority fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if deletion fails or its commit cannot be classified.
+    pub async fn delete_conversations_atomically(&self, ids: &[String]) -> DbResult<()> {
+        match self.delete_conversations_in_transaction(ids).await {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "conversation deletion commit outcome is unclassified".into(),
+                ))
+            }
+        }
     }
 
     /// Delete a conversation and all its messages
@@ -9936,8 +10028,17 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        self.delete_conversations_in_transaction(&[id.to_string()])
+        match self
+            .delete_conversations_in_transaction(&[id.to_string()])
             .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "conversation deletion commit outcome is unclassified".into(),
+                ))
+            }
+        }
     }
 
     /// Rename conversation (update slug)
@@ -24972,6 +25073,39 @@ mod tests {
         assert_eq!(binding_exists, 0);
         assert_eq!(receipt_exists, 0);
         assert_eq!(link_exists, 0);
+    }
+
+    #[tokio::test]
+    async fn product_conversation_members_include_subordinate_participants() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("member-root", "member-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation_with_project(
+                "member-agent",
+                "member-agent",
+                "/tmp",
+                false,
+                Some(&root.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        let members = db.product_conversation_member_ids(&root.id).await.unwrap();
+
+        assert_eq!(members, vec![child.id, root.id]);
     }
 
     #[tokio::test]

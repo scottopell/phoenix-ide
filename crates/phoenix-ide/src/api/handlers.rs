@@ -6462,13 +6462,20 @@ pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: Prep
     finish_hard_deleted_conversation(state, conversation).await;
 }
 
+pub(super) async fn finalize_hard_deleted_conversation_resources(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) {
+    retire_work_scope_after_hard_delete(state, conversation).await;
+    delete_conversation_attachments(&conversation.id).await;
+}
+
 pub(super) async fn finish_hard_deleted_conversation(
     state: &AppState,
     conversation: Box<crate::db::Conversation>,
 ) {
     let id = conversation.id.clone();
-    retire_work_scope_after_hard_delete(state, &conversation).await;
-    delete_conversation_attachments(&id).await;
+    finalize_hard_deleted_conversation_resources(state, &conversation).await;
     broadcast_conversation_hard_deleted(state, &id).await;
 }
 
@@ -6478,11 +6485,27 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
         return Ok(());
     }
-    if let Err(error) = state.runtime.db().delete_conversation(id).await {
-        reopen_prepared_hard_delete(state, &prepared).await;
-        return Err(AppError::Internal(format!(
-            "Failed to delete conversation row: {error}"
-        )));
+    match state
+        .runtime
+        .db()
+        .delete_conversations_atomically_with_authority(&[id.to_string()])
+        .await
+    {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+            reopen_prepared_hard_delete(state, &prepared).await;
+            return Err(AppError::Internal(format!(
+                "Failed to delete conversation row: {error}"
+            )));
+        }
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+            state
+                .runtime
+                .signal_fatal_local_authority("conversation_hard_delete_commit");
+            return Err(AppError::Internal(
+                "conversation deletion lost local commit authority".to_string(),
+            ));
+        }
     }
     finish_prepared_hard_delete(state, prepared).await;
     Ok(())
@@ -6543,6 +6566,21 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
         let _ = tx.send_hard_deleted_and_close(id.to_string());
+    }
+}
+
+pub(super) async fn broadcast_aggregate_hard_deleted(
+    state: &AppState,
+    root_id: &str,
+    product_conversation_id: &str,
+) {
+    if let Some(handle) = state.runtime.try_get_handle(root_id).await {
+        let _ = handle
+            .broadcast_tx
+            .send_hard_deleted_and_close(product_conversation_id.to_string());
+    }
+    if let Some(tx) = state.runtime.take_evicted_broadcaster(root_id).await {
+        let _ = tx.send_hard_deleted_and_close(product_conversation_id.to_string());
     }
 }
 
@@ -13888,7 +13926,34 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn chain_delete_handler_removes_every_member() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
+        let root = state.db.get_conversation("cd-a").await.expect("root");
+        let subordinate = state
+            .db
+            .create_conversation_with_project(
+                "cd-agent",
+                "cd-agent",
+                "/tmp",
+                false,
+                Some("cd-a"),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("subordinate participant");
+        assert_eq!(
+            subordinate.product_conversation_id,
+            root.product_conversation_id
+        );
         mark_chain_history(&state, "cd-a").await;
+        let mut events = state.runtime.subscribe("cd-a").await.expect("subscribe");
 
         let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
@@ -13897,12 +13962,22 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .expect("chain delete");
 
-        for id in ["cd-a", "cd-b", "cd-c"] {
+        for id in ["cd-a", "cd-b", "cd-c", "cd-agent"] {
             assert!(
                 state.db.get_conversation(id).await.is_err(),
                 "{id} must be gone after chain delete"
             );
         }
+        let event = events.recv().await.expect("aggregate hard-delete event");
+        assert!(matches!(
+            event,
+            SseEvent::ConversationHardDeleted { conversation_id, .. }
+                if conversation_id == root.product_conversation_id.as_str()
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "aggregate deletion must emit exactly one hard-delete event"
+        );
     }
 
     #[tokio::test]
