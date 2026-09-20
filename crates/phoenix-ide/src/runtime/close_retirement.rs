@@ -175,8 +175,13 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?;
                 for captured in scopes {
-                    self.acquire_close_resource_lease(&attempt_id, captured.scope)
-                        .await?;
+                    if let Err(error) = self
+                        .acquire_close_resource_lease(&attempt_id, captured.scope)
+                        .await
+                    {
+                        self.cancel_close_resource_leases(&attempt_id).await?;
+                        return Err(error);
+                    }
                 }
                 self.retire_close_runtime_resources(attempt_id)
                     .await
@@ -4595,6 +4600,9 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
             address = next;
             let path_bytes = info.vnode.vip_path.as_flattened();
             let mapped_path = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
+            if info.vnode.vip_vi.vi_stat.vst_nlink == 0 {
+                continue;
+            }
             if info.region.protection & u32::try_from(libc::VM_PROT_WRITE).unwrap() != 0
                 && matches!(
                     info.region.share_mode,
@@ -4651,6 +4659,7 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                         revalidated.region.share_mode,
                         SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
                     )
+                    && revalidated.vnode.vip_vi.vi_stat.vst_nlink > 0
                     && revalidated_path.to_bytes() == mapped_path.to_bytes();
                 if after_uid != uid {
                     return Err("matching writer identity changed during inspection".to_string());
@@ -5838,6 +5847,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
             let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
             let candidate_path = Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
+            if info.vnode.vip_vi.vi_stat.vst_nlink == 0 {
+                continue;
+            }
             let candidate_is_within = path_is_within(candidate_path, &canonical);
             let target_is_directory =
                 info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
@@ -5886,7 +5898,8 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 let revalidated = unsafe { revalidated.assume_init() };
                 let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
                 let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
-                let resource_still_matches = revalidated_path.to_bytes() == candidate.to_bytes()
+                let resource_still_matches = revalidated.vnode.vip_vi.vi_stat.vst_nlink > 0
+                    && revalidated_path.to_bytes() == candidate.to_bytes()
                     && macos_descriptor_access_mode(revalidated.file.open_flags)
                         == macos_descriptor_access_mode(info.file.open_flags);
                 if after_uid != uid {

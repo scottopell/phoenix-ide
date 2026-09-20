@@ -10812,6 +10812,23 @@ END;
 ";
 
 const MIGRATION_105: &str = r"
+CREATE TRIGGER close_attempt_participants_reject_identity_update
+BEFORE UPDATE OF attempt_id, conversation_id ON close_attempt_participants
+BEGIN
+    SELECT RAISE(ABORT, 'active Close participant identity is immutable');
+END;
+
+CREATE TRIGGER close_attempt_participants_reject_active_delete
+BEFORE DELETE ON close_attempt_participants
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active Close participant cannot be deleted');
+END;
+
 CREATE TRIGGER close_attempt_participants_reject_unclaimed_deleted_settlement
 BEFORE UPDATE OF settlement_state ON close_attempt_participants
 WHEN NEW.settlement_state = 'deleted'

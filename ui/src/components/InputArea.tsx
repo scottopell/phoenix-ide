@@ -187,6 +187,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
+  const scopeKeyRef = useRef(scopeKey);
+  scopeKeyRef.current = scopeKey;
   useEffect(() => {
     composerHasContentRef.current = draft.length > 0
       || images.length > 0
@@ -445,6 +447,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // broken @reference before re-sending).
     const previousVoiceBase = voiceBase;
     const previousVoiceInterim = voiceInterim;
+    const submittedScopeKey = scopeKey;
     if (voiceBase !== null) {
       setVoiceBase(null);
       setVoiceInterim('');
@@ -461,6 +464,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const closeFenced = err instanceof ConflictError
         && err.detail.error_type === 'close_admission_fenced';
       if ((err instanceof ExpansionError || closeFenced)
+        && scopeKeyRef.current === submittedScopeKey
         && !composerHasContentRef.current) {
         if (err instanceof ExpansionError) {
           setExpansionError(err.detail.error);
@@ -479,6 +483,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [
     voiceBase,
     voiceInterim,
+    scopeKey,
     draft,
     images,
     files,
