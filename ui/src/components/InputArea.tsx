@@ -176,7 +176,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // attachment uploads target it, and this ref lets an in-flight upload detect a
   // conversation switch and discard its late response.
   const scopeKeyRef = useRef(scopeKey);
-  useEffect(() => { scopeKeyRef.current = scopeKey; }, [scopeKey]);
+  scopeKeyRef.current = scopeKey;
   const voiceSupported = isWebSpeechSupported();
   const [quickActionSending, setQuickActionSending] = useState(false);
 
@@ -215,7 +215,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const voiceBaseRef = useRef(voiceBase);
   draftRef.current = draft;
   voiceBaseRef.current = voiceBase;
-  const loadedRecoveryRef = useRef<FencedSendRecovery | undefined>(undefined);
+  const loadedRecoveryRef = useRef<{
+    scopeKey: string | undefined;
+    recovery: FencedSendRecovery;
+  } | undefined>(undefined);
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
   // =========================================================================
@@ -247,8 +250,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const setExpansionErrorRef = useRef(setExpansionError);
   setExpansionErrorRef.current = setExpansionError;
   useEffect(() => {
-    if (!fencedSendRecovery || loadedRecoveryRef.current === fencedSendRecovery) return;
-    loadedRecoveryRef.current = fencedSendRecovery;
+    const loadedRecovery = loadedRecoveryRef.current;
+    if (!fencedSendRecovery
+      || (loadedRecovery
+        && loadedRecovery.scopeKey === scopeKey
+        && loadedRecovery.recovery === fencedSendRecovery)) return;
+    loadedRecoveryRef.current = { scopeKey, recovery: fencedSendRecovery };
     if (fencedSendRecovery.restoreTo === 'voice') {
       setVoiceBase(fencedSendRecovery.text);
       setVoiceInterim('');
@@ -260,7 +267,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setImages([...fencedSendRecovery.images, ...composerContentRef.current.images]);
     setFiles(current => [...fencedSendRecovery.files, ...current]);
     if (fencedSendRecovery.error) setExpansionErrorRef.current(fencedSendRecovery.error);
-  }, [fencedSendRecovery, setDraft, setFiles, setImages, setVoiceBase, setVoiceInterim]);
+  }, [fencedSendRecovery, scopeKey, setDraft, setFiles, setImages, setVoiceBase, setVoiceInterim]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -496,7 +503,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
     try {
       await onSend(text, images, files);
-      if (loadedRecoveryRef.current) {
+      if (loadedRecoveryRef.current?.scopeKey === submittedScopeKey) {
         loadedRecoveryRef.current = undefined;
         onFencedSendRecoverySent?.();
       }

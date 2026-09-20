@@ -3083,7 +3083,12 @@ fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementEr
             invariant: invariant.to_string(),
             relation: relation.to_string(),
         },
-        error => CloseRetirementError::Message(error.to_string()),
+        error => {
+            tracing::error!(error = %error, "Close retirement persistence failed");
+            CloseRetirementError::Message(
+                "Close retirement persistence failed; retry or inspect server logs".to_string(),
+            )
+        }
     }
 }
 
@@ -4692,13 +4697,12 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 let Some(before_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
-                let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
-                else {
+                let Some((after_uid, _)) = macos_process_owner_incarnation(pid)? else {
                     continue;
                 };
-                let Some(after_executable) = macos_process_executable(pid)? else {
+                if macos_process_executable(pid)?.is_none() {
                     continue;
-                };
+                }
                 let mut revalidated = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
                 let revalidated_bytes = unsafe {
                     libc::proc_pidinfo(
@@ -4738,15 +4742,22 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                     )
                     && revalidated.vnode.vip_vi.vi_stat.vst_nlink > 0
                     && revalidated_path.to_bytes() == mapped_path.to_bytes();
-                if after_uid != uid {
+                let Some((final_uid, final_incarnation)) = macos_process_owner_incarnation(pid)?
+                else {
+                    continue;
+                };
+                let Some(final_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                if after_uid != uid || final_uid != uid {
                     return Err("matching writer identity changed during inspection".to_string());
                 }
                 if !revalidated_writer_identity(
                     &before_incarnation,
                     &before_executable,
                     mapping_still_matches,
-                    &after_incarnation,
-                    &after_executable,
+                    &final_incarnation,
+                    &final_executable,
                 )? {
                     continue;
                 }
