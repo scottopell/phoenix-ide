@@ -242,6 +242,58 @@
   }
 }
 
+.product-conversation-page__coordinator-settings {
+  position: relative;
+}
+
+.product-conversation-page__coordinator-settings > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  list-style: none;
+}
+
+.product-conversation-page__coordinator-settings > form {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  gap: 8px;
+  width: min(440px, calc(100vw - 24px));
+  padding: 14px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 25%);
+}
+
+.product-conversation-page__coordinator-settings textarea {
+  width: 100%;
+  resize: vertical;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.product-conversation-page__coordinator-settings p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.product-conversation-page__coordinator-toggle,
+.product-conversation-page__coordinator-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.product-conversation-page__coordinator-actions {
+  justify-content: flex-end;
+}
+
 @media (width <= 640px) {
   .product-conversation-page__recall-panel {
     position: fixed;

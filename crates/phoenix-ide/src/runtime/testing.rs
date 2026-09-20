@@ -576,6 +576,9 @@ pub struct InMemoryStorage {
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
+    project_coordinator_profiles: Mutex<
+        HashMap<String, phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>,
+    >,
     approval_authority_unclassified: Mutex<bool>,
     fail_approval_authority_persistence: Mutex<bool>,
     next_msg_id: Mutex<u64>,
@@ -652,6 +655,7 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
+            project_coordinator_profiles: Mutex::new(HashMap::new()),
             approval_authority_unclassified: Mutex::new(false),
             fail_approval_authority_persistence: Mutex::new(false),
             next_msg_id: Mutex::new(1),
@@ -1081,6 +1085,17 @@ impl InMemoryStorage {
             .clone()
     }
 
+    pub fn set_project_coordinator_profile(
+        &self,
+        conv_id: &str,
+        profile: phoenix_core::domain::product_conversation::ProjectCoordinatorProfile,
+    ) {
+        self.project_coordinator_profiles
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), profile);
+    }
+
     pub fn set_active_direct_turn(&self, active: Option<crate::runtime::traits::ActiveDirectTurn>) {
         *self.active_direct_turn.lock().unwrap() =
             active.map(
@@ -1158,6 +1173,19 @@ impl MessageStore for InMemoryStorage {
         }
         Ok(self
             .accepted_continuation_handoff_message_ids
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned())
+    }
+
+    async fn get_project_coordinator_profile(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>
+    {
+        Ok(self
+            .project_coordinator_profiles
             .lock()
             .unwrap()
             .get(conv_id)

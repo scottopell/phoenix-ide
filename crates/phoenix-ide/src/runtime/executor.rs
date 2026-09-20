@@ -7636,10 +7636,36 @@ where
                 "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
             );
         }
+        let project_coordinator_profile = if is_coordinator || is_sub_agent {
+            None
+        } else {
+            match self.storage.get_project_coordinator_profile(&conv_id).await {
+                Ok(profile) => profile,
+                Err(error) => {
+                    tracing::warn!(%error, conversation_id = %conv_id, "failed to load Project Coordinator profile");
+                    None
+                }
+            }
+        };
+        if project_coordinator_profile.is_some() {
+            crate::system_prompt::append_project_coordinator_guidance(
+                &mut system_prompt,
+                llm_language,
+            );
+        }
         if has_approved_task_write_authority {
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
             );
+        }
+        let mut request_system_blocks = vec![SystemContent::cached(&system_prompt)];
+        if let Some(profile) = project_coordinator_profile {
+            request_system_blocks.push(SystemContent::cached(
+                crate::system_prompt::project_coordinator_charter_block(
+                    profile.charter(),
+                    llm_language,
+                ),
+            ));
         }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
@@ -7652,7 +7678,7 @@ where
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let request = LlmRequest {
-            system: vec![SystemContent::cached(&system_prompt)],
+            system: request_system_blocks,
             messages,
             provider_replay,
             tools,
@@ -8857,8 +8883,25 @@ where
                 }));
             }
         };
-        let policy = CompactionPolicy::for_coordinator(self.context.is_coordinator);
-        let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
+        let is_project_coordinator = if self.context.is_coordinator || self.context.is_sub_agent {
+            false
+        } else {
+            match self
+                .storage
+                .get_project_coordinator_profile(&self.context.conversation_id)
+                .await
+            {
+                Ok(profile) => profile.is_some(),
+                Err(error) => {
+                    tracing::warn!(%error, conversation_id = %self.context.conversation_id, "failed to load Project Coordinator profile for compaction");
+                    false
+                }
+            }
+        };
+        let policy =
+            CompactionPolicy::for_profile(self.context.is_coordinator, is_project_coordinator);
+        let mut continuation_prompt =
+            policy.instruction(&rejected_tool_calls, self.context.llm_language);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
@@ -14015,7 +14058,7 @@ mod authoritative_user_message_effect_tests {
                 .contains("Cancel Crick"));
             assert_eq!(
                 request.system[0].text,
-                CompactionPolicy::for_coordinator(coordinator).system_prompt()
+                CompactionPolicy::for_profile(coordinator, false).system_prompt()
             );
             if coordinator {
                 assert!(!request.system[0]
