@@ -1406,13 +1406,10 @@ impl RuntimeManager {
                             .final_tombstone
                             .as_ref()
                             .expect("filtered above");
-                        if tombstone.object_device.is_none()
-                            && quarantine_path
-                                .try_exists()
-                                .map_err(|error| error.to_string())?
+                        if let Some(observed_path) =
+                            final_tombstone_observation_path(tombstone, &quarantine_path)?
                         {
                             let observe = std::sync::Arc::clone(&self.ambient_writer_observer);
-                            let observed_path = quarantine_path.clone();
                             match tokio::task::spawn_blocking(move || observe(&observed_path))
                                 .await
                                 .map_err(|error| error.to_string())?
@@ -3108,6 +3105,23 @@ enum FinalTombstoneRecovery {
     Residual(String),
 }
 
+fn final_tombstone_observation_path(
+    tombstone: &CloseWorktreeFinalTombstone,
+    quarantine_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if quarantine_path
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(quarantine_path.to_path_buf()));
+    }
+    let tombstone_object = tombstone.root.join("object");
+    tombstone_object
+        .try_exists()
+        .map(|exists| exists.then_some(tombstone_object))
+        .map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
@@ -4339,16 +4353,6 @@ fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_mapping_path_is_deleted(path: &[u8]) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    let full_path = Path::new(std::ffi::OsStr::from_bytes(path));
-    if std::fs::metadata(full_path).is_ok() {
-        return false;
-    }
-    path.ends_with(b" (deleted)")
-}
-
-#[cfg(target_os = "linux")]
 fn linux_writable_shared_mapping_path(
     mapping: &[u8],
     canonical: &Path,
@@ -4370,9 +4374,7 @@ fn linux_writable_shared_mapping_path(
     if permissions.get(1) != Some(&b'w') || permissions.get(3) != Some(&b's') {
         return Ok(None);
     }
-    if mapped_path.ends_with(b" (deleted)")
-        && (inode == b"0" || linux_mapping_path_is_deleted(mapped_path))
-    {
+    if mapped_path.ends_with(b" (deleted)") && inode == b"0" {
         return Ok(None);
     }
     let canonical_display = linux_procfs_display_path(canonical);
@@ -6908,7 +6910,8 @@ mod tests {
     use super::{
         both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
-        git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
+        final_tombstone_observation_path, git_path_from_observation,
+        inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
         planned_administrative_dir_is_absent,
         quarantine_and_remove_exact_worktree_with_writer_inspection,
@@ -7535,6 +7538,43 @@ mod tests {
         ));
         assert!(displaced.join("object/original").is_file());
         assert!(recorded.root.join("replacement-marker").is_file());
+    }
+
+    #[test]
+    fn final_tombstone_recovery_observes_the_extant_object_regardless_of_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let root = temp.path().join("private-tombstone");
+        std::fs::create_dir(&root).unwrap();
+        let object = root.join("object");
+        std::fs::create_dir(&object).unwrap();
+
+        for object_identity in [None, Some((7, 11))] {
+            let recorded = CloseWorktreeFinalTombstone {
+                root: root.clone(),
+                device: 1,
+                inode: 2,
+                object_device: object_identity.map(|identity| identity.0),
+                object_inode: object_identity.map(|identity| identity.1),
+            };
+            assert_eq!(
+                final_tombstone_observation_path(&recorded, &quarantine).unwrap(),
+                Some(object.clone())
+            );
+        }
+
+        std::fs::create_dir(&quarantine).unwrap();
+        let recorded = CloseWorktreeFinalTombstone {
+            root,
+            device: 1,
+            inode: 2,
+            object_device: Some(7),
+            object_inode: Some(11),
+        };
+        assert_eq!(
+            final_tombstone_observation_path(&recorded, &quarantine).unwrap(),
+            Some(quarantine)
+        );
     }
 
     #[cfg(unix)]
@@ -9186,6 +9226,20 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_writable_shared_mapping_with_surviving_inode_remains_authority() {
+        let mapping = b"7f000000-7f001000 rw-s 00000000 00:00 42 /tmp/quarantine/file (deleted)";
+        assert_eq!(
+            super::linux_writable_shared_mapping_path(
+                mapping,
+                std::path::Path::new("/tmp/quarantine"),
+            )
+            .unwrap(),
+            Some(b"/tmp/quarantine/file (deleted)".to_vec())
         );
     }
 

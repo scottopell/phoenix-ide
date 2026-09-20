@@ -186,21 +186,17 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
-  const composerHasContentRef = useRef(false);
+  const ignoreSubmittedVoiceEndRef = useRef(false);
   const composerContentRef = useRef({ draft, images, files });
   const deferredFailuresRef = useRef(new Map<string | undefined, Array<{
     text: string;
+    restoreTo: 'draft' | 'voice';
     error?: string;
     images: ImageData[];
     files: FileAttachment[];
   }>>());
   useEffect(() => {
     composerContentRef.current = { draft, images, files };
-    composerHasContentRef.current = draft.length > 0
-      || images.length > 0
-      || files.length > 0
-      || voiceBase !== null
-      || voiceInterim.length > 0;
   }, [draft, images, files, voiceBase, voiceInterim]);
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -236,16 +232,25 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const deferred = deferredFailuresRef.current.get(scopeKey);
     if (deferred) {
       const current = composerContentRef.current;
-      setDraft([...deferred.map(failure => failure.text), current.draft]
-        .filter(Boolean)
-        .join('\n'));
+      setDraft([
+        ...deferred.filter(failure => failure.restoreTo === 'draft').map(failure => failure.text),
+        current.draft,
+      ].filter(Boolean).join('\n'));
+      const deferredVoice = deferred
+        .filter(failure => failure.restoreTo === 'voice')
+        .map(failure => failure.text)
+        .join('\n');
+      if (deferredVoice) {
+        setVoiceBase(deferredVoice);
+        setVoiceInterim('');
+      }
       setImages([...deferred.flatMap(failure => failure.images), ...current.images]);
       setFiles([...deferred.flatMap(failure => failure.files), ...current.files]);
       const expansionError = deferred.findLast(failure => failure.error)?.error;
       if (expansionError) setExpansionErrorRef.current(expansionError);
       deferredFailuresRef.current.delete(scopeKey);
     }
-  }, [scopeKey, setDraft, setFiles, setImages]);
+  }, [scopeKey, setDraft, setFiles, setImages, setVoiceBase, setVoiceInterim]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -467,9 +472,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // restore the draft if an ExpansionError comes back (user must fix the
     // broken @reference before re-sending).
     const previousVoiceBase = voiceBase;
-    const previousVoiceInterim = voiceInterim;
     const submittedScopeKey = scopeKey;
     if (voiceBase !== null) {
+      ignoreSubmittedVoiceEndRef.current = true;
       setVoiceBase(null);
       setVoiceInterim('');
     }
@@ -477,7 +482,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setImages([]);
     setFiles([]);
     setExpansionError(null);
-    composerHasContentRef.current = false;
 
     try {
       await onSend(text, images, files);
@@ -496,6 +500,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           const failures = deferredFailuresRef.current.get(submittedScopeKey) ?? [];
           failures.push({
             text,
+            restoreTo: 'draft',
             error: err.detail.error ?? 'Reference expansion failed',
             images,
             files,
@@ -505,16 +510,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       } else if (closeFenced) {
         if (scopeKeyRef.current === submittedScopeKey) {
           const current = composerContentRef.current;
-          setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          if (previousVoiceBase !== null) {
+            setVoiceBase(text);
+            setVoiceInterim('');
+          } else {
+            setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          }
           setImages([...images, ...current.images]);
           setFiles([...files, ...current.files]);
-          if (previousVoiceBase !== null && !composerHasContentRef.current) {
-            setVoiceBase(previousVoiceBase);
-            setVoiceInterim(previousVoiceInterim);
-          }
         } else {
           const failures = deferredFailuresRef.current.get(submittedScopeKey) ?? [];
-          failures.push({ text, images, files });
+          failures.push({
+            text,
+            restoreTo: previousVoiceBase !== null ? 'voice' : 'draft',
+            images,
+            files,
+          });
           deferredFailuresRef.current.set(submittedScopeKey, failures);
         }
       }
@@ -564,19 +575,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   const handleVoiceStart = useCallback(() => {
+    ignoreSubmittedVoiceEndRef.current = false;
     setVoiceBase(draft);
+    clearDraft();
     setVoiceInterim('');
-  }, [draft, setVoiceBase, setVoiceInterim]);
+  }, [draft, clearDraft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceEnd = useCallback(() => {
-    setVoiceBase(prev => {
-      if (prev !== null) {
-        setDraft(prev);
-      }
-      return null;
-    });
+    if (ignoreSubmittedVoiceEndRef.current) {
+      ignoreSubmittedVoiceEndRef.current = false;
+      return;
+    }
+    if (voiceBase !== null) {
+      setDraft(draft.length > 0 ? `${voiceBase}\n${draft}` : voiceBase);
+    }
+    setVoiceBase(null);
     setVoiceInterim('');
-  }, [setDraft, setVoiceBase, setVoiceInterim]);
+  }, [draft, voiceBase, setDraft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceFinal = useCallback((text: string) => {
     if (!text) return;
