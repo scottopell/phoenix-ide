@@ -233,9 +233,12 @@ mod tests {
                 assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content == "Ready" && !tool.is_error)));
                 let tool = messages
                     .iter()
-                    .find_map(|message| match &message.content {
-                        MessageContent::Tool(tool) if tool.tool_use_id == "svg" => Some(tool),
-                        _ => None,
+                    .find_map(|message| {
+                        if let MessageContent::Tool(tool) = &message.content {
+                            (tool.tool_use_id == "svg").then_some(tool)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap();
                 if stored_assistant == Some("current-assistant") {
