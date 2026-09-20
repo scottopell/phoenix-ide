@@ -967,6 +967,18 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/^streaming \(retry 3\/3 after server error\)$/i)).toBeInTheDocument();
   });
 
+  it('shows streaming for an in-flight overload retry after first byte', () => {
+    renderStateBar({
+      convState: { type: 'server_overload_retrying', attempt: 3, retryAt: null },
+      phaseStateUpdatedAt: T_NOW - 2_000,
+      lastSseEventAt: T_NOW - 200,
+      firstByteRequestId: 'overload-req-3',
+      turnRetryContext: { attempt: 3, maxAttempts: 5, reasonText: 'server overloaded' },
+    });
+    expect(screen.getByText(/^streaming \(retry 3\/5 after server overloaded\)$/i)).toBeInTheDocument();
+    expect(screen.queryByText(/model overloaded/i)).not.toBeInTheDocument();
+  });
+
   it('appends the retry suffix on tool_executing too (carries across intra-turn transitions)', () => {
     renderStateBar({
       convState: {
@@ -1086,6 +1098,37 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/reconnecting \(2\).*last.*awaiting LLM response.*12s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/reconnecting/);
+  });
+
+  it('freezes overload in-flight streaming in the disconnected activity snapshot', () => {
+    const props = {
+      conversation: makeConversation(),
+      convState: { type: 'server_overload_retrying', attempt: 2, retryAt: null } as ConversationState,
+      connectionAttempt: 0,
+      nextRetryIn: null,
+      contextWindowUsed: 0,
+      modelContextWindow: 200_000,
+      phaseStateUpdatedAt: T_NOW - 5_000,
+      lastSseEventAtRef: { current: T_NOW - 100 },
+      firstByteRequestId: 'overload-req-2',
+    };
+    const { rerender } = render(
+      <MemoryRouter><StateBar {...props} connectionState="connected" /></MemoryRouter>,
+    );
+    expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar {...props} connectionState="reconnecting" connectionAttempt={2} />
+      </MemoryRouter>,
+    );
+    rerender(
+      <MemoryRouter>
+        <StateBar {...props} connectionState="reconnecting" connectionAttempt={3} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/reconnecting \(3\).*last: streaming/i)).toBeInTheDocument();
+    expect(screen.queryByText(/last: model overloaded/i)).not.toBeInTheDocument();
   });
 
   it('renders and decrements the persisted overload countdown after reconnect (REQ-LRV-008)', () => {

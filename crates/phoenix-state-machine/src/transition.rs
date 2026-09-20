@@ -880,6 +880,7 @@ pub fn transition_core(
             CoreState::ServerOverloadRetrying { .. },
             CoreEvent::ServerOverloaded { .. }
             | CoreEvent::ContinuationServerOverloaded { .. }
+            | CoreEvent::OverloadRetryDeadlineExpired
             | CoreEvent::RetryTimeout { .. },
         ) => handle_server_overload_retry(state, context, event),
 
@@ -1273,6 +1274,7 @@ fn handle_core_tool_complete(
         | CoreEvent::LlmError { .. }
         | CoreEvent::ServerOverloaded { .. }
         | CoreEvent::ContinuationServerOverloaded { .. }
+        | CoreEvent::OverloadRetryDeadlineExpired
         | CoreEvent::RetryTimeout { .. }
         | CoreEvent::ToolAborted { .. }
         | CoreEvent::SubAgentResult { .. }
@@ -1751,18 +1753,25 @@ fn schedule_server_overload(
     identity: &str,
     message: String,
 ) -> Result<CoreTransitionResult, TransitionError> {
-    if attempt > OVERLOAD_MAX_ATTEMPTS
-        || matches!(guidance, Some(OverloadRetryGuidance::ExceedsLimit(_)))
-    {
+    let terminal_retry = ServerOverloadRetry {
+        target: target.clone(),
+        phase: ServerOverloadPhase::InFlight,
+        attempt: attempt.saturating_sub(1),
+        started_at,
+        deadline_at,
+    };
+    if let Some(OverloadRetryGuidance::ExceedsLimit(duration)) = guidance {
         return overload_terminal(
-            &ServerOverloadRetry {
-                target,
-                phase: ServerOverloadPhase::InFlight,
-                attempt: attempt.saturating_sub(1),
-                started_at,
-                deadline_at,
-            },
-            message,
+            &terminal_retry,
+            format!("{message} Retry-After was {duration:?}, beyond the automatic retry limit."),
+            ErrorKind::ServerOverloaded,
+            None,
+        );
+    }
+    if attempt > OVERLOAD_MAX_ATTEMPTS {
+        return overload_terminal(
+            &terminal_retry,
+            format!("{message} Automatic overload retry attempts exhausted."),
             ErrorKind::ServerOverloaded,
             None,
         );
@@ -1785,7 +1794,12 @@ fn schedule_server_overload(
         let mut last_dispatched = retry;
         last_dispatched.attempt = last_dispatched.attempt.saturating_sub(1);
         last_dispatched.phase = ServerOverloadPhase::InFlight;
-        return overload_terminal(&last_dispatched, message, ErrorKind::ServerOverloaded, None);
+        return overload_terminal(
+            &last_dispatched,
+            format!("{message} Automatic overload retry deadline elapsed."),
+            ErrorKind::ServerOverloaded,
+            None,
+        );
     }
     Ok(
         CoreTransitionResult::new(CoreState::ServerOverloadRetrying { retry })
@@ -1911,6 +1925,14 @@ fn handle_server_overload_retry(
                 CoreTransitionResult::new(CoreState::ServerOverloadRetrying { retry: in_flight })
                     .with_effect(Effect::PersistState)
                     .with_effect(effect),
+            )
+        }
+        (CoreState::ServerOverloadRetrying { retry }, CoreEvent::OverloadRetryDeadlineExpired) => {
+            overload_terminal(
+                retry,
+                "Server overload retry deadline elapsed".to_string(),
+                ErrorKind::ServerOverloaded,
+                None,
             )
         }
         (
@@ -3484,6 +3506,7 @@ pub fn transition_sub_agent(
             SubAgentEvent::Core(
                 core_event @ (CoreEvent::ServerOverloaded { .. }
                 | CoreEvent::ContinuationServerOverloaded { .. }
+                | CoreEvent::OverloadRetryDeadlineExpired
                 | CoreEvent::RetryTimeout { .. }),
             ),
         ) => {
@@ -4280,6 +4303,85 @@ mod tests {
     }
 
     #[test]
+    fn initial_overload_stop_preserves_provider_duration_and_distinguishes_exhaustion() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let duration = Duration::from_secs(47);
+        let provider_stop = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::ServerOverloaded {
+                message: "capacity".to_string(),
+                detected_at: at,
+                guidance: Some(OverloadRetryGuidance::ExceedsLimit(duration)),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            provider_stop.new_state,
+            ConvState::Error { message, error_kind: ErrorKind::ServerOverloaded, .. }
+                if message.contains("47s")
+                    && message.contains("Retry-After")
+                    && !message.contains("attempts exhausted")
+        ));
+
+        let retrying = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Ordinary,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: OVERLOAD_MAX_ATTEMPTS,
+                started_at: at,
+                deadline_at: at + chrono::Duration::seconds(120),
+            },
+        };
+        let exhausted = transition(
+            &retrying,
+            &test_context(),
+            overload_event(at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+        assert!(matches!(
+            exhausted.new_state,
+            ConvState::Error { message, error_kind: ErrorKind::ServerOverloaded, .. }
+                if message.contains("attempts exhausted") && !message.contains("Retry-After")
+        ));
+    }
+
+    #[test]
+    fn overload_deadline_expiry_is_not_provider_guidance() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for target in [
+            ServerOverloadTarget::Ordinary,
+            ServerOverloadTarget::Continuation {
+                operation_id: "deadline-op".to_string(),
+                rejected_tool_calls: vec![],
+            },
+        ] {
+            let state = ConvState::ServerOverloadRetrying {
+                retry: ServerOverloadRetry {
+                    target,
+                    phase: ServerOverloadPhase::Waiting { retry_at: at },
+                    attempt: 3,
+                    started_at: at - chrono::Duration::seconds(120),
+                    deadline_at: at,
+                },
+            };
+            let result =
+                transition(&state, &test_context(), Event::OverloadRetryDeadlineExpired).unwrap();
+            let message = match result.new_state {
+                ConvState::Error { message, .. } => message,
+                ConvState::RecoverableContinuationFailure { failure } => failure.message,
+                other => panic!("unexpected deadline terminal state: {other:?}"),
+            };
+            assert!(message.contains("deadline elapsed"));
+            assert!(!message.contains("Retry-After"));
+        }
+    }
+
+    #[test]
     fn overload_retry_waits_dispatches_and_exhausts_ordinary() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4546,7 +4648,7 @@ mod tests {
         assert!(matches!(
             &result.new_state,
             ConvState::Failed { error, error_kind: ErrorKind::ServerOverloaded }
-                if error == "capacity"
+                if error == "capacity Retry-After was 31s, beyond the automatic retry limit."
         ));
         assert!(matches!(
             result.effects.as_slice(),
@@ -4554,11 +4656,11 @@ mod tests {
                 Effect::PersistState,
                 Effect::NotifyParent {
                     outcome: SubAgentOutcome::Failure {
+                        error,
                         error_kind: ErrorKind::ServerOverloaded,
-                        ..
                     }
                 }
-            ]
+            ] if error == "capacity Retry-After was 31s, beyond the automatic retry limit."
         ));
     }
 
@@ -4581,7 +4683,7 @@ mod tests {
             (
                 overload_event(at + chrono::Duration::seconds(1)),
                 ErrorKind::ServerOverloaded,
-                "capacity",
+                "capacity Automatic overload retry attempts exhausted.",
             ),
             (
                 Event::LlmError {

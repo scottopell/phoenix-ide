@@ -751,12 +751,16 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_state_change': {
       const phase =
         action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
+      const terminalOverload =
+        (phase.type === 'error' || phase.type === 'recoverable_continuation_failure')
+        && phase.error_kind === 'server_overloaded';
       return {
         ...atom,
         phase,
         phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         firstByteRequestId: null,
+        turnRetryContext: terminalOverload ? null : atom.turnRetryContext,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
     }

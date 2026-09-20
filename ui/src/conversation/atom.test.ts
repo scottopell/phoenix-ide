@@ -1530,6 +1530,65 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(13);
     });
 
+    it('clears overload retry context only at terminal overload state changes', () => {
+      const retryContext = {
+        attempt: 3,
+        maxAttempts: 5,
+        reason: 'server_overloaded' as const,
+        reasonText: 'server overloaded',
+        backingOffMs: 4_000,
+        resetsAt: null,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        turnRetryContext: retryContext,
+      };
+      const waiting = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'server_overload_retrying', attempt: 3, retryAt: Date.now() + 4_000 },
+        stateUpdatedAt: 1,
+      });
+      expect(waiting.turnRetryContext).toBe(retryContext);
+
+      for (const phase of [
+        { type: 'error', message: 'capacity', error_kind: 'server_overloaded' },
+        {
+          type: 'recoverable_continuation_failure',
+          message: 'capacity',
+          error_kind: 'server_overloaded',
+          operation_id: 'op-1',
+          attempt: 3,
+        },
+      ] as const) {
+        const terminal = dispatch(atom, {
+          type: 'sse_state_change',
+          sequenceId: 1,
+          phase,
+          stateUpdatedAt: 1,
+        });
+        expect(terminal.turnRetryContext).toBeNull();
+      }
+    });
+
+    it('preserves retry context for terminal changes unrelated to overload', () => {
+      const retryContext = {
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'network' as const,
+        reasonText: 'network error',
+        backingOffMs: 1_000,
+        resetsAt: null,
+      };
+      const next = dispatch({ ...createInitialAtom(), turnRetryContext: retryContext }, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'error', message: 'bad request', error_kind: 'invalid_request' },
+        stateUpdatedAt: 1,
+      });
+      expect(next.turnRetryContext).toBe(retryContext);
+    });
+
     it('is a no-op for sequenceId already seen', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 10 };
 

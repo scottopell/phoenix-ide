@@ -486,6 +486,7 @@ pub enum Event {
         detected_at: DateTime<Utc>,
         guidance: Option<OverloadRetryGuidance>,
     },
+    OverloadRetryDeadlineExpired,
     RetryTimeout {
         attempt: u32,
     },
@@ -669,6 +670,7 @@ impl Event {
             Event::LlmError { .. } => "LlmError",
             Event::ServerOverloaded { .. } => "ServerOverloaded",
             Event::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
+            Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
@@ -760,6 +762,7 @@ pub enum CoreEvent {
         detected_at: DateTime<Utc>,
         guidance: Option<OverloadRetryGuidance>,
     },
+    OverloadRetryDeadlineExpired,
     RetryTimeout {
         attempt: u32,
     },
@@ -971,6 +974,9 @@ impl TryFrom<Event> for ParentEvent {
                 detected_at,
                 guidance,
             })),
+            Event::OverloadRetryDeadlineExpired => {
+                Ok(ParentEvent::Core(CoreEvent::OverloadRetryDeadlineExpired))
+            }
             Event::RetryTimeout { attempt } => {
                 Ok(ParentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1180,6 +1186,9 @@ impl TryFrom<Event> for SubAgentEvent {
                     guidance,
                 },
             )),
+            Event::OverloadRetryDeadlineExpired => {
+                Ok(SubAgentEvent::Core(CoreEvent::OverloadRetryDeadlineExpired))
+            }
             Event::RetryTimeout { attempt } => {
                 Ok(SubAgentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1286,6 +1295,7 @@ impl CoreEvent {
             CoreEvent::RetryTimeout { .. } => "RetryTimeout",
             CoreEvent::ServerOverloaded { .. } => "ServerOverloaded",
             CoreEvent::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
+            CoreEvent::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",

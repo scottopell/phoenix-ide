@@ -656,6 +656,7 @@ export function StateBar({
     ) {
       const wasStreaming =
         (convState.type === "llm_requesting" ||
+          convState.type === "server_overload_retrying" ||
           convState.type === "seeded_llm_requesting" ||
           convState.type === "awaiting_llm") &&
         firstByteRequestId != null;
@@ -859,6 +860,7 @@ export function StateBar({
             // sub-agent phases retain their elapsed counter.
             if (
               (convState.type === "llm_requesting" ||
+                convState.type === "server_overload_retrying" ||
                 convState.type === "seeded_llm_requesting" ||
                 convState.type === "awaiting_llm") &&
               firstByteRequestId != null

@@ -2364,34 +2364,16 @@ where
         };
 
         if let ConvState::ServerOverloadRetrying { retry } = self.state.clone() {
-            use phoenix_core::domain::sm_state::{
-                OverloadRetryGuidance, ServerOverloadPhase, ServerOverloadTarget,
-            };
+            use phoenix_core::domain::sm_state::{ServerOverloadPhase, ServerOverloadTarget};
             let now = Utc::now();
             if matches!(
                 overload_startup_action(&retry, now),
                 OverloadStartupAction::Expire
             ) {
-                let expiry = match &retry.target {
-                    ServerOverloadTarget::Ordinary => Event::ServerOverloaded {
-                        message: "Server overload retry deadline elapsed".to_string(),
-                        detected_at: now,
-                        guidance: Some(OverloadRetryGuidance::ExceedsLimit(
-                            std::time::Duration::from_secs(31),
-                        )),
-                    },
-                    ServerOverloadTarget::Continuation { operation_id, .. } => {
-                        Event::ContinuationServerOverloaded {
-                            operation_id: operation_id.clone(),
-                            message: "Server overload retry deadline elapsed".to_string(),
-                            detected_at: now,
-                            guidance: Some(OverloadRetryGuidance::ExceedsLimit(
-                                std::time::Duration::from_secs(31),
-                            )),
-                        }
-                    }
-                };
-                if let Err(error) = self.process_event(expiry).await {
+                if let Err(error) = self
+                    .process_event(Event::OverloadRetryDeadlineExpired)
+                    .await
+                {
                     tracing::error!(%error, "Failed to expire recovered overload retry");
                     return RuntimeExitDisposition::Interrupted;
                 }
@@ -21058,6 +21040,55 @@ mod retry_timer_epoch_tests {
     }
 
     #[tokio::test]
+    async fn startup_expired_ordinary_overload_persists_deadline_terminal() {
+        let mut rt = runtime_requesting();
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 4,
+                started_at: now - chrono::Duration::seconds(121),
+                deadline_at: now - chrono::Duration::seconds(1),
+            },
+        };
+        let runtime = tokio::spawn(rt.run());
+
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(state @ ConvState::Error { .. }) =
+                    storage.get_current_state("conv-retry")
+                {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup expiry reaches durable terminal state");
+        let ConvState::Error {
+            message,
+            error_kind,
+            ..
+        } = persisted
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            error_kind,
+            phoenix_core::domain::db_schema::ErrorKind::ServerOverloaded
+        );
+        assert!(message.contains("deadline elapsed"));
+        assert!(!message.contains("Retry-After"));
+
+        runtime.abort();
+        assert!(matches!(runtime.await, Err(error) if error.is_cancelled()));
+    }
+
+    #[tokio::test]
     async fn startup_expired_continuation_overload_persists_recoverable_terminal() {
         let mut rt = runtime_requesting();
         let storage = Arc::clone(&rt.storage);
@@ -21095,6 +21126,8 @@ mod retry_timer_epoch_tests {
         };
         assert_eq!(failure.request.operation_id, "startup-expired-continuation");
         assert_eq!(failure.request.attempt, 4);
+        assert!(failure.message.contains("deadline elapsed"));
+        assert!(!failure.message.contains("Retry-After"));
 
         runtime.abort();
         assert!(
