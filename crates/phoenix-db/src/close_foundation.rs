@@ -4273,6 +4273,9 @@ impl Database {
                AND plan.resource_kind = ?3 AND plan.identity_kind = ?4
                AND plan.identity_codec = ?5 AND plan.identity_value = ?6
                AND (plan.inspection_generation <> ?7 OR plan.inspection_fingerprint <> ?8)
+               AND plan.administrative_dir_codec = 'hex_path_v1'
+               AND plan.administrative_dir_value = ?9
+               AND plan.administrative_dir_incarnation = ?10
                AND NOT EXISTS (
                    SELECT 1 FROM close_worktree_cleanup_adoptions adoption
                    WHERE adoption.attempt_id=plan.attempt_id
@@ -4284,8 +4287,7 @@ impl Database {
                      AND adoption.identity_codec=plan.identity_codec
                      AND adoption.identity_value=plan.identity_value
                )
-             ORDER BY inventory.captured_at DESC, plan.rowid DESC
-             LIMIT 1",
+             ORDER BY inventory.captured_at DESC, plan.rowid DESC",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -4295,6 +4297,8 @@ impl Database {
         .bind(identity.value())
         .bind(request.target_snapshot.generation())
         .bind(request.target_snapshot.fingerprint())
+        .bind(&observed_administrative_dir_value)
+        .bind(&request.observed_administrative_dir_incarnation)
         .fetch_all(&mut *tx)
         .await?;
         let Some(source) = sources.first() else {

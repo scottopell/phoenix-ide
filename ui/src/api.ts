@@ -2339,7 +2339,8 @@ export const api = {
   async abandonTask(convId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/abandon-task`, { method: 'POST' });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to abandon task', resp.status, err.error_type);
     }
     return resp.json();
@@ -2348,7 +2349,8 @@ export const api = {
   async markMerged(conversationId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to mark as merged', resp.status, err.error_type);
     }
     return resp.json();
