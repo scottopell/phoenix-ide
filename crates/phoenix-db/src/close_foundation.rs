@@ -1172,6 +1172,22 @@ impl Database {
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
 
+        let automatic_continuation_pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM automatic_continuation_admissions
+                 WHERE product_conversation_id = ?1
+                   AND phase NOT IN ('message_settled', 'superseded')
+             )",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if automatic_continuation_pending != 0 {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} has pending automatic continuation"
+            )));
+        }
+
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome

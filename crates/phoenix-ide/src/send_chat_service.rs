@@ -313,6 +313,18 @@ impl SendChatApplicationService {
             .load_active_runtime_turn(&ConversationAuthority(conversation.id.clone()))
             .await
             .map_err(|error| map_db_internal_error(&error))?;
+        if req.expansion_policy != MessageExpansionPolicy::GeneratedPredecessorContext
+            && self
+                .db
+                .has_pending_continuation_opening(&conversation.id)
+                .await
+                .map_err(|error| map_db_internal_error(&error))?
+        {
+            return Ok(SendChatOutcome::Rejected {
+                message: "reserved continuation opening is pending".to_string(),
+                code: "continuation_opening_pending",
+            });
+        }
         let generated_opening =
             req.expansion_policy == MessageExpansionPolicy::GeneratedPredecessorContext;
         if !generated_opening
