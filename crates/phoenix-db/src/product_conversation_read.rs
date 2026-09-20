@@ -8,7 +8,7 @@ use serde::Serialize;
 use sqlx::{Connection, Executor, Row, SqliteConnection};
 use tracing::Instrument;
 
-use crate::{Database, DbError, DbResult, MessageContent, MessageType};
+use crate::{CloseProjection, Database, DbError, DbResult, MessageContent, MessageType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProductConversation {
@@ -64,6 +64,7 @@ pub struct ProductConversationListProjection {
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
+    pub close: Option<CloseProjection>,
     pub messages: Vec<(i64, crate::Message)>,
     pub requested_transcript_row_id: String,
 }
@@ -799,6 +800,12 @@ impl Database {
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
+            let close = Self::get_active_close_projection_for_product_on(
+                &mut connection,
+                aggregate.product_conversation.id(),
+            )
+            .instrument(tracing::info_span!("product_conversation.close"))
+            .await?;
             let messages = Self::get_product_conversation_messages_page_on(
                 &mut connection,
                 aggregate.product_conversation.id(),
@@ -810,6 +817,7 @@ impl Database {
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
+                close,
                 messages,
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
             })
@@ -1286,6 +1294,7 @@ mod tests {
         ContinuationContent, ContinueOutcome, ConvState, MessageContent,
         NewContinuationDispatchIntent,
     };
+    use phoenix_core::domain::close::TranscriptConversationId;
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
 
@@ -1641,6 +1650,37 @@ mod tests {
         assert_eq!(
             snapshot.aggregate.product_conversation.id(),
             &exact_id.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_read_includes_active_close_projection() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("snapshot-close", "snapshot-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse(conversation.id.clone()).unwrap(),
+            "snapshot-close-attempt",
+        )
+        .await
+        .unwrap();
+
+        let snapshot = db
+            .read_ordinary_product_conversation_snapshot(&conversation.id, None, None, 1)
+            .await
+            .unwrap();
+
+        let close = snapshot.close.expect("active Close projection");
+        assert_eq!(
+            close.obligation.attempt_id().as_str(),
+            "snapshot-close-attempt"
+        );
+        assert_eq!(
+            close.obligation.product_conversation_id(),
+            &conversation.product_conversation_id
         );
     }
 

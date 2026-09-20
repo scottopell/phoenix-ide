@@ -26,7 +26,7 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{
-    DbError, ProductConversationAggregate, ProductConversationCloseAvailability,
+    CloseProjection, DbError, ProductConversationAggregate, ProductConversationCloseAvailability,
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
     ProductConversationListLifecycle, ProductConversationListProjection,
     ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSource,
@@ -254,6 +254,7 @@ pub async fn get_product_conversation(
             snapshot_view(
                 &state,
                 snapshot.aggregate,
+                snapshot.close,
                 snapshot.requested_transcript_row_id,
                 cursor,
                 message_limit,
@@ -400,6 +401,7 @@ fn close_action_view(
 async fn snapshot_view(
     state: &AppState,
     mut aggregate: ProductConversationAggregate,
+    close: Option<CloseProjection>,
     requested_transcript_row_id: String,
     cursor: Option<AggregateCursor>,
     message_limit: usize,
@@ -409,12 +411,8 @@ async fn snapshot_view(
         .product_conversation
         .ordinary_lifecycle()
         .expect("ordinary aggregate read returned Coordinator");
-    let close = state
-        .db
-        .get_active_close_projection_for_product(aggregate.product_conversation.id())
-        .await
-        .map_err(db_to_app)?
-        .map(close_view);
+    let writable = close.is_none();
+    let close = close.map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -459,7 +457,11 @@ async fn snapshot_view(
         },
         ordinary_lifecycle: lifecycle_view(lifecycle),
         latest_transcript_row_id: latest_id.clone(),
-        writable_transcript_row_id: writable_transcript_row_id(state, lifecycle, &aggregate).await,
+        writable_transcript_row_id: if writable {
+            writable_transcript_row_id(lifecycle, &aggregate)
+        } else {
+            None
+        },
         updated_at: aggregate.updated_at.to_rfc3339(),
         presentation: presentation(
             root_title,
@@ -728,26 +730,15 @@ fn aggregate_segment_ceilings(
         .collect()
 }
 
-async fn writable_transcript_row_id(
-    state: &AppState,
+fn writable_transcript_row_id(
     lifecycle: OrdinaryProductConversationLifecycle,
     aggregate: &ProductConversationAggregate,
 ) -> Option<String> {
     if lifecycle != OrdinaryProductConversationLifecycle::Open {
         return None;
     }
-    let latest = aggregate
-        .segments
-        .last()?
-        .transcript_row
-        .conversation
-        .clone();
-    let effective_state = state
-        .runtime
-        .effective_conversation_state(&latest.id)
-        .await
-        .unwrap_or(latest.state);
-    accepts_user_message_direct_or_steering(&effective_state).then_some(latest.id)
+    let latest = &aggregate.segments.last()?.transcript_row.conversation;
+    accepts_user_message_direct_or_steering(&latest.state).then(|| latest.id.clone())
 }
 
 fn validate_cursor(
@@ -1393,7 +1384,7 @@ mod tests {
             .all(
                 |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
             ));
-        assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
+        assert!(snapshot["writable_transcript_row_id"].is_null());
         assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
         assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
     }

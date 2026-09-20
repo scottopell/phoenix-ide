@@ -13,7 +13,7 @@ use phoenix_core::domain::close::{
 use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Connection, Row, Sqlite, Transaction};
+use sqlx::{Connection, Row, Sqlite, SqliteConnection, Transaction};
 use std::fmt::Write as _;
 
 use crate::{
@@ -2289,6 +2289,17 @@ impl Database {
     ) -> DbResult<Option<CloseProjection>> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin().await?;
+        let projection =
+            Self::get_active_close_projection_for_product_on(&mut tx, product_conversation_id)
+                .await?;
+        tx.rollback().await?;
+        Ok(projection)
+    }
+
+    pub(crate) async fn get_active_close_projection_for_product_on(
+        connection: &mut SqliteConnection,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<CloseProjection>> {
         let obligation = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase,
                     inspection_generation, inspection_fingerprint,
@@ -2297,12 +2308,11 @@ impl Database {
              WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
         .bind(product_conversation_id.as_str())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *connection)
         .await?
         .map(parse_close_obligation_row)
         .transpose()?;
         let Some(obligation) = obligation else {
-            tx.rollback().await?;
             return Ok(None);
         };
         let inspections = sqlx::query(
@@ -2312,7 +2322,7 @@ impl Database {
              ORDER BY scope, inspected_at",
         )
         .bind(obligation.attempt_id().as_str())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_inspection_row)
@@ -2329,7 +2339,7 @@ impl Database {
              ORDER BY loss.scope, loss.generation, loss.category, loss.identity_kind, loss.identity_value",
         )
         .bind(obligation.attempt_id().as_str())
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_inspection_loss_row)
@@ -2361,12 +2371,11 @@ impl Database {
                 .snapshot()
                 .map(CloseRetirementSnapshot::fingerprint),
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(parse_close_retired_resource_row)
         .collect::<DbResult<Vec<_>>>()?;
-        tx.rollback().await?;
         Ok(Some(CloseProjection {
             obligation,
             inspections,
