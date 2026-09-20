@@ -197,14 +197,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       || voiceBase !== null
       || voiceInterim.length > 0;
   }, [draft, images, files, voiceBase, voiceInterim]);
-  useEffect(() => {
-    const deferred = deferredExpansionErrorRef.current;
-    if (deferred?.scopeKey === scopeKey) {
-      setExpansionError(deferred.error);
-      deferredExpansionErrorRef.current = null;
-    }
-  }, [scopeKey, setExpansionError]);
-
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
   // =========================================================================
@@ -233,6 +225,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Inline expansion-error surface is shared between @ref/skill expansion and
   // attachment-upload failures, so the file-drop handlers reuse it.
   const { reset: resetRefs, setExpansionError, expansionError } = ir;
+  useEffect(() => {
+    const deferred = deferredExpansionErrorRef.current;
+    if (deferred?.scopeKey === scopeKey) {
+      setExpansionError(deferred.error);
+      deferredExpansionErrorRef.current = null;
+    }
+  }, [scopeKey, setExpansionError]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -488,17 +487,21 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setImages(images);
           setFiles(files);
         }
-      } else if (closeFenced
-        && scopeKeyRef.current === submittedScopeKey
-        && !composerHasContentRef.current) {
-        if (previousVoiceBase !== null) {
-          setVoiceBase(previousVoiceBase);
-          setVoiceInterim(previousVoiceInterim);
+      } else if (closeFenced) {
+        if (scopeKeyRef.current === submittedScopeKey) {
+          const current = composerContentRef.current;
+          setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          setImages([...images, ...current.images]);
+          setFiles([...files, ...current.files]);
+          if (previousVoiceBase !== null && !composerHasContentRef.current) {
+            setVoiceBase(previousVoiceBase);
+            setVoiceInterim(previousVoiceInterim);
+          }
         } else {
           setDraft(text);
+          setImages(images);
+          setFiles(files);
         }
-        setImages(images);
-        setFiles(files);
       }
       // Other errors remain visible in the message queue with a retry button.
     }
