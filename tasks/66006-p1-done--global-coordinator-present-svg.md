@@ -2,7 +2,7 @@
 
 ## Observed journey
 
-- PR #793 is merged on current `origin/main` (`87606f424`) and its durable SVG publication path is already deployed separately, but the actual Global Coordinator tool schema still omits `present_svg`.
+- PR #793 merged as `87606f424`; current `origin/main` is `ce34111f1` after merged PR #789 and its durable SVG publication path is already deployed separately, but the actual Global Coordinator tool schema still omits `present_svg`.
 - Ordinary Direct/Work publication has been verified independently, including artifact `b3447423-be2a-46dc-a7dd-e38036f5a669`. That evidence proves the existing publisher, not Global exposure.
 - The requested journey is a disposable **development** Global Coordinator conversation that generates a static SVG through its existing explicitly WorkScope-targeted Bash capability, invokes the real `present_svg` tool, and owns the resulting durable artifact under the Global transcript and the exact Global assistant-message/tool-use invocation.
 - The deployed devmbp binary at `d994…` predates current source and is not an acceptance target. Production exposure requires separate deployment authorization.

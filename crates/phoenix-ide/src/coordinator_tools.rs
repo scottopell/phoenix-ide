@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
 use crate::tools::{
-    BashTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
+    BashTool, PresentSvgTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget,
+    WritingConversationTools,
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
@@ -31,7 +32,8 @@ pub(crate) fn tools(
         .into_tools()
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
-    tools.push(Arc::new(WorkScopeCoordinatorBash(service)));
+    tools.push(Arc::new(WorkScopeCoordinatorBash(service.clone())));
+    tools.push(Arc::new(WorkScopeCoordinatorPresentSvg(service)));
     tools
 }
 
@@ -123,6 +125,58 @@ impl Tool for WorkScopeCoordinatorBash {
         };
         BashTool
             .run_explicit_target(context_input, spawn_target, ctx)
+            .await
+    }
+}
+
+struct WorkScopeCoordinatorPresentSvg(GlobalReadService);
+
+#[async_trait]
+impl Tool for WorkScopeCoordinatorPresentSvg {
+    fn name(&self) -> &'static str {
+        "present_svg"
+    }
+
+    fn description(&self) -> String {
+        "Publish a static SVG staged inside one active WorkScope as a durable inline visual owned by this Global Coordinator transcript. First generate the file through Coordinator bash using that WorkScope's explicit work_scope_id, then call present_svg with the same work_scope_id and resolved absolute SERVER filename. The server re-resolves the active WorkScope and permits only a contained regular file without symlinks. Keep staging until success; the tool does not remove it. Validation enforces the existing bounded static SVG policy and is not visual inspection. Success returns a compact reference, never SVG bytes."
+            .to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        let mut schema = PresentSvgTool.input_schema();
+        schema["properties"]["work_scope_id"] = json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Authoritative active WorkScope used to stage the SVG through Coordinator bash. Phoenix re-resolves its canonical root server-side."
+        });
+        schema["required"] = json!(["work_scope_id", "path", "title", "description"]);
+        schema
+    }
+
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let Some(object) = input.as_object_mut() else {
+            return ToolOutput::error("present_svg invalid_input: Provide work_scope_id, path, title, and description as strings.");
+        };
+        let Some(work_scope_id) = object
+            .remove("work_scope_id")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return ToolOutput::error(
+                "present_svg invalid_input: work_scope_id must name one active WorkScope.",
+            );
+        };
+        let Ok(binding) = self
+            .0
+            .resolve_active_work_scope_bash_target(&work_scope_id)
+            .await
+        else {
+            return ToolOutput::error(
+                "present_svg policy_rejection: active persisted WorkScope with a live owner not found.",
+            );
+        };
+        PresentSvgTool
+            .run_for_coordinator_work_scope(input, ctx, binding.path)
             .await
     }
 }
@@ -525,9 +579,23 @@ mod tests {
                 "query_database",
                 "resolve_reference",
                 "send_conversation_message",
-                "bash"
+                "bash",
+                "present_svg"
             ]
         );
+        let present_svg = coordinator
+            .iter()
+            .find(|tool| tool.name() == "present_svg")
+            .unwrap();
+        let schema = present_svg.input_schema();
+        assert_eq!(
+            schema["required"],
+            json!(["work_scope_id", "path", "title", "description"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(present_svg
+            .description()
+            .contains("owned by this Global Coordinator transcript"));
     }
 
     #[tokio::test]
@@ -581,6 +649,32 @@ mod tests {
         assert_eq!(body["outcome"], "rejected");
         assert_eq!(body["reason_code"], "self_target_rejected");
         assert!(db.get_messages("origin").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_present_svg_rejects_unknown_work_scope_before_source_read() {
+        let (writing, coordinator) = application_tools().await;
+        drop(writing);
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "present_svg")
+            .unwrap();
+        let output = tool
+            .run(
+                json!({
+                    "work_scope_id": "missing-scope",
+                    "path": "/tmp/must-not-be-read.svg",
+                    "title": "Missing",
+                    "description": "This source must not be read."
+                }),
+                context("global-transcript"),
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output
+            .output()
+            .contains("active persisted WorkScope with a live owner not found"));
     }
 
     #[tokio::test]

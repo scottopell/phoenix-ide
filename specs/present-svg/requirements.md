@@ -14,7 +14,16 @@ AND SHALL reject control characters in either text field
 AND SHALL read only a bounded regular file using the host process's applicable filesystem permissions
 AND SHALL NOT expand shell expressions or remove the source.
 
-THE SYSTEM SHALL NOT advertise publication in Explore, filesystem-free coordinator contexts, or Explore subagents.
+WHEN the singleton Global Coordinator invokes `present_svg`
+THE SYSTEM SHALL require an authoritative active WorkScope identifier with a live owner
+AND SHALL resolve its canonical root server-side
+AND SHALL read only a regular source file structurally contained beneath that root without following symlinks
+AND SHALL retain the executing Coordinator transcript and its assistant-message/tool-use pair as artifact ownership and invocation identity.
+
+THE selected WorkScope SHALL authorize only the source read for that invocation
+AND SHALL NOT grant the Coordinator generic filesystem authority or change the artifact owner to a WorkScope conversation.
+
+THE SYSTEM SHALL NOT advertise publication in Explore or Explore subagents.
 
 ### REQ-SVG-002: Static SVG policy
 
