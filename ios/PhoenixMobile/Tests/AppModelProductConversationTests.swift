@@ -533,6 +533,41 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: drainRow.id))
     }
 
+    func testAggregateDeletionTombstonesEveryIdentityBeforeCleanupCanSuspend() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-delete-tombstone-race-tests-\(UUID().uuidString)")
+        let aggregateId = "pc-deleted"
+        let listed = conversation(id: "listed-row", aggregateId: aggregateId)
+        let cached = conversation(id: "cached-row", aggregateId: aggregateId)
+        let retained = conversation(id: "retained-row", aggregateId: aggregateId)
+        persistReadableSnapshot(conversation: cached)
+        persistReadableSnapshot(conversation: retained)
+        let model = AppModel()
+        model.installAPIForTesting()
+        model.listStore.upsert(listed)
+        XCTAssertNotNil(model.session(for: retained.id))
+        var checkedBeforeFirstAwait = false
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId,
+            transcriptIds: [listed.id, cached.id],
+            tombstonesInstalled: {
+                checkedBeforeFirstAwait = true
+                XCTAssertTrue(model.deletedProductHistoryIds.isSuperset(
+                    of: [aggregateId, listed.id, cached.id, retained.id]))
+                XCTAssertNil(model.session(for: aggregateId))
+                XCTAssertNil(model.session(for: listed.id))
+                XCTAssertNil(model.session(for: cached.id))
+                XCTAssertNil(model.session(for: retained.id))
+            })
+
+        XCTAssertTrue(removed)
+        XCTAssertTrue(checkedBeforeFirstAwait)
+        XCTAssertNil(model.session(for: listed.id))
+        XCTAssertNil(model.session(for: cached.id))
+        XCTAssertNil(model.session(for: retained.id))
+    }
+
     func testRetainedProductHistoryCacheShowsAgeUntilOnlineRefreshSucceeds() {
         let now = Date()
 
@@ -675,6 +710,61 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.pendingProductCloseConfirmation?.productConversationId, "product-a")
         XCTAssertFalse(firstSession.acceptsConversationActions)
         XCTAssertFalse(secondSession.acceptsConversationActions)
+    }
+
+    func testCloseRehydrationClearsAbsentFencePromptAndReconciliationButPreservesActive() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-authoritative-close-tests-\(UUID().uuidString)")
+        let model = AppModel()
+        model.installAPIForTesting()
+        let absent = conversation(id: "absent-row", aggregateId: "absent")
+        let active = conversation(
+            id: "active-row",
+            aggregateId: "active",
+            closeAction: .unavailable(reason: .active_close_attempt))
+        model.listStore.upsert(absent)
+        model.listStore.upsert(active)
+        let absentSession = try XCTUnwrap(model.session(for: absent.id))
+        let activeSession = try XCTUnwrap(model.session(for: active.id))
+        model.recordCloseConfirmationRequiredForTesting(productConversationId: "absent")
+        model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
+            productConversationId: "absent",
+            transcriptRowId: absent.id,
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation)))
+        model.fenceProductCloseForTesting(productConversationId: "active", fenced: true)
+
+        model.listStore.remove(aggregateId: "absent")
+        await model.rehydratePendingProductCloseConfirmationForTesting { aggregateId in
+            XCTAssertEqual(aggregateId, "active")
+            var snapshot = self.historySnapshot(aggregateId: aggregateId, segments: [])
+            snapshot.ordinary_lifecycle = .open
+            snapshot.close = self.closeSnapshot(phase: .settling_active_work)
+            return snapshot
+        }
+
+        XCTAssertFalse(absentSession.isArchiving)
+        XCTAssertTrue(absentSession.acceptsConversationActions)
+        XCTAssertTrue(activeSession.isArchiving)
+        XCTAssertFalse(activeSession.acceptsConversationActions)
+        XCTAssertNil(model.pendingProductCloseConfirmation)
+        XCTAssertFalse(model.closeConfirmationReconciliationIdsForTesting.contains("absent"))
+    }
+
+    func testAggregateEventBackoffRequiresHealthyFrameAndCapsTotalDelay() {
+        var backoff = AggregateEventStreamBackoff()
+
+        XCTAssertEqual(
+            (0..<7).map { _ in
+                backoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 0)
+            },
+            [1, 2, 4, 8, 16, 30, 30])
+        XCTAssertEqual(
+            backoff.delayAfterDisconnect(streamWasHealthy: false, jitterFraction: 1),
+            30)
+        XCTAssertEqual(
+            backoff.delayAfterDisconnect(streamWasHealthy: true, jitterFraction: 0),
+            1)
+        XCTAssertEqual(backoff.baseDelay, 2)
     }
 
     func testForegroundAttentionSeedInvalidatesBackgroundEvidenceGeneration() {
