@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
-import { api } from '../api';
+import { api, ConflictError } from '../api';
 import type { ProductConversationSnapshotView } from '../api';
 import type { AssociatedPrSummaryResponse, PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
