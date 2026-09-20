@@ -44,7 +44,11 @@ impl SvgPresentationMetadata {
 }
 
 fn valid_text(value: &str, max: usize) -> bool {
-    !value.trim().is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
+    !value
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+        .is_empty()
+        && value.chars().count() <= max
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -96,5 +100,19 @@ mod tests {
             assert!(SvgPresentationMetadata::new(&text, "Description").is_err());
             assert!(SvgPresentationMetadata::new("Title", &text).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_bom_only_text_but_preserves_bom_with_visible_text() {
+        assert!(!"\u{feff}".trim().is_empty());
+        for blank in ["\u{feff}", " \u{feff}\u{a0}\u{feff} "] {
+            assert!(SvgPresentationMetadata::new(blank, "Description").is_err());
+            assert!(SvgPresentationMetadata::new("Title", blank).is_err());
+        }
+        let title = "\u{feff}Title\u{feff}";
+        let description = " \u{feff}Description\u{feff} ";
+        let metadata = SvgPresentationMetadata::new(title, description).unwrap();
+        assert_eq!(metadata.title(), title);
+        assert_eq!(metadata.description(), description);
     }
 }
