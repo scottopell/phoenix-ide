@@ -1684,6 +1684,10 @@ where
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
     coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
+    previous_transcripts: Option<(
+        crate::api::global_read::GlobalReadService,
+        crate::api::global_read::PreviousTranscriptsBinding,
+    )>,
     /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
     /// Static for the conversation's tool set, so it is computed once and only
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
@@ -1987,6 +1991,7 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             coordinator_read_service: None,
+            previous_transcripts: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
@@ -2167,6 +2172,15 @@ where
         service: crate::api::global_read::GlobalReadService,
     ) -> Self {
         self.coordinator_read_service = Some(service);
+        self
+    }
+
+    pub(crate) fn with_previous_transcripts(
+        mut self,
+        service: crate::api::global_read::GlobalReadService,
+        binding: crate::api::global_read::PreviousTranscriptsBinding,
+    ) -> Self {
+        self.previous_transcripts = Some((service, binding));
         self
     }
 
@@ -6970,6 +6984,7 @@ where
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
         let coordinator_read_service = self.coordinator_read_service.clone();
+        let previous_transcripts = self.previous_transcripts.clone();
         let explore_bash = self.context.explore_bash;
         let request_tool_surface = tool_surface;
 
@@ -7054,6 +7069,14 @@ where
                 None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
             };
             system.push(SystemContent::new(capsule));
+        }
+        if let Some((service, binding)) = previous_transcripts {
+            let orientation =
+                Box::pin(async move { service.previous_transcripts_orientation(&binding).await })
+                    .await;
+            if let Some(capsule) = orientation {
+                system.push(SystemContent::new(capsule));
+            }
         }
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = LlmRequest {

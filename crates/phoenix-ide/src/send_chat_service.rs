@@ -67,8 +67,55 @@ pub(crate) enum SendChatServiceError {
     Busy,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
+    #[error("message_id produces a persisted identity longer than 256 UTF-8 bytes")]
+    MessageIdTooLong,
     #[error("conversation is permanently unavailable in History")]
     HistoryUnavailable,
+}
+
+fn persisted_message_id(req: &SendChatRequest) -> String {
+    format!("{}:{}", req.conversation_id, req.message_id)
+}
+
+async fn validate_direct_message_identity(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(), SendChatServiceError> {
+    if message_id.len() <= 256 {
+        return Ok(());
+    }
+    let legacy_allowed = db
+        .is_legacy_direct_message_id(conversation_id, message_id)
+        .await
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    legacy_allowed
+        .then_some(())
+        .ok_or(SendChatServiceError::MessageIdTooLong)
+}
+
+async fn validate_steering_message_identity(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(), SendChatServiceError> {
+    if message_id.len() <= 256 {
+        return Ok(());
+    }
+    let legacy_allowed = db
+        .is_legacy_steering_message_id(conversation_id, message_id)
+        .await
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    legacy_allowed
+        .then_some(())
+        .ok_or(SendChatServiceError::MessageIdTooLong)
+}
+
+async fn validate_persisted_message_id(
+    db: &crate::db::Database,
+    req: &SendChatRequest,
+) -> Result<(), SendChatServiceError> {
+    validate_direct_message_identity(db, &req.conversation_id, &persisted_message_id(req)).await
 }
 
 #[derive(Clone)]
@@ -227,6 +274,8 @@ impl SendChatApplicationService {
                 }
             }
 
+            validate_steering_message_identity(&self.db, &req.conversation_id, &req.message_id)
+                .await?;
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
                 llm_text: expanded.llm_text,
@@ -269,6 +318,7 @@ impl SendChatApplicationService {
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
 
+        validate_persisted_message_id(&self.db, &req).await?;
         let images = map_images(req.images);
         let delivery = PreparedDirectTurnDelivery {
             text: expanded.display_text.clone(),
@@ -937,10 +987,11 @@ mod tests {
     use super::{
         active_turn_fences_direct_acceptance, close_admission_fenced_outcome,
         lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
-        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
+        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance, persisted_message_id,
         persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
-        submitted_identity_from_request, DurableReplayOutcome, MessageExpansionPolicy,
-        SendChatOutcome, SendChatRequest, SendChatServiceError,
+        submitted_identity_from_request, validate_direct_message_identity,
+        validate_persisted_message_id, validate_steering_message_identity, DurableReplayOutcome,
+        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
@@ -956,6 +1007,81 @@ mod tests {
         AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
         ProcessIncarnation, Timestamp, TurnAuthorityId, TurnConflict, TurnOutcome,
     };
+
+    #[test]
+    fn persisted_message_identity_counts_derived_utf8_bytes() {
+        let mut req = request();
+        req.message_id = "m".repeat(256 - req.conversation_id.len() - 1);
+        assert_eq!(persisted_message_id(&req).len(), 256);
+
+        req.message_id.push('m');
+        assert_eq!(persisted_message_id(&req).len(), 257);
+    }
+
+    #[tokio::test]
+    async fn steering_identity_validates_raw_id_not_direct_turn_derivation() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let mut req = request();
+        req.message_id = "m".repeat(250);
+
+        assert!(
+            validate_direct_message_identity(&db, &req.conversation_id, &req.message_id)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_persisted_message_id(&db, &req).await,
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_message_identity_allows_only_live_legacy_owner() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let mut req = request();
+        req.message_id = "m".repeat(257);
+        let canonical = persisted_message_id(&req);
+        db.create_conversation(
+            &req.conversation_id,
+            "legacy-owner",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            validate_persisted_message_id(&db, &req).await,
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
+
+        sqlx::query(
+            "INSERT INTO steering_messages
+                (message_id, conversation_id, ordinal, text)
+             VALUES (?1, ?2, 0, 'legacy')",
+        )
+        .bind(&canonical)
+        .bind(&req.conversation_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            validate_steering_message_identity(&db, &req.conversation_id, &canonical)
+                .await
+                .is_ok()
+        );
+        sqlx::query("DELETE FROM steering_messages WHERE message_id = ?1")
+            .bind(&canonical)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            validate_steering_message_identity(&db, &req.conversation_id, &canonical).await,
+            Err(SendChatServiceError::MessageIdTooLong)
+        ));
+    }
 
     fn request() -> SendChatRequest {
         SendChatRequest {

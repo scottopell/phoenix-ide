@@ -14,10 +14,13 @@
 //! fresh run with no memory of prior Q&A (REQ-CHN-006). The Q&A row is
 //! persisted through its lifecycle (`in_flight` → `completed` | `failed`).
 
+use crate::api::global_read::GlobalReadService;
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
+#[cfg(test)]
+use crate::db::MessageType;
 use crate::db::{
     ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageRetriever,
-    MessageType, NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
+    NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
 };
 use chrono::Utc;
 use phoenix_llm::{
@@ -36,20 +39,14 @@ const MAX_QA_TURNS: usize = 6;
 
 /// Maximum tool calls actually executed in one planning turn. Providers may
 /// batch parallel tool calls in a single assistant message; without a cap a
-/// batch of `read_conversation`s could inject (batch × [`READ_PAGE_CHARS`])
-/// into the next turn, defeating the per-page budget. Calls beyond the cap get
+/// batch of `read_conversation`s could inject several host-bounded pages into
+/// the next turn, defeating the aggregate prompt budget. Calls beyond the cap get
 /// a "skipped" tool result (every `tool_use` must still be answered to keep the
 /// request valid) so the model re-requests fewer.
 const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 
 /// How many ranked chunks `search_conversations` returns per call.
 const SEARCH_TOP_K: usize = 8;
-
-/// Host-fixed budget (in characters) for one `read_conversation` page
-/// (REQ-RET-008): the model cannot enlarge it, so a single read can never
-/// overflow the next turn's context. Continuation is by character offset, so
-/// the bound holds even within one oversized message.
-const READ_PAGE_CHARS: usize = 6000;
 
 /// Maximum tokens cap for an answer turn. Sized to a typical recall answer;
 /// the model can stop earlier via `end_turn`.
@@ -635,16 +632,37 @@ impl ChainQa {
                         true,
                     );
                 }
-                let cursor = usize::try_from(
-                    input
-                        .get("cursor")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                )
-                .unwrap_or(0);
-                match self.db.get_messages(conv_id).await {
-                    Ok(msgs) => (read_page(&msgs, cursor), false),
-                    Err(e) => (format!("error: read failed: {e}"), true),
+                let cursor = match input.get("cursor") {
+                    None => None,
+                    Some(serde_json::Value::String(cursor)) => Some(cursor.as_str()),
+                    Some(serde_json::Value::Number(_)) => {
+                        return (
+                            "error: numeric read_conversation cursors are no longer accepted; restart this read without a cursor"
+                                .to_string(),
+                            true,
+                        )
+                    }
+                    Some(_) => {
+                        return (
+                            "error: unsupported read_conversation cursor type; restart this read without a cursor"
+                                .to_string(),
+                            true,
+                        )
+                    }
+                };
+                let Some(root_id) = member_ids.first() else {
+                    return (
+                        "error: chain has no readable conversations".to_string(),
+                        true,
+                    );
+                };
+                let service = GlobalReadService::new(self.db.clone(), self.retriever.clone());
+                match service
+                    .read_chain_conversation(root_id, conv_id, cursor)
+                    .await
+                {
+                    Ok(page) => (page, false),
+                    Err(e) => (format!("error: {e}"), true),
                 }
             }
             other => (format!("error: unknown tool '{other}'"), true),
@@ -837,8 +855,8 @@ fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
                     "description": "A conversation id from the chain skeleton or a search result."
                 },
                 "cursor": {
-                    "type": "integer",
-                    "description": "Resume offset returned by a previous read_conversation page; omit to start at the beginning."
+                    "type": "string",
+                    "description": "Opaque versioned cursor returned by a previous read_conversation page; omit to start at the beginning. Numeric cursors are rejected."
                 }
             },
             "required": ["conversation_id"]
@@ -864,48 +882,9 @@ fn format_search_hits(hits: &[RetrievedChunk]) -> String {
     out
 }
 
-/// Return one host-budgeted page of a conversation's full transcript starting
-/// at character `cursor`. The budget is fixed by the host ([`READ_PAGE_CHARS`],
-/// REQ-RET-008); paging by character offset bounds the page even within one
-/// oversized message.
-fn read_page(messages: &[Message], cursor: usize) -> String {
-    let end = cursor.saturating_add(READ_PAGE_CHARS);
-    let mut out = String::new();
-    let mut pos = 0usize; // char offset into the full (non-hidden) transcript
-    let mut has_more = false;
-    'outer: for m in messages {
-        if message_is_hidden(m) {
-            continue;
-        }
-        // Render one message at a time and copy only the window chars, so a
-        // multi-message transcript is never fully materialized; stop as soon as
-        // the page is filled (the next char proves there's more).
-        for ch in render_message_line(m).chars() {
-            if pos >= end {
-                has_more = true;
-                break 'outer;
-            }
-            if pos >= cursor {
-                out.push(ch);
-            }
-            pos += 1;
-        }
-    }
-    // `pos` is now the total transcript length (unless we stopped early).
-    if out.is_empty() && !has_more {
-        return "(end of conversation)".to_string();
-    }
-    if has_more {
-        format!("{out}\n[… more content; call read_conversation again with cursor={end}]")
-    } else {
-        out
-    }
-}
-
 /// Render a whole conversation transcript by concatenating
-/// [`render_message_line`] over non-hidden messages. The production read path
-/// ([`read_page`]) streams the window incrementally instead; this materializes
-/// the full transcript and is used only to assert rendering in tests.
+/// [`render_message_line`] over non-hidden messages. This materializes the full
+/// transcript and is used only to assert chain-specific rendering in tests.
 #[cfg(test)]
 fn render_full_transcript(messages: &[Message]) -> String {
     let mut out = String::new();
@@ -922,8 +901,9 @@ fn render_full_transcript(messages: &[Message]) -> String {
 }
 
 /// Render one (non-hidden) message as a `"Label: body\n"` line for the read
-/// path. Factored out so [`read_page`] can stream the transcript a message at a
-/// time without materializing the whole thing.
+/// path. Factored out so tests can assert chain-specific rendering independently
+/// of the shared bounded read engine.
+#[cfg(test)]
 fn render_message_line(m: &Message) -> String {
     let label = match m.message_type {
         MessageType::User => "User",
@@ -1011,6 +991,7 @@ fn render_message_line(m: &Message) -> String {
 /// dismissed-error/question recovery markers. Mirrors the index extractor's
 /// hidden guard so the read path and the search index agree on what content
 /// is user-visible.
+#[cfg(test)]
 fn message_is_hidden(m: &Message) -> bool {
     m.display_data
         .as_ref()

@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies a transparent bounded relational snapshot on every Coordinator turn. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
+Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies a transparent bounded relational snapshot on every Coordinator turn. The Coordinator receives bounded natural-language history search, conversation reading, read-only operational SQLite, singular cross-conversation messaging, and stable reference resolution. Ordinary parents receive only the separately bound predecessor-recall tools.
 
 The Coordinator has two host capabilities that can perform mutations: singular text-message delivery to an existing non-Coordinator conversation, and unsandboxed Bash targeted to an explicit active WorkScope. A Coordinator-only built-in skill documents supported Phoenix HTTP APIs for user-authorized lifecycle actions through scoped Bash. Those calls preserve normal API authorization and require response plus resulting-state verification. Message delivery reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, executed, or completed the instruction.
 
@@ -14,12 +14,11 @@ Coordinator LLM requests keep the stable language-specific prompt as their cache
 
 The host-bound `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI. The shipped snapshot and database still expose legacy project-named rows and fields; normative orientation now identifies ProductConversation and WorkScope, with repository context derived through WorkScope rather than a Project grouping. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
 
-Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. Durable reference resolution remains Coordinator-only. Restricted planning conversations and sub-agents receive none of these global tools. Coordinator also receives unsandboxed Bash with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. The Coordinator registry remains builtin-only and excludes ambient/default filesystem access, browser, MCP, task, repository, workspace, conversation creation, approval, and lifecycle mutation tools.
+Natural-language global message search, global transcript reads, read-only database access, cross-conversation messaging, and durable reference resolution remain Coordinator-only. Ordinary parents receive scoped predecessor search/read tools, not Phoenix-wide tools. Restricted planning conversations and sub-agents receive no global tools. Coordinator also receives unsandboxed Bash with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. The Coordinator registry remains builtin-only and excludes ambient/default filesystem access, browser, MCP, task, repository, workspace, conversation creation, approval, and lifecycle mutation tools.
 
 The separately specified ordinary-parent predecessor capability (REQ-RET-009,
-ADR-051) does not grant global authority to restricted planning parents. It is
-not implemented; its status and delivery task live in the conversation-retrieval
-executive summary.
+ADR-051) does not grant global authority. Ordinary parents receive only scoped
+predecessor discovery, search, and read tools.
 
 ## Status Summary
 
@@ -31,7 +30,7 @@ executive summary.
 | **REQ-GR-004:** Provide Bounded Read-Only Relational Queries | ✅ Complete | Engine-authorized one-statement SQLite reads have work, row, and byte budgets |
 | **REQ-GR-005:** Provide Stable References and App-Local Links | 🟡 Partial | Existing work, chain, conversation, and message references remain resolvable; typed ProductConversation/transcript domains and chain-alias normalization remain migration targets. |
 | **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` resolves the singleton through the standard runtime and UI |
-| **REQ-GR-007:** Bound Phoenix-Wide Agent Capabilities | ✅ Complete | Write-capable ordinary ProductConversations and Coordinator share bounded database/history reads and singular messaging; reference resolution and unsandboxed, WorkScope-targeted Bash remain Coordinator-only |
+| **REQ-GR-007:** Bound Phoenix-Wide Agent Capabilities | ✅ Complete | Coordinator retains global database/history/reference/message tools; ordinary parents receive only host-bound predecessor recall |
 | **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Transcript reads expose citation metadata and the prompt requires stable citations |
 | **REQ-GR-009:** Resolve Durable Targets Without Guessing | 🟡 Partial | Existing resolution supports work/conversation handles and links; typed ProductConversation/transcript domains and ambiguous-bare-ID rejection remain migration targets. |
 | **REQ-GR-010:** Keep the Coordinator Surface Chat-Only | ✅ Complete | `/global` mounts only the shared conversation runtime and inline briefing action |

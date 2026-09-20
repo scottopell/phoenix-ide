@@ -1121,6 +1121,28 @@ impl ToolRegistry {
             .try_with_writing_conversation_tools(tools)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the registry already contains a tool with this name.
+    pub fn try_with_host_bound_tool(mut self, tool: Arc<dyn Tool>) -> Result<Self, String> {
+        self.try_add_host_bound_tool(tool)?;
+        Ok(self)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the registry already contains a tool with this name.
+    pub fn try_add_host_bound_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.name();
+        if self.tools.iter().any(|existing| existing.name() == name) {
+            return Err(format!(
+                "tool registry already contains host-bound capability {name}"
+            ));
+        }
+        self.tools.push(tool);
+        Ok(())
+    }
+
     /// Add `propose_task` to a Git-backed parent registry. The full-write
     /// constructor uses this to retain the blocking task-review capability
     /// alongside unrestricted writing tools (REQ-PROJ-033/036).

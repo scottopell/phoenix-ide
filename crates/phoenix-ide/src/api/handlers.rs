@@ -2321,6 +2321,12 @@ async fn create_conversation_with_id(
         }
     }
 
+    if req.message_id.len() > 256 {
+        return Err(AppError::BadRequest(
+            "message_id must not exceed 256 UTF-8 bytes".to_string(),
+        ));
+    }
+
     if state.llm_registry.get(&req.model).is_none() {
         let available = state.llm_registry.available_models().join(", ");
         return Err(AppError::BadRequest(format!(
@@ -4605,6 +4611,12 @@ async fn send_chat(
                     "message_id was already used for a different target or payload".to_string(),
                     "idempotency_conflict",
                 )))
+            }
+            crate::send_chat_service::SendChatServiceError::MessageIdTooLong => {
+                AppError::BadRequest(
+                    "message_id produces a persisted identity longer than 256 UTF-8 bytes"
+                        .to_string(),
+                )
             }
             crate::send_chat_service::SendChatServiceError::Internal(message) => {
                 AppError::Internal(message)

@@ -60,8 +60,9 @@ pub use product_conversation_read::{
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
-    RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
+    ChunkRef, FreshRetrieval, FreshRetrievalRequest, Fts5Retriever, MessageRetriever,
+    ReconcileStats, RetrievalError, RetrievalGrouping, RetrievalMatchMode, RetrievalRequest,
+    RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
 pub use sqlite_workload::{
@@ -8006,6 +8007,15 @@ impl Database {
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
+        if let Some(intent) = intent {
+            let persisted_message_id = format!("{new_id}:{}", intent.message_id.as_str());
+            if persisted_message_id.len() > 256 {
+                return Err(DbError::ContinuationPrecondition(
+                    "continuation message_id produces a persisted identity longer than 256 UTF-8 bytes"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Sequential slug: walk to chain root, count existing members, then
         // assign `{root_slug}-{N}` where N = member_count + 1 (e.g. root-only
@@ -10364,7 +10374,22 @@ impl Database {
         let (content, display_data) = build_sub_agent_fan_in(results);
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(tool_id);
+            let legacy_message_id = format!("{tool_id}-result");
+            let message_id = if sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages
+                     WHERE conversation_id = ?1 AND message_id = ?2
+                 )",
+            )
+            .bind(conversation_id)
+            .bind(&legacy_message_id)
+            .fetch_one(&mut *tx)
+            .await?
+            {
+                legacy_message_id
+            } else {
+                tool_result_message_id(tool_id)
+            };
             let stored_content = serde_json::to_string(
                 &MessageContent::tool(tool_id, content, false).to_stored_json(),
             )
@@ -11664,6 +11689,168 @@ impl Database {
         rows.reverse();
         hydrate_attachments(&self.pool, &mut rows).await?;
         Ok(rows)
+    }
+
+    /// Returns whether a live durable direct-turn owner in this conversation
+    /// permits materializing an oversized message ID.
+    ///
+    /// # Errors
+    /// Returns an error if the owner relations cannot be queried.
+    pub async fn is_legacy_direct_message_id(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM durable_turns
+                 WHERE conversation_id = ?1
+                   AND COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key) = ?2
+                 UNION ALL
+                 SELECT 1 FROM conversation_creation_jobs
+                 WHERE conversation_id = ?1 AND message_id = ?2
+                 UNION ALL
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE successor_conversation_id = ?1
+                   AND (message_id = ?2 OR successor_conversation_id || ':' || message_id = ?2)
+             )",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a live steering owner in this conversation permits
+    /// materializing an oversized raw steering message ID.
+    ///
+    /// # Errors
+    /// Returns an error if the steering owner relation cannot be queried.
+    pub async fn is_legacy_steering_message_id(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_messages
+                 WHERE conversation_id = ?1 AND message_id = ?2
+             )",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a live pre-bound owner permits materializing an oversized message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner relations cannot be queried.
+    pub async fn is_legacy_oversized_message_id(&self, message_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_creation_jobs WHERE message_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM durable_turns
+                 WHERE COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key) = ?1
+                 UNION ALL
+                 SELECT 1 FROM steering_messages WHERE message_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE message_id = ?1
+                    OR successor_conversation_id || ':' || message_id = ?1
+             )",
+        )
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get the first messages in sequence order, capped by `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_messages_first_limited(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            let mut rows = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY sequence_id ASC
+                 LIMIT ?2",
+            )
+            .bind(conversation_id)
+            .bind(limit)
+            .try_map(parse_message_row)
+            .fetch_all(&self.pool)
+            .await?;
+
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Get the first message rows without hydrating attachment payloads.
+    /// Text-only bounded read renderers use this to avoid loading files/images
+    /// for messages that may not fit the current page.
+    ///
+    /// # Errors
+    /// Returns an error if the message query fails.
+    pub async fn get_message_rows_first_limited(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY sequence_id ASC
+             LIMIT ?2",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get message rows after a sequence without hydrating attachment payloads.
+    ///
+    /// # Errors
+    /// Returns an error if the message query fails.
+    pub async fn get_message_rows_after_limited(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id > ?2
+             ORDER BY sequence_id ASC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(after_sequence)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Get messages after a sequence ID, capped by `limit`.
@@ -13155,7 +13342,7 @@ async fn insert_conversation_tx(
 /// `tool_result_message_id`) so the restart-materialized result shares identity
 /// with the row the live path would have written: `{tool_use_id}-result`.
 fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
+    phoenix_core::domain::sm_event::persisted_tool_result_message_id(tool_use_id)
 }
 
 /// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring
@@ -23279,6 +23466,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(authority, "generated_predecessor_context");
+    }
+
+    #[tokio::test]
+    async fn oversized_continuation_identity_is_rejected_before_successor_commit() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "parent-oversized-intent",
+            "parent-oversized-intent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        let error = db
+            .continue_conversation_with_intent(
+                "parent-oversized-intent",
+                NewContinuationDispatchIntent::user_authorized(
+                    ClientTurnKey::try_from("m".repeat(256)).unwrap(),
+                    "handoff".to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DbError::ContinuationPrecondition(message)
+                if message.contains("longer than 256 UTF-8 bytes")
+        ));
+        let parent = db
+            .get_conversation("parent-oversized-intent")
+            .await
+            .unwrap();
+        assert!(parent.continued_in_conv_id.is_none());
+        assert!(db
+            .continuation_dispatch_intent("parent-oversized-intent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

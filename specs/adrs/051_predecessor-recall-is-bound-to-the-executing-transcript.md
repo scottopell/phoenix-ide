@@ -1,6 +1,6 @@
 # ADR-051: Predecessor recall is bound to the executing transcript
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-060
 - **Date:** 2026-09-12
 - **Affects:** REQ-RET-009, REQ-GR-007
 

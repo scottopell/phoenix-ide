@@ -5094,49 +5094,41 @@ impl RuntimeManager {
                     self.db.clone(),
                     self.message_retriever.clone(),
                 );
-                let send_chat =
-                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                        self.db.clone(),
-                        self.clone(),
-                    ));
-                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-                let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
-                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
+                let previous_binding = crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.as_str().to_string(),
+                    conv.id.clone(),
+                );
+                let host_bound_tools = crate::coordinator_tools::predecessor_host_bound_tools(
+                    global_read.clone(),
+                    previous_binding.clone(),
+                );
+                let registry = match conv.conv_mode {
+                    ConvMode::Explore { .. } if approved_task_objective.is_some() => {
+                        ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
+                    }
+                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                         ToolRegistry::explore(
                             &context.tasks_dir_name,
                             agent_catalog.to_vec(),
                             ExploreToolPolicy::from_platform(&self.platform),
-                        ),
-                        Some(writing_tools),
-                    ),
-                    ConvMode::Direct => (
-                        ToolRegistry::direct(agent_catalog.to_vec())
-                            .try_with_writing_conversation_tools(writing_tools)?,
-                        None,
-                    ),
+                        )
+                    }
+                    ConvMode::Direct => ToolRegistry::direct(agent_catalog.to_vec()),
                     ConvMode::Work { .. }
                     | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
+                    | ConvMode::DetachedApprovedTask { .. } => {
+                        // Full tool suite plus `propose_task` (non-blocking fork
+                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
+                        // history, so the tool is always offered.
+                        ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
+                    }
                 };
                 ToolRegistryExecutor::with_mcp(
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
                 )
-                .with_writing_tools(upgrade_writing_tools)
+                .with_predecessor_tools(host_bound_tools)
             }
         };
 
@@ -5241,6 +5233,20 @@ impl RuntimeManager {
                 self.db.clone(),
                 self.message_retriever.clone(),
             ))
+        } else {
+            runtime
+        };
+        let runtime = if !is_sub_agent && !is_coordinator {
+            runtime.with_previous_transcripts(
+                crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                ),
+                crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.as_str().to_string(),
+                    conv.id.clone(),
+                ),
+            )
         } else {
             runtime
         };

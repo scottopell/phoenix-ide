@@ -1132,7 +1132,7 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 // ============================================================================
 
 use crate::db::Database;
-use crate::tools::{ToolRegistry, WritingConversationTools};
+use crate::tools::ToolRegistry;
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
@@ -2159,8 +2159,8 @@ pub struct ToolRegistryExecutor {
     mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
-    writing_tools: Option<WritingConversationTools>,
     coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    predecessor_tools: Option<crate::coordinator_tools::PredecessorHostBoundTools>,
 }
 
 impl ToolRegistryExecutor {
@@ -2175,8 +2175,8 @@ impl ToolRegistryExecutor {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
             agent_catalog,
-            writing_tools: None,
             coordinator_skill_catalog: None,
+            predecessor_tools: None,
         }
     }
 
@@ -2192,8 +2192,8 @@ impl ToolRegistryExecutor {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),
             agent_catalog,
-            writing_tools: None,
             coordinator_skill_catalog: None,
+            predecessor_tools: None,
         }
     }
 
@@ -2207,8 +2207,24 @@ impl ToolRegistryExecutor {
     }
 
     #[must_use]
-    pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
-        self.writing_tools = tools;
+    pub fn with_predecessor_tools(
+        mut self,
+        tools: crate::coordinator_tools::PredecessorHostBoundTools,
+    ) -> Self {
+        {
+            let mut registry = self
+                .registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for tool in tools.iter() {
+                if registry.find_tool(tool.name()).is_none() {
+                    registry
+                        .try_add_host_bound_tool(tool)
+                        .expect("registry has no duplicate host-bound tool");
+                }
+            }
+        }
+        self.predecessor_tools = Some(tools);
         self
     }
 
@@ -2321,13 +2337,16 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        let registry = match self.writing_tools.clone() {
-            Some(tools) => {
-                ToolRegistry::git_backed_writing_parent(self.agent_catalog.to_vec(), tools)
-                    .expect("fresh Git-backed writing registry has no global writing capabilities")
+        let mut registry = ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task();
+        if let Some(tools) = &self.predecessor_tools {
+            for tool in tools.iter() {
+                if registry.find_tool(tool.name()).is_none() {
+                    registry = registry
+                        .try_with_host_bound_tool(tool)
+                        .expect("fresh Work registry has no predecessor capability");
+                }
             }
-            None => ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task(),
-        };
+        }
         self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Git-backed writing mode");
     }
@@ -2340,16 +2359,19 @@ mod tool_registry_executor_tests {
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
-    struct NamedMarker(&'static str);
+    struct NamedMarker {
+        name: &'static str,
+        description: &'static str,
+    }
 
     #[async_trait]
     impl Tool for NamedMarker {
         fn name(&self) -> &'static str {
-            self.0
+            self.name
         }
 
         fn description(&self) -> String {
-            "test marker".to_string()
+            self.description.to_string()
         }
 
         fn input_schema(&self) -> Value {
@@ -2361,8 +2383,41 @@ mod tool_registry_executor_tests {
         }
     }
 
+    async fn assert_predecessor_tool_definitions(executor: &ToolRegistryExecutor) {
+        let definitions = executor.definitions().await;
+        for name in [
+            "previous_transcripts",
+            "search_conversations",
+            "read_conversation",
+        ] {
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|definition| definition.name == name)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|definition| definition.name == "search_conversations")
+                .unwrap()
+                .description,
+            "predecessor scoped search"
+        );
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|definition| definition.name == "read_conversation")
+                .unwrap()
+                .description,
+            "predecessor scoped read"
+        );
+    }
+
     #[tokio::test]
-    async fn explore_upgrade_preserves_writing_tools_and_propose_task() {
+    async fn explore_upgrade_preserves_scoped_predecessor_tools_without_global_authority() {
         let executor = ToolRegistryExecutor::builtin_only(
             ToolRegistry::explore(
                 "tasks",
@@ -2375,22 +2430,54 @@ mod tool_registry_executor_tests {
             ),
             Arc::from(Vec::new()),
         )
-        .with_writing_tools(Some(
-            WritingConversationTools::new(
-                Arc::new(NamedMarker("search_conversations")),
-                Arc::new(NamedMarker("read_conversation")),
-                Arc::new(NamedMarker("query_database")),
-                Arc::new(NamedMarker("send_conversation_message")),
-            )
-            .unwrap(),
-        ));
+        .with_predecessor_tools(crate::coordinator_tools::PredecessorHostBoundTools {
+            tools: [
+                Arc::new(NamedMarker {
+                    name: "previous_transcripts",
+                    description: "predecessor list",
+                }),
+                Arc::new(NamedMarker {
+                    name: "search_conversations",
+                    description: "predecessor scoped search",
+                }),
+                Arc::new(NamedMarker {
+                    name: "read_conversation",
+                    description: "predecessor scoped read",
+                }),
+            ],
+        });
 
-        assert!(!executor
+        assert!(executor
             .definitions()
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "read_conversation"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
+        let explore_names = executor
+            .definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!explore_names.iter().any(|name| name == "query_database"));
+        assert!(!explore_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
         executor.upgrade_to_work_mode();
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "read_conversation"));
         assert!(executor
             .definitions()
             .await
@@ -2401,6 +2488,22 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "propose_task"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
+        let work_names = executor
+            .definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!work_names.iter().any(|name| name == "query_database"));
+        assert!(!work_names
+            .iter()
+            .any(|name| name == "send_conversation_message"));
+        assert_predecessor_tool_definitions(&executor).await;
     }
 }
 
