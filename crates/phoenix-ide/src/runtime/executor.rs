@@ -1940,6 +1940,7 @@ where
 #[derive(Debug)]
 enum FollowUpApprovalError {
     BeforeGit(String),
+    PersistenceFailed(String),
     AuthorityLost(String),
 }
 
@@ -8588,7 +8589,7 @@ where
                 state_updated_at,
             )
             .await
-            .map_err(FollowUpApprovalError::AuthorityLost)?;
+            .map_err(FollowUpApprovalError::PersistenceFailed)?;
         if matches!(
             establishment,
             crate::db::LocalAuthorityResult::DurableFactUnclassified
@@ -8598,8 +8599,8 @@ where
                 "approval authority establishment is unclassified".to_string(),
             ));
         }
-        self.state = approved_state;
-        self.state_updated_at = state_updated_at;
+        self.install_live_state(approved_state, state_updated_at, true)
+            .map_err(FollowUpApprovalError::AuthorityLost)?;
 
         let _ = self
             .broadcast_tx
@@ -8694,12 +8695,15 @@ where
                     )?;
                     Err(error)
                 }
-                Err(FollowUpApprovalError::AuthorityLost(error)) => {
+                Err(FollowUpApprovalError::PersistenceFailed(error)) => {
                     self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                     Err(format!(
-                        "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
+                        "follow-up approval persistence failed after Git mutation; recreate actor from database: {error}"
                     ))
                 }
+                Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
+                )),
             };
         }
         if matches!(
@@ -8833,8 +8837,7 @@ where
                     admitted.close("task_approval_authority_establishment");
                     return Err("approval authority establishment is unclassified".to_string());
                 }
-                self.state = approved_state;
-                self.state_updated_at = state_updated_at;
+                self.install_live_state(approved_state, state_updated_at, true)?;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Upgrade tool registry from Explore to Work mode so the agent
@@ -15833,7 +15836,7 @@ mod approved_explore_follow_up_tests {
             .await
             .expect_err("post-Git persistence failure must retire actor");
 
-        assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+        assert!(error.starts_with("follow-up approval persistence failed after Git mutation"));
         assert_eq!(
             runtime.recovery_disposition,
             RuntimeRecoveryDisposition::RecreateFromDatabase

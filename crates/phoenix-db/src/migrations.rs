@@ -10453,6 +10453,18 @@ CREATE TABLE approval_request_obligations (
     FOREIGN KEY (conversation_id, approval_message_id)
         REFERENCES messages(conversation_id, message_id) ON DELETE CASCADE
 );
+INSERT OR IGNORE INTO approval_request_obligations
+    (conversation_id, approval_message_id, created_at_us)
+SELECT c.id, m.message_id, CAST(strftime('%s', m.created_at) AS INTEGER) * 1000000
+FROM conversations c
+JOIN messages m ON m.conversation_id = c.id
+WHERE c.state_kind = 'llm_requesting'
+  AND m.message_type = 'user'
+  AND json_extract(m.content, '$.User.is_meta') = 1
+  AND json_extract(m.content, '$.User.text') LIKE 'Task approved%'
+  AND m.sequence_id = (
+      SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
+  );
 CREATE TRIGGER approval_request_obligation_after_agent_response
 AFTER INSERT ON messages
 WHEN NEW.message_type = 'agent'
@@ -10833,20 +10845,46 @@ mod tests {
     async fn migration_104_binds_approval_message_to_conversation() {
         let pool = test_pool().await;
         sqlx::raw_sql(
-            "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 state_kind TEXT NOT NULL DEFAULT 'idle'
+             );
              CREATE TABLE messages (
                  message_id TEXT PRIMARY KEY,
-                 conversation_id TEXT NOT NULL REFERENCES conversations(id)
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL DEFAULT 'user',
+                 sequence_id INTEGER NOT NULL DEFAULT 1,
+                 content TEXT NOT NULL DEFAULT '{}',
+                 created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
              );
              CREATE UNIQUE INDEX messages_conversation_message_id_unique
                  ON messages(conversation_id, message_id);
-             INSERT INTO conversations VALUES ('a'), ('b');
-             INSERT INTO messages VALUES ('approval', 'b');",
+             INSERT INTO conversations (id) VALUES ('a'), ('b');
+             INSERT INTO conversations (id, state_kind) VALUES ('legacy', 'llm_requesting');
+             INSERT INTO messages (message_id, conversation_id) VALUES ('approval', 'b');
+             INSERT INTO messages
+                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
+             VALUES
+                 ('legacy-approval', 'legacy', 'user', 7,
+                  '{\"User\":{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}}',
+                  '2025-01-01T00:00:00Z');",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::raw_sql(MIGRATION_104).execute(&pool).await.unwrap();
+        let legacy_obligation = sqlx::query_as::<_, (String, String)>(
+            "SELECT conversation_id, approval_message_id
+             FROM approval_request_obligations
+             WHERE conversation_id = 'legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy_obligation,
+            ("legacy".to_string(), "legacy-approval".to_string())
+        );
 
         assert!(sqlx::query(
             "INSERT INTO approval_request_obligations

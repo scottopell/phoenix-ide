@@ -89,11 +89,27 @@ impl ExploreReadOnlyPolicy {
                 "working directory is outside the inherited worktree",
             ));
         }
-        let scratch_dir = worktree_root
-            .join(".phoenix-bash-scratch")
-            .join(uuid::Uuid::new_v4().to_string());
+        let scratch_root = worktree_root.join(".phoenix").join("bash-scratch");
+        std::fs::create_dir_all(&scratch_root)?;
+        let canonical_scratch_root = scratch_root.canonicalize()?;
+        if !canonical_scratch_root.starts_with(&worktree_root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sandbox scratch resolves outside the inherited worktree",
+            ));
+        }
+        let scratch_dir = canonical_scratch_root.join(uuid::Uuid::new_v4().to_string());
         let platform_temp = scratch_dir.join("platform-temp");
         std::fs::create_dir_all(&platform_temp)?;
+        if !platform_temp
+            .canonicalize()?
+            .starts_with(&canonical_scratch_root)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "sandbox temp resolves outside the inherited worktree",
+            ));
+        }
         Ok(Self {
             repo_root,
             scratch_dir,
@@ -432,6 +448,24 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_policy_rejects_symlinked_scratch_root() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let outside = tempfile::TempDir::new().expect("outside");
+        std::fs::create_dir(worktree.path().join(".phoenix")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            worktree.path().join(".phoenix/bash-scratch"),
+        )
+        .unwrap();
+
+        assert!(
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path(),)
+                .is_err()
+        );
+    }
 
     #[test]
     fn worktree_child_env_preserves_network_routing_allowlist() {

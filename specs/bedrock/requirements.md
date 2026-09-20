@@ -143,11 +143,14 @@ THE SYSTEM SHALL configure tools to operate within the conversation's worktree d
 AND enable file-write tools within that worktree
 AND allow bash commands that read and write files within that worktree
 
-WHEN a tool with write authority attempts to write outside the worktree directory
+WHEN an attached Work sub-agent attempts to write outside the inherited worktree directory
 THE SYSTEM SHALL block the write
 AND return a descriptive error
 
-**Rationale:** Write authority is scoped to the disposable worktree, not to the whole filesystem and not to a lifecycle mode name. This preserves isolation without requiring a separate writing lifecycle label as a product concept.
+WHEN an owning WorkScope conversation requires Git common-directory, build-output, generated-output, or normal tool-cache writes to execute its approved objective
+THE SYSTEM SHALL allow those bounded external writes subject to operating-system permissions and command safety checks
+
+**Rationale:** An attached child is confined to its inherited disposable worktree. The owning conversation retains the bounded external write capabilities required to operate that worktree and its toolchain without making lifecycle mode names the authority source.
 
 ---
 

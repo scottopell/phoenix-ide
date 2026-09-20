@@ -492,13 +492,11 @@ invariant OneWorkSubAgentPerParent {
 -- guarantees that sub-agent writes cannot escape the parent's
 -- isolation boundary.
 --
--- Work sub-agents spawned from a Direct parent are out of scope here:
--- Direct mode has no worktree to scope against, and Direct's writes are
--- unscoped by design (see REQ-PROJ-007's
--- `parent.mode in { work, branch }` precondition). Explore sub-agents
--- are read-only, so escape-via-cwd is not a write-safety concern.
+-- Direct mode has no worktree to scope against and remains unscoped by design.
+-- Every write-capable sub-agent whose parent owns a worktree, including one from
+-- an approved Explore-origin parent, stays within that inherited worktree.
 invariant WorkSubAgentCwdInsideWorktree {
-    for sa in SubAgents where sa.execution_authority = write_capable and sa.parent.mode in { work, branch }:
+    for sa in SubAgents where sa.execution_authority = write_capable and sa.parent.worktree_path != absent:
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 
