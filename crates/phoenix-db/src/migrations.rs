@@ -656,7 +656,7 @@ WHEN EXISTS (
       AND (
           (intent.opening_authority = 'generated_predecessor_context'
            AND NEW.message_type = 'continuation'
-           AND json_extract(NEW.content, '$.summary') = intent.handoff)
+           AND NEW.content = json_object('summary', intent.handoff))
           OR (intent.opening_authority = 'user_authorized_instruction'
               AND NEW.message_type = 'user'
               AND json_extract(NEW.content, '$.text') = intent.handoff)
@@ -679,7 +679,7 @@ BEGIN
       AND (
           (intent.opening_authority = 'generated_predecessor_context'
            AND NEW.message_type = 'continuation'
-           AND json_extract(NEW.content, '$.summary') = intent.handoff)
+           AND NEW.content = json_object('summary', intent.handoff))
           OR (intent.opening_authority = 'user_authorized_instruction'
               AND NEW.message_type = 'user'
               AND json_extract(NEW.content, '$.text') = intent.handoff)
@@ -694,7 +694,7 @@ BEGIN
       AND (
           (opening_authority = 'generated_predecessor_context'
            AND NEW.message_type = 'continuation'
-           AND json_extract(NEW.content, '$.summary') = handoff)
+           AND NEW.content = json_object('summary', handoff))
           OR (opening_authority = 'user_authorized_instruction'
               AND NEW.message_type = 'user'
               AND json_extract(NEW.content, '$.text') = handoff)
