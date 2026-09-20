@@ -255,11 +255,15 @@ struct AggregateEventStreamBackoff {
             baseDelay = 1
         }
         let boundedBase = min(baseDelay, Self.maximumDelay)
-        let jitter = min(
-            boundedBase * 0.3 * min(max(jitterFraction, 0), 1),
-            Self.maximumDelay - boundedBase)
+        let boundedFraction = min(max(jitterFraction, 0), 1)
+        let delay: TimeInterval
+        if boundedBase == Self.maximumDelay {
+            delay = boundedBase * (0.7 + 0.3 * boundedFraction)
+        } else {
+            delay = min(boundedBase * (1 + 0.3 * boundedFraction), Self.maximumDelay)
+        }
         baseDelay = min(boundedBase * 2, Self.maximumDelay)
-        return boundedBase + jitter
+        return delay
     }
 }
 
@@ -1736,10 +1740,11 @@ final class AppModel {
 
     nonisolated static func removedAggregateIds(
         authoritative: [Conversation],
-        locallyOwned: Set<String>
+        locallyOwned: Set<String>,
+        preserving preservedIds: Set<String> = []
     ) -> Set<String> {
         let authoritativeIds = Set(authoritative.lazy.map(\.aggregateIdentity))
-        return locallyOwned.subtracting(authoritativeIds)
+        return locallyOwned.subtracting(authoritativeIds).subtracting(preservedIds)
     }
 
     @discardableResult
@@ -1819,7 +1824,13 @@ final class AppModel {
               connectivity.isOnline,
               isForeground
         else { return false }
-        return listStore.applyExternal(fresh, startedAt: token)
+        let provisioningShells = listStore.conversations.filter {
+            ConversationState.parse($0.state).isProvisioningCreationShell
+        }
+        return listStore.applyExternal(
+            fresh,
+            preserving: provisioningShells,
+            startedAt: token)
     }
 
     private func seedForegroundAttention() {
@@ -1862,7 +1873,11 @@ final class AppModel {
 
         let removed = Self.removedAggregateIds(
             authoritative: fresh,
-            locallyOwned: Set(locallyOwned.keys))
+            locallyOwned: Set(locallyOwned.keys),
+            preserving: Set(listStore.conversations.compactMap { row in
+                ConversationState.parse(row.state).isProvisioningCreationShell
+                    ? row.aggregateIdentity : nil
+            }))
         for aggregateId in removed.sorted() {
             guard await removeProductHistoryLocally(
                 productConversationId: aggregateId,
