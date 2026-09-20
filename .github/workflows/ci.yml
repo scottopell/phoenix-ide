@@ -214,6 +214,8 @@ jobs:
         run: |
           npm i -g corepack@latest
           corepack enable
+      - name: Install ast-grep
+        run: npm i -g @ast-grep/cli
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
       - name: Configure git identity

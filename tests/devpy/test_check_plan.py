@@ -397,6 +397,16 @@ class CheckPlanTests(unittest.TestCase):
         self.assertIn("check-devpy:", workflow)
         self.assertEqual(2, workflow.count("check-e2e, check-devpy, check-ui"))
 
+    def test_devpy_ci_job_installs_ast_grep_before_running_tests(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        devpy_job = workflow.split("  check-devpy:\n", 1)[1].split("  check-ui:\n", 1)[0]
+
+        self.assertIn("npm i -g @ast-grep/cli", devpy_job)
+        self.assertLess(
+            devpy_job.index("npm i -g @ast-grep/cli"),
+            devpy_job.index("./dev.py check --lanes devpy"),
+        )
+
     def test_linux_musl_smoke_runs_once_in_rust_ci_group(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         self.assertEqual(1, workflow.count("cargo check --target x86_64-unknown-linux-musl"))
