@@ -2008,7 +2008,7 @@ mod tests {
             }
         }
         seen.sort();
-        assert_eq!(seen, vec!["root-1", "successor-1", "successor-2"]);
+        assert_eq!(seen, vec!["opening", "root-1", "successor-1", "successor-2"]);
         assert_eq!(seen_handoffs, vec!["root-handoff"]);
 
         state
