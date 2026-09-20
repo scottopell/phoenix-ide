@@ -2081,6 +2081,15 @@ fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<Resourc
     }
 }
 
+async fn accepts_browser_scope_event(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> bool {
+    crate::resource_authority::resolve_resource_authority(db, conv)
+        .await
+        .is_ok_and(|authority| authority.authority == crate::work_scope::ResourceAuthority::Work)
+}
+
 fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
     let owner_id = worktree_path.file_name()?.to_str()?;
     let id_prefix: String = owner_id.chars().take(8).collect();
@@ -2582,7 +2591,7 @@ impl RuntimeManager {
                         continue;
                     }
                     if matches!(audience, BrowserSessionAudience::Scope)
-                        && matches!(conv.conv_mode, ConvMode::Explore { .. })
+                        && !accepts_browser_scope_event(&manager.db, &conv).await
                     {
                         continue;
                     }
@@ -6587,6 +6596,61 @@ mod approved_objective_registry_tests {
         )
         .unwrap()
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod browser_scope_event_authority_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approved_explore_accepts_scope_event_but_restricted_explore_does_not() {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let restricted = db
+            .create_conversation(
+                "restricted-browser",
+                "restricted",
+                "/tmp",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("restricted conversation");
+        assert!(!accepts_browser_scope_event(&db, &restricted).await);
+
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let approved = db
+            .create_conversation_with_project(
+                "approved-browser",
+                "approved",
+                worktree.path().to_str().unwrap(),
+                false,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Explore {
+                    worktree_path: Some(
+                        phoenix_core::domain::db_schema::NonEmptyString::new(
+                            worktree.path().to_str().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("approved conversation");
+        sqlx::query("UPDATE work_scopes SET authority_kind = 'work' WHERE id = ?1")
+            .bind(approved.attached_work_scope_id.as_ref().unwrap().as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(accepts_browser_scope_event(&db, &approved).await);
     }
 }
 

@@ -113,11 +113,7 @@ impl ExploreReadOnlyPolicy {
             command.env(WORKTREE_ROOT_ENV, worktree_root);
         }
         if self.worktree_write_root.is_some() {
-            for name in NETWORK_ENV_ALLOWLIST {
-                if let Some(value) = std::env::var_os(name) {
-                    command.env(name, value);
-                }
-            }
+            apply_network_env(command, std::env::vars_os());
         }
         self.apply_child_env(command);
     }
@@ -127,6 +123,9 @@ impl ExploreReadOnlyPolicy {
         command.env("HOME", &self.home);
         command.env("TMPDIR", &self.platform_temp);
         command.env("PATH", &self.path);
+        if self.worktree_write_root.is_some() {
+            apply_network_env(command, std::env::vars_os());
+        }
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -296,6 +295,14 @@ fn env_path(name: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("missing {name}"))
 }
 
+fn apply_network_env(command: &mut Command, vars: impl IntoIterator<Item = (OsString, OsString)>) {
+    for (name, value) in vars {
+        if NETWORK_ENV_ALLOWLIST.iter().any(|allowed| name == *allowed) {
+            command.env(name, value);
+        }
+    }
+}
+
 fn inherited_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
@@ -425,6 +432,29 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_child_env_preserves_network_routing_allowlist() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let policy =
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
+                .expect("worktree policy");
+        let mut command = Command::new("bash");
+        command.env_clear();
+        apply_network_env(
+            &mut command,
+            [(
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:8080"),
+            )],
+        );
+        policy.apply_child_env(&mut command);
+        let value = command
+            .get_envs()
+            .find_map(|(name, value)| (name == "HTTPS_PROXY").then_some(value))
+            .flatten();
+        assert_eq!(value, Some(std::ffi::OsStr::new("http://proxy.test:8080")));
+    }
 
     #[test]
     fn worktree_write_policy_grants_only_worktree_and_scratch_writes() {

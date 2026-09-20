@@ -266,7 +266,8 @@ rule SpawnRejectedSystemRootCwd {
 -- runtime would see a different working_dir).
 rule SpawnRejectedWorkCwdOutsideWorktree {
     when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: parent.mode in { work, branch }
+    requires: parent.work_scope_authority = write_capable
+    requires: parent.worktree_path != absent
     requires: any_work_task_has_cwd_outside_worktree(tasks, parent.worktree_path)
     ensures: SpawnAgentsRejected(parent,
         reason: "Work sub-agent cwd must be inside the parent's worktree")
@@ -278,7 +279,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
         -- symlink that escapes the worktree is rejected.
         --
         -- When the task omits `cwd`, the effective cwd is the parent's
-        -- working_dir, which for parent.mode in { work, branch } equals
+        -- working_dir, which for any attached write-capable WorkScope equals
         -- worktree_path by REQ-PROJ-008's inherited-workspace contract — that
         -- case satisfies the invariant trivially.
 }
@@ -333,7 +334,8 @@ rule SubAgentSpecsResolved {
     requires: not any_task_has_unknown_agent_type(tasks, parent)
     requires: not any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
-    requires: parent.mode not in { work, branch }
+    requires: parent.work_scope_authority != write_capable
+        or parent.worktree_path = absent
         or not any_work_task_has_cwd_outside_worktree(
             tasks, parent.worktree_path)
     ensures: SubAgentSpecsCreated(parent, tasks)
