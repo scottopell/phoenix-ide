@@ -58,11 +58,16 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     let frame = 0;
     let observedComposer: Element | null = null;
     let observedObstructions = new Set<Element>();
-    const layoutOwner = scroller.closest('.conversation-column') ?? document.body;
-    const layoutChild = (element: Element | null) => {
+    const initialComposer = document.getElementById('input-area');
+    const scrollerAncestors = new Set<Element>();
+    for (let ancestor: Element | null = scroller; ancestor; ancestor = ancestor.parentElement) scrollerAncestors.add(ancestor);
+    let layoutOwner: Element = initialComposer ?? document.body;
+    while (layoutOwner.parentElement && !scrollerAncestors.has(layoutOwner)) layoutOwner = layoutOwner.parentElement;
+    if (!scrollerAncestors.has(layoutOwner)) layoutOwner = document.body;
+    const childWithin = (element: Element | null, owner: Element) => {
       let child = element;
-      while (child?.parentElement && child.parentElement !== layoutOwner) child = child.parentElement;
-      return child?.parentElement === layoutOwner ? child : null;
+      while (child?.parentElement && child.parentElement !== owner) child = child.parentElement;
+      return child?.parentElement === owner ? child : null;
     };
     const position = () => {
       frame = 0;
@@ -105,10 +110,13 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
         let obstructionTop = composer?.getBoundingClientRect().top ?? bottom;
-        const transcriptChild = layoutChild(scroller);
-        const composerChild = layoutChild(composer);
+        const composerOwner = composer?.closest('.conversation-column') ?? layoutOwner;
+        const composerChild = childWithin(composer, composerOwner);
+        const transcriptChild = composerOwner.contains(scroller) ? childWithin(scroller, composerOwner) : null;
         const nextObstructions = new Set<Element>();
-        for (let sibling = transcriptChild?.nextElementSibling; sibling && sibling !== composerChild; sibling = sibling.nextElementSibling) {
+        for (let sibling = transcriptChild?.nextElementSibling ?? composerOwner.firstElementChild;
+          sibling && sibling !== composerChild;
+          sibling = sibling.nextElementSibling) {
           const siblingRect = sibling.getBoundingClientRect();
           if (siblingRect.height > 0) {
             obstructionTop = Math.min(obstructionTop, siblingRect.top);

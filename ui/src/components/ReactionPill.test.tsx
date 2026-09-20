@@ -249,6 +249,28 @@ describe('reaction pill', () => {
     await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '404px' }));
   });
 
+  it('stays above embedded composer controls when the transcript has a separate layout owner', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 500, 390, 80);
+      if (this.id === 'embedded-work-controls') return new DOMRect(0, 460, 390, 40);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<FocusScopeProvider>
+      <main className="product-conversation-page">
+        <section><div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div></section>
+        <div className="product-conversation-page__composer">
+          <div className="conversation-column">
+            <div id="embedded-work-controls" />
+            <footer id="input-area" />
+          </div>
+        </div>
+      </main>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '394px' }));
+  });
+
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {
     Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
       offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
