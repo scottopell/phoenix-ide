@@ -896,9 +896,11 @@ fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
                     kind: ReferenceKind::Paint,
                 }));
             }
-            if !matches!(value, "none" | "currentColor" | "inherit") {
+            let accepted_keyword = matches!(value, "currentColor" | "inherit")
+                || (value == "none" && matches!(name, "fill" | "stroke"));
+            if !accepted_keyword {
                 svgtypes::Color::from_str(value).map_err(|_| {
-                    policy("Use a static color or a local url(#id) paint reference.")
+                    policy("Use a static color, currentColor or inherit; only fill/stroke accept none or local url(#id) paint references.")
                 })?;
             }
         }
@@ -1572,6 +1574,21 @@ mod tests {
             );
         }
         validate(svg(r##"<g fill="red" font-size="12" style="stroke: blue; text-anchor: middle"><rect width="10" height="10"/><text>Label<tspan alignment-baseline="middle">x</tspan></text></g><defs fill="green" font-family="sans-serif"><path id="p" d="M0 0L1 1"/><text id="t">Text</text><linearGradient color="blue"><stop stop-color="currentColor" stop-opacity="0.5"/></linearGradient></defs><use href="#p"/><use href="#t"/>"##).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn none_is_paint_not_a_color() {
+        for body in [
+            r#"<rect color="none"/>"#,
+            r#"<linearGradient><stop stop-color="none"/></linearGradient>"#,
+            r#"<rect style="color:none"/>"#,
+            r#"<linearGradient><stop style="stop-color:none"/></linearGradient>"#,
+            r"<style>rect {color:none}</style><rect/>",
+            r"<style>stop {stop-color:none}</style><linearGradient><stop/></linearGradient>",
+        ] {
+            assert_eq!(rejected(body).category, ValidationCategory::Policy);
+        }
+        validate(svg(r#"<rect fill="none" stroke="none" color="currentColor"/><rect style="fill:none;stroke:none;color:inherit"/><style>rect {fill:none;stroke:none;color:red} stop {stop-color:currentColor}</style><linearGradient><stop stop-color="inherit"/><stop stop-color="transparent"/></linearGradient>"#).as_bytes()).unwrap();
     }
 
     #[test]
