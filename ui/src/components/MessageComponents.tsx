@@ -3110,6 +3110,7 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
 
 function ChildToolActivity({ block, result, liveProgress }: { block: ContentBlock; result: Message | undefined; liveProgress?: import('../generated/sse').BashToolProgress | undefined }) {
   const name = block.name || 'tool';
+  const artifact = svgArtifactFromResult(name, result);
   const input = (block.input || {}) as Record<string, unknown>;
   const output = getToolResultText(result);
   const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
@@ -3121,14 +3122,17 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
   const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
 
   return (
-    <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
-      <span className="subagent-activity-tag">{name}</span>
-      <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
-      <span className="subagent-activity-arrow">→</span>
-      <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
-        {outputPreview}
-      </span>
-    </div>
+    <>
+      <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
+        <span className="subagent-activity-tag">{name}</span>
+        <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
+        <span className="subagent-activity-arrow">→</span>
+        <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
+          {outputPreview}
+        </span>
+      </div>
+      {artifact && <SvgArtifactCard artifact={artifact} />}
+    </>
   );
 }
 

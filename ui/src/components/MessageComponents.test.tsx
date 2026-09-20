@@ -3732,13 +3732,23 @@ describe('tool result ownership across repeated provider IDs', () => {
     expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
   });
 
-  it('keeps subagent result summaries scoped to their assistant round', () => {
+  it.each([false, true])('renders child-owned artifacts in subagent transcripts (full=%s) across live append and reload', (full) => {
     const messages = rounds();
-    const atom = { ...createInitialAtom(), messages };
-    render(<SubAgentTranscript inline={{ type: 'ready', atom, error: null }} running={false} full />);
-    const outputs = document.querySelectorAll('.subagent-activity-output');
-    expect(outputs).toHaveLength(2);
-    expect(outputs[0]?.getAttribute('title')).toContain('svg-1');
-    expect(outputs[1]?.getAttribute('title')).toContain('svg-2');
+    const transcript = (rows: Message[]) => <SubAgentTranscript inline={{ type: 'ready', atom: { ...createInitialAtom(), messages: rows }, error: null }} running={false} full={full} />;
+    const { rerender, unmount } = render(transcript(messages.slice(0, 2)));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    rerender(transcript(messages));
+    const assertArtifacts = () => {
+      expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
+      expect(screen.getAllByRole('link', { name: 'Download SVG' }).map((link) => link.getAttribute('href'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1/download', '/api/conversations/agent-1/svg-artifacts/svg-2/download']);
+      const outputs = document.querySelectorAll('.subagent-activity-output');
+      expect(outputs).toHaveLength(2);
+      expect(outputs[0]?.getAttribute('title')).toContain('svg-1');
+      expect(outputs[1]?.getAttribute('title')).toContain('svg-2');
+    };
+    assertArtifacts();
+    unmount();
+    render(transcript(messages));
+    assertArtifacts();
   });
 });
