@@ -653,6 +653,12 @@ WHEN EXISTS (
     WHERE (NEW.message_id = intent.message_id
            OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
+      AND (
+          (intent.opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation')
+          OR (intent.opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user')
+      )
 )
 BEGIN
     INSERT INTO completed_continuation_handoffs (
@@ -668,13 +674,25 @@ BEGIN
     WHERE (NEW.message_id = intent.message_id
            OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
+      AND (
+          (intent.opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation')
+          OR (intent.opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user')
+      )
     ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
     LIMIT 1;
 
     DELETE FROM continuation_dispatch_intents
     WHERE successor_conversation_id = NEW.conversation_id
       AND (message_id = NEW.message_id
-           OR NEW.message_id = successor_conversation_id || ':' || message_id);
+           OR NEW.message_id = successor_conversation_id || ':' || message_id)
+      AND (
+          (opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation')
+          OR (opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user')
+      );
 END;
 
 CREATE TABLE automatic_continuation_admissions (
