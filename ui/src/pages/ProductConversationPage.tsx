@@ -744,6 +744,7 @@ function ProductConversationPageInner() {
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
   const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
+  const snapshotChangeSequenceRef = useRef(0);
   const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
@@ -811,6 +812,7 @@ function ProductConversationPageInner() {
     setError(null);
     setOlderError(null);
     const snapshotChangeSequence = getProductConversationSnapshotChangeSequence();
+    snapshotChangeSequenceRef.current = snapshotChangeSequence;
 
     const candidateMeasurement = openMeasurementRef.current;
     const measurement = candidateMeasurement && !candidateMeasurement.reported
@@ -859,14 +861,27 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshotRetry]);
 
   useEffect(() => {
+    const canonicalId = snapshot?.product_conversation_id;
     const identities = new Set([
       productConversationId,
-      snapshot?.product_conversation_id,
+      canonicalId,
     ].filter((identity): identity is string => Boolean(identity)));
-    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    let refreshed = false;
+    const refresh = () => {
+      if (refreshed) return;
+      refreshed = true;
+      setSnapshotRetry((retry) => retry + 1);
+    };
     const unsubscribes = [...identities].map((identity) => (
       subscribeProductConversationSnapshotChanged(identity, refresh)
     ));
+    if (canonicalId && canonicalId !== productConversationId
+      && productConversationSnapshotChangedSince(
+        canonicalId,
+        snapshotChangeSequenceRef.current,
+      )) {
+      refresh();
+    }
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [productConversationId, snapshot?.product_conversation_id]);
 

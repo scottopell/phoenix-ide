@@ -256,6 +256,36 @@ final class ConversationListStore {
             .map(\.conversation)
     }
 
+    func projectHistory(aggregateId: String) {
+        guard let index = conversations.firstIndex(where: { $0.aggregateIdentity == aggregateId }) else {
+            return
+        }
+        let existing = conversations[index]
+        upsert(Conversation(
+            id: existing.id,
+            product_conversation_id: existing.product_conversation_id,
+            chain_root_id: existing.chain_root_id,
+            slug: existing.slug,
+            title: existing.title,
+            model: existing.model,
+            cwd: existing.cwd,
+            created_at: existing.created_at,
+            updated_at: existing.updated_at,
+            message_count: existing.message_count,
+            state: existing.state,
+            state_updated_at: existing.state_updated_at,
+            branch_name: existing.branch_name,
+            task_title: existing.task_title,
+            archived: true,
+            product_close_action: nil,
+            project_name: existing.project_name,
+            conv_mode_label: existing.conv_mode_label,
+            presentation_mode: existing.presentation_mode,
+            requires_action: existing.requires_action,
+            transcript_generation: existing.transcript_generation,
+            runtime_role: existing.runtime_role))
+    }
+
     func remove(aggregateId: String) {
         externalMutationGeneration += 1
         upsertsDuringRefresh[aggregateId] = nil

@@ -306,11 +306,25 @@ private struct ProductHistoryHandoffView: View {
     }
 }
 
+struct ProductHistoryCachePresentation {
+    static func shouldShowAge(
+        isOnline: Bool,
+        refreshFailed: Bool,
+        fetchedAt: Date,
+        now: Date,
+        stalenessThreshold: TimeInterval = 120
+    ) -> Bool {
+        (!isOnline || refreshFailed)
+            && now.timeIntervalSince(fetchedAt) > stalenessThreshold
+    }
+}
+
 private struct ProductHistoryView: View {
     @Environment(AppModel.self) private var model
     let productConversationId: String
     @State private var cached: CachedProductHistory?
     @State private var error: ProductHistoryLoadError?
+    @State private var refreshFailed = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -357,21 +371,33 @@ private struct ProductHistoryView: View {
             error = nil
             do {
                 cached = try await model.loadProductHistory(productConversationId: productConversationId)
+                refreshFailed = false
             } catch is CancellationError {
                 return
             } catch let loadError as ProductHistoryLoadError {
                 if loadError == .notFound { cached = nil }
-                if cached == nil { error = loadError }
+                if cached == nil {
+                    error = loadError
+                } else {
+                    refreshFailed = true
+                }
             } catch {
-                if cached == nil { self.error = .emptyResponse }
+                if cached == nil {
+                    self.error = .emptyResponse
+                } else {
+                    refreshFailed = true
+                }
             }
         }
     }
 
     private func cacheAgeNote(at now: Date) -> String? {
-        guard !model.connectivity.isOnline,
-              let cached,
-              now.timeIntervalSince(cached.fetchedAt) > 120
+        guard let cached,
+              ProductHistoryCachePresentation.shouldShowAge(
+                  isOnline: model.connectivity.isOnline,
+                  refreshFailed: refreshFailed,
+                  fetchedAt: cached.fetchedAt,
+                  now: now)
         else { return nil }
         let fetchedAt = cached.fetchedAt
         let formatter = RelativeDateTimeFormatter()
