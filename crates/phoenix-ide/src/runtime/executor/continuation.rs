@@ -248,10 +248,13 @@ mod tests {
         let history =
             ContinuationHistory::from_projection(&[generated], Some("generated")).unwrap();
         let handoff = history.handoff.unwrap();
-        assert_eq!(
-            handoff.message.content,
-            user("authority-wrapped generated context").content
-        );
+        let [phoenix_core::domain::llm_types::ContentBlock::Text { text }] =
+            handoff.message.content.as_slice()
+        else {
+            panic!("expected one protected generated-context text block");
+        };
+        assert!(text.contains("generated predecessor context"));
+        assert!(!text.contains("authority-wrapped generated context"));
     }
 
     #[test]
