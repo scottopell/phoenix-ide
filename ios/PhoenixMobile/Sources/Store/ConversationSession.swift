@@ -108,6 +108,16 @@ final class ConversationSession {
         return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
+    static func cachedConversation(conversationId: String) -> Conversation? {
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion),
+              snapshot.syncedAt != nil
+        else { return nil }
+        return snapshot.conversation
+    }
+
     private var transcriptGeneration: Int64?
     private(set) var snapshotSyncedAt: Date?
 

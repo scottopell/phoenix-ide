@@ -446,7 +446,9 @@ pub async fn delete_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let root = validate_aggregate_delete_root(&state, &root_id).await?;
+    let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
+        return Ok(Json(SuccessResponse { success: true }));
+    };
     let product_conversation_id = root.product_conversation_id.to_string();
     let member_ids = state
         .db
@@ -623,18 +625,19 @@ pub async fn stream_chain(
 async fn validate_aggregate_delete_root(
     state: &AppState,
     root_id: &str,
-) -> Result<Conversation, AppError> {
-    let root =
-        state.db.get_conversation(root_id).await.map_err(|_| {
-            AppError::NotFound(format!("no ProductConversation rooted at {root_id}"))
-        })?;
+) -> Result<Option<Conversation>, AppError> {
+    let root = match state.db.get_conversation(root_id).await {
+        Ok(root) => root,
+        Err(DbError::ConversationNotFound(_)) => return Ok(None),
+        Err(error) => return Err(db_to_app(error)),
+    };
     let canonical_root = state.db.chain_root_of(root_id).await.map_err(db_to_app)?;
     if canonical_root.as_deref() != Some(root_id) || !root.user_initiated {
         return Err(AppError::NotFound(format!(
             "no ProductConversation rooted at {root_id}"
         )));
     }
-    Ok(root)
+    Ok(Some(root))
 }
 
 async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppError> {

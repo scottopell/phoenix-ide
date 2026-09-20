@@ -105,6 +105,78 @@ final class AppModelProductConversationTests: XCTestCase {
             has_older: hasOlder)
     }
 
+    func testAttentionMergeIncludesCoordinatorWithoutContaminatingOrdinaryList() {
+        let ordinary = [conversation(id: "ordinary", aggregateId: "pc-ordinary")]
+        let coordinator = conversation(
+            id: "coordinator",
+            aggregateId: "pc-coordinator",
+            runtimeRole: "coordinator")
+
+        let attention = AppModel.attentionConversations(
+            ordinary: ordinary,
+            coordinator: coordinator)
+
+        XCTAssertEqual(ordinary.map(\.id), ["ordinary"])
+        XCTAssertEqual(attention.map(\.id), ["ordinary", "coordinator"])
+    }
+
+    func testAttentionMergeReplacesDuplicateCoordinatorIdentity() {
+        let stale = conversation(id: "stale", aggregateId: "pc-coordinator")
+        let coordinator = conversation(
+            id: "coordinator",
+            aggregateId: "pc-coordinator",
+            runtimeRole: "coordinator")
+
+        let attention = AppModel.attentionConversations(
+            ordinary: [stale],
+            coordinator: coordinator)
+
+        XCTAssertEqual(attention, [coordinator])
+    }
+
+    func testCoordinatorAttentionFetchUsesAuthoritativeProjection() async throws {
+        let authoritative = conversation(
+            id: "coordinator",
+            aggregateId: "pc-coordinator",
+            runtimeRole: "coordinator")
+
+        let result = try await AppModel.coordinatorForAttention(
+            rememberedId: "coordinator",
+            fetch: { id in
+                XCTAssertEqual(id, "coordinator")
+                return authoritative
+            },
+            cached: { _ in XCTFail("successful fetch must not read fallback"); return nil })
+
+        XCTAssertEqual(result, authoritative)
+    }
+
+    func testCoordinatorAttentionFetchFallsBackOnlyForTransportFailure() async throws {
+        let cached = conversation(
+            id: "coordinator",
+            aggregateId: "pc-coordinator",
+            runtimeRole: "coordinator")
+        let transport = APIError.transport(underlying: URLError(.notConnectedToInternet))
+
+        let fallback = try await AppModel.coordinatorForAttention(
+            rememberedId: "coordinator",
+            fetch: { _ in throw transport },
+            cached: { _ in cached })
+        XCTAssertEqual(fallback, cached)
+
+        do {
+            _ = try await AppModel.coordinatorForAttention(
+                rememberedId: "coordinator",
+                fetch: { _ in throw APIError.http(status: 500, body: "failure") },
+                cached: { _ in cached })
+            XCTFail("authoritative HTTP failures must propagate")
+        } catch let APIError.http(status, _) {
+            XCTAssertEqual(status, 500)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testProductHistoryMergePreservesAggregateIdentityAndLineageOrderWithoutDuplicates() throws {
         let newer = historySnapshot(
             segments: [

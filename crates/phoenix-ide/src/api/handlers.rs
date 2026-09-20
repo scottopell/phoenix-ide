@@ -14002,6 +14002,62 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn chain_delete_retry_after_success_is_idempotent_success() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["retry-a", "retry-b"]).await;
+        mark_chain_history(&state, "retry-a").await;
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("first delete");
+        let retry = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("missing aggregate is an idempotent success");
+
+        assert!(retry.0.success);
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_database_failure() {
+        let state = make_test_state().await;
+        state.db.pool().close().await;
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("unreadable-root".to_string()),
+        )
+        .await
+        .expect_err("database failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_decode_failure() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["decode-a", "decode-b"]).await;
+        sqlx::query("UPDATE conversations SET user_initiated = 'not-a-bool' WHERE id = 'decode-a'")
+            .execute(state.db.pool())
+            .await
+            .expect("corrupt persisted state");
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("decode-a".to_string()),
+        )
+        .await
+        .expect_err("decode failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
+    }
+
+    #[tokio::test]
     async fn chain_delete_rejects_open_and_close_fenced_aggregates_without_cleanup() {
         for (prefix, expected_error) in [
             ("open-chain", "target_unavailable"),

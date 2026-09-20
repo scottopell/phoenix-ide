@@ -7,6 +7,10 @@ import { cacheDB } from '../cache';
 import { clearLastViewer } from '../storage/lastViewerStorage';
 import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
+import {
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
+} from '../notifications';
 
 const POLL_INTERVAL_MS = 5000;
 const AGGREGATE_EVENT_RETRY_MAX_MS = 30_000;
@@ -244,6 +248,8 @@ export function useConversationsRefreshDriver(): void {
         deletedConversationIds?: string[];
       }>).detail;
       if (!detail?.conversationId) return;
+      notifyProductConversationListMayHaveChanged();
+      notifyProductConversationSnapshotChanged(detail.conversationId);
       const deletedConversationIds = detail.deletedConversationIds ?? [detail.conversationId];
       for (const conversationId of deletedConversationIds) {
         const removedSlugs = store.removeByConversationId(conversationId);
