@@ -11844,8 +11844,8 @@ mod error_mapping_tests {
         );
         let db_kind = llm_error_to_db_error(LlmErrorKind::ServerOverloaded);
         assert!(
-            !db_kind.is_auto_retryable(),
-            "ServerOverloaded must NOT be retryable after mapping"
+            db_kind.is_auto_retryable(),
+            "ServerOverloaded must retain its bounded overload retry policy after mapping"
         );
     }
 

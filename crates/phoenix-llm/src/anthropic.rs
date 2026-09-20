@@ -1443,9 +1443,10 @@ mod tests {
 
         assert_eq!(err.kind, crate::LlmErrorKind::ServerOverloaded);
         assert!(
-            !err.kind.is_auto_retryable(),
-            "overloaded Anthropic SSE errors should not be retried as empty responses"
+            err.kind.is_auto_retryable(),
+            "overloaded Anthropic SSE errors use the bounded overload policy"
         );
+        assert_eq!(err.retry_after(), None);
         assert!(err.message.contains("overloaded"));
     }
 
