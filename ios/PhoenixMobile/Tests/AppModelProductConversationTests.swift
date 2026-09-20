@@ -248,24 +248,31 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(DiskStore.listNames(prefix: "outbox-row-deleted").contains("outbox-row-deleted"))
     }
 
-    func testRetainedProductHistoryCacheShowsAgeAfterOnlineRefreshFailure() {
+    func testRetainedProductHistoryCacheShowsAgeUntilOnlineRefreshSucceeds() {
         let now = Date()
 
         XCTAssertTrue(ProductHistoryCachePresentation.shouldShowAge(
             isOnline: true,
-            refreshFailed: true,
+            onlineRefreshSucceeded: false,
             fetchedAt: now.addingTimeInterval(-121),
             now: now))
         XCTAssertFalse(ProductHistoryCachePresentation.shouldShowAge(
             isOnline: true,
-            refreshFailed: false,
+            onlineRefreshSucceeded: true,
             fetchedAt: now.addingTimeInterval(-121),
             now: now))
         XCTAssertFalse(ProductHistoryCachePresentation.shouldShowAge(
             isOnline: true,
-            refreshFailed: true,
+            onlineRefreshSucceeded: false,
             fetchedAt: now.addingTimeInterval(-119),
             now: now))
+    }
+
+    func testProductHistoryLoadKeyChangesOnOfflineToOnlineTransition() {
+        let offline = ProductHistoryLoadKey(productConversationId: "product", isOnline: false)
+        let online = ProductHistoryLoadKey(productConversationId: "product", isOnline: true)
+
+        XCTAssertNotEqual(offline, online)
     }
 
     func testCloseCompletionGenerationsAreScopedByProduct() {
@@ -297,6 +304,19 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.notificationNavigationId(for: "latest-row"), "pc-history")
     }
 
+    func testPendingCloseResolutionTrackerSerializesActionsAndInvalidatesResetCompletion() {
+        var tracker = ProductCloseResolutionTracker()
+        let first = tracker.begin(productConversationId: "product")
+
+        XCTAssertNotNil(first)
+        XCTAssertTrue(tracker.isInFlight)
+        XCTAssertNil(tracker.begin(productConversationId: "product"))
+
+        tracker.reset()
+        XCTAssertFalse(tracker.isInFlight)
+        XCTAssertFalse(tracker.isCurrent(first!, productConversationId: "product"))
+    }
+
     func testPendingCloseConfirmationKindsFollowAuthoritativePhase() {
         let stopWork = PendingProductCloseConfirmation(
             productConversationId: "product",
@@ -306,6 +326,10 @@ final class AppModelProductConversationTests: XCTestCase {
             productConversationId: "product",
             transcriptRowId: "latest",
             close: closeSnapshot(phase: .awaiting_loss_confirmation))
+        let repair = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .needs_repair))
         let settling = PendingProductCloseConfirmation(
             productConversationId: "product",
             transcriptRowId: "latest",
@@ -313,6 +337,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertEqual(stopWork.kind, .stopWork)
         XCTAssertEqual(losses.kind, .losses)
+        XCTAssertEqual(repair.kind, .repair)
         XCTAssertNil(settling.kind)
     }
 
@@ -325,8 +350,49 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(pending?.transcriptRowId, "latest")
         XCTAssertEqual(pending?.kind, .stopWork)
 
+        snapshot.close = closeSnapshot(phase: .needs_repair)
+        XCTAssertEqual(PendingProductCloseConfirmation(snapshot: snapshot)?.kind, .repair)
+
         snapshot.close = closeSnapshot(phase: .settling_active_work)
         XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
+    }
+
+    func testCloseLossInventoryRendersExactCategorizedItemsDeterministically() {
+        let losses = [
+            ProductConversationCloseLoss(
+                scope: "scope-b", generation: "g", category: "untracked", identity: "notes.txt"),
+            ProductConversationCloseLoss(
+                scope: "scope-a", generation: "g", category: "staged", identity: "Sources/App.swift"),
+        ]
+
+        XCTAssertTrue(ProductCloseLossInventory.isComplete(losses))
+        XCTAssertEqual(
+            ProductCloseLossInventory.message(losses),
+            "Scope: scope-a\nCategory: staged\nItem: Sources/App.swift\n\n"
+                + "Scope: scope-b\nCategory: untracked\nItem: notes.txt")
+        XCTAssertFalse(ProductCloseLossInventory.isComplete([]))
+        XCTAssertFalse(ProductCloseLossInventory.isComplete([
+            ProductConversationCloseLoss(
+                scope: "scope", generation: "g", category: "tracked", identity: ""),
+        ]))
+    }
+
+    func testClearCacheClearsPendingCloseAndInFlightResolution() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-reset-tests-\(UUID().uuidString)")
+        let model = AppModel()
+        let pending = PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation))
+        model.installPendingProductCloseConfirmationForTesting(pending, resolving: true)
+        XCTAssertNotNil(model.pendingProductCloseConfirmation)
+        XCTAssertTrue(model.isResolvingPendingProductClose)
+
+        await model.clearCache()
+
+        XCTAssertNil(model.pendingProductCloseConfirmation)
+        XCTAssertFalse(model.isResolvingPendingProductClose)
     }
 
     func testOfflineCloseConfirmationFailsImmediatelyWithExplanation() async {

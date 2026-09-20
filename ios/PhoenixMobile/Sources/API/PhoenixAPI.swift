@@ -448,6 +448,14 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
+    func retryCloseRetirement(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/retry-retirement",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
+    }
+
     func deleteConversation(reference: String, chainRootId: String?) async throws {
         let path = if let chainRootId {
             "api/chains/\(chainRootId)"

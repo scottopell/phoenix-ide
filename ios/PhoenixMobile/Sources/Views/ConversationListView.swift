@@ -89,12 +89,14 @@ struct ConversationListView: View {
                     get: { model.pendingProductCloseConfirmation?.kind != nil },
                     set: { _ in })
             ) {
-                Button(closeConfirmationActionTitle, role: .destructive) {
+                Button(closeConfirmationActionTitle, role: closeConfirmationActionRole) {
                     Task { await model.resolvePendingProductCloseConfirmation(confirm: true) }
                 }
-                Button("Cancel Close", role: .cancel) {
+                .disabled(closeConfirmationActionDisabled)
+                Button(closeConfirmationCancelTitle, role: .cancel) {
                     Task { await model.resolvePendingProductCloseConfirmation(confirm: false) }
                 }
+                .disabled(model.isResolvingPendingProductClose)
             } message: {
                 Text(closeConfirmationMessage)
             }
@@ -119,25 +121,57 @@ struct ConversationListView: View {
     }
 
     private var closeConfirmationTitle: String {
-        model.pendingProductCloseConfirmation?.kind == .stopWork
-            ? "Stop work and close?"
-            : "Confirm Close losses?"
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork: "Stop work and close?"
+        case .losses: "Confirm Close losses?"
+        case .repair: "Close needs repair"
+        case nil: ""
+        }
     }
 
     private var closeConfirmationActionTitle: String {
-        model.pendingProductCloseConfirmation?.kind == .stopWork
-            ? "Stop Work"
-            : "Accept Losses"
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork: "Stop Work"
+        case .losses: "Accept Losses"
+        case .repair: "Retry Retirement"
+        case nil: "Close"
+        }
+    }
+
+    private var closeConfirmationActionRole: ButtonRole? {
+        model.pendingProductCloseConfirmation?.kind == .repair ? nil : .destructive
+    }
+
+    private var closeConfirmationCancelTitle: String {
+        model.pendingProductCloseConfirmation?.kind == .repair ? "Not Now" : "Cancel Close"
+    }
+
+    private var closeConfirmationActionDisabled: Bool {
+        guard !model.isResolvingPendingProductClose else { return true }
+        guard let pending = model.pendingProductCloseConfirmation else { return true }
+        if pending.kind == .losses {
+            return !ProductCloseLossInventory.isComplete(pending.close.losses)
+                || pending.close.confirmation_snapshot == nil
+        }
+        return false
     }
 
     private var closeConfirmationMessage: String {
         switch model.pendingProductCloseConfirmation?.kind {
         case .stopWork:
-            "This conversation is still working. Stop its active work before Close continues."
+            return "This conversation is still working. Stop its active work before Close continues."
         case .losses:
-            "Close found tracked, untracked, submodule, or detached work loss. Accept these losses to retire the conversation."
+            guard let losses = model.pendingProductCloseConfirmation?.close.losses,
+                  ProductCloseLossInventory.isComplete(losses)
+            else {
+                return "The server did not provide the exact loss inventory. Refresh before accepting losses."
+            }
+            return "Close will permanently discard these exact items:\n\n"
+                + ProductCloseLossInventory.message(losses)
+        case .repair:
+            return "Resource retirement did not finish. Retry retirement for this exact Close attempt after repairing the reported resource problem."
         case nil:
-            ""
+            return ""
         }
     }
 
@@ -346,14 +380,19 @@ private struct ProductHistoryHandoffView: View {
 struct ProductHistoryCachePresentation {
     static func shouldShowAge(
         isOnline: Bool,
-        refreshFailed: Bool,
+        onlineRefreshSucceeded: Bool,
         fetchedAt: Date,
         now: Date,
         stalenessThreshold: TimeInterval = 120
     ) -> Bool {
-        (!isOnline || refreshFailed)
+        (!isOnline || !onlineRefreshSucceeded)
             && now.timeIntervalSince(fetchedAt) > stalenessThreshold
     }
+}
+
+struct ProductHistoryLoadKey: Equatable {
+    var productConversationId: String
+    var isOnline: Bool
 }
 
 private struct ProductHistoryView: View {
@@ -361,7 +400,7 @@ private struct ProductHistoryView: View {
     let productConversationId: String
     @State private var cached: CachedProductHistory?
     @State private var error: ProductHistoryLoadError?
-    @State private var refreshFailed = false
+    @State private var onlineRefreshSucceeded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -403,26 +442,32 @@ private struct ProductHistoryView: View {
                 }
             }
         }
-        .task(id: productConversationId) {
-            cached = model.cachedProductHistory(productConversationId: productConversationId)
+        .task(id: ProductHistoryLoadKey(
+            productConversationId: productConversationId,
+            isOnline: model.connectivity.isOnline)
+        ) {
+            if cached == nil {
+                cached = model.cachedProductHistory(productConversationId: productConversationId)
+            }
             error = nil
+            if !model.connectivity.isOnline {
+                onlineRefreshSucceeded = false
+            }
             do {
                 cached = try await model.loadProductHistory(productConversationId: productConversationId)
-                refreshFailed = false
+                onlineRefreshSucceeded = model.connectivity.isOnline
             } catch is CancellationError {
                 return
             } catch let loadError as ProductHistoryLoadError {
+                onlineRefreshSucceeded = false
                 if loadError == .notFound { cached = nil }
                 if cached == nil {
                     error = loadError
-                } else {
-                    refreshFailed = true
                 }
             } catch {
+                onlineRefreshSucceeded = false
                 if cached == nil {
                     self.error = .emptyResponse
-                } else {
-                    refreshFailed = true
                 }
             }
         }
@@ -432,7 +477,7 @@ private struct ProductHistoryView: View {
         guard let cached,
               ProductHistoryCachePresentation.shouldShowAge(
                   isOnline: model.connectivity.isOnline,
-                  refreshFailed: refreshFailed,
+                  onlineRefreshSucceeded: onlineRefreshSucceeded,
                   fetchedAt: cached.fetchedAt,
                   now: now)
         else { return nil }

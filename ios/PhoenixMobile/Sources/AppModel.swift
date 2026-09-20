@@ -113,6 +113,24 @@ enum ProductHistorySnapshotStore {
 enum ProductCloseConfirmationKind: Equatable {
     case stopWork
     case losses
+    case repair
+}
+
+struct ProductCloseLossInventory {
+    static func isComplete(_ losses: [ProductConversationCloseLoss]) -> Bool {
+        !losses.isEmpty && losses.allSatisfy {
+            !$0.scope.isEmpty && !$0.category.isEmpty && !$0.identity.isEmpty
+        }
+    }
+
+    static func message(_ losses: [ProductConversationCloseLoss]) -> String {
+        losses
+            .sorted {
+                ($0.scope, $0.category, $0.identity) < ($1.scope, $1.category, $1.identity)
+            }
+            .map { "Scope: \($0.scope)\nCategory: \($0.category)\nItem: \($0.identity)" }
+            .joined(separator: "\n\n")
+    }
 }
 
 struct PendingProductCloseConfirmation: Equatable {
@@ -124,6 +142,7 @@ struct PendingProductCloseConfirmation: Equatable {
         guard let close = snapshot.close,
               close.phase == .awaiting_stop_work_confirmation
                 || close.phase == .awaiting_loss_confirmation
+                || close.phase == .needs_repair
         else { return nil }
         productConversationId = snapshot.product_conversation_id
         transcriptRowId = snapshot.latest_transcript_row_id
@@ -140,6 +159,7 @@ struct PendingProductCloseConfirmation: Equatable {
         switch close.phase {
         case .awaiting_stop_work_confirmation: .stopWork
         case .awaiting_loss_confirmation: .losses
+        case .needs_repair: .repair
         default: nil
         }
     }
@@ -179,10 +199,42 @@ struct ProductActionGenerationTracker {
         generations[productConversationId] == generation
     }
 
+    mutating func reset() {
+        generations.removeAll()
+    }
+
     mutating func end(_ generation: Int, productConversationId: String) {
         if isCurrent(generation, productConversationId: productConversationId) {
             generations[productConversationId] = nil
         }
+    }
+}
+
+struct ProductCloseResolutionTracker {
+    private var nextGeneration = 0
+    private var current: (productConversationId: String, generation: Int)?
+
+    var isInFlight: Bool { current != nil }
+
+    mutating func begin(productConversationId: String) -> Int? {
+        guard current == nil else { return nil }
+        nextGeneration &+= 1
+        current = (productConversationId, nextGeneration)
+        return nextGeneration
+    }
+
+    func isCurrent(_ generation: Int, productConversationId: String) -> Bool {
+        current?.generation == generation
+            && current?.productConversationId == productConversationId
+    }
+
+    mutating func end(_ generation: Int, productConversationId: String) {
+        guard isCurrent(generation, productConversationId: productConversationId) else { return }
+        current = nil
+    }
+
+    mutating func reset() {
+        current = nil
     }
 }
 
@@ -242,6 +294,10 @@ final class AppModel {
     private var productHistoryGenerations = ProductActionGenerationTracker()
     private(set) var deletedProductHistoryIds: Set<String> = []
     private(set) var pendingProductCloseConfirmation: PendingProductCloseConfirmation?
+    private var pendingProductCloseResolution = ProductCloseResolutionTracker()
+    var isResolvingPendingProductClose: Bool {
+        pendingProductCloseResolution.isInFlight
+    }
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -794,7 +850,21 @@ final class AppModel {
               let kind = pending.kind,
               let api
         else { return }
+        if kind == .losses && confirm,
+           (!ProductCloseLossInventory.isComplete(pending.close.losses)
+               || pending.close.confirmation_snapshot == nil)
+        {
+            lastActionError = "Close confirmation is missing its exact retirement loss inventory."
+            return
+        }
         let startedGeneration = apiGeneration
+        guard let actionGeneration = pendingProductCloseResolution.begin(
+            productConversationId: pending.productConversationId)
+        else { return }
+        defer {
+            pendingProductCloseResolution.end(
+                actionGeneration, productConversationId: pending.productConversationId)
+        }
         do {
             if confirm {
                 switch kind {
@@ -803,23 +873,57 @@ final class AppModel {
                         conversationId: pending.transcriptRowId,
                         attemptId: pending.close.attempt_id)
                 case .losses:
-                    guard let inspection = pending.close.confirmation_snapshot else {
-                        lastActionError = "Close confirmation is missing its retirement inspection."
-                        return
-                    }
+                    guard let inspection = pending.close.confirmation_snapshot else { return }
                     try await api.confirmCloseLossRetirement(
                         conversationId: pending.transcriptRowId,
                         attemptId: pending.close.attempt_id,
                         inspection: inspection)
+                case .repair:
+                    try await api.retryCloseRetirement(
+                        conversationId: pending.transcriptRowId,
+                        attemptId: pending.close.attempt_id)
                 }
+            } else if kind == .repair {
+                pendingProductCloseConfirmation = nil
+                return
             } else {
                 try await api.cancelClose(
                     conversationId: pending.transcriptRowId,
                     attemptId: pending.close.attempt_id)
             }
-            guard apiGeneration == startedGeneration else { return }
-            pendingProductCloseConfirmation = nil
-            if confirm {
+            guard isCurrentPendingCloseAction(
+                actionGeneration,
+                productConversationId: pending.productConversationId,
+                apiGeneration: startedGeneration)
+            else { return }
+            if confirm && kind == .repair {
+                let snapshot = try await api.getProductConversation(
+                    reference: pending.productConversationId)
+                guard isCurrentPendingCloseAction(
+                    actionGeneration,
+                    productConversationId: pending.productConversationId,
+                    apiGeneration: startedGeneration)
+                else { return }
+                if let refreshed = PendingProductCloseConfirmation(snapshot: snapshot) {
+                    pendingProductCloseConfirmation = refreshed
+                    await listStore.refresh(api: api)
+                } else if snapshot.close?.phase == .completed
+                            || snapshot.ordinary_lifecycle == .history
+                {
+                    let transcriptIds = Set(
+                        listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
+                            + [snapshot.latest_transcript_row_id])
+                    _ = await finalizeProductCloseLocally(
+                        productConversationId: pending.productConversationId,
+                        transcriptIds: transcriptIds,
+                        startedGeneration: startedGeneration,
+                        api: api)
+                } else {
+                    pendingProductCloseConfirmation = nil
+                    await listStore.refresh(api: api)
+                }
+            } else if confirm {
+                pendingProductCloseConfirmation = nil
                 let transcriptIds = Set(
                     listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
                         + [pending.transcriptRowId])
@@ -829,26 +933,42 @@ final class AppModel {
                     startedGeneration: startedGeneration,
                     api: api)
             } else {
+                pendingProductCloseConfirmation = nil
                 await listStore.refresh(api: api)
             }
         } catch {
-            guard apiGeneration == startedGeneration else { return }
+            guard isCurrentPendingCloseAction(
+                actionGeneration,
+                productConversationId: pending.productConversationId,
+                apiGeneration: startedGeneration)
+            else { return }
             if let snapshot = try? await api.getProductConversation(
                 reference: pending.productConversationId),
-               apiGeneration == startedGeneration,
-               let close = snapshot.close,
-               close.phase != .completed
+               isCurrentPendingCloseAction(
+                   actionGeneration,
+                   productConversationId: pending.productConversationId,
+                   apiGeneration: startedGeneration)
             {
-                pendingProductCloseConfirmation = PendingProductCloseConfirmation(
-                    productConversationId: pending.productConversationId,
-                    transcriptRowId: snapshot.latest_transcript_row_id,
-                    close: close)
+                pendingProductCloseConfirmation = PendingProductCloseConfirmation(snapshot: snapshot)
                 await listStore.refresh(api: api)
-            } else {
-                pendingProductCloseConfirmation = nil
             }
+            guard isCurrentPendingCloseAction(
+                actionGeneration,
+                productConversationId: pending.productConversationId,
+                apiGeneration: startedGeneration)
+            else { return }
             lastActionError = error.localizedDescription
         }
+    }
+
+    private func isCurrentPendingCloseAction(
+        _ actionGeneration: Int,
+        productConversationId: String,
+        apiGeneration startedGeneration: Int
+    ) -> Bool {
+        apiGeneration == startedGeneration
+            && pendingProductCloseResolution.isCurrent(
+                actionGeneration, productConversationId: productConversationId)
     }
 
     @discardableResult
@@ -928,6 +1048,17 @@ final class AppModel {
     }
 
     #if DEBUG
+    func installPendingProductCloseConfirmationForTesting(
+        _ pending: PendingProductCloseConfirmation,
+        resolving: Bool = false
+    ) {
+        pendingProductCloseConfirmation = pending
+        if resolving {
+            _ = pendingProductCloseResolution.begin(
+                productConversationId: pending.productConversationId)
+        }
+    }
+
     func removeProductHistoryLocallyForTesting(
         productConversationId: String,
         transcriptIds: Set<String>
@@ -1102,6 +1233,11 @@ final class AppModel {
         for session in ownedSessions { await session.outbox.clearAndWait() }
         sessions.removeAll()
         drainSessions.removeAll()
+        pendingProductCloseConfirmation = nil
+        pendingProductCloseResolution.reset()
+        closeActionGenerations.reset()
+        productHistoryGenerations.reset()
+        closingProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
         deletedProductHistoryIds.removeAll()
