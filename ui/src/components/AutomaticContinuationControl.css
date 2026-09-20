@@ -70,6 +70,13 @@
   color: var(--accent-red);
 }
 
+.automatic-continuation__handoff-preview {
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .automatic-continuation__feedback {
   min-height: 18px;
   margin-top: 6px;

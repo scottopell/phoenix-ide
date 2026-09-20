@@ -6714,6 +6714,24 @@ impl Database {
         Ok(exists != 0)
     }
 
+    /// Returns the durable successor that accepted a completed handoff.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn completed_continuation_successor(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT successor_conversation_id
+             FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(predecessor_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Classify and persist any completed handoff for an automatic admission atomically.
     ///
     /// # Errors
@@ -8687,6 +8705,16 @@ impl Database {
              WHERE predecessor_conversation_id = ?1",
         )
         .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE steering_messages
+             SET conversation_id = ?2
+             WHERE conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .bind(&new_id)
         .execute(&mut *tx)
         .await?;
 

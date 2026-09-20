@@ -181,8 +181,6 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
             {failedAdmission?.actionable_failure && (
               <div role="alert" className="automatic-continuation__failure">
                 <span>{failedAdmission.actionable_failure.message}</span>
-                <pre>{failedAdmission.actionable_failure.accepted_handoff}</pre>
-                <span> Retry safely with the same persisted {failedAdmission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated handoff' : 'manual handoff'} and message identity. Automatic continuation remains enabled for future exhaustions.</span>
                 <button
                   type="button"
                   disabled={retrying}
@@ -190,6 +188,8 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
                 >
                   {retrying ? 'Retrying…' : `Retry ${failedAdmission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated' : 'manual'} handoff`}
                 </button>
+                <pre className="automatic-continuation__handoff-preview">{failedAdmission.actionable_failure.accepted_handoff}</pre>
+                <span> Retry safely with the same persisted {failedAdmission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated handoff' : 'manual handoff'} and message identity. Automatic continuation remains enabled for future exhaustions.</span>
               </div>
             )}
           </div>

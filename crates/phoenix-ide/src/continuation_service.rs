@@ -88,12 +88,38 @@ impl ContinuationApplicationService {
         if self
             .runtime
             .db()
-            .reconcile_completed_automatic_continuation(admission)
+            .has_completed_continuation_handoff(&admission.predecessor_conversation_id)
             .await
             .map_err(|error| error.to_string())?
-            .is_some()
         {
-            return Ok(true);
+            if let Some(successor_id) = self
+                .runtime
+                .db()
+                .completed_continuation_successor(&admission.predecessor_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                crate::runtime::wake::transfer_active_for_continuation(
+                    &self.runtime,
+                    &admission.predecessor_conversation_id,
+                    &successor_id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            if self
+                .runtime
+                .db()
+                .reconcile_completed_automatic_continuation(admission)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Ok(true);
+            }
         }
 
         let current = self.current_admission(admission).await?;
