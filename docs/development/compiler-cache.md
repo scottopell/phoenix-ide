@@ -21,7 +21,7 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `KACHE_DISABLED=1` makes Kache unavailable under the same rules. An sccache candidate must execute its version probe successfully before selection.
 
-Phoenix-generated cache variables are scoped to the Cargo build subprocess, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache.
+Phoenix-generated cache variables are scoped to direct Cargo subprocesses and the E2E harness that owns a Cargo build, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache. Relative backend cache/socket paths are normalized against the invoking directory before daemon startup so production-build worktree cwd changes cannot redirect them.
 
 Kache-specific settings (`KACHE_CACHE_DIR`, `KACHE_SOCKET_PATH`) and sccache-specific settings (`SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`) remain separate. Phoenix does not install tools, purge caches, configure remotes, or replace either tool's garbage-collection policy.
 

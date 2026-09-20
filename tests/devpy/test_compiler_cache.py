@@ -321,11 +321,38 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev._compiler_cache_overrides("sccache", configured),
         )
 
-    def test_only_direct_cargo_steps_receive_check_cache(self):
+    def test_only_cargo_owning_steps_receive_check_cache(self):
         self.assertTrue(self.dev._command_uses_compiler_cache(["cargo", "test"]))
         self.assertTrue(self.dev._command_uses_compiler_cache(["/opt/bin/cargo", "clippy"]))
+        self.assertTrue(
+            self.dev._command_uses_compiler_cache(["uv", "run", "tests/e2e/run.py"])
+        )
         self.assertFalse(self.dev._command_uses_compiler_cache(["uv", "run", "tests.py"]))
         self.assertFalse(self.dev._command_uses_compiler_cache([]))
+
+    def test_cache_paths_normalize_against_invoking_directory(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KACHE_CACHE_DIR": "cache/kache",
+                "KACHE_SOCKET_PATH": "run/kache.sock",
+                "SCCACHE_DIR": "cache/sccache",
+            },
+            clear=True,
+        ):
+            self.dev._normalize_cache_paths("kache", self.dev.Path("/workspace"))
+            self.assertEqual("/workspace/cache/kache", os.environ["KACHE_CACHE_DIR"])
+            self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
+            self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
+            self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
+            self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])
+
+    def test_absolute_cache_paths_are_preserved(self):
+        with mock.patch.dict(
+            os.environ, {"KACHE_CACHE_DIR": "/owned/cache"}, clear=True
+        ):
+            self.dev._normalize_cache_paths("kache", self.dev.Path("/elsewhere"))
+            self.assertEqual("/owned/cache", os.environ["KACHE_CACHE_DIR"])
 
     def test_invalid_environment_backend_fails(self):
         with self.assertRaisesRegex(SystemExit, "invalid compiler cache"):

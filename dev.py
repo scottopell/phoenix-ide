@@ -4923,6 +4923,20 @@ def _ensure_kache_daemon(binary: str) -> str | None:
     return None
 
 
+def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
+    base = (base or Path.cwd()).resolve()
+    names = (
+        ("KACHE_CACHE_DIR", "KACHE_SOCKET_PATH")
+        if backend == "kache"
+        else ("SCCACHE_DIR",)
+    )
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            path = Path(value).expanduser()
+            os.environ[name] = str(path if path.is_absolute() else base / path)
+
+
 def _environment_flag(name: str) -> bool:
     value = os.environ.get(name, "").strip().lower()
     return value not in ("", "0", "false", "no", "off")
@@ -5002,6 +5016,7 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
     wrapper = kache_binary if backend == "kache" else sccache_binary
     assert wrapper is not None
+    _normalize_cache_paths(backend)
     os.environ["RUSTC_WRAPPER"] = wrapper
     if backend == "kache":
         generated_socket = "KACHE_SOCKET_PATH" not in os.environ
@@ -5054,7 +5069,11 @@ def _compiler_cache_overrides(
 
 
 def _command_uses_compiler_cache(command: list[str]) -> bool:
-    return bool(command) and Path(command[0]).name == "cargo"
+    if not command:
+        return False
+    if Path(command[0]).name == "cargo":
+        return True
+    return command == ["uv", "run", "tests/e2e/run.py"]
 
 
 def _parse_cache_size(value: str) -> int:

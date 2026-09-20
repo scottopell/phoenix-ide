@@ -119,7 +119,7 @@ OR explicitly selects no compiler cache
 THE SYSTEM SHALL preserve that choice
 AND SHALL report it
 
-THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses
+THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses and explicitly identified wrappers that own Cargo builds
 AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
 
 THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
