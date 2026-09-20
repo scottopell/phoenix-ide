@@ -38,8 +38,9 @@ use tokio_stream::StreamExt;
 use ts_rs::TS;
 
 use super::handlers::{
-    finish_hard_deleted_conversation, prepare_hard_delete_cascade, reopen_prepared_hard_delete,
-    require_hard_delete_admission, AppError, PreparedHardDelete,
+    broadcast_aggregate_hard_deleted, finalize_hard_deleted_conversation_resources,
+    prepare_hard_delete_cascade, reopen_prepared_hard_delete, require_hard_delete_admission,
+    AppError, PreparedHardDelete,
 };
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
@@ -447,9 +448,15 @@ pub async fn delete_chain_handler(
 ) -> Result<Json<SuccessResponse>, AppError> {
     validate_chain_root(&state, &root_id).await?;
 
+    let root = state
+        .db
+        .get_conversation(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    let product_conversation_id = root.product_conversation_id.to_string();
     let member_ids = state
         .db
-        .chain_members_forward(&root_id)
+        .product_conversation_member_ids(&root_id)
         .await
         .map_err(db_to_app)?;
     let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
@@ -510,22 +517,38 @@ pub async fn delete_chain_handler(
         ));
     }
 
-    if let Err(error) = state.db.delete_conversations_atomically(&member_ids).await {
-        for member in &prepared {
-            reopen_prepared_hard_delete(&state, member).await;
+    match state
+        .db
+        .delete_conversations_atomically_with_authority(&member_ids)
+        .await
+    {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+            for member in &prepared {
+                reopen_prepared_hard_delete(&state, member).await;
+            }
+            return Err(AppError::Internal(format!(
+                "Failed to delete chain conversation rows: {error}"
+            )));
         }
-        return Err(AppError::Internal(format!(
-            "Failed to delete chain conversation rows: {error}"
-        )));
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+            state
+                .runtime
+                .signal_fatal_local_authority("aggregate_hard_delete_commit");
+            return Err(AppError::Internal(
+                "aggregate deletion lost local commit authority".to_string(),
+            ));
+        }
     }
 
     let conversations = prepared
         .into_iter()
         .filter_map(PreparedHardDelete::release_authority)
         .collect::<Vec<_>>();
-    for conversation in conversations {
-        finish_hard_deleted_conversation(&state, conversation).await;
+    for conversation in &conversations {
+        finalize_hard_deleted_conversation_resources(&state, conversation).await;
     }
+    broadcast_aggregate_hard_deleted(&state, &root_id, &product_conversation_id).await;
 
     Ok(Json(SuccessResponse { success: true }))
 }
