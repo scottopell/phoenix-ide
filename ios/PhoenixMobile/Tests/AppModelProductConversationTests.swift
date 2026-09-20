@@ -186,6 +186,44 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(evidence)
     }
 
+    func testAggregateReconciliationRetriesTransientFailureAndApplyLoss() async {
+        var attempts = 0
+        var waits = 0
+        let expected = [conversation(id: "ordinary", aggregateId: "pc-ordinary")]
+
+        let result = await AppModel.fetchApplicableAggregateList(
+            attempt: {
+                attempts += 1
+                if attempts == 1 {
+                    throw APIError.transport(underlying: URLError(.networkConnectionLost))
+                }
+                return attempts == 2 ? nil : expected
+            },
+            canContinue: { true },
+            waitBeforeRetry: { waits += 1 })
+
+        XCTAssertEqual(result, expected)
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(waits, 2)
+    }
+
+    func testAggregateReconciliationCancellationStopsRetryLifecycle() async {
+        let task = Task {
+            await AppModel.fetchApplicableAggregateList(
+                attempt: { nil },
+                canContinue: { true },
+                waitBeforeRetry: {
+                    while !Task.isCancelled { await Task.yield() }
+                    throw CancellationError()
+                })
+        }
+
+        task.cancel()
+
+        let result = await task.value
+        XCTAssertNil(result)
+    }
+
     func testRemovedAggregateProjectionIgnoresCoordinatorAndKeepsAuthoritativeOrdinaryRows() {
         let authoritative = [
             conversation(id: "ordinary", aggregateId: "pc-kept"),

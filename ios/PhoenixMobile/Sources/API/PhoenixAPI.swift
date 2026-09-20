@@ -33,6 +33,17 @@ enum APIError: Error, LocalizedError {
         return false
     }
 
+    var isRetryableAggregateReconciliationFailure: Bool {
+        switch self {
+        case .transport, .decoding:
+            return true
+        case .http(let status, _):
+            return status == 408 || status == 429 || status >= 500
+        case .certificatePinMismatch, .invalidURL:
+            return false
+        }
+    }
+
     var isRetryableChatDeliveryFailure: Bool {
         switch self {
         case .transport, .decoding:

@@ -286,6 +286,8 @@ final class AppModel {
     /// Invalidates responses started with earlier server credentials or URL.
     private var apiGeneration = 0
     private var aggregateEventTask: Task<Void, Never>?
+    private var aggregateReconciliationTask: Task<Void, Never>?
+    private var aggregateReconciliationId: UUID?
     private var isForeground = true
 
     /// Sessions for conversations the user has opened, kept alive so their
@@ -315,7 +317,7 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            Task { await self?.reconcileListThenResumeAndDrain() }
+            self?.startAggregateReconciliation()
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
@@ -325,6 +327,7 @@ final class AppModel {
         apiGeneration += 1
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
+        cancelAggregateReconciliation()
         guard let url = URL(string: serverURLString), url.host != nil else {
             api = nil
             return
@@ -498,11 +501,9 @@ final class AppModel {
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
             await rehydratePendingProductCloseConfirmation(api: api)
-            // The user is looking at fresh data — nothing here should nudge
-            // them later.
-            attention.seed(
+            attention.seedOrdinary(
                 with: listStore.conversations,
-                transcriptToAggregate: listStore.transcriptToAggregate)
+                preservingAggregateIds: rememberedCoordinatorAggregateIds())
         }
     }
 
@@ -698,34 +699,39 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations() else { return false }
-        let coordinator = await Self.coordinatorAttentionEvidence(
-            rememberedId: coordinatorConversationId,
-            fetch: { _ in try await api.getCoordinatorProjection() },
-            cached: { ConversationSession.cachedConversation(conversationId: $0) })
-        guard !Task.isCancelled,
+        guard let fresh = try? await api.listConversations(),
+              !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration,
               nudgePreferenceGeneration == startedNudgeGeneration,
               attentionEvidenceGeneration == startedEvidenceGeneration,
-              listStore.canApplyExternal(startedAt: listToken)
+              listStore.applyExternal(fresh, startedAt: listToken)
         else { return false }
-        guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
-        let attentionConversations = Self.attentionConversations(
-            ordinary: fresh,
-            coordinator: coordinator)
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
                 && self.apiGeneration == startedGeneration
                 && self.nudgePreferenceGeneration == startedNudgeGeneration
                 && self.attentionEvidenceGeneration == startedEvidenceGeneration
+                && !Task.isCancelled
         }
-        await attention.refreshAndNotifyIfNeeded(
-            from: attentionConversations,
-            transcriptToAggregate: listStore.transcriptToAggregate,
+        await attention.refreshOrdinaryAndNotifyIfNeeded(
+            from: fresh,
+            preservingAggregateIds: rememberedCoordinatorAggregateIds(),
             isCurrent: isCurrent)
-        return await isCurrent()
+        guard isCurrent() else { return false }
+
+        let coordinator = await Self.coordinatorAttentionEvidence(
+            rememberedId: coordinatorConversationId,
+            fetch: { _ in try await api.getCoordinatorProjection() },
+            cached: { ConversationSession.cachedConversation(conversationId: $0) })
+        guard isCurrent() else { return false }
+        if let coordinator {
+            await attention.refreshAdditionalEvidenceAndNotifyIfNeeded(
+                from: [coordinator],
+                isCurrent: isCurrent)
+        }
+        return isCurrent()
     }
 
     static func coordinatorAttentionEvidence(
@@ -759,6 +765,13 @@ final class AppModel {
     ) -> [Conversation] {
         guard let coordinator else { return ordinary }
         return ordinary.filter { $0.aggregateIdentity != coordinator.aggregateIdentity } + [coordinator]
+    }
+
+    private func rememberedCoordinatorAggregateIds() -> Set<String> {
+        guard let coordinatorConversationId else { return [] }
+        let cached = ConversationSession.cachedConversation(
+            conversationId: coordinatorConversationId)
+        return [cached?.aggregateIdentity ?? coordinatorConversationId]
     }
 
     // MARK: - Coordinator
@@ -1302,7 +1315,7 @@ final class AppModel {
     func foregrounded() {
         isForeground = true
         if let api { startAggregateEventStream(api: api, generation: apiGeneration) }
-        Task { await reconcileListThenResumeAndDrain() }
+        startAggregateReconciliation()
     }
 
     private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {
@@ -1350,16 +1363,79 @@ final class AppModel {
         return locallyOwned.subtracting(authoritativeIds)
     }
 
+    private func startAggregateReconciliation() {
+        guard isForeground, connectivity.isOnline, api != nil else { return }
+        aggregateReconciliationTask?.cancel()
+        let id = UUID()
+        aggregateReconciliationId = id
+        aggregateReconciliationTask = Task { [weak self] in
+            await self?.reconcileListThenResumeAndDrain()
+            guard let self, self.aggregateReconciliationId == id else { return }
+            self.aggregateReconciliationTask = nil
+            self.aggregateReconciliationId = nil
+        }
+    }
+
+    private func cancelAggregateReconciliation() {
+        aggregateReconciliationTask?.cancel()
+        aggregateReconciliationTask = nil
+        aggregateReconciliationId = nil
+    }
+
+    static func fetchApplicableAggregateList(
+        attempt: () async throws -> [Conversation]?,
+        canContinue: () -> Bool,
+        waitBeforeRetry: () async throws -> Void
+    ) async -> [Conversation]? {
+        while canContinue(), !Task.isCancelled {
+            do {
+                if let fresh = try await attempt() {
+                    guard canContinue(), !Task.isCancelled else { return nil }
+                    return fresh
+                }
+            } catch is CancellationError {
+                return nil
+            } catch let error as APIError where !error.isRetryableAggregateReconciliationFailure {
+                return nil
+            } catch {
+                guard canContinue(), !Task.isCancelled else { return nil }
+            }
+            do {
+                try await waitBeforeRetry()
+            } catch {
+                return nil
+            }
+        }
+        return nil
+    }
+
     private func reconcileListThenResumeAndDrain() async {
-        guard let api, connectivity.isOnline else { return }
+        guard let api, connectivity.isOnline, isForeground else { return }
         let startedGeneration = apiGeneration
-        let listToken = listStore.externalRefreshToken()
         let locallyOwned = locallyOwnedOrdinaryAggregates()
-        guard let fresh = try? await api.listConversations(),
-              !Task.isCancelled,
-              apiGeneration == startedGeneration,
-              connectivity.isOnline,
-              listStore.applyExternal(fresh, startedAt: listToken)
+        var retryDelay = 1.0
+        guard let fresh = await Self.fetchApplicableAggregateList(
+            attempt: { [weak self] in
+                guard let self else { return nil }
+                let token = self.listStore.externalRefreshToken()
+                let fresh = try await api.listConversations()
+                guard self.apiGeneration == startedGeneration,
+                      self.connectivity.isOnline,
+                      self.isForeground,
+                      self.listStore.applyExternal(fresh, startedAt: token)
+                else { return nil }
+                return fresh
+            },
+            canContinue: { [weak self] in
+                guard let self else { return false }
+                return self.apiGeneration == startedGeneration
+                    && self.connectivity.isOnline
+                    && self.isForeground
+            },
+            waitBeforeRetry: {
+                try await Task.sleep(for: .seconds(retryDelay))
+                retryDelay = min(retryDelay * 2, 30)
+            })
         else { return }
 
         let removed = Self.removedAggregateIds(
@@ -1372,14 +1448,16 @@ final class AppModel {
                 startedGeneration: startedGeneration)
             else { return }
         }
-        guard !Task.isCancelled, apiGeneration == startedGeneration, connectivity.isOnline else {
-            return
-        }
+        guard !Task.isCancelled,
+              apiGeneration == startedGeneration,
+              connectivity.isOnline,
+              isForeground
+        else { return }
         await rehydratePendingProductCloseConfirmation(api: api)
         guard apiGeneration == startedGeneration else { return }
-        attention.seed(
+        attention.seedOrdinary(
             with: listStore.conversations,
-            transcriptToAggregate: listStore.transcriptToAggregate)
+            preservingAggregateIds: rememberedCoordinatorAggregateIds())
         if isForeground {
             for session in sessions.values { session.resyncAfterForeground() }
         }
@@ -1428,6 +1506,7 @@ final class AppModel {
 
     func backgrounded() {
         isForeground = false
+        cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         // Streams die in the background anyway; stop them cleanly and
@@ -1463,6 +1542,7 @@ final class AppModel {
 
     func clearCache() async {
         apiGeneration += 1
+        cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)

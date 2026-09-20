@@ -160,6 +160,15 @@ final class AttentionMonitor {
         persist()
     }
 
+    func seedOrdinary(
+        with conversations: [Conversation],
+        preservingAggregateIds: Set<String>
+    ) {
+        snapshot = snapshot.filter { preservingAggregateIds.contains($0.key) }
+        snapshot.merge(Self.entries(from: conversations)) { _, current in current }
+        persist()
+    }
+
     /// Refresh using the latest list and emit notifications for transitions.
     /// No-op unless the user enabled background nudges.
     func refreshAndNotifyIfNeeded(
@@ -167,18 +176,53 @@ final class AttentionMonitor {
         transcriptToAggregate: [String: String] = [:],
         isCurrent: @escaping @MainActor () -> Bool
     ) async {
-        let current = Self.entries(from: conversations)
+        await refreshAndNotifyIfNeeded(
+            from: conversations,
+            replacingSnapshotWith: Self.entries(from: conversations),
+            isCurrent: isCurrent)
+    }
+
+    func refreshOrdinaryAndNotifyIfNeeded(
+        from conversations: [Conversation],
+        preservingAggregateIds: Set<String>,
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async {
+        var current = snapshot.filter { preservingAggregateIds.contains($0.key) }
+        current.merge(Self.entries(from: conversations)) { _, replacement in replacement }
+        await refreshAndNotifyIfNeeded(
+            from: conversations,
+            replacingSnapshotWith: current,
+            isCurrent: isCurrent)
+    }
+
+    func refreshAdditionalEvidenceAndNotifyIfNeeded(
+        from conversations: [Conversation],
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async {
+        var current = snapshot
+        current.merge(Self.entries(from: conversations)) { _, replacement in replacement }
+        await refreshAndNotifyIfNeeded(
+            from: conversations,
+            replacingSnapshotWith: current,
+            isCurrent: isCurrent)
+    }
+
+    private func refreshAndNotifyIfNeeded(
+        from conversations: [Conversation],
+        replacingSnapshotWith current: [String: Entry],
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async {
         let events = Self.diff(previous: snapshot, current: conversations)
-        guard await isCurrent() else { return }
+        guard isCurrent() else { return }
         snapshot = current
         persist()
-        guard await isCurrent() else { return }
+        guard isCurrent() else { return }
 
         let center = UNUserNotificationCenter.current()
         for event in events {
-            guard await isCurrent() else { return }
+            guard isCurrent() else { return }
             let settings = await center.notificationSettings()
-            guard await isCurrent() else { return }
+            guard isCurrent() else { return }
             guard settings.authorizationStatus == .authorized else { return }
             let content = UNMutableNotificationContent()
             switch event {
@@ -199,7 +243,7 @@ final class AttentionMonitor {
                 content: content,
                 trigger: nil)
             try? await center.add(request)
-            guard await isCurrent() else {
+            guard isCurrent() else {
                 center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
                 center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
                 return
