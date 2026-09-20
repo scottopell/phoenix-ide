@@ -225,13 +225,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Inline expansion-error surface is shared between @ref/skill expansion and
   // attachment-upload failures, so the file-drop handlers reuse it.
   const { reset: resetRefs, setExpansionError, expansionError } = ir;
+  const setExpansionErrorRef = useRef(setExpansionError);
+  setExpansionErrorRef.current = setExpansionError;
   useEffect(() => {
     const deferred = deferredExpansionErrorRef.current;
     if (deferred?.scopeKey === scopeKey) {
-      setExpansionError(deferred.error);
+      setExpansionErrorRef.current(deferred.error);
       deferredExpansionErrorRef.current = null;
     }
-  }, [scopeKey, setExpansionError]);
+  }, [scopeKey]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
