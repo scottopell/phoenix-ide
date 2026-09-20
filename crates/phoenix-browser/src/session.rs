@@ -1600,6 +1600,16 @@ impl BrowserSessionManager {
         if state.sessions.contains_key(&new_key) {
             return false;
         }
+        let Some(entry) = state.sessions.get(&old_key) else {
+            return false;
+        };
+        if entry
+            .current_kill
+            .lock()
+            .is_ok_and(|current| current.is_some())
+        {
+            return false;
+        }
         let Some(mut entry) = state.sessions.remove(&old_key) else {
             return false;
         };
