@@ -24177,7 +24177,7 @@ mod tests {
             intent.unwrap().opening_authority,
             ContinuationOpeningAuthority::GeneratedPredecessorContext
         );
-        let opening = MessageContent::User(UserContent::new("exact generated context"));
+        let opening = MessageContent::continuation("exact generated context");
         db.add_message("generated-opening", &successor.id, &opening, None, None)
             .await
             .unwrap();
