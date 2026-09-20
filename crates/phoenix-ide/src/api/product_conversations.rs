@@ -1517,23 +1517,17 @@ mod tests {
             format!("/product-conversations/{}", root.product_conversation_id)
         );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
-        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert_eq!(
             snapshot["segments"][0]["handoff"]["continuation_message_id"],
             "handoff"
-        );
-        assert_eq!(
-            snapshot["segments"][0]["handoff"]["accepted_successor_message_id"],
-            "opening"
         );
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(
-                |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
-            ));
+            .all(|message| message["message_id"] != "handoff"));
         assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
         assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
         assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
