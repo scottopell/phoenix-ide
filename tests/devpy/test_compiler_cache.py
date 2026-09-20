@@ -57,7 +57,7 @@ class CompilerCacheTests(unittest.TestCase):
     def test_auto_prefers_supported_kache(self):
         selected, env = self.configure(installed={"kache", "sccache"})
         self.assertEqual("kache", selected)
-        self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
+        self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
         self.assertNotIn("SCCACHE_CACHE_SIZE", env)
 
     def test_auto_reports_none_when_no_backend_is_installed(self):
@@ -104,7 +104,7 @@ class CompilerCacheTests(unittest.TestCase):
     def test_auto_uses_kache_when_sccache_is_unavailable(self):
         selected, env = self.configure(installed={"kache"})
         self.assertEqual("kache", selected)
-        self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
+        self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
         self.assertNotIn("SCCACHE_CACHE_SIZE", env)
 
     def test_none_disables_automatic_wrapper(self):
@@ -117,7 +117,7 @@ class CompilerCacheTests(unittest.TestCase):
             env={"PHOENIX_COMPILER_CACHE": "kache"}, installed={"kache"}
         )
         self.assertEqual("kache", selected)
-        self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
+        self.assertEqual(str(self.dev.Path("/bin/kache").resolve()), env["RUSTC_WRAPPER"])
 
     def test_cli_selection_takes_precedence_over_environment(self):
         selected, env = self.configure(
@@ -126,7 +126,7 @@ class CompilerCacheTests(unittest.TestCase):
             installed={"kache", "sccache"},
         )
         self.assertEqual("sccache", selected)
-        self.assertEqual("/bin/sccache", env["RUSTC_WRAPPER"])
+        self.assertEqual(str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"])
 
     def test_explicit_sccache_does_not_probe_kache(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -173,7 +173,7 @@ class CompilerCacheTests(unittest.TestCase):
             env={"KACHE_DISABLED": "1"}, installed={"kache", "sccache"}
         )
         self.assertEqual("sccache", selected)
-        self.assertEqual("/bin/sccache", env["RUSTC_WRAPPER"])
+        self.assertEqual(str(self.dev.Path("/bin/sccache").resolve()), env["RUSTC_WRAPPER"])
 
     def test_kache_disabled_explicit_fails(self):
         with self.assertRaisesRegex(SystemExit, "KACHE_DISABLED"):
@@ -197,7 +197,10 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
         ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"):
             self.assertEqual("sccache", self.dev._configure_compiler_cache("auto"))
-            self.assertEqual("/bin/sccache", os.environ["RUSTC_WRAPPER"])
+            self.assertEqual(
+                str(self.dev.Path("/bin/sccache").resolve()),
+                os.environ["RUSTC_WRAPPER"],
+            )
             self.assertEqual("10G", os.environ["SCCACHE_CACHE_SIZE"])
             self.assertTrue(self.dev.Path(os.environ["SCCACHE_DIR"]).is_absolute())
 
@@ -262,7 +265,10 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev, "_usable_sccache", return_value=("sccache 0.18.0", None)
         ):
             self.assertEqual("sccache", self.dev._configure_compiler_cache("auto"))
-            self.assertEqual("/bin/sccache", os.environ["RUSTC_WRAPPER"])
+            self.assertEqual(
+                str(self.dev.Path("/bin/sccache").resolve()),
+                os.environ["RUSTC_WRAPPER"],
+            )
 
     def test_build_configures_cache_before_spawning_cargo(self):
         calls = []
