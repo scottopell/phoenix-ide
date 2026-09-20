@@ -9105,9 +9105,9 @@ mod tests {
     #[test]
     fn live_mapping_filename_ending_deleted_remains_authority() {
         let quarantine = tempfile::tempdir().unwrap();
-        let live = quarantine.path().join("file");
+        let live = quarantine.path().join("file (deleted)");
         std::fs::write(&live, b"live").unwrap();
-        let displayed = format!("{} (deleted)", live.display());
+        let displayed = live.display().to_string();
         let mapping = format!("7f000000-7f001000 rw-s 00000000 00:00 1 {displayed}");
         assert_eq!(
             super::linux_writable_shared_mapping_path(mapping.as_bytes(), quarantine.path(),)
