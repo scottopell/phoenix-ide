@@ -197,6 +197,11 @@ pub trait MessageStore: Send + Sync {
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
+    async fn get_project_coordinator_profile(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>;
+
     /// Load one transactionally consistent, fully hydrated durable prompt
     /// snapshot for a runtime-owned projection.
     async fn load_hydrated_prompt_snapshot(
@@ -649,6 +654,14 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self)
             .accepted_continuation_handoff_message_id(conv_id)
             .await
+    }
+
+    async fn get_project_coordinator_profile(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>
+    {
+        (**self).get_project_coordinator_profile(conv_id).await
     }
 
     async fn add_message(
@@ -1219,6 +1232,17 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<Option<String>, String> {
         self.db
             .accepted_continuation_handoff_message_id(conv_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_project_coordinator_profile(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::domain::product_conversation::ProjectCoordinatorProfile>, String>
+    {
+        self.db
+            .get_project_coordinator_profile_for_conversation(conv_id)
             .await
             .map_err(|error| error.to_string())
     }

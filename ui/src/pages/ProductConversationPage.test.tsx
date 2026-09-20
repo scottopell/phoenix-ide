@@ -174,6 +174,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
+      putProjectCoordinatorProfile: vi.fn(),
       reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
       getPrStatus: vi.fn(),
       getChain: vi.fn(),
@@ -204,6 +205,9 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-1',
     close: null,
+    project_coordinator_eligible: true,
+    project_coordinator_revision: overrides.project_coordinator_revision ?? 0,
+    project_coordinator_profile: null,
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
     canonical_root: { transcript_row_id: 'row-1', slug: 'root-slug', title: 'Root title' },
@@ -373,6 +377,8 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.putProjectCoordinatorProfile).mockReset();
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 0, profile: null });
     vi.mocked(api.reportProductConversationOpen).mockClear();
     vi.mocked(api.getChain).mockReset();
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
@@ -384,6 +390,397 @@ describe('ProductConversationPage', () => {
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
       work_change: { kind: 'clean' },
     });
+  });
+
+  it('enables the Project Coordinator profile through the explicit settings action', async () => {
+    const { api } = await import('../api');
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Coordinate this product.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
+      type: 'enable',
+      charter: 'Coordinate this product.',
+      expected_revision: 0,
+    }));
+  });
+
+  it('does not let a pre-save snapshot response overwrite the saved profile', async () => {
+    const { api } = await import('../api');
+    let resolveStaleSnapshot!: (snapshot: ProductConversationSnapshotView) => void;
+    const staleSnapshot = new Promise<ProductConversationSnapshotView>((resolve) => {
+      resolveStaleSnapshot = resolve;
+    });
+    const savedProfile = {
+      charter: 'Saved charter',
+      updated_at_unix_micros: 2,
+    };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockReturnValueOnce(staleSnapshot)
+      .mockRejectedValueOnce(new Error('post-save refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 1, profile: savedProfile });
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedProfile.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      resolveStaleSnapshot(makeSnapshot());
+      await staleSnapshot;
+    });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
+  });
+
+  it('does not let a delayed save response overwrite a newer profile revision', async () => {
+    const { api } = await import('../api');
+    let resolveSave!: (profile: { revision: number; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }) => void;
+    const save = new Promise<{ revision: number; profile: NonNullable<ProductConversationSnapshotView['project_coordinator_profile']> }>((resolve) => {
+      resolveSave = resolve;
+    });
+    const savedRevisionOne = {
+      charter: 'Saved revision one',
+      updated_at_unix_micros: 1,
+    };
+    const newerRevision = {
+      charter: 'Concurrent revision two',
+      updated_at_unix_micros: 2,
+    };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: newerRevision, project_coordinator_revision: 2 }))
+      .mockRejectedValueOnce(new Error('post-save refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockReturnValue(save);
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedRevisionOne.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledTimes(1));
+
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText('Coordinator ✓')).toBeInTheDocument());
+
+    await act(async () => {
+      resolveSave({ revision: 1, profile: savedRevisionOne });
+      await save;
+    });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue(newerRevision.charter);
+  });
+
+  it('clears pending pagination loading when a profile save invalidates pagination', async () => {
+    const { api } = await import('../api');
+    let resolveOlder!: (snapshot: ProductConversationSnapshotView) => void;
+    const older = new Promise<ProductConversationSnapshotView>((resolve) => { resolveOlder = resolve; });
+    const savedProfile = {
+      charter: 'Saved while older is pending',
+      updated_at_unix_micros: 1,
+    };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ has_older: true, before: 'cursor-1' }))
+      .mockReturnValueOnce(older)
+      .mockRejectedValueOnce(new Error('post-save refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 1, profile: savedProfile });
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(true));
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedProfile.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(false));
+
+    await act(async () => {
+      resolveOlder(makeSnapshot({ segments: [{ segment_ordinal: 0, transcript_row_id: 'old-row', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 1)], handoff: null }] }));
+      await older;
+    });
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(false);
+  });
+
+  it('uses retained revision when re-enabling a disabled profile', async () => {
+    const { api } = await import('../api');
+    const savedProfile = { charter: 'Re-enabled', updated_at_unix_micros: 4 };
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      project_coordinator_profile: null,
+      project_coordinator_revision: 3,
+    }));
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 4, profile: savedProfile });
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedProfile.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
+      type: 'enable',
+      charter: savedProfile.charter,
+      expected_revision: 3,
+    }));
+  });
+
+  it('keeps a conflicted dirty draft on its original revision', async () => {
+    const { api } = await import('../api');
+    const refreshedProfile = { charter: 'Server version', updated_at_unix_micros: 2 };
+    const savedProfile = { charter: 'Local draft', updated_at_unix_micros: 3 };
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: { charter: 'Base', updated_at_unix_micros: 1 }, project_coordinator_revision: 1 }))
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: refreshedProfile, project_coordinator_revision: 2 }));
+    vi.mocked(api.putProjectCoordinatorProfile)
+      .mockRejectedValue(new Error('Profile changed elsewhere'));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: savedProfile.charter } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenLastCalledWith('pc-1', {
+      type: 'enable',
+      charter: savedProfile.charter,
+      expected_revision: 1,
+    }));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText('Charter')).toHaveValue(savedProfile.charter);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenLastCalledWith('pc-1', {
+      type: 'enable',
+      charter: savedProfile.charter,
+      expected_revision: 1,
+    }));
+  });
+
+  it('retains unsaved charter text and surfaces save failure', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('Profile changed elsewhere'));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Unsaved charter' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Profile changed elsewhere');
+    expect(screen.getByLabelText('Charter')).toHaveValue('Unsaved charter');
+  });
+
+  it('preserves dirty Project Coordinator draft across disclosure close and reopen', async () => {
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Draft across close' } });
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByText('Coordinator +'));
+
+    expect(screen.getByLabelText('Use Project Coordinator guidance')).toBeChecked();
+    expect(screen.getByLabelText('Charter')).toHaveValue('Draft across close');
+  });
+
+  it('clears stale Project Coordinator save errors after authoritative refresh matches the draft', async () => {
+    const { api } = await import('../api');
+    let resolveRefresh!: (snapshot: ProductConversationSnapshotView) => void;
+    const refresh = new Promise<ProductConversationSnapshotView>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ project_coordinator_profile: null, project_coordinator_revision: 0 }))
+      .mockReturnValueOnce(refresh);
+    vi.mocked(api.putProjectCoordinatorProfile).mockRejectedValue(new Error('transient save error'));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator +'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Eventually saved' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('transient save error');
+
+    await act(async () => {
+      resolveRefresh(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Eventually saved',
+          updated_at_unix_micros: 1,
+        },
+        project_coordinator_revision: 1,
+      }));
+      await refresh;
+    });
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Charter')).toHaveValue('Eventually saved');
+  });
+
+  it('keeps dirty drafts on their original revision when a refreshed snapshot arrives', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Opened charter',
+          updated_at_unix_micros: 1,
+        },
+        project_coordinator_revision: 4,
+      }))
+      .mockResolvedValue(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Other editor charter',
+          updated_at_unix_micros: 2,
+        },
+        project_coordinator_revision: 5,
+      }));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Dirty draft' } });
+    act(() => notifyCloseSnapshotChanged('pc-1'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
+      type: 'enable',
+      charter: 'Dirty draft',
+      expected_revision: 4,
+    }));
+  });
+
+  it('disables the profile using the current revision fence', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        project_coordinator_profile: {
+          charter: 'Saved charter',
+          updated_at_unix_micros: 1,
+        },
+        project_coordinator_revision: 7,
+      }))
+      .mockRejectedValueOnce(new Error('post-disable refresh failed'));
+    vi.mocked(api.putProjectCoordinatorProfile).mockResolvedValue({ revision: 8, profile: null });
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.click(screen.getByLabelText('Use Project Coordinator guidance'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.putProjectCoordinatorProfile).toHaveBeenCalledWith('pc-1', {
+      type: 'disable',
+      expected_revision: 7,
+    }));
+    fireEvent.click(screen.getByText('Coordinator +'));
+    expect(screen.getByText(/Revision 8\./)).toBeInTheDocument();
+  });
+
+  it('cancels dirty edits without persisting them', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      project_coordinator_profile: {
+        charter: 'Saved charter',
+        updated_at_unix_micros: 1,
+      },
+    }));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Dirty charter' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(api.putProjectCoordinatorProfile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Charter')).toHaveValue('Saved charter');
+  });
+
+  it('hides the settings action for an ineligible ProductConversation', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      project_coordinator_eligible: false,
+    }));
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    expect(screen.queryByText(/^Coordinator/)).not.toBeInTheDocument();
+  });
+
+  it('shows retained Project Coordinator settings read-only for History aggregates', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      project_coordinator_eligible: false,
+      project_coordinator_profile: { charter: 'retained charter', updated_at_unix_micros: 7 },
+      project_coordinator_revision: 7,
+    }));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    expect(screen.getByLabelText('Use Project Coordinator guidance')).toBeDisabled();
+    expect(screen.getByLabelText('Charter')).toHaveValue('retained charter');
+    expect(screen.getByLabelText('Charter')).toBeDisabled();
+    expect(screen.getByText(/Revision 7/)).toBeInTheDocument();
+    expect(screen.getByText('History is read-only; retained Project Coordinator guidance is shown for inspection.')).toBeInTheDocument();
+    expect(api.putProjectCoordinatorProfile).not.toHaveBeenCalled();
+  });
+
+  it('resets Project Coordinator editor state when navigating between ProductConversations', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-1',
+        project_coordinator_profile: { charter: 'Conversation A charter', updated_at_unix_micros: 0 },
+        project_coordinator_revision: 0,
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        project_coordinator_profile: null,
+      }));
+
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByText('Coordinator ✓'));
+    fireEvent.change(screen.getByLabelText('Charter'), { target: { value: 'Unsaved A draft' } });
+
+    fireEvent.click(screen.getByText('open second product'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledWith(
+      'pc-2',
+      expect.objectContaining({ message_limit: 100 }),
+    ));
+    await waitFor(() => expect(screen.getByText('Coordinator +')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Coordinator +'));
+
+    expect(screen.getByLabelText('Use Project Coordinator guidance')).not.toBeChecked();
+    expect(screen.getByLabelText('Charter')).toHaveValue('');
+    expect(api.putProjectCoordinatorProfile).not.toHaveBeenCalled();
   });
 
   it('reports hidden-at-start opens without waiting for or fabricating paint', async () => {

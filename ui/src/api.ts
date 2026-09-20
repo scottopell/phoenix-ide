@@ -83,8 +83,10 @@ import type { BashHandleInspection as BashHandleInspectionType } from './generat
 export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
 export type { ProductConversationListRow } from './generated/ProductConversationListRow';
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
+export type { ProjectCoordinatorProfileWriteResponse } from './generated/ProjectCoordinatorProfileWriteResponse';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+import type { ProjectCoordinatorProfileWriteResponse as ProjectCoordinatorProfileWriteResponseType } from './generated/ProjectCoordinatorProfileWriteResponse';
 export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
 export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
 export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
@@ -1779,6 +1781,33 @@ export const api = {
       const detail = resp.status === 404
         ? 'Conversation not found'
         : 'Failed to fetch product conversation snapshot';
+      throw new ApiResponseError(detail, resp.status);
+    }
+    return resp.json();
+  },
+
+  async putProjectCoordinatorProfile(
+    productConversationId: string,
+    request:
+      | { type: 'enable'; charter: string; expected_revision: number }
+      | { type: 'disable'; expected_revision: number },
+  ): Promise<ProjectCoordinatorProfileWriteResponseType> {
+    const resp = await fetch(
+      `/api/product-conversations/${encodeURIComponent(productConversationId)}/project-coordinator-profile`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+    if (!resp.ok) {
+      let detail = 'Failed to save Project Coordinator profile';
+      try {
+        const body = await resp.json() as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // Preserve the stable fallback for a non-JSON failure response.
+      }
       throw new ApiResponseError(detail, resp.status);
     }
     return resp.json();

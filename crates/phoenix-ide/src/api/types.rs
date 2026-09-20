@@ -279,9 +279,37 @@ pub struct ProductConversationListRow {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProjectCoordinatorProfileView {
+    pub charter: String,
+    pub updated_at_unix_micros: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProjectCoordinatorProfileWriteRequest {
+    Enable {
+        charter: String,
+        expected_revision: i64,
+    },
+    Disable {
+        expected_revision: i64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProjectCoordinatorProfileWriteResponse {
+    pub revision: i64,
+    pub profile: Option<ProjectCoordinatorProfileView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationSnapshotView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
+    pub project_coordinator_eligible: bool,
+    pub project_coordinator_revision: i64,
     pub canonical_route: String,
     pub requested_transcript_row_id: String,
     pub canonical_root: ProductConversationTranscriptRowView,
@@ -290,6 +318,7 @@ pub struct ProductConversationSnapshotView {
     pub writable_transcript_row_id: Option<String>,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
+    pub project_coordinator_profile: Option<ProjectCoordinatorProfileView>,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
     pub source: Option<ProductConversationSourceView>,
     pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
