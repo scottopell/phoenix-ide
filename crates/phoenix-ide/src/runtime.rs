@@ -2013,14 +2013,18 @@ fn approved_managed_registry(
 }
 
 fn sub_agent_registry_for_authority(
+    mode: &ConvMode,
     authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
-    match authority {
-        crate::work_scope::ResourceAuthority::Restricted => {
+    match (mode, authority) {
+        (_, crate::work_scope::ResourceAuthority::Restricted) => {
             ToolRegistry::for_subagent_explore(policy)
         }
-        crate::work_scope::ResourceAuthority::Work => ToolRegistry::for_subagent_work(),
+        (ConvMode::AttachedWorkChild { .. }, crate::work_scope::ResourceAuthority::Work) => {
+            ToolRegistry::for_attached_subagent_work()
+        }
+        (_, crate::work_scope::ResourceAuthority::Work) => ToolRegistry::for_subagent_work(),
     }
 }
 
@@ -5121,6 +5125,7 @@ impl RuntimeManager {
 
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_authority(
+                &conv.conv_mode,
                 context.resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
@@ -6577,8 +6582,9 @@ mod sub_agent_registry_resume_tests {
     use crate::tools::ExploreToolPolicy;
     use crate::work_scope::ResourceAuthority;
 
-    fn registry_has(authority: ResourceAuthority, tool: &str) -> bool {
+    fn registry_has(mode: &crate::db::ConvMode, authority: ResourceAuthority, tool: &str) -> bool {
         sub_agent_registry_for_authority(
+            mode,
             authority,
             ExploreToolPolicy::from_platform(&PlatformCapability::None {
                 details: "test".into(),
@@ -6591,13 +6597,28 @@ mod sub_agent_registry_resume_tests {
 
     #[test]
     fn restricted_subagent_resume_excludes_patch() {
-        assert!(!registry_has(ResourceAuthority::Restricted, "patch"));
-        assert!(registry_has(ResourceAuthority::Restricted, "submit_result"));
+        let mode = crate::db::ConvMode::Explore {
+            worktree_path: None,
+            next_taskmd_id_hint: None,
+        };
+        assert!(!registry_has(&mode, ResourceAuthority::Restricted, "patch"));
+        assert!(registry_has(
+            &mode,
+            ResourceAuthority::Restricted,
+            "submit_result"
+        ));
     }
 
     #[test]
     fn work_authority_subagent_resume_keeps_patch() {
-        assert!(registry_has(ResourceAuthority::Work, "patch"));
+        assert!(registry_has(
+            &crate::db::ConvMode::AttachedWorkChild {
+                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/worktree")
+                    .unwrap(),
+            },
+            ResourceAuthority::Work,
+            "patch"
+        ));
     }
 }
 

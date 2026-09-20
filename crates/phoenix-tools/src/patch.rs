@@ -162,9 +162,10 @@ impl PatchTool {
             }
         };
 
-        if std::path::Path::new(raw_path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+        if matches!(self.scope, PatchScope::TaskProposalDraft { .. })
+            && std::path::Path::new(raw_path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Some(format!(
                 "patch cannot use '..' outside its allowed WorkScope (got '{raw_path}')."
@@ -185,10 +186,24 @@ impl PatchTool {
             }
         }
 
-        let canon_allowed =
-            canonicalize_existing_ancestor(&allowed_root).unwrap_or_else(|_| allowed_root.clone());
-        let canon_resolved =
-            canonicalize_existing_ancestor(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+        let canon_allowed = match canonicalize_existing_ancestor(&allowed_root) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(format!(
+                    "patch could not resolve allowed WorkScope '{}': {error}",
+                    allowed_root.display()
+                ));
+            }
+        };
+        let canon_resolved = match canonicalize_existing_ancestor(resolved) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(format!(
+                    "patch could not safely resolve target '{}': {error}",
+                    resolved.display()
+                ));
+            }
+        };
         if canon_resolved.starts_with(&canon_allowed) {
             None
         } else {
@@ -222,7 +237,7 @@ impl PatchTool {
 fn canonicalize_existing_ancestor(path: &std::path::Path) -> std::io::Result<PathBuf> {
     let mut missing = Vec::new();
     let mut existing = path;
-    while !existing.exists() {
+    while std::fs::symlink_metadata(existing).is_err() {
         let Some(parent) = existing.parent() else {
             return Ok(path.to_path_buf());
         };
@@ -519,6 +534,32 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside_file).unwrap(), "original\n");
     }
 
+    #[tokio::test]
+    async fn worktree_patch_allows_parent_traversal_within_worktree() {
+        let worktree = tempdir().unwrap();
+        let nested = worktree.path().join("crate/src");
+        fs::create_dir_all(&nested).unwrap();
+        let tool = PatchTool::for_worktree();
+        let mut ctx = test_context(nested);
+        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
+
+        let result = tool
+            .run(
+                json!({
+                    "path": "../../Cargo.toml",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "[package]\nname = \"safe\"\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(result.is_success(), "{}", result.output());
+        assert!(worktree.path().join("Cargo.toml").exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn worktree_patch_rejects_new_file_through_outside_symlink() {
@@ -544,6 +585,31 @@ mod tests {
 
         assert!(!blocked.is_success());
         assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_patch_rejects_dangling_symlink_escape() {
+        let worktree = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let missing_target = outside.path().join("new.txt");
+        std::os::unix::fs::symlink(&missing_target, worktree.path().join("escape")).unwrap();
+        let tool = PatchTool::for_worktree();
+        let mut ctx = test_context(worktree.path().to_path_buf());
+        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
+
+        let blocked = tool
+            .run(
+                json!({
+                    "path": "escape",
+                    "patches": [{"operation": "overwrite", "newText": "escaped\n"}]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(!blocked.is_success());
+        assert!(!missing_target.exists());
     }
 
     #[tokio::test]
