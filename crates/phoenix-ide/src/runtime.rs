@@ -4220,6 +4220,17 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
         self.require_local_authority_admission()?;
+        if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
+            return Ok(handle);
+        }
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(parent_id) = conversation.parent_conversation_id.as_deref() {
+            Box::pin(self.get_or_create(parent_id)).await?;
+        }
         self.get_or_create_inner(conversation_id, None).await
     }
 
@@ -5242,6 +5253,25 @@ impl RuntimeManager {
             None
         };
 
+        let parent_event_tx = if let Some(parent_id) = conv.parent_conversation_id.as_deref() {
+            Some(
+                self.runtimes
+                    .read()
+                    .await
+                    .get(parent_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "Parent runtime '{parent_id}' was not materialized before sub-agent '{}'",
+                            conv.id
+                        )
+                    })?
+                    .event_tx,
+            )
+        } else {
+            None
+        };
+
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
             initial_state.clone(),
@@ -5258,6 +5288,11 @@ impl RuntimeManager {
             broadcaster.clone(),
         );
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
+        let runtime = if let Some(parent_event_tx) = parent_event_tx {
+            runtime.with_parent(parent_event_tx)
+        } else {
+            runtime
+        };
         let runtime = if is_coordinator {
             runtime.with_coordinator_read_service(crate::api::global_read::GlobalReadService::new(
                 self.db.clone(),
@@ -9950,6 +9985,87 @@ mod scope_liveness_tests {
                 .unwrap(),
             0,
             "reconciliation must be idempotent once the state is finalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_overload_subagent_restores_parent_notification_once() {
+        let manager = Arc::new(test_manager().await);
+        let parent_id = "overload-restart-parent";
+        let child_id = "overload-restart-child";
+        let parent = manager
+            .db()
+            .create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .create_subagent_conversation(
+                child_id,
+                child_id,
+                "/tmp",
+                parent_id,
+                "mock-model",
+                &ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                parent.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        manager
+            .db()
+            .update_conversation_state(
+                child_id,
+                &ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                            retry_at: now + chrono::Duration::seconds(30),
+                        },
+                        attempt: 3,
+                        started_at: now,
+                        deadline_at: now + chrono::Duration::seconds(120),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let mut parent_events = manager
+            .inject_handle_with_event_capture_for_test(parent_id, ConvState::Idle)
+            .await;
+
+        let child = manager.get_or_create(child_id).await.unwrap();
+        child
+            .event_tx
+            .send(Event::OverloadRetryDeadlineExpired)
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), parent_events.recv())
+            .await
+            .expect("recovered child notifies its parent")
+            .expect("parent channel remains open");
+        assert!(matches!(
+            event,
+            Event::SubAgentResult {
+                agent_id,
+                outcome: SubAgentOutcome::Failure {
+                    error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    ..
+                },
+            } if agent_id == child_id
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), parent_events.recv(),)
+                .await
+                .is_err(),
+            "terminal overload settlement must notify the parent exactly once"
         );
     }
 

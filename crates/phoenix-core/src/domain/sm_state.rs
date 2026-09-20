@@ -1093,6 +1093,7 @@ pub struct RecoverableContinuationFailure {
 pub enum RecoveryResumeTarget {
     ConversationTurn,
     ContinuationSummary { request: ContinuationSummaryRequest },
+    ServerOverloadRetry { retry: ServerOverloadRetry },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverloadRetryGuidance {

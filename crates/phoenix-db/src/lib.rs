@@ -6516,7 +6516,13 @@ impl Database {
                     | ConvState::RecoverableContinuationFailure { .. }
                     | ConvState::AwaitingRecovery {
                     resume:
-                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. }
+                        | phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation { .. },
+                                ..
+                            },
+                        },
                     ..
                 }
             ) {
@@ -10042,7 +10048,8 @@ impl Database {
                 state,
                 ConvState::AwaitingRecovery {
                     resume:
-                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. }
+                        | phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry { .. },
                     ..
                 }
             ) {
@@ -22346,7 +22353,7 @@ mod tests {
     #[tokio::test]
     async fn reset_preserves_continuation_auth_recovery_but_resets_ordinary_recovery() {
         let db = Database::open_in_memory().await.unwrap();
-        for id in ["continuation-auth", "ordinary-auth"] {
+        for id in ["continuation-auth", "overload-auth", "ordinary-auth"] {
             db.create_conversation(id, id, "/tmp", true, None, None)
                 .await
                 .unwrap();
@@ -22364,6 +22371,27 @@ mod tests {
                 recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
                 resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary {
                     request: request.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let started_at = Utc::now();
+        let overload_retry = phoenix_core::domain::sm_state::ServerOverloadRetry {
+            target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+            phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            attempt: 3,
+            started_at,
+            deadline_at: started_at + chrono::Duration::seconds(120),
+        };
+        db.update_conversation_state(
+            "overload-auth",
+            &ConvState::AwaitingRecovery {
+                message: "authenticate".to_string(),
+                error_kind: ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: overload_retry.clone(),
                 },
             },
         )
@@ -22391,6 +22419,15 @@ mod tests {
                 },
                 ..
             } if persisted == request
+        ));
+        assert!(matches!(
+            db.get_conversation("overload-auth").await.unwrap().state,
+            ConvState::AwaitingRecovery {
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: persisted,
+                },
+                ..
+            } if persisted == overload_retry
         ));
         assert_eq!(
             db.get_conversation("ordinary-auth").await.unwrap().state,

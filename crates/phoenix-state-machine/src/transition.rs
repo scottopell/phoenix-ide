@@ -465,7 +465,9 @@ pub fn transition(
     if let ConvState::ServerOverloadRetrying { retry } = state {
         if matches!(retry.phase, ServerOverloadPhase::InFlight) {
             if let Event::LlmResponse { .. } = event {
-                return transition(&overload_in_flight_state(retry), context, event);
+                if context.is_sub_agent {
+                    return transition(&overload_in_flight_state(retry), context, event);
+                }
             }
             if let Event::LlmError {
                 message,
@@ -483,7 +485,18 @@ pub fn transition(
                         *observed_at,
                     );
                 }
-                return transition(&overload_in_flight_state(retry), context, event);
+                if context.is_sub_agent
+                    || !matches!(
+                        &event,
+                        Event::LlmError {
+                            error_kind: ErrorKind::Auth,
+                            recovery_in_progress: true,
+                            ..
+                        }
+                    )
+                {
+                    return transition(&overload_in_flight_state(retry), context, event);
+                }
             }
         }
     }
@@ -884,17 +897,17 @@ pub fn transition_core(
             | CoreEvent::RetryTimeout { .. },
         ) => handle_server_overload_retry(state, context, event),
 
-        (
-            CoreState::ServerOverloadRetrying {
-                retry:
-                    ServerOverloadRetry {
-                        target: ServerOverloadTarget::Ordinary,
-                        phase: ServerOverloadPhase::InFlight,
-                        ..
-                    },
-            },
-            CoreEvent::LlmResponse { .. },
-        ) => handle_core_llm_response(&CoreState::LlmRequesting { attempt: 1 }, context, event),
+        (CoreState::ServerOverloadRetrying { retry }, CoreEvent::LlmResponse { .. })
+            if matches!(retry.target, ServerOverloadTarget::Ordinary) =>
+        {
+            handle_core_llm_response(
+                &CoreState::LlmRequesting {
+                    attempt: retry.attempt,
+                },
+                context,
+                event,
+            )
+        }
 
         // LLM Response Processing (REQ-BED-003)
         (CoreState::LlmRequesting { .. }, CoreEvent::LlmResponse { .. }) => {
@@ -2541,7 +2554,37 @@ pub fn transition_parent(
                     request: request.clone(),
                 }),
             ),
+            RecoveryResumeTarget::ServerOverloadRetry { retry } => {
+                let effect = match &retry.target {
+                    ServerOverloadTarget::Ordinary => Effect::RequestLlm,
+                    target @ ServerOverloadTarget::Continuation { .. } => {
+                        Effect::RequestContinuation {
+                            request: target
+                                .continuation_request(retry.attempt)
+                                .expect("continuation overload target reconstructs its request"),
+                        }
+                    }
+                };
+                Ok(ParentTransitionResult::new(ParentState::Core(
+                    CoreState::ServerOverloadRetrying {
+                        retry: retry.clone(),
+                    },
+                ))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(effect))
+            }
         },
+
+        (
+            ParentState::AwaitingRecovery {
+                error_kind,
+                resume: RecoveryResumeTarget::ServerOverloadRetry { retry },
+                ..
+            },
+            ParentEvent::Parent(ParentOnlyEvent::CredentialHelperFailed { message }),
+        ) => overload_terminal(retry, message.clone(), error_kind.clone(), None)
+            .map(CoreTransitionResult::into_parent_result),
 
         (
             ParentState::AwaitingRecovery {
@@ -2676,7 +2719,17 @@ pub fn transition_parent(
         // issues with guards on the same event payload.
         // ============================================================
         (
-            ParentState::Core(CoreState::LlmRequesting { attempt }),
+            ParentState::Core(
+                core_state @ (CoreState::LlmRequesting { .. }
+                | CoreState::ServerOverloadRetrying {
+                    retry:
+                        ServerOverloadRetry {
+                            target: ServerOverloadTarget::Ordinary,
+                            phase: ServerOverloadPhase::InFlight,
+                            ..
+                        },
+                }),
+            ),
             ParentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
@@ -2685,7 +2738,11 @@ pub fn transition_parent(
                 ..
             }),
         ) => {
-            let final_attempt = *attempt;
+            let final_attempt = match core_state {
+                CoreState::LlmRequesting { attempt } => *attempt,
+                CoreState::ServerOverloadRetrying { retry } => retry.attempt,
+                _ => unreachable!("response interception only accepts request states"),
+            };
             // REQ-LRV-006: stamp the retry count onto every parent-intercepted
             // assistant message (propose_task / ask_user_question — typed,
             // malformed, and validation-retry branches all persist a
@@ -2869,6 +2926,10 @@ pub fn transition_parent(
                         usage_data,
                         request_id,
                         final_attempt,
+                        match core_state {
+                            CoreState::ServerOverloadRetrying { retry } => Some(retry),
+                            _ => None,
+                        },
                     );
                     return Ok(ParentTransitionResult {
                         new_state: ParentState::try_from(tr.new_state)
@@ -3062,6 +3123,10 @@ pub fn transition_parent(
                     usage_data,
                     request_id,
                     final_attempt,
+                    match core_state {
+                        CoreState::ServerOverloadRetrying { retry } => Some(retry),
+                        _ => None,
+                    },
                 );
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
@@ -3077,9 +3142,6 @@ pub fn transition_parent(
                 end_turn: false,
                 usage: usage_data,
                 request_id,
-            };
-            let ParentState::Core(core_state) = state else {
-                unreachable!()
             };
             let core_result = transition_core(core_state, context, core_event)?;
             Ok(core_result.into_parent_result())
@@ -3100,6 +3162,29 @@ pub fn transition_parent(
                 error_kind: error_kind.clone(),
                 recovery_kind: RecoveryKind::Credential,
                 resume: RecoveryResumeTarget::ConversationTurn,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change()))
+        }
+
+        (
+            ParentState::Core(CoreState::ServerOverloadRetrying { retry }),
+            ParentEvent::Core(CoreEvent::LlmError {
+                message,
+                error_kind,
+                recovery_in_progress: true,
+                ..
+            }),
+        ) if matches!(retry.phase, ServerOverloadPhase::InFlight)
+            && matches!(error_kind, ErrorKind::Auth) =>
+        {
+            Ok(ParentTransitionResult::new(ParentState::AwaitingRecovery {
+                message: message.clone(),
+                error_kind: error_kind.clone(),
+                recovery_kind: RecoveryKind::Credential,
+                resume: RecoveryResumeTarget::ServerOverloadRetry {
+                    retry: retry.clone(),
+                },
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change()))
@@ -3589,6 +3674,7 @@ pub fn transition_sub_agent(
                     usage_data,
                     request_id,
                     final_attempt,
+                    None,
                 );
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
@@ -4071,6 +4157,7 @@ fn handle_context_exhaustion(
     usage_data: UsageData,
     request_id: String,
     final_attempt: u32,
+    overload_retry: Option<&ServerOverloadRetry>,
 ) -> TransitionResult {
     use crate::state::SubAgentOutcome;
 
@@ -4080,21 +4167,32 @@ fn handle_context_exhaustion(
             let request = ContinuationSummaryRequest {
                 operation_id: request_id.clone(),
                 rejected_tool_calls: tool_calls,
-                attempt: 1,
+                attempt: overload_retry.map_or(1, |retry| retry.attempt),
             };
-            TransitionResult::new(ConvState::AwaitingContinuation {
-                request: request.clone(),
-            })
-            .with_effect(Effect::begin_continuation(
-                request.clone(),
-                blocks,
-                usage_data,
-                ctx.execution_environment.working_dir(),
-                request_id,
-                final_attempt,
-            ))
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestContinuation { request })
+            let continuation_state = overload_retry.map_or_else(
+                || ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                },
+                |retry| {
+                    let mut retry = retry.clone();
+                    retry.target = ServerOverloadTarget::Continuation {
+                        operation_id: request.operation_id.clone(),
+                        rejected_tool_calls: request.rejected_tool_calls.clone(),
+                    };
+                    ConvState::ServerOverloadRetrying { retry }
+                },
+            );
+            TransitionResult::new(continuation_state)
+                .with_effect(Effect::begin_continuation(
+                    request.clone(),
+                    blocks,
+                    usage_data,
+                    ctx.execution_environment.working_dir(),
+                    request_id,
+                    final_attempt,
+                ))
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestContinuation { request })
         }
         ContextExhaustionBehavior::IntentionallyUnhandled => {
             // REQ-BED-024: Sub-agent fails immediately
@@ -4494,6 +4592,62 @@ mod tests {
     }
 
     #[test]
+    fn overload_success_crossing_context_threshold_keeps_incident_for_continuation() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let original = ServerOverloadRetry {
+            target: ServerOverloadTarget::Ordinary,
+            phase: ServerOverloadPhase::InFlight,
+            attempt: 3,
+            started_at: at,
+            deadline_at: at + chrono::Duration::seconds(120),
+        };
+        let result = transition(
+            &ConvState::ServerOverloadRetrying {
+                retry: original.clone(),
+            },
+            &test_context(),
+            Event::LlmResponse {
+                content: vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                    "near limit",
+                )],
+                tool_calls: vec![test_tool_call("rejected")],
+                end_turn: true,
+                usage: phoenix_core::domain::llm_types::Usage {
+                    input_tokens: 190_000,
+                    output_tokens: 1,
+                    reasoning_tokens: None,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+                request_id: "overload-continuation".to_string(),
+            },
+        )
+        .unwrap();
+
+        let ConvState::ServerOverloadRetrying { retry } = &result.new_state else {
+            panic!("continuation must remain in the overload incident")
+        };
+        assert_eq!(retry.attempt, original.attempt);
+        assert_eq!(retry.started_at, original.started_at);
+        assert_eq!(retry.deadline_at, original.deadline_at);
+        assert_eq!(retry.phase, ServerOverloadPhase::InFlight);
+        assert!(matches!(
+            &retry.target,
+            ServerOverloadTarget::Continuation {
+                operation_id,
+                rejected_tool_calls,
+            } if operation_id == "overload-continuation" && rejected_tool_calls.len() == 1
+        ));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RequestContinuation { request }
+                if request.operation_id == "overload-continuation" && request.attempt == 3
+        )));
+    }
+
+    #[test]
     fn mixed_transient_failure_stays_in_original_overload_incident() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -4599,15 +4753,33 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(
-            recovered.new_state,
-            ConvState::AwaitingRecovery {
-                resume: RecoveryResumeTarget::ContinuationSummary { request },
-                ..
-            } if request.operation_id == "continuation-auth"
-                && request.attempt == 3
-                && request.rejected_tool_calls == rejected_tool_calls
-        ));
+        let ConvState::AwaitingRecovery {
+            resume: RecoveryResumeTarget::ServerOverloadRetry { retry },
+            ..
+        } = &recovered.new_state
+        else {
+            panic!("overload credential recovery must retain its incident")
+        };
+        assert_eq!(
+            retry,
+            match &state {
+                ConvState::ServerOverloadRetrying { retry } => retry,
+                _ => unreachable!(),
+            }
+        );
+        let restored: ConvState =
+            serde_json::from_str(&serde_json::to_string(&recovered.new_state).unwrap()).unwrap();
+        assert_eq!(restored, recovered.new_state);
+        let resumed =
+            transition(&restored, &test_context(), Event::CredentialBecameAvailable).unwrap();
+        assert_eq!(resumed.new_state, state);
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RequestContinuation { request }
+                if request.operation_id == "continuation-auth"
+                    && request.attempt == 3
+                    && request.rejected_tool_calls == rejected_tool_calls
+        )));
 
         let failed = transition(
             &state,
@@ -6090,6 +6262,7 @@ mod tests {
             },
             "test-req-id".to_string(),
             1,
+            None,
         );
 
         // Sub-agent should go to Failed, not AwaitingContinuation
@@ -6429,6 +6602,7 @@ mod tests {
             },
             "test-req-id".to_string(),
             1,
+            None,
         );
 
         // Parent should go to AwaitingContinuation
