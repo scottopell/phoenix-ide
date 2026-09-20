@@ -1849,6 +1849,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
 
 def build_rust(release: bool = False):
     """Build the Rust backend for local development by default."""
+    _configure_compiler_cache()
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
     # In dev mode Vite serves assets, so an empty dir is fine.
     (UI_DIR / "dist").mkdir(exist_ok=True)
@@ -3850,6 +3851,27 @@ def collect_doctor_results() -> list[DoctorResult]:
         str(browser) if browser is not None else "not found",
     ))
 
+    kache_binary = _kache_binary()
+    if kache_binary:
+        version, error = _kache_version(kache_binary)
+        results.append(DoctorResult(
+            "kache",
+            version is not None,
+            f"{version} ({kache_binary})" if version else str(error),
+            required=False,
+        ))
+    else:
+        results.append(DoctorResult("kache", False, "not found", required=False))
+
+    sccache_binary = shutil.which("sccache")
+    if sccache_binary:
+        version, error = _command_version(sccache_binary)
+        results.append(DoctorResult(
+            "sccache", version is not None, version or str(error), required=False,
+        ))
+    else:
+        results.append(DoctorResult("sccache", False, "not found", required=False))
+
     for name, command, environment in (
         ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
         ("allium", ["allium", "--version"], None),
@@ -4815,6 +4837,40 @@ def _append_git_config_override(key, value, environ=None):
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
 
 
+_SUPPORTED_KACHE_SERIES = (0, 26)
+
+
+def _command_version(binary: str) -> tuple[str | None, str | None]:
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, str(error)
+    output = (result.stdout or result.stderr).strip().splitlines()
+    detail = output[0] if output else f"exit code {result.returncode}"
+    return (detail, None) if result.returncode == 0 else (None, detail)
+
+
+def _kache_version(binary: str) -> tuple[str | None, str | None]:
+    detail, error = _command_version(binary)
+    if error:
+        return None, error
+    assert detail is not None
+    match = re.fullmatch(r"kache (\d+)\.(\d+)\.(\d+)(?:[-+].*)?", detail)
+    if match is None:
+        return None, f"unrecognized version output: {detail}"
+    version = ".".join(match.groups())
+    series = tuple(int(part) for part in match.groups()[:2])
+    if series != _SUPPORTED_KACHE_SERIES:
+        return None, f"unsupported kache {version}; Phoenix supports released kache 0.26.x"
+    return version, None
+
+
 def _kache_binary() -> str | None:
     configured = os.environ.get("PHOENIX_KACHE_BIN")
     if configured:
@@ -4882,22 +4938,35 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
     automatic = backend == "auto"
     kache_binary = _kache_binary()
+    sccache_binary = shutil.which("sccache")
+    kache_version = None
+    kache_error = None
+    if kache_binary:
+        kache_version, kache_error = _kache_version(kache_binary)
+
     if automatic:
-        if shutil.which("sccache"):
-            backend = "sccache"
-        elif kache_binary:
+        if kache_version:
             backend = "kache"
+        elif sccache_binary:
+            if kache_error:
+                print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
+            backend = "sccache"
         else:
+            if kache_error:
+                print(f"  ⚠ kache unavailable; continuing without compiler cache: {kache_error}")
             return "none"
-    elif backend == "kache" and not kache_binary:
-        raise SystemExit(
-            "requested compiler cache 'kache' is not installed; put it on PATH "
-            "or set PHOENIX_KACHE_BIN"
-        )
-    elif backend == "sccache" and not shutil.which("sccache"):
+    elif backend == "kache":
+        if not kache_binary:
+            raise SystemExit(
+                "requested compiler cache 'kache' is not installed; put it on PATH "
+                "or set PHOENIX_KACHE_BIN"
+            )
+        if kache_error:
+            raise SystemExit(f"requested compiler cache 'kache' is incompatible: {kache_error}")
+    elif backend == "sccache" and not sccache_binary:
         raise SystemExit("requested compiler cache 'sccache' is not installed or not on PATH")
 
-    wrapper = kache_binary if backend == "kache" else backend
+    wrapper = kache_binary if backend == "kache" else sccache_binary
     assert wrapper is not None
     os.environ["RUSTC_WRAPPER"] = wrapper
     if backend == "kache":
@@ -4909,11 +4978,24 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             os.environ.pop("RUSTC_WRAPPER", None)
             if generated_socket:
                 os.environ.pop("KACHE_SOCKET_PATH", None)
+            if sccache_binary:
+                print(f"  ⚠ kache unavailable; using sccache: {daemon_error}")
+                os.environ["RUSTC_WRAPPER"] = sccache_binary
+                os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
+                print("  Compiler cache: sccache")
+                return "sccache"
             print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
             return "none"
-    elif backend == "sccache":
+        print(f"  Compiler cache: kache {kache_version}")
+    else:
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
+        print("  Compiler cache: sccache")
     return backend
+
+
+def _compiler_cache_subprocess_env(requested: str | None = None) -> tuple[str, dict[str, str]]:
+    selected = _configure_compiler_cache(requested)
+    return selected, os.environ.copy()
 
 
 def _parse_cache_size(value: str) -> int:
@@ -7519,7 +7601,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
         raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
-    build_env = os.environ.copy()
+    _, build_env = _compiler_cache_subprocess_env()
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")

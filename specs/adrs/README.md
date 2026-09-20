@@ -70,6 +70,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_kache-first-automatic-compiler-cache.md) | Automatic compiler caching prefers released Kache | Accepted | development methodology; REQ-COMP-001 |
 
 ## For agents: which decisions bind your task
 
@@ -78,6 +79,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Task type | Relevant ADRs |
 | --- | --- |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Selecting or qualifying development compiler-cache defaults | 059, within 034's compatibility scope |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
