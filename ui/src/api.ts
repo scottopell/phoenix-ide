@@ -697,7 +697,8 @@ export interface ConversationMessagesAroundResponse {
 export type MessageContent = 
   | { text: string; images?: ImageData[]; files?: FileAttachment[] }  // user message
   | ContentBlock[]  // agent message
-  | ToolResultContent;  // tool result
+  | ToolResultContent  // tool result
+  | { summary: string }; // continuation handoff
 
 export interface ContentBlock {
   type: 'text' | 'tool_use';

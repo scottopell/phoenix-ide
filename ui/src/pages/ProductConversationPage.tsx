@@ -748,6 +748,11 @@ function ProductConversationPageInner() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
+  useEffect(() => {
+    const refresh = () => setSnapshotRetry((value) => value + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);

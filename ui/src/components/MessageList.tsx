@@ -372,6 +372,11 @@ function renderHistoricalUnit(
           {...(onRevealHandled ? { onRevealHandled } : {})}
         />
       );
+    case 'continuation': {
+      const summary = (unit.message.content as { summary?: string })?.summary;
+      if (!summary) return null;
+      return <CompletedContinuationBoundary summary={summary} />;
+    }
     case 'system': {
       const displayData = unit.message.display_data as ProductHistoricalHandoffDisplayData | null;
       if (displayData?.hidden) return null;

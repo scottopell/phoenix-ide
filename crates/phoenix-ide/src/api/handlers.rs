@@ -5550,6 +5550,16 @@ async fn continue_conversation(
         ));
     }
     let mut automatic_retry_phase = None;
+    let _automatic_retry_authority = if req.retry_failed_automatic {
+        Some(
+            state
+                .runtime
+                .acquire_local_authority_pass()
+                .map_err(|()| AppError::Internal("local authority is closed".to_string()))?,
+        )
+    } else {
+        None
+    };
     let failed_admission = if req.retry_failed_automatic {
         state
             .runtime

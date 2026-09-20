@@ -318,11 +318,7 @@ impl PreparedDirectTurnPayload {
         {
             crate::domain::db_schema::MessageContent::Continuation(
                 crate::domain::db_schema::ContinuationContent {
-                    summary: self
-                        .delivery
-                        .llm_text
-                        .clone()
-                        .unwrap_or_else(|| self.delivery.text.clone()),
+                    summary: self.delivery.text.clone(),
                 },
             )
         } else if let Some(invocation) = &self.delivery.skill_invocation {
@@ -1380,7 +1376,7 @@ mod direct_turn_payload_tests {
         let crate::domain::db_schema::MessageContent::Continuation(continuation) = content else {
             panic!("expected typed continuation content");
         };
-        assert_eq!(continuation.summary, "authority-wrapped context");
+        assert_eq!(continuation.summary, "display summary");
     }
 
     #[test]

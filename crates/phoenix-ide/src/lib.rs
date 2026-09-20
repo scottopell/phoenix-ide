@@ -971,7 +971,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let automatic_continuation_runtime = state.runtime.clone();
-    tokio::spawn(async move {
+    let automatic_continuation_authority = state.runtime.clone();
+    let automatic_continuation_task = tokio::spawn(async move {
         if !crate::continuation_service::drain_automatic_continuations(
             automatic_continuation_runtime.clone(),
         )
@@ -990,6 +991,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return;
             }
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(error) = automatic_continuation_task.await {
+            tracing::error!(%error, "automatic continuation authority task exited unexpectedly");
+            automatic_continuation_authority
+                .signal_fatal_local_authority("automatic_continuation_driver_supervisor");
         }
     });
 
