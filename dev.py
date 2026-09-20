@@ -1793,7 +1793,9 @@ def ensure_ui_deps():
     (UI_DIR / "dist").mkdir(exist_ok=True)
 
 
-def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
+def _run_cargo_build(
+    args: list[str], cwd: Path, profile: str, *, env: dict[str, str] | None = None
+) -> None:
     started_at = time.monotonic()
     lock_timer = CargoLockWaitTimer(started_at)
     span = _begin_dev_span("dev.build", {"build.profile": profile})
@@ -1803,6 +1805,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         proc = subprocess.Popen(
             args,
             cwd=cwd,
+            env=env,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
@@ -1849,7 +1852,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
 
 def build_rust(release: bool = False):
     """Build the Rust backend for local development by default."""
-    _configure_compiler_cache()
+    _, build_env = _compiler_cache_subprocess_env()
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
     # In dev mode Vite serves assets, so an empty dir is fine.
     (UI_DIR / "dist").mkdir(exist_ok=True)
@@ -1858,7 +1861,7 @@ def build_rust(release: bool = False):
     if release:
         args.append("--release")
     print("Building Rust backend...")
-    _run_cargo_build(args, ROOT, "release" if release else "debug")
+    _run_cargo_build(args, ROOT, "release" if release else "debug", env=build_env)
 
 
 def tls_enabled_from_env(env: dict[str, str]) -> bool:
@@ -4923,6 +4926,7 @@ def _ensure_kache_daemon(binary: str) -> str | None:
 def _configure_compiler_cache(requested: str | None = None) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
+        print("  Compiler cache: explicit")
         return "explicit"
 
     backend = requested or os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
@@ -4933,10 +4937,12 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
         )
 
     if backend == "none":
+        print("  Compiler cache: none")
         return "none"
 
     automatic = backend == "auto"
-    kache_binary = _kache_binary()
+    wants_kache = automatic or backend == "kache"
+    kache_binary = _kache_binary() if wants_kache else None
     sccache_binary = shutil.which("sccache")
     kache_version = None
     kache_error = None
@@ -4995,8 +5001,13 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
 
 def _compiler_cache_subprocess_env(requested: str | None = None) -> tuple[str, dict[str, str]]:
-    selected = _configure_compiler_cache(requested)
-    return selected, os.environ.copy()
+    original = os.environ.copy()
+    try:
+        selected = _configure_compiler_cache(requested)
+        return selected, os.environ.copy()
+    finally:
+        os.environ.clear()
+        os.environ.update(original)
 
 
 def _parse_cache_size(value: str) -> int:

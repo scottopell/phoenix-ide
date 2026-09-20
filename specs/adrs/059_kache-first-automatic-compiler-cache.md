@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-20
-- **Affects:** development methodology; REQ-COMP-001
+- **Affects:** development methodology; REQ-COMP-001, REQ-COMP-006
 
 ## Context
 

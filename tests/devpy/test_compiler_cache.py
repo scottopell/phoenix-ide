@@ -42,7 +42,9 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertFalse(self.dev._cargo_check_active({"vitest"}))
 
     def test_explicit_rustc_wrapper_wins(self):
-        selected, env = self.configure("kache", env={"RUSTC_WRAPPER": "custom"})
+        with mock.patch("builtins.print") as output:
+            selected, env = self.configure("kache", env={"RUSTC_WRAPPER": "custom"})
+        output.assert_called_once_with("  Compiler cache: explicit")
         self.assertEqual("explicit", selected)
         self.assertEqual("custom", env["RUSTC_WRAPPER"])
 
@@ -119,6 +121,15 @@ class CompilerCacheTests(unittest.TestCase):
         )
         self.assertEqual("sccache", selected)
         self.assertEqual("/bin/sccache", env["RUSTC_WRAPPER"])
+
+    def test_explicit_sccache_does_not_probe_kache(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.shutil,
+            "which",
+            side_effect=lambda name: f"/bin/{name}",
+        ), mock.patch.object(self.dev, "_kache_version") as probe:
+            self.assertEqual("sccache", self.dev._configure_compiler_cache("sccache"))
+        probe.assert_not_called()
 
     def test_local_kache_binary_is_supported(self):
         with mock.patch.dict(
@@ -228,21 +239,31 @@ class CompilerCacheTests(unittest.TestCase):
         process.wait.return_value = 0
         process.poll.return_value = 0
         with mock.patch.object(
-            self.dev, "_configure_compiler_cache", side_effect=lambda: calls.append("cache")
+            self.dev,
+            "_configure_compiler_cache",
+            side_effect=lambda _requested: calls.append("cache"),
         ), mock.patch.object(
-            self.dev.subprocess, "Popen", side_effect=lambda *args, **kwargs: calls.append("cargo") or process
+            self.dev.subprocess,
+            "Popen",
+            side_effect=lambda *args, **kwargs: calls.append(("cargo", kwargs.get("env"))) or process,
         ), mock.patch.object(self.dev, "_begin_dev_span", return_value=None), mock.patch.object(
             self.dev, "_finish_dev_span"
         ):
             self.dev.build_rust()
-        self.assertEqual(["cache", "cargo"], calls)
+        self.assertEqual("cache", calls[0])
+        self.assertEqual("cargo", calls[1][0])
+        self.assertIsNotNone(calls[1][1])
 
-    def test_subprocess_environment_reports_actual_backend(self):
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            self.dev, "_configure_compiler_cache", return_value="sccache"
-        ):
+    def test_subprocess_environment_reports_actual_backend_without_leaking(self):
+        def configure(_requested):
             os.environ["RUSTC_WRAPPER"] = "/bin/sccache"
+            return "sccache"
+
+        with mock.patch.dict(os.environ, {"ORIGINAL": "yes"}, clear=True), mock.patch.object(
+            self.dev, "_configure_compiler_cache", side_effect=configure
+        ):
             selected, environment = self.dev._compiler_cache_subprocess_env("auto")
+            self.assertEqual({"ORIGINAL": "yes"}, os.environ)
         self.assertEqual("sccache", selected)
         self.assertEqual("/bin/sccache", environment["RUSTC_WRAPPER"])
 
