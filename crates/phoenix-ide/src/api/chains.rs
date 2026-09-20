@@ -38,7 +38,7 @@ use tokio_stream::StreamExt;
 use ts_rs::TS;
 
 use super::handlers::{
-    finish_prepared_hard_delete, prepare_hard_delete_cascade, reopen_prepared_hard_delete,
+    finish_hard_deleted_conversation, prepare_hard_delete_cascade, reopen_prepared_hard_delete,
     require_hard_delete_admission, AppError, PreparedHardDelete,
 };
 use super::types::{ConflictErrorResponse, SuccessResponse};
@@ -484,9 +484,10 @@ pub async fn delete_chain_handler(
         }
     }
 
+    let deleting_conversation_ids = member_ids.iter().cloned().collect();
     let mut prepared = Vec::with_capacity(member_ids.len());
     for id in &member_ids {
-        match prepare_hard_delete_cascade(&state, id).await {
+        match prepare_hard_delete_cascade(&state, id, &deleting_conversation_ids).await {
             Ok(member) => prepared.push(member),
             Err(error) => {
                 for member in &prepared {
@@ -518,8 +519,12 @@ pub async fn delete_chain_handler(
         )));
     }
 
-    for member in prepared {
-        finish_prepared_hard_delete(&state, member).await;
+    let conversations = prepared
+        .into_iter()
+        .filter_map(PreparedHardDelete::release_authority)
+        .collect::<Vec<_>>();
+    for conversation in conversations {
+        finish_hard_deleted_conversation(&state, conversation).await;
     }
 
     Ok(Json(SuccessResponse { success: true }))
