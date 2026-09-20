@@ -141,13 +141,18 @@ PY
 
 assert_private_release() {
   local metadata=$1
-  "$PYTHON3" - "$metadata" <<'PY'
+  "$PYTHON3" - "$metadata" "$tag" <<'PY'
 import json
 import sys
 from pathlib import Path
 release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+tag = sys.argv[2]
 if not release.get("draft"):
     raise SystemExit("error: release became public before exact verification")
+if release.get("prerelease"):
+    raise SystemExit("error: stable release draft became a prerelease")
+if release.get("tag_name") != tag:
+    raise SystemExit("error: release draft no longer targets the exact tag")
 PY
 }
 

@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001 through REQ-DESKTOP-REL-008.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }

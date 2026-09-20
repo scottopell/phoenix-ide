@@ -47,10 +47,19 @@ Merge the bump PR only after the user separately authorizes release publication.
 
 ```bash
 gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId') --exit-status
-gh release view vX.Y.Z --json url,assets -q '{url, assets: [.assets[].name]}'
+bash scripts/verify-published-release.sh scottopell/phoenix-ide vX.Y.Z \
+  phoenix_ide-x86_64-unknown-linux-musl \
+  phoenix_ide-aarch64-unknown-linux-musl \
+  phoenix_ide-x86_64-unknown-linux-musl-debug \
+  phoenix_ide-aarch64-unknown-linux-musl-debug \
+  phoenix_ide-x86_64-apple-darwin \
+  phoenix_ide-aarch64-apple-darwin \
+  Phoenix-macos-x86_64-apple-darwin-vX.Y.Z.zip \
+  Phoenix-macos-aarch64-apple-darwin-vX.Y.Z.zip
+gh release view vX.Y.Z --json url -q .url
 ```
 
-Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all eight payload assets. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+The verifier downloads by captured asset IDs and checks the exact nine-name set, `SHA256SUMS`, downloaded bytes, GitHub-reported digests, stable-release classification, and tag identity. Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all eight payload assets. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
 If the build fails, do not retry blindly. Open the run and fix the underlying issue. A manual dispatch may retry only when the existing version tag still points at that exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
 
