@@ -315,8 +315,7 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.drainPersistedOutboxes()
-            Task { await self?.refreshList() }
+            Task { await self?.reconcileListThenResumeAndDrain() }
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
@@ -700,15 +699,10 @@ final class AppModel {
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
         guard let fresh = try? await api.listConversations() else { return false }
-        let coordinator: Conversation?
-        do {
-            coordinator = try await Self.coordinatorForAttention(
-                rememberedId: coordinatorConversationId,
-                fetch: { try await api.getConversation(id: $0).conversation },
-                cached: { ConversationSession.cachedConversation(conversationId: $0) })
-        } catch {
-            return false
-        }
+        let coordinator = await Self.coordinatorAttentionEvidence(
+            rememberedId: coordinatorConversationId,
+            fetch: { _ in try await api.getCoordinatorProjection() },
+            cached: { ConversationSession.cachedConversation(conversationId: $0) })
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration,
@@ -732,6 +726,17 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate,
             isCurrent: isCurrent)
         return await isCurrent()
+    }
+
+    static func coordinatorAttentionEvidence(
+        rememberedId: String?,
+        fetch: (String) async throws -> Conversation,
+        cached: (String) -> Conversation?
+    ) async -> Conversation? {
+        try? await coordinatorForAttention(
+            rememberedId: rememberedId,
+            fetch: fetch,
+            cached: cached)
     }
 
     static func coordinatorForAttention(
@@ -1297,11 +1302,88 @@ final class AppModel {
     func foregrounded() {
         isForeground = true
         if let api { startAggregateEventStream(api: api, generation: apiGeneration) }
-        for session in sessions.values {
-            session.resyncAfterForeground()
+        Task { await reconcileListThenResumeAndDrain() }
+    }
+
+    private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {
+        var owned: [String: Set<String>] = [:]
+        func add(aggregateId: String, transcriptId: String?) {
+            if let transcriptId { owned[aggregateId, default: []].insert(transcriptId) }
+            else { owned[aggregateId, default: []] = owned[aggregateId, default: []] }
+        }
+
+        for row in listStore.conversations where !row.isCoordinator {
+            add(aggregateId: row.aggregateIdentity, transcriptId: row.transcriptRowIdentity)
+            for transcriptId in listStore.transcriptRowIds(forAggregateId: row.aggregateIdentity) {
+                add(aggregateId: row.aggregateIdentity, transcriptId: transcriptId)
+            }
+        }
+        for name in DiskStore.listNames(prefix: "product-history-") {
+            let aggregateId = String(name.dropFirst("product-history-".count))
+            guard let history = cachedProductHistory(productConversationId: aggregateId),
+                  history.snapshot.ordinary_lifecycle != nil
+            else { continue }
+            for segment in history.snapshot.segments {
+                add(aggregateId: aggregateId, transcriptId: segment.transcript_row_id)
+            }
+        }
+        let ownedTranscriptIds = Set(sessions.keys)
+            .union(drainSessions.keys)
+            .union(DiskStore.listNames(prefix: "conv-").map {
+                String($0.dropFirst("conv-".count))
+            })
+        for transcriptId in ownedTranscriptIds {
+            let cached = ConversationSession.cachedConversation(conversationId: transcriptId)
+            guard cached?.isCoordinator != true else { continue }
+            let aggregateId = listStore.aggregateId(forTranscriptRowId: transcriptId)
+                ?? cached?.product_conversation_id
+            if let aggregateId { add(aggregateId: aggregateId, transcriptId: transcriptId) }
+        }
+        return owned
+    }
+
+    nonisolated static func removedAggregateIds(
+        authoritative: [Conversation],
+        locallyOwned: Set<String>
+    ) -> Set<String> {
+        let authoritativeIds = Set(authoritative.lazy.map(\.aggregateIdentity))
+        return locallyOwned.subtracting(authoritativeIds)
+    }
+
+    private func reconcileListThenResumeAndDrain() async {
+        guard let api, connectivity.isOnline else { return }
+        let startedGeneration = apiGeneration
+        let listToken = listStore.externalRefreshToken()
+        let locallyOwned = locallyOwnedOrdinaryAggregates()
+        guard let fresh = try? await api.listConversations(),
+              !Task.isCancelled,
+              apiGeneration == startedGeneration,
+              connectivity.isOnline,
+              listStore.applyExternal(fresh, startedAt: listToken)
+        else { return }
+
+        let removed = Self.removedAggregateIds(
+            authoritative: fresh,
+            locallyOwned: Set(locallyOwned.keys))
+        for aggregateId in removed.sorted() {
+            guard await removeProductHistoryLocally(
+                productConversationId: aggregateId,
+                transcriptIds: locallyOwned[aggregateId] ?? [],
+                startedGeneration: startedGeneration)
+            else { return }
+        }
+        guard !Task.isCancelled, apiGeneration == startedGeneration, connectivity.isOnline else {
+            return
+        }
+        await rehydratePendingProductCloseConfirmation(api: api)
+        guard apiGeneration == startedGeneration else { return }
+        attention.seed(
+            with: listStore.conversations,
+            transcriptToAggregate: listStore.transcriptToAggregate)
+        if isForeground {
+            for session in sessions.values { session.resyncAfterForeground() }
         }
         drainPersistedOutboxes()
-        Task { await refreshList() }
     }
 
     func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {

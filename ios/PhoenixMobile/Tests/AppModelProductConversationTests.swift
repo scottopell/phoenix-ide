@@ -177,6 +177,31 @@ final class AppModelProductConversationTests: XCTestCase {
         }
     }
 
+    func testCoordinatorAttentionEvidenceFailureIsIndependent() async {
+        let evidence = await AppModel.coordinatorAttentionEvidence(
+            rememberedId: "coordinator",
+            fetch: { _ in throw APIError.http(status: 500, body: "failure") },
+            cached: { _ in XCTFail("HTTP failure must not use stale cache"); return nil })
+
+        XCTAssertNil(evidence)
+    }
+
+    func testRemovedAggregateProjectionIgnoresCoordinatorAndKeepsAuthoritativeOrdinaryRows() {
+        let authoritative = [
+            conversation(id: "ordinary", aggregateId: "pc-kept"),
+            conversation(
+                id: "coordinator",
+                aggregateId: "pc-coordinator",
+                runtimeRole: "coordinator"),
+        ]
+
+        XCTAssertEqual(
+            AppModel.removedAggregateIds(
+                authoritative: authoritative,
+                locallyOwned: ["pc-kept", "pc-deleted", "pc-coordinator"]),
+            ["pc-deleted"])
+    }
+
     func testProductHistoryMergePreservesAggregateIdentityAndLineageOrderWithoutDuplicates() throws {
         let newer = historySnapshot(
             segments: [

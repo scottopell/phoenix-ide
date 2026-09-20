@@ -525,6 +525,10 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
+    func getCoordinatorProjection() async throws -> Conversation {
+        try await get("api/global/coordinator", as: ConversationResponse.self).conversation
+    }
+
     /// Get-or-create the fleet Coordinator's writable transcript row. The
     /// list surface is aggregate-keyed, but live Coordinator transcript work
     /// still uses the ordinary conversation endpoints.

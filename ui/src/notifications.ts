@@ -208,6 +208,37 @@ export function subscribeProductConversationSnapshotChanged(
   return () => window.removeEventListener(PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT, handler);
 }
 
+const PRODUCT_CONVERSATION_DELETED_EVENT = 'phoenix:product-conversation-deleted';
+
+type ProductConversationDeletedDetail = {
+  productConversationId: string;
+  deletedConversationIds: string[];
+};
+
+export function notifyProductConversationDeleted(
+  productConversationId: string,
+  deletedConversationIds: string[],
+): void {
+  window.dispatchEvent(new CustomEvent<ProductConversationDeletedDetail>(
+    PRODUCT_CONVERSATION_DELETED_EVENT,
+    { detail: { productConversationId, deletedConversationIds } },
+  ));
+}
+
+export function subscribeProductConversationDeleted(
+  identities: ReadonlySet<string>,
+  listener: () => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationDeletedDetail>).detail;
+    if (!detail) return;
+    if (identities.has(detail.productConversationId)
+      || detail.deletedConversationIds.some((id) => identities.has(id))) listener();
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_DELETED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_DELETED_EVENT, handler);
+}
+
 const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
 
 export type CloseSnapshotInvalidationSource = 'close' | 'stream';

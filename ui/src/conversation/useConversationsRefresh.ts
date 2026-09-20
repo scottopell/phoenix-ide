@@ -8,6 +8,7 @@ import { clearLastViewer } from '../storage/lastViewerStorage';
 import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
 import {
+  notifyProductConversationDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
 } from '../notifications';
@@ -251,6 +252,7 @@ export function useConversationsRefreshDriver(): void {
       notifyProductConversationListMayHaveChanged();
       notifyProductConversationSnapshotChanged(detail.conversationId);
       const deletedConversationIds = detail.deletedConversationIds ?? [detail.conversationId];
+      notifyProductConversationDeleted(detail.conversationId, deletedConversationIds);
       for (const conversationId of deletedConversationIds) {
         const removedSlugs = store.removeByConversationId(conversationId);
         for (const slug of removedSlugs) {

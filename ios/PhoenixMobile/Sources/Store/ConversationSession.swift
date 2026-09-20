@@ -119,6 +119,7 @@ final class ConversationSession {
     }
 
     private var transcriptGeneration: Int64?
+    private var deliveryAllowed = true
     private(set) var snapshotSyncedAt: Date?
 
     init(
@@ -214,6 +215,9 @@ final class ConversationSession {
     /// foreground transition resumes only that conversation's live stream.
     func pauseForBackground() {
         pauseLiveTasks()
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
     }
 
     private func pauseLiveTasks() {
@@ -241,6 +245,7 @@ final class ConversationSession {
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
         guard !isHardDeleted else { return }
+        deliveryAllowed = true
         resumeLiveTasks()
         drainOutbox()
     }
@@ -256,6 +261,9 @@ final class ConversationSession {
     }
 
     private func connectivityLost() {
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
         streamTask?.cancel()
         streamTask = nil
         staleCheckTask?.cancel()
@@ -387,7 +395,7 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard drainTask == nil, !isHardDeleted else { return }
+        guard drainTask == nil, !isHardDeleted, deliveryAllowed else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
