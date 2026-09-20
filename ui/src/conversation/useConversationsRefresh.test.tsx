@@ -114,7 +114,7 @@ describe('aggregate deletion event subscription', () => {
     class FakeEventSource {
       onerror: (() => void) | null = null;
       close = vi.fn();
-      constructor(_url: string) { instances.push(this); }
+      constructor() { instances.push(this); }
       addEventListener() {}
     }
     globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
