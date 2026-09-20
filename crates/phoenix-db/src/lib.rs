@@ -6723,6 +6723,7 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM continuation_dispatch_intents AS intent
                  WHERE intent.successor_conversation_id = ?1
+                   AND intent.opening_authority = 'generated_predecessor_context'
                    AND NOT EXISTS (
                        SELECT 1 FROM completed_continuation_handoffs AS completed
                        WHERE completed.predecessor_conversation_id = intent.parent_conversation_id
