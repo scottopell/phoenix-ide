@@ -250,6 +250,26 @@ final class AppModelProductConversationTests: XCTestCase {
             ["pc-deleted"])
     }
 
+    func testLocallyOwnedAggregatesExcludeRememberedLegacyCoordinatorWithoutRuntimeRole() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-legacy-coordinator-tests-\(UUID().uuidString)")
+        UserDefaults.standard.set("coordinator-row", forKey: "phoenix.coordinatorConversationId")
+        defer { UserDefaults.standard.removeObject(forKey: "phoenix.coordinatorConversationId") }
+        persistReadableSnapshot(conversation: conversation(
+            id: "coordinator-row",
+            aggregateId: "pc-coordinator"))
+        let model = AppModel()
+        model.listStore.upsert(conversation(
+            id: "coordinator-row",
+            aggregateId: "pc-coordinator"))
+        model.listStore.upsert(conversation(id: "ordinary-row", aggregateId: "pc-ordinary"))
+
+        let owned = model.locallyOwnedOrdinaryAggregatesForTesting()
+
+        XCTAssertNil(owned["pc-coordinator"])
+        XCTAssertEqual(owned["pc-ordinary"], ["ordinary-row"])
+    }
+
     func testProductHistoryMergePreservesAggregateIdentityAndLineageOrderWithoutDuplicates() throws {
         let newer = historySnapshot(
             segments: [
@@ -425,6 +445,32 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: leaf.id))
         XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-root"))
         XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-leaf"))
+    }
+
+    func testAggregateDeletionTerminalizesRetainedOwnersMissingFromAliases() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-retained-delete-tests-\(UUID().uuidString)")
+        let aggregateId = "pc-deleted"
+        let openRow = conversation(id: "open-row", aggregateId: aggregateId)
+        let drainRow = conversation(id: "drain-row", aggregateId: aggregateId)
+        persistReadableSnapshot(conversation: openRow)
+        persistReadableSnapshot(conversation: drainRow)
+        let model = AppModel()
+        model.installAPIForTesting()
+        let openOwner = try XCTUnwrap(model.session(for: openRow.id))
+        let drainOwner = try XCTUnwrap(model.installDrainSessionForTesting(conversationId: drainRow.id))
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId,
+            transcriptIds: [])
+
+        XCTAssertTrue(removed)
+        XCTAssertTrue(openOwner.isHardDeleted)
+        XCTAssertTrue(drainOwner.isHardDeleted)
+        XCTAssertFalse(openOwner.acceptsConversationActions)
+        XCTAssertFalse(drainOwner.acceptsConversationActions)
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: openRow.id))
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: drainRow.id))
     }
 
     func testRetainedProductHistoryCacheShowsAgeUntilOnlineRefreshSucceeds() {
@@ -623,6 +669,86 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertTrue(session.isArchiving)
         XCTAssertFalse(session.acceptsConversationActions)
+    }
+
+    func testActiveCloseFenceAppliesToCachedOwnersMissingFromListAliases() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-cached-close-fence-tests-\(UUID().uuidString)")
+        persistReadableSnapshot(conversation: conversation(id: "open", aggregateId: "product"))
+        persistReadableSnapshot(conversation: conversation(id: "drain", aggregateId: "product"))
+        let model = AppModel()
+        model.installAPIForTesting()
+        let openOwner = try XCTUnwrap(model.session(for: "open"))
+        let drainOwner = try XCTUnwrap(model.installDrainSessionForTesting(conversationId: "drain"))
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+
+        model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
+
+        XCTAssertTrue(openOwner.isArchiving)
+        XCTAssertTrue(drainOwner.isArchiving)
+        XCTAssertFalse(openOwner.acceptsConversationActions)
+        XCTAssertFalse(drainOwner.acceptsConversationActions)
+    }
+
+    func testCancelReconciliationKeepsFenceForConcurrentCloseAttempt() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-cancel-close-fence-tests-\(UUID().uuidString)")
+        let row = conversation(id: "latest", aggregateId: "product")
+        persistReadableSnapshot(conversation: row)
+        let model = AppModel()
+        model.installAPIForTesting()
+        let session = try XCTUnwrap(model.session(for: row.id))
+        model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
+        var concurrent = historySnapshot(aggregateId: "product", segments: [])
+        concurrent.ordinary_lifecycle = .open
+        concurrent.close = closeSnapshot(phase: .awaiting_stop_work_confirmation)
+
+        model.reconcileAuthoritativeCloseForTesting(
+            concurrent,
+            productConversationId: "product")
+
+        XCTAssertEqual(model.pendingProductCloseConfirmation?.close.attempt_id, "attempt")
+        XCTAssertTrue(session.isArchiving)
+        XCTAssertFalse(session.acceptsConversationActions)
+    }
+
+    func testTypedCloseConflictFencesImmediatelyAndRetainsReconciliationObligation() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-conflict-fence-tests-\(UUID().uuidString)")
+        let row = conversation(id: "latest", aggregateId: "product")
+        persistReadableSnapshot(conversation: row)
+        let model = AppModel()
+        model.installAPIForTesting()
+        let session = try XCTUnwrap(model.session(for: row.id))
+
+        model.recordCloseConfirmationRequiredForTesting(productConversationId: "product")
+
+        XCTAssertTrue(session.isArchiving)
+        XCTAssertFalse(session.acceptsConversationActions)
+        XCTAssertEqual(model.closeConfirmationReconciliationIdsForTesting, ["product"])
+        XCTAssertNil(model.pendingProductCloseConfirmation)
+    }
+
+    func testTypedCloseConflictReconciliationUnfencesOnlyAfterAuthoritativeSnapshot() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-conflict-reconcile-tests-\(UUID().uuidString)")
+        let row = conversation(id: "latest", aggregateId: "product")
+        persistReadableSnapshot(conversation: row)
+        let model = AppModel()
+        model.installAPIForTesting()
+        let session = try XCTUnwrap(model.session(for: row.id))
+        model.recordCloseConfirmationRequiredForTesting(productConversationId: "product")
+        var open = historySnapshot(aggregateId: "product", segments: [])
+        open.ordinary_lifecycle = .open
+
+        model.completeCloseConfirmationReconciliationForTesting(
+            open,
+            productConversationId: "product")
+
+        XCTAssertFalse(session.isArchiving)
+        XCTAssertTrue(session.acceptsConversationActions)
+        XCTAssertTrue(model.closeConfirmationReconciliationIdsForTesting.isEmpty)
+        XCTAssertNil(model.pendingProductCloseConfirmation)
     }
 
     func testPendingCloseConfirmationBlocksPersistedAggregateOutboxWithoutRequest() async {

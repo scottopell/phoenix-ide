@@ -300,6 +300,7 @@ final class AppModel {
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
     private var closeAdmissionFencedProductConversationIds: Set<String> = []
+    private var closeConfirmationReconciliationProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
     private var productHistoryGenerations = ProductActionGenerationTracker()
     private var confirmationRehydrationGenerations = ProductActionGenerationTracker()
@@ -383,8 +384,10 @@ final class AppModel {
                 onHardDeleted: onHardDeleted)
         }
         sessions[conversationId] = session
-        if let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId),
-           closeAdmissionFencedProductConversationIds.contains(aggregateId)
+        for aggregateId in closeAdmissionFencedProductConversationIds where sessionBelongsToAggregate(
+            session,
+            transcriptId: conversationId,
+            productConversationId: aggregateId)
         {
             session.setCloseAdmissionFenced(true)
         }
@@ -539,6 +542,56 @@ final class AppModel {
         }
     }
 
+    private func sessionBelongsToAggregate(
+        _ session: ConversationSession,
+        transcriptId: String,
+        productConversationId: String
+    ) -> Bool {
+        aggregateIdentity(forTranscriptRowId: transcriptId) == productConversationId
+            || session.conversation?.product_conversation_id == productConversationId
+            || ConversationSession.cachedConversation(conversationId: transcriptId)?
+                .product_conversation_id == productConversationId
+    }
+
+    private func recordCloseConfirmationRequired(productConversationId: String) {
+        setProductCloseAdmissionFence(
+            productConversationId: productConversationId,
+            fenced: true)
+        closeConfirmationReconciliationProductConversationIds.insert(productConversationId)
+    }
+
+    private func completeCloseConfirmationReconciliation(
+        _ snapshot: ProductConversationSnapshot,
+        productConversationId: String
+    ) {
+        closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
+        reconcileAuthoritativeClose(
+            snapshot,
+            productConversationId: productConversationId)
+    }
+
+    private func reconcileAuthoritativeClose(
+        _ snapshot: ProductConversationSnapshot,
+        productConversationId: String
+    ) {
+        if let refreshed = PendingProductCloseConfirmation(snapshot: snapshot) {
+            pendingProductCloseConfirmation = refreshed
+            setProductCloseAdmissionFence(
+                productConversationId: productConversationId,
+                fenced: true)
+        } else if snapshot.close != nil && !PendingProductCloseConfirmation.isCompleted(snapshot: snapshot) {
+            pendingProductCloseConfirmation = nil
+            setProductCloseAdmissionFence(
+                productConversationId: productConversationId,
+                fenced: true)
+        } else {
+            pendingProductCloseConfirmation = nil
+            setProductCloseAdmissionFence(
+                productConversationId: productConversationId,
+                fenced: false)
+        }
+    }
+
     private func setProductCloseAdmissionFence(
         productConversationId: String,
         fenced: Bool
@@ -548,10 +601,19 @@ final class AppModel {
         } else {
             closeAdmissionFencedProductConversationIds.remove(productConversationId)
         }
-        let transcriptIds = listStore.transcriptRowIds(forAggregateId: productConversationId)
-        for transcriptId in transcriptIds {
-            sessions[transcriptId]?.setCloseAdmissionFenced(fenced)
-            drainSessions[transcriptId]?.setCloseAdmissionFenced(fenced)
+        for (transcriptId, session) in sessions where sessionBelongsToAggregate(
+            session,
+            transcriptId: transcriptId,
+            productConversationId: productConversationId)
+        {
+            session.setCloseAdmissionFenced(fenced)
+        }
+        for (transcriptId, session) in drainSessions where sessionBelongsToAggregate(
+            session,
+            transcriptId: transcriptId,
+            productConversationId: productConversationId)
+        {
+            session.setCloseAdmissionFenced(fenced)
         }
     }
 
@@ -561,25 +623,21 @@ final class AppModel {
         let rehydrationGeneration = confirmationRehydrationGenerations.begin(
             productConversationId: fenceIdentity)
         let startedGeneration = apiGeneration
-        let activeCloseRows = listStore.conversations.filter {
-            $0.product_close_action == .unavailable(reason: .active_close_attempt)
-        }
-        for row in activeCloseRows {
-            guard let snapshot = try? await api.getProductConversation(reference: row.aggregateIdentity),
+        let activeCloseIds = Set(listStore.conversations.compactMap { row in
+            row.product_close_action == .unavailable(reason: .active_close_attempt)
+                ? row.aggregateIdentity : nil
+        }).union(closeConfirmationReconciliationProductConversationIds)
+        for productConversationId in activeCloseIds.sorted() {
+            guard let snapshot = try? await api.getProductConversation(reference: productConversationId),
                   apiGeneration == startedGeneration,
                   pendingProductCloseConfirmation == nil,
                   confirmationRehydrationGenerations.isCurrent(
                     rehydrationGeneration, productConversationId: fenceIdentity)
             else { continue }
-            if let close = snapshot.close, close.phase != .completed {
-                setProductCloseAdmissionFence(
-                    productConversationId: snapshot.product_conversation_id,
-                    fenced: true)
-            }
-            if let pending = PendingProductCloseConfirmation(snapshot: snapshot) {
-                pendingProductCloseConfirmation = pending
-                return
-            }
+            completeCloseConfirmationReconciliation(
+                snapshot,
+                productConversationId: productConversationId)
+            if pendingProductCloseConfirmation != nil { return }
         }
     }
 
@@ -822,9 +880,11 @@ final class AppModel {
 
     private func rememberedCoordinatorAggregateIds() -> Set<String> {
         guard let coordinatorConversationId else { return [] }
-        let cached = ConversationSession.cachedConversation(
-            conversationId: coordinatorConversationId)
-        return [cached?.aggregateIdentity ?? coordinatorConversationId]
+        let aggregateId = listStore.aggregateId(forTranscriptRowId: coordinatorConversationId)
+            ?? ConversationSession.cachedConversation(conversationId: coordinatorConversationId)?
+                .aggregateIdentity
+            ?? coordinatorConversationId
+        return [aggregateId]
     }
 
     // MARK: - Coordinator
@@ -981,20 +1041,22 @@ final class AppModel {
             }
             if let apiError = error as? APIError,
                ["close_stop_work_confirmation_required", "close_loss_confirmation_required"]
-                .contains(apiError.serverErrorType),
-               let snapshot = try? await api.getProductConversation(
-                   reference: conversation.aggregateIdentity),
-               apiGeneration == startedGeneration,
-               let close = snapshot.close
+                .contains(apiError.serverErrorType)
             {
-                pendingProductCloseConfirmation = PendingProductCloseConfirmation(
-                    productConversationId: conversation.aggregateIdentity,
-                    transcriptRowId: snapshot.latest_transcript_row_id,
-                    close: close)
-                setProductCloseAdmissionFence(
-                    productConversationId: conversation.aggregateIdentity,
-                    fenced: true)
+                recordCloseConfirmationRequired(
+                    productConversationId: conversation.aggregateIdentity)
+                if let snapshot = try? await api.getProductConversation(
+                    reference: conversation.aggregateIdentity),
+                   apiGeneration == startedGeneration
+                {
+                    completeCloseConfirmationReconciliation(
+                        snapshot,
+                        productConversationId: conversation.aggregateIdentity)
+                }
                 await listStore.refresh(api: api)
+                if pendingProductCloseConfirmation == nil {
+                    await rehydratePendingProductCloseConfirmation(api: api)
+                }
                 return false
             }
             lastActionError = error.localizedDescription
@@ -1090,9 +1152,21 @@ final class AppModel {
                 try await api.cancelClose(
                     conversationId: pending.transcriptRowId,
                     attemptId: pending.close.attempt_id)
-                setProductCloseAdmissionFence(
+                guard isCurrentPendingCloseAction(
+                    actionGeneration,
                     productConversationId: pending.productConversationId,
-                    fenced: false)
+                    apiGeneration: startedGeneration)
+                else { return }
+                let snapshot = try await api.getProductConversation(
+                    reference: pending.productConversationId)
+                guard isCurrentPendingCloseAction(
+                    actionGeneration,
+                    productConversationId: pending.productConversationId,
+                    apiGeneration: startedGeneration)
+                else { return }
+                reconcileAuthoritativeClose(
+                    snapshot,
+                    productConversationId: pending.productConversationId)
             }
             guard isCurrentPendingCloseAction(
                 actionGeneration,
@@ -1136,7 +1210,6 @@ final class AppModel {
                     startedGeneration: startedGeneration,
                     api: api)
             } else {
-                pendingProductCloseConfirmation = nil
                 await listStore.refresh(api: api)
             }
         } catch {
@@ -1231,12 +1304,24 @@ final class AppModel {
         await historyWriter.remove(revision: revision)
         guard apiGeneration == startedGeneration else { return false }
 
-        for transcriptId in transcriptIds {
+        let retainedTranscriptIds = Set(sessions.compactMap { transcriptId, session in
+            sessionBelongsToAggregate(
+                session,
+                transcriptId: transcriptId,
+                productConversationId: productConversationId) ? transcriptId : nil
+        }).union(drainSessions.compactMap { transcriptId, session in
+            sessionBelongsToAggregate(
+                session,
+                transcriptId: transcriptId,
+                productConversationId: productConversationId) ? transcriptId : nil
+        })
+        let allTranscriptIds = transcriptIds.union(retainedTranscriptIds)
+        for transcriptId in allTranscriptIds {
             guard apiGeneration == startedGeneration else { return false }
             let openOwner = sessions.removeValue(forKey: transcriptId)
             let drainOwner = drainSessions.removeValue(forKey: transcriptId)
             let owners = [openOwner, drainOwner].compactMap { $0 }
-            owners.forEach { $0.stop() }
+            owners.forEach { $0.markHardDeleted() }
 
             for session in owners {
                 guard apiGeneration == startedGeneration else { return false }
@@ -1261,8 +1346,9 @@ final class AppModel {
         _ = closeActionGenerations.begin(productConversationId: productConversationId)
         _ = confirmationRehydrationGenerations.begin(
             productConversationId: "pending-close-confirmation")
+        closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
         if pendingOpenConversationId == productConversationId
-            || transcriptIds.contains(pendingOpenConversationId ?? "")
+            || allTranscriptIds.contains(pendingOpenConversationId ?? "")
         {
             pendingOpenConversationId = nil
         }
@@ -1310,6 +1396,46 @@ final class AppModel {
             _ = pendingProductCloseResolution.begin(
                 productConversationId: pending.productConversationId)
         }
+    }
+
+    func locallyOwnedOrdinaryAggregatesForTesting() -> [String: Set<String>] {
+        locallyOwnedOrdinaryAggregates()
+    }
+
+    func installDrainSessionForTesting(conversationId: String) -> ConversationSession? {
+        guard let api else { return nil }
+        let session = ConversationSession(
+            conversationId: conversationId,
+            api: api,
+            connectivity: connectivity)
+        drainSessions[conversationId] = session
+        return session
+    }
+
+    var closeConfirmationReconciliationIdsForTesting: Set<String> {
+        closeConfirmationReconciliationProductConversationIds
+    }
+
+    func recordCloseConfirmationRequiredForTesting(productConversationId: String) {
+        recordCloseConfirmationRequired(productConversationId: productConversationId)
+    }
+
+    func completeCloseConfirmationReconciliationForTesting(
+        _ snapshot: ProductConversationSnapshot,
+        productConversationId: String
+    ) {
+        completeCloseConfirmationReconciliation(
+            snapshot,
+            productConversationId: productConversationId)
+    }
+
+    func reconcileAuthoritativeCloseForTesting(
+        _ snapshot: ProductConversationSnapshot,
+        productConversationId: String
+    ) {
+        reconcileAuthoritativeClose(
+            snapshot,
+            productConversationId: productConversationId)
     }
 
     func removeProductHistoryLocallyForTesting(
@@ -1417,12 +1543,17 @@ final class AppModel {
 
     private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {
         var owned: [String: Set<String>] = [:]
+        let coordinatorAggregateIds = rememberedCoordinatorAggregateIds()
+        let rememberedCoordinatorTranscriptId = coordinatorConversationId
         func add(aggregateId: String, transcriptId: String?) {
             if let transcriptId { owned[aggregateId, default: []].insert(transcriptId) }
             else { owned[aggregateId, default: []] = owned[aggregateId, default: []] }
         }
 
-        for row in listStore.conversations where !row.isCoordinator {
+        for row in listStore.conversations where !row.isCoordinator
+            && row.transcriptRowIdentity != rememberedCoordinatorTranscriptId
+            && !coordinatorAggregateIds.contains(row.aggregateIdentity)
+        {
             add(aggregateId: row.aggregateIdentity, transcriptId: row.transcriptRowIdentity)
             for transcriptId in listStore.transcriptRowIds(forAggregateId: row.aggregateIdentity) {
                 add(aggregateId: row.aggregateIdentity, transcriptId: transcriptId)
@@ -1430,7 +1561,8 @@ final class AppModel {
         }
         for name in DiskStore.listNames(prefix: "product-history-") {
             let aggregateId = String(name.dropFirst("product-history-".count))
-            guard let history = cachedProductHistory(productConversationId: aggregateId),
+            guard !coordinatorAggregateIds.contains(aggregateId),
+                  let history = cachedProductHistory(productConversationId: aggregateId),
                   history.snapshot.ordinary_lifecycle != nil
             else { continue }
             for segment in history.snapshot.segments {
@@ -1444,10 +1576,14 @@ final class AppModel {
             })
         for transcriptId in ownedTranscriptIds {
             let cached = ConversationSession.cachedConversation(conversationId: transcriptId)
-            guard cached?.isCoordinator != true else { continue }
+            guard transcriptId != rememberedCoordinatorTranscriptId,
+                  cached?.isCoordinator != true
+            else { continue }
             let aggregateId = listStore.aggregateId(forTranscriptRowId: transcriptId)
                 ?? cached?.product_conversation_id
-            if let aggregateId { add(aggregateId: aggregateId, transcriptId: transcriptId) }
+            if let aggregateId, !coordinatorAggregateIds.contains(aggregateId) {
+                add(aggregateId: aggregateId, transcriptId: transcriptId)
+            }
         }
         return owned
     }
@@ -1617,6 +1753,13 @@ final class AppModel {
                 drainSession = ConversationSession(
                     conversationId: conversationId, api: api, connectivity: connectivity)
                 drainSessions[conversationId] = drainSession
+                for aggregateId in closeAdmissionFencedProductConversationIds where sessionBelongsToAggregate(
+                    drainSession,
+                    transcriptId: conversationId,
+                    productConversationId: aggregateId)
+                {
+                    drainSession.setCloseAdmissionFenced(true)
+                }
             }
             drainSession.drainOutbox()
         }
@@ -1678,6 +1821,7 @@ final class AppModel {
         confirmationRehydrationGenerations.reset()
         closingProductConversationIds.removeAll()
         closeAdmissionFencedProductConversationIds.removeAll()
+        closeConfirmationReconciliationProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
         deletedProductHistoryIds.removeAll()
