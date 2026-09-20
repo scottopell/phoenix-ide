@@ -313,7 +313,12 @@ impl SendChatApplicationService {
             .load_active_runtime_turn(&ConversationAuthority(conversation.id.clone()))
             .await
             .map_err(|error| map_db_internal_error(&error))?;
-        if req.expansion_policy != MessageExpansionPolicy::GeneratedPredecessorContext
+        let reserved_opening = self
+            .db
+            .is_reserved_continuation_opening(&conversation.id, req.message_id.as_str())
+            .await
+            .map_err(|error| map_db_internal_error(&error))?;
+        if !reserved_opening
             && self
                 .db
                 .has_pending_continuation_opening(&conversation.id)

@@ -6735,6 +6735,29 @@ impl Database {
         Ok(pending != 0)
     }
 
+    /// Returns whether the supplied message is the successor's reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn is_reserved_continuation_opening(
+        &self,
+        successor_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        let matches: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE successor_conversation_id = ?1
+                   AND (message_id = ?2 OR successor_conversation_id || ':' || message_id = ?2)
+             )",
+        )
+        .bind(successor_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(matches != 0)
+    }
+
     /// Returns the durable successor that accepted a completed handoff.
     ///
     /// # Errors
