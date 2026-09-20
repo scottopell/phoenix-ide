@@ -203,6 +203,22 @@ pub fn sse_stream(
     (headers, sse)
 }
 
+pub(crate) fn aggregate_event_stream(
+    broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
+) -> impl IntoResponse {
+    let events = BroadcastStream::new(broadcast_rx).filter_map(|result| match result {
+        Ok(event) => Some(Ok::<Event, Infallible>(sse_event_to_axum(event))),
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            tracing::warn!(lagged_by = n, "aggregate SSE broadcast lagged");
+            None
+        }
+    });
+    let sse = Sse::new(events).keep_alive(conversation_keep_alive());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    (headers, sse)
+}
+
 fn sse_event_to_axum(event: SseEvent) -> Event {
     let wire: SseWireEvent = event.into();
     let event_type = wire.event_type();

@@ -285,6 +285,8 @@ final class AppModel {
     private(set) var api: PhoenixAPI?
     /// Invalidates responses started with earlier server credentials or URL.
     private var apiGeneration = 0
+    private var aggregateEventTask: Task<Void, Never>?
+    private var isForeground = true
 
     /// Sessions for conversations the user has opened, kept alive so their
     /// outboxes continue draining while the user navigates elsewhere.
@@ -296,6 +298,7 @@ final class AppModel {
     private var closingProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
     private var productHistoryGenerations = ProductActionGenerationTracker()
+    private var confirmationRehydrationGenerations = ProductActionGenerationTracker()
     private(set) var deletedProductHistoryIds: Set<String> = []
     private(set) var pendingProductCloseConfirmation: PendingProductCloseConfirmation?
     private var pendingProductCloseResolution = ProductCloseResolutionTracker()
@@ -321,6 +324,8 @@ final class AppModel {
 
     private func rebuildAPI() {
         apiGeneration += 1
+        aggregateEventTask?.cancel()
+        aggregateEventTask = nil
         guard let url = URL(string: serverURLString), url.host != nil else {
             api = nil
             return
@@ -333,6 +338,7 @@ final class AppModel {
         guard let rebuiltAPI else { return }
         for session in sessions.values { session.replaceAPI(rebuiltAPI) }
         for session in drainSessions.values { session.replaceAPI(rebuiltAPI) }
+        if isForeground { startAggregateEventStream(api: rebuiltAPI, generation: apiGeneration) }
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
@@ -433,6 +439,60 @@ final class AppModel {
             withIdentifiers: ["attention-\(notificationId)"])
     }
 
+    private func startAggregateEventStream(api: PhoenixAPI, generation: Int) {
+        guard aggregateEventTask == nil else { return }
+        aggregateEventTask = Task { [weak self] in
+            var retryDelay = 1.0
+            while !Task.isCancelled {
+                guard let self, self.apiGeneration == generation, self.isForeground else { return }
+                if !self.connectivity.isOnline {
+                    try? await Task.sleep(for: .seconds(30))
+                    continue
+                }
+                do {
+                    let bytes = try await api.openProductConversationEventStream()
+                    retryDelay = 1
+                    var parser = SSEParser()
+                    for try await byte in bytes {
+                        if Task.isCancelled { return }
+                        if let frame = parser.consume(byte),
+                           let deletion = ProductConversationDeletionEvent.decode(frame: frame)
+                        {
+                            await self.handleAggregateHardDeleted(deletion, generation: generation)
+                        }
+                    }
+                } catch let error as APIError where error.isPermanentStreamAuthenticationFailure {
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    if Task.isCancelled { return }
+                }
+                let jitter = Double.random(in: 0...0.3) * retryDelay
+                try? await Task.sleep(for: .seconds(retryDelay + jitter))
+                retryDelay = min(retryDelay * 2, 30)
+            }
+        }
+    }
+
+    private func handleAggregateHardDeleted(
+        _ deletion: ProductConversationDeletionEvent,
+        generation: Int
+    ) async {
+        guard apiGeneration == generation else { return }
+        let aggregateId = deletion.conversation_id
+        let cachedIds = cachedProductHistory(productConversationId: aggregateId)?
+            .snapshot.segments.map(\.transcript_row_id) ?? []
+        let transcriptIds = Set(
+            deletion.deleted_conversation_ids
+                + listStore.transcriptRowIds(forAggregateId: aggregateId)
+                + cachedIds)
+        _ = await removeProductHistoryLocally(
+            productConversationId: aggregateId,
+            transcriptIds: transcriptIds,
+            startedGeneration: generation)
+    }
+
     func refreshList() async {
         guard let api else { return }
         attentionEvidenceGeneration &+= 1
@@ -449,13 +509,19 @@ final class AppModel {
 
     private func rehydratePendingProductCloseConfirmation(api: PhoenixAPI) async {
         guard pendingProductCloseConfirmation == nil else { return }
+        let fenceIdentity = "pending-close-confirmation"
+        let rehydrationGeneration = confirmationRehydrationGenerations.begin(
+            productConversationId: fenceIdentity)
         let startedGeneration = apiGeneration
         let activeCloseRows = listStore.conversations.filter {
             $0.product_close_action == .unavailable(reason: .active_close_attempt)
         }
         for row in activeCloseRows {
             guard let snapshot = try? await api.getProductConversation(reference: row.aggregateIdentity),
-                  apiGeneration == startedGeneration
+                  apiGeneration == startedGeneration,
+                  pendingProductCloseConfirmation == nil,
+                  confirmationRehydrationGenerations.isCurrent(
+                    rehydrationGeneration, productConversationId: fenceIdentity)
             else { continue }
             if let pending = PendingProductCloseConfirmation(snapshot: snapshot) {
                 pendingProductCloseConfirmation = pending
@@ -738,6 +804,8 @@ final class AppModel {
 
     @discardableResult
     func closeProductConversation(_ conversation: Conversation) async -> Bool {
+        _ = confirmationRehydrationGenerations.begin(
+            productConversationId: "pending-close-confirmation")
         guard ClientOperation.close.policy == .onlineOnly else { return false }
         let conversationId = conversation.transcriptRowIdentity
         let transcriptIds = Set(
@@ -853,6 +921,8 @@ final class AppModel {
     }
 
     func resolvePendingProductCloseConfirmation(confirm: Bool) async {
+        _ = confirmationRehydrationGenerations.begin(
+            productConversationId: "pending-close-confirmation")
         guard connectivity.isOnline else {
             lastActionError = "Resolving a Close confirmation needs a connection — reconnect and try again."
             return
@@ -1010,9 +1080,8 @@ final class AppModel {
             listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
                 + [conversation.transcriptRowIdentity])
         do {
-            try await api.deleteConversation(
-                reference: conversation.transcriptRowIdentity,
-                chainRootId: conversation.chain_root_id)
+            let rootTranscriptRowId = conversation.chain_root_id ?? conversation.transcriptRowIdentity
+            try await api.deleteProductConversation(rootTranscriptRowId: rootTranscriptRowId)
             guard apiGeneration == startedGeneration else { return false }
             return await removeProductHistoryLocally(
                 productConversationId: conversation.aggregateIdentity,
@@ -1065,6 +1134,14 @@ final class AppModel {
         guard apiGeneration == startedGeneration else { return false }
         listStore.remove(aggregateId: productConversationId)
         deletedProductHistoryIds.insert(productConversationId)
+        if pendingProductCloseConfirmation?.productConversationId == productConversationId {
+            pendingProductCloseConfirmation = nil
+            pendingProductCloseResolution.reset()
+        }
+        closingProductConversationIds.remove(productConversationId)
+        _ = closeActionGenerations.begin(productConversationId: productConversationId)
+        _ = confirmationRehydrationGenerations.begin(
+            productConversationId: "pending-close-confirmation")
         if pendingOpenConversationId == productConversationId
             || transcriptIds.contains(pendingOpenConversationId ?? "")
         {
@@ -1079,6 +1156,8 @@ final class AppModel {
         _ pending: PendingProductCloseConfirmation,
         resolving: Bool = false
     ) {
+        _ = confirmationRehydrationGenerations.begin(
+            productConversationId: "pending-close-confirmation")
         pendingProductCloseConfirmation = pending
         if resolving {
             _ = pendingProductCloseResolution.begin(
@@ -1094,6 +1173,17 @@ final class AppModel {
             productConversationId: productConversationId,
             transcriptIds: transcriptIds,
             startedGeneration: apiGeneration)
+    }
+
+    func handleAggregateHardDeletedForTesting(
+        productConversationId: String,
+        transcriptIds: [String]
+    ) async {
+        await handleAggregateHardDeleted(
+            ProductConversationDeletionEvent(
+                conversation_id: productConversationId,
+                deleted_conversation_ids: transcriptIds),
+            generation: apiGeneration)
     }
     #endif
 
@@ -1173,6 +1263,8 @@ final class AppModel {
     }
 
     func foregrounded() {
+        isForeground = true
+        if let api { startAggregateEventStream(api: api, generation: apiGeneration) }
         for session in sessions.values {
             session.resyncAfterForeground()
         }
@@ -1221,6 +1313,9 @@ final class AppModel {
     }
 
     func backgrounded() {
+        isForeground = false
+        aggregateEventTask?.cancel()
+        aggregateEventTask = nil
         // Streams die in the background anyway; stop them cleanly and
         // persist snapshots. Outboxes are already disk-backed.
         for session in sessions.values { session.pauseForBackground() }
@@ -1254,6 +1349,8 @@ final class AppModel {
 
     func clearCache() async {
         apiGeneration += 1
+        aggregateEventTask?.cancel()
+        aggregateEventTask = nil
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
         for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
@@ -1264,6 +1361,7 @@ final class AppModel {
         pendingProductCloseResolution.reset()
         closeActionGenerations.reset()
         productHistoryGenerations.reset()
+        confirmationRehydrationGenerations.reset()
         closingProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()

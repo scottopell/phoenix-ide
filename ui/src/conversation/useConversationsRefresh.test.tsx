@@ -6,13 +6,14 @@
 // recycles a slug, an orphan entry would silently restore a viewer under
 // the wrong conversation.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act, waitFor } from '@testing-library/react';
 import { useContext } from 'react';
 import {
   ConversationProvider,
   ConversationStore,
 } from './';
+import { subscribeToAggregateDeletionEvents } from './useConversationsRefresh';
 import { ConversationContext } from './ConversationContext';
 import { DraftContext } from './DraftContext';
 import type { DraftStore } from './DraftStore';
@@ -67,6 +68,66 @@ function CaptureStore({
   if (store) onStore(store);
   return null;
 }
+
+describe('aggregate deletion event subscription', () => {
+  const originalEventSource = globalThis.EventSource;
+
+  afterEach(() => {
+    globalThis.EventSource = originalEventSource;
+    vi.useRealTimers();
+  });
+
+  it('forwards the aggregate member set and closes on cleanup', () => {
+    const listeners = new Map<string, EventListener>();
+    const close = vi.fn();
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      constructor(public url: string) {}
+      addEventListener(type: string, listener: EventListener) { listeners.set(type, listener); }
+      close = close;
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const received = vi.fn();
+    window.addEventListener('phoenix:conversation-hard-deleted', received, { once: true });
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    listeners.get('conversation_hard_deleted')?.(new MessageEvent('conversation_hard_deleted', {
+      data: JSON.stringify({
+        sequence_id: 0,
+        conversation_id: 'product-id',
+        deleted_conversation_ids: ['root-id', 'leaf-id'],
+      }),
+    }));
+
+    expect(received).toHaveBeenCalledOnce();
+    expect((received.mock.calls[0]![0] as CustomEvent).detail).toEqual({
+      conversationId: 'product-id',
+      deletedConversationIds: ['root-id', 'leaf-id'],
+    });
+    unsubscribe();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('bounds reconnect delay and cleanup cancels the pending retry', () => {
+    vi.useFakeTimers();
+    const instances: Array<{ onerror: (() => void) | null; close: ReturnType<typeof vi.fn> }> = [];
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor(_url: string) { instances.push(this); }
+      addEventListener() {}
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    instances[0]!.onerror?.();
+    unsubscribe();
+    vi.runAllTimers();
+
+    expect(instances).toHaveLength(1);
+    expect(instances[0]!.close).toHaveBeenCalledOnce();
+  });
+});
 
 describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () => {
   beforeEach(() => {

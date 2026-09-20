@@ -248,6 +248,40 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(DiskStore.listNames(prefix: "outbox-row-deleted").contains("outbox-row-deleted"))
     }
 
+    func testAggregateDeletionEventCleansAllExactTranscriptOwnersAndConfirmation() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-aggregate-event-tests-\(UUID().uuidString)")
+        let model = AppModel()
+        model.serverURLString = "http://localhost"
+        let aggregateId = "pc-deleted"
+        let root = conversation(id: "root", aggregateId: aggregateId)
+        let leaf = conversation(id: "leaf", aggregateId: aggregateId)
+        model.listStore.upsert(root)
+        model.listStore.upsert(leaf)
+        persistReadableSnapshot(conversation: root)
+        persistReadableSnapshot(conversation: leaf)
+        DiskStore.save(["queued"], name: "outbox-root")
+        DiskStore.save(["queued"], name: "outbox-leaf")
+        XCTAssertNotNil(model.session(for: root.id))
+        XCTAssertNotNil(model.session(for: leaf.id))
+        model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
+            productConversationId: aggregateId,
+            transcriptRowId: leaf.id,
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation)))
+
+        await model.handleAggregateHardDeletedForTesting(
+            productConversationId: aggregateId,
+            transcriptIds: [root.id, leaf.id])
+
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+        XCTAssertTrue(model.deletedProductHistoryIds.contains(aggregateId))
+        XCTAssertNil(model.pendingProductCloseConfirmation)
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: root.id))
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: leaf.id))
+        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-root"))
+        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-leaf"))
+    }
+
     func testRetainedProductHistoryCacheShowsAgeUntilOnlineRefreshSucceeds() {
         let now = Date()
 
