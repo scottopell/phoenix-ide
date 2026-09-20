@@ -6839,7 +6839,7 @@ mod tests {
         set_state(&db, "root", approval_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -6996,7 +6996,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
+            db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
