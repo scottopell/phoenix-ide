@@ -1852,7 +1852,7 @@ def _run_cargo_build(
 
 def build_rust(release: bool = False):
     """Build the Rust backend for local development by default."""
-    _, build_env = _compiler_cache_subprocess_env()
+    _, build_env = _compiler_cache_subprocess_env(cargo_cwd=ROOT)
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
     # In dev mode Vite serves assets, so an empty dir is fine.
     (UI_DIR / "dist").mkdir(exist_ok=True)
@@ -4897,7 +4897,7 @@ def _private_kache_socket_dir() -> Path:
     return directory
 
 
-def _ensure_kache_daemon(binary: str) -> str | None:
+def _ensure_kache_daemon(binary: str, *, cargo_cwd: Path | None = None) -> str | None:
     cache_dir = os.environ.get("KACHE_CACHE_DIR")
     if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
         digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
@@ -4910,6 +4910,7 @@ def _ensure_kache_daemon(binary: str) -> str | None:
     try:
         result = subprocess.run(
             [binary, "daemon", "start"],
+            cwd=cargo_cwd,
             capture_output=True,
             text=True,
             env=os.environ,
@@ -4955,7 +4956,9 @@ def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
     return version, None
 
 
-def _configure_compiler_cache(requested: str | None = None) -> str:
+def _configure_compiler_cache(
+    requested: str | None = None, *, cargo_cwd: Path | None = None
+) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
         print("  Compiler cache: explicit")
@@ -5031,7 +5034,7 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     os.environ["RUSTC_WRAPPER"] = wrapper
     if backend == "kache":
         generated_socket = "KACHE_SOCKET_PATH" not in os.environ
-        daemon_error = _ensure_kache_daemon(wrapper)
+        daemon_error = _ensure_kache_daemon(wrapper, cargo_cwd=cargo_cwd)
         if daemon_error:
             if not automatic:
                 raise SystemExit(f"kache daemon failed to start: {daemon_error}")
@@ -5058,10 +5061,12 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     return backend
 
 
-def _compiler_cache_subprocess_env(requested: str | None = None) -> tuple[str, dict[str, str]]:
+def _compiler_cache_subprocess_env(
+    requested: str | None = None, *, cargo_cwd: Path | None = None
+) -> tuple[str, dict[str, str]]:
     original = os.environ.copy()
     try:
-        selected = _configure_compiler_cache(requested)
+        selected = _configure_compiler_cache(requested, cargo_cwd=cargo_cwd)
         return selected, os.environ.copy()
     finally:
         os.environ.clear()
@@ -6019,7 +6024,9 @@ def cmd_check(
     selected_compiler_cache = None
     compiler_cache_env = None
     if cargo_active:
-        selected_compiler_cache, configured_env = _compiler_cache_subprocess_env(compiler_cache)
+        selected_compiler_cache, configured_env = _compiler_cache_subprocess_env(
+            compiler_cache, cargo_cwd=ROOT
+        )
         compiler_cache_env = _compiler_cache_overrides(
             selected_compiler_cache, configured_env
         )
@@ -7697,7 +7704,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
         raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
-    _, build_env = _compiler_cache_subprocess_env()
+    _, build_env = _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")

@@ -152,7 +152,18 @@ class CompilerCacheTests(unittest.TestCase):
             selected = self.dev._configure_compiler_cache("kache")
             self.assertEqual("kache", selected)
             self.assertEqual("/opt/local/kache", os.environ["RUSTC_WRAPPER"])
-            ensure.assert_called_once_with("/opt/local/kache")
+            ensure.assert_called_once_with("/opt/local/kache", cargo_cwd=None)
+
+    def test_kache_daemon_uses_cargo_working_directory(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        cargo_cwd = self.dev.Path("/detached/build")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.dev.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertIsNone(
+                self.dev._ensure_kache_daemon("/bin/kache", cargo_cwd=cargo_cwd)
+            )
+        self.assertEqual(cargo_cwd, run.call_args.kwargs["cwd"])
 
     def test_daemon_socket_uses_private_owned_directory(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
@@ -299,7 +310,7 @@ class CompilerCacheTests(unittest.TestCase):
         with mock.patch.object(
             self.dev,
             "_configure_compiler_cache",
-            side_effect=lambda _requested: calls.append("cache"),
+            side_effect=lambda _requested, **_kwargs: calls.append("cache"),
         ), mock.patch.object(
             self.dev.subprocess,
             "Popen",
@@ -313,7 +324,7 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIsNotNone(calls[1][1])
 
     def test_subprocess_environment_reports_actual_backend_without_leaking(self):
-        def configure(_requested):
+        def configure(_requested, *, cargo_cwd=None):
             os.environ["RUSTC_WRAPPER"] = "/bin/sccache"
             return "sccache"
 
