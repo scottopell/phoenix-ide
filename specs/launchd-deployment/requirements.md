@@ -32,11 +32,15 @@ When changing the target job state, the system shall check launchctl exit status
 
 ### REQ-LDD-007 — Exact runtime verification
 
-A deployment shall succeed only when the target job is running with a new PID and the credential-free `/api/version` endpoint reports both the expected package version and embedded git SHA.
+A deployment shall succeed only when the target job is running with a new PID and the credential-free `/api/version` endpoint reports both the expected package version and complete 40-character lowercase embedded git SHA. The candidate SHA shall equal the selected full source commit exactly; a matching prefix shall not establish candidate identity.
 
 ### REQ-LDD-008 — Verified rollback
 
-If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the previous exact runtime identity at the previous service endpoint, and durably distinguish successful rollback from rollback failure.
+If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the captured previous runtime identity at the previous service endpoint, and durably distinguish successful runtime-artifact rollback from rollback failure.
+
+Only in this rollback role, the captured identity of an already-installed previous runtime may contain either a legacy 12-character lowercase git SHA or a full 40-character lowercase git SHA. This allowance shall not admit shortened identity for a candidate, release asset, helper, or general downgrade path and shall not establish cross-version compatibility.
+
+Automated rollback shall not restore a database or guarantee that the restored binary can use a database changed by the candidate; database rollback remains governed by `specs/compatibility/requirements.md`.
 
 ### REQ-LDD-009 — Truthful durable result
 
@@ -48,7 +52,13 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 ### REQ-LDD-011 — Explicit candidate sources
 
-The local command shall deploy exact local `HEAD` after checks and compilation. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry and require its embedded git SHA to match that commit, and shall not run repository checks, dependency installation, worktree mutation, or compilation.
+The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
+
+WHEN `latest` is requested,
+THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
+
+WHEN an exact release-candidate tag is requested,
+THE release command SHALL require the tag, GitHub prerelease metadata, full embedded version, and exact commit identity to agree.
 
 ### REQ-LDD-012 — Unambiguous command surface
 
@@ -68,4 +78,4 @@ Before signaling Phoenix, the system shall validate that the running process rep
 
 ### REQ-LDD-016 — Exact, truthful restart result
 
-A restart shall commit only after launchd reports a new target PID and `/api/version` reports the same exact runtime identity, with the installed artifact hashes unchanged. The system shall durably distinguish preparation failure, concurrent rejection, verified success, and failure after signaling; it shall not claim rollback when no installation artifact changed.
+A restart shall require the already-installed runtime to report a complete 40-character lowercase embedded git SHA and shall commit only after launchd reports a new target PID and `/api/version` reports the same exact runtime identity, with the installed artifact hashes unchanged. The rollback-only legacy identity allowance in REQ-LDD-008 shall not authorize restart of a shortened-identity installation. The system shall durably distinguish preparation failure, concurrent rejection, verified success, and failure after signaling; it shall not claim rollback when no installation artifact changed.

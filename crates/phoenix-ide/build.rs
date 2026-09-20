@@ -13,7 +13,7 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // Embed a short git SHA into the binary so the UI can surface exactly
+    // Embed the full git SHA into the binary so the UI can surface exactly
     // which build is running. Falls back to "unknown" when git isn't
     // available (e.g. tarball builds, where .git/ is absent).
     //
@@ -29,7 +29,14 @@ fn main() {
     // recompile the crate.
     println!("cargo:rerun-if-changed=__phoenix_git_sha_force_rerun__");
 
-    let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let sha = git(&["rev-parse", "HEAD"])
+        .filter(|sha| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
     // "-dirty" suffix when the working tree has uncommitted changes, so a
     // binary built from modified sources can't masquerade as the commit it

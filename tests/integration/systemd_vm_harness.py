@@ -270,7 +270,7 @@ def committed_reboot_journey(instance, guest_root, unit, port, previous_pid):
                 instance,
                 f"python3 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen(\"http://127.0.0.1:{port}/api/version\", timeout=2))[\"git_sha\"])'",
                 check=False,
-            ).stdout.strip() == "bbbbbbbbbbbb",
+            ).stdout.strip() == "b" * 40,
             45,
         )
     except RuntimeError as exc:

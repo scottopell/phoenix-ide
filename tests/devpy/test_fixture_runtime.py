@@ -15,13 +15,13 @@ FIXTURE = ROOT / "tests/integration/fixture_runtime.py"
 class FixtureRuntimeTests(unittest.TestCase):
     def test_build_identity_is_exact_and_configurable(self):
         result = subprocess.run(
-            [sys.executable, str(FIXTURE), "--build-identity", "--version", "1.0.0", "--git-sha", "aaaaaaaaaaaa"],
+            [sys.executable, str(FIXTURE), "--build-identity", "--version", "1.0.0", "--git-sha", "a" * 40],
             text=True,
             capture_output=True,
             check=True,
         )
         self.assertEqual(
-            {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"},
+            {"version": "1.0.0", "git_sha": "a" * 40},
             json.loads(result.stdout),
         )
 
@@ -32,7 +32,7 @@ class FixtureRuntimeTests(unittest.TestCase):
                 sys.executable,
                 str(FIXTURE),
                 "--version", "1.0.0",
-                "--git-sha", "aaaaaaaaaaaa",
+                "--git-sha", "a" * 40,
                 "--port", "0",
                 "--ready-file", str(ready),
             ])
@@ -44,7 +44,7 @@ class FixtureRuntimeTests(unittest.TestCase):
                 port = int(ready.read_text())
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/version") as response:
                     self.assertEqual(
-                        {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"},
+                        {"version": "1.0.0", "git_sha": "a" * 40},
                         json.load(response),
                     )
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/version") as response:
@@ -63,9 +63,9 @@ class FixtureRuntimeTests(unittest.TestCase):
                 sys.executable,
                 str(FIXTURE),
                 "--version", "2.0.0",
-                "--git-sha", "bbbbbbbbbbbb",
+                "--git-sha", "b" * 40,
                 "--report-version", "9.9.9",
-                "--report-git-sha", "cccccccccccc",
+                "--report-git-sha", "c" * 40,
                 "--ready-file", str(ready),
             ])
             try:
@@ -75,7 +75,7 @@ class FixtureRuntimeTests(unittest.TestCase):
                 port = int(ready.read_text())
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/version") as response:
                     self.assertEqual(
-                        {"version": "9.9.9", "git_sha": "cccccccccccc"},
+                        {"version": "9.9.9", "git_sha": "c" * 40},
                         json.load(response),
                     )
             finally:

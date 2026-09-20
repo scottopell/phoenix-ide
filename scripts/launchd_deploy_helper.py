@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import ssl
 import subprocess
@@ -26,6 +27,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 HANDOFF_PROTOCOL_VERSION = 1
+FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
+VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 TERMINAL_STATES = {
     "committed",
@@ -410,6 +414,27 @@ def request_helper_bootout(uid: int, helper_label: str) -> None:
     )
 
 
+def validate_manifest_identities(manifest: Manifest) -> None:
+    if (
+        not VERSION_RE.fullmatch(manifest.expected.version)
+        or not FULL_GIT_SHA_RE.fullmatch(manifest.expected.git_sha)
+        or manifest.expected.git_sha != manifest.source_commit
+    ):
+        raise ActivationError("candidate runtime identity must be the exact full source commit")
+    if manifest.release_commit is not None and not FULL_GIT_SHA_RE.fullmatch(manifest.release_commit):
+        raise ActivationError("release commit must be a full lowercase git SHA")
+    if manifest.previous_deployed_sha is not None and not FULL_GIT_SHA_RE.fullmatch(manifest.previous_deployed_sha):
+        raise ActivationError("previous deployed SHA must be a full lowercase git SHA")
+    if manifest.previous is not None and (
+        not VERSION_RE.fullmatch(manifest.previous.version)
+        or not (
+            LEGACY_GIT_SHA_RE.fullmatch(manifest.previous.git_sha)
+            or FULL_GIT_SHA_RE.fullmatch(manifest.previous.git_sha)
+        )
+    ):
+        raise ActivationError("previous runtime identity is malformed")
+
+
 def activate(manifest: Manifest) -> str:
     lock_path = Path(manifest.lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,6 +447,7 @@ def activate(manifest: Manifest) -> str:
         prepared_installs: list[Path] = []
         prepared_rollback: Optional[tuple[Path, Path]] = None
         try:
+            validate_manifest_identities(manifest)
             candidate_binary = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "candidate binary")
             candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
             with candidate_plist.open("rb") as stream:

@@ -1,0 +1,367 @@
+-- allium: 3
+-- Phoenix macOS direct-distribution release lifecycle
+--
+-- Scope: exact-tag gating, paired architecture-specific helper/app builds,
+-- Developer ID signing, notarization, and private publication preparation.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009.
+
+enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
+enum ArtifactState { pending | built | verified | failed }
+enum NotaryState { pending | submitted | accepted | stapled | validated | failed }
+enum PublicationState { idle | inaccessible | uploading | verified | public | failed }
+enum FailureDomain { none | tag_gate | build | signing | notarization | publication | configuration }
+enum LowerHexDigit { `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` | a | b | c | d | e | f }
+
+value CommitHexWord {
+    d1: LowerHexDigit
+    d2: LowerHexDigit
+    d3: LowerHexDigit
+    d4: LowerHexDigit
+    d5: LowerHexDigit
+    d6: LowerHexDigit
+    d7: LowerHexDigit
+    d8: LowerHexDigit
+}
+
+value FullCommitIdentity {
+    w1: CommitHexWord
+    w2: CommitHexWord
+    w3: CommitHexWord
+    w4: CommitHexWord
+    w5: CommitHexWord
+}
+
+value ReleaseIdentity {
+    version: String
+    full_commit: FullCommitIdentity
+}
+
+entity ReleaseGate {
+    identity: ReleaseIdentity
+    state: TagGateState
+
+    transitions state {
+        unresolved -> exact_tag_match
+        unresolved -> new_tag_created
+        unresolved -> refused
+        exact_tag_match -> exact_tag_match
+        new_tag_created -> new_tag_created
+        refused -> refused
+    }
+}
+
+entity ArchitecturePair {
+    target: String
+    identity: ReleaseIdentity
+    standalone: ArtifactState
+    desktop: ArtifactState
+    notarization: NotaryState
+
+    transitions standalone {
+        pending -> built
+        pending -> failed
+        built -> verified
+        built -> failed
+        verified -> failed
+        failed -> failed
+    }
+
+    transitions desktop {
+        pending -> built
+        pending -> failed
+        built -> verified
+        built -> failed
+        verified -> failed
+        failed -> failed
+    }
+
+    transitions notarization {
+        pending -> submitted
+        pending -> failed
+        submitted -> accepted
+        submitted -> failed
+        accepted -> stapled
+        accepted -> failed
+        stapled -> validated
+        stapled -> failed
+        validated -> failed
+        failed -> failed
+    }
+}
+
+entity ReleasePublication {
+    identity: ReleaseIdentity
+    apple_silicon_pair: ArchitecturePair
+    intel_pair: ArchitecturePair
+    state: PublicationState
+    failure_domain: FailureDomain
+
+    transitions state {
+        idle -> inaccessible
+        idle -> public
+        idle -> failed
+        inaccessible -> uploading
+        inaccessible -> failed
+        uploading -> inaccessible
+        uploading -> verified
+        uploading -> failed
+        verified -> public
+        verified -> failed
+        public -> public
+        failed -> inaccessible
+        failed -> failed
+    }
+}
+
+surface DesktopReleaseWorkflow {
+    context gate: ReleaseGate
+    context pair: ArchitecturePair
+    context publication: ReleasePublication
+
+    provides:
+        ReleaseTagCreated(gate)
+        ExactReleaseTagFound(gate)
+        ReleaseGateRejected(gate)
+        StandaloneHelperVerified(pair)
+        DesktopAppVerified(pair)
+        NotarizationSubmitted(pair)
+        NotarizationAccepted(pair)
+        NotarizationStapled(pair)
+        NotarizationValidated(pair)
+        InaccessiblePublicationCreated(gate, publication)
+        InaccessiblePublicationResumed(gate, publication)
+        InaccessibleUploadStarted(publication)
+        InaccessibleUploadInterrupted(publication)
+        InaccessiblePublicationVerified(publication)
+        InaccessiblePublicationPublished(gate, publication)
+        PublishedReleaseRetried(gate, publication)
+        PublishedReleaseMismatchFound(publication)
+}
+
+-- Helpers
+--
+-- valid_release_identity(identity) -> Boolean
+--   identity.version is exactly X.Y.Z or X.Y.Z-rc.N, where N is within the
+--   supported positive bound; its tag and channel are derived from that version.
+-- bundle_version_representable(identity) -> Boolean
+--   identity.version can be represented by the required bounded app bundle version.
+-- bundle_versions_match_release_identity(pair) -> Boolean
+--   pair's app uses numeric Apple marketing/build versions derived from its
+--   complete authoritative stable or RC release identity.
+-- tag_absent(gate) -> Boolean
+--   no tag derived from gate.identity.version exists.
+-- tag_gate_is_serialized(gate) -> Boolean
+--   validation against existing supported tags and tag creation hold one sole-writer gate.
+-- version_follows_existing_supported_tags(identity) -> Boolean
+--   identity.version is newer than every existing supported release tag.
+-- tag_exists_at_different_commit(gate) -> Boolean
+--   the tag derived from gate.identity.version exists and does not resolve to
+--   gate.identity.full_commit.
+-- tag_points_at_exact_commit(gate) -> Boolean
+--   the tag derived from gate.identity.version resolves to gate.identity.full_commit.
+-- protected_release_configuration_available(pair) -> Boolean
+--   the protected signing and notarization configuration is available.
+-- standalone_signature_valid(pair) -> Boolean
+--   the standalone helper has a hardened-runtime Developer ID signature from the
+--   configured release authority and passes strict verification.
+-- helper_identity_resolves_to_release(pair) -> Boolean
+--   the helper's clean embedded identity resolves to pair.identity.full_commit.
+-- helper_bytes_are_paired(pair) -> Boolean
+--   the helper embedded in the desktop app is byte-identical to the separately
+--   published signed helper before and after outer-app signing.
+-- desktop_signature_valid(pair) -> Boolean
+--   the outer app has the required hardened-runtime signature and passes strict
+--   complete-bundle verification.
+-- apple_notarization_accepted(pair) -> Boolean
+--   Apple returned terminal notary status Accepted for pair before stapling.
+-- notarization_ticket_and_gatekeeper_valid(pair) -> Boolean
+--   the stapled ticket validates and Gatekeeper accepts the app.
+-- exact_inaccessible_assets_and_digests(publication) -> Boolean
+--   consumer-inaccessible publication work contains exactly the eight required
+--   non-manifest assets and SHA256SUMS, whose entries and reported digests match.
+-- required_architecture_pairs_validated(publication) -> Boolean
+--   publication.apple_silicon_pair and publication.intel_pair have distinct
+--   targets, matching release identities, verified helper/app artifacts, and
+--   validated notarization.
+-- public_release_is_exact(publication) -> Boolean
+--   the public release contains exactly the required names and matching digests.
+-- publication_channel_is_exact(publication) -> Boolean
+--   stable publication metadata is prerelease=false and make_latest=true unless a
+--   newer stable is already latest, in which case publication is refused; RC
+--   metadata is prerelease=true and make_latest=false.
+-- publication_is_serialized(publication) -> Boolean
+--   publication verification and mutation hold one sole-writer gate across tags.
+-- public_release_differs(publication) -> Boolean
+--   a public release exists but is not the exact required release.
+-- release_absent_for_identity(identity) -> Boolean
+--   no public or inaccessible release exists for the tag derived from identity.version.
+-- recoverable_inaccessible_publication_exists(publication) -> Boolean
+--   one inaccessible publication exists for publication.identity and can resume
+--   without replacing its release object.
+
+rule GateCreatesOnlyRepresentableReleaseTag {
+    when: ReleaseTagCreated(gate)
+    requires: gate.state = unresolved
+    requires: valid_release_identity(gate.identity)
+    requires: bundle_version_representable(gate.identity)
+    requires: tag_absent(gate)
+    requires: tag_gate_is_serialized(gate)
+    requires: version_follows_existing_supported_tags(gate.identity)
+    ensures: gate.state = new_tag_created
+    ensures: tag_points_at_exact_commit(gate)
+}
+
+rule GateAcceptsOnlyExistingExactTag {
+    when: ExactReleaseTagFound(gate)
+    requires: gate.state = unresolved
+    requires: valid_release_identity(gate.identity)
+    requires: bundle_version_representable(gate.identity)
+    requires: tag_points_at_exact_commit(gate)
+    ensures: gate.state = exact_tag_match
+}
+
+rule GateRefusesDifferentCommitOrInvalidVersion {
+    when: ReleaseGateRejected(gate)
+    requires: gate.state = unresolved
+    requires: not valid_release_identity(gate.identity) or not bundle_version_representable(gate.identity) or tag_exists_at_different_commit(gate)
+    ensures: gate.state = refused
+}
+
+rule StandaloneHelperMustVerifyBeforeAppPackaging {
+    when: StandaloneHelperVerified(pair)
+    requires: pair.standalone = built
+    requires: protected_release_configuration_available(pair)
+    requires: standalone_signature_valid(pair)
+    requires: helper_identity_resolves_to_release(pair)
+    ensures: pair.standalone = verified
+}
+
+rule DesktopAppPreservesThePublishedHelper {
+    when: DesktopAppVerified(pair)
+    requires: pair.standalone = verified
+    requires: pair.desktop = built
+    requires: helper_bytes_are_paired(pair)
+    requires: desktop_signature_valid(pair)
+    requires: bundle_versions_match_release_identity(pair)
+    ensures: pair.desktop = verified
+}
+
+rule NotarizationRequiresVerifiedApp {
+    when: NotarizationSubmitted(pair)
+    requires: pair.desktop = verified
+    requires: protected_release_configuration_available(pair)
+    ensures: pair.notarization = submitted
+}
+
+rule AcceptedNotarizationRequiresAppleAcceptance {
+    when: NotarizationAccepted(pair)
+    requires: pair.notarization = submitted
+    requires: apple_notarization_accepted(pair)
+    ensures: pair.notarization = accepted
+}
+
+rule StaplingRequiresAcceptedNotarization {
+    when: NotarizationStapled(pair)
+    requires: pair.notarization = accepted
+    ensures: pair.notarization = stapled
+}
+
+rule GatekeeperValidationRequiresStapledTicket {
+    when: NotarizationValidated(pair)
+    requires: pair.notarization = stapled
+    requires: notarization_ticket_and_gatekeeper_valid(pair)
+    ensures: pair.notarization = validated
+}
+
+rule PublicationCreatesInaccessiblePreparationOnlyWhenReleaseIsAbsent {
+    when: InaccessiblePublicationCreated(gate, publication)
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: publication.state = idle or publication.state = failed
+    requires: release_absent_for_identity(publication.identity)
+    ensures: publication.state = inaccessible
+    ensures: publication.failure_domain = none
+}
+
+rule PublicationResumesExistingInaccessiblePreparation {
+    when: InaccessiblePublicationResumed(gate, publication)
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: publication.state = idle or publication.state = failed
+    requires: recoverable_inaccessible_publication_exists(publication)
+    ensures: publication.state = inaccessible
+    ensures: publication.failure_domain = none
+}
+
+rule InaccessibleUploadStartsFromPreparedState {
+    when: InaccessibleUploadStarted(publication)
+    requires: publication.state = inaccessible
+    ensures: publication.state = uploading
+}
+
+rule InterruptedUploadRemainsInaccessible {
+    when: InaccessibleUploadInterrupted(release)
+    requires: release.state = uploading
+    ensures: release.state = inaccessible
+    ensures: release.failure_domain = publication
+}
+
+rule CompleteInaccessiblePublicationBecomesVerified {
+    when: InaccessiblePublicationVerified(release)
+    requires: release.state = uploading
+    requires: exact_inaccessible_assets_and_digests(release)
+    requires: required_architecture_pairs_validated(release)
+    ensures: release.state = verified
+    ensures: release.failure_domain = none
+}
+
+rule VerifiedInaccessiblePublicationBecomesPublic {
+    when: InaccessiblePublicationPublished(gate, publication)
+    requires: publication.state = verified
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: tag_points_at_exact_commit(gate)
+    requires: exact_inaccessible_assets_and_digests(publication)
+    requires: required_architecture_pairs_validated(publication)
+    requires: publication_channel_is_exact(publication)
+    requires: publication_is_serialized(publication)
+    ensures: publication.state = public
+    ensures: publication.failure_domain = none
+}
+
+rule ExactPublicRetryIsIdempotent {
+    when: PublishedReleaseRetried(gate, publication)
+    requires: publication.state = idle
+    requires: gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: public_release_is_exact(publication)
+    requires: publication_channel_is_exact(publication)
+    requires: required_architecture_pairs_validated(publication)
+    ensures: publication.state = public
+    ensures: publication.failure_domain = none
+}
+
+rule DifferentPublicReleaseFailsWithoutReplacement {
+    when: PublishedReleaseMismatchFound(release)
+    requires: release.state = idle
+    requires: public_release_differs(release)
+    ensures: release.state = failed
+    ensures: release.failure_domain = publication
+}
+
+invariant CompletedArchitecturePairHasOneIdentity {
+    ArchitecturePair.notarization = validated implies (
+        ArchitecturePair.standalone = verified and
+        ArchitecturePair.desktop = verified and
+        helper_identity_resolves_to_release(ArchitecturePair) and
+        helper_bytes_are_paired(ArchitecturePair)
+    )
+}
+
+invariant PublicReleaseIsExact {
+    ReleasePublication.state = public implies (
+        public_release_is_exact(ReleasePublication) and
+        required_architecture_pairs_validated(ReleasePublication) and
+        publication_channel_is_exact(ReleasePublication)
+    )
+}

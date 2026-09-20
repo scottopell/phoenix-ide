@@ -82,19 +82,33 @@ external entity TargetService {
 -- atomic_candidate_install(transaction) -> Boolean
 --   Fsynced destination-filesystem artifacts replace targets by rename.
 -- exact_identity_running(service, identity) -> Boolean
---   The job has a PID and /api/version equals both identity fields.
+--   The job has a PID, /api/version equals both identity fields, and the
+--   candidate git_sha is the complete 40-character source commit rather than a
+--   matching prefix.
 -- exact_previous_restored(transaction, service) -> Boolean
---   Previous artifacts are atomically restored and the previous identity runs.
+--   Previous runtime artifacts are atomically restored and the captured
+--   previous identity runs. Its git_sha may be exactly 12 or 40 lowercase
+--   hexadecimal characters only because it identifies the already-installed
+--   rollback predecessor. No database is restored or verified.
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD, or release source is one resolved tag
---   and commit with matching host asset, checksum and embedded git SHA.
+--   and commit with a host-architecture asset matching its checksum and version.
+--   A latest selection resolves to stable tag and metadata; an exact RC selection
+--   has matching tag, prerelease metadata, full embedded version, and commit. In
+--   either case the candidate's 40-character lowercase embedded git_sha equals
+--   source_commit.
+-- previous_rollback_identity_is_valid(transaction) -> Boolean
+--   No previous runtime exists, or previous is the captured already-installed
+--   predecessor and its git_sha is exactly 12 or 40 lowercase hexadecimal
+--   characters. The 12-character form is not valid for any candidate or helper.
 -- restart_preparation_complete(restart) -> Boolean
 --   The loaded target job reports the installed plist and binary program,
 --   KeepAlive, and the sole listener service used by its health endpoint; the
 --   running process reports that it adopted the listener, its running and
---   installed binary identities match the deployed source identity, and the
---   secret-free handoff contains hashes of the installed binary, plist, and
---   deployed SHA without environment values.
+--   installed binary identities contain the same complete 40-character SHA and
+--   match the deployed source identity, and the secret-free handoff contains
+--   hashes of the installed binary, plist, and deployed SHA without environment
+--   values. A rollback-only 12-character predecessor is not restartable.
 -- restart_helper_is_launchd_owned(restart) -> Boolean
 --   A distinct one-shot LaunchAgent owns signaling and verification
 --   independently of Phoenix and the initiating shell.
@@ -109,6 +123,7 @@ rule PrepareCandidate {
     when: DeploymentRequested(transaction)
     requires: activation_claim_available()
     requires: selected_source_is_valid(transaction)
+    requires: previous_rollback_identity_is_valid(transaction)
     ensures: transaction.state = prepared
     ensures: preparation_complete(transaction)
 }
@@ -161,6 +176,8 @@ rule RollBackFailedActivation {
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
+    ensures: RuntimeArtifactRollbackRecorded(transaction)
+    ensures: not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
@@ -230,6 +247,25 @@ rule PreserveRestartFailure {
     ensures: restart.state = restart_failed
     ensures: DurableRestartStatusWritten(restart)
     ensures: not RollbackClaimed(restart)
+}
+
+invariant CandidateIdentityIsFullAndExact {
+    for transaction in DeployTransactions:
+        transaction.state in { prepared, activating, committed } implies
+            selected_source_is_valid(transaction)
+}
+
+invariant LegacyIdentityIsRollbackOnly {
+    for transaction in DeployTransactions:
+        transaction.previous != null implies
+            previous_rollback_identity_is_valid(transaction)
+}
+
+invariant AutomatedRollbackDoesNotClaimDatabaseRecovery {
+    for transaction in DeployTransactions:
+        transaction.state = activation_failed_rolled_back implies
+            RuntimeArtifactRollbackRecorded(transaction)
+            and not DatabaseRollbackClaimed(transaction)
 }
 
 invariant CommitRequiresExactIdentity {
