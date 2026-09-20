@@ -188,11 +188,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
   const composerContentRef = useRef({ draft, images, files });
-  const deferredExpansionErrorsRef = useRef(new Map<string | undefined, string>());
-  const deferredAttachmentsRef = useRef(new Map<string | undefined, {
+  const deferredFailuresRef = useRef(new Map<string | undefined, Array<{
+    text: string;
+    error?: string;
     images: ImageData[];
     files: FileAttachment[];
-  }>());
+  }>>());
   useEffect(() => {
     composerContentRef.current = { draft, images, files };
     composerHasContentRef.current = draft.length > 0
@@ -232,19 +233,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const setExpansionErrorRef = useRef(setExpansionError);
   setExpansionErrorRef.current = setExpansionError;
   useEffect(() => {
-    const deferred = deferredExpansionErrorsRef.current.get(scopeKey);
+    const deferred = deferredFailuresRef.current.get(scopeKey);
     if (deferred) {
-      setExpansionErrorRef.current(deferred);
-      deferredExpansionErrorsRef.current.delete(scopeKey);
-    }
-    const attachments = deferredAttachmentsRef.current.get(scopeKey);
-    if (attachments) {
       const current = composerContentRef.current;
-      setImages([...attachments.images, ...current.images]);
-      setFiles([...attachments.files, ...current.files]);
-      deferredAttachmentsRef.current.delete(scopeKey);
+      setDraft([...deferred.map(failure => failure.text), current.draft]
+        .filter(Boolean)
+        .join('\n'));
+      setImages([...deferred.flatMap(failure => failure.images), ...current.images]);
+      setFiles([...deferred.flatMap(failure => failure.files), ...current.files]);
+      const expansionError = deferred.findLast(failure => failure.error)?.error;
+      if (expansionError) setExpansionErrorRef.current(expansionError);
+      deferredFailuresRef.current.delete(scopeKey);
     }
-  }, [scopeKey, setFiles, setImages]);
+  }, [scopeKey, setDraft, setFiles, setImages]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -492,12 +493,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setFiles([...files, ...current.files]);
         } else {
           // This render's callbacks remain bound to the submitted conversation's stores.
-          deferredExpansionErrorsRef.current.set(
-            submittedScopeKey,
-            err.detail.error ?? 'Reference expansion failed',
-          );
-          setDraft(text);
-          deferredAttachmentsRef.current.set(submittedScopeKey, { images, files });
+          const failures = deferredFailuresRef.current.get(submittedScopeKey) ?? [];
+          failures.push({
+            text,
+            error: err.detail.error ?? 'Reference expansion failed',
+            images,
+            files,
+          });
+          deferredFailuresRef.current.set(submittedScopeKey, failures);
         }
       } else if (closeFenced) {
         if (scopeKeyRef.current === submittedScopeKey) {
@@ -510,8 +513,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             setVoiceInterim(previousVoiceInterim);
           }
         } else {
-          setDraft(text);
-          deferredAttachmentsRef.current.set(submittedScopeKey, { images, files });
+          const failures = deferredFailuresRef.current.get(submittedScopeKey) ?? [];
+          failures.push({ text, images, files });
+          deferredFailuresRef.current.set(submittedScopeKey, failures);
         }
       }
       // Other errors remain visible in the message queue with a retry button.
