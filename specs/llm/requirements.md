@@ -274,10 +274,14 @@ WHEN LLM request fails
 THE SYSTEM SHALL classify error into an explicit, named category
 AND SHALL NOT use a catch-all or unknown classification
 
-WHEN error is retryable for automatic runtime retry (network timeout, transient rate-limit throttle, server error)
+WHEN error is retryable under the generic automatic runtime policy (network timeout, transient rate-limit throttle, server error)
 THE SYSTEM SHALL include retry-after hint when available
+AND SHALL use 3 total attempts with nominal waits of 2 seconds and 4 seconds
 
-WHEN error is not retryable for automatic runtime retry but may be recovered by user action (authentication failure, selected model overload, usage-limit window reset)
+WHEN error is retryable under the selected-model overload policy
+THE SYSTEM SHALL classify it separately from the generic automatic runtime policy
+
+WHEN error is not retryable for automatic runtime retry but may be recovered by user action (authentication failure, usage-limit window reset)
 THE SYSTEM SHALL classify automatic retry policy separately from user-resume policy
 AND SHALL NOT use automatic retry classification to hide a persisted conversation resume affordance
 
@@ -285,9 +289,9 @@ WHEN error is a quota/usage-limit exhaustion (distinct from a transient throttle
 THE SYSTEM SHALL classify it as a non-auto-retryable error category distinct from the transient rate-limit category
 AND SHALL classify it as user-resumable, because the quota window resets on a clock boundary and the user can resume the conversation once it clears
 
-WHEN error indicates the selected model is at capacity (e.g. provider returns `server_is_overloaded` or `slow_down`)
-THE SYSTEM SHALL classify it as a terminal, non-retryable error category distinct from generic server errors
-AND SHALL surface a message suggesting the user try a different model
+WHEN error indicates the selected model is at capacity (e.g. provider returns `server_is_overloaded`, `slow_down`, or `overloaded_error`)
+THE SYSTEM SHALL classify it as `ServerOverloaded`, distinct from quota exhaustion, authentication failure, prompt rejection, invalid request, and generic server error
+AND SHALL apply the dedicated selected-model overload retry policy in REQ-LLM-006b
 
 WHEN the provider rejects the assembled prompt under its prompt policy (for example Responses API code `invalid_prompt`)
 THE SYSTEM SHALL classify it as a prompt-rejection category distinct from a malformed request
@@ -303,7 +307,7 @@ AND SHALL apply this user-resume policy to persisted invalid-request errors with
 WHEN a new error condition is encountered
 THE SYSTEM SHALL require an explicit classification decision before it can be handled
 
-**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion, overloaded-model errors, and prompt rejection are distinct from transient failures — automatically replaying them is wasted work or repeats a request the provider has already refused. Automatic retry safety is not the same capability as user-triggered resume after external action or revised input. A provider can reject a request because of temporary routing or entitlement state; a bad-request classification alone does not establish that the conversation is permanently unusable.
+**Rationale:** Error classification enables the state machine to select the appropriate automatic retry policy. Exhaustive classification prevents unknown errors from silently inheriting retry behavior. Quota exhaustion, model capacity, authentication failure, prompt rejection, and malformed requests require distinct recovery behavior. Automatic retry safety is also separate from user-triggered resume after external action or revised input.
 
 ---
 
@@ -330,6 +334,56 @@ THE SYSTEM SHALL apply the provider's existing generic error path
 AND SHALL NOT attempt to parse codex-specific structured fields
 
 **Rationale:** Phoenix's codex bridge routes ChatGPT-plan-backed traffic to a backend that returns structured quota state in both the response body (plan type, reset timestamp) and headers (window snapshots, credits, promo messages). Surfacing this structure as opaque text strands the user — they cannot tell whether to wait, upgrade, or contact an admin. The codex CLI (the canonical client for the same backend) already renders these strings; adopting the same wording avoids divergence with what users see in adjacent tools.
+
+---
+
+### REQ-LLM-006b: Bounded Selected-Model Overload Retry
+
+WHEN an ordinary turn or continuation-summary request first receives `ServerOverloaded`
+THE SYSTEM SHALL retain the selected model and retry that same logical request against that same model
+AND SHALL NOT change models, purchase capacity, or open a second retry loop
+AND SHALL set an absolute overload deadline 120 seconds after the first overload observation
+
+WHEN scheduling selected-model overload retries
+THE SYSTEM SHALL permit at most 5 total provider attempts
+AND SHALL use nominal waits of 4, 8, 16, and 32 seconds before attempts 2 through 5
+AND SHALL apply deterministic jitter in the inclusive range of minus 25 percent through plus 25 percent
+AND SHALL derive that jitter from the stable logical request identity and target attempt so restart computes the same wait
+
+WHEN a valid provider `Retry-After` hint is present and does not exceed 30 seconds
+THE SYSTEM SHALL use the hint as a floor for the jittered wait
+
+WHEN a valid provider `Retry-After` hint exceeds 30 seconds
+THE SYSTEM SHALL stop automatic retry visibly
+AND SHALL NOT truncate the hint to 30 seconds
+
+WHEN a computed retry time reaches or exceeds the absolute overload deadline
+THE SYSTEM SHALL stop automatic retry visibly
+AND SHALL NOT renew the deadline
+
+WHEN overload retry is waiting or in flight
+THE SYSTEM SHALL persist the logical target, target attempt, retry time when waiting, first-overload time, and absolute deadline as conversation state
+
+WHEN the runtime restarts with persisted overload retry state before its deadline
+THE SYSTEM SHALL rearm a future retry once, dispatch a due retry once, or redispatch an in-flight target once according to the persisted phase
+AND SHALL preserve the original target attempt and deadline
+
+WHEN the runtime restarts at or after the persisted deadline
+THE SYSTEM SHALL expire the overload retry without provider dispatch
+
+WHEN selected-model overload retry stops because of attempt exhaustion, an over-limit provider hint, or deadline exhaustion
+THE SYSTEM SHALL enter ordinary terminal `Error` for an ordinary turn
+AND SHALL enter `RecoverableContinuationFailure` for continuation-summary generation while retaining the continuation operation identity and inputs
+
+WHEN a user cancels an overload retry or Close settles the active conversation
+THE SYSTEM SHALL retire both retry-timer authority and provider-admission authority
+AND SHALL reject stale timer and provider outcomes
+
+WHEN automatic continuation opens a successor request
+THE SYSTEM SHALL use the request's single overload loop
+AND SHALL NOT create another overload loop at the continuation-opening boundary
+
+**Rationale:** Selected-model capacity is transient enough to merit bounded same-model retry, but it must not silently change the user's routing choice or outlive its accepted logical operation. Stable jitter prevents synchronized retries without making restart renew the wait. Persisted phase and absolute time bounds make process recovery deterministic, while target-specific terminal states preserve continuation identity.
 
 ---
 

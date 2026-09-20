@@ -212,9 +212,9 @@ entity LlmResponse {
 -- classifiers (Anthropic SSE / HTTP status; Responses SSE / codex
 -- backend). `kind` is set once at creation and never transitions.
 --
--- `auto_retryable` and `user_resumable` are derived, not stored: each
--- decision is a pure function of `kind`, so they cannot drift out of sync
--- with the taxonomy or with each other.
+-- `auto_retryable`, `overload_retryable`, and `user_resumable` are derived,
+-- not stored: each decision is a pure function of `kind`, so the generic and
+-- selected-model overload policies cannot drift into one another.
 -- `has_quota` records whether structured QuotaDetails is attached; it is
 -- bound to `usage_limit_reached` by QuotaBoundToUsageLimit.
 entity LlmError {
@@ -228,10 +228,14 @@ entity LlmError {
     -- snapshots, credits) is attached to this error.
     has_quota: Boolean
 
-    -- Automatic runtime retry decision. A malformed response is a
-    -- server/transport fault, so it joins the transient-failure kinds; every
-    -- other kind requires stopping the in-flight turn.
+    -- Generic automatic runtime retry decision. A malformed response is a
+    -- server/transport fault, so it joins the transient-failure kinds.
     auto_retryable: kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response
+
+    -- Dedicated same-model capacity retry decision. This is separate from the
+    -- generic policy because its attempt budget, backoff, persistence, and
+    -- absolute window differ.
+    overload_retryable: kind = server_overloaded
 
     -- User-triggered resume from a persisted conversation error. Auth is not
     -- auto-retryable, but is resumable after credentials are fixed.
@@ -239,6 +243,141 @@ entity LlmError {
     -- on a clock boundary, so the user can resume once the window clears.
     user_resumable: kind = auth or kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected or kind = invalid_request
 }
+
+------------------------------------------------------------
+-- Selected-model overload retry (REQ-LLM-006b)
+------------------------------------------------------------
+
+value OverloadRetryState {
+    logical_identity: String
+    target_kind: ordinary | continuation
+    model_id: String
+    target_attempt: Integer
+    phase: waiting | in_flight
+    retry_at: Timestamp?
+    started_at: Timestamp
+    deadline_at: Timestamp
+    continuation_operation_id: String?
+}
+
+entity ActiveOverloadRetry {
+    conversation_id: String
+    retry: OverloadRetryState
+}
+
+rule FirstServerOverloadSchedulesSameModelRetry {
+    when: ServerOverloadObserved(conversation_id, logical_identity, model_id, failed_attempt, observed_at, retry_after?)
+    requires: failed_attempt < 5
+    requires: retry_after = null or retry_after <= 30.seconds
+    let target_attempt = failed_attempt + 1
+    let wait = overload_wait(logical_identity, target_attempt, retry_after)
+    requires: observed_at + wait < observed_at + 120.seconds
+    ensures: ActiveOverloadRetry{conversation_id: conversation_id}.retry = OverloadRetryState{
+        logical_identity: logical_identity,
+        target_kind: ordinary,
+        model_id: model_id,
+        target_attempt: target_attempt,
+        phase: waiting,
+        retry_at: observed_at + wait,
+        started_at: observed_at,
+        deadline_at: observed_at + 120.seconds,
+        continuation_operation_id: null
+    }
+    ensures: SameModelRetryScheduled(conversation_id, model_id, target_attempt, wait)
+}
+
+rule ContinuationServerOverloadSchedulesSameOperationRetry {
+    when: ContinuationServerOverloadObserved(conversation_id, operation_id, model_id, failed_attempt, observed_at, retry_after?)
+    requires: failed_attempt < 5
+    requires: retry_after = null or retry_after <= 30.seconds
+    let target_attempt = failed_attempt + 1
+    let wait = overload_wait(operation_id, target_attempt, retry_after)
+    requires: observed_at + wait < observed_at + 120.seconds
+    ensures: ActiveOverloadRetry{conversation_id: conversation_id}.retry = OverloadRetryState{
+        logical_identity: operation_id,
+        target_kind: continuation,
+        model_id: model_id,
+        target_attempt: target_attempt,
+        phase: waiting,
+        retry_at: observed_at + wait,
+        started_at: observed_at,
+        deadline_at: observed_at + 120.seconds,
+        continuation_operation_id: operation_id
+    }
+    ensures: SameContinuationRetryScheduled(conversation_id, operation_id, model_id, target_attempt, wait)
+}
+
+rule RepeatedServerOverloadPreservesWindow {
+    when: ServerOverloadRetryFailed(retry, observed_at, retry_after?)
+    requires: retry.retry.phase = in_flight
+    requires: retry.retry.target_attempt < 5
+    requires: retry_after = null or retry_after <= 30.seconds
+    let target_attempt = retry.retry.target_attempt + 1
+    let wait = overload_wait(retry.retry.logical_identity, target_attempt, retry_after)
+    requires: observed_at + wait < retry.retry.deadline_at
+    ensures: retry.retry.target_attempt = target_attempt
+    ensures: retry.retry.phase = waiting
+    ensures: retry.retry.retry_at = observed_at + wait
+    ensures: retry.retry.started_at = previous(retry.retry.started_at)
+    ensures: retry.retry.deadline_at = previous(retry.retry.deadline_at)
+    ensures: retry.retry.model_id = previous(retry.retry.model_id)
+}
+
+rule OrdinaryOverloadRetryStopsInError {
+    when: OverloadRetryCannotContinue(retry, reason)
+    requires: retry.retry.target_kind = ordinary
+    requires: reason in { attempts_exhausted, retry_after_over_30_seconds, deadline_exhausted }
+    ensures: not exists ActiveOverloadRetry{conversation_id: retry.conversation_id}
+    ensures: OrdinaryConversationError(retry.conversation_id, server_overloaded, reason)
+    ensures: VisibleOverloadFailure(retry.conversation_id, ordinary, reason)
+}
+
+rule ContinuationOverloadRetryStopsRecoverably {
+    when: OverloadRetryCannotContinue(retry, reason)
+    requires: retry.retry.target_kind = continuation
+    requires: reason in { attempts_exhausted, retry_after_over_30_seconds, deadline_exhausted }
+    ensures: not exists ActiveOverloadRetry{conversation_id: retry.conversation_id}
+    ensures: RecoverableContinuationFailure(
+        retry.conversation_id,
+        retry.retry.continuation_operation_id,
+        server_overloaded,
+        reason)
+    ensures: VisibleOverloadFailure(retry.conversation_id, continuation, reason)
+}
+
+rule OverloadRetryRestoredBeforeDeadline {
+    when: RuntimeStartsWithOverloadRetry(retry, now)
+    requires: now < retry.retry.deadline_at
+    ensures: ExactlyOneOverloadStartupAction(retry.conversation_id, retry.retry.phase, retry.retry.retry_at)
+    ensures: OverloadDeadlinePreserved(retry.conversation_id, retry.retry.deadline_at)
+}
+
+rule OverloadRetryExpiresOnRestart {
+    when: RuntimeStartsWithOverloadRetry(retry, now)
+    requires: now >= retry.retry.deadline_at
+    ensures: not ProviderRequestDispatched(retry.conversation_id)
+    ensures: OverloadRetryCannotContinue(retry, deadline_exhausted)
+}
+
+rule OverloadAuthorityRetired {
+    when: OverloadRetryRetirementRequested(retry, cause)
+    requires: cause in { user_cancelled, close_settlement }
+    ensures: not exists ActiveOverloadRetry{conversation_id: retry.conversation_id}
+    ensures: OverloadTimerAuthorityRetired(retry.conversation_id)
+    ensures: OverloadProviderAdmissionRetired(retry.conversation_id)
+}
+
+-- Helpers:
+--   overload_wait(logical_identity: String, target_attempt: Integer,
+--                 retry_after: Duration?) -> Duration
+--       Uses nominal waits 4/8/16/32 seconds for target attempts 2/3/4/5,
+--       applies deterministic inclusive +/-25% jitter from logical_identity and
+--       target_attempt, then takes a valid retry_after not exceeding 30 seconds
+--       as a floor.
+--   ExactlyOneOverloadStartupAction(conversation_id, phase, retry_at)
+--       Waiting before retry_at rearms one timer; waiting at or after retry_at
+--       dispatches once; in_flight redispatches once. No branch opens a second
+--       overload loop.
 
 ------------------------------------------------------------
 -- Invariants
@@ -265,6 +404,12 @@ invariant QuotaBoundToUsageLimit {
 invariant AutoRetryablePartition {
     for e in LlmErrors:
         e.auto_retryable = (e.kind = network or e.kind = timed_out or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response)
+}
+
+invariant OverloadRetryablePartition {
+    for e in LlmErrors:
+        e.overload_retryable = (e.kind = server_overloaded)
+        e.overload_retryable implies not e.auto_retryable
 }
 
 invariant UserResumablePartition {

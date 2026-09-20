@@ -780,8 +780,8 @@ rule ResponsesCodex429Classified {
         -- codex backend; the platform Responses API never reaches it.
 }
 
--- A codex-backend HTTP 503. The overloaded signals are a terminal
--- server_overloaded; any other 503 falls through to the generic HTTP
+-- A codex-backend HTTP 503. The overloaded signals enter the dedicated
+-- server_overloaded policy; any other 503 falls through to the generic HTTP
 -- path (a retryable server_error).
 rule ResponsesCodex503Classified {
     when: CodexBackendHttpError(status, error_type?, body)

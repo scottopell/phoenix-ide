@@ -70,6 +70,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_bounded-selected-model-overload-retry.md) | Selected-model overload uses a durable bounded retry window | Accepted | REQ-LLM-006/006b, REQ-LRV-002/005/008, REQ-BED-006/007 |
 
 ## For agents: which decisions bind your task
 
@@ -114,6 +115,8 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 | Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 
+| Specifying selected-model overload classification, retry policy, durable restart, continuation outcome, or retry visibility | 059, qualified by 048 for each provider attempt and 025 for continuation identity |
+
 ## Decision dependencies
 
 ```text
@@ -149,8 +152,9 @@ ADR-000 (adopt spEARS v2 for new work)
           └── ADR-020 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
-      │   └── ADR-045 (Provider prompts use persisted generation-fenced projections)
-      │       └── ADR-054 (Automatic continuation admission binds consent and context authority)
+      │   ├── ADR-045 (Provider prompts use persisted generation-fenced projections)
+      │   │   └── ADR-054 (Automatic continuation admission binds consent and context authority)
+      │   └── ADR-059 (Selected-model overload uses a durable bounded retry window; also qualifies ADR-048)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)

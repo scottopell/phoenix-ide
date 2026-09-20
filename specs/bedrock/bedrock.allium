@@ -1512,6 +1512,47 @@ rule RejectCancelDuringContinuation {
     ensures: not LlmAborted(conversation)
 }
 
+-- Continuation summary generation uses the request's one retry loop. Generic
+-- transient failures retain the generic policy; selected-model capacity uses
+-- the persisted overload policy in specs/llm/llm.allium without opening a
+-- second loop at the continuation boundary.
+rule ContinuationServerOverload {
+    when: ContinuationServerOverloadObserved(conversation, operation_id, target_attempt)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    ensures: SameContinuationOperationOverloadRetryScheduled(conversation, operation_id, target_attempt)
+    ensures: not SecondOverloadLoopOpened(conversation, operation_id)
+}
+
+rule RestoreContinuationOverloadRetry {
+    when: RuntimeStartsWithContinuationOverload(conversation, operation_id, deadline_at)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    requires: Now() < deadline_at
+    ensures: ExactlyOneContinuationOverloadStartupAction(conversation, operation_id)
+    ensures: ContinuationOverloadDeadlinePreserved(conversation, operation_id, deadline_at)
+}
+
+rule ExpireContinuationOverloadRetryOnRestart {
+    when: RuntimeStartsWithContinuationOverload(conversation, operation_id, deadline_at)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    requires: Now() >= deadline_at
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: not ProviderRequestDispatched(conversation)
+}
+
+rule ContinuationOverloadStopsRecoverably {
+    when: ContinuationOverloadCannotContinue(conversation, operation_id, reason)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    requires: reason in { attempts_exhausted, retry_after_over_30_seconds, deadline_exhausted }
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: ContinuationRetryOffered(conversation, operation_id)
+}
+
 rule ContinuationRetryableError {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = awaiting_continuation
@@ -1822,6 +1863,13 @@ rule CloseSettlementCapturesExactDirectTurnTargets {
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
     ensures: not AdditionalCloseDirectTurnSettlementTargetMayBeCaptured(product_conversation, attempt_id)
+}
+
+rule CloseSettlementRetiresOverloadAuthority {
+    when: CloseSettlementRequested(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    ensures: OverloadTimerAuthorityRetired(product_conversation)
+    ensures: OverloadProviderAdmissionRetired(product_conversation)
 }
 
 rule CloseObligationCanBeCancelledBeforeSettlementStarts {
