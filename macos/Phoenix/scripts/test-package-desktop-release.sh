@@ -9,7 +9,9 @@ mkdir -p "$tmp/bin" "$tmp/out" "$tmp/runner" "$tmp/tmpdir"
 cat >"$tmp/sidecar" <<'EOF'
 #!/bin/sh
 if [ "$1" = --build-identity ]; then
-  printf '{"version":"1.2.3","git_sha":"%s"}\n' "${FAKE_EMBEDDED_SHA:-0123456789abcdef0123456789abcdef01234567}"
+  printf '{"version":"%s","git_sha":"%s"}\n' \
+    "${FAKE_EMBEDDED_VERSION:-1.2.3}" \
+    "${FAKE_EMBEDDED_SHA:-0123456789abcdef0123456789abcdef01234567}"
 fi
 EOF
 chmod +x "$tmp/sidecar"
@@ -149,11 +151,30 @@ asset=$(run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567)
 [[ "$asset" == "$tmp/out/Phoenix-macos-aarch64-apple-darwin-v1.2.3.zip" ]]
 [[ -s "$asset" ]]
 grep -Fx "marketing=1.2.3" "$tmp/xcodebuild.log"
-grep -Fx "project_version=2.2.3" "$tmp/xcodebuild.log"
+grep -Fx "project_version=2.2.399" "$tmp/xcodebuild.log"
 case $(grep '^derived=' "$tmp/xcodebuild.log") in
   "derived=$tmp/tmpdir/phoenix-desktop-aarch64-apple-darwin."*) ;;
   *) echo "expected derived data to be created under TMPDIR fallback" >&2; exit 1 ;;
 esac
+
+export FAKE_EMBEDDED_VERSION=0.12.98
+asset=$(run_unsigned v0.12.98 0123456789abcdef0123456789abcdef01234567)
+[[ "$asset" == "$tmp/out/Phoenix-macos-aarch64-apple-darwin-v0.12.98.zip" ]]
+grep -Fx "marketing=0.12.98" "$tmp/xcodebuild.log"
+grep -Fx "project_version=1.12.98" "$tmp/xcodebuild.log"
+
+export FAKE_EMBEDDED_VERSION=0.13.0-rc.1
+asset=$(run_unsigned v0.13.0-rc.1 0123456789abcdef0123456789abcdef01234567)
+[[ "$asset" == "$tmp/out/Phoenix-macos-aarch64-apple-darwin-v0.13.0-rc.1.zip" ]]
+grep -Fx "marketing=0.13.0" "$tmp/xcodebuild.log"
+grep -Fx "project_version=1.13.1" "$tmp/xcodebuild.log"
+
+export FAKE_EMBEDDED_VERSION=0.13.0
+asset=$(run_unsigned v0.13.0 0123456789abcdef0123456789abcdef01234567)
+[[ "$asset" == "$tmp/out/Phoenix-macos-aarch64-apple-darwin-v0.13.0.zip" ]]
+grep -Fx "marketing=0.13.0" "$tmp/xcodebuild.log"
+grep -Fx "project_version=1.13.99" "$tmp/xcodebuild.log"
+unset FAKE_EMBEDDED_VERSION
 
 unset TMPDIR RUNNER_TEMP
 : > "$tmp/xcodebuild.log"
@@ -168,7 +189,22 @@ esac
 [[ -s "$asset" ]]
 
 if run_unsigned v1.2.3-rc1 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
-  echo "expected prerelease tag to fail" >&2
+  echo "expected malformed prerelease tag to fail" >&2
+  exit 1
+fi
+
+if run_unsigned v0.12.98-rc.1 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
+  echo "expected release candidate below 0.13.0 to fail" >&2
+  exit 1
+fi
+
+if run_unsigned v1.2.3-rc.99 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
+  echo "expected release candidate 99 to fail" >&2
+  exit 1
+fi
+
+if run_unsigned v1.2.99 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
+  echo "expected patch 99 to fail" >&2
   exit 1
 fi
 

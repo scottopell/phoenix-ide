@@ -105,6 +105,7 @@ if args[:2] == ["release", "upload"]:
 if args and args[0] == "api":
     method = "GET"
     filtered = []
+    fields = {}
     input_path = None
     slurp = "--slurp" in args
     index = 1
@@ -115,7 +116,13 @@ if args and args[0] == "api":
         elif args[index] == "--input":
             input_path = Path(args[index + 1])
             index += 2
-        elif args[index] in {"-F", "-f", "-H", "--hostname"}:
+        elif args[index] in {"-F", "-f"}:
+            key, value = args[index + 1].split("=", 1)
+            if args[index] == "-F" and value in {"true", "false"}:
+                value = value == "true"
+            fields[key] = value
+            index += 2
+        elif args[index] in {"-H", "--hostname"}:
             index += 2
         elif args[index] in {"--paginate", "--slurp"}:
             index += 1
@@ -124,6 +131,39 @@ if args and args[0] == "api":
             index += 1
     endpoint = filtered[0]
     release = load()
+    if method == "POST" and endpoint.endswith("/releases"):
+        if release is not None:
+            raise SystemExit("release already exists")
+        required = {
+            "tag_name": os.environ["FAKE_TAG"],
+            "name": os.environ["FAKE_TAG"],
+            "target_commitish": os.environ["EXPECTED_COMMIT"],
+            "draft": True,
+            "prerelease": os.environ["FAKE_CHANNEL"] == "rc",
+            "make_latest": "false" if os.environ["FAKE_CHANNEL"] == "rc" else "true",
+            "generate_release_notes": True,
+        }
+        if fields != required:
+            raise SystemExit(f"release creation metadata is not explicit and exact: {fields!r}")
+        release = {
+            "id": 42,
+            "tag": fields["tag_name"],
+            "tag_name": fields["tag_name"],
+            "draft": True,
+            "prerelease": fields["prerelease"],
+            "make_latest": fields["make_latest"],
+            "assets": [],
+            "next_id": 100,
+        }
+        save(release)
+        print(json.dumps(api_release(release)))
+        raise SystemExit(0)
+    if method == "GET" and endpoint.endswith("/releases/latest"):
+        latest_tag = os.environ.get("FAKE_LATEST_TAG")
+        if latest_tag is None:
+            latest_tag = "v1.2.2" if os.environ["FAKE_CHANNEL"] == "rc" else os.environ["FAKE_TAG"]
+        print(latest_tag if "--jq" in args else json.dumps({"tag_name": latest_tag}))
+        raise SystemExit(0)
     if method == "GET" and "/releases/tags/" in endpoint:
         if release is None:
             raise SystemExit(1)
@@ -163,9 +203,18 @@ if args and args[0] == "api":
     if method == "PATCH" and "/releases/" in endpoint:
         if release is None or not release["draft"]:
             raise SystemExit("only a draft can be published")
+        required = {
+            "draft": False,
+            "prerelease": os.environ["FAKE_CHANNEL"] == "rc",
+            "make_latest": "false" if os.environ["FAKE_CHANNEL"] == "rc" else "true",
+        }
+        if fields != required:
+            raise SystemExit(f"publication metadata is not explicit and exact: {fields!r}")
         if os.environ.get("FAKE_PUBLISH_FAIL") == "1":
             raise SystemExit("simulated publish failure")
-        release["draft"] = False
+        release["draft"] = fields["draft"]
+        release["prerelease"] = fields["prerelease"]
+        release["make_latest"] = fields["make_latest"]
         save(release)
         raise SystemExit(0)
 raise SystemExit(2)
@@ -177,6 +226,8 @@ export FAKE_STATE="$tmp/state"
 export FAKE_REPO=owner/repo
 export EXPECTED_COMMIT=0123456789abcdef0123456789abcdef01234567
 export GIT="$tmp/bin/git"
+export FAKE_TAG=v1.2.3
+export FAKE_CHANNEL=stable
 
 asset="$tmp/assets/Phoenix-macos-aarch64-apple-darwin-v1.2.3.zip"
 checksums="$tmp/assets/SHA256SUMS"
@@ -197,13 +248,15 @@ write_checksums
 
 publish() {
   bash "$root/scripts/publish-release-assets.sh" \
-    "$FAKE_REPO" v1.2.3 "$EXPECTED_COMMIT" "$asset" "$checksums"
+    "$FAKE_REPO" "$FAKE_TAG" "$EXPECTED_COMMIT" "$FAKE_CHANNEL" "$asset" "$checksums"
 }
 
 reset_state() {
   rm -rf "$FAKE_STATE"
   mkdir -p "$FAKE_STATE"
-  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE
+  unset FAKE_DIGEST_MISMATCH FAKE_PUBLISH_FAIL FAKE_TAG_MOVE_AFTER FAKE_UPLOAD_FAIL_AFTER FAKE_API_FAILURE FAKE_LATEST_TAG
+  export FAKE_TAG=v1.2.3
+  export FAKE_CHANNEL=stable
 }
 
 assert_draft() {
@@ -217,12 +270,15 @@ PY
 }
 
 assert_published_exact() {
-  python3 - "$FAKE_STATE/release.json" <<'PY'
+  python3 - "$FAKE_STATE/release.json" "$FAKE_CHANNEL" <<'PY'
 import json
 import sys
 from pathlib import Path
 release = json.loads(Path(sys.argv[1]).read_text())
 assert release["draft"] is False
+channel = sys.argv[2]
+assert release["prerelease"] is (channel == "rc")
+assert release["make_latest"] == ("false" if channel == "rc" else "true")
 assert sorted(asset["name"] for asset in release["assets"]) == [
     "Phoenix-macos-aarch64-apple-darwin-v1.2.3.zip",
     "SHA256SUMS",
@@ -234,12 +290,49 @@ PY
 reset_state
 publish
 assert_published_exact
-grep -F -- '--draft' "$FAKE_STATE/gh.log" >/dev/null
+grep -F -- '--method POST repos/owner/repo/releases' "$FAKE_STATE/gh.log" >/dev/null
+grep -F -- '-F draft=true -F prerelease=false -f make_latest=true' "$FAKE_STATE/gh.log" >/dev/null
+grep -F -- '-F draft=false -F prerelease=false -f make_latest=true' "$FAKE_STATE/gh.log" >/dev/null
 grep -F -- '--hostname uploads.github.com --method POST' "$FAKE_STATE/gh.log" >/dev/null
 if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log" >/dev/null; then
   echo "draft recovery must not delete the release" >&2
   exit 1
 fi
+
+# RC publication is explicitly a prerelease and never becomes latest, including an idempotent retry.
+reset_state
+export FAKE_TAG=v1.2.3-rc.1
+export FAKE_CHANNEL=rc
+publish
+assert_published_exact
+before=$(cat "$FAKE_STATE/release.json")
+publish
+test "$(cat "$FAKE_STATE/release.json")" = "$before"
+grep -F -- '-F draft=true -F prerelease=true -f make_latest=false' "$FAKE_STATE/gh.log" >/dev/null
+grep -F -- '-F draft=false -F prerelease=true -f make_latest=false' "$FAKE_STATE/gh.log" >/dev/null
+export FAKE_LATEST_TAG="$FAKE_TAG"
+if publish >/dev/null 2>&1; then
+  echo "expected RC publication to reject becoming repository latest" >&2
+  exit 1
+fi
+unset FAKE_LATEST_TAG
+
+# The supplied channel must be derived from the validated tag before any API mutation.
+reset_state
+export FAKE_TAG=v1.2.3-rc.1
+export FAKE_CHANNEL=stable
+if publish >/dev/null 2>&1; then
+  echo "expected stable channel with an RC tag to fail" >&2
+  exit 1
+fi
+test ! -e "$FAKE_STATE/gh.log"
+reset_state
+export FAKE_CHANNEL=rc
+if publish >/dev/null 2>&1; then
+  echo "expected RC channel with a stable tag to fail" >&2
+  exit 1
+fi
+test ! -e "$FAKE_STATE/gh.log"
 
 # An interrupted draft upload remains private and is replaced exactly on retry.
 reset_state
@@ -262,6 +355,55 @@ if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log
   echo "partial draft recovery must not delete the release" >&2
   exit 1
 fi
+
+# An interrupted RC draft remains a prerelease, never latest, and is replaced exactly on retry.
+reset_state
+export FAKE_TAG=v1.2.3-rc.1
+export FAKE_CHANNEL=rc
+export FAKE_UPLOAD_FAIL_AFTER=1
+if publish >/dev/null 2>&1; then
+  echo "expected partial RC draft upload to fail" >&2
+  exit 1
+fi
+assert_draft
+python3 - "$FAKE_STATE/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+release = json.loads(Path(sys.argv[1]).read_text())
+assert release["prerelease"] is True
+assert release["make_latest"] == "false"
+PY
+unset FAKE_UPLOAD_FAIL_AFTER
+publish
+assert_published_exact
+
+# An existing draft with the wrong publication channel fails before asset mutation.
+reset_state
+export FAKE_UPLOAD_FAIL_AFTER=1
+if publish >/dev/null 2>&1; then
+  echo "expected partial draft upload to fail" >&2
+  exit 1
+fi
+unset FAKE_UPLOAD_FAIL_AFTER
+python3 - "$FAKE_STATE/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["prerelease"] = True
+path.write_text(json.dumps(release))
+PY
+before=$(cat "$FAKE_STATE/release.json")
+log_lines=$(wc -l < "$FAKE_STATE/gh.log")
+if publish >/dev/null 2>&1; then
+  echo "expected stable publication to reject an RC draft" >&2
+  exit 1
+fi
+test "$(cat "$FAKE_STATE/release.json")" = "$before"
+tail -n "+$((log_lines + 1))" "$FAKE_STATE/gh.log" | grep -Ev -- '^api --paginate --slurp repos/owner/repo/releases\?per_page=100$' >"$tmp/unexpected-mutations" || true
+test ! -s "$tmp/unexpected-mutations"
 
 # Digest verification failure never publishes the draft.
 reset_state
@@ -324,6 +466,32 @@ path.write_text(json.dumps(release))
 PY
 if publish >/dev/null 2>&1; then
   echo "expected incomplete public release to fail closed" >&2
+  exit 1
+fi
+
+# Existing public metadata with the wrong channel is immutable and fails closed.
+reset_state
+publish
+python3 - "$FAKE_STATE/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["prerelease"] = True
+path.write_text(json.dumps(release))
+PY
+before=$(cat "$FAKE_STATE/release.json")
+log_lines=$(wc -l < "$FAKE_STATE/gh.log")
+if publish >/dev/null 2>&1; then
+  echo "expected stable publication to reject an RC public release" >&2
+  exit 1
+fi
+test "$(cat "$FAKE_STATE/release.json")" = "$before"
+new_calls="$tmp/public-channel-calls"
+tail -n "+$((log_lines + 1))" "$FAKE_STATE/gh.log" >"$new_calls"
+if grep -E -- '--method (POST|DELETE|PATCH)' "$new_calls" >/dev/null; then
+  echo "public channel mismatch must fail before mutation" >&2
   exit 1
 fi
 

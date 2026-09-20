@@ -13,7 +13,8 @@ Phoenix release source contains a direct-distribution path for architecture-spec
 | REQ-DESKTOP-REL-005 | Publish enumerates eight payload assets, creates `SHA256SUMS`, and verifies exact draft and public names plus GitHub-reported SHA-256 digests. |
 | REQ-DESKTOP-REL-006 | `test-package-desktop-release.sh` covers unsigned shell orchestration with tool doubles. The `macos-app` hosted workflow also builds a real unsigned Release app, packages it through `package-desktop-release.sh`, and verifies the resulting archive on macOS. |
 | REQ-DESKTOP-REL-007 | Every retry rebuilds and validates both architecture pairs from the immutable tagged commit before `publish-release-assets.sh` compares them with any public release. The publisher creates or resumes a private exact-tag draft, verifies it remains private before each mutation, replaces timestamp-dependent draft assets, verifies the complete exact set, and only then makes it public. It never deletes the release itself; an exact public release is unchanged and an inexact public release fails closed without replacement. |
-| REQ-DESKTOP-REL-008 | The release gate rejects unrepresentable bundle versions before tag creation; packaging passes and verifies the resolved marketing and project versions. |
+| REQ-DESKTOP-REL-008 | The shared release-version parser derives numeric Apple marketing/build versions for stable and bounded RC SemVer; the gate rejects unrepresentable versions before tag creation, and packaging verifies both exact plist values while preserving complete SemVer in helper identity. |
+| REQ-DESKTOP-REL-009 | The shared release-version parser accepts only stable or bounded `rc.N` SemVer, drives workflow/publisher channel metadata, keeps RCs non-latest, and fails closed on stable/RC metadata disagreement. RCs use the same protected signing, notarization, exact-asset, and private-draft path as stable releases. |
 
 ## Proposed protected configuration
 

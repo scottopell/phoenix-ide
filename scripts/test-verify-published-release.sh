@@ -47,6 +47,10 @@ args = sys.argv[1:]
 if args[:1] != ["api"] or os.environ.get("FAKE_API_FAILURE") == "1":
     raise SystemExit(2)
 release = json.loads(Path(os.environ["FAKE_RELEASE_JSON"]).read_text())
+if any(arg.endswith("/releases/latest") for arg in args):
+    latest_tag = os.environ.get("FAKE_LATEST_TAG", "v1.2.3")
+    print(latest_tag if "--jq" in args else json.dumps({"tag_name": latest_tag}))
+    raise SystemExit(0)
 if any(arg.endswith("/releases?per_page=100") for arg in args):
     page = [] if os.environ.get("FAKE_RELEASE_ABSENT") == "1" else [release]
     print(json.dumps([page] if "--slurp" in args else page))
@@ -64,11 +68,58 @@ export PATH="$tmp/bin:$PATH"
 export FAKE_RELEASE_JSON="$tmp/release.json"
 export FAKE_ASSET_DIR="$tmp/source"
 
-bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null
+
+# RC metadata verifies only as the RC channel.
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["tag_name"] = "v1.2.3-rc.1"
+release["prerelease"] = True
+path.write_text(json.dumps(release))
+PY
+export FAKE_LATEST_TAG=v1.2.3
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3-rc.1 rc asset-one asset-two >/dev/null
+export FAKE_LATEST_TAG=v1.2.3-rc.1
+if bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3-rc.1 rc asset-one asset-two >/dev/null 2>&1; then
+  echo "expected RC latest relationship mismatch to fail" >&2
+  exit 1
+fi
+export FAKE_LATEST_TAG=v1.2.3
+if bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3-rc.1 stable asset-one asset-two >/dev/null 2>&1; then
+  echo "expected tag/channel mismatch to fail" >&2
+  exit 1
+fi
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["prerelease"] = False
+path.write_text(json.dumps(release))
+PY
+if bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3-rc.1 rc asset-one asset-two >/dev/null 2>&1; then
+  echo "expected RC tag with stable metadata to fail" >&2
+  exit 1
+fi
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["tag_name"] = "v1.2.3"
+release["prerelease"] = False
+path.write_text(json.dumps(release))
+PY
 
 export FAKE_RELEASE_ABSENT=1
 set +e
-bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null 2>&1
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 3 || { echo "expected absent public release status 3, got $status" >&2; exit 1; }
@@ -76,7 +127,7 @@ unset FAKE_RELEASE_ABSENT
 
 export FAKE_API_FAILURE=1
 set +e
-bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null 2>&1
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -ne 0
@@ -93,11 +144,28 @@ release["prerelease"] = True
 path.write_text(json.dumps(release))
 PY
 set +e
-bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null 2>&1
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -ne 0
-test "$status" -ne 3 || { echo "prerelease must be rejected, not classified as stable-release absence" >&2; exit 1; }
+test "$status" -ne 3 || { echo "channel mismatch must be rejected, not classified as release absence" >&2; exit 1; }
+
+# A mismatched draft for the exact tag is also a metadata error, not public absence.
+python3 - "$tmp/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release["draft"] = True
+path.write_text(json.dumps(release))
+PY
+set +e
+bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -ne 0
+test "$status" -ne 3 || { echo "mismatched draft must not be classified as release absence" >&2; exit 1; }
 python3 - "$tmp/release.json" <<'PY'
 import json
 import sys
@@ -105,6 +173,7 @@ from pathlib import Path
 path = Path(sys.argv[1])
 release = json.loads(path.read_text())
 release["prerelease"] = False
+release["draft"] = False
 path.write_text(json.dumps(release))
 PY
 
@@ -117,7 +186,7 @@ release = json.loads(path.read_text())
 release["assets"][0]["digest"] = "sha256:" + "f" * 64
 path.write_text(json.dumps(release))
 PY
-if bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 asset-one asset-two >/dev/null 2>&1; then
+if bash "$root/scripts/verify-published-release.sh" owner/repo v1.2.3 stable asset-one asset-two >/dev/null 2>&1; then
   echo "expected GitHub digest mismatch to fail" >&2
   exit 1
 fi

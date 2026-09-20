@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 from pathlib import Path
 
 workflow = Path('.github/workflows/release.yml').read_text()
@@ -8,9 +9,16 @@ required_fragments = [
     'RETRY_TAG: ${{ inputs.tag }}',
     'Retrying $TAG from its immutable main commit $TAG_COMMIT.',
     'git merge-base --is-ancestor "$TAG_COMMIT" origin/main',
-    'validate_bundle_version "$VERSION"',
+    'VERSION=$(python3 scripts/release_version.py validate-tag "$TAG")',
+    'VERSION=$(python3 scripts/release_version.py validate "$VERSION")',
+    'channel: ${{ steps.ver.outputs.channel }}',
+    '*) CHANNEL=stable ;;',
+    '*-rc.*) CHANNEL=rc ;;',
+    'echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"',
+    '"${{ needs.gate.outputs.channel }}"',
     'commit: ${{ steps.ver.outputs.commit }}',
     'ref: ${{ needs.gate.outputs.commit }}',
+    'ref: ${{ github.sha }}',
     'environment: macos-release-signing',
     'DEVELOPER_ID_P12_BASE64',
     'DEVELOPER_ID_P12_PASSWORD',
@@ -47,6 +55,7 @@ for line in workflow.splitlines():
             raise SystemExit(f'action is not pinned to a full commit: {line.strip()}')
 
 for forbidden in [
+    'validate_bundle_version() {',
     'APPLE_ID:',
     'APPLE_APP_SPECIFIC_PASSWORD',
     'MACOS_CERTIFICATE_P12_BASE64',
@@ -63,15 +72,76 @@ for forbidden in [
     if forbidden in workflow:
         raise SystemExit(f'forbidden release workflow contract: {forbidden}')
 
+build_macos_job = workflow.split('\n  build-macos:\n', 1)[1].split('\n  publish:\n', 1)[0]
 publish_job = workflow.split('\n  publish:\n', 1)[1]
+if not build_macos_job.startswith('    environment: macos-release-signing\n'):
+    raise SystemExit('macOS signing must use the protected macos-release-signing environment')
 if not publish_job.startswith('    needs: [gate, build-linux, build-macos]\n    environment: macos-release-signing\n'):
     raise SystemExit('release publication must use the protected macos-release-signing environment')
+if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
+    raise SystemExit('macOS artifacts must be built from the immutable tagged commit')
+if 'ref: ${{ github.sha }}' not in publish_job:
+    raise SystemExit('publication retries must use current protected workflow tooling')
 
-stable_check = workflow.index("printf '%s' \"$VERSION\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'")
-bundle_check = workflow.index('validate_bundle_version "$VERSION"', stable_check)
-tag_creation = workflow.index('git tag -a "$TAG"', bundle_check)
-if not stable_check < bundle_check < tag_creation:
-    raise SystemExit('stable and bundle-version validation must precede tag creation')
+secret_names = set(re.findall(r'\$\{\{ secrets\.([A-Z0-9_]+) \}\}', workflow))
+expected_secrets = {
+    'DEVELOPER_ID_P12_BASE64',
+    'DEVELOPER_ID_P12_PASSWORD',
+    'APPLE_TEAM_ID',
+    'APP_STORE_CONNECT_ISSUER_ID',
+    'APP_STORE_CONNECT_KEY_ID',
+    'APP_STORE_CONNECT_API_KEY',
+    'GITHUB_TOKEN',
+}
+if secret_names != expected_secrets:
+    raise SystemExit(f'release workflow secret allowlist mismatch: {sorted(secret_names)}')
+
+version_check = workflow.index('VERSION=$(python3 scripts/release_version.py validate "$VERSION")')
+tag_creation = workflow.index('git tag -a "$TAG"', version_check)
+if not version_check < tag_creation:
+    raise SystemExit('bounded stable/RC version validation must precede tag creation')
+retry_parse = workflow.index('VERSION=$(python3 scripts/release_version.py validate-tag "$TAG")')
+retry_channel = workflow.index('case "$VERSION" in', retry_parse)
+retry_output = workflow.index('echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"', retry_channel)
+version_channel = workflow.index('case "$VERSION" in', version_check)
+version_output = workflow.index('echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"', version_channel)
+if not retry_parse < retry_channel < retry_output or not version_check < version_channel < version_output < tag_creation:
+    raise SystemExit('release channel must be derived from the validated stable/RC version')
+
+publish_script = Path('scripts/publish-release-assets.sh').read_text()
+for fragment in [
+    '"$SCRIPT_DIR/release_version.py" validate-tag "$tag"',
+    '[[ "$channel" == "$tag_channel" ]]',
+    'gh api "repos/$repo/releases/latest" --jq .tag_name',
+    '-F prerelease="$expected_prerelease"',
+    '-f make_latest="$make_latest"',
+]:
+    if fragment not in publish_script:
+        raise SystemExit(f'missing stable/RC publication contract: {fragment}')
+if 'gh release create' in publish_script:
+    raise SystemExit('release creation must use explicit channel and latest metadata')
+
+verify_script = Path('scripts/verify-published-release.sh').read_text()
+for fragment in [
+    '"$SCRIPT_DIR/release_version.py" validate-tag "$tag"',
+    '[[ "$channel" == "$tag_channel" ]]',
+    'gh api "repos/$repo/releases/latest" --jq .tag_name',
+    '--argjson prerelease "$expected_prerelease"',
+]:
+    if fragment not in verify_script:
+        raise SystemExit(f'missing stable/RC verification contract: {fragment}')
+
+tag_script = Path('scripts/tag-release.sh').read_text()
+for fragment in [
+    'git -C "$ROOT" ls-remote --refs --tags origin',
+    'python3 "$VERSION_HELPER" validate-new-from-tags "$VERSION"',
+    'python3 "$VERSION_HELPER" next-from-tags',
+]:
+    if fragment not in tag_script:
+        raise SystemExit(f'missing release-tag version contract: {fragment}')
+for forbidden in ['MINOR + 1', '^[0-9]+\\.[0-9]+\\.[0-9]+$']:
+    if forbidden in tag_script:
+        raise SystemExit(f'tag release script bypasses shared version contract: {forbidden}')
 
 package_script = Path('macos/Phoenix/scripts/package-desktop-release.sh').read_text()
 for fragment in [
@@ -84,10 +154,13 @@ for fragment in [
     '--verify --deep --strict --verbose=2',
     '--assess --type execute --verbose=2',
     '--sequesterRsrc --keepParent',
+    '"$version_helper" validate-tag "$tag"',
+    '"$version_helper" apple-marketing "$release_version"',
+    '"$version_helper" apple-build "$release_version"',
 ]:
     if fragment not in package_script:
         raise SystemExit(f'missing package verification contract: {fragment}')
-for forbidden in ['com.apple.security.app-sandbox', '--clobber']:
+for forbidden in ['com.apple.security.app-sandbox', '--clobber', 'def release_build_number']:
     if forbidden in package_script:
         raise SystemExit(f'forbidden package behavior: {forbidden}')
 

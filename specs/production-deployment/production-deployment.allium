@@ -95,7 +95,9 @@ variant BareLinuxHandoff : DeploymentHandoff {
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD after required checks and compilation,
 --   or release source is one resolved tag and commit with a host-target asset
---   matching its checksum and package version. In either case expected.git_sha
+--   matching its checksum and package version. A latest selection resolves to
+--   stable tag and metadata; an exact RC selection has matching tag, prerelease
+--   metadata, full embedded version, and commit. In either case expected.git_sha
 --   is exactly source_commit, both are 40 lowercase hexadecimal characters,
 --   and no prefix match establishes candidate identity.
 -- previous_rollback_identity_is_valid(transaction) -> Boolean

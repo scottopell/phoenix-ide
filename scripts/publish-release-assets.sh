@@ -3,20 +3,42 @@ set -euo pipefail
 
 GIT=${GIT:-git}
 PYTHON3=${PYTHON3:-python3}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-[[ $# -ge 4 ]] || {
-  echo "usage: publish-release-assets.sh REPO TAG EXPECTED_COMMIT ASSET..." >&2
+[[ $# -ge 5 ]] || {
+  echo "usage: publish-release-assets.sh REPO TAG EXPECTED_COMMIT CHANNEL ASSET..." >&2
   exit 2
 }
 repo=$1
 tag=$2
 expected_commit=$3
-shift 3
+channel=$4
+shift 4
 assets=("$@")
 [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || {
   echo "error: expected commit must be a full lowercase git SHA" >&2
   exit 2
 }
+release_version=$("$PYTHON3" "$SCRIPT_DIR/release_version.py" validate-tag "$tag") || exit 2
+case "$release_version" in
+  *-rc.*) tag_channel=rc ;;
+  *) tag_channel=stable ;;
+esac
+[[ "$channel" == stable || "$channel" == rc ]] || {
+  echo "error: release channel must be stable or rc" >&2
+  exit 2
+}
+[[ "$channel" == "$tag_channel" ]] || {
+  echo "error: release channel $channel does not match tag $tag" >&2
+  exit 2
+}
+if [[ "$channel" == rc ]]; then
+  expected_prerelease=true
+  make_latest=false
+else
+  expected_prerelease=false
+  make_latest=true
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -83,15 +105,15 @@ verify_tag() {
 
 published_release_metadata() {
   gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
-  jq -ce --arg tag "$tag" \
-    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease == true) then error("stable release tag is already a prerelease") else [$matching[] | select(.draft == false)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end end' \
+  jq -ce --arg tag "$tag" --argjson prerelease "$expected_prerelease" \
+    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease != $prerelease) then error("release publication channel does not match requested channel") else [$matching[] | select(.draft == false)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end end' \
     "$release_inventory"
 }
 
 draft_release_metadata() {
   gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$release_inventory" || return $?
-  jq -ce --arg tag "$tag" \
-    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease == true) then error("stable release tag is already a prerelease") else [$matching[] | select(.draft == true)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end end' \
+  jq -ce --arg tag "$tag" --argjson prerelease "$expected_prerelease" \
+    '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease != $prerelease) then error("release publication channel does not match requested channel") else [$matching[] | select(.draft == true)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple drafts for release tag") end end' \
     "$release_inventory"
 }
 
@@ -116,7 +138,7 @@ verify_release_assets() {
   local expected_draft=$1
   local metadata="$work/release-$expected_draft.json"
   current_release_metadata >"$metadata"
-  "$PYTHON3" - "$expected_digests" "$metadata" "$expected_draft" <<'PY'
+  "$PYTHON3" - "$expected_digests" "$metadata" "$expected_draft" "$expected_prerelease" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -129,6 +151,9 @@ release = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 expected_draft = sys.argv[3] == "true"
 if bool(release.get("draft")) != expected_draft:
     raise SystemExit("error: release visibility does not match the required state")
+expected_prerelease = sys.argv[4] == "true"
+if release.get("prerelease") is not expected_prerelease:
+    raise SystemExit("error: release publication channel does not match the required state")
 assets = release.get("assets", [])
 actual = {asset.get("name"): asset.get("digest") for asset in assets}
 if len(actual) != len(assets) or set(actual) != set(expected):
@@ -139,18 +164,39 @@ for name, digest in expected.items():
 PY
 }
 
+verify_latest_relationship() {
+  local latest_tag
+  latest_tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+  if [[ "$channel" == stable ]]; then
+    [[ "$latest_tag" == "$tag" ]] || {
+      echo "error: newly published stable release $tag is not the repository latest release" >&2
+      return 1
+    }
+  else
+    [[ "$latest_tag" != "$tag" ]] || {
+      echo "error: release candidate $tag replaced the repository latest stable release" >&2
+      return 1
+    }
+  fi
+}
+
+verify_public_rc_is_not_latest() {
+  [[ "$channel" != rc ]] || verify_latest_relationship
+}
+
 assert_private_release() {
   local metadata=$1
-  "$PYTHON3" - "$metadata" "$tag" <<'PY'
+  "$PYTHON3" - "$metadata" "$tag" "$expected_prerelease" <<'PY'
 import json
 import sys
 from pathlib import Path
 release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 tag = sys.argv[2]
+expected_prerelease = sys.argv[3] == "true"
 if not release.get("draft"):
     raise SystemExit("error: release became public before exact verification")
-if release.get("prerelease"):
-    raise SystemExit("error: stable release draft became a prerelease")
+if release.get("prerelease") is not expected_prerelease:
+    raise SystemExit("error: release draft channel changed before exact verification")
 if release.get("tag_name") != tag:
     raise SystemExit("error: release draft no longer targets the exact tag")
 PY
@@ -191,6 +237,7 @@ verify_tag
 if metadata=$(published_release_metadata); then
   verify_release_assets false
   verify_tag
+  verify_public_rc_is_not_latest
   echo "release $tag is already published with the exact asset set"
   exit 0
 else
@@ -211,7 +258,14 @@ else
 fi
 if [[ -z "$metadata" ]]; then
   verify_tag
-  gh release create "$tag" --repo "$repo" --verify-tag --draft --title "$tag" --generate-notes
+  gh api --method POST "repos/$repo/releases" \
+    -f tag_name="$tag" \
+    -f name="$tag" \
+    -f target_commitish="$expected_commit" \
+    -F draft=true \
+    -F prerelease="$expected_prerelease" \
+    -f make_latest="$make_latest" \
+    -F generate_release_notes=true >/dev/null
   metadata=$(draft_release_metadata)
 fi
 
@@ -241,6 +295,11 @@ done
 verify_tag
 release_metadata_by_id "$release_id" >"$metadata_file"
 verify_complete_private_release "$metadata_file"
-gh api --method PATCH "repos/$repo/releases/$release_id" -F draft=false >/dev/null
+assert_private_release "$metadata_file"
+gh api --method PATCH "repos/$repo/releases/$release_id" \
+  -F draft=false \
+  -F prerelease="$expected_prerelease" \
+  -f make_latest="$make_latest" >/dev/null
 verify_release_assets false
 verify_tag
+verify_latest_relationship

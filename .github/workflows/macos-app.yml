@@ -16,6 +16,8 @@ on:
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/release_version.py"
+      - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
@@ -33,6 +35,8 @@ on:
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
       - "scripts/publish-release-assets.sh"
+      - "scripts/release_version.py"
+      - "scripts/test_release_version.py"
       - "scripts/verify-published-release.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
@@ -57,6 +61,7 @@ jobs:
           scripts/test-publish-release-assets.sh
           scripts/test-verify-published-release.sh
           python3 scripts/test-desktop-release-workflow.py
+          python3 scripts/test_release_version.py
       - name: Build a real unsigned Release package
         run: |
           version=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')

@@ -439,7 +439,109 @@ class PreparationTests(unittest.TestCase):
                  mock.patch.object(platform, "machine", return_value=machine):
                 self.assertEqual(expected, self.dev._release_asset_name())
 
-    def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
+    def test_exact_rc_opt_in_validates_metadata_checksum_and_full_build_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"rc release")
+            digest = self.dev._file_sha256(asset)
+            (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
+            release_commit = "abc123def456" + "0" * 28
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v0.13.0-rc.2", "isPrerelease": True, "isDraft": False}), ""),
+                subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with mock.patch.object(
+                self.dev,
+                "_binary_identity",
+                return_value={"version": "0.13.0-rc.2", "git_sha": release_commit},
+            ) as identity:
+                candidate = self.dev._prepare_release_candidate("v0.13.0-rc.2", staging)
+
+        self.assertEqual("v0.13.0-rc.2", candidate.release_tag)
+        self.assertEqual("0.13.0-rc.2", candidate.identity.version)
+        self.assertEqual(release_commit, candidate.identity.git_sha)
+        self.assertEqual(release_commit, candidate.release_commit)
+        identity.assert_called_once_with(asset)
+        self.assertIn("v0.13.0-rc.2", run.call_args_list[2].args[0])
+
+    def test_exact_rc_rejects_build_identity_without_rc_suffix(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity") as identity, \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"rc release")
+            digest = self.dev._file_sha256(asset)
+            (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
+            release_commit = "abc123def456" + "0" * 28
+            identity.return_value = {"version": "0.13.0", "git_sha": release_commit}
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v0.13.0-rc.2", "isPrerelease": True, "isDraft": False}), ""),
+                subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "expected 0.13.0-rc.2"):
+                self.dev._prepare_release_candidate("v0.13.0-rc.2", staging)
+
+    def test_explicit_release_rejects_prerelease_metadata_mismatch(self):
+        cases = [
+            ("v1.2.3", True, "isPrerelease=false"),
+            ("v0.13.0-rc.2", False, "isPrerelease=true"),
+        ]
+        for tag, is_prerelease, message in cases:
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as td, \
+                 mock.patch.object(
+                     self.dev.subprocess,
+                     "run",
+                     return_value=subprocess.CompletedProcess(
+                         [],
+                         0,
+                         json.dumps({"tagName": tag, "isPrerelease": is_prerelease, "isDraft": False}),
+                         "",
+                     ),
+                 ) as run:
+                with self.assertRaisesRegex(SystemExit, message):
+                    self.dev._prepare_release_candidate(tag, Path(td))
+            run.assert_called_once()
+
+    def test_release_rejects_unsupported_explicit_tag_before_lookup(self):
+        invalid_tags = [
+            "1.2.3",
+            "v01.2.3",
+            "v1.2.3-beta.1",
+            "v0.13.0-rc.0",
+            "v0.12.9-rc.1",
+            "v1.100.0",
+        ]
+        with mock.patch.object(self.dev.subprocess, "run") as run:
+            for tag in invalid_tags:
+                with self.subTest(tag=tag), self.assertRaisesRegex(
+                    SystemExit, "unsupported release tag"
+                ):
+                    self.dev._prepare_release_candidate(tag, Path("unused"))
+        run.assert_not_called()
+
+    def test_latest_rejects_rc_release(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            self.dev.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps({"tagName": "v0.13.0-rc.2", "isPrerelease": True, "isDraft": False}),
+                "",
+            ),
+        ) as run:
+            with self.assertRaisesRegex(SystemExit, "latest must resolve to a stable"):
+                self.dev._prepare_release_candidate("latest", Path(td))
+        run.assert_called_once()
+
+    def test_latest_resolves_stable_once_then_downloads_immutable_tag_and_checks_checksum(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
              mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456" + "0" * 28}), \

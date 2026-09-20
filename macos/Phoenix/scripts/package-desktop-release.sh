@@ -24,22 +24,6 @@ EOF
   exit 2
 }
 
-release_build_number() {
-  local version=${1#v}
-  "$PYTHON3" - "$version" <<'PY'
-import re
-import sys
-version = sys.argv[1]
-match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
-if not match:
-    raise SystemExit(f"invalid semantic version: {version}")
-major, minor, patch = (int(match.group(i)) for i in range(1, 4))
-if major >= 9_999 or minor >= 100 or patch >= 100:
-    raise SystemExit("semantic version components exceed CFBundleVersion limits")
-print(f"{major + 1}.{minor}.{patch}")
-PY
-}
-
 info_plist_string() {
   local plist=$1
   local key=$2
@@ -70,18 +54,19 @@ expected_commit=$4
 output_dir=$(mkdir -p "$5" && cd "$5" && pwd)
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 project="$repo_root/macos/Phoenix/Phoenix.xcodeproj"
-release_version=${tag#v}
-release_build_number=$(release_build_number "$tag")
+version_helper="$repo_root/scripts/release_version.py"
+release_version=$("$PYTHON3" "$version_helper" validate-tag "$tag") || {
+  echo "error: unsupported release tag: $tag" >&2
+  exit 1
+}
+release_marketing_version=$("$PYTHON3" "$version_helper" apple-marketing "$release_version")
+release_build_number=$("$PYTHON3" "$version_helper" apple-build "$release_version")
 expected_arch=
 case "$target" in
   aarch64-apple-darwin) expected_arch=arm64 ;;
   x86_64-apple-darwin) expected_arch=x86_64 ;;
   *) echo "error: unsupported desktop target: $target" >&2; exit 1 ;;
 esac
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-  echo "error: release tag must be v-prefixed semantic version: $tag" >&2
-  exit 1
-}
 [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || {
   echo "error: expected commit must be a full lowercase git SHA" >&2
   exit 1
@@ -137,7 +122,7 @@ PHOENIX_EXPECTED_BUILD_IDENTITY="$expected_build_identity" \
     -derivedDataPath "$derived" \
     ARCHS="$expected_arch" \
     ONLY_ACTIVE_ARCH=YES \
-    MARKETING_VERSION="$release_version" \
+    MARKETING_VERSION="$release_marketing_version" \
     CURRENT_PROJECT_VERSION="$release_build_number" \
     CODE_SIGNING_ALLOWED=NO \
     build >&2
@@ -164,8 +149,8 @@ read -r embedded_version embedded_commit < <("$PYTHON3" -c 'import json,sys; d=j
   echo "error: sidecar Git identity does not match the release commit" >&2
   exit 1
 }
-[[ "$(info_plist_string "$info_plist" CFBundleShortVersionString)" == "$release_version" ]] || {
-  echo "error: built app marketing version does not match release $release_version" >&2
+[[ "$(info_plist_string "$info_plist" CFBundleShortVersionString)" == "$release_marketing_version" ]] || {
+  echo "error: built app marketing version does not match release $release_marketing_version" >&2
   exit 1
 }
 [[ "$(info_plist_string "$info_plist" CFBundleVersion)" == "$release_build_number" ]] || {

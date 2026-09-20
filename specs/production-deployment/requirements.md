@@ -14,6 +14,12 @@ When an operator invokes a production command, the system shall select launchd o
 
 The local deployment command shall run required checks, build exact local `HEAD`, require the candidate to embed that complete 40-character lowercase commit SHA, and stage the resulting binary. The release deployment command shall resolve `latest` at most once or use the requested tag, bind the tag to one immutable commit, select the host target asset, verify the published checksum, and require the candidate's complete 40-character lowercase embedded SHA to equal the selected commit exactly; it shall not run repository checks, install dependencies, mutate the worktree, or compile.
 
+WHEN `latest` is requested,
+THE release deployment command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
+
+WHEN an exact release-candidate tag is requested,
+THE release deployment command SHALL require the tag, GitHub prerelease metadata, full embedded version, and exact commit identity to agree.
+
 ### REQ-PD-003 — Complete preparation before disruption
 
 Before disrupting a running runtime, the system shall stage and validate the candidate, backend configuration, exact `.phoenix-ide.env` snapshot, rollback inputs, runtime identities and endpoints, destination-space reservations, artifact hashes, backend activation program, immutable handoff, and initial durable transaction status.

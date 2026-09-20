@@ -8,11 +8,11 @@ on:
     branches: [main]
     paths:
       - 'crates/phoenix-ide/Cargo.toml'
-  # Manual retry is bound to an existing immutable stable tag.
+  # Manual retry is bound to an existing immutable release tag.
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing stable release tag to retry (for example v1.2.3)
+        description: Existing release tag to retry (for example v1.2.3 or v1.2.3-rc.1)
         required: true
         type: string
 
@@ -28,6 +28,7 @@ jobs:
     outputs:
       release: ${{ steps.ver.outputs.release }}
       tag: ${{ steps.ver.outputs.tag }}
+      channel: ${{ steps.ver.outputs.channel }}
       commit: ${{ steps.ver.outputs.commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -39,27 +40,21 @@ jobs:
         env:
           RETRY_TAG: ${{ inputs.tag }}
         run: |
-          validate_bundle_version() {
-            python3 - "$1" <<'PY'
-          import sys
-          major, minor, patch = map(int, sys.argv[1].split("."))
-          if major >= 9_999 or minor >= 100 or patch >= 100:
-              raise SystemExit("release version exceeds CFBundleVersion component limits")
-          PY
-          }
           if [[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]]; then
             TAG=$RETRY_TAG
-            printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
-              echo "Manual retry requires an existing stable vX.Y.Z tag: $TAG" >&2
+            VERSION=$(python3 scripts/release_version.py validate-tag "$TAG") || {
+              echo "Manual retry requires a supported existing release tag: $TAG" >&2
               exit 1
             }
+            case "$VERSION" in
+              *-rc.*) CHANNEL=rc ;;
+              *) CHANNEL=stable ;;
+            esac
             git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
               echo "Manual dispatch cannot create missing tag $TAG" >&2
               exit 1
             }
             TAG_COMMIT=$(git rev-list -n 1 "$TAG")
-            VERSION=${TAG#v}
-            validate_bundle_version "$VERSION"
             git merge-base --is-ancestor "$TAG_COMMIT" origin/main || {
               echo "Tagged commit $TAG_COMMIT is not on main" >&2
               exit 1
@@ -67,20 +62,25 @@ jobs:
             echo "Retrying $TAG from its immutable main commit $TAG_COMMIT."
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+            echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           VERSION=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           [ -n "$VERSION" ] || { echo "Could not read version from crates/phoenix-ide/Cargo.toml"; exit 1; }
-          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
-            echo "Release version must be a stable X.Y.Z version before a tag may be created: $VERSION"
+          VERSION=$(python3 scripts/release_version.py validate "$VERSION") || {
+            echo "Release version must be a supported X.Y.Z or X.Y.Z-rc.N version before a tag may be created: $VERSION"
             exit 1
           }
-          validate_bundle_version "$VERSION"
+          case "$VERSION" in
+            *-rc.*) CHANNEL=rc ;;
+            *) CHANNEL=stable ;;
+          esac
           TAG="v$VERSION"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             TAG_COMMIT=$(git rev-list -n 1 "$TAG")
             if [ "$TAG_COMMIT" = "$GITHUB_SHA" ]; then
@@ -91,6 +91,10 @@ jobs:
               echo "release=false" >> "$GITHUB_OUTPUT"
             fi
           else
+            git tag --list 'v*' | python3 scripts/release_version.py validate-new-from-tags "$VERSION" >/dev/null || {
+              echo "Release version $VERSION must be newer than every supported release tag." >&2
+              exit 1
+            }
             echo "Tagging $(git rev-parse --short HEAD) as $TAG"
             # Annotated tags need a committer identity; the runner has none.
             git config user.name  "github-actions[bot]"
@@ -284,7 +288,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.gate.outputs.commit }}
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: '*-release-assets'
@@ -318,4 +322,5 @@ jobs:
             scottopell/phoenix-ide \
             "${{ needs.gate.outputs.tag }}" \
             "${{ needs.gate.outputs.commit }}" \
+            "${{ needs.gate.outputs.channel }}" \
             "${assets[@]}"

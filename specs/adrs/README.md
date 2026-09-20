@@ -76,6 +76,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
 | [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
 | [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
+| [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
 
 ## For agents: which decisions bind your task
 
@@ -117,6 +118,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-063 (non-binding), then 034, 018, and 017 |
 | Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
+| Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
@@ -151,6 +153,7 @@ ADR-000 (adopt spEARS v2 for new work)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
       │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
+      │   │           └── ADR-065 (Release candidates share the stable artifact path)
       │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)

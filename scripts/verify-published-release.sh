@@ -1,22 +1,44 @@
 #!/bin/bash
 set -euo pipefail
 
-[[ $# -ge 3 ]] || {
-  echo "usage: verify-published-release.sh REPO TAG ASSET_NAME..." >&2
+PYTHON3=${PYTHON3:-python3}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+[[ $# -ge 4 ]] || {
+  echo "usage: verify-published-release.sh REPO TAG CHANNEL ASSET_NAME..." >&2
   exit 2
 }
 repo=$1
 tag=$2
-shift 2
+channel=$3
+shift 3
 required=("$@")
+release_version=$("$PYTHON3" "$SCRIPT_DIR/release_version.py" validate-tag "$tag") || exit 2
+case "$release_version" in
+  *-rc.*) tag_channel=rc ;;
+  *) tag_channel=stable ;;
+esac
+[[ "$channel" == stable || "$channel" == rc ]] || {
+  echo "error: release channel must be stable or rc" >&2
+  exit 2
+}
+[[ "$channel" == "$tag_channel" ]] || {
+  echo "error: release channel $channel does not match tag $tag" >&2
+  exit 2
+}
+if [[ "$channel" == rc ]]; then
+  expected_prerelease=true
+else
+  expected_prerelease=false
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 metadata="$work/release.json"
 releases="$work/releases.json"
 gh api --paginate --slurp "repos/$repo/releases?per_page=100" >"$releases"
-if jq -ce --arg tag "$tag" \
-  '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease == true) then error("stable release tag is a prerelease") else [$matching[] | select(.draft == false)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end end' \
+if jq -ce --arg tag "$tag" --argjson prerelease "$expected_prerelease" \
+  '[.[][] | select(.tag_name == $tag)] as $matching | if any($matching[]; .prerelease != $prerelease) then error("release publication channel does not match requested channel") else [$matching[] | select(.draft == false)] | if length == 1 then .[0] elif length == 0 then empty else error("multiple public releases for tag") end end' \
   "$releases" >"$metadata"
 then
   :
@@ -30,6 +52,14 @@ else
 fi
 
 printf '%s\n' "${required[@]}" SHA256SUMS | sort >"$work/expected-names"
+if [[ "$channel" == rc ]]; then
+  latest_tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+  [[ "$latest_tag" != "$tag" ]] || {
+    echo "error: release candidate $tag replaced the repository latest stable release" >&2
+    exit 1
+  }
+fi
+
 jq -r '.assets[].name' "$metadata" | sort >"$work/actual-names"
 cmp -s "$work/expected-names" "$work/actual-names" || {
   echo "error: public release $tag has an unexpected asset set" >&2
@@ -46,7 +76,7 @@ while IFS=$'\t' read -r asset_id asset_name; do
   gh api "repos/$repo/releases/assets/$asset_id" \
     -H 'Accept: application/octet-stream' >"$work/assets/$asset_name"
 done < <(jq -r '.assets[] | [.id, .name] | @tsv' "$metadata")
-python3 - "$work/assets" "$work/manifest-names" <<'PY'
+"$PYTHON3" - "$work/assets" "$work/manifest-names" <<'PY'
 import hashlib
 import re
 import sys
@@ -74,7 +104,7 @@ cmp -s "$work/expected-manifest-names" "$work/manifest-names" || {
   exit 1
 }
 
-python3 - "$metadata" "$work/assets" <<'PY'
+"$PYTHON3" - "$metadata" "$work/assets" <<'PY'
 import hashlib
 import json
 import sys
