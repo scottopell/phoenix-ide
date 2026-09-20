@@ -1583,7 +1583,7 @@ impl BrowserSessionManager {
         manager
     }
 
-    /// Promote a restricted actor's existing session to the shared WorkScope key.
+    /// Promote a restricted actor's existing session to the shared `WorkScope` key.
     ///
     /// Returns `true` when a live entry moved. If the destination is already
     /// occupied, the restricted entry is left unchanged.
@@ -1614,6 +1614,29 @@ impl BrowserSessionManager {
             return false;
         };
         entry.authority = ResourceAuthority::Work;
+        state.sessions.insert(new_key, entry);
+        true
+    }
+
+    /// Revert a prior actor-to-WorkScope promotion when the caller cannot
+    /// complete the authority transition.
+    pub async fn demote_work_scope_to_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor_conversation_id: &str,
+    ) -> bool {
+        let restricted =
+            EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let old_key = work_scope.stable_key();
+        let new_key = session_key(work_scope, &restricted);
+        let mut state = self.state.write().await;
+        if state.sessions.contains_key(&new_key) {
+            return false;
+        }
+        let Some(mut entry) = state.sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.authority = ResourceAuthority::Restricted;
         state.sessions.insert(new_key, entry);
         true
     }

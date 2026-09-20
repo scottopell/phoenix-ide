@@ -5048,11 +5048,11 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority =
+        let authority_resolution =
             crate::resource_authority::resolve_resource_authority(self.db(), &conv)
                 .await
-                .map_err(|error| format!("Failed to load resource authority: {error}"))?
-                .authority;
+                .map_err(|error| format!("Failed to load resource authority: {error}"))?;
+        context.resource_authority = authority_resolution.authority;
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
         context.service_tier = self
@@ -5071,7 +5071,19 @@ impl RuntimeManager {
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
+        context.work_scope_worktree =
+            if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. }) {
+                conv_cwd
+                    .as_ref()
+                    .map(crate::conversation_cwd::ValidConversationCwd::path_buf)
+            } else {
+                conv.conv_mode.worktree_path().map(PathBuf::from)
+            };
+        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. })
+            && context.work_scope_worktree.is_none()
+        {
+            return Err("Attached Work child is missing its persisted worktree path".to_string());
+        }
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on

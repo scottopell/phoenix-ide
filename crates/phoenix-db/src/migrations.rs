@@ -10461,7 +10461,10 @@ JOIN messages m ON m.conversation_id = c.id
 WHERE c.state_kind = 'llm_requesting'
   AND m.message_type = 'user'
   AND json_extract(m.content, '$.is_meta') = 1
-  AND json_extract(m.content, '$.text') LIKE 'Task approved%'
+  AND (
+      json_extract(m.content, '$.text') LIKE 'Task approved%'
+      OR json_extract(m.content, '$.text') LIKE 'Follow-up task approved%'
+  )
   AND m.sequence_id = (
       SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
   );
@@ -10860,14 +10863,21 @@ mod tests {
              CREATE UNIQUE INDEX messages_conversation_message_id_unique
                  ON messages(conversation_id, message_id);
              INSERT INTO conversations (id) VALUES ('a'), ('b');
-             INSERT INTO conversations (id, state_kind) VALUES ('legacy', 'llm_requesting');
+             INSERT INTO conversations (id, state_kind)
+             VALUES ('legacy', 'llm_requesting'), ('follow-up', 'llm_requesting');
              INSERT INTO messages (message_id, conversation_id) VALUES ('approval', 'b');
              INSERT INTO messages
                  (message_id, conversation_id, message_type, sequence_id, content, created_at)
              VALUES
                  ('legacy-approval', 'legacy', 'user', 7,
                   '{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}',
-                  '2025-01-01T00:00:00Z');",
+                  '2025-01-01T00:00:00Z');
+             INSERT INTO messages
+                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
+             VALUES
+                 ('follow-up-approval', 'follow-up', 'user', 8,
+                  '{\"text\":\"Follow-up task approved. Continue.\",\"is_meta\":true}',
+                  '2025-01-01T00:00:01Z');",
         )
         .execute(&pool)
         .await
@@ -10885,6 +10895,20 @@ mod tests {
             legacy_obligation,
             ("legacy".to_string(), "legacy-approval".to_string())
         );
+        sqlx::query("DELETE FROM approval_request_obligations WHERE conversation_id = 'legacy'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM approval_request_obligations
+                 WHERE conversation_id = 'follow-up'
+                   AND approval_message_id = 'follow-up-approval'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap());
 
         assert!(sqlx::query(
             "INSERT INTO approval_request_obligations
