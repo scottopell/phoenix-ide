@@ -346,7 +346,7 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.startAggregateReconciliation()
+            self?.restartAggregateEventStreamAfterConnectivityRestore()
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
@@ -490,6 +490,13 @@ final class AppModel {
             withIdentifiers: ["attention-\(notificationId)"])
         UNUserNotificationCenter.current().removePendingNotificationRequests(
             withIdentifiers: ["attention-\(notificationId)"])
+    }
+
+    private func restartAggregateEventStreamAfterConnectivityRestore() {
+        aggregateEventTask?.cancel()
+        aggregateEventTask = nil
+        aggregateEventTaskId = nil
+        startAggregateReconciliation()
     }
 
     private func startAggregateEventStream(api: PhoenixAPI, generation: Int) {
@@ -1378,7 +1385,10 @@ final class AppModel {
                 + cachedIds
                 + [conversation.transcriptRowIdentity])
         do {
-            let rootTranscriptRowId = conversation.chain_root_id ?? conversation.transcriptRowIdentity
+            let rootTranscriptRowId = try await Self.resolveProductHistoryRoot(
+                conversation: conversation,
+                fetch: { try await api.getProductConversation(reference: $0) })
+            guard apiGeneration == startedGeneration else { return false }
             try await api.deleteProductConversation(rootTranscriptRowId: rootTranscriptRowId)
             guard apiGeneration == startedGeneration else { return false }
             return await removeProductHistoryLocally(
@@ -1395,6 +1405,14 @@ final class AppModel {
             lastActionError = error.localizedDescription
             return false
         }
+    }
+
+    nonisolated static func resolveProductHistoryRoot(
+        conversation: Conversation,
+        fetch: (String) async throws -> ProductConversationSnapshot
+    ) async throws -> String {
+        if let root = conversation.chain_root_id { return root }
+        return try await fetch(conversation.transcriptRowIdentity).canonical_root.transcript_row_id
     }
 
     private func removeProductHistoryLocally(
@@ -1519,6 +1537,11 @@ final class AppModel {
 
     var aggregateEventStreamOwnedForTesting: Bool {
         aggregateEventTask != nil
+    }
+
+    func startAggregateEventStreamForTesting() {
+        guard let api else { return }
+        startAggregateEventStream(api: api, generation: apiGeneration)
     }
 
     func fenceProductCloseForTesting(

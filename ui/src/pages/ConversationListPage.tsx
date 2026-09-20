@@ -144,7 +144,10 @@ export function ConversationListPage() {
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
-  const finishProductDelete = () => {
+  const finishProductDelete = (deletedProductConversationId: string) => {
+    setProductConversations((rows) => rows.filter(
+      (row) => row.product_conversation_id !== deletedProductConversationId,
+    ));
     setProductDeleteTarget(null);
     setProductDeleteError(undefined);
     notifyProductConversationListMayHaveChanged();
@@ -153,13 +156,14 @@ export function ConversationListPage() {
   const handleProductDelete = async () => {
     if (!productDeleteTarget || productDeleteSubmitting) return;
     setProductDeleteSubmitting(true);
+    const deletingProductConversationId = productDeleteTarget.product_conversation_id;
     try {
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
       await api.deleteChain(rootId);
-      finishProductDelete();
+      finishProductDelete(deletingProductConversationId);
     } catch (error) {
       if (error instanceof ApiResponseError && error.status === 404) {
-        finishProductDelete();
+        finishProductDelete(deletingProductConversationId);
       } else {
         setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
       }

@@ -157,6 +157,26 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
   });
 
+  it('removes deleted History locally when the invalidation refresh fails', async () => {
+    const history = {
+      ...productConversation(),
+      lifecycle: { state: 'history' as const },
+      latest_transcript_row_id: 'successor-mobile',
+    };
+    vi.mocked(api.listProductConversations)
+      .mockResolvedValueOnce({ product_conversations: [history] })
+      .mockRejectedValueOnce(new Error('refresh failed'));
+    vi.mocked(api.deleteChain).mockResolvedValue(undefined);
+    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
+
+    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(screen.getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
+    await waitFor(() => expect(screen.queryByText('Mobile Product')).toBeNull());
+  });
+
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {
     vi.mocked(api.closeProductConversation).mockResolvedValue(undefined);
     vi.mocked(api.listProductConversations).mockResolvedValue({

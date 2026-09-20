@@ -15,11 +15,13 @@ final class AppModelProductConversationTests: XCTestCase {
         state: JSONValue? = nil,
         updatedAt: String? = nil,
         runtimeRole: String? = nil,
-        closeAction: ProductConversationCloseAction? = nil
+        closeAction: ProductConversationCloseAction? = nil,
+        chainRootId: String? = nil
     ) -> Conversation {
         Conversation(
             id: id,
             product_conversation_id: aggregateId,
+            chain_root_id: chainRootId,
             slug: slug,
             title: title,
             model: nil,
@@ -219,6 +221,19 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertGreaterThan(model.apiGenerationForTesting, inheritedGeneration)
         XCTAssertFalse(model.aggregateEventStreamOwnedForTesting)
         XCTAssertNil(model.aggregateReconciliationId)
+    }
+
+    func testConnectivityRestoreReleasesOfflineStreamBeforeReconciliation() {
+        let model = AppModel()
+        model.installAPIForTesting()
+        model.connectivity.setOnlineForTesting(false)
+        model.startAggregateEventStreamForTesting()
+        XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
+
+        model.connectivity.setOnlineForTesting(true)
+
+        XCTAssertFalse(model.aggregateEventStreamOwnedForTesting)
+        XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
     func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() {
@@ -1023,6 +1038,38 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertFalse(tracker.isCurrent(productA, productConversationId: "product-a"))
         XCTAssertTrue(tracker.isCurrent(productB, productConversationId: "product-b"))
+    }
+
+    func testLegacyCachedHistoryResolvesCanonicalRootBeforeDelete() async throws {
+        let legacy = conversation(id: "latest", aggregateId: "product", archived: true)
+        var fetchedReferences: [String] = []
+
+        let root = try await AppModel.resolveProductHistoryRoot(
+            conversation: legacy,
+            fetch: { reference in
+                fetchedReferences.append(reference)
+                return self.historySnapshot(aggregateId: "product", segments: [])
+            })
+
+        XCTAssertEqual(root, "root")
+        XCTAssertEqual(fetchedReferences, ["latest"])
+    }
+
+    func testPersistedHistoryRootSkipsCanonicalLookupBeforeDelete() async throws {
+        let migrated = conversation(
+            id: "latest",
+            aggregateId: "product",
+            archived: true,
+            chainRootId: "persisted-root")
+
+        let root = try await AppModel.resolveProductHistoryRoot(
+            conversation: migrated,
+            fetch: { _ in
+                XCTFail("A persisted canonical root must not be looked up again")
+                throw APIError.invalidURL
+            })
+
+        XCTAssertEqual(root, "persisted-root")
     }
 
     func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {
