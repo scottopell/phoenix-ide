@@ -11,12 +11,12 @@ const add = vi.fn();
 const close = vi.fn();
 const navigate = vi.fn<(source: ReactionSource, signal: AbortSignal) => boolean | Promise<boolean>>(() => true);
 let offscreen = false;
-function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void }) {
+function Fixture({ mounted = true, body = 'Keep this guarantee', touchDocked = false, captureSource, composerKey = 'composer', composerTop }: { mounted?: boolean; body?: string; touchDocked?: boolean; captureSource?: () => void; composerKey?: string; composerTop?: number }) {
   return <FocusScopeProvider>
     <div id="messages">
       {mounted && <div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div>}
     </div>
-    <footer id="input-area" />
+    <footer key={composerKey} id="input-area" {...(composerTop === undefined ? {} : { 'data-composer-top': composerTop })} />
     <ReactionPill source={source} touchDocked={touchDocked} {...(captureSource ? { captureSource } : {})} bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body={body} available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
   </FocusScopeProvider>;
 }
@@ -201,6 +201,32 @@ describe('reaction pill', () => {
     act(() => listeners.get('resize')?.(new Event('resize')));
     await waitFor(() => expect(dock).toHaveStyle({ top: '274px' }));
     expect(screen.getByRole('textbox')).toHaveFocus();
+  });
+
+  it('re-resolves composer geometry after the composer remounts', async () => {
+    const listeners = new Map<string, EventListener>();
+    const viewport = {
+      offsetLeft: 0, offsetTop: 0, width: 390, height: 700,
+      addEventListener: vi.fn((type: string, listener: EventListener) => listeners.set(type, listener)),
+      removeEventListener: vi.fn(),
+    };
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, Number(this.dataset['composerTop']), 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const view = render(<Fixture touchDocked body="Retained" composerKey="ordinary" composerTop={620} />);
+    const dock = screen.getByRole('region', { name: 'Docked reaction' });
+    const input = screen.getByRole('textbox');
+    expect(dock).toHaveStyle({ top: '554px' });
+    expect(input).not.toHaveFocus();
+    const originalComposer = document.getElementById('input-area')!;
+    view.rerender(<Fixture touchDocked body="Retained" composerKey="resumed" composerTop={500} />);
+    expect(document.getElementById('input-area')).not.toBe(originalComposer);
+    act(() => listeners.get('resize')?.(new Event('resize')));
+    await waitFor(() => expect(dock).toHaveStyle({ top: '434px' }));
+    expect(input).not.toHaveFocus();
   });
 
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {

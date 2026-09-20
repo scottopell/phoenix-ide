@@ -54,12 +54,18 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   useLayoutEffect(() => {
     const el = bubbleRef.current;
     const scroller = document.getElementById('messages');
-    const composer = document.getElementById('input-area');
     if (!el || !scroller) return;
     let frame = 0;
+    let observedComposer: Element | null = null;
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
+      const composer = document.getElementById('input-area');
+      if (composer !== observedComposer) {
+        if (observedComposer) resize.unobserve(observedComposer);
+        observedComposer = composer;
+        if (observedComposer) resize.observe(observedComposer);
+      }
       const styles = getComputedStyle(document.documentElement);
       const safeTop = Number.parseFloat(styles.getPropertyValue('--safe-area-top')) || 0;
       const safeRight = Number.parseFloat(styles.getPropertyValue('--safe-area-right')) || 0;
@@ -102,15 +108,15 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
     if (touchDocked) scroller.classList.add('reaction-dock-reserved');
-    position();
     const mutations = new MutationObserver(schedule);
-    mutations.observe(scroller, { childList: true, subtree: true });
+    const layoutOwner = scroller.closest('.conversation-column') ?? document.body;
+    mutations.observe(layoutOwner, { childList: true, subtree: true });
     const resize = new ResizeObserver(schedule);
+    position();
     resize.observe(scroller);
     resize.observe(el);
     const sourceOwner = restoreReactionRange(source)?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
     if (sourceOwner) resize.observe(sourceOwner);
-    if (composer) resize.observe(composer);
     window.addEventListener('scroll', schedule, true);
     window.addEventListener('resize', schedule);
     window.visualViewport?.addEventListener('resize', schedule);
