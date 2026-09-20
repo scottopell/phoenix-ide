@@ -186,6 +186,16 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(evidence)
     }
 
+    func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() {
+        let model = AppModel()
+        model.cancelAggregateReconciliationForTesting()
+        XCTAssertNil(model.aggregateReconciliationId)
+
+        model.rebuildAPIForTesting()
+
+        XCTAssertNotNil(model.aggregateReconciliationId)
+    }
+
     func testAggregateReconciliationRetriesTransientFailureAndApplyLoss() async {
         var attempts = 0
         var waits = 0

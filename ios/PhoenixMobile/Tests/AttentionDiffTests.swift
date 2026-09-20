@@ -245,7 +245,7 @@ final class AttentionDiffTests: XCTestCase {
     func testOrdinaryEvidenceCommitsBeforeOptionalCoordinatorEvidence() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
-        let monitor = AttentionMonitor()
+        let monitor = AttentionMonitor(submitNotifications: { _, _ in true })
         monitor.seed(with: [
             conv("ordinary", aggregateId: "pc-ordinary", mode: "working"),
             conv("coordinator", aggregateId: "pc-coordinator", mode: "working"),
@@ -260,6 +260,38 @@ final class AttentionDiffTests: XCTestCase {
             "pc-ordinary": entry("idle"),
             "pc-coordinator": entry("working"),
         ])
+    }
+
+    @MainActor
+    func testCancelledNotificationSubmissionKeepsTransitionRetryable() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        var submissions = 0
+        var firstAttempt = true
+        let monitor = AttentionMonitor(submitNotifications: { events, _ in
+            submissions += 1
+            XCTAssertEqual(events.count, 1)
+            if firstAttempt {
+                firstAttempt = false
+                return false
+            }
+            return true
+        })
+        monitor.seed(with: [conv("c1", mode: "working")])
+        let finished = [conv("c1", mode: "idle")]
+
+        await monitor.refreshAndNotifyIfNeeded(
+            from: finished,
+            transcriptToAggregate: [:],
+            isCurrent: { true })
+        XCTAssertEqual(monitor.snapshot, ["c1": entry("working")])
+
+        await monitor.refreshAndNotifyIfNeeded(
+            from: finished,
+            transcriptToAggregate: [:],
+            isCurrent: { true })
+        XCTAssertEqual(submissions, 2)
+        XCTAssertEqual(monitor.snapshot, ["c1": entry("idle")])
     }
 
     @MainActor

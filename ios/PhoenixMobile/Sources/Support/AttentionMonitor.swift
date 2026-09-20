@@ -39,8 +39,14 @@ final class AttentionMonitor {
 
     private(set) var snapshot: [String: Entry]
     private var quarantinedLegacyTranscriptSnapshot: [String: Entry]
+    private let submitNotifications: ([Event], @escaping @MainActor () -> Bool) async -> Bool
 
-    init(currentConversations: [Conversation] = [], transcriptToAggregate: [String: String] = [:]) {
+    init(
+        currentConversations: [Conversation] = [],
+        transcriptToAggregate: [String: String] = [:],
+        submitNotifications: (([Event], @escaping @MainActor () -> Bool) async -> Bool)? = nil
+    ) {
+        self.submitNotifications = submitNotifications ?? Self.submitNotificationsToSystem
         if let current = DiskStore.loadVersioned(
             Store.self, name: Self.storeName, version: Self.schemaVersion)
         {
@@ -214,16 +220,22 @@ final class AttentionMonitor {
     ) async {
         let events = Self.diff(previous: snapshot, current: conversations)
         guard isCurrent() else { return }
+        if !events.isEmpty {
+            guard await submitNotifications(events, isCurrent), isCurrent() else { return }
+        }
         snapshot = current
         persist()
-        guard isCurrent() else { return }
+    }
 
+    private static func submitNotificationsToSystem(
+        _ events: [Event],
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async -> Bool {
         let center = UNUserNotificationCenter.current()
         for event in events {
-            guard isCurrent() else { return }
+            guard isCurrent() else { return false }
             let settings = await center.notificationSettings()
-            guard isCurrent() else { return }
-            guard settings.authorizationStatus == .authorized else { return }
+            guard isCurrent(), settings.authorizationStatus == .authorized else { return false }
             let content = UNMutableNotificationContent()
             switch event {
             case .needsAction(_, _, let title):
@@ -242,13 +254,18 @@ final class AttentionMonitor {
                 identifier: "attention-\(event.aggregateId)",
                 content: content,
                 trigger: nil)
-            try? await center.add(request)
+            do {
+                try await center.add(request)
+            } catch {
+                return false
+            }
             guard isCurrent() else {
                 center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
                 center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
-                return
+                return false
             }
         }
+        return true
     }
 
     func reset() {
