@@ -13,6 +13,31 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+#[derive(Debug)]
+pub enum CoordinatorSvgSourceError {
+    Authority,
+    Persistence,
+    Read,
+}
+
+#[async_trait]
+pub trait CoordinatorSvgSourceResolver: Send + Sync {
+    async fn resolve_active_work_scope_root(
+        &self,
+        work_scope_id: &str,
+    ) -> Result<PathBuf, CoordinatorSvgSourceError>;
+}
+
+pub struct CoordinatorPresentSvgTool {
+    resolver: Arc<dyn CoordinatorSvgSourceResolver>,
+}
+
+impl CoordinatorPresentSvgTool {
+    pub fn new(resolver: Arc<dyn CoordinatorSvgSourceResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
 pub struct SvgArtifactDraft {
     pub metadata: SvgPresentationMetadata,
     pub svg: validation::ValidatedSvg,
@@ -206,20 +231,11 @@ fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileRe
 }
 
 #[cfg(not(unix))]
-fn read_regular_file_beneath(root: &Path, path: &Path) -> Result<Vec<u8>, FileReadError> {
-    let canonical = path.canonicalize().map_err(|_| {
-        (
-            "read_failure",
-            "Cannot resolve source beneath the selected WorkScope root.",
-        )
-    })?;
-    if !canonical.starts_with(root) {
-        return Err((
-            "policy_rejection",
-            "Source must be contained by the selected active WorkScope root.",
-        ));
-    }
-    read_regular_file(&canonical)
+fn read_regular_file_beneath(_root: &Path, _path: &Path) -> Result<Vec<u8>, FileReadError> {
+    Err((
+        "policy_rejection",
+        "Contained no-follow Coordinator publication is unsupported on this platform.",
+    ))
 }
 
 enum PublicationSource {
@@ -230,7 +246,7 @@ enum PublicationSource {
 impl PresentSvgTool {
     /// Publish from one server-resolved active `WorkScope` without making the
     /// Coordinator's otherwise filesystem-free tool context ambiently writable.
-    pub async fn run_for_coordinator_work_scope(
+    async fn run_for_coordinator_work_scope(
         &self,
         input: Value,
         ctx: ToolContext,
@@ -252,6 +268,21 @@ impl PresentSvgTool {
             PublicationSource::CoordinatorWorkScope(canonical_work_scope_root),
         )
         .await
+    }
+
+    async fn lookup_existing(&self, ctx: &ToolContext) -> Option<ToolOutput> {
+        let store = ctx.svg_artifact_store.as_ref()?;
+        let assistant_message_id = ctx.svg_assistant_message_id.as_ref()?;
+        let tool_use_id = ctx.tool_use_id()?;
+        let invocation = SvgInvocationId::new(assistant_message_id, tool_use_id);
+        match store.lookup(&ctx.conversation_id, &invocation).await {
+            Ok(Some(reference)) => Some(reference_output(&reference)),
+            Ok(None) => None,
+            Err(_) => Some(failure(
+                "persistence_failure",
+                "Could not check durable publication identity; retry later.",
+            )),
+        }
     }
 
     async fn publish(
@@ -344,6 +375,81 @@ impl PresentSvgTool {
                 "Could not commit SVG snapshot and ownership; retry later.",
             ),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for CoordinatorPresentSvgTool {
+    fn name(&self) -> &'static str {
+        "present_svg"
+    }
+
+    fn description(&self) -> String {
+        "Publish a static SVG staged inside one active WorkScope as a durable inline visual owned by this Global Coordinator transcript. First generate the file through Coordinator bash using that WorkScope's explicit work_scope_id, then call present_svg with the same work_scope_id and resolved absolute SERVER filename. The server re-resolves the active WorkScope and permits only a contained regular file without symlinks. Keep staging until success; the tool does not remove it. Validation enforces the existing bounded static SVG policy and is not visual inspection. Success returns a compact reference, never SVG bytes."
+            .to_string()
+    }
+
+    fn input_schema(&self) -> Value {
+        let mut schema = PresentSvgTool.input_schema();
+        schema["properties"]["work_scope_id"] = json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Authoritative active WorkScope used to stage the SVG through Coordinator bash. Phoenix re-resolves its canonical root server-side."
+        });
+        schema["required"] = json!(["work_scope_id", "path", "title", "description"]);
+        schema
+    }
+
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let Some(object) = input.as_object_mut() else {
+            return failure(
+                "invalid_input",
+                "Provide work_scope_id, path, title, and description as strings.",
+            );
+        };
+        let Some(work_scope_id) = object
+            .remove("work_scope_id")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return failure(
+                "invalid_input",
+                "work_scope_id must name one active WorkScope.",
+            );
+        };
+
+        if let Some(reference) = PresentSvgTool.lookup_existing(&ctx).await {
+            return reference;
+        }
+
+        let root = match self
+            .resolver
+            .resolve_active_work_scope_root(&work_scope_id)
+            .await
+        {
+            Ok(root) => root,
+            Err(CoordinatorSvgSourceError::Authority) => {
+                return failure(
+                    "policy_rejection",
+                    "Active persisted WorkScope with a live owner not found.",
+                )
+            }
+            Err(CoordinatorSvgSourceError::Persistence) => {
+                return failure(
+                    "persistence_failure",
+                    "Could not resolve the selected WorkScope; retry later.",
+                )
+            }
+            Err(CoordinatorSvgSourceError::Read) => {
+                return failure(
+                    "read_failure",
+                    "Selected WorkScope root is unavailable or invalid.",
+                )
+            }
+        };
+        PresentSvgTool
+            .run_for_coordinator_work_scope(input, ctx, root)
+            .await
     }
 }
 
@@ -454,6 +560,33 @@ mod tests {
     }
     const SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='80' height='20'/></svg>";
 
+    struct Resolver(Mutex<Result<PathBuf, CoordinatorSvgSourceError>>);
+
+    #[async_trait]
+    impl CoordinatorSvgSourceResolver for Resolver {
+        async fn resolve_active_work_scope_root(
+            &self,
+            _work_scope_id: &str,
+        ) -> Result<PathBuf, CoordinatorSvgSourceError> {
+            match &*self.0.lock().unwrap() {
+                Ok(path) => Ok(path.clone()),
+                Err(CoordinatorSvgSourceError::Authority) => {
+                    Err(CoordinatorSvgSourceError::Authority)
+                }
+                Err(CoordinatorSvgSourceError::Persistence) => {
+                    Err(CoordinatorSvgSourceError::Persistence)
+                }
+                Err(CoordinatorSvgSourceError::Read) => Err(CoordinatorSvgSourceError::Read),
+            }
+        }
+    }
+
+    fn coordinator_input(path: &Path) -> Value {
+        let mut value = input(path);
+        value["work_scope_id"] = json!("scope-1");
+        value
+    }
+
     fn coordinator_context(store: Arc<dyn SvgArtifactStore>, id: &str) -> ToolContext {
         ToolContext::new_without_filesystem(
             CancellationToken::new(),
@@ -523,6 +656,62 @@ mod tests {
             assert!(linked.output().contains("read_failure"));
         }
         assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_replay_precedes_retired_scope_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let file = root_path.join("chart.svg");
+        std::fs::write(&file, SVG).unwrap();
+        let store = Arc::new(Store::default());
+        let resolver = Arc::new(Resolver(Mutex::new(Ok(root_path))));
+        let tool = CoordinatorPresentSvgTool::new(resolver.clone());
+        let first = tool
+            .run(
+                coordinator_input(&file),
+                coordinator_context(store.clone(), "replay"),
+            )
+            .await;
+        assert!(first.is_success(), "{}", first.output());
+
+        *resolver.0.lock().unwrap() = Err(CoordinatorSvgSourceError::Authority);
+        std::fs::remove_file(&file).unwrap();
+        let replay = tool
+            .run(
+                coordinator_input(&file),
+                coordinator_context(store, "replay"),
+            )
+            .await;
+        assert!(replay.is_success(), "{}", replay.output());
+        assert_eq!(replay.output(), first.output());
+    }
+
+    #[tokio::test]
+    async fn coordinator_resolver_errors_keep_distinct_categories() {
+        for (error, category) in [
+            (CoordinatorSvgSourceError::Authority, "policy_rejection"),
+            (
+                CoordinatorSvgSourceError::Persistence,
+                "persistence_failure",
+            ),
+            (CoordinatorSvgSourceError::Read, "read_failure"),
+        ] {
+            let tool = CoordinatorPresentSvgTool::new(Arc::new(Resolver(Mutex::new(Err(error)))));
+            let result = tool
+                .run(
+                    json!({
+                        "work_scope_id": "scope-1",
+                        "path": "/not/read.svg",
+                        "title": "Title",
+                        "description": "Description"
+                    }),
+                    coordinator_context(Arc::new(Store::default()), category),
+                )
+                .await;
+            assert!(!result.is_success());
+            assert!(result.output().contains(category), "{}", result.output());
+        }
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
 use crate::tools::{
-    BashTool, PresentSvgTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget,
-    WritingConversationTools,
+    BashTool, CoordinatorPresentSvgTool, CoordinatorSvgSourceError, CoordinatorSvgSourceResolver,
+    Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
@@ -33,7 +33,9 @@ pub(crate) fn tools(
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
     tools.push(Arc::new(WorkScopeCoordinatorBash(service.clone())));
-    tools.push(Arc::new(WorkScopeCoordinatorPresentSvg(service)));
+    tools.push(Arc::new(CoordinatorPresentSvgTool::new(Arc::new(
+        GlobalCoordinatorSvgSourceResolver(service),
+    ))));
     tools
 }
 
@@ -106,7 +108,20 @@ impl Tool for WorkScopeCoordinatorBash {
                     .await
                 {
                     Ok(path) => path,
-                    Err(error) => return ToolOutput::error(error),
+                    Err(error) => {
+                        let message = match error {
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Authority => {
+                                "active persisted WorkScope with a live owner not found for Coordinator bash run"
+                            }
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Persistence => {
+                                "failed to resolve Coordinator bash WorkScope"
+                            }
+                            crate::api::global_read::CoordinatorWorkScopeTargetError::Read => {
+                                "active persisted WorkScope root is unavailable or invalid"
+                            }
+                        };
+                        return ToolOutput::error(message);
+                    }
                 };
                 ValidatedBashSpawnTarget {
                     working_dir: binding.path,
@@ -129,55 +144,29 @@ impl Tool for WorkScopeCoordinatorBash {
     }
 }
 
-struct WorkScopeCoordinatorPresentSvg(GlobalReadService);
+struct GlobalCoordinatorSvgSourceResolver(GlobalReadService);
 
 #[async_trait]
-impl Tool for WorkScopeCoordinatorPresentSvg {
-    fn name(&self) -> &'static str {
-        "present_svg"
-    }
-
-    fn description(&self) -> String {
-        "Publish a static SVG staged inside one active WorkScope as a durable inline visual owned by this Global Coordinator transcript. First generate the file through Coordinator bash using that WorkScope's explicit work_scope_id, then call present_svg with the same work_scope_id and resolved absolute SERVER filename. The server re-resolves the active WorkScope and permits only a contained regular file without symlinks. Keep staging until success; the tool does not remove it. Validation enforces the existing bounded static SVG policy and is not visual inspection. Success returns a compact reference, never SVG bytes."
-            .to_string()
-    }
-
-    fn input_schema(&self) -> Value {
-        let mut schema = PresentSvgTool.input_schema();
-        schema["properties"]["work_scope_id"] = json!({
-            "type": "string",
-            "minLength": 1,
-            "description": "Authoritative active WorkScope used to stage the SVG through Coordinator bash. Phoenix re-resolves its canonical root server-side."
-        });
-        schema["required"] = json!(["work_scope_id", "path", "title", "description"]);
-        schema
-    }
-
-    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
-        let Some(object) = input.as_object_mut() else {
-            return ToolOutput::error("present_svg invalid_input: Provide work_scope_id, path, title, and description as strings.");
-        };
-        let Some(work_scope_id) = object
-            .remove("work_scope_id")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .filter(|value| !value.trim().is_empty())
-        else {
-            return ToolOutput::error(
-                "present_svg invalid_input: work_scope_id must name one active WorkScope.",
-            );
-        };
-        let Ok(binding) = self
-            .0
-            .resolve_active_work_scope_bash_target(&work_scope_id)
+impl CoordinatorSvgSourceResolver for GlobalCoordinatorSvgSourceResolver {
+    async fn resolve_active_work_scope_root(
+        &self,
+        work_scope_id: &str,
+    ) -> Result<std::path::PathBuf, CoordinatorSvgSourceError> {
+        self.0
+            .resolve_active_work_scope_bash_target(work_scope_id)
             .await
-        else {
-            return ToolOutput::error(
-                "present_svg policy_rejection: active persisted WorkScope with a live owner not found.",
-            );
-        };
-        PresentSvgTool
-            .run_for_coordinator_work_scope(input, ctx, binding.path)
-            .await
+            .map(|binding| binding.path)
+            .map_err(|error| match error {
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Authority => {
+                    CoordinatorSvgSourceError::Authority
+                }
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Persistence => {
+                    CoordinatorSvgSourceError::Persistence
+                }
+                crate::api::global_read::CoordinatorWorkScopeTargetError::Read => {
+                    CoordinatorSvgSourceError::Read
+                }
+            })
     }
 }
 
@@ -674,7 +663,7 @@ mod tests {
         assert!(!output.is_success());
         assert!(output
             .output()
-            .contains("active persisted WorkScope with a live owner not found"));
+            .contains("Active persisted WorkScope with a live owner not found"));
     }
 
     #[tokio::test]
