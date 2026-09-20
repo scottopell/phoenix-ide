@@ -104,7 +104,8 @@ publicly.
 ### REQ-AUTH-005: Read-Only Share View
 
 WHEN a viewer navigates to `/s/{token}` with a valid share token
-THE SYSTEM SHALL display the full conversation history
+THE SYSTEM SHALL display the full conversation history, including published visualization previews
+AND SHALL allow read-only expansion, escaped source inspection, and download of those visualizations
 AND stream live updates via SSE (new messages, state changes)
 AND NOT display any input controls, mutation buttons, or settings
 
@@ -120,8 +121,13 @@ No input controls means no ambiguity about what viewers can do.
 ### REQ-AUTH-006: Share Token Exemption from Auth
 
 WHERE `PHOENIX_PASSWORD` is set
-THE SYSTEM SHALL exempt `/s/{token}` routes from password authentication
+THE SYSTEM SHALL exempt `/s/{token}` and `/api/share/{token}` routes from password authentication
 AND validate only the share token itself
+
+WHEN a share viewer requests a published visualization's preview, source, or download
+THE SYSTEM SHALL resolve the conversation from the valid share token on every request
+AND SHALL NOT grant access to an artifact owned by any other conversation
+AND SHALL reject requests using invalid or revoked tokens with HTTP 404
 
 **Rationale:** The whole point of sharing is that coworkers access without
 the password. The share token is the authorization -- it grants read-only

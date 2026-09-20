@@ -221,6 +221,15 @@ WHEN all tools complete
 THE SYSTEM SHALL transition to awaiting LLM response
 AND send all tool results to LLM
 
+THE SYSTEM SHALL bind each persisted tool-result identity to both its owning assistant message and its provider tool ID
+AND SHALL preserve that identity when materializing an interrupted tool round
+AND SHALL keep results from distinct assistant rounds separate when a provider reuses a tool ID.
+
+WHEN sub-agent fan-in updates an awaited spawn result
+THE SYSTEM SHALL update the latest matching durable result in the owning conversation
+AND SHALL preserve earlier rounds with the same provider tool ID
+AND SHALL fail if the awaited result is missing.
+
 WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
 AND allow LLM to handle the error

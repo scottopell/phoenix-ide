@@ -549,9 +549,15 @@ pub struct MaterializeAuthoritativeUserMessageCall {
     pub now: Timestamp,
 }
 
+type StoredSvgArtifacts = HashMap<
+    (String, crate::tools::present_svg::SvgInvocationId),
+    (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
+>;
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    svg_artifacts: Mutex<StoredSvgArtifacts>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -622,6 +628,7 @@ pub struct InMemoryStorage {
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
+            svg_artifacts: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
@@ -2406,6 +2413,49 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 // Tests
 // ============================================================================
 
+#[async_trait]
+impl crate::runtime::traits::SvgArtifactRepository for InMemoryStorage {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+    ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
+        Ok(self
+            .svg_artifacts
+            .lock()
+            .unwrap()
+            .get(&(conversation_id.to_string(), invocation.clone()))
+            .map(|(reference, _)| reference.clone()))
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        use crate::tools::present_svg::{SvgArtifactReference, SvgValidationOutcome};
+        let mut artifacts = self.svg_artifacts.lock().unwrap();
+        let (reference, _) = artifacts
+            .entry((conversation_id.to_string(), invocation.clone()))
+            .or_insert_with(|| {
+                (
+                    SvgArtifactReference {
+                        artifact_id: uuid::Uuid::new_v4().to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        title: draft.metadata.title().into(),
+                        description: draft.metadata.description().into(),
+                        width: draft.svg.width(),
+                        height: draft.svg.height(),
+                        validation: SvgValidationOutcome::AcceptedStaticSvg,
+                    },
+                    draft.svg.into_bytes(),
+                )
+            });
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(reference.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3039,6 +3089,39 @@ mod tests {
         );
     }
 
+    async fn storage_with_spawn_round(conv_id: &str, tool_use_id: &str) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        let assistant_id = format!("{conv_id}-spawn-assistant");
+        storage
+            .add_message(
+                &assistant_id,
+                conv_id,
+                &MessageContent::agent(vec![ContentBlock::tool_use(
+                    tool_use_id,
+                    "spawn_agents",
+                    serde_json::json!({"tasks": [{"task": "do thing", "mode": "work"}]}),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .add_message(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant_id,
+                    tool_use_id,
+                ),
+                conv_id,
+                &MessageContent::tool(tool_use_id, "Spawning sub-agents", false),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
     /// REQ-BED-005a `CancellingSubAgentsDeadlineFires`: a parent wedged in
     /// `CancellingSubAgents` because a cancelled sub-agent never reported back
     /// must still reach `Idle` within the bounded cancellation deadline.
@@ -3057,11 +3140,11 @@ mod tests {
         use std::path::PathBuf;
         use tokio::sync::mpsc;
 
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = storage_with_spawn_round("test-conv", "spawn-1").await;
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx = mpsc::channel::<Event>(32).0;
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 2);
         let mut broadcast_rx = broadcast_tx.subscribe();
 
         let initial_state = ConvState::CancellingSubAgents {
@@ -3091,7 +3174,7 @@ mod tests {
             broadcast_tx,
         );
 
-        tokio::spawn(async move { runtime.run().await });
+        let runtime_task = tokio::spawn(async move { runtime.run().await });
 
         // Liveness assertion: AgentDone within a bounded deadline. The backstop
         // is CANCELLING_SUBAGENTS_DEADLINE (6s); this window is longer so it
@@ -3107,6 +3190,9 @@ mod tests {
             }
         }
 
+        runtime_task.abort();
+        let _ = runtime_task.await;
+
         assert!(
             agent_done,
             "A parent wedged in CancellingSubAgents with a silent sub-agent must still \
@@ -3117,6 +3203,22 @@ mod tests {
         assert!(
             matches!(final_state, Some(ConvState::Idle)),
             "Conversation should return to Idle after the backstop fires, got {final_state:?}"
+        );
+        let messages = storage.get_all_messages("test-conv");
+        let result = messages
+            .iter()
+            .find(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "spawn-1"))
+            .expect("durable spawn result");
+        assert!(
+            matches!(&result.content, MessageContent::Tool(tool) if tool.content.starts_with("Sub-agent results"))
+        );
+        assert_eq!(
+            result
+                .display_data
+                .as_ref()
+                .and_then(|data| data.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("subagent_summary")
         );
     }
 

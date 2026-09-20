@@ -24,5 +24,6 @@ pub mod retry_policy;
 pub mod skill_invocation;
 pub mod sm_event;
 pub mod sm_state;
+pub mod tool_result_identity;
 pub mod tool_wire;
 pub mod work_scope_inventory;

@@ -515,7 +515,28 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
+    Migration {
+        version: 101,
+        name: "create_conversation_svg_artifacts",
+        sql: MIGRATION_101,
+    },
 ];
+
+const MIGRATION_101: &str = r"
+CREATE TABLE conversation_svg_artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    width REAL NOT NULL CHECK(width > 0 AND width <= 16384),
+    height REAL NOT NULL CHECK(height > 0 AND height <= 16384),
+    bytes BLOB NOT NULL CHECK(typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 2097152),
+    CHECK(width * height <= 64000000),
+    UNIQUE(conversation_id, assistant_message_id, tool_use_id)
+);
+";
 
 const MIGRATION_100: &str = r"
 ALTER TABLE product_conversations
