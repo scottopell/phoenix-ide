@@ -1,5 +1,8 @@
 pub use phoenix_svg as validation;
-pub use phoenix_svg::{SvgArtifactReference, SvgInvocationId, SvgValidationOutcome};
+pub use phoenix_svg::{
+    SvgArtifactReference, SvgInvocationId, SvgPresentationMetadata, SvgValidationOutcome,
+    MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS,
+};
 
 use super::{Tool, ToolContext, ToolExecutionEnvironment, ToolOutput};
 use async_trait::async_trait;
@@ -10,12 +13,8 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const MAX_TITLE_CHARS: usize = 200;
-pub const MAX_DESCRIPTION_CHARS: usize = 2000;
-
 pub struct SvgArtifactDraft {
-    pub title: String,
-    pub description: String,
+    pub metadata: SvgPresentationMetadata,
     pub svg: validation::ValidatedSvg,
 }
 
@@ -67,10 +66,6 @@ fn reference_output(reference: &SvgArtifactReference) -> ToolOutput {
             "Could not encode the published reference.",
         ),
     }
-}
-
-fn valid_text(value: &str, max: usize) -> bool {
-    !value.trim().is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
 }
 
 fn read_regular_file(path: &Path) -> Result<Vec<u8>, (&'static str, &'static str)> {
@@ -176,11 +171,10 @@ impl Tool for PresentSvgTool {
         {
             return failure("invalid_input", "Use a resolved absolute server filename of at most 4096 bytes; shell expressions are not expanded.");
         }
-        if !valid_text(&input.title, MAX_TITLE_CHARS)
-            || !valid_text(&input.description, MAX_DESCRIPTION_CHARS)
-        {
-            return failure("invalid_input", "Title and description must be nonempty plain text without control characters, at most 200 and 2000 characters respectively.");
-        }
+        let metadata = match SvgPresentationMetadata::new(&input.title, &input.description) {
+            Ok(metadata) => metadata,
+            Err(error) => return failure("invalid_input", error.message),
+        };
         if ctx.cancel.is_cancelled() {
             return failure("cancelled", "Publication cancelled before reading.");
         }
@@ -209,11 +203,7 @@ impl Tool for PresentSvgTool {
             .publish(
                 &ctx.conversation_id,
                 &invocation,
-                SvgArtifactDraft {
-                    title: input.title,
-                    description: input.description,
-                    svg,
-                },
+                SvgArtifactDraft { metadata, svg },
             )
             .await
         {
@@ -264,8 +254,8 @@ mod tests {
                         SvgArtifactReference {
                             artifact_id: uuid::Uuid::new_v4().to_string(),
                             conversation_id: conversation_id.into(),
-                            title: draft.title,
-                            description: draft.description,
+                            title: draft.metadata.title().into(),
+                            description: draft.metadata.description().into(),
                             width: draft.svg.width(),
                             height: draft.svg.height(),
                             validation: SvgValidationOutcome::AcceptedStaticSvg,
@@ -424,13 +414,12 @@ mod tests {
 
     #[test]
     fn metadata_limits_count_unicode_characters() {
-        assert!(valid_text(&"é".repeat(MAX_TITLE_CHARS), MAX_TITLE_CHARS));
-        assert!(!valid_text(
-            &"é".repeat(MAX_TITLE_CHARS + 1),
-            MAX_TITLE_CHARS
-        ));
-        assert!(!valid_text("\n", MAX_DESCRIPTION_CHARS));
-        assert!(!valid_text("x\0y", MAX_DESCRIPTION_CHARS));
+        assert!(SvgPresentationMetadata::new(&"é".repeat(MAX_TITLE_CHARS), "Description").is_ok());
+        assert!(
+            SvgPresentationMetadata::new(&"é".repeat(MAX_TITLE_CHARS + 1), "Description").is_err()
+        );
+        assert!(SvgPresentationMetadata::new("Title", "\n").is_err());
+        assert!(SvgPresentationMetadata::new("Title", "x\0y").is_err());
     }
 
     #[test]

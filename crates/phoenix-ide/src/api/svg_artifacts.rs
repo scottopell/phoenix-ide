@@ -169,11 +169,12 @@ mod tests {
             .publish_svg_artifact(
                 "owner",
                 &SvgInvocationId::new("assistant-message", "call"),
-                "Title",
-                "Description",
+                &phoenix_svg::SvgPresentationMetadata::new("Title", "Description").unwrap(),
                 &validation::validate(SVG).unwrap(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         let router = crate::api::create_router(state);
         for suffix in ["", "/source", "/download"] {
@@ -223,11 +224,12 @@ mod tests {
             .publish_svg_artifact(
                 "owner",
                 &SvgInvocationId::new("assistant-message", "call"),
-                "Title",
-                "Description",
+                &phoenix_svg::SvgPresentationMetadata::new("Title", "Description").unwrap(),
                 &validation::validate(SVG).unwrap(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         assert!(matches!(
             owned_artifact(&db, "other", &artifact.artifact_id).await,

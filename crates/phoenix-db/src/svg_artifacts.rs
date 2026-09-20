@@ -1,5 +1,8 @@
+use crate::workflow::LocalAuthorityResult;
+#[cfg(test)]
+use crate::DbError;
 use crate::{Database, DbResult};
-use phoenix_svg::{SvgInvocationId, ValidatedSvg};
+use phoenix_svg::{SvgInvocationId, SvgPresentationMetadata, ValidatedSvg};
 use sqlx::Row;
 
 /// Immutable accepted SVG bytes and their conversation-owned presentation metadata.
@@ -41,6 +44,37 @@ fn artifact_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SvgArtifact, sqlx:
     })
 }
 
+#[derive(Clone, Copy)]
+enum PublicationCommit {
+    Normal,
+    #[cfg(test)]
+    CommittedError,
+    #[cfg(test)]
+    RolledBackError,
+    #[cfg(test)]
+    CommittedLookupUnavailable,
+}
+
+impl PublicationCommit {
+    async fn execute(self, transaction: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
+        match self {
+            Self::Normal => transaction.commit().await.map_err(Into::into),
+            #[cfg(test)]
+            Self::CommittedError | Self::CommittedLookupUnavailable => {
+                transaction.commit().await?;
+                Err(DbError::Serialization(
+                    "injected commit acknowledgement failure".into(),
+                ))
+            }
+            #[cfg(test)]
+            Self::RolledBackError => {
+                transaction.rollback().await?;
+                Err(DbError::Serialization("injected commit failure".into()))
+            }
+        }
+    }
+}
+
 impl Database {
     /// Find an already committed publication before attempting to read staging again.
     ///
@@ -62,53 +96,112 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Commit bytes and ownership together; a repeated invocation returns its first snapshot.
+    /// Commit validated bytes and metadata; classify an ambiguous commit by exact invocation.
     ///
-    /// # Errors
-    /// Returns a database error for missing owners, invalid metadata or failed persistence.
-    ///
-    /// Unvalidated bytes cannot be passed to the publication boundary:
+    /// Raw bytes cannot cross the publication boundary:
     /// ```compile_fail
     /// async fn reject_raw_bytes(db: &phoenix_db::Database, id: &phoenix_svg::SvgInvocationId) {
-    ///     db.publish_svg_artifact("owner", id, "Chart", "Description", b"<svg/>").await.unwrap();
+    ///     let metadata = phoenix_svg::SvgPresentationMetadata::new("Chart", "Description").unwrap();
+    ///     db.publish_svg_artifact("owner", id, &metadata, b"<svg/>").await;
+    /// }
+    /// ```
+    /// Unvalidated presentation text cannot cross the publication boundary:
+    /// ```compile_fail
+    /// async fn reject_raw_metadata(db: &phoenix_db::Database, id: &phoenix_svg::SvgInvocationId, svg: &phoenix_svg::ValidatedSvg) {
+    ///     db.publish_svg_artifact("owner", id, "Chart", svg).await;
     /// }
     /// ```
     pub async fn publish_svg_artifact(
         &self,
         conversation_id: &str,
         invocation: &SvgInvocationId,
-        title: &str,
-        description: &str,
+        metadata: &SvgPresentationMetadata,
         svg: &ValidatedSvg,
-    ) -> DbResult<SvgArtifact> {
-        let mut transaction = self.pool().begin().await?;
-        sqlx::query(
-            "INSERT INTO conversation_svg_artifacts
-             (artifact_id, conversation_id, assistant_message_id, tool_use_id, title, description, width, height, bytes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(conversation_id, assistant_message_id, tool_use_id) DO NOTHING",
+    ) -> LocalAuthorityResult<DbResult<SvgArtifact>> {
+        self.publish_svg_artifact_with_commit(
+            conversation_id,
+            invocation,
+            metadata,
+            svg,
+            PublicationCommit::Normal,
         )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(conversation_id)
-        .bind(&invocation.assistant_message_id)
-        .bind(&invocation.tool_use_id)
-        .bind(title)
-        .bind(description)
-        .bind(svg.width())
-        .bind(svg.height())
-        .bind(svg.bytes())
-        .execute(&mut *transaction)
-        .await?;
-        let artifact = artifact_from_row(
-            &sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND assistant_message_id = ? AND tool_use_id = ?")
-                .bind(conversation_id)
-                .bind(&invocation.assistant_message_id)
-                .bind(&invocation.tool_use_id)
-                .fetch_one(&mut *transaction)
-                .await?,
-        )?;
-        transaction.commit().await?;
-        Ok(artifact)
+        .await
+    }
+
+    async fn publish_svg_artifact_with_commit(
+        &self,
+        conversation_id: &str,
+        invocation: &SvgInvocationId,
+        metadata: &SvgPresentationMetadata,
+        svg: &ValidatedSvg,
+        commit: PublicationCommit,
+    ) -> LocalAuthorityResult<DbResult<SvgArtifact>> {
+        let prepared: DbResult<_> = async {
+            let mut transaction = self.pool().begin().await?;
+            sqlx::query(
+                "INSERT INTO conversation_svg_artifacts
+                 (artifact_id, conversation_id, assistant_message_id, tool_use_id, title, description, width, height, bytes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(conversation_id, assistant_message_id, tool_use_id) DO NOTHING",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(conversation_id)
+            .bind(&invocation.assistant_message_id)
+            .bind(&invocation.tool_use_id)
+            .bind(metadata.title())
+            .bind(metadata.description())
+            .bind(svg.width())
+            .bind(svg.height())
+            .bind(svg.bytes())
+            .execute(&mut *transaction)
+            .await?;
+            let artifact = artifact_from_row(
+                &sqlx::query("SELECT * FROM conversation_svg_artifacts WHERE conversation_id = ? AND assistant_message_id = ? AND tool_use_id = ?")
+                    .bind(conversation_id)
+                    .bind(&invocation.assistant_message_id)
+                    .bind(&invocation.tool_use_id)
+                    .fetch_one(&mut *transaction)
+                    .await?,
+            )?;
+            Ok((transaction, artifact))
+        }.await;
+        let (transaction, artifact) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        let commit_result = commit.execute(transaction).await;
+        match commit_result {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(artifact)),
+            Err(error) => {
+                let lookup = self
+                    .classify_svg_commit(conversation_id, invocation, commit)
+                    .await;
+                match lookup {
+                    Ok(Some(artifact)) => {
+                        LocalAuthorityResult::DurableFactEstablished(Ok(artifact))
+                    }
+                    Ok(None) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                    Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+                }
+            }
+        }
+    }
+
+    async fn classify_svg_commit(
+        &self,
+        conversation_id: &str,
+        invocation: &SvgInvocationId,
+        commit: PublicationCommit,
+    ) -> DbResult<Option<SvgArtifact>> {
+        let _ = commit;
+        #[cfg(test)]
+        if matches!(commit, PublicationCommit::CommittedLookupUnavailable) {
+            return Err(DbError::Serialization(
+                "injected classification failure".into(),
+            ));
+        }
+        self.svg_artifact_for_invocation(conversation_id, invocation)
+            .await
     }
 
     /// Read a snapshot only within its owning transcript.
@@ -143,6 +236,72 @@ mod tests {
 
     fn validated() -> ValidatedSvg {
         phoenix_svg::validate(SVG).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ambiguous_commit_is_classified_by_exact_invocation() {
+        for commit in [
+            PublicationCommit::CommittedError,
+            PublicationCommit::RolledBackError,
+            PublicationCommit::CommittedLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            db.create_conversation("owner", "owner", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let metadata = SvgPresentationMetadata::new("Chart", "Description").unwrap();
+            db.publish_svg_artifact(
+                "owner",
+                &SvgInvocationId::new("other-assistant", "call"),
+                &metadata,
+                &validated(),
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+            let result = db
+                .publish_svg_artifact_with_commit(
+                    "owner",
+                    &invocation("call"),
+                    &metadata,
+                    &validated(),
+                    commit,
+                )
+                .await;
+            match commit {
+                PublicationCommit::CommittedError => {
+                    let artifact = result.established().unwrap().unwrap();
+                    assert_eq!(artifact.bytes, SVG);
+                    assert_eq!(
+                        db.svg_artifact_for_invocation("owner", &invocation("call"))
+                            .await
+                            .unwrap(),
+                        Some(artifact)
+                    );
+                }
+                PublicationCommit::RolledBackError => {
+                    assert!(result.established().unwrap().is_err());
+                    assert!(db
+                        .svg_artifact_for_invocation("owner", &invocation("call"))
+                        .await
+                        .unwrap()
+                        .is_none());
+                }
+                PublicationCommit::CommittedLookupUnavailable => {
+                    assert!(matches!(
+                        result,
+                        LocalAuthorityResult::DurableFactUnclassified
+                    ));
+                    assert!(db
+                        .svg_artifact_for_invocation("owner", &invocation("call"))
+                        .await
+                        .unwrap()
+                        .is_some());
+                }
+                PublicationCommit::Normal => unreachable!(),
+            }
+        }
     }
 
     fn interrupted_svg_state(staging: &std::path::Path, cancelling: bool) -> crate::ConvState {
@@ -210,11 +369,13 @@ mod tests {
                         db.publish_svg_artifact(
                             "owner",
                             &SvgInvocationId::new(assistant_id, "svg"),
-                            "Chart",
-                            "A retained chart",
+                            &phoenix_svg::SvgPresentationMetadata::new("Chart", "A retained chart")
+                                .unwrap(),
                             &validated(),
                         )
                         .await
+                        .established()
+                        .unwrap()
                         .unwrap(),
                     )
                 } else {
@@ -301,11 +462,12 @@ mod tests {
             .publish_svg_artifact(
                 "retained-owner",
                 &invocation("call"),
-                "Title",
-                "Description",
+                &phoenix_svg::SvgPresentationMetadata::new("Title", "Description").unwrap(),
                 &phoenix_svg::validate(&std::fs::read(&staging).unwrap()).unwrap(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         db.update_conversation_state("retained-owner", &ConvState::Terminal)
             .await
@@ -355,11 +517,12 @@ mod tests {
             .publish_svg_artifact(
                 "owner",
                 &invocation("call"),
-                "Title",
-                "Description",
+                &phoenix_svg::SvgPresentationMetadata::new("Title", "Description").unwrap(),
                 &phoenix_svg::validate(&std::fs::read(&staging).unwrap()).unwrap(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         std::fs::remove_file(staging).unwrap();
         db.pool().close().await;
@@ -386,24 +549,26 @@ mod tests {
             .publish_svg_artifact(
                 "svg-owner",
                 &invocation("call"),
-                "Chart",
-                "Bars",
+                &phoenix_svg::SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
                 &validated(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         let replay = db
             .publish_svg_artifact(
                 "svg-owner",
                 &invocation("call"),
-                "Changed",
-                "Changed",
+                &phoenix_svg::SvgPresentationMetadata::new("Changed", "Changed").unwrap(),
                 &phoenix_svg::validate(
                     br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"/>"#,
                 )
                 .unwrap(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         assert_eq!(first, replay);
         assert_eq!(
@@ -421,11 +586,12 @@ mod tests {
             .publish_svg_artifact(
                 "svg-owner",
                 &invocation("call-2"),
-                "Chart",
-                "Bars",
+                &phoenix_svg::SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
                 &validated(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         assert_ne!(first.artifact_id, separate.artifact_id);
         let later_assistant = SvgInvocationId::new("later-assistant-message", "call");
@@ -438,11 +604,12 @@ mod tests {
             .publish_svg_artifact(
                 "svg-owner",
                 &later_assistant,
-                "Later chart",
-                "Bars",
+                &phoenix_svg::SvgPresentationMetadata::new("Later chart", "Bars").unwrap(),
                 &validated(),
             )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         assert_ne!(first.artifact_id, reused_provider_id.artifact_id);
         assert_eq!(
@@ -466,26 +633,18 @@ mod tests {
             .publish_svg_artifact(
                 "missing",
                 &invocation("call"),
-                "Chart",
-                "Bars",
+                &phoenix_svg::SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
                 &validated()
             )
             .await
+            .established()
+            .unwrap()
             .is_err());
         db.create_conversation("svg-owner", "svg-owner", "/tmp", true, None, None)
             .await
             .unwrap();
-        for title in [String::new(), "x".repeat(201)] {
-            assert!(db
-                .publish_svg_artifact(
-                    "svg-owner",
-                    &invocation("call"),
-                    &title,
-                    "Bars",
-                    &validated()
-                )
-                .await
-                .is_err());
+        for title in [String::new(), "x".repeat(201), "x\ny".into(), "   ".into()] {
+            assert!(SvgPresentationMetadata::new(&title, "Bars").is_err());
         }
         assert!(db
             .svg_artifact_for_invocation("svg-owner", &invocation("call"))

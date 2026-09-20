@@ -12,9 +12,9 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| REQ-SVG-001 | Implemented | Typed invocation, Direct/Work registration and Explore/coordinator exclusion tests; real agent publication |
+| REQ-SVG-001 | Implemented | Typed invocation and storage-enforced presentation metadata, Direct/Work registration and Explore/coordinator exclusion tests; real agent publication |
 | REQ-SVG-002 | Implemented | XML-aware allowlist, bounded reference graph, property applicability and parent-child models, adversarial unit cases and actual Matplotlib fixture |
-| REQ-SVG-003 | Implemented | Atomic database snapshot, invocation replay, commit-before-checkpoint restart recovery in executing/cancelling states, rollback, reopen and transcript deletion tests; live source deletion and server restart |
+| REQ-SVG-003 | Implemented | Atomic database snapshot, deterministic ambiguous-commit classification, invocation replay, commit-before-checkpoint restart recovery in executing/cancelling states, rollback, reopen and transcript deletion tests; live source deletion and server restart |
 | REQ-SVG-004 | Implemented | Router authentication/owner/header tests; live image, source, attachment and direct-navigation checks |
 | REQ-SVG-005 | Implemented | Component tests, 12 browser fixture journeys and actual conversation controls/reload |
 | REQ-SVG-006 | Implemented | Typed input roundtrip, ordinary persisted tool-result reference, runtime/SSE E2E and native generic-result inspection |
@@ -25,7 +25,7 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 ### Automated qualification
 
 - `cargo test -p phoenix-svg`: validator tests cover supported library output, hostile XML/CSS/URLs, compatible reference targets, exact selector grammar, per-element geometry, reference cycles/expansion and geometry/complexity limits.
-- `cargo test -p phoenix-tools present_svg`: publication tests cover file boundaries, cancellation, replay, reused provider IDs in separate assistant messages, and bounded persistence errors. The database publication API requires the validator's private-field `ValidatedSvg`; a compile-fail doctest rejects raw bytes.
+- `cargo test -p phoenix-tools present_svg`: publication tests cover file boundaries, cancellation, replay, reused provider IDs in separate assistant messages, and bounded persistence errors. The database publication API requires private-field `ValidatedSvg` and `SvgPresentationMetadata`; compile-fail doctests reject raw bytes and raw metadata. Deterministic commit fault tests distinguish committed snapshots, confirmed absence, and unclassified local authority.
 - `cargo test -p phoenix-db svg_artifact`: five tests cover immutable snapshots, reopen after staging deletion, actual workscope retirement after worktree-directory removal, separate invocations, owner isolation, cascade deletion, rejected writes and transaction rollback.
 - `cargo test -p phoenix_ide svg_artifact`: actual router authentication, ownership, accepted bytes and response headers for all three retrieval routes.
 - `uv run tests/e2e/run.py --scenario present_svg`: mock-provider turn dispatch generates a file with bash, publishes through the runtime, replaces/deletes staging, checks retrieval/ownership, reloads persisted references through HTTP and SSE init, and publishes a separate revision when a later assistant round reuses the provider tool ID.

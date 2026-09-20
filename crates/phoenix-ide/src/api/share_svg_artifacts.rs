@@ -71,8 +71,15 @@ mod tests {
         }
         let artifact = state
             .db
-            .publish_svg_artifact("shared-owner", &invocation, "Chart", "Bars", &svg)
+            .publish_svg_artifact(
+                "shared-owner",
+                &invocation,
+                &phoenix_svg::SvgPresentationMetadata::new("Chart", "Bars").unwrap(),
+                &svg,
+            )
             .await
+            .established()
+            .unwrap()
             .unwrap();
         let token = state.db.create_share_token("shared-owner").await.unwrap();
         let other_token = state.db.create_share_token("other-owner").await.unwrap();

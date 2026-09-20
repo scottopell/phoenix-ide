@@ -26,7 +26,7 @@ AND SHALL preserve accepted visual content without silently stripping unsupporte
 THE SYSTEM SHALL accept geometry and presentation attributes only on compatible elements, local references only to compatible resource types, and stylesheets only with the documented simple-selector grammar
 AND SHALL apply the same presentation-property restrictions to inline declarations and require each stylesheet selector with matches to have a compatible target for each declaration, while permitting broad selectors and inherited container styling
 AND SHALL enforce documented parent-child content models so visual elements and text cannot be placed where the SVG renderer ignores them
-AND SHALL require a validation-backed value at the storage publication boundary so unvalidated bytes and independently supplied dimensions cannot be published.
+AND SHALL require validation-backed values at the storage publication boundary so unvalidated bytes, independently supplied dimensions, and unvalidated presentation metadata cannot be published.
 
 THE SYSTEM SHALL support bounded local references for glyph reuse, clipping, and gradients
 AND SHALL reject cycles, excessive expansion, invalid/non-finite geometry, extreme dimensions, and byte/structure/path/reference limits.
@@ -39,6 +39,11 @@ AND SHALL return only a compact reference and static-validation outcome, without
 
 WHEN the same invocation is replayed
 THE SYSTEM SHALL return its first committed snapshot without depending on staging-file availability.
+
+WHEN the publication commit outcome is ambiguous
+THE SYSTEM SHALL make one exact lookup by the owning conversation and invocation identity
+AND SHALL recover the committed reference when present or return a known non-commit failure when absent
+AND SHALL apply the local persistence authority fail-stop contract in `specs/bedrock/requirements.md` REQ-BED-033 when classification is unavailable.
 
 WHEN restart recovery materializes an interrupted publication whose exact invocation has a committed snapshot
 THE SYSTEM SHALL recover its compact successful reference into tool-result history
