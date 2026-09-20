@@ -121,7 +121,16 @@ printf 'exit=%s\n' "$rc"
 
 ### Before/after disk snapshots
 
-This exact function was called with distinct output files immediately before and after each owned run (for example, `disk-before-musl.tsv` and `disk-after-musl.tsv`). `du -sk` reports allocated KiB on this APFS host and `du -skA` reports apparent KiB. Deltas are compared by path; shared trees are reported once, not summed across lanes.
+This exact function was called with distinct output files immediately before and after each owned run (for example, `disk-before-musl.tsv` and `disk-after-musl.tsv`). `du -sk` reports allocated KiB on this APFS host and `du -skA` reports apparent KiB. Deltas are compared by path; shared trees are reported once, not summed across lanes. The musl baseline is reproduced separately by recording installed targets and measuring the target-specific Rust std directory rather than inferring it from aggregate toolchains:
+
+```bash
+rustup target list --installed
+sysroot=$(rustc --print sysroot)
+du -sk "$sysroot/lib/rustlib/x86_64-unknown-linux-musl"
+du -skA "$sysroot/lib/rustlib/x86_64-unknown-linux-musl"
+```
+
+The audited host output included `x86_64-unknown-linux-musl`; both size commands returned `222708` KiB.
 
 ```bash
 snapshot_disk() {
