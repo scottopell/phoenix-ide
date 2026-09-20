@@ -10288,13 +10288,37 @@ impl Database {
                 Some(sequence_id) => sequence_id,
                 None => self.next_sequence_id(&conv_id).await?,
             };
+            let mut completed_results = completed_results;
+            let mut unfinished = Vec::new();
+            for tool_id in interrupted_tool_ids {
+                let is_svg = assistant_message.tool_uses().iter().any(|block| {
+                    matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, .. }
+                        if id == &tool_id && name == "present_svg")
+                });
+                let artifact = if is_svg {
+                    self.svg_artifact_for_invocation(
+                        &conv_id,
+                        &phoenix_svg::SvgInvocationId::new(&assistant_message.message_id, &tool_id),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(artifact) = artifact {
+                    let output = serde_json::to_string(&artifact.into_reference())
+                        .map_err(|error| DbError::Serialization(error.to_string()))?;
+                    completed_results.push(ToolResult::success(tool_id, output));
+                } else {
+                    unfinished.push(tool_id);
+                }
+            }
             let (agent_msg, tool_msgs) = build_materialized_tool_round(
                 &conv_id,
                 start_seq,
                 &materialized_at,
                 &assistant_message,
                 &completed_results,
-                &interrupted_tool_ids,
+                &unfinished,
                 &pending_sub_agents,
                 &sub_agent_outcomes,
             );

@@ -14,7 +14,7 @@ Strict XML/SVG validation precedes an atomic conversation-owned database snapsho
 | --- | --- | --- |
 | REQ-SVG-001 | Implemented | Typed invocation, Direct/Work registration and Explore/coordinator exclusion tests; real agent publication |
 | REQ-SVG-002 | Implemented | XML-aware allowlist, bounded reference graph, property applicability and parent-child models, adversarial unit cases and actual Matplotlib fixture |
-| REQ-SVG-003 | Implemented | Atomic database snapshot, invocation replay, rollback, reopen and transcript deletion tests; live source deletion and server restart |
+| REQ-SVG-003 | Implemented | Atomic database snapshot, invocation replay, commit-before-checkpoint restart recovery in executing/cancelling states, rollback, reopen and transcript deletion tests; live source deletion and server restart |
 | REQ-SVG-004 | Implemented | Router authentication/owner/header tests; live image, source, attachment and direct-navigation checks |
 | REQ-SVG-005 | Implemented | Component tests, 12 browser fixture journeys and actual conversation controls/reload |
 | REQ-SVG-006 | Implemented | Typed input roundtrip, ordinary persisted tool-result reference, runtime/SSE E2E and native generic-result inspection |

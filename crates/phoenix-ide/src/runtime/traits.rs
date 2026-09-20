@@ -2474,7 +2474,7 @@ impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
         self.db
             .svg_artifact_for_invocation(conversation_id, invocation)
             .await
-            .map(|artifact| artifact.map(svg_reference))
+            .map(|artifact| artifact.map(crate::db::SvgArtifact::into_reference))
             .map_err(|error| error.to_string())
     }
     async fn publish(
@@ -2492,21 +2492,7 @@ impl crate::tools::present_svg::SvgArtifactStore for DatabaseStorage {
                 &draft.svg,
             )
             .await
-            .map(svg_reference)
+            .map(crate::db::SvgArtifact::into_reference)
             .map_err(|error| error.to_string())
-    }
-}
-
-fn svg_reference(
-    artifact: crate::db::SvgArtifact,
-) -> crate::tools::present_svg::SvgArtifactReference {
-    crate::tools::present_svg::SvgArtifactReference {
-        artifact_id: artifact.artifact_id,
-        conversation_id: artifact.conversation_id,
-        title: artifact.title,
-        description: artifact.description,
-        width: artifact.width,
-        height: artifact.height,
-        validation: crate::tools::present_svg::SvgValidationOutcome::AcceptedStaticSvg,
     }
 }

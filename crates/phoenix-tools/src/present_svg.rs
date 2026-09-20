@@ -1,11 +1,10 @@
 pub use phoenix_svg as validation;
-pub use phoenix_svg::SvgInvocationId;
+pub use phoenix_svg::{SvgArtifactReference, SvgInvocationId, SvgValidationOutcome};
 
 use super::{Tool, ToolContext, ToolExecutionEnvironment, ToolOutput};
 use async_trait::async_trait;
 use phoenix_core::domain::sm_state::PresentSvgInput;
 use phoenix_core::work_scope::ResourceAuthority;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::Path;
@@ -13,23 +12,6 @@ use std::sync::Arc;
 
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_DESCRIPTION_CHARS: usize = 2000;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SvgArtifactReference {
-    pub artifact_id: String,
-    pub conversation_id: String,
-    pub title: String,
-    pub description: String,
-    pub width: f64,
-    pub height: f64,
-    pub validation: SvgValidationOutcome,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SvgValidationOutcome {
-    AcceptedStaticSvg,
-}
 
 pub struct SvgArtifactDraft {
     pub title: String,

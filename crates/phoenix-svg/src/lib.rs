@@ -4,6 +4,9 @@ use std::str::FromStr;
 use roxmltree::{Document, Node, ParsingOptions};
 use svgtypes::{Length, LengthUnit, Number, NumberListParser, PathParser, PathSegment, Transform};
 
+mod reference;
+pub use reference::{SvgArtifactReference, SvgValidationOutcome};
+
 mod invocation;
 pub use invocation::SvgInvocationId;
 

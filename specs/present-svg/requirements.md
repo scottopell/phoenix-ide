@@ -40,6 +40,10 @@ AND SHALL return only a compact reference and static-validation outcome, without
 WHEN the same invocation is replayed
 THE SYSTEM SHALL return its first committed snapshot without depending on staging-file availability.
 
+WHEN restart recovery materializes an interrupted publication whose exact invocation has a committed snapshot
+THE SYSTEM SHALL recover its compact successful reference into tool-result history
+AND SHALL retain an interrupted error when that invocation has no committed snapshot.
+
 Invocation identity SHALL include the owning assistant-message identity and provider tool-use ID within the conversation
 AND SHALL distinguish separate assistant messages even when their provider tool-use IDs repeat.
 

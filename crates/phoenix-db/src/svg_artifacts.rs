@@ -14,6 +14,21 @@ pub struct SvgArtifact {
     pub bytes: Vec<u8>,
 }
 
+impl SvgArtifact {
+    #[must_use]
+    pub fn into_reference(self) -> phoenix_svg::SvgArtifactReference {
+        phoenix_svg::SvgArtifactReference {
+            artifact_id: self.artifact_id,
+            conversation_id: self.conversation_id,
+            title: self.title,
+            description: self.description,
+            width: self.width,
+            height: self.height,
+            validation: phoenix_svg::SvgValidationOutcome::AcceptedStaticSvg,
+        }
+    }
+}
+
 fn artifact_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SvgArtifact, sqlx::Error> {
     Ok(SvgArtifact {
         artifact_id: row.try_get("artifact_id")?,
@@ -128,6 +143,121 @@ mod tests {
 
     fn validated() -> ValidatedSvg {
         phoenix_svg::validate(SVG).unwrap()
+    }
+
+    fn interrupted_svg_state(staging: &std::path::Path, cancelling: bool) -> crate::ConvState {
+        use crate::{ConvState, ToolResult};
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, PresentSvgInput, ToolCall, ToolInput,
+        };
+
+        let input = PresentSvgInput {
+            path: staging.to_str().unwrap().into(),
+            title: "Chart".into(),
+            description: "A retained chart".into(),
+        };
+        let assistant = AssistantMessage::new(
+            "current-assistant".into(),
+            vec![
+                ContentBlock::tool_use("done", "think", serde_json::json!({"thoughts": "ready"})),
+                ContentBlock::tool_use("svg", "present_svg", serde_json::to_value(&input).unwrap()),
+            ],
+            None,
+            None,
+        );
+        let completed_results = vec![ToolResult::success("done".into(), "Ready".into())];
+        if cancelling {
+            ConvState::CancellingTool {
+                tool_use_id: "svg".into(),
+                skipped_tools: vec![],
+                completed_results,
+                assistant_message: assistant,
+                pending_sub_agents: vec![],
+            }
+        } else {
+            ConvState::ToolExecuting {
+                current_tool: ToolCall::new("svg", ToolInput::PresentSvg(input)),
+                remaining_tools: vec![],
+                completed_results,
+                pending_sub_agents: vec![],
+                assistant_message: assistant,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_only_committed_svg_invocation_after_staging_is_deleted() {
+        use crate::MessageContent;
+
+        for cancelling in [false, true] {
+            for stored_assistant in [None, Some("older-assistant"), Some("current-assistant")] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("restart.db");
+                let staging = directory.path().join("chart.svg");
+                std::fs::write(&staging, SVG).unwrap();
+                let db = Database::open(path.to_str().unwrap()).await.unwrap();
+                crate::migrations::run_pending_migrations(db.pool())
+                    .await
+                    .unwrap();
+                db.create_conversation("owner", "owner", "/tmp", true, None, None)
+                    .await
+                    .unwrap();
+                let state = interrupted_svg_state(&staging, cancelling);
+                db.update_conversation_state("owner", &state).await.unwrap();
+                let published = if let Some(assistant_id) = stored_assistant {
+                    Some(
+                        db.publish_svg_artifact(
+                            "owner",
+                            &SvgInvocationId::new(assistant_id, "svg"),
+                            "Chart",
+                            "A retained chart",
+                            &validated(),
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                std::fs::remove_file(&staging).unwrap();
+                db.pool().close().await;
+                let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+                crate::migrations::run_pending_migrations(reopened.pool())
+                    .await
+                    .unwrap();
+                reopened.reset_all_to_idle().await.unwrap();
+                reopened.reset_all_to_idle().await.unwrap();
+                let messages = reopened.get_messages("owner").await.unwrap();
+                assert_eq!(messages.len(), 3);
+                assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content == "Ready" && !tool.is_error)));
+                let tool = messages
+                    .iter()
+                    .find_map(|message| match &message.content {
+                        MessageContent::Tool(tool) if tool.tool_use_id == "svg" => Some(tool),
+                        _ => None,
+                    })
+                    .unwrap();
+                if stored_assistant == Some("current-assistant") {
+                    assert!(!tool.is_error);
+                    let reference: phoenix_svg::SvgArtifactReference =
+                        serde_json::from_str(&tool.content).unwrap();
+                    assert_eq!(reference, published.unwrap().into_reference());
+                    assert_eq!(
+                        reopened
+                            .svg_artifact("owner", &reference.artifact_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .bytes,
+                        SVG
+                    );
+                } else {
+                    assert!(tool.is_error);
+                    assert!(tool.content.contains("interrupted by server restart"));
+                }
+            }
+        }
     }
 
     #[tokio::test]
