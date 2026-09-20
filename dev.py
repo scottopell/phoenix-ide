@@ -4151,7 +4151,7 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("TASKS")
         if p.startswith("specs/"):
             cats.add("SPECS")
-        if p.startswith("tests/devpy/"):
+        if p.startswith("tests/devpy/") or p.startswith("tests/integration/"):
             cats.add("DEVTOOLS")
         if p == "scripts/check_rust_test_timing.py":
             cats.update({"ASTGREP", "DEVTOOLS"})
@@ -4164,8 +4164,6 @@ def _categorize_changed_paths(paths) -> set:
             "scripts/launchd_restart_helper.py",
             "scripts/python_unittest_profile.py",
             "scripts/systemd_deploy_helper.py",
-            "tests/integration/fixture_runtime.py",
-            "tests/integration/systemd_vm_harness.py",
             ".python-version",
             "Cargo.toml",
             "Cargo.lock",
