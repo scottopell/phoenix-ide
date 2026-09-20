@@ -4,9 +4,9 @@
 
 ## Result
 
-The current command has 13 path-gated, sequential lanes. The default invocation for this documentation-only branch selected only always-on task validation and took **0.47 s process wall / 0.14 s internal check wall**. A non-profiled, all-lane warm invocation took **491.1 s**; it retained one load-sensitive tmux cleanup failure and canceled 1,689 later Rust tests, so its Rust execution time is a lower bound. The profiler materially changes Rust execution (one wrapper per test), so its **1,073.8 s** full run is used only for complete per-lane shares and explicitly not as ordinary warm performance.
+The current command has 13 path-gated, sequential lanes. A **profile-enabled path-selection sample** for this documentation-only branch selected task validation and took **0.47 s process wall / 0.14 s internal check wall**; plain unprofiled default-check cost was not measured. A non-profiled, all-lane warm invocation took **491.1 s**; it retained one load-sensitive tmux cleanup failure and canceled 1,689 later Rust tests, so its Rust execution time is a lower bound. The profiler materially changes Rust execution (one wrapper per test), so its **1,073.8 s** full run is used only for complete per-lane shares and explicitly not as ordinary warm performance.
 
-There is no current-source cold measurement: the only naturally empty target was consumed at stale head `bac41074c` before the source correction. That sample is retained below as historical context, not current evidence. The highest-ROI policy is the existing one: cheap task validation always on; every substantive lane conditional on relevant paths; CI runs the same groups. No gate should be removed from this evidence.
+There is no current-source cold measurement: the only naturally empty target was consumed at stale head `bac41074c` before the source correction. That sample is retained below as historical context, not current evidence. The highest-ROI policy is the existing one: cheap task validation is included in unfiltered local plans and has a dedicated CI job; explicit `--lanes` filtering includes it only when callers request `task` (or `fast`); every substantive lane is conditional on relevant paths. No gate should be removed from this evidence.
 
 ## Evidence and caveats
 
@@ -34,7 +34,7 @@ Current profiled critical path was 1,073.8 s; lane records sum to 1,072.7 s (99.
 | `spec-shape` | Validate spEARS v2 artifact shape, then run all `tests/devpy` orchestration/deployment/check tests. | 34.7 s ordinary; profile 149.5 s, **13.9%**. Cold: unknown. | 28/50 (56%) | Python/uv caches are shared host state and not attributable; no material worktree output. | CI `check (ui/specs)`; shape validation is unique, while dev.py tests protect the check/deploy/task machinery itself. | **Conditional (retain).** The 35 s cost is dominated by distinct dev.py regression tests. A future split could improve attribution, but consolidation/removal has no proven protection-preserving saving. |
 | `spec-anchors` | Cross-check code `REQ-*` references against declarations. | 0.6 s; profile 0.6 s, **0.1%**. Cold: cache-independent. | 46/50 (92%) | None. | CI `check (ui/specs)`; intentionally spans specs, Rust, and UI; shape validation cannot catch orphan code anchors. | **Conditional (retain).** Very frequent but sub-second and unique. |
 | `e2e` | Build/run a real Phoenix binary and drive HTTP/SSE scenarios with isolated DB/mock model. | 48.8 s; profile 53.4 s, **5.0%**. Cold: unknown. | 32/50 (64%) | Reuses normal `target/debug` dependencies but must link non-test binary; incremental bytes cannot be separated safely from Rust lane in the shared tree. | Dedicated CI `check (e2e)`; overlaps user journeys but uniquely crosses binary/API/SSE/process boundaries. | **Conditional (retain).** CI-only saves ~49 s on Rust/E2E changes but removes the only local real-binary boundary gate. |
-| `task` | Validate task filename grammar and global ID uniqueness. Always on. | 0.0 s (12 ms profile); **<0.1%**. | 50/50 (100%) | None. | CI `check (task validation)` plus roadmap reducer test. No substitute. | **Retain local always-on.** Negligible cost; it caught the intentionally plain approval brief until that proposal artifact was removed after approval. |
+| `task` | Validate task filename grammar and global ID uniqueness. Included in every unfiltered plan; explicit `--lanes` filtering removes it unless `task` or the `fast` alias is requested. | 0.0 s (12 ms profile); **<0.1%**. | 50/50 (100%) in the simulated unfiltered plans. | None. | CI has a dedicated `check (task validation)` job plus roadmap reducer test, independent of other lane filters. No substitute. | **Retain in unfiltered local plans and dedicated CI.** Filtered callers wanting it must include `task`/`fast`. Negligible cost. |
 | `pkglock` | Run `git status --porcelain -- ui/pnpm-lock.yaml` and fail if that one file is dirty. This is only an uncommitted-lockfile tripwire: it does not validate package/lock consistency or predict whether a clean frozen install succeeds. | <0.1 s; profile 0.1 s, **<0.1%**. Cold: cache-independent. | 27/50 (54%) | None. | CI `check (ui/specs)` runs this same dirty-file predicate after checkout; its separate `pnpm install --frozen-lockfile` step provides package/lock consistency protection. | **Conditional (retain).** Near-zero cost for the exact dirty-file predicate. |
 
 ### Shared UI dependency footprint
@@ -58,9 +58,9 @@ The workflow triggers on every PR and pushes to `main`. On PRs, `plan check lane
 
 **Unique protection:** compilation of the production-only `phoenix_ide/datadog-tracing` feature for Linux musl, target-specific `cfg`/dependency compatibility, and native C build configuration. Because this is `cargo check`, it does **not** prove final static linking or runtime behavior; release workflow builds both x86_64/aarch64 musl artifacts and supplies compilers.
 
-**Measured devmbp capability/cost:** the repository-declared Rust std target was already installed and occupies **222,708 KiB allocated (217.5 MiB)**. It is part of the audited host/toolchain baseline, not incremental local-lane cost. Neither `musl-gcc` nor `x86_64-linux-musl-gcc` was installed. One exact-command attempt failed honestly after **10.33 s** at `aws-lc-sys` because `x86_64-linux-musl-gcc` was absent. The failed attempt allocated **51,260 KiB (50.1 MiB)** under `target/x86_64-unknown-linux-musl` plus 107,208 KiB in shared `target/debug`; this is a lower bound, not successful-musl footprint. Incremental local cost is therefore a cross compiler plus isolated build artifacts (**>50.1 MiB observed**); successful current-source wall time and successful artifact cost are **unknown on devmbp**. Installing a cross compiler solely to complete this audit was not necessary and would have changed host-global state.
+**Measured devmbp capability/cost:** the repository-declared Rust std target was already installed and occupies **222,708 KiB allocated (217.5 MiB)**. It is part of the audited host/toolchain baseline, not incremental local-lane cost. Neither `musl-gcc` nor `x86_64-linux-musl-gcc` was installed. One exact-command attempt failed honestly after **10.33 s** at `aws-lc-sys` because `x86_64-linux-musl-gcc` was absent. The failed attempt allocated **51,260 KiB (50.1 MiB)** under `target/x86_64-unknown-linux-musl` plus 107,208 KiB in shared `target/debug`; this is a lower bound, not successful-musl footprint. The failed attempt's total observed artifact delta was at least **158,468 KiB (154.8 MiB)** across the isolated target tree and shared debug tree; attribution overlap was not established. Incremental local cost is therefore a cross compiler plus at least that observed artifact delta; successful current-source wall time and successful artifact cost are **unknown on devmbp**. Installing a cross compiler solely to complete this audit was not necessary and would have changed host-global state.
 
-**Recommendation: CI-only (retain existing placement).** Removing it from local `check` saves **0 s** because it is already absent. Adding it locally would require a cross compiler and >50.1 MiB observed additional build artifacts; the pre-existing 217.5 MiB Rust target is not an incremental charge. CI provides relevant Linux tooling and observed pre-merge execution; the tradeoff is delayed feedback after Rust tests. Keep release builds as the stronger final-link protection. Do not claim the historical 8.6 s figure as current.
+**Recommendation: CI-only (retain existing placement).** Removing it from local `check` saves **0 s** because it is already absent. Adding it locally would require a cross compiler and at least 154.8 MiB observed additional artifacts from the failed attempt; the pre-existing 217.5 MiB Rust target is not an incremental charge. CI provides relevant Linux tooling and observed pre-merge execution; the tradeoff is delayed feedback after Rust tests. Keep release builds as the stronger final-link protection. Do not claim the historical 8.6 s figure as current.
 
 ## CI mapping and recommendation summary
 
@@ -72,7 +72,7 @@ Exact workflow mapping at `bed747b5`:
 - `check (ui/specs)`: `tsc,ui-lint,vitest,ast-grep,allium,spec-shape,spec-anchors,pkglock`.
 - `check (task validation)`: `task` (and a separate roadmap reducer test).
 
-All jobs are merge-time PR checks subject to the current path plan; all groups run on pushes to `main`. The current local design already captures the measurable ROI: an unchanged/docs-only branch paid 0.47 s instead of roughly 491 s, while relevant edits select their distinct gates. Recommended changes to gates: **none**. Potential follow-up investigations—not changes commissioned here—are load-sensitive tmux cleanup tests and whether `spec-shape` should be renamed/split solely for clearer ownership; neither has evidence supporting removal or CI-only conversion.
+All jobs are merge-time PR checks subject to the current path plan; all groups run on pushes to `main`. The current local design already captures the measurable ROI: a profile-enabled docs-only path-selection sample took 0.47 s while the non-profiled all-lane warm run took roughly 491 s (not a like-for-like overhead comparison), while relevant edits select their distinct gates. Recommended changes to gates: **none**. Potential follow-up investigations—not changes commissioned here—are load-sensitive tmux cleanup tests and whether `spec-shape` should be renamed/split solely for clearer ownership; neither has evidence supporting removal or CI-only conversion.
 
 ## Reproduction procedure
 
@@ -90,7 +90,15 @@ mkdir -p target/check-roi-audit
 
 ### Plans, timed checks, and logs
 
-`/usr/bin/time -lp` writes process wall/resource data into each named log through `tee`; `--profile-work` writes command/lane/step JSON under the named profile directory.
+`/usr/bin/time -lp` writes process wall/resource data into each named log through `tee`; `--profile-work` writes command/lane/step JSON under the named profile directory. Each timed pipeline below is a **separate shell invocation with the fail-closed preamble above**. This is necessary because the retained full runs and musl attempt return nonzero; they must reach their natural endpoint and record that status without allowing one expected failure to suppress later independent samples. After the host/path guard succeeds, wrap each one pipeline as shown so only its expected nonzero status is captured; the next sample starts in a new fail-closed shell:
+
+```bash
+set +e
+/usr/bin/time -lp COMMAND 2>&1 | tee LOG
+rc=${PIPESTATUS[0]}
+set -e
+printf 'exit=%s\n' "$rc"
+```
 
 ```bash
 ./dev.py check-plan --all --format json \
@@ -138,7 +146,7 @@ snapshot_disk() {
 
 ### Current-classifier simulation over 50 first-parent commits
 
-This standalone simulation transcribes `_categorize_changed_paths`, `_LANE_INPUTS`, the `SELF` rule, and always-on `task` from audited `dev.py`; it evaluates each commit against its first parent rather than PR aggregates. The explicit `sha^` comparison also gives merge commits first-parent semantics. Recomputing the pinned cohort with that form produced the same published counts.
+This standalone simulation transcribes `_categorize_changed_paths`, `_LANE_INPUTS`, the `SELF` rule, and unfiltered-plan `task` inclusion from audited `dev.py`; it evaluates each commit against its first parent rather than PR aggregates. The explicit `sha^` comparison also gives merge commits first-parent semantics. Recomputing the pinned cohort with that form produced the same published counts.
 
 ```bash
 python3 - <<'PY' > target/check-roi-audit/commit-frequency.json
