@@ -70,6 +70,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_touch-reactions-dock-away-from-native-selection.md) | Touch reactions dock away from native selection | Accepted | REQ-PF-018, REQ-PF-020 |
 
 ## For agents: which decisions bind your task
 

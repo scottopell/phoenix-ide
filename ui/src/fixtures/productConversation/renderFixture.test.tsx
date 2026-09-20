@@ -23,7 +23,11 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
-  it('appends two source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
+  it('appends two touch-docked source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      matches: query === '(any-pointer: coarse)', media: query, onchange: null,
+      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    }));
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
       return this.id === 'messages' ? 800 : 0;
     });
@@ -51,12 +55,16 @@ describe('ProductConversationFixture', () => {
         expect(found).not.toBeNull();
         return found!;
       });
+      fireEvent.pointerDown(paragraph, { pointerType: 'touch' });
       const range = document.createRange();
       range.selectNodeContents(paragraph);
       window.getSelection()!.removeAllRanges();
       window.getSelection()!.addRange(range);
       fireEvent(document, new Event('selectionchange'));
-      const reactionInput = await screen.findByRole('textbox', { name: 'Your reaction' });
+      const dock = await screen.findByRole('region', { name: 'Docked reaction' });
+      const reactionInput = screen.getByRole('textbox', { name: 'Your reaction' });
+      expect(dock).toBeInTheDocument();
+      expect(reactionInput).not.toHaveFocus();
       fireEvent.change(reactionInput, { target: { value: reaction } });
       fireEvent.click(screen.getByRole('button', { name: 'Add to draft' }));
     }
@@ -102,7 +110,7 @@ describe('ProductConversationFixture', () => {
     expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).toBeNull();
     const quote = 'Preserve the user’s draft';
     act(() => {
-      reactionStore.dispatch(snapshot.product_conversation_id, { type: 'select', source: {
+      reactionStore.dispatch(snapshot.product_conversation_id, { type: 'select', presentation: 'floating', source: {
         messageId: 'reaction-answer-older', sequenceId: 2,
         occurrenceToken: 'reaction-history:reaction-answer-older', quote,
         textAnchor: {

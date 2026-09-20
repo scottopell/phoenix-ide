@@ -47,7 +47,10 @@
   --breadcrumb-height: 36px;
   --input-area-height: 60px;
   --offline-banner-height: 36px;
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
 
   /* Per-line shading for the Pierre file code view, injected via unsafeCSS.
    * Custom properties pierce the shadow boundary into Pierre's rendered rows. */

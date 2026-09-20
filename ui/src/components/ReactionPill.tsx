@@ -5,10 +5,11 @@ import { restoreReactionRange } from './reactionRange';
 import { useFocusScope, useKeyboardRouterShortcut, useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ReactionPill.css';
 
-export function ReactionPill({ source, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
+export function ReactionPill({ source, sourceRange, touchDocked = false, captureSource, bubbleRef, scopeId, body, available, onChange, onAdd, onClose, returnToSource }: ReactionPillProps) {
   useRegisterFocusScope(scopeId);
   const { activeScope } = useFocusScope();
-  const [docked, setDocked] = useState(false);
+  const [sourceDocked, setSourceDocked] = useState(false);
+  const docked = touchDocked || sourceDocked;
   const [discard, setDiscard] = useState(false);
   const [error, setError] = useState('');
   const returning = useRef(false);
@@ -53,17 +54,25 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
   useLayoutEffect(() => {
     const el = bubbleRef.current;
     const scroller = document.getElementById('messages');
+    const composer = document.getElementById('input-area');
     if (!el || !scroller) return;
     let frame = 0;
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
-      const left = viewport?.offsetLeft ?? 0;
-      const top = viewport?.offsetTop ?? 0;
-      const width = viewport?.width ?? window.innerWidth;
-      const bottom = top + (viewport?.height ?? window.innerHeight);
+      const styles = getComputedStyle(document.documentElement);
+      const safeTop = Number.parseFloat(styles.getPropertyValue('--safe-area-top')) || 0;
+      const safeRight = Number.parseFloat(styles.getPropertyValue('--safe-area-right')) || 0;
+      const safeBottom = Number.parseFloat(styles.getPropertyValue('--safe-area-bottom')) || 0;
+      const safeLeft = Number.parseFloat(styles.getPropertyValue('--safe-area-left')) || 0;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const left = viewportLeft + safeLeft;
+      const top = viewportTop + safeTop;
+      const width = (viewport?.width ?? window.innerWidth) - safeLeft - safeRight;
+      const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
       const transcript = scroller.getBoundingClientRect();
-      const range = restoreReactionRange(source);
+      const range = restoreReactionRange(source) ?? sourceRange;
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;
@@ -73,17 +82,21 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       const visibleTop = Math.max(top, transcript.top);
       const visibleBottom = Math.min(bottom, transcript.bottom);
       const visible = Boolean(rect && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom);
-      setDocked(!visible);
-      el.style.width = `${Math.min(420, width - 24)}px`;
+      setSourceDocked(!visible);
+      const pillWidth = Math.min(420, width - 24);
+      el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
       let y = Math.min(visibleBottom, bottom) - height - 12;
-      let x = transcript.right - Math.min(420, width - 24) - 12;
-      if (visible && rect) {
+      let x = transcript.right - pillWidth - 12;
+      if (touchDocked) {
+        const composerTop = composer?.getBoundingClientRect().top ?? bottom;
+        y = Math.min(bottom, composerTop) - height - 12;
+      } else if (visible && rect) {
         x = rect.left;
         y = rect.bottom + 16;
         if (y + height > visibleBottom - 8) y = rect.top - height - 16;
       }
-      el.style.left = `${Math.max(left + 12, Math.min(x, left + width - Math.min(420, width - 24) - 12))}px`;
+      el.style.left = `${Math.max(left + 12, Math.min(x, left + width - pillWidth - 12))}px`;
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
@@ -93,6 +106,9 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
     const resize = new ResizeObserver(schedule);
     resize.observe(scroller);
     resize.observe(el);
+    const sourceOwner = restoreReactionRange(source)?.commonAncestorContainer.parentElement?.closest('[data-inline-reaction-message]');
+    if (sourceOwner) resize.observe(sourceOwner);
+    if (composer) resize.observe(composer);
     window.addEventListener('scroll', schedule, true);
     window.addEventListener('resize', schedule);
     window.visualViewport?.addEventListener('resize', schedule);
@@ -106,7 +122,7 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
       window.visualViewport?.removeEventListener('resize', schedule);
       window.visualViewport?.removeEventListener('scroll', schedule);
     };
-  }, [source, bubbleRef]);
+  }, [source, sourceRange, touchDocked, bubbleRef]);
 
   useEffect(() => {
     if (!docked) setError('');
@@ -146,20 +162,28 @@ export function ReactionPill({ source, bubbleRef, scopeId, body, available, onCh
         </>
       ) : (
         <>
-          {docked ? (
+          {sourceDocked && !touchDocked ? (
             <button type="button" className="reaction-pill-return" onClick={returnToPassage} disabled={returnPending} title={error || source.quote}>
               <ArrowUpRight size={18} aria-hidden="true" />
               <span>{returnPending ? 'Returning to passage…' : error || `Return to passage · ${body || source.quote}`}</span>
             </button>
           ) : (
             <>
+              {touchDocked && (sourceDocked ? (
+                <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onClick={returnToPassage} disabled={returnPending}>
+                  {returnPending ? 'Returning…' : `“${source.quote}”`}
+                </button>
+              ) : (
+                <span className="reaction-pill-source" title={source.quote}>“{source.quote}”</span>
+              ))}
               <input
                 ref={inputRef}
                 type="text"
                 aria-label="Your reaction"
-                placeholder="Your reaction… (Enter to focus)"
+                placeholder={touchDocked ? 'React to selection…' : 'Your reaction… (Enter to focus)'}
                 title={available ? source.quote : 'Draft unavailable. Your reaction is retained.'}
                 value={body}
+                onPointerDown={captureSource}
                 onChange={(event) => onChange(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.nativeEvent.isComposing || event.keyCode === 229) return;
