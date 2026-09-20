@@ -189,6 +189,8 @@ surface DesktopReleaseWorkflow {
 --   stable publication metadata is prerelease=false and make_latest=true unless a
 --   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
+-- publication_is_serialized(publication) -> Boolean
+--   publication verification and mutation hold one sole-writer gate across tags.
 -- public_release_differs(publication) -> Boolean
 --   a public release exists but is not the exact required release.
 -- release_absent_for_identity(identity) -> Boolean
@@ -322,6 +324,7 @@ rule VerifiedInaccessiblePublicationBecomesPublic {
     requires: exact_inaccessible_assets_and_digests(publication)
     requires: required_architecture_pairs_validated(publication)
     requires: publication_channel_is_exact(publication)
+    requires: publication_is_serialized(publication)
     ensures: publication.state = public
     ensures: publication.failure_domain = none
 }

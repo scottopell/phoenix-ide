@@ -78,6 +78,10 @@ if not build_macos_job.startswith('    environment: macos-release-signing\n'):
     raise SystemExit('macOS signing must use the protected macos-release-signing environment')
 if not publish_job.startswith('    needs: [gate, build-linux, build-macos]\n    environment: macos-release-signing\n'):
     raise SystemExit('release publication must use the protected macos-release-signing environment')
+if 'concurrency:\n      group: publish-release-assets\n      cancel-in-progress: false' not in publish_job:
+    raise SystemExit('release publication must be serialized across tags')
+if 'publish-release-assets-${{ needs.gate.outputs.tag }}' in publish_job:
+    raise SystemExit('tag-specific publication concurrency permits stable latest races')
 if 'concurrency:\n      group: release-tag-gate\n      cancel-in-progress: false' not in workflow.split('\n  build-linux:', 1)[0]:
     raise SystemExit('release tag validation and creation must be serialized')
 if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
@@ -116,7 +120,7 @@ for fragment in [
     '[[ "$channel" == "$tag_channel" ]]',
     'gh api "repos/$repo/releases/latest" --jq .tag_name',
     'https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$name',
-    'validate-new-from-tags "$version"',
+    '"$PYTHON3" "$SCRIPT_DIR/release_version.py" validate-new-from-tags "$release_version"',
     '-F prerelease="$expected_prerelease"',
     '-f make_latest="$make_latest"',
 ]:

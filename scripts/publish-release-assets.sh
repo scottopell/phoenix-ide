@@ -194,7 +194,7 @@ assert_stable_is_newest_before_publication() {
         [[ ${statuses[0]} -eq 0 && ${statuses[1]} -eq 4 ]] || return 1
       }
   [[ ! -s "$public_stable_tags" ]] && return 0
-  "$SCRIPT_DIR/release_version.py" validate-new-from-tags "$version" \
+  "$PYTHON3" "$SCRIPT_DIR/release_version.py" validate-new-from-tags "$release_version" \
     <"$public_stable_tags" >/dev/null || {
       echo "error: refusing to make older stable release $tag latest over a newer public stable release" >&2
       return 1
