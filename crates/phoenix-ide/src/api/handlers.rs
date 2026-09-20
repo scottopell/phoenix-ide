@@ -5960,7 +5960,10 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         ))));
     }
 
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+            .await?;
 
     if let Err(error) = state
         .runtime
@@ -6001,6 +6004,7 @@ async fn scope_still_owned_after_delete(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
@@ -6037,7 +6041,9 @@ async fn scope_still_owned_after_delete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
-        candidate.id != id && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
+        candidate.id != id
+            && !deleting_conversation_ids.contains(&candidate.id)
+            && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
     }))
 }
 
@@ -6129,16 +6135,10 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
 /// last live conversation on the scope is the one being deleted, every
 /// cascade tears down. Projects retains a conv-shaped API: it inspects
 /// `conv.conv_mode` for the branch/worktree mode discriminant.
-pub(super) async fn run_resource_cleanup_cascade(
-    state: &AppState,
-    conv: &crate::db::Conversation,
-) -> Result<ResourceCleanupReceipt, AppError> {
-    run_runtime_resource_cleanup_cascade(&state.runtime, conv).await
-}
-
 pub(crate) async fn run_runtime_resource_cleanup_cascade(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
     let resolved_authority =
@@ -6150,7 +6150,9 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let scope_still_owned = scope_still_owned_after_delete(runtime, conv, &work_scope).await?;
+    let scope_still_owned =
+        scope_still_owned_after_delete(runtime, conv, &work_scope, deleting_conversation_ids)
+            .await?;
     let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
@@ -6317,9 +6319,19 @@ pub(super) enum PreparedHardDelete {
     },
 }
 
+impl PreparedHardDelete {
+    pub(super) fn release_authority(self) -> Option<Box<crate::db::Conversation>> {
+        match self {
+            Self::AlreadyDeleted => None,
+            Self::Ready { conversation, .. } => Some(conversation),
+        }
+    }
+}
+
 pub(super) async fn prepare_hard_delete_cascade(
     state: &AppState,
     id: &str,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<PreparedHardDelete, AppError> {
     let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
@@ -6421,7 +6433,9 @@ pub(super) async fn prepare_hard_delete_cascade(
     // retry. Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, deleting_conversation_ids)
+            .await?;
 
     Ok(PreparedHardDelete::Ready {
         conversation: Box::new(conv),
@@ -6442,9 +6456,16 @@ pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &Pre
 }
 
 pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: PreparedHardDelete) {
-    let PreparedHardDelete::Ready { conversation, .. } = prepared else {
+    let Some(conversation) = prepared.release_authority() else {
         return;
     };
+    finish_hard_deleted_conversation(state, conversation).await;
+}
+
+pub(super) async fn finish_hard_deleted_conversation(
+    state: &AppState,
+    conversation: Box<crate::db::Conversation>,
+) {
     let id = conversation.id.clone();
     retire_work_scope_after_hard_delete(state, &conversation).await;
     delete_conversation_attachments(&id).await;
@@ -6452,7 +6473,8 @@ pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: Prep
 }
 
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    let prepared = prepare_hard_delete_cascade(state, id).await?;
+    let deleting_conversation_ids = std::collections::HashSet::from([id.to_string()]);
+    let prepared = prepare_hard_delete_cascade(state, id, &deleting_conversation_ids).await?;
     if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
         return Ok(());
     }
@@ -9510,9 +9532,14 @@ pub(crate) mod hard_delete_cascade_tests {
         create_approved_explore(&state, id).await;
         let conversation = state.db.get_conversation(id).await.expect("conversation");
 
-        let receipt = super::run_runtime_resource_cleanup_cascade(&state.runtime, &conversation)
-            .await
-            .expect("lifecycle cleanup");
+        let deleting_conversation_ids = std::collections::HashSet::from([conversation.id.clone()]);
+        let receipt = super::run_runtime_resource_cleanup_cascade(
+            &state.runtime,
+            &conversation,
+            &deleting_conversation_ids,
+        )
+        .await
+        .expect("lifecycle cleanup");
         assert_eq!(
             receipt.work_scope,
             crate::resource_authority::resolve_resource_authority(&state.db, &conversation)
@@ -15140,7 +15167,10 @@ pub(crate) mod hard_delete_cascade_tests {
         // must propagate rather than swallow to "assume live".
         state.db.pool().close().await;
 
-        let result = run_resource_cleanup_cascade(&state, &conv).await;
+        let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+        let result =
+            run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+                .await;
 
         assert!(
             matches!(result, Err(AppError::Internal(_))),

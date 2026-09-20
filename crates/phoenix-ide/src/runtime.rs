@@ -3731,8 +3731,13 @@ impl RuntimeManager {
             barrier.wait().await;
             barrier.wait().await;
         }
-        if let Err(error) =
-            crate::api::handlers::run_runtime_resource_cleanup_cascade(self, conv).await
+        let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+        if let Err(error) = crate::api::handlers::run_runtime_resource_cleanup_cascade(
+            self,
+            conv,
+            &deleting_conversation_ids,
+        )
+        .await
         {
             tracing::warn!(
                 conv_id = %conv.id,
