@@ -1373,6 +1373,7 @@ async fn render_message_page_bounded_as(
     let mut encoded_content_bytes = 0usize;
     let mut page_start: Option<PreviousReadPageStart> = None;
     let mut next_cursor = None;
+    let mut last_completed_position: Option<PreviousReadPosition> = None;
     let mut after_sequence = None;
     let mut cursor_pending = cursor.message_id.is_some();
     let mut target_only = initial_read_target(db, &conv.id, &cursor).await?;
@@ -1412,12 +1413,7 @@ async fn render_message_page_bounded_as(
                 continue;
             }
             if encoded_content_bytes >= PREVIOUS_READ_CONTENT_JSON_BYTES {
-                next_cursor = Some(PreviousReadPosition {
-                    message_sequence: message.sequence_id,
-                    byte_offset: 0,
-                    message_id: Some(message.message_id.clone()),
-                    rendered_sha256: None,
-                });
+                next_cursor = last_completed_position.clone();
                 break;
             }
             if message.message_id.len() > PREVIOUS_TITLE_BYTES
@@ -1496,6 +1492,14 @@ async fn render_message_page_bounded_as(
                 encoded_content_bytes = encoded_content_bytes.saturating_add(escaped_bytes);
                 line_offset = line_offset.saturating_add(ch.len_utf8());
             }
+            if next_cursor.is_none() {
+                last_completed_position = Some(PreviousReadPosition {
+                    message_sequence: message.sequence_id,
+                    byte_offset: line.len(),
+                    message_id: Some(message.message_id.clone()),
+                    rendered_sha256: Some(line_freshness),
+                });
+            }
             if next_cursor.is_some() {
                 break;
             }
@@ -1554,9 +1558,13 @@ fn resolve_predecessor_read_target(
             "requested transcript is not a predecessor of the executing transcript".to_string(),
         );
     };
-    let message_id = encoded_message_id
-        .map(percent_decode_url_component)
-        .transpose()?;
+    let message_id = if reference.contains("#message-") {
+        encoded_message_id
+            .map(percent_decode_url_component)
+            .transpose()?
+    } else {
+        encoded_message_id.map(str::to_string)
+    };
     Ok(ConversationReadTarget {
         conversation_id: conversation.id.clone(),
         message_id,
