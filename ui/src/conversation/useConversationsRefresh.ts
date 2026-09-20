@@ -26,6 +26,9 @@ export function subscribeToAggregateDeletionEvents(): () => void {
   const connect = () => {
     if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
     source = new EventSource('/api/product-conversations/events');
+    source.onopen = () => {
+      retryDelayMs = 1_000;
+    };
     source.addEventListener('conversation_hard_deleted', (event) => {
       let payload: unknown;
       try {
@@ -41,7 +44,6 @@ export function subscribeToAggregateDeletionEvents(): () => void {
           (id) => typeof id === 'string',
         )
       ) return;
-      retryDelayMs = 1_000;
       const data = payload as { conversation_id: string; deleted_conversation_ids: string[] };
       window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
         detail: {
@@ -53,6 +55,7 @@ export function subscribeToAggregateDeletionEvents(): () => void {
     source.onerror = () => {
       source?.close();
       source = null;
+      retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
       scheduleReconciliation();
     };
   };
@@ -68,7 +71,6 @@ export function subscribeToAggregateDeletionEvents(): () => void {
             row.product_conversation_id
           ))));
           notifyProductConversationListMayHaveChanged();
-          retryDelayMs = 1_000;
           connect();
         })
         .catch(() => {

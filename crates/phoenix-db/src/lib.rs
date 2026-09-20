@@ -9534,7 +9534,7 @@ impl Database {
                     if let Some(binding) = approved_binding {
                         let source_conversation_id: String = binding.get("source_conversation_id");
                         sqlx::query(
-                            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+                            "INSERT OR IGNORE INTO work_scope_git_repositories (work_scope_id, repository_id)
                              SELECT ?1, repository_id
                              FROM conversations source
                              JOIN work_scope_git_repositories repository
@@ -9546,7 +9546,7 @@ impl Database {
                         .execute(&mut *tx)
                         .await?;
                         sqlx::query(
-                            "INSERT INTO product_conversation_sources (
+                            "INSERT OR IGNORE INTO product_conversation_sources (
                                  target_product_conversation_id, source_product_conversation_id,
                                  source_conversation_id, relation_kind, relation_key, approved_title,
                                  approved_priority, approved_artifact_body, approved_task_title,
@@ -9758,6 +9758,63 @@ impl Database {
         Ok(())
     }
 
+    async fn materialize_approved_task_binding_before_source_deletion(
+        connection: &mut sqlx::SqliteConnection,
+        source_conversation_id: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_scope_git_repositories (work_scope_id, repository_id)
+             SELECT target.work_scope_id, repository.repository_id
+             FROM approved_task_creation_bindings binding
+             JOIN conversation_creation_jobs job ON job.id = binding.job_id
+             JOIN conversations target ON target.id = job.conversation_id
+             JOIN conversations source ON source.id = binding.source_conversation_id
+             JOIN work_scope_git_repositories repository
+               ON repository.work_scope_id = source.work_scope_id
+             WHERE binding.source_conversation_id = ?1",
+        )
+        .bind(source_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO product_conversation_sources (
+                 target_product_conversation_id, source_product_conversation_id,
+                 source_conversation_id, relation_kind, relation_key, approved_title,
+                 approved_priority, approved_artifact_body, approved_task_title,
+                 approved_plan, approved_task_file, created_at_us
+             ) SELECT target.product_conversation_id, binding.source_product_conversation_id,
+                      binding.source_conversation_id, 'approved_task', binding.task_id,
+                      binding.approved_title, binding.approved_priority,
+                      binding.approved_artifact_body, binding.task_title,
+                      binding.approved_plan, binding.approved_task_file, ?2
+               FROM approved_task_creation_bindings binding
+               JOIN conversation_creation_jobs job ON job.id = binding.job_id
+               JOIN conversations target ON target.id = job.conversation_id
+              WHERE binding.source_conversation_id = ?1",
+        )
+        .bind(source_conversation_id)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM approved_task_creation_bindings
+             WHERE source_conversation_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs job
+                   JOIN conversations target ON target.id = job.conversation_id
+                   JOIN product_conversation_sources source
+                     ON source.target_product_conversation_id = target.product_conversation_id
+                   WHERE job.id = approved_task_creation_bindings.job_id
+                     AND source.relation_kind = 'approved_task'
+                     AND source.relation_key = approved_task_creation_bindings.task_id
+               )",
+        )
+        .bind(source_conversation_id)
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_conversation_row_with_dependents(
         connection: &mut sqlx::SqliteConnection,
         conversation_id: &str,
@@ -9772,6 +9829,9 @@ impl Database {
         let Some(membership) = membership else {
             return Ok(None);
         };
+
+        Self::materialize_approved_task_binding_before_source_deletion(connection, conversation_id)
+            .await?;
 
         sqlx::query(
             "DELETE FROM workflows
@@ -10019,10 +10079,12 @@ impl Database {
                             .map_err(DbError::from)
                     })
                     .await;
-                crate::workflow::LocalAuthorityResult::DurableFactEstablished(match rollback {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(rollback_error),
-                })
+                match rollback {
+                    Ok(()) => {
+                        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error))
+                    }
+                    Err(_) => crate::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                }
             }
         }
     }
@@ -25173,6 +25235,19 @@ mod tests {
             .create_conversation("binding-source", "binding-source", "/tmp", true, None, None)
             .await
             .unwrap();
+        let source_scope = source.attached_work_scope_id.clone().unwrap();
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('binding-repository')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             VALUES (?1, 'binding-repository')",
+        )
+        .bind(source_scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "4056841909".to_string(),
             task_title: "Preserve provenance".to_string(),
@@ -25186,28 +25261,6 @@ mod tests {
             .create_task_approval_handoff_creation_job(&source.id, &approval)
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO product_conversation_sources (
-                 target_product_conversation_id, source_product_conversation_id,
-                 source_conversation_id, relation_kind, relation_key, created_at_us,
-                 approved_title, approved_priority, approved_artifact_body,
-                 approved_task_title, approved_plan, approved_task_file
-             ) VALUES (?1, ?2, ?3, 'approved_task', ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)",
-        )
-        .bind(target.product_conversation_id.as_str())
-        .bind(source.product_conversation_id.as_str())
-        .bind(&source.id)
-        .bind(&approval.task_id)
-        .bind(&approval.title)
-        .bind(serde_json::to_string(&approval.priority).unwrap())
-        .bind(&approval.artifact_body)
-        .bind(&approval.task_title)
-        .bind(&approval.plan)
-        .bind(&approval.task_file)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
         db.delete_conversation(&source.id).await.unwrap();
 
         let binding_count: i64 = sqlx::query_scalar(
@@ -25226,8 +25279,20 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
+        let target_repository: Option<String> = sqlx::query_scalar(
+            "SELECT repository.repository_id
+             FROM conversations target
+             JOIN work_scope_git_repositories repository
+               ON repository.work_scope_id = target.work_scope_id
+             WHERE target.id = ?1",
+        )
+        .bind(&target.id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
         assert_eq!(binding_count, 0);
         assert_eq!(provenance_count, 1);
+        assert_eq!(target_repository.as_deref(), Some("binding-repository"));
         assert!(db.get_conversation(&target.id).await.is_ok());
     }
 

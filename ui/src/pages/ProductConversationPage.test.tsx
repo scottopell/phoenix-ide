@@ -467,6 +467,23 @@ describe('ProductConversationPage', () => {
     expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
   });
 
+  it('defers authoritative absence for an unresolved legacy alias until canonical snapshot', async () => {
+    const { api } = await import('../api');
+    let resolveSnapshot: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
+    vi.mocked(api.getProductConversationSnapshot).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveSnapshot = resolve; }),
+    );
+    renderPage('/product-conversations/root-alias');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledOnce());
+
+    act(() => notifyProductConversationsReconciled(new Set(['pc-1'])));
+    expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
+
+    act(() => resolveSnapshot?.(makeSnapshot()));
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+    expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
+  });
+
   it('clears a writable snapshot when stream reconciliation proves the aggregate absent', async () => {
     renderPage();
     expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();

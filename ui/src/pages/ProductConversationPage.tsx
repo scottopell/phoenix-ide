@@ -764,6 +764,7 @@ function ProductConversationPageInner() {
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
   const aggregateDeletedRef = useRef(false);
+  const pendingAuthoritativeIdentitiesRef = useRef<ReadonlySet<string> | null>(null);
   const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
   if (openMeasurementRef.current?.routeReference !== productConversationId) {
     openMeasurementRef.current = productConversationId ? {
@@ -800,6 +801,7 @@ function ProductConversationPageInner() {
   useEffect(() => {
     routeGenerationRef.current += 1;
     aggregateDeletedRef.current = false;
+    pendingAuthoritativeIdentitiesRef.current = null;
     paginationRequestRef.current += 1;
     setLatestProjection(null);
     setRestoreCommand(null);
@@ -913,8 +915,13 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshot]);
 
   useEffect(() => subscribeProductConversationsReconciled((authoritativeIdentities) => {
-    const canonicalId = snapshot?.product_conversation_id ?? productConversationId;
-    if (!canonicalId || authoritativeIdentities.has(canonicalId)) return;
+    const canonicalId = snapshot?.product_conversation_id;
+    if (!canonicalId) {
+      pendingAuthoritativeIdentitiesRef.current = authoritativeIdentities;
+      return;
+    }
+    pendingAuthoritativeIdentitiesRef.current = null;
+    if (authoritativeIdentities.has(canonicalId)) return;
     aggregateDeletedRef.current = true;
     routeGenerationRef.current += 1;
     paginationRequestRef.current += 1;
@@ -922,7 +929,22 @@ function ProductConversationPageInner() {
     setLatestProjection(null);
     setLoading(false);
     setError('This product conversation was deleted.');
-  }), [productConversationId, snapshot?.product_conversation_id]);
+  }), [snapshot?.product_conversation_id]);
+
+  useEffect(() => {
+    const canonicalId = snapshot?.product_conversation_id;
+    const authoritativeIdentities = pendingAuthoritativeIdentitiesRef.current;
+    if (!canonicalId || !authoritativeIdentities) return;
+    pendingAuthoritativeIdentitiesRef.current = null;
+    if (authoritativeIdentities.has(canonicalId)) return;
+    aggregateDeletedRef.current = true;
+    routeGenerationRef.current += 1;
+    paginationRequestRef.current += 1;
+    setOwnedSnapshot(null);
+    setLatestProjection(null);
+    setLoading(false);
+    setError('This product conversation was deleted.');
+  }, [snapshot?.product_conversation_id]);
 
   useEffect(() => {
     const notificationIds = new Set([

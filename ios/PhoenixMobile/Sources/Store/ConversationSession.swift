@@ -388,12 +388,20 @@ final class ConversationSession {
 
     func beginArchiving() -> Bool {
         guard !isArchiving, outbox.visibleEntries.isEmpty else { return false }
-        isArchiving = true
+        setCloseAdmissionFenced(true)
         return true
     }
 
+    func setCloseAdmissionFenced(_ fenced: Bool) {
+        isArchiving = fenced
+        if fenced {
+            drainTask?.cancel()
+            drainTask = nil
+        }
+    }
+
     func endArchiving() {
-        isArchiving = false
+        setCloseAdmissionFenced(false)
     }
 
     /// Attempt delivery of every sendable entry, oldest first. Safe to call
@@ -401,7 +409,7 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard drainTask == nil, !isHardDeleted, deliveryAllowed else { return }
+        guard drainTask == nil, !isHardDeleted, !isArchiving, deliveryAllowed else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
