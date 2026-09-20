@@ -23,7 +23,7 @@ Current profiled critical path was 1,073.8 s; lane records sum to 1,072.7 s (99.
 
 | Lane | Exact purpose and distinct regression protection | Current ordinary warm; profiled share | Observed classifier frequency | Extra unique allocated disk / reuse | Local and CI overlap | Recommendation |
 |---|---|---:|---:|---|---|---|
-| `rust` | Nextest compile; ts-rs export/staleness; workspace tests excluding duplicate export tests (`lane_rust`). Protects compile/type contracts, generated Rust→TS parity, and ~4,043 unit/integration behaviors. | **≥289.7 s**: compile 19.3, codegen 17.8, tests ≥252.6. Profile: 695.7 s, **64.8%**. Cold: unknown. | 31/50 (62%) | Shares `target/debug` with E2E/focused Cargo work; no honest per-lane split. Current-source compilation/profile activity added 6.52 GiB to debug. Reused until sources/features/toolchain invalidate Cargo fingerprints. | CI `check (rust)`, PR path-gated and all main pushes; codegen overlaps UI only at typed boundary, not behavior. | **Conditional (retain current).** Avoids ≥290 s on non-Rust changes while retaining the broadest protection. Investigate tmux load sensitivity separately; do not weaken this gate. |
+| `rust` | Nextest compile; ts-rs export/staleness; tests excluding duplicate export tests (`lane_rust`). Ordinary gated checks scope `-p` to changed crates plus reverse dependencies when attribution is safe; `--all`, main pushes, and unsafe-to-narrow inputs run the full workspace. Protects compile/type contracts, generated Rust→TS parity, and behavior in that selected scope. | **Full-workspace `--all` ≥289.7 s**: compile 19.3, codegen 17.8, ≥1,683 tests completed before failure and 1,689 canceled. Profile: 695.7 s, **64.8%**. The repository's ~4,043 tests describe the full inventory, not every ordinary scoped invocation. Cold: unknown. | 31/50 (62%) | Shares `target/debug` with E2E/focused Cargo work; no honest per-lane split. Current-source compilation/profile activity added 6.52 GiB to debug. Reused until sources/features/toolchain invalidate Cargo fingerprints. | CI `check (rust)` is path-gated on PRs and crate-scoped when safe; main pushes force full. Codegen overlaps UI only at typed boundary, not behavior. | **Conditional (retain current).** Avoids full-workspace cost on non-Rust changes and may narrow relevant Rust changes while retaining reverse-dependent coverage. Investigate tmux load sensitivity separately; do not weaken this gate. |
 | `cargo-fmt` | `cargo fmt --check`; syntactic formatting drift. | 2.8 s; profile 3.8 s, **0.4%**. Cold: effectively cache-independent but not separately measured. | 31/50 (62%) | Negligible persistent output. | Same `check (rust)` job; no behavioral-test substitute. | **Conditional (retain).** Only ~3 s when Rust changes and distinct deterministic protection. |
 | `clippy` | `cargo clippy --all-targets -- -D warnings`; static/pedantic defects including tests. | 60.8 s; profile 88.6 s, **8.3%**. Cold: unknown. | 31/50 (62%) | Dedicated non-incremental `target/clippy`: stale natural build allocated **937,040 KiB (915 MiB)**; current refresh added 47,044 KiB. Isolation prevents clippy-driver invalidating Rust-test fingerprints; source/toolchain changes rebuild. | CI `check (clippy)`; overlaps compilation but catches lint classes tests do not. | **Conditional (retain).** CI-only would save ~61 s on Rust changes but delay static feedback; dedicated target trades ~915 MiB for avoiding cross-lane invalidation. |
 | `tsc` | `pnpm run typecheck` (`tsc -b --noEmit`); project-reference and `exactOptionalPropertyTypes` errors. | 0.5 s warm; profile 15.1 s, **1.4%**. Cold: unknown. | 27/50 (54%) | `--noEmit` emits no JS build tree, but composite mode persists `ui/node_modules/.tmp/{tsconfig.app,tsconfig.node}.tsbuildinfo` (422,879 + 51,919 bytes apparent in the measured state). These caches share `node_modules` and are invalidated/recomputed when TypeScript's tracked project inputs/options or the cache files change. | CI `check (ui/specs)`; ESLint/Vitest do not prove TS project-reference correctness. | **Conditional (retain).** The sub-second result is cache-assisted; protection remains unique. |
@@ -138,7 +138,7 @@ snapshot_disk() {
 
 ### Current-classifier simulation over 50 first-parent commits
 
-This is the exact standalone simulation used for the table. It transcribes `_categorize_changed_paths`, `_LANE_INPUTS`, the `SELF` rule, and always-on `task` from audited `dev.py`; it evaluates each commit diff rather than PR aggregates.
+This standalone simulation transcribes `_categorize_changed_paths`, `_LANE_INPUTS`, the `SELF` rule, and always-on `task` from audited `dev.py`; it evaluates each commit against its first parent rather than PR aggregates. The explicit `sha^` comparison also gives merge commits first-parent semantics. Recomputing the pinned cohort with that form produced the same published counts.
 
 ```bash
 python3 - <<'PY' > target/check-roi-audit/commit-frequency.json
@@ -173,7 +173,7 @@ shas = subprocess.check_output(
 counts = {lane: 0 for lane in lanes}; rows = []
 for sha in shas:
   paths = subprocess.check_output(
-    ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha], text=True
+    ['git', 'diff', '--name-only', f'{sha}^', sha], text=True
   ).splitlines()
   cats = categories(paths)
   active = (set(lanes) if 'SELF' in cats else
