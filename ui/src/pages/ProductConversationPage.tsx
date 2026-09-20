@@ -29,6 +29,7 @@ import {
   getProductConversationSnapshotChangeSequence,
   productConversationSnapshotChangedSince,
   subscribeCloseSnapshotChanged,
+  subscribeProductConversationDeleted,
   subscribeProductConversationSnapshotChanged,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
@@ -761,6 +762,7 @@ function ProductConversationPageInner() {
   const [historyGeneration, setHistoryGeneration] = useState(0);
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
+  const aggregateDeletedRef = useRef(false);
   const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
   if (openMeasurementRef.current?.routeReference !== productConversationId) {
     openMeasurementRef.current = productConversationId ? {
@@ -796,6 +798,7 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     routeGenerationRef.current += 1;
+    aggregateDeletedRef.current = false;
     paginationRequestRef.current += 1;
     setLatestProjection(null);
     setRestoreCommand(null);
@@ -806,6 +809,10 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     if (!productConversationId) return;
+    if (aggregateDeletedRef.current) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
     if (!isBackgroundRefresh) setLoading(true);
@@ -827,7 +834,7 @@ function ProductConversationPageInner() {
       : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     request
       .then((next) => {
-        if (cancelled) return;
+        if (cancelled || aggregateDeletedRef.current) return;
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
@@ -884,6 +891,25 @@ function ProductConversationPageInner() {
     }
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [productConversationId, snapshot?.product_conversation_id, snapshotRetry]);
+
+  useEffect(() => {
+    const identities = new Set([
+      productConversationId,
+      snapshot?.product_conversation_id,
+      snapshot?.latest_transcript_row_id,
+      snapshot?.canonical_root.transcript_row_id,
+      ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
+    ].filter((id): id is string => Boolean(id)));
+    return subscribeProductConversationDeleted(identities, () => {
+      aggregateDeletedRef.current = true;
+      routeGenerationRef.current += 1;
+      paginationRequestRef.current += 1;
+      setOwnedSnapshot(null);
+      setLatestProjection(null);
+      setLoading(false);
+      setError('This product conversation was deleted.');
+    });
+  }, [productConversationId, snapshot]);
 
   useEffect(() => {
     const notificationIds = new Set([

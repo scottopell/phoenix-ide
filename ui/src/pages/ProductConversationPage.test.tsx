@@ -16,7 +16,11 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
-import { notifyCloseSnapshotChanged, notifyProductConversationSnapshotChanged } from '../notifications';
+import {
+  notifyCloseSnapshotChanged,
+  notifyProductConversationDeleted,
+  notifyProductConversationSnapshotChanged,
+} from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -436,6 +440,30 @@ describe('ProductConversationPage', () => {
 
     expect(await screen.findByRole('heading', { name: 'Renamed Product' })).toBeInTheDocument();
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears a writable open snapshot when its aggregate is deleted', async () => {
+    renderPage();
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationDeleted('pc-1', ['row-1', 'row-2']));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+      mutationEnabled: false,
+      aggregateLifecycleOpen: false,
+    }));
+  });
+
+  it('clears an alias-routed writable snapshot when a deleted member matches', async () => {
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationDeleted('pc-other', ['row-2']));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
   });
 
   it('refreshes an alias route from canonical aggregate invalidation', async () => {
