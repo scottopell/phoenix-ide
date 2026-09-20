@@ -486,6 +486,7 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
   }
 
   if (viewportChanged) {
+    if (wasPinned && store.tailFollowAllowed) setScrollerScrollTop(store, totalPhysicalExtent(store));
     recompute(store);
     publish();
   }

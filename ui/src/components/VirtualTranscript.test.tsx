@@ -274,6 +274,27 @@ describe('VirtualTranscript', () => {
     expect(rowIndexes()).toEqual([14, 15, 16, 17, 18, 19]);
   });
 
+  it('advances a pinned tail when dock padding reserves viewport space', () => {
+    let scroller: HTMLDivElement | null = null;
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        items={makeItems(20, 10)}
+        getKey={(item) => item.id}
+        estimatedExtent={10}
+        overscan={0}
+        initialTail
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+    expect(scrollTopOf(scroller)).toBe(100);
+    scroller!.style.paddingBottom = '40px';
+    act(() => resizeObservers[0]!.triggerEntries([[scroller!, 60]]));
+    expect(scrollTopOf(scroller)).toBe(140);
+    expect(rowIndexes()).toEqual([14, 15, 16, 17, 18, 19]);
+  });
+
   it('positions an intra-row target through the transcript executor', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
