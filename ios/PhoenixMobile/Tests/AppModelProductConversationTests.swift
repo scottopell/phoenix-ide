@@ -595,6 +595,7 @@ final class AppModelProductConversationTests: XCTestCase {
             .appendingPathComponent("phoenix-close-repair-fence-tests-\(UUID().uuidString)")
         let model = AppModel()
         model.rebuildAPIForTesting()
+        model.cancelAggregateReconciliationForTesting()
         model.connectivity.setOnlineForTesting(true)
         let row = conversation(id: "latest", aggregateId: "product")
         model.listStore.upsert(row)
@@ -615,6 +616,7 @@ final class AppModelProductConversationTests: XCTestCase {
     func testActiveCloseFenceAppliesToSessionCreatedAfterRehydration() throws {
         let model = AppModel()
         model.rebuildAPIForTesting()
+        model.cancelAggregateReconciliationForTesting()
         let row = conversation(id: "latest", aggregateId: "product")
         model.listStore.upsert(row)
         model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
