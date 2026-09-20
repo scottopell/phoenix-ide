@@ -454,7 +454,9 @@ pub fn transition(
             error_kind: ErrorKind::ServerOverloaded,
             ..
         }
-    ) {
+    ) && !state.is_terminal()
+        && !matches!(state, ConvState::ContextExhausted { .. })
+    {
         return Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -1843,6 +1845,7 @@ fn continue_overload_after_mixed_transient(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_server_overload_retry(
     state: &CoreState,
     context: &ConvContext,

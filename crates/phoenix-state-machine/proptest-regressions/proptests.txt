@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83a52eef30e913823a35f666c3b9db9c7899ea3f20617cd001dfac933e980bb1 # shrinks to summary = "", event = LlmError { message: "a", error_kind: ServerOverloaded, attempt: 1, recovery_in_progress: false, resets_at: None }

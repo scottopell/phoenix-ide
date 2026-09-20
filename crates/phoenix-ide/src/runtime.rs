@@ -9947,6 +9947,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_materializes_persisted_continuation_operations() {
         let manager = Arc::new(test_manager().await);
         for (id, state) in [

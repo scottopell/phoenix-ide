@@ -7337,14 +7337,13 @@ where
             let result = if let Some(deadline) = overload_deadline {
                 let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
-                match tokio::time::timeout(remaining, provider).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
-                        Err(phoenix_llm::LlmError::server_overloaded(
-                            "Server overload retry deadline elapsed",
-                        ))
-                    }
+                if let Ok(result) = tokio::time::timeout(remaining, provider).await {
+                    result
+                } else {
+                    let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                    Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    ))
                 }
             } else {
                 provider.await
@@ -8553,14 +8552,13 @@ where
             let result = if let Some(deadline) = overload_deadline {
                 let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
-                match tokio::time::timeout(remaining, provider).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
-                        Err(phoenix_llm::LlmError::server_overloaded(
-                            "Server overload retry deadline elapsed",
-                        ))
-                    }
+                if let Ok(result) = tokio::time::timeout(remaining, provider).await {
+                    result
+                } else {
+                    let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
+                    Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    ))
                 }
             } else {
                 provider.await
