@@ -168,6 +168,25 @@ class CompilerCacheTests(unittest.TestCase):
                 self.assertRegex(socket_path.name, r"^[0-9a-f]{16}\.sock$")
             run.assert_called_once()
 
+    def test_auto_reports_missing_kache_before_sccache_fallback(self):
+        with mock.patch("builtins.print") as output:
+            selected, _ = self.configure(installed={"sccache"})
+        self.assertEqual("sccache", selected)
+        output.assert_any_call(
+            "  ⚠ kache unavailable; using sccache: not installed or not on PATH"
+        )
+
+    def test_auto_reports_invalid_configured_kache_binary(self):
+        with mock.patch("builtins.print") as output:
+            selected, _ = self.configure(
+                env={"PHOENIX_KACHE_BIN": "missing/kache"}, installed={"sccache"}
+            )
+        self.assertEqual("sccache", selected)
+        output.assert_any_call(
+            "  ⚠ kache unavailable; using sccache: "
+            "PHOENIX_KACHE_BIN is not an executable file: missing/kache"
+        )
+
     def test_kache_disabled_auto_falls_back_to_sccache(self):
         selected, env = self.configure(
             env={"KACHE_DISABLED": "1"}, installed={"kache", "sccache"}
@@ -349,6 +368,7 @@ class CompilerCacheTests(unittest.TestCase):
             {
                 "KACHE_CACHE_DIR": "cache/kache",
                 "KACHE_SOCKET_PATH": "run/kache.sock",
+                "KACHE_CONFIG": "config/kache.toml",
                 "SCCACHE_DIR": "cache/sccache",
             },
             clear=True,
@@ -356,6 +376,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev._normalize_cache_paths("kache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/kache", os.environ["KACHE_CACHE_DIR"])
             self.assertEqual("/workspace/run/kache.sock", os.environ["KACHE_SOCKET_PATH"])
+            self.assertEqual("/workspace/config/kache.toml", os.environ["KACHE_CONFIG"])
             self.assertEqual("cache/sccache", os.environ["SCCACHE_DIR"])
             self.dev._normalize_cache_paths("sccache", self.dev.Path("/workspace"))
             self.assertEqual("/workspace/cache/sccache", os.environ["SCCACHE_DIR"])

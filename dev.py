@@ -4930,7 +4930,7 @@ def _absolute_executable(binary: str | None) -> str | None:
 def _normalize_cache_paths(backend: str, base: Path | None = None) -> None:
     base = (base or Path.cwd()).resolve()
     names = (
-        ("KACHE_CACHE_DIR", "KACHE_SOCKET_PATH")
+        ("KACHE_CACHE_DIR", "KACHE_SOCKET_PATH", "KACHE_CONFIG")
         if backend == "kache"
         else ("SCCACHE_DIR",)
     )
@@ -4980,6 +4980,13 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     kache_error = None
     if wants_kache and _environment_flag("KACHE_DISABLED"):
         kache_error = "KACHE_DISABLED is set"
+    elif wants_kache and not kache_binary:
+        configured = os.environ.get("PHOENIX_KACHE_BIN")
+        kache_error = (
+            f"PHOENIX_KACHE_BIN is not an executable file: {configured}"
+            if configured
+            else "not installed or not on PATH"
+        )
     elif kache_binary:
         kache_version, kache_error = _kache_version(kache_binary)
 
