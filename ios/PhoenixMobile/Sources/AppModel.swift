@@ -2,79 +2,111 @@ import Foundation
 import Observation
 import UserNotifications
 
+struct CachedProductHistory: Codable, Equatable, Sendable {
+    var snapshot: ProductConversationSnapshot
+    var fetchedAt: Date
+}
+
 @MainActor
 enum ProductHistorySnapshotStore {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     static func cacheName(productConversationId: String) -> String {
         "product-history-\(productConversationId)"
     }
 
-    static func load(productConversationId: String) -> ProductConversationSnapshot? {
-        guard let snapshot = DiskStore.loadVersioned(
-            ProductConversationSnapshot.self,
+    static func load(productConversationId: String) -> CachedProductHistory? {
+        let cached = DiskStore.loadVersioned(
+            CachedProductHistory.self,
             name: cacheName(productConversationId: productConversationId),
-            version: schemaVersion),
-            snapshot.product_conversation_id == productConversationId
-        else { return nil }
-        return snapshot
+            version: schemaVersion)
+        guard let cached, cached.snapshot.product_conversation_id == productConversationId else {
+            return nil
+        }
+        return cached
     }
 
-    @discardableResult
-    static func save(_ snapshot: ProductConversationSnapshot) -> Bool {
-        DiskStore.saveVersioned(
-            snapshot,
-            name: cacheName(productConversationId: snapshot.product_conversation_id),
+    static func writer(productConversationId: String) -> VersionedDiskWriter {
+        DiskStore.versionedWriter(
+            name: cacheName(productConversationId: productConversationId),
             version: schemaVersion)
     }
 
-    static func merge(_ pages: [ProductConversationSnapshot]) throws -> ProductConversationSnapshot {
-        guard var merged = pages.first else {
-            throw ProductHistoryLoadError.emptyResponse
+    nonisolated static func merging(
+        _ accumulated: ProductConversationSnapshot?,
+        page: ProductConversationSnapshot
+    ) throws -> ProductConversationSnapshot {
+        guard var merged = accumulated else {
+            var first = page
+            first.segments = try normalizedSegments(page.segments)
+            first.before = nil
+            first.has_older = false
+            return first
         }
-        let aggregateId = merged.product_conversation_id
-        var segmentsByOrdinal: [Int64: ProductConversationSegment] = [:]
+        guard page.product_conversation_id == merged.product_conversation_id else {
+            throw ProductHistoryLoadError.aggregateIdentityChanged
+        }
 
-        for page in pages {
-            guard page.product_conversation_id == aggregateId else {
-                throw ProductHistoryLoadError.aggregateIdentityChanged
-            }
-            for segment in page.segments {
-                if var existing = segmentsByOrdinal[segment.segment_ordinal] {
-                    guard existing.transcript_row_id == segment.transcript_row_id else {
-                        throw ProductHistoryLoadError.segmentIdentityChanged
-                    }
-                    var messagesById: [String: Message] = [:]
-                    for message in existing.messages + segment.messages
-                        where messagesById[message.message_id] == nil
-                    {
-                        messagesById[message.message_id] = message
-                    }
-                    existing.messages = messagesById.values.sorted {
-                        ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
-                    }
-                    if existing.handoff == nil { existing.handoff = segment.handoff }
-                    segmentsByOrdinal[segment.segment_ordinal] = existing
-                } else {
-                    var ordered = segment
-                    var messagesById: [String: Message] = [:]
-                    for message in segment.messages where messagesById[message.message_id] == nil {
-                        messagesById[message.message_id] = message
-                    }
-                    ordered.messages = messagesById.values.sorted {
-                        ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
-                    }
-                    segmentsByOrdinal[segment.segment_ordinal] = ordered
+        var segmentsByOrdinal = Dictionary(uniqueKeysWithValues: merged.segments.map {
+            ($0.segment_ordinal, $0)
+        })
+        for segment in page.segments {
+            if var existing = segmentsByOrdinal[segment.segment_ordinal] {
+                guard existing.transcript_row_id == segment.transcript_row_id else {
+                    throw ProductHistoryLoadError.segmentIdentityChanged
                 }
+                var messagesById: [String: Message] = [:]
+                for message in existing.messages + segment.messages
+                    where messagesById[message.message_id] == nil
+                {
+                    messagesById[message.message_id] = message
+                }
+                existing.messages = messagesById.values.sorted {
+                    ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
+                }
+                if existing.handoff == nil { existing.handoff = segment.handoff }
+                segmentsByOrdinal[segment.segment_ordinal] = existing
+            } else {
+                segmentsByOrdinal[segment.segment_ordinal] = normalizedSegment(segment)
             }
         }
-
         merged.segments = segmentsByOrdinal.values.sorted {
             ($0.segment_ordinal, $0.transcript_row_id) < ($1.segment_ordinal, $1.transcript_row_id)
         }
         merged.before = nil
         merged.has_older = false
         return merged
+    }
+
+    private nonisolated static func normalizedSegments(
+        _ segments: [ProductConversationSegment]
+    ) throws -> [ProductConversationSegment] {
+        var byOrdinal: [Int64: ProductConversationSegment] = [:]
+        for segment in segments {
+            if let existing = byOrdinal[segment.segment_ordinal],
+               existing.transcript_row_id != segment.transcript_row_id
+            {
+                throw ProductHistoryLoadError.segmentIdentityChanged
+            }
+            byOrdinal[segment.segment_ordinal] = normalizedSegment(segment)
+        }
+        return byOrdinal.values.sorted {
+            ($0.segment_ordinal, $0.transcript_row_id) < ($1.segment_ordinal, $1.transcript_row_id)
+        }
+    }
+
+    private nonisolated static func normalizedSegment(
+        _ segment: ProductConversationSegment
+    ) -> ProductConversationSegment {
+        var normalized = segment
+        var messagesById: [String: Message] = [:]
+        for message in segment.messages where messagesById[message.message_id] == nil {
+            messagesById[message.message_id] = message
+        }
+        normalized.messages = messagesById.values.sorted {
+            ($0.sequence_id, $0.message_id) < ($1.sequence_id, $1.message_id)
+        }
+        return normalized
     }
 }
 
@@ -85,6 +117,7 @@ enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
     case missingCursor
     case repeatedCursor
     case staleServerGeneration
+    case notFound
 
     var errorDescription: String? {
         switch self {
@@ -93,6 +126,7 @@ enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
         case .segmentIdentityChanged: "Product History lineage changed while loading."
         case .missingCursor, .repeatedCursor: "The server returned an invalid Product History page cursor."
         case .staleServerGeneration: "Product History was invalidated while loading."
+        case .notFound: "This conversation was deleted or is no longer available."
         }
     }
 }
@@ -170,6 +204,7 @@ final class AppModel {
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
+    private(set) var deletedProductHistoryIds: Set<String> = []
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -341,11 +376,25 @@ final class AppModel {
             latestTranscriptRowId: latestTranscriptRowId)
     }
 
-    func cachedProductHistory(productConversationId: String) -> ProductConversationSnapshot? {
+    func cachedProductHistory(productConversationId: String) -> CachedProductHistory? {
         ProductHistorySnapshotStore.load(productConversationId: productConversationId)
     }
 
-    func loadProductHistory(productConversationId: String) async throws -> ProductConversationSnapshot {
+    func notificationNavigationId(for notifiedId: String) -> String {
+        guard let aggregateId = listStore.aggregateId(forTranscriptRowId: notifiedId) else {
+            return notifiedId
+        }
+        if listStore.conversations.contains(where: {
+            $0.aggregateIdentity == aggregateId && $0.archived == true
+        }) {
+            return aggregateId
+        }
+        return resolvedNavigationConversationId(
+            aggregateId: aggregateId,
+            latestTranscriptRowId: notifiedId)
+    }
+
+    func loadProductHistory(productConversationId: String) async throws -> CachedProductHistory {
         guard let api, connectivity.isOnline else {
             if let cached = cachedProductHistory(productConversationId: productConversationId) {
                 return cached
@@ -353,39 +402,62 @@ final class AppModel {
             throw APIError.transport(underlying: URLError(.notConnectedToInternet))
         }
         let startedGeneration = apiGeneration
-        var pages: [ProductConversationSnapshot] = []
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: productConversationId)
+        var snapshot: ProductConversationSnapshot?
         var before: String?
         var seenCursors: Set<String> = []
-        repeat {
-            let page = try await api.getProductConversation(
-                reference: productConversationId,
-                before: before)
-            guard !Task.isCancelled, apiGeneration == startedGeneration else {
+        do {
+            repeat {
+                let page = try await api.getProductConversation(
+                    reference: productConversationId,
+                    before: before)
+                guard !Task.isCancelled, apiGeneration == startedGeneration else {
+                    throw ProductHistoryLoadError.staleServerGeneration
+                }
+                guard page.product_conversation_id == productConversationId else {
+                    throw ProductHistoryLoadError.aggregateIdentityChanged
+                }
+                snapshot = try await Task.detached(priority: .userInitiated) {
+                    try ProductHistorySnapshotStore.merging(snapshot, page: page)
+                }.value
+                guard page.has_older else { break }
+                guard let next = page.before, !next.isEmpty else {
+                    throw ProductHistoryLoadError.missingCursor
+                }
+                guard seenCursors.insert(next).inserted else {
+                    throw ProductHistoryLoadError.repeatedCursor
+                }
+                before = next
+            } while true
+        } catch let error as APIError where error.isNotFound {
+            guard apiGeneration == startedGeneration else {
                 throw ProductHistoryLoadError.staleServerGeneration
             }
-            guard page.product_conversation_id == productConversationId else {
-                throw ProductHistoryLoadError.aggregateIdentityChanged
+            let revision = writer.reserveRevision()
+            await writer.remove(revision: revision)
+            guard apiGeneration == startedGeneration else {
+                throw ProductHistoryLoadError.staleServerGeneration
             }
-            pages.append(page)
-            guard page.has_older else { break }
-            guard let next = page.before, !next.isEmpty else {
-                throw ProductHistoryLoadError.missingCursor
-            }
-            guard seenCursors.insert(next).inserted else {
-                throw ProductHistoryLoadError.repeatedCursor
-            }
-            before = next
-        } while true
+            deletedProductHistoryIds.insert(productConversationId)
+            listStore.remove(aggregateId: productConversationId)
+            throw ProductHistoryLoadError.notFound
+        }
 
-        guard !Task.isCancelled, apiGeneration == startedGeneration else {
+        guard !Task.isCancelled, apiGeneration == startedGeneration,
+              let snapshot
+        else {
             throw ProductHistoryLoadError.staleServerGeneration
         }
-        let snapshot = try ProductHistorySnapshotStore.merge(pages)
-        guard apiGeneration == startedGeneration else {
+        let cached = CachedProductHistory(snapshot: snapshot, fetchedAt: Date())
+        let revision = writer.reserveRevision()
+        guard await writer.save(cached, revision: revision),
+              !Task.isCancelled,
+              apiGeneration == startedGeneration
+        else {
             throw ProductHistoryLoadError.staleServerGeneration
         }
-        ProductHistorySnapshotStore.save(snapshot)
-        return snapshot
+        deletedProductHistoryIds.remove(productConversationId)
+        return cached
     }
 
     func navigationConversationId(for conversation: Conversation) -> String {
@@ -565,6 +637,8 @@ final class AppModel {
         var closed = false
         defer { if !closed { fencedSessions.forEach { $0.endArchiving() } } }
         do {
+            _ = try await loadProductHistory(productConversationId: conversation.aggregateIdentity)
+            guard apiGeneration == startedGeneration else { return false }
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
             closed = true
@@ -595,6 +669,7 @@ final class AppModel {
     @discardableResult
     func deleteHistoryConversation(_ conversation: Conversation) async -> Bool {
         guard ClientOperation.delete.policy == .onlineOnly else { return false }
+        let startedGeneration = apiGeneration
         guard let api, connectivity.isOnline else {
             lastActionError = "Deleting needs a connection — it can't be queued."
             return false
@@ -603,9 +678,15 @@ final class AppModel {
             try await api.deleteConversation(
                 reference: conversation.transcriptRowIdentity,
                 chainRootId: conversation.chain_root_id)
+            guard apiGeneration == startedGeneration else { return false }
             let transcriptIds = Set(
                 listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
                     + [conversation.transcriptRowIdentity])
+            let historyWriter = ProductHistorySnapshotStore.writer(
+                productConversationId: conversation.aggregateIdentity)
+            let revision = historyWriter.reserveRevision()
+            await historyWriter.remove(revision: revision)
+            guard apiGeneration == startedGeneration else { return false }
             for transcriptId in transcriptIds {
                 let owners = [sessions[transcriptId], drainSessions[transcriptId]].compactMap { $0 }
                 for session in owners {
@@ -619,13 +700,20 @@ final class AppModel {
                 DiskStore.remove(name: "outbox-\(transcriptId)")
             }
             listStore.remove(aggregateId: conversation.aggregateIdentity)
-            DiskStore.remove(name: ProductHistorySnapshotStore.cacheName(
-                productConversationId: conversation.aggregateIdentity))
+            deletedProductHistoryIds.insert(conversation.aggregateIdentity)
+            removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
             return true
         } catch {
+            guard apiGeneration == startedGeneration else { return false }
             lastActionError = error.localizedDescription
             return false
         }
+    }
+
+    private func removeAttentionNotifications(productConversationId: String) {
+        let identifier = "attention-\(productConversationId)"
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
     }
 
     @discardableResult
@@ -787,6 +875,7 @@ final class AppModel {
         drainSessions.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
+        deletedProductHistoryIds.removeAll()
         attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil

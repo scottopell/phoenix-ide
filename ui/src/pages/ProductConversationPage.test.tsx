@@ -454,6 +454,24 @@ describe('ProductConversationPage', () => {
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it('replays a canonical rename invalidation received while an alias snapshot is loading', async () => {
+    const { api } = await import('../api');
+    let resolveInitial: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve; }))
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    act(() => resolveInitial?.(makeSnapshot()));
+
+    expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it('starts a new measured open when revisiting a previously loaded product route', async () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-1', true);

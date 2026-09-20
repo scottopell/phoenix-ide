@@ -130,7 +130,8 @@ final class AppModelProductConversationTests: XCTestCase {
                 handoff: handoff),
         ])
 
-        let merged = try ProductHistorySnapshotStore.merge([newer, older])
+        let first = try ProductHistorySnapshotStore.merging(nil, page: newer)
+        let merged = try ProductHistorySnapshotStore.merging(first, page: older)
 
         XCTAssertEqual(merged.product_conversation_id, "pc-history")
         XCTAssertEqual(merged.segments.map(\.transcript_row_id), ["root", "successor"])
@@ -153,18 +154,23 @@ final class AppModelProductConversationTests: XCTestCase {
                 messages: [message("cached", sequence: 1)],
                 handoff: nil),
         ])
-        XCTAssertTrue(ProductHistorySnapshotStore.save(snapshot))
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: snapshot.product_conversation_id)
+        let revision = writer.reserveRevision()
+        let saved = await writer.save(
+            CachedProductHistory(snapshot: snapshot, fetchedAt: Date()), revision: revision)
+        XCTAssertTrue(saved)
         XCTAssertNil(ProductHistorySnapshotStore.load(productConversationId: "different-aggregate"))
 
         let model = AppModel()
         model.connectivity.setOnlineForTesting(false)
         let reopened = try await model.loadProductHistory(productConversationId: "pc-history")
 
-        XCTAssertEqual(reopened.product_conversation_id, "pc-history")
-        XCTAssertEqual(reopened.segments[0].messages.map(\.message_id), ["cached"])
+        XCTAssertEqual(reopened.snapshot.product_conversation_id, "pc-history")
+        XCTAssertEqual(reopened.snapshot.segments[0].messages.map(\.message_id), ["cached"])
+        XCTAssertNotNil(reopened.fetchedAt)
     }
 
-    func testCachedProductHistoryIsAvailableBeforeNetworkRefresh() {
+    func testCachedProductHistoryIsAvailableBeforeNetworkRefresh() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
         let snapshot = historySnapshot(segments: [
@@ -176,12 +182,28 @@ final class AppModelProductConversationTests: XCTestCase {
                 messages: [message("cached", sequence: 1)],
                 handoff: nil),
         ])
-        XCTAssertTrue(ProductHistorySnapshotStore.save(snapshot))
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: snapshot.product_conversation_id)
+        let revision = writer.reserveRevision()
+        let saved = await writer.save(
+            CachedProductHistory(snapshot: snapshot, fetchedAt: Date()), revision: revision)
+        XCTAssertTrue(saved)
 
         let model = AppModel()
         let cached = model.cachedProductHistory(productConversationId: "pc-history")
 
-        XCTAssertEqual(cached?.segments[0].messages.map(\.message_id), ["cached"])
+        XCTAssertEqual(cached?.snapshot.segments[0].messages.map(\.message_id), ["cached"])
+        XCTAssertNotNil(cached?.fetchedAt)
+    }
+
+    func testProductHistoryIncrementalMergeRejectsIdentityChanges() throws {
+        let first = try ProductHistorySnapshotStore.merging(
+            nil,
+            page: historySnapshot(segments: []))
+        XCTAssertThrowsError(try ProductHistorySnapshotStore.merging(
+            first,
+            page: historySnapshot(aggregateId: "different", segments: []))) {
+            XCTAssertEqual($0 as? ProductHistoryLoadError, .aggregateIdentityChanged)
+        }
     }
 
     func testCloseCompletionGenerationsAreScopedByProduct() {
@@ -201,6 +223,16 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(tracker.isCurrent(replacementA, productConversationId: "product-a"))
         tracker.end(replacementA, productConversationId: "product-a")
         XCTAssertFalse(tracker.isCurrent(replacementA, productConversationId: "product-a"))
+    }
+
+    func testArchivedTranscriptNotificationAliasRoutesToProductHistoryAggregate() {
+        let model = AppModel()
+        model.listStore.upsert(conversation(id: "root-row", aggregateId: "pc-history"))
+        model.listStore.upsert(conversation(
+            id: "latest-row", aggregateId: "pc-history", archived: true))
+
+        XCTAssertEqual(model.notificationNavigationId(for: "root-row"), "pc-history")
+        XCTAssertEqual(model.notificationNavigationId(for: "latest-row"), "pc-history")
     }
 
     func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {

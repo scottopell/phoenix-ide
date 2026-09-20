@@ -18,7 +18,12 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if let history = model.listStore.conversations.first(where: {
+                if model.deletedProductHistoryIds.contains(conversationId) {
+                    ContentUnavailableView(
+                        "Conversation deleted",
+                        systemImage: "trash",
+                        description: Text("This Product History is no longer available."))
+                } else if let history = model.listStore.conversations.first(where: {
                     $0.archived == true && $0.aggregateIdentity == conversationId
                 }) {
                     ProductHistoryView(productConversationId: history.aggregateIdentity)
@@ -179,10 +184,7 @@ struct ConversationListView: View {
     private func consumePendingNavigation() {
         guard let id = model.pendingOpenConversationId else { return }
         model.pendingOpenConversationId = nil
-        let aggregateId = model.listStore.aggregateId(forTranscriptRowId: id)
-        navPath = [model.resolvedNavigationConversationId(
-            aggregateId: aggregateId,
-            latestTranscriptRowId: id)]
+        navPath = [model.notificationNavigationId(for: id)]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.
@@ -307,38 +309,73 @@ private struct ProductHistoryHandoffView: View {
 private struct ProductHistoryView: View {
     @Environment(AppModel.self) private var model
     let productConversationId: String
-    @State private var snapshot: ProductConversationSnapshot?
-    @State private var error: String?
+    @State private var cached: CachedProductHistory?
+    @State private var error: ProductHistoryLoadError?
 
     var body: some View {
-        Group {
-            if let snapshot {
-                List(snapshot.segments, id: \.segment_ordinal) { segment in
-                    Section(segment.title ?? segment.slug ?? "Conversation") {
-                        ForEach(segment.messages, id: \.id) { message in
-                            MessageView(message: message)
-                        }
-                        if let handoff = segment.handoff {
-                            ProductHistoryHandoffView(handoff: handoff)
+        VStack(spacing: 0) {
+            OfflineBanner()
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                if let staleness = cacheAgeNote(at: context.date) {
+                    Text(staleness)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
+                }
+            }
+            Group {
+                if let cached {
+                    List(cached.snapshot.segments, id: \.segment_ordinal) { segment in
+                        Section(segment.title ?? segment.slug ?? "Conversation") {
+                            ForEach(segment.messages, id: \.id) { message in
+                                MessageView(message: message)
+                            }
+                            if let handoff = segment.handoff {
+                                ProductHistoryHandoffView(handoff: handoff)
+                            }
                         }
                     }
+                } else if error == .notFound {
+                    ContentUnavailableView(
+                        "Conversation deleted",
+                        systemImage: "trash",
+                        description: Text("This Product History is no longer available."))
+                } else if let error {
+                    ContentUnavailableView(
+                        "Unable to load history",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(error.localizedDescription))
+                } else {
+                    ProgressView("Loading history…")
                 }
-            } else if let error {
-                ContentUnavailableView("Unable to load history", systemImage: "exclamationmark.triangle", description: Text(error))
-            } else {
-                ProgressView("Loading history…")
             }
         }
         .task(id: productConversationId) {
-            snapshot = model.cachedProductHistory(productConversationId: productConversationId)
+            cached = model.cachedProductHistory(productConversationId: productConversationId)
             error = nil
             do {
-                snapshot = try await model.loadProductHistory(productConversationId: productConversationId)
+                cached = try await model.loadProductHistory(productConversationId: productConversationId)
             } catch is CancellationError {
                 return
+            } catch let loadError as ProductHistoryLoadError {
+                if loadError == .notFound { cached = nil }
+                if cached == nil { error = loadError }
             } catch {
-                if snapshot == nil { self.error = error.localizedDescription }
+                if cached == nil { self.error = .emptyResponse }
             }
         }
+    }
+
+    private func cacheAgeNote(at now: Date) -> String? {
+        guard !model.connectivity.isOnline,
+              let cached,
+              now.timeIntervalSince(cached.fetchedAt) > 120
+        else { return nil }
+        let fetchedAt = cached.fetchedAt
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "Cached \(formatter.localizedString(for: fetchedAt, relativeTo: now))"
     }
 }
