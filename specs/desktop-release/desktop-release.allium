@@ -10,7 +10,6 @@ enum ArtifactState { pending | built | verified | failed }
 enum NotaryState { pending | submitted | accepted | stapled | validated | failed }
 enum PublicationState { idle | inaccessible | uploading | verified | public | failed }
 enum FailureDomain { none | tag_gate | build | signing | notarization | publication | configuration }
-enum ReleaseChannel { stable | rc }
 enum LowerHexDigit { `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` | a | b | c | d | e | f }
 
 value CommitHexWord {
@@ -33,9 +32,7 @@ value FullCommitIdentity {
 }
 
 value ReleaseIdentity {
-    tag: String
     version: String
-    channel: ReleaseChannel
     full_commit: FullCommitIdentity
 }
 
@@ -144,21 +141,24 @@ surface DesktopReleaseWorkflow {
 -- Helpers
 --
 -- valid_release_identity(identity) -> Boolean
---   identity has a supported v-prefixed release tag; its full commit is structural.
+--   identity.version is exactly X.Y.Z or X.Y.Z-rc.N, where N is within the
+--   supported positive bound; its tag and channel are derived from that version.
 -- bundle_version_representable(identity) -> Boolean
---   identity.tag can be represented by the required bounded app bundle version.
--- release_channel_matches_version(identity) -> Boolean
---   stable identifies exactly X.Y.Z and rc identifies exactly X.Y.Z-rc.N where
---   N is within the supported positive bound.
+--   identity.version can be represented by the required bounded app bundle version.
 -- bundle_versions_match_release_identity(pair) -> Boolean
 --   pair's app uses numeric Apple marketing/build versions derived from its
 --   complete authoritative stable or RC release identity.
 -- tag_absent(gate) -> Boolean
---   no tag named gate.identity.tag exists.
+--   no tag derived from gate.identity.version exists.
+-- tag_gate_is_serialized(gate) -> Boolean
+--   validation against existing supported tags and tag creation hold one sole-writer gate.
+-- version_follows_existing_supported_tags(identity) -> Boolean
+--   identity.version is newer than every existing supported release tag.
 -- tag_exists_at_different_commit(gate) -> Boolean
---   gate.identity.tag exists and does not resolve to gate.identity.full_commit.
+--   the tag derived from gate.identity.version exists and does not resolve to
+--   gate.identity.full_commit.
 -- tag_points_at_exact_commit(gate) -> Boolean
---   gate.identity.tag resolves to gate.identity.full_commit.
+--   the tag derived from gate.identity.version resolves to gate.identity.full_commit.
 -- protected_release_configuration_available(pair) -> Boolean
 --   the protected signing and notarization configuration is available.
 -- standalone_signature_valid(pair) -> Boolean
@@ -186,12 +186,13 @@ surface DesktopReleaseWorkflow {
 -- public_release_is_exact(publication) -> Boolean
 --   the public release contains exactly the required names and matching digests.
 -- publication_channel_is_exact(publication) -> Boolean
---   stable publication metadata is prerelease=false and make_latest=true; RC
+--   stable publication metadata is prerelease=false and make_latest=true unless a
+--   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
 -- public_release_differs(publication) -> Boolean
 --   a public release exists but is not the exact required release.
 -- release_absent_for_identity(identity) -> Boolean
---   no public or inaccessible release exists for identity.tag.
+--   no public or inaccessible release exists for the tag derived from identity.version.
 -- recoverable_inaccessible_publication_exists(publication) -> Boolean
 --   one inaccessible publication exists for publication.identity and can resume
 --   without replacing its release object.
@@ -200,9 +201,10 @@ rule GateCreatesOnlyRepresentableReleaseTag {
     when: ReleaseTagCreated(gate)
     requires: gate.state = unresolved
     requires: valid_release_identity(gate.identity)
-    requires: release_channel_matches_version(gate.identity)
     requires: bundle_version_representable(gate.identity)
     requires: tag_absent(gate)
+    requires: tag_gate_is_serialized(gate)
+    requires: version_follows_existing_supported_tags(gate.identity)
     ensures: gate.state = new_tag_created
     ensures: tag_points_at_exact_commit(gate)
 }
@@ -211,7 +213,6 @@ rule GateAcceptsOnlyExistingExactTag {
     when: ExactReleaseTagFound(gate)
     requires: gate.state = unresolved
     requires: valid_release_identity(gate.identity)
-    requires: release_channel_matches_version(gate.identity)
     requires: bundle_version_representable(gate.identity)
     requires: tag_points_at_exact_commit(gate)
     ensures: gate.state = exact_tag_match
@@ -220,7 +221,7 @@ rule GateAcceptsOnlyExistingExactTag {
 rule GateRefusesDifferentCommitOrInvalidVersion {
     when: ReleaseGateRejected(gate)
     requires: gate.state = unresolved
-    requires: not valid_release_identity(gate.identity) or not release_channel_matches_version(gate.identity) or not bundle_version_representable(gate.identity) or tag_exists_at_different_commit(gate)
+    requires: not valid_release_identity(gate.identity) or not bundle_version_representable(gate.identity) or tag_exists_at_different_commit(gate)
     ensures: gate.state = refused
 }
 

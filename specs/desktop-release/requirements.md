@@ -96,7 +96,10 @@ THEN THE SYSTEM SHALL fail without rewriting public metadata or mutating public 
 Stable promotion SHALL use a new stable version and the normal version-bump release flow; the system SHALL NOT relabel release-candidate bytes as stable or move an existing tag.
 
 WHEN creating a new release tag,
-THE SYSTEM SHALL require its supported version to follow every existing supported release tag.
+THE SYSTEM SHALL serialize tag-gate operations and require its supported version to follow every existing supported release tag.
+
+WHEN publishing a stable draft,
+THE SYSTEM SHALL refuse to make it latest if a newer stable release is already latest.
 
 WHEN retrying an existing exact release tag,
 THE SYSTEM SHALL preserve the historical tagged build identity while using the protected workflow's current publication verifier.
