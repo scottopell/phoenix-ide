@@ -22,8 +22,6 @@ Automatic compiler-cache selection prefers Kache when the executable reports the
 
 The same selector owns checks, ordinary development builds, and production build preparation. Phoenix does not install cache tools, configure remotes, purge storage, or promise an acceleration. Support for another Kache release requires deliberate qualification rather than assumed cross-version compatibility.
 
-On macOS, automatic and explicit Kache selection defaults executable caching off while preserving an explicit user setting. This keeps library caching and cross-worktree restores without adopting v0.26.0's unresolved store-time debug-symbol behavior. Linux retains the upstream executable-cache default and remains a separately qualified platform path.
-
 ## Consequences
 
 - **Positive:** Phoenix's default matches its isolated multi-worktree build shape, and fallback cannot be mislabeled as Kache.

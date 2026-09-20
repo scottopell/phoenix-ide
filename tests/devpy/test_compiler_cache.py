@@ -135,28 +135,6 @@ class CompilerCacheTests(unittest.TestCase):
             self.assertEqual("/opt/local/kache", os.environ["RUSTC_WRAPPER"])
             ensure.assert_called_once_with("/opt/local/kache")
 
-    def test_macos_kache_disables_executable_cache_by_default(self):
-        with mock.patch.object(self.dev.sys, "platform", "darwin"):
-            selected, env = self.configure("kache", installed={"kache"})
-        self.assertEqual("kache", selected)
-        self.assertEqual("0", env["KACHE_CACHE_EXECUTABLES"])
-
-    def test_macos_kache_preserves_explicit_executable_cache_setting(self):
-        with mock.patch.object(self.dev.sys, "platform", "darwin"):
-            selected, env = self.configure(
-                "kache",
-                env={"KACHE_CACHE_EXECUTABLES": "1"},
-                installed={"kache"},
-            )
-        self.assertEqual("kache", selected)
-        self.assertEqual("1", env["KACHE_CACHE_EXECUTABLES"])
-
-    def test_linux_kache_keeps_upstream_executable_cache_default(self):
-        with mock.patch.object(self.dev.sys, "platform", "linux"):
-            selected, env = self.configure("kache", installed={"kache"})
-        self.assertEqual("kache", selected)
-        self.assertNotIn("KACHE_CACHE_EXECUTABLES", env)
-
     def test_daemon_socket_uses_private_owned_directory(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with self.subTest("socket path and permissions"), mock.patch.dict(
