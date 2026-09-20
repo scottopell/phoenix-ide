@@ -106,8 +106,8 @@ WHEN Phoenix automatically selects Kache for a Rust build subprocess
 THE SYSTEM SHALL require the executable to report exactly version `0.26.0`
 AND SHALL require its local daemon to accept the configured socket
 
-WHEN Kache is absent, reports another version, or cannot start its daemon
-THE SYSTEM SHALL fall through to an available sccache executable and then to no compiler cache
+WHEN Kache is absent, disabled, reports another version, or cannot start its daemon
+THE SYSTEM SHALL fall through to an sccache executable that passes its version probe and then to no compiler cache
 AND SHALL report the fallback reason and the backend actually selected
 
 WHEN an operator explicitly selects Kache or sccache
@@ -119,7 +119,7 @@ OR explicitly selects no compiler cache
 THE SYSTEM SHALL preserve that choice
 AND SHALL report it
 
-THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to the Cargo subprocess
+THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses
 AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
 
 THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup

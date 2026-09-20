@@ -4923,6 +4923,20 @@ def _ensure_kache_daemon(binary: str) -> str | None:
     return None
 
 
+def _environment_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def _usable_sccache(binary: str | None) -> tuple[str | None, str | None]:
+    if binary is None:
+        return None, "not installed or not on PATH"
+    version, error = _command_version(binary)
+    if error:
+        return None, error
+    return version, None
+
+
 def _configure_compiler_cache(requested: str | None = None) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
@@ -4946,21 +4960,33 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     sccache_binary = shutil.which("sccache")
     kache_version = None
     kache_error = None
-    if kache_binary:
+    if wants_kache and _environment_flag("KACHE_DISABLED"):
+        kache_error = "KACHE_DISABLED is set"
+    elif kache_binary:
         kache_version, kache_error = _kache_version(kache_binary)
 
     if automatic:
         if kache_version:
             backend = "kache"
-        elif sccache_binary:
-            if kache_error:
-                print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
-            backend = "sccache"
         else:
-            if kache_error:
-                print(f"  ⚠ kache unavailable; continuing without compiler cache: {kache_error}")
-            print("  Compiler cache: none")
-            return "none"
+            sccache_version, sccache_error = _usable_sccache(sccache_binary)
+            if sccache_version:
+                if kache_error:
+                    print(f"  ⚠ kache unavailable; using sccache: {kache_error}")
+                backend = "sccache"
+            else:
+                reasons = "; ".join(
+                    reason
+                    for reason in (
+                        f"kache: {kache_error}" if kache_error else None,
+                        f"sccache: {sccache_error}" if sccache_error else None,
+                    )
+                    if reason
+                )
+                if reasons:
+                    print(f"  ⚠ compiler caches unavailable; continuing without: {reasons}")
+                print("  Compiler cache: none")
+                return "none"
     elif backend == "kache":
         if not kache_binary:
             raise SystemExit(
@@ -4969,8 +4995,10 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             )
         if kache_error:
             raise SystemExit(f"requested compiler cache 'kache' is incompatible: {kache_error}")
-    elif backend == "sccache" and not sccache_binary:
-        raise SystemExit("requested compiler cache 'sccache' is not installed or not on PATH")
+    elif backend == "sccache":
+        _, sccache_error = _usable_sccache(sccache_binary)
+        if sccache_error:
+            raise SystemExit(f"requested compiler cache 'sccache' is unavailable: {sccache_error}")
 
     wrapper = kache_binary if backend == "kache" else sccache_binary
     assert wrapper is not None
@@ -4984,13 +5012,16 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             os.environ.pop("RUSTC_WRAPPER", None)
             if generated_socket:
                 os.environ.pop("KACHE_SOCKET_PATH", None)
-            if sccache_binary:
+            sccache_version, sccache_error = _usable_sccache(sccache_binary)
+            if sccache_version:
+                assert sccache_binary is not None
                 print(f"  ⚠ kache unavailable; using sccache: {daemon_error}")
                 os.environ["RUSTC_WRAPPER"] = sccache_binary
                 os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
                 print("  Compiler cache: sccache")
                 return "sccache"
-            print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
+            detail = f"{daemon_error}; sccache: {sccache_error}"
+            print(f"  ⚠ kache unavailable; continuing without compiler cache: {detail}")
             print("  Compiler cache: none")
             return "none"
         print(f"  Compiler cache: kache {kache_version}")
@@ -5008,6 +5039,22 @@ def _compiler_cache_subprocess_env(requested: str | None = None) -> tuple[str, d
     finally:
         os.environ.clear()
         os.environ.update(original)
+
+
+def _compiler_cache_overrides(
+    selected: str, configured_env: dict[str, str]
+) -> dict[str, str]:
+    backend_prefix = {"kache": "KACHE_", "sccache": "SCCACHE_"}.get(selected)
+    return {
+        key: value
+        for key, value in configured_env.items()
+        if key == "RUSTC_WRAPPER"
+        or (backend_prefix is not None and key.startswith(backend_prefix))
+    }
+
+
+def _command_uses_compiler_cache(command: list[str]) -> bool:
+    return bool(command) and Path(command[0]).name == "cargo"
 
 
 def _parse_cache_size(value: str) -> int:
@@ -5262,6 +5309,8 @@ def cmd_check(
         # neutralise any inherited FORCE_COLOR override. node_env() returns a
         # cached shared dict, so copy before mutating.
         env = dict(node_env()) if Path(cwd) == UI_DIR else os.environ.copy()
+        if compiler_cache_env is not None and _command_uses_compiler_cache(cmd):
+            env.update(compiler_cache_env)
         env["CARGO_TERM_COLOR"] = "never"
         env["NO_COLOR"] = "1"
         budget = str(_check_cpu_budget())
@@ -5937,8 +5986,12 @@ def cmd_check(
     # Share compiler outputs across worktrees and independent target dirs.
     # The selected wrapper is inherited by every cargo subprocess below.
     selected_compiler_cache = None
+    compiler_cache_env = None
     if cargo_active:
-        selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+        selected_compiler_cache, configured_env = _compiler_cache_subprocess_env(compiler_cache)
+        compiler_cache_env = _compiler_cache_overrides(
+            selected_compiler_cache, configured_env
+        )
         if selected_compiler_cache == "sccache":
             if warning := _sccache_limit_warning():
                 reporter.info(warning)

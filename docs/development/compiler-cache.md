@@ -19,6 +19,8 @@ Phoenix supports the qualified released Kache `0.26.0` command contract. Downloa
 
 `./dev.py check --compiler-cache …` overrides the environment for checks. A caller-provided `RUSTC_WRAPPER` always wins and is reported as `explicit`. Explicit unavailable or incompatible choices fail with an actionable error. Automatic fallback prints the reason and reports the backend that actually runs; it never labels sccache or uncached work as Kache.
 
+`KACHE_DISABLED=1` makes Kache unavailable under the same rules. An sccache candidate must execute its version probe successfully before selection.
+
 Phoenix-generated cache variables are scoped to the Cargo build subprocess, so starting Phoenix does not force agent-executed Cargo commands in other repositories through Phoenix's selected cache.
 
 Kache-specific settings (`KACHE_CACHE_DIR`, `KACHE_SOCKET_PATH`) and sccache-specific settings (`SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`) remain separate. Phoenix does not install tools, purge caches, configure remotes, or replace either tool's garbage-collection policy.
