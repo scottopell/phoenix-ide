@@ -5071,14 +5071,17 @@ impl RuntimeManager {
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree =
-            if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. }) {
-                conv_cwd
-                    .as_ref()
-                    .map(crate::conversation_cwd::ValidConversationCwd::path_buf)
-            } else {
-                conv.conv_mode.worktree_path().map(PathBuf::from)
-            };
+        context.work_scope_worktree = match (&conv.conv_mode, &authority_resolution.environment) {
+            (
+                ConvMode::AttachedWorkChild { .. },
+                Some(phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
+                    worktree_path,
+                    ..
+                }),
+            ) => Some(PathBuf::from(worktree_path)),
+            (ConvMode::AttachedWorkChild { .. }, _) => None,
+            _ => conv.conv_mode.worktree_path().map(PathBuf::from),
+        };
         if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. })
             && context.work_scope_worktree.is_none()
         {

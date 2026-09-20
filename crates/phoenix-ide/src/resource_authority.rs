@@ -9,7 +9,7 @@ pub(crate) struct ResolvedResourceAuthority {
     pub(crate) authority: ResourceAuthority,
     pub(crate) actor: EffectiveResourceAccess,
     lifecycle: Option<WorkScopeLifecycle>,
-    environment: Option<EnvironmentContext>,
+    pub(crate) environment: Option<EnvironmentContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
