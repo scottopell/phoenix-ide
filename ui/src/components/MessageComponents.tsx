@@ -1,3 +1,4 @@
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import { SvgArtifactCard } from './SvgArtifactCard';
 import { svgArtifactFromResult } from './svgArtifact';
 /**
@@ -3131,7 +3132,7 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
           {outputPreview}
         </span>
       </div>
-      {artifact && <SvgArtifactCard artifact={artifact} />}
+      {artifact && <SvgArtifactAccessContext.Provider value={{ kind: 'owner' }}><SvgArtifactCard artifact={artifact} /></SvgArtifactAccessContext.Provider>}
     </>
   );
 }

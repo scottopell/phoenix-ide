@@ -1,3 +1,4 @@
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
@@ -3732,9 +3733,9 @@ describe('tool result ownership across repeated provider IDs', () => {
     expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
   });
 
-  it.each([false, true])('renders child-owned artifacts in subagent transcripts (full=%s) across live append and reload', (full) => {
+  it.each([false, true])('renders child-owned artifacts under a parent share context (full=%s) across live append and reload', (full) => {
     const messages = rounds();
-    const transcript = (rows: Message[]) => <SubAgentTranscript inline={{ type: 'ready', atom: { ...createInitialAtom(), messages: rows }, error: null }} running={false} full={full} />;
+    const transcript = (rows: Message[]) => <SvgArtifactAccessContext.Provider value={{ kind: 'share', token: 'parent-share-token' }}><SubAgentTranscript inline={{ type: 'ready', atom: { ...createInitialAtom(), messages: rows }, error: null }} running={false} full={full} /></SvgArtifactAccessContext.Provider>;
     const { rerender, unmount } = render(transcript(messages.slice(0, 2)));
     expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
     rerender(transcript(messages));
