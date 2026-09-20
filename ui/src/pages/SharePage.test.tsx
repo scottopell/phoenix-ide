@@ -111,6 +111,29 @@ describe('SharePage SSE schema validation', () => {
     vi.restoreAllMocks();
   });
 
+  it('renders published SVGs through token-authorized URLs in the shared transcript', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 800, bottom: 120, width: 800, height: 120, toJSON: () => ({}) });
+    renderSharePage();
+    const base = { conversation_id: 'conv-1', created_at: '2026-01-01T00:00:00Z', display_data: null };
+    const reference = { artifact_id: 'chart-1', conversation_id: 'conv-1', title: 'Shared chart', description: 'Shared directory sizes', width: 800, height: 400, validation: 'accepted_static_svg' };
+    act(() => {
+      MockEventSource.instances[0]!.emit('init', {
+        sequence_id: 2, transcript_generation: 1, transcript_coverage: 'complete',
+        conversation: { id: 'conv-1', slug: 'test', model: 'test' },
+        messages: [
+          { ...base, message_id: 'agent', sequence_id: 1, message_type: 'agent', content: [{ type: 'tool_use', id: 'publish', name: 'present_svg', input: { path: '/server/chart.svg' } }] },
+          { ...base, message_id: 'tool', sequence_id: 2, message_type: 'tool', content: { tool_use_id: 'publish', content: JSON.stringify(reference), is_error: false } },
+        ],
+        steering_messages: [], agent_working: false, last_sequence_id: 2,
+        stream_incarnation: 'test-stream', presentation_mode: 'idle', context_window_size: 0,
+        project_name: null, pending_anchor_sequence_id: 0, pending_events: [], pending_truncated: false,
+      });
+    });
+    expect(await screen.findByRole('img', { name: 'Shared directory sizes' })).toHaveAttribute('src', '/api/share/tok-1/svg-artifacts/chart-1');
+    expect(screen.getByRole('link', { name: 'Download SVG' })).toHaveAttribute('href', '/api/share/tok-1/svg-artifacts/chart-1/download');
+  });
+
   it('shows an error banner when init payload is malformed (missing required fields)', () => {
     renderSharePage();
 

@@ -12,6 +12,7 @@ path = "src/lib.rs"
 test-support = ["dep:tempfile"]
 
 [dependencies]
+phoenix-svg = { path = "../phoenix-svg" }
 # Shared domain vocabulary (llm_types, bash_types, tool_wire), the narrow
 # LlmSelector/CompletionService capability traits, WorkScope, and TaskSource.
 phoenix-core = { path = "../phoenix-core" }

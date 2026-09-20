@@ -14,7 +14,7 @@ battery of scripted conversations using the same HTTP/SSE surface that
 phoenix-client.py uses.
 
 Tests select mock scenarios with the `[[scenario:NAME]]` marker
-(see crates/phoenix-ide/src/llm/mock.rs).
+(see crates/phoenix-llm/src/mock.rs).
 
 Exit code 0 if all scenarios pass; 1 otherwise.
 
@@ -24,7 +24,7 @@ Adding a new scenario
 1. If you can express the test with one of the existing mock variants,
    skip to step 3. Grep `[[scenario:` in this file for what already
    exists; the marker name is the source-of-truth pointer — grep the
-   same string in `crates/phoenix-ide/src/llm/mock.rs` to see the
+   same string in `crates/phoenix-llm/src/mock.rs` to see the
    scripted response.
 
 2. If you need a new mock response shape:
@@ -1296,36 +1296,89 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
     )
 
 
+def _is_llm_first_byte_witness(event_name: str, event_data: object) -> bool:
+    if event_name == "llm_first_byte":
+        return True
+    if event_name != "init" or not isinstance(event_data, dict):
+        return False
+    pending_events = event_data.get("pending_events", [])
+    return isinstance(pending_events, list) and any(
+        isinstance(pending, dict) and pending.get("type") == "llm_first_byte"
+        for pending in pending_events
+    )
+
+
+async def _new_conv_until_first_byte_async(base_url: str, text: str, timeout: float) -> str:
+    conv_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+    payload = {
+        "conversation_id": conv_id,
+        "cwd": str(ROOT),
+        "model": _default_model(base_url),
+        "text": text,
+        "images": [],
+        "message_id": message_id,
+    }
+    stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
+    create_url = f"{base_url}/api/conversations/new"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            create_task = asyncio.create_task(client.post(create_url, json=payload))
+            try:
+                while True:
+                    try:
+                        async with aconnect_sse(client, "GET", stream_url) as source:
+                            source.response.raise_for_status()
+                            async for event in source.aiter_sse():
+                                if event.event == "ping":
+                                    continue
+                                event_data = json.loads(event.data)
+                                if _is_llm_first_byte_witness(event.event, event_data):
+                                    response = await create_task
+                                    response.raise_for_status()
+                                    return conv_id
+                            raise RuntimeError(
+                                "SSE stream closed before the initial turn emitted llm_first_byte"
+                            )
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code != 404:
+                            raise
+                        if create_task.done():
+                            response = await create_task
+                            response.raise_for_status()
+                        await asyncio.sleep(0)
+            finally:
+                if not create_task.done():
+                    create_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await create_task
+
+
+def _new_conv_until_first_byte(base_url: str, text: str, timeout: float) -> str:
+    try:
+        return asyncio.run(_new_conv_until_first_byte_async(base_url, text, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        raise TimeoutError(
+            f"initial turn did not emit llm_first_byte in {timeout:g}s"
+        ) from error
+
+
 def scenario_mid_stream_cancel(base_url: str) -> None:
-    """Cancel during streaming; verify state reaches idle cleanly."""
-    conv = _new_conv(base_url, "[[scenario:long]] start streaming")
-    # Creation returns an instant provisioning shell; poll until the worker has
-    # submitted the first turn before cancelling. Waiting on the SSE iterator can
-    # block past the deadline when no event arrives during async provisioning.
-    deadline = time.monotonic() + 10.0
-    last_state = None
-    while time.monotonic() < deadline:
-        snap = _get_conv(base_url, conv["id"])
-        last_state = _state_str(snap["conversation"]["state"])
-        if last_state not in ("idle", "provisioning"):
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError(f"conversation did not start before cancel deadline (last: {last_state})")
-    resp = _cancel(base_url, conv["id"])
-    assert not resp.get("no_op", False), "cancel was a no-op — conversation already idle before we cancelled"
-    # State should converge to idle within a few seconds.
-    deadline = time.monotonic() + 5.0
-    last_state = None
-    while time.monotonic() < deadline:
-        snap = _get_conv(base_url, conv["id"])
-        last_state = _state_str(snap["conversation"]["state"])
-        if last_state == "idle":
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"after cancel, state did not become idle (last: {last_state})")
-
-
+    """Cancel an initial turn after its identity-bound streaming witness."""
+    conv_id = _new_conv_until_first_byte(
+        base_url, "[[scenario:long]] start streaming", SCENARIO_TIMEOUT_SECONDS
+    )
+    resp = _cancel(base_url, conv_id)
+    assert not resp.get("no_op", False), "cancel was a no-op after llm_first_byte"
+    _poll_to_idle_with_messages(
+        base_url,
+        conv_id,
+        lambda _messages: True,
+        "mid-stream cancellation finalization",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
 def scenario_image_roundtrip(base_url: str) -> None:
     image = {"media_type": "image/png", "data": TINY_PNG_B64}
     conv = _new_conv(base_url, "[[scenario:plain_text]] describe", images=[image])
@@ -1404,6 +1457,102 @@ def scenario_patch(base_url: str) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def scenario_present_svg(base_url: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-svg-") as work_dir:
+        staging = Path(work_dir).resolve() / "chart.svg"
+        conv = _new_conv_in(
+            base_url, work_dir,
+            f"[[scenario:present_svg]] [[svg_path:{staging}]] visualize measured disk usage",
+        )
+        conv_id = conv["id"]
+        final = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: _has_tool_use(messages, "present_svg"),
+            "SVG publication", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        messages = final["messages"]
+        assert _count_tool_use(messages, "bash") == 1
+        assert _count_tool_use(messages, "present_svg") == 1
+        uses = [
+            block for message in messages if isinstance(message.get("content"), list)
+            for block in message["content"] if block.get("type") == "tool_use"
+        ]
+        assert [block["name"] for block in uses] == ["bash", "present_svg"]
+        publication = next(block for block in uses if block["name"] == "present_svg")
+        assert publication["input"]["path"] == str(staging)
+        assert set(publication["input"]) == {"path", "title", "description"}
+        results = [m for m in messages if m.get("message_type") == "tool"]
+        assert len(results) == 2, results
+        for message in results:
+            assert message["content"].get("is_error") is False, message["content"]
+        result = next(m for m in results if m["content"]["tool_use_id"] == publication["id"])
+        reference_text = result["content"]["content"]
+        reference = json.loads(reference_text)
+        assert reference["conversation_id"] == conv_id
+        assert reference["validation"] == "accepted_static_svg"
+        assert reference["title"] == "Measured disk usage"
+        assert reference["width"] == 800 and reference["height"] == 400
+        assert "<svg" not in reference_text and len(reference_text) < 2048
+        accepted = staging.read_bytes()
+        assert b"48 GiB" in accepted and b"24 GiB" in accepted and b"36 GiB" in accepted
+        artifact_path = f"/api/conversations/{conv_id}/svg-artifacts/{reference['artifact_id']}"
+
+        def check_representations() -> None:
+            for suffix in ("", "/source", "/download"):
+                response = httpx.get(f"{base_url}{artifact_path}{suffix}", timeout=10.0)
+                response.raise_for_status()
+                assert response.content == accepted
+                assert response.headers["x-content-type-options"] == "nosniff"
+                assert "sandbox" in response.headers["content-security-policy"]
+                assert response.headers["cross-origin-resource-policy"] == "same-origin"
+                if suffix == "/source":
+                    assert response.headers["content-type"].startswith("text/plain")
+                else:
+                    assert response.headers["content-type"].startswith("image/svg+xml")
+                    assert "attachment" in response.headers["content-disposition"]
+
+        check_representations()
+        staging.write_text("<svg>replaced after publication</svg>")
+        check_representations()
+        staging.unlink()
+        check_representations()
+        reloaded = _get_conv(base_url, conv_id)
+        assert [m for m in reloaded["messages"] if m["message_id"] == result["message_id"]] == [result]
+        _wait_for_sse_signal(
+            base_url, conv_id,
+            lambda event, data: event == "init" and reference["artifact_id"] in data,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        replayed = _get_conv(base_url, conv_id)
+        assert _count_tool_use(replayed["messages"], "present_svg") == 1
+        assert [m for m in replayed["messages"] if m["message_id"] == result["message_id"]] == [result]
+        _send_chat_and_stream(
+            base_url, conv_id,
+            f"[[scenario:present_svg]] [[svg_path:{staging}]] publish a separate revision",
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        revised = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: _count_tool_use(messages, "present_svg") == 2,
+            "SVG revision with reused provider tool ID", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        publications = [
+            m for m in revised["messages"] if m.get("message_type") == "tool"
+            and m["content"].get("tool_use_id") == publication["id"]
+        ]
+        assert len(publications) == 2, publications
+        references = [json.loads(m["content"]["content"]) for m in publications]
+        assert len({ref["artifact_id"] for ref in references}) == 2
+        check_representations()
+        other = _new_conv(base_url, "[[scenario:plain_text]] unrelated SVG ownership check")
+        for suffix in ("", "/source", "/download"):
+            response = httpx.get(
+                f"{base_url}/api/conversations/{other['id']}/svg-artifacts/{reference['artifact_id']}{suffix}",
+                timeout=10.0,
+            )
+            assert response.status_code == 404, response.text
+
+
 def scenario_perf_stream(base_url: str) -> None:
     # Uses the [[perf:N]] marker (see mock.rs `parse_perf_words`) — emits
     # exactly N whitespace-separated deterministic words. Catches stream
@@ -1434,6 +1583,7 @@ SCENARIOS = [
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
     ("patch", scenario_patch),
+    ("present_svg", scenario_present_svg),
     ("continuation", scenario_continuation),
     (
         "product_conversation_context_continuation",
@@ -1708,6 +1858,19 @@ class StartupRetryTests(unittest.TestCase):
         self.assertFalse(_is_addr_in_use("database migration failed"))
 
 
+class StreamReadinessTests(unittest.TestCase):
+    def test_llm_first_byte_witness_accepts_top_level_and_init_replay(self):
+        self.assertFalse(_is_llm_first_byte_witness("ping", "ping"))
+        self.assertTrue(_is_llm_first_byte_witness("llm_first_byte", {}))
+        self.assertTrue(
+            _is_llm_first_byte_witness(
+                "init", {"pending_events": [{"type": "llm_first_byte"}]}
+            )
+        )
+        self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": []}))
+        self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": [{}]}))
+
+
 class ScenarioSelectorTests(unittest.TestCase):
     def test_select_scenarios_defaults_to_all(self):
         self.assertEqual([name for name, _ in SCENARIOS], [name for name, _ in _select_scenarios([])])
@@ -1777,6 +1940,7 @@ def _run_self_tests() -> int:
             HarnessIsolationTests,
             CpuProfilingTests,
             StartupRetryTests,
+            StreamReadinessTests,
             ScenarioSelectorTests,
         )
     )

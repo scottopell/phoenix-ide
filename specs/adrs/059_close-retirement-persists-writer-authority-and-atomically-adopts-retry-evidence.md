@@ -1,4 +1,4 @@
-# ADR-058: Close retirement persists writer authority and atomically adopts retry evidence
+# ADR-059: Close retirement persists writer authority and atomically adopts retry evidence
 
 - **Status:** Accepted
 - **Date:** 2026-09-13

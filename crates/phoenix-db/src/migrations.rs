@@ -520,37 +520,30 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
-    Migration {
-        version: 101,
-        name: "persist_typed_close_repair_cause",
-        sql: MIGRATION_101,
-    },
-    Migration {
-        version: 102,
-        name: "settled_close_participant_allows_legacy_member_delete",
-        sql: MIGRATION_102,
-    },
-    Migration {
-        version: 103,
-        name: "enforce_close_ambient_writer_authority_pairs",
-        sql: MIGRATION_103,
-    },
-    Migration {
-        version: 104,
-        name: "persist_close_ambient_writer_indeterminate_cause",
-        sql: MIGRATION_104,
-    },
-    Migration {
-        version: 105,
-        name: "guard_close_participant_deleted_settlement",
-        sql: MIGRATION_105,
-    },
-    Migration {
-        version: 106,
-        name: "exclude_conflicting_close_repair_causes",
-        sql: MIGRATION_106,
-    },
+    Migration { version: 101, name: "create_conversation_svg_artifacts", sql: MIGRATION_101 },
+    Migration { version: 102, name: "persist_typed_close_repair_cause", sql: MIGRATION_102 },
+    Migration { version: 103, name: "settled_close_participant_allows_legacy_member_delete", sql: MIGRATION_103 },
+    Migration { version: 104, name: "enforce_close_ambient_writer_authority_pairs", sql: MIGRATION_104 },
+    Migration { version: 105, name: "persist_close_ambient_writer_indeterminate_cause", sql: MIGRATION_105 },
+    Migration { version: 106, name: "guard_close_participant_deleted_settlement", sql: MIGRATION_106 },
+    Migration { version: 107, name: "exclude_conflicting_close_repair_causes", sql: MIGRATION_107 },
 ];
+
+const MIGRATION_101: &str = r"
+CREATE TABLE conversation_svg_artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    width REAL NOT NULL CHECK(width > 0 AND width <= 16384),
+    height REAL NOT NULL CHECK(height > 0 AND height <= 16384),
+    bytes BLOB NOT NULL CHECK(typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 2097152),
+    CHECK(width * height <= 64000000),
+    UNIQUE(conversation_id, assistant_message_id, tool_use_id)
+);
+";
 
 const MIGRATION_100: &str = r"
 ALTER TABLE product_conversations
@@ -9108,7 +9101,7 @@ CREATE TABLE close_ambient_writer_evidence (
 );
 ";
 
-const MIGRATION_103: &str = r"
+const MIGRATION_104: &str = r"
 CREATE TRIGGER close_ambient_writer_evidence_valid_authority_insert
 BEFORE INSERT ON close_ambient_writer_evidence
 FOR EACH ROW
@@ -9160,7 +9153,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_104: &str = r"
+const MIGRATION_105: &str = r"
 CREATE TABLE close_ambient_writer_indeterminate_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
@@ -9199,7 +9192,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_101: &str = r"
+const MIGRATION_102: &str = r"
 CREATE TABLE close_needs_repair_causes (
     attempt_id TEXT PRIMARY KEY NOT NULL
         REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
@@ -10779,7 +10772,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_102: &str = r"
+const MIGRATION_103: &str = r"
 DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
 DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
 
@@ -10828,7 +10821,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_105: &str = r"
+const MIGRATION_106: &str = r"
 CREATE TRIGGER close_attempt_participants_reject_identity_update
 BEFORE UPDATE OF attempt_id, conversation_id ON close_attempt_participants
 BEGIN
@@ -10864,7 +10857,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_106: &str = r"
+const MIGRATION_107: &str = r"
 CREATE TRIGGER close_ambient_writer_cause_reject_evidence_cause
 BEFORE INSERT ON close_ambient_writer_indeterminate_causes
 WHEN EXISTS (

@@ -582,6 +582,12 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        None
+    }
+
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
     fn upgrade_to_work_mode(&self) {
@@ -590,8 +596,45 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// Combined storage trait for convenience
-pub trait Storage: MessageStore + StateStore {}
-impl<T: MessageStore + StateStore> Storage for T {}
+pub trait Storage: MessageStore + StateStore + SvgArtifactRepository {}
+impl<T: MessageStore + StateStore + SvgArtifactRepository> Storage for T {}
+
+#[async_trait]
+pub trait SvgArtifactRepository: Send + Sync {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+    ) -> Result<Option<phoenix_svg::SvgArtifactReference>, String>;
+
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>;
+}
+
+#[async_trait]
+impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+    ) -> Result<Option<phoenix_svg::SvgArtifactReference>, String> {
+        (**self).lookup(conversation_id, invocation).await
+    }
+
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &phoenix_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        (**self).publish(conversation_id, invocation, draft).await
+    }
+}
 
 // ============================================================================
 // Arc implementations for trait objects
@@ -1112,6 +1155,12 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
         (**self).clearable_tool_names()
+    }
+
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        (**self).coordinator_skill_catalog()
     }
 }
 
@@ -2148,6 +2197,7 @@ pub struct ToolRegistryExecutor {
     /// Named-worker descriptions used to construct the base tool registry.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     writing_tools: Option<WritingConversationTools>,
+    coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
 }
 
 impl ToolRegistryExecutor {
@@ -2163,6 +2213,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
     }
 
@@ -2179,7 +2230,17 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             writing_tools: None,
+            coordinator_skill_catalog: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_coordinator_skill_catalog(
+        mut self,
+        catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Self {
+        self.coordinator_skill_catalog = catalog;
+        self
     }
 
     #[must_use]
@@ -2224,6 +2285,12 @@ impl ToolExecutor for ToolRegistryExecutor {
         }
 
         None
+    }
+
+    fn coordinator_skill_catalog(
+        &self,
+    ) -> Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog> {
+        self.coordinator_skill_catalog.clone()
     }
 
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
@@ -2431,5 +2498,45 @@ mod registry_llm_client_tests {
             mismatch.continuation_request_limits(),
             phoenix_llm::ContinuationRequestLimits::TokenWindowOnly
         );
+    }
+}
+
+#[async_trait]
+impl SvgArtifactRepository for DatabaseStorage {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+    ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
+        self.db
+            .svg_artifact_for_invocation(conversation_id, invocation)
+            .await
+            .map(|artifact| artifact.map(crate::db::SvgArtifact::into_reference))
+            .map_err(|error| error.to_string())
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        match self
+            .db
+            .publish_svg_artifact(conversation_id, invocation, &draft.metadata, &draft.svg)
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(
+                    result
+                        .map(crate::db::SvgArtifact::into_reference)
+                        .map_err(|error| error.to_string()),
+                )
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
     }
 }

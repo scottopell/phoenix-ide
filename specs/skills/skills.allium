@@ -22,6 +22,7 @@ external entity Skill {
     base_dir: String        -- absolute path to the skill's containing directory (filesystem path)
     argument_hint: String?  -- from frontmatter; shown in autocomplete after /name
     source: String          -- scanning location: ".claude/skills" | ".agents/skills"
+    audience: String        -- "conversation" | "global-coordinator"
 }
 
 -- Opaque types referenced by rules below; declared as external so the
@@ -108,6 +109,22 @@ rule CollectNamespacedSubSkills {
         -- Implementation: collect_skills_from_dir() in src/system_prompt.rs.
 }
 
+rule FilterSkillCatalogByAudience {
+    when: AudienceCatalogRequested(audience, working_dir)
+
+    let catalog = collect_skills(working_dir, audience: audience)
+
+    ensures: for skill in catalog where skill.audience = audience:
+        skill in audience_catalog
+    ensures: for skill in catalog where skill.audience != audience:
+        skill not in audience_catalog
+
+    @guidance
+        -- Skills without audience metadata use the conversation audience.
+        -- Only Phoenix built-ins may declare global-coordinator. Filesystem
+        -- metadata cannot promote a skill into the Coordinator catalog.
+}
+
 ------------------------------------------------------------
 -- Rules: Invocation — User Slash Command
 ------------------------------------------------------------
@@ -131,7 +148,7 @@ rule UserInvokesSkill {
 
     requires: exists token
 
-    let skill = find_skill(collect_skills(working_dir), token.name)
+    let skill = find_skill(collect_skills(working_dir, audience: "conversation"), token.name)
     -- find_skill: black box looking up a skill by exact name in a List<Skill>
 
     requires: exists skill
@@ -168,7 +185,7 @@ rule SkillTokenNotMatched {
 
     requires: exists token
 
-    let skill = find_skill(collect_skills(working_dir), token.name)
+    let skill = find_skill(collect_skills(working_dir, audience: "conversation"), token.name)
 
     requires: not exists skill
 
@@ -211,10 +228,13 @@ rule NoSlashToken {
 rule LlmCallsSkillTool {
     when: LlmToolCall(tool, skill_name, args, working_dir)
 
-    let skill = find_skill(collect_skills(working_dir), skill_name)
+    let audience = caller_audience(tool)
+    let catalog = collect_skills(working_dir, audience: audience)
+    let skill = find_skill(catalog, skill_name)
 
     requires: tool = "skill"
     requires: exists skill
+    -- caller_audience: black box returning the audience bound to this Skill tool
 
     ensures: ToolResult.created(
         content: expand_skill(skill, args),
@@ -230,12 +250,14 @@ rule LlmCallsSkillTool {
 rule LlmCallsSkillToolNotFound {
     when: LlmToolCall(tool, skill_name, args, working_dir)
 
-    let skill = find_skill(collect_skills(working_dir), skill_name)
+    let audience = caller_audience(tool)
+    let catalog = collect_skills(working_dir, audience: audience)
+    let skill = find_skill(catalog, skill_name)
 
     requires: tool = "skill"
     requires: not exists skill
 
-    let available = skill_names_joined(collect_skills(working_dir))
+    let available = skill_names_joined(catalog)
     -- skill_names_joined: black box returning comma-separated skill names
 
     ensures: ToolResult.created(
@@ -366,9 +388,9 @@ rule StripFrontmatter {
 ------------------------------------------------------------
 
 rule InjectSkillCatalog {
-    when: SystemPromptBuilt(working_dir)
+    when: SystemPromptBuilt(working_dir, audience)
 
-    let catalog = collect_skills(working_dir)
+    let catalog = collect_skills(working_dir, audience: audience)
 
     requires: catalog.count > 0
 
@@ -411,10 +433,12 @@ invariant SkillNamesUnique {
 }
 
 ------------------------------------------------------------
--- Open Questions
+-- Unsupported Frontmatter
 ------------------------------------------------------------
 
-open question "context-mode: fork — a planned frontmatter field that would cause skill invocation to run in an isolated context (similar to a sub-agent) rather than injecting into the current conversation. Semantics, lifecycle, and delivery format are unresolved. Not implementing yet."
+-- `context-mode: fork` is unsupported. Skill invocation delivers the skill body
+-- in the current conversation; it does not create an isolated context or
+-- sub-agent lifecycle.
 
 -- REQ-SK-002 delivery split: resolved. User slash path → user-role message.
 -- LLM tool path → tool result. Both are intentional; see rule comment above.

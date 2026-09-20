@@ -40,6 +40,20 @@ describe('SelectionDialog', () => {
     await waitFor(() => expect(trigger).toHaveFocus());
   });
 
+  it('consumes Escape before window navigation handlers after dismissing', () => {
+    const globalShortcut = vi.fn();
+    window.addEventListener('keydown', globalShortcut);
+    try {
+      render(<DialogHarness />);
+      fireEvent.click(screen.getByRole('button', { name: 'Open chooser' }));
+      fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(globalShortcut).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('keydown', globalShortcut);
+    }
+  });
+
   it('dismisses from the dialog backdrop', async () => {
     render(<DialogHarness />);
     const trigger = screen.getByRole('button', { name: 'Open chooser' });

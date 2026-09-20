@@ -583,6 +583,9 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
+        ToolOutput::TrustedInstructions(instructions) => ToolOutcome::TrustedInstructions {
+            output: cap_tool_output_text(instructions.into_output()),
+        },
         ToolOutput::Error {
             output,
             images,
@@ -594,6 +597,71 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             images: convert(images),
         },
     }
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    let persisted_output = match &result.outcome {
+        ToolOutcome::TrustedInstructions { .. } => {
+            "Authenticated built-in skill instructions were delivered for this live request."
+        }
+        _ => result.output(),
+    };
+    MessageContent::tool_with_images(
+        &result.tool_use_id,
+        persisted_output,
+        result.is_error(),
+        result.images().to_vec(),
+    )
+}
+
+fn trusted_tool_results(results: &[ToolResult]) -> Vec<(String, String)> {
+    results
+        .iter()
+        .filter_map(|result| match &result.outcome {
+            ToolOutcome::TrustedInstructions { output } => {
+                Some((result.tool_use_id.clone(), output.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[(String, String)]) {
+    for (trusted_id, trusted) in trusted_results {
+        if let Some(content) = messages.iter_mut().rev().find_map(|message| {
+            message
+                .content
+                .iter_mut()
+                .rev()
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } if tool_use_id == trusted_id => Some(content),
+                    _ => None,
+                })
+        }) {
+            *content = format!(
+                "<trusted_builtin_skill audience=\"global-coordinator\">{trusted}</trusted_builtin_skill>"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn count_trusted_envelopes(messages: &[LlmMessage]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { content, .. }
+                    if content.contains("<trusted_builtin_skill")
+            )
+        })
+        .count()
 }
 
 /// Await a tool task's oneshot outcome and forward it, generation-tagged, to
@@ -1629,6 +1697,7 @@ where
     /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
+    pending_trusted_tool_results: Vec<(String, String)>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -1824,6 +1893,7 @@ where
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
@@ -1907,6 +1977,7 @@ where
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
+        let fatal_local_authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
 
         Self {
             context,
@@ -1921,6 +1992,7 @@ where
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
+            pending_trusted_tool_results: Vec::new(),
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -1958,8 +2030,10 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
-            fatal_local_authority_rx: None,
-            fatal_external_effect_cancellation: None,
+            fatal_local_authority_rx: Some(fatal_local_authority_fence.subscribe()),
+            fatal_external_effect_cancellation: Some(
+                fatal_local_authority_fence.external_effect_cancellation(),
+            ),
             #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
@@ -1973,7 +2047,8 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
-            fatal_local_authority_fence: crate::runtime::FatalLocalAuthorityFence::new(),
+            fatal_local_authority_fence,
+            svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
@@ -2403,6 +2478,7 @@ where
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.
                     if matches!(event, Event::Shutdown) {
+                        self.svg_publication_lifetime.coordinated_shutdown();
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
@@ -2758,6 +2834,8 @@ where
             self.retry_timer_handle = None;
         }
 
+        let is_llm_outcome = matches!(&outcome, EffectOutcome::Llm(_));
+
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
             tool_calls,
@@ -2791,6 +2869,14 @@ where
                 return Err(invalid.reason);
             }
         };
+        if is_llm_outcome
+            && !result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
+        {
+            self.pending_trusted_tool_results.clear();
+        }
 
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
 
@@ -6135,13 +6221,9 @@ where
             }
 
             AuthoritativeEffect::PersistToolResults { results } => {
+                self.pending_trusted_tool_results = trusted_tool_results(&results);
                 for result in results {
-                    let content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let content = tool_result_message_content(&result);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let seq = self.broadcast_tx.next_seq();
                     let msg = self
@@ -6802,7 +6884,12 @@ where
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
         self.refresh_active_prompt_projection().await?;
-        let frozen_messages = assemble_cleared_messages(
+        let trusted_results = self.pending_trusted_tool_results.clone();
+        let trusted_token_reserve = trusted_results
+            .iter()
+            .map(|(_, content)| estimate_text_tokens(content))
+            .sum::<usize>();
+        let mut frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
             &self
@@ -6812,10 +6899,14 @@ where
                 .messages,
             None,
             &self.clearable_names,
-            self.context.context_window,
+            self.context
+                .context_window
+                .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
         .await;
+
+        overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
@@ -6929,7 +7020,10 @@ where
                 phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
             };
         let mut system_prompt = if is_coordinator {
-            crate::system_prompt::build_coordinator_system_prompt(llm_language)
+            crate::system_prompt::build_coordinator_system_prompt(
+                llm_language,
+                tool_executor.coordinator_skill_catalog().as_ref(),
+            )
         } else {
             build_system_prompt(
                 working_dir
@@ -7379,7 +7473,7 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
-        let tool_ctx = match &self.context.execution_environment {
+        let mut tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
             } => ToolContext::new_with_resource_scope(
@@ -7410,8 +7504,25 @@ where
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
+        .with_svg_artifact_store(Arc::new(
+            super::svg_artifacts::RuntimeSvgArtifactStore::new(
+                self.storage.clone(),
+                self.fatal_local_authority_fence.clone(),
+                self.svg_publication_lifetime.clone(),
+            ),
+        ))
         .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
+
+        if let ConvState::ToolExecuting {
+            assistant_message, ..
+        }
+        | ConvState::CancellingTool {
+            assistant_message, ..
+        } = &self.state
+        {
+            tool_ctx = tool_ctx.with_svg_assistant_message_id(&assistant_message.message_id);
+        }
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -7514,6 +7625,7 @@ where
             assistant_message,
             tool_results,
         } = data;
+        self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -7537,14 +7649,9 @@ where
             .into_iter()
             .zip(reserved_seqs.into_iter().skip(1))
             .map(|(result, sequence_id)| {
-                let content = MessageContent::tool_with_images(
-                    &result.tool_use_id,
-                    result.output(),
-                    result.is_error(),
-                    result.images().to_vec(),
-                );
+                let content = tool_result_message_content(&result);
                 crate::db::Message {
-                    message_id: tool_result_message_id(&result.tool_use_id),
+                    message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                     conversation_id: conv_id.clone(),
                     sequence_id,
                     message_type: content.message_type(),
@@ -7602,6 +7709,7 @@ where
                 assistant_message,
                 tool_results,
             } => {
+                self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
                 let conv_id = self.context.conversation_id.clone();
 
                 // Build the assistant message row.
@@ -7634,16 +7742,14 @@ where
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
                 for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let tool_content = tool_result_message_content(result);
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
-                        message_id: tool_result_message_id(&result.tool_use_id),
+                        message_id: tool_result_message_id(
+                            &agent_msg.message_id,
+                            &result.tool_use_id,
+                        ),
                         conversation_id: conv_id.clone(),
                         sequence_id: *tool_seq,
                         message_type: tool_content.message_type(),
@@ -7767,7 +7873,7 @@ where
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             tool_msgs.push(crate::db::Message {
-                message_id: tool_result_message_id(&result.tool_use_id),
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                 conversation_id: conv_id.clone(),
                 sequence_id: *tool_seq,
                 message_type: tool_content.message_type(),
@@ -7862,7 +7968,7 @@ where
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
         if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(&tool_id);
+            let message_id = self.latest_spawn_result_message_id(&tool_id).await?;
 
             // This summary replaces the initial "Spawning N sub-agents..."
             // acknowledgement so build_llm_messages_static feeds the actual
@@ -7950,6 +8056,21 @@ where
         Ok(None)
     }
 
+    async fn latest_spawn_result_message_id(&self, tool_use_id: &str) -> Result<String, String> {
+        let messages = self
+            .storage
+            .get_messages(&self.context.conversation_id)
+            .await?;
+        phoenix_core::domain::tool_result_identity::latest_tool_result_message_id(
+            &messages,
+            tool_use_id,
+        )
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "Awaited spawn result is missing from durable conversation history".to_owned()
+        })
+    }
+
     async fn persist_terminal_sub_agent_results(
         &mut self,
         spawn_tool_id: Option<String>,
@@ -7962,7 +8083,7 @@ where
         let evidence = if let Some(tool_id) = spawn_tool_id {
             TerminalSubAgentEvidence::Update {
                 conversation_id: self.context.conversation_id.clone(),
-                message_id: tool_result_message_id(&tool_id),
+                message_id: self.latest_spawn_result_message_id(&tool_id).await?,
                 content: MessageContent::tool(&tool_id, &llm_content, false),
                 display_data: display_data.clone(),
             }
@@ -12999,6 +13120,14 @@ mod authoritative_user_message_effect_tests {
                 request.system[0].text,
                 CompactionPolicy::for_coordinator(coordinator).system_prompt()
             );
+            if coordinator {
+                assert!(!request.system[0]
+                    .text
+                    .contains("cannot create conversations"));
+                assert!(!request.system[0]
+                    .text
+                    .contains("NEVER call Phoenix HTTP API through Bash"));
+            }
             assert!(request.messages.len() < 63);
         }
     }
@@ -17928,6 +18057,78 @@ mod steer_drain_detector_tests {
     /// assistant text summary that renders into LLM history. This pins that the
     /// orphan branch is gone.
     #[tokio::test]
+    async fn repeated_provider_ids_persist_distinct_rounds_and_fan_in_updates_latest() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "reused-provider-id",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        for assistant_id in ["first-assistant", "second-assistant"] {
+            let assistant = AssistantMessage::new(
+                assistant_id.to_owned(),
+                vec![phoenix_llm::ContentBlock::tool_use(
+                    "reused",
+                    "spawn_agents",
+                    serde_json::json!({"agents": []}),
+                )],
+                None,
+                None,
+            );
+            let data = CheckpointData::tool_round(
+                assistant,
+                vec![crate::db::ToolResult::success(
+                    "reused".into(),
+                    assistant_id.into(),
+                )],
+            )
+            .unwrap();
+            rt.execute_effect(Effect::PersistCheckpoint { data })
+                .await
+                .unwrap();
+        }
+        let messages = storage.get_all_messages("reused-provider-id");
+        assert_eq!(messages.len(), 4);
+        for assistant_id in ["first-assistant", "second-assistant"] {
+            assert!(messages.iter().any(
+                |message| message.message_id == tool_result_message_id(assistant_id, "reused")
+            ));
+        }
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_sub_agent_results(
+            vec![SubAgentResult {
+                agent_id: "child".into(),
+                task: "work".into(),
+                outcome: SubAgentOutcome::TimedOut,
+            }],
+            Some("reused".into()),
+            "unused-summary".into(),
+            &mut admitted,
+        )
+        .await
+        .unwrap();
+        let messages = storage.get_all_messages("reused-provider-id");
+        let old = messages
+            .iter()
+            .find(|message| {
+                message.message_id == tool_result_message_id("first-assistant", "reused")
+            })
+            .unwrap();
+        assert!(
+            matches!(&old.content, crate::db::MessageContent::Tool(content) if content.content == "first-assistant")
+        );
+        let latest = messages
+            .iter()
+            .find(|message| {
+                message.message_id == tool_result_message_id("second-assistant", "reused")
+            })
+            .unwrap();
+        assert!(
+            matches!(&latest.content, crate::db::MessageContent::Tool(content) if content.content.contains("Sub-agent results"))
+        );
+        assert!(rt.latest_spawn_result_message_id("missing").await.is_err());
+    }
+
+    #[tokio::test]
     async fn persist_sub_agent_results_none_emits_non_tool_message() {
         use crate::db::MessageContent;
 
@@ -18223,6 +18424,66 @@ mod steer_drain_detector_tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    async fn build_cancelling_runtime(
+        conv_id: &str,
+        agent_ids: &[&str],
+        cause: crate::state_machine::event::CancelCause,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        Arc<InMemoryStorage>,
+    ) {
+        let (mut runtime, storage) = build_runtime_with_state_and_queue(
+            conv_id,
+            mk_cancelling_sub_agents(agent_ids, cause),
+            vec![],
+        );
+        let assistant = AssistantMessage::new(
+            format!("{conv_id}-spawn-assistant"),
+            vec![ContentBlock::tool_use(
+                "spawn-1",
+                "spawn_agents",
+                serde_json::json!({"tasks": agent_ids.iter().map(|id| serde_json::json!({"task": format!("task {id}"), "mode": "work"})).collect::<Vec<_>>()}),
+            )],
+            None,
+            None,
+        );
+        let checkpoint = CheckpointData::tool_round(
+            assistant,
+            vec![ToolResult::success(
+                "spawn-1".into(),
+                "Spawning sub-agents".into(),
+            )],
+        )
+        .unwrap();
+        runtime
+            .execute_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .await
+            .unwrap();
+        (runtime, storage)
+    }
+
+    fn assert_cancellation_fan_in_persisted(storage: &InMemoryStorage, conv_id: &str) {
+        let messages = storage.get_all_messages(conv_id);
+        let message = messages
+            .iter()
+            .find(|message| {
+                matches!(&message.content,
+            MessageContent::Tool(content) if content.tool_use_id == "spawn-1")
+            })
+            .expect("spawn checkpoint must retain its tool result");
+        assert!(matches!(&message.content, MessageContent::Tool(content)
+            if content.content.starts_with("Sub-agent results")));
+        assert_eq!(
+            message
+                .display_data
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("subagent_summary")
+        );
+    }
+
     /// Test 4 (part A): the one-writer reservation is released ONLY when a
     /// `SubAgentResult` for the in-flight Work agent is actually processed — not
     /// merely because the parent is in `CancellingSubAgents`. Seed the counter at
@@ -18230,14 +18491,12 @@ mod steer_drain_detector_tests {
     /// drops to 0.
     #[tokio::test]
     async fn one_writer_released_on_confirmed_stop() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-onewriter-release",
-            mk_cancelling_sub_agents(
-                &["w1"],
-                crate::state_machine::event::CancelCause::UserRequested,
-            ),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         // Before the result drains, the reservation is still held.
@@ -18265,6 +18524,7 @@ mod steer_drain_detector_tests {
             "the last drained result resolves CancellingSubAgents -> Idle, got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-release");
     }
 
     /// Test 4 (part B): after the 6s last-resort presumes a silent Work agent
@@ -18272,11 +18532,12 @@ mod steer_drain_detector_tests {
     /// — no leak. Drives the backstop directly (no real 6s wait).
     #[tokio::test]
     async fn one_writer_released_by_last_resort_backstop() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-onewriter-backstop",
-            mk_cancelling_sub_agents(&["w1"], crate::state_machine::event::CancelCause::Timeout),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::Timeout,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         // Fire the last-resort backstop directly (the deadline arm would call
@@ -18292,6 +18553,7 @@ mod steer_drain_detector_tests {
             "a Timeout teardown resumes the parent (LlmRequesting), got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-backstop");
     }
 
     /// Test 5 (mixed drain): two pending Work agents — one reports a real result,
@@ -18299,14 +18561,12 @@ mod steer_drain_detector_tests {
     /// decrement each (no double-release, no leak); the parent reaches Idle.
     #[tokio::test]
     async fn mixed_drain_real_result_then_backstop_no_double_release() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-mixed-drain",
-            mk_cancelling_sub_agents(
-                &["real", "silent"],
-                crate::state_machine::event::CancelCause::Timeout,
-            ),
-            vec![],
-        );
+            &["real", "silent"],
+            crate::state_machine::event::CancelCause::Timeout,
+        )
+        .await;
         rt.active_work_subagents = 2;
 
         // "real" reports a genuine Success — fidelity preserved, counter -> 1.
@@ -18328,7 +18588,6 @@ mod steer_drain_detector_tests {
             "still draining the silent agent, got {}",
             rt.state.variant_name()
         );
-
         // "silent" never reports; the backstop presumes it dead and drains it.
         rt.handle_cancelling_sub_agents_timeout().await;
 
@@ -18341,6 +18600,7 @@ mod steer_drain_detector_tests {
             "Timeout teardown resumes the parent after both agents drain, got {}",
             rt.state.variant_name()
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-mixed-drain");
     }
 
     /// Double-release / underflow probe: a real result drains a Work agent
@@ -18350,14 +18610,12 @@ mod steer_drain_detector_tests {
     /// `saturating_sub` floor is never even reached because the guard fires first.
     #[tokio::test]
     async fn late_duplicate_result_for_same_agent_does_not_double_release() {
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_cancelling_runtime(
             "conv-dup-nounder",
-            mk_cancelling_sub_agents(
-                &["w1"],
-                crate::state_machine::event::CancelCause::UserRequested,
-            ),
-            vec![],
-        );
+            &["w1"],
+            crate::state_machine::event::CancelCause::UserRequested,
+        )
+        .await;
         rt.active_work_subagents = 1;
 
         rt.process_event(Event::SubAgentResult {
@@ -18388,6 +18646,7 @@ mod steer_drain_detector_tests {
             rt.active_work_subagents, 0,
             "a late duplicate for an already-drained agent must not decrement again"
         );
+        assert_cancellation_fan_in_persisted(&storage, "conv-dup-nounder");
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.
@@ -19033,6 +19292,111 @@ mod steer_drain_detector_tests {
         );
     }
 
+    #[test]
+    fn trusted_overlay_targets_only_latest_reused_tool_id() {
+        use phoenix_llm::ContentBlock;
+
+        let mut messages = vec![
+            LlmMessage {
+                role: phoenix_llm::MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "reused".to_string(),
+                    content: "historical ordinary output".to_string(),
+                    is_error: false,
+                    images: vec![],
+                }],
+            },
+            LlmMessage {
+                role: phoenix_llm::MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "reused".to_string(),
+                    content: "current persisted placeholder".to_string(),
+                    is_error: false,
+                    images: vec![],
+                }],
+            },
+        ];
+
+        overlay_trusted_tool_results(
+            &mut messages,
+            &[(
+                "reused".to_string(),
+                "authenticated current output".to_string(),
+            )],
+        );
+
+        assert_eq!(count_trusted_envelopes(&messages), 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content == "historical ordinary output"
+        ));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content.contains("authenticated current output")
+        ));
+    }
+
+    #[tokio::test]
+    async fn persist_checkpoint_downgrades_trusted_instruction_to_ordinary_content() {
+        use crate::db::{MessageContent, ToolOutcome, ToolResult};
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-checkpoint",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "trusted-skill-1".to_string(),
+                name: "skill".to_string(),
+                input: serde_json::json!({"skill_name": "phoenix-api"}),
+            }],
+            None,
+            None,
+        );
+        let result = ToolResult {
+            tool_use_id: "trusted-skill-1".to_string(),
+            outcome: ToolOutcome::TrustedInstructions {
+                output: "authenticated instructions".to_string(),
+            },
+            duration_ms: None,
+        };
+        let data = CheckpointData::tool_round(assistant, vec![result]).expect("tool_round");
+
+        rt.execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("PersistCheckpoint must succeed");
+
+        let msgs = storage.get_all_messages("conv-trusted-checkpoint");
+        assert!(matches!(
+            msgs.iter().find_map(|message| match &message.content {
+                MessageContent::Tool(content) if content.tool_use_id == "trusted-skill-1" => {
+                    Some((content.content.as_str(), content.is_error))
+                }
+                _ => None,
+            }),
+            Some((
+                "Authenticated built-in skill instructions were delivered for this live request.",
+                false
+            ))
+        ));
+        let persisted = msgs
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Tool(content) => Some(content.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!persisted.contains("authenticated instructions"));
+        assert!(!persisted.contains("trusted_builtin_skill"));
+    }
+
     #[tokio::test]
     async fn retired_terminal_checkpoint_does_not_publish_deleted_rows() {
         use crate::state_machine::{AssistantMessage, CheckpointData};
@@ -19136,7 +19500,7 @@ mod steer_drain_detector_tests {
         loop {
             match rx.try_recv() {
                 Ok(SseEvent::Message { message }) => {
-                    if message.message_id == "tool-duration-1-result" {
+                    if message.message_id == tool_row.message_id {
                         saw_tool_message = true;
                     }
                 }
@@ -19145,7 +19509,7 @@ mod steer_drain_detector_tests {
                     duration_ms: Some(_),
                     ..
                 }) => {
-                    if message_id == "tool-duration-1-result" {
+                    if message_id == tool_row.message_id {
                         saw_duration_update = true;
                     }
                 }
@@ -19470,9 +19834,9 @@ mod work_subagent_cwd_guard_tests {
 
     fn tool_result_text(result: &ToolResult) -> String {
         match &result.outcome {
-            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => {
-                output.clone()
-            }
+            ToolOutcome::Success { output, .. }
+            | ToolOutcome::TrustedInstructions { output }
+            | ToolOutcome::Error { output, .. } => output.clone(),
             ToolOutcome::Cancelled { message } => message.clone(),
         }
     }
@@ -20106,6 +20470,16 @@ mod tool_output_to_outcome_tests {
     use crate::tools::{ToolImage, ToolOutput};
 
     #[test]
+    fn trusted_instructions_are_a_distinct_persisted_outcome() {
+        assert!(matches!(
+            ToolOutcome::TrustedInstructions {
+                output: "trusted".to_string()
+            },
+            ToolOutcome::TrustedInstructions { ref output } if output == "trusted"
+        ));
+    }
+
+    #[test]
     fn success_output_maps_to_success_outcome() {
         let out = ToolOutput::success("ran clean")
             .with_display(serde_json::json!({ "k": "v" }))
@@ -20574,7 +20948,7 @@ mod fork_proposal_persist_tests {
         );
         let ack = msgs
             .iter()
-            .find(|m| m.message_id == tool_result_message_id("tool-fork-1"))
+            .find(|m| m.message_id == tool_result_message_id("asst-fork", "tool-fork-1"))
             .expect("synthetic success ack must be persisted");
         assert!(
             matches!(&ack.content, MessageContent::Tool(tc) if !tc.is_error),

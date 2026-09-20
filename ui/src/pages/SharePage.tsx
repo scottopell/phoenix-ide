@@ -18,6 +18,7 @@ import {
   SseStateChangeDataSchema,
   SseTokenDataSchema,
 } from '../sseSchemas';
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import type { SSEAction } from '../conversation/atom';
 
 type ShareStatus = 'loading' | 'connected' | 'error' | 'not_found';
@@ -135,7 +136,7 @@ export function SharePage() {
     };
   }, [token, handleSseInit, handleSseMessage, handleSseStateChange]);
 
-  if (status === 'not_found') {
+  if (status === 'not_found' || !token) {
     return (
       <div className="share-page">
         <div className="share-banner share-banner--error">
@@ -185,19 +186,21 @@ export function SharePage() {
         </span>
       </div>
       <main className="share-main">
-        <MessageList
-          messages={messages}
-          pendingMessages={[]}
-          convState={convState}
-          onRetry={() => {}}
-          onOpenFile={undefined}
-          enableMessageSidepanel={false}
-          conversationId={conversation.id}
-          transcriptPositioning={{
-            kind: 'idle',
-            view: { conversationId: conversation.id, generation: 0, transcriptGeneration: 0 },
-          }}
-        />
+        <SvgArtifactAccessContext.Provider value={{ kind: 'share', token }}>
+          <MessageList
+            messages={messages}
+            pendingMessages={[]}
+            convState={convState}
+            onRetry={() => {}}
+            onOpenFile={undefined}
+            enableMessageSidepanel={false}
+            conversationId={conversation.id}
+            transcriptPositioning={{
+              kind: 'idle',
+              view: { conversationId: conversation.id, generation: 0, transcriptGeneration: 0 },
+            }}
+          />
+        </SvgArtifactAccessContext.Provider>
       </main>
     </div>
   );

@@ -18,6 +18,7 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
+mod svg_artifacts;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
@@ -5117,10 +5118,18 @@ impl RuntimeManager {
                         self.db.clone(),
                         self.clone(),
                     ));
+                let coordinator_catalog =
+                    crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
+                        crate::skills::builtin::default_extract_dir().as_deref(),
+                    );
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(
+                        crate::coordinator_tools::tools(service, send_chat),
+                        coordinator_catalog.clone(),
+                    ),
                     agent_catalog.clone(),
                 )
+                .with_coordinator_skill_catalog(coordinator_catalog)
             } else {
                 let global_read = crate::api::global_read::GlobalReadService::new(
                     self.db.clone(),

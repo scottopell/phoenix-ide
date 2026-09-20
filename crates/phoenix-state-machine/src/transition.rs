@@ -2198,6 +2198,7 @@ pub fn transition_parent(
                         | ToolInput::Patch(_)
                         | ToolInput::KeywordSearch(_)
                         | ToolInput::ReadImage(_)
+                        | ToolInput::PresentSvg(_)
                         | ToolInput::SpawnAgents(_)
                         | ToolInput::SubmitResult(_)
                         | ToolInput::SubmitError(_)
@@ -2438,6 +2439,7 @@ pub fn transition_parent(
                 | ToolInput::Patch(_)
                 | ToolInput::KeywordSearch(_)
                 | ToolInput::ReadImage(_)
+                | ToolInput::PresentSvg(_)
                 | ToolInput::SpawnAgents(_)
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
@@ -3116,6 +3118,7 @@ pub fn transition_sub_agent(
                     | ToolInput::Patch(_)
                     | ToolInput::KeywordSearch(_)
                     | ToolInput::ReadImage(_)
+                    | ToolInput::PresentSvg(_)
                     | ToolInput::SpawnAgents(_)
                     | ToolInput::ProposeTask(_)
                     | ToolInput::AskUserQuestion(_)
@@ -5469,6 +5472,7 @@ mod tests {
     /// `propose_task` call must be rejected in the state machine — surfaced as a
     /// tool error and the LLM re-requested — not stalled or routed to the
     /// executor's unreachable `run()` fallback.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_subagent_sole_propose_task_rejected_not_stalled() {
         use crate::state::{ContextExhaustionBehavior, ProposeTaskInput, ToolInput};
@@ -5569,7 +5573,9 @@ mod tests {
                     "rejection must explain task management is the parent's job, got: {output}"
                 );
             }
-            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+            other @ (ToolOutcome::Success { .. }
+            | ToolOutcome::TrustedInstructions { .. }
+            | ToolOutcome::Cancelled { .. }) => {
                 panic!("expected an error tool result, got {other:?}")
             }
         }

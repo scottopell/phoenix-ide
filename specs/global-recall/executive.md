@@ -4,7 +4,7 @@
 
 Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies a transparent bounded relational snapshot on every Coordinator turn. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
 
-The Coordinator has two mutation capabilities: singular text-message delivery to an existing non-Coordinator conversation, and unsandboxed Bash targeted to an explicit active WorkScope. User-authorized continuation of an existing ordinary context-exhausted transcript uses the normal idempotent continuation runtime only when that scoped Bash context already has usable authenticated server transport; it reports the accepted successor identity and creates only the successor transcript within the existing ProductConversation. Message delivery reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
+The Coordinator has two host capabilities that can perform mutations: singular text-message delivery to an existing non-Coordinator conversation, and unsandboxed Bash targeted to an explicit active WorkScope. A Coordinator-only built-in skill documents supported Phoenix HTTP APIs for user-authorized lifecycle actions through scoped Bash. Those calls preserve normal API authorization and require response plus resulting-state verification. Message delivery reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, executed, or completed the instruction.
 
 The `/global` surface is the standard transcript and composer without a separate work view. A compact composer action requests a read-only current-activity briefing through the normal message path while preserving the user's draft.
 
@@ -52,7 +52,7 @@ Coverage verifies operator-level application-data reads, read-only SQLite author
 
 The scope is transparent relational orientation, one durable chat-only Coordinator conversation, bounded global reads, explicitly WorkScope-targeted local operation through unsandboxed Bash, singular text-message delivery to existing non-Coordinator conversations, and a compact read-only briefing action.
 
-The Coordinator runs only on user turns. It does not monitor work in the background, create unrelated or new-work conversations, perform arbitrary lifecycle mutation, manage a global objective, retain attention history, or infer recipient understanding from message acceptance.
+The Coordinator runs only on user turns. It does not monitor work in the background, manage a global objective, retain attention history, or infer execution or recipient understanding from request acceptance.
 
 ## Out of Scope
 
@@ -60,6 +60,6 @@ The Coordinator runs only on user turns. It does not monitor work in the backgro
 - Phoenix-wide tools for restricted planning conversations or sub-agents.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
-- Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; selected-WorkScope mutation remains available only through explicitly targeted Bash.
+- Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; user-authorized supported HTTP APIs remain available only through explicitly targeted Bash. Current APIs do not provide one aggregate-targeted lifecycle contract, uniform operation receipts, a general conversation retry, or caller-idempotent cancel.
 - Background monitoring or proactive intervention without a user turn.
 - A separate transcript/composer runtime for the Coordinator.
