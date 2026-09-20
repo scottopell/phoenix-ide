@@ -1,12 +1,31 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
 import { VoicePermission } from './VoiceInput/VoicePermission';
 import type { ComposerQuickAction, InputAreaHandle } from './InputArea';
-import type { ConversationState, Message, SkillEntry } from '../api';
-import { api } from '../api';
+import type { ConversationState, FileAttachment, ImageData, Message, SkillEntry } from '../api';
+import { api, ConflictError } from '../api';
+
+vi.mock('./VoiceInput', () => ({
+  isWebSpeechSupported: () => true,
+  VoiceRecorder: ({
+    onStart,
+    onEnd,
+    onInterim,
+  }: {
+    onStart?: () => void;
+    onEnd?: () => void;
+    onInterim?: (text: string) => void;
+  }) => (
+    <>
+      <button type="button" onClick={onStart}>start mock voice</button>
+      <button type="button" onClick={onEnd}>end mock voice</button>
+      <button type="button" onClick={() => onInterim?.('last spoken words')}>mock interim voice</button>
+    </>
+  ),
+}));
 
 const idleState: ConversationState = { type: 'idle' };
 
@@ -171,6 +190,256 @@ describe('InputArea controlled-draft contract', () => {
 
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
     expect(screen.queryByText('<path>')).not.toBeInTheDocument();
+  });
+});
+
+describe('InputArea close-fenced recovery', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const submittedImage: ImageData = { data: 'submitted-image', media_type: 'image/png' };
+  const newerImage: ImageData = { data: 'newer-image', media_type: 'image/jpeg' };
+  const submittedFile: FileAttachment = {
+    original_name: 'submitted.txt',
+    media_type: 'text/plain',
+    size_bytes: 10,
+    stored_path: '/submitted.txt',
+  };
+  const newerFile: FileAttachment = {
+    original_name: 'newer.txt',
+    media_type: 'text/plain',
+    size_bytes: 20,
+    stored_path: '/newer.txt',
+  };
+
+  it('unions submitted attachments with newer same-scope attachments', async () => {
+    const response = deferred<void>();
+
+    function Harness() {
+      const [draft, setDraft] = useState('submitted A');
+      const [images, setImages] = useState<ImageData[]>([submittedImage]);
+      const [files, setFiles] = useState<FileAttachment[]>([submittedFile]);
+      return (
+        <>
+          <InputArea
+            cwd="/repo"
+            scopeKey="conv-a"
+            convState={idleState}
+            images={images}
+            setImages={setImages}
+            files={files}
+            setFiles={setFiles}
+            isOffline={false}
+            failedMessages={[]}
+            draft={draft}
+            onDraftChange={setDraft}
+            onSend={() => response.promise}
+            onCancel={() => {}}
+            onRetry={() => {}}
+          />
+          <output data-testid="draft-state">{draft}</output>
+          <output data-testid="image-state">{images.map(image => image.data).join(',')}</output>
+          <output data-testid="file-state">{files.map(file => file.original_name).join(',')}</output>
+          <button type="button" onClick={() => {
+            setDraft('newer B');
+            setImages([newerImage]);
+            setFiles([newerFile]);
+          }}>add newer content</button>
+        </>
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'add newer content' }));
+    response.reject(new ConflictError({
+      error: 'Conversation is closing and cannot accept new work.',
+      error_type: 'close_admission_fenced',
+    }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('draft-state')).toHaveTextContent('submitted A\nnewer B', {
+        normalizeWhitespace: false,
+      });
+      expect(screen.getByTestId('image-state')).toHaveTextContent('submitted-image,newer-image');
+      expect(screen.getByTestId('file-state')).toHaveTextContent('submitted.txt,newer.txt');
+    });
+  });
+
+  it('restores a cross-scope failure only after returning to its owning scope', async () => {
+    const response = deferred<void>();
+
+    function Harness() {
+      const [scope, setScope] = useState<'conv-a' | 'conv-b'>('conv-a');
+      const [drafts, setDrafts] = useState({ 'conv-a': 'submitted A', 'conv-b': 'draft B' });
+      const [images, setImages] = useState<ImageData[]>([submittedImage]);
+      const [files, setFiles] = useState<FileAttachment[]>([submittedFile]);
+      const setDraft = (draft: string) => setDrafts(current => ({ ...current, [scope]: draft }));
+      return (
+        <>
+          <InputArea
+            cwd="/repo"
+            scopeKey={scope}
+            convState={idleState}
+            images={images}
+            setImages={setImages}
+            files={files}
+            setFiles={setFiles}
+            isOffline={false}
+            failedMessages={[]}
+            draft={drafts[scope]}
+            onDraftChange={setDraft}
+            onSend={() => response.promise}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            enqueueFencedSendRecovery={(recovery) => {
+              setDrafts(current => ({
+                ...current,
+                'conv-a': current['conv-a'].length > 0
+                  ? `${recovery.text}\n${current['conv-a']}`
+                  : recovery.text,
+              }));
+              if (scope === 'conv-a') {
+                setImages(recovery.images);
+                setFiles(recovery.files);
+              }
+            }}
+          />
+          <output data-testid="scope-state">{scope}</output>
+          <output data-testid="draft-state">{drafts[scope]}</output>
+          <output data-testid="image-state">{images.map(image => image.data).join(',')}</output>
+          <output data-testid="file-state">{files.map(file => file.original_name).join(',')}</output>
+          <button type="button" onClick={() => {
+            setScope('conv-b');
+            setImages([newerImage]);
+            setFiles([newerFile]);
+          }}>switch to B</button>
+          <button type="button" onClick={() => {
+            setScope('conv-a');
+            setImages([submittedImage]);
+            setFiles([submittedFile]);
+          }}>return to A</button>
+        </>
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'switch to B' }));
+    response.reject(new ConflictError({
+      error: 'Conversation is closing and cannot accept new work.',
+      error_type: 'close_admission_fenced',
+    }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('scope-state')).toHaveTextContent('conv-b');
+      expect(screen.getByTestId('draft-state')).toHaveTextContent('draft B');
+      expect(screen.getByTestId('image-state')).toHaveTextContent('newer-image');
+      expect(screen.getByTestId('file-state')).toHaveTextContent('newer.txt');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'return to A' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('draft-state')).toHaveTextContent('submitted A');
+      expect(screen.getByTestId('image-state')).toHaveTextContent('submitted-image');
+      expect(screen.getByTestId('file-state')).toHaveTextContent('submitted.txt');
+    });
+  });
+
+  it('keeps rejected voice text in one composer state across a late voice end', async () => {
+    const response = deferred<void>();
+
+    function Harness() {
+      const [draft, setDraft] = useState('voice base');
+      return (
+        <>
+          <InputArea
+            cwd="/repo"
+            scopeKey="conv-voice"
+            convState={idleState}
+            images={[]}
+            setImages={() => {}}
+            isOffline={false}
+            failedMessages={[]}
+            draft={draft}
+            onDraftChange={setDraft}
+            onSend={() => response.promise}
+            onCancel={() => {}}
+            onRetry={() => {}}
+          />
+          <output data-testid="draft-state">{draft}</output>
+        </>
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'start mock voice' }));
+    fireEvent.click(screen.getByRole('button', { name: 'mock interim voice' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    response.reject(new ConflictError({
+      error: 'Conversation is closing and cannot accept new work.',
+      error_type: 'close_admission_fenced',
+    }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox')).toHaveValue('voice base last spoken words');
+      expect(screen.getByTestId('draft-state')).toBeEmptyDOMElement();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'end mock voice' }));
+    await waitFor(() => {
+      expect(screen.getByRole('textbox')).toHaveValue('voice base last spoken words');
+      expect(screen.getByTestId('draft-state')).toBeEmptyDOMElement();
+    });
+  });
+
+  it('keeps rejected voice text in one composer state when voice ends before rejection', async () => {
+    const response = deferred<void>();
+
+    function Harness() {
+      const [draft, setDraft] = useState('voice base');
+      return (
+        <>
+          <InputArea
+            cwd="/repo"
+            scopeKey="conv-voice"
+            convState={idleState}
+            images={[]}
+            setImages={() => {}}
+            isOffline={false}
+            failedMessages={[]}
+            draft={draft}
+            onDraftChange={setDraft}
+            onSend={() => response.promise}
+            onCancel={() => {}}
+            onRetry={() => {}}
+          />
+          <output data-testid="draft-state">{draft}</output>
+        </>
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'start mock voice' }));
+    fireEvent.click(screen.getByRole('button', { name: 'mock interim voice' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'end mock voice' }));
+    response.reject(new ConflictError({
+      error: 'Conversation is closing and cannot accept new work.',
+      error_type: 'close_admission_fenced',
+    }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox')).toHaveValue('voice base last spoken words');
+      expect(screen.getByTestId('draft-state')).toBeEmptyDOMElement();
+    });
   });
 });
 

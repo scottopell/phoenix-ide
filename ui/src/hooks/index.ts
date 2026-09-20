@@ -3,6 +3,7 @@ export { useKeyboardNav, useGlobalKeyboardShortcuts } from './useKeyboardNav';
 export {
   useDraftValue,
   useDraftActions,
+  useFencedSendRecovery,
   useDraftLifecycle,
   DraftLifecycle,
   seedDraftStorageKey,

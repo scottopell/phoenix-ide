@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ConflictError, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -1267,6 +1267,7 @@ function ConversationPageContent({
       if (isArchived) return;
 
       sendingMessagesRef.current.add(localId);
+      const dismissSubmitted = dismissRef.current;
 
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
       const phaseBeforePost = atomRef.current.phase;
@@ -1335,12 +1336,17 @@ function ConversationPageContent({
           });
         }
       } catch (err) {
+        if (err instanceof ConflictError && err.detail.error_type === 'close_admission_fenced') {
+          dismissSubmitted(localId);
+          rollbackOptimisticPhase();
+          throw err;
+        }
         if (err instanceof ExpansionError) {
           // Don't mark as failed — InputArea restores the draft and shows
           // an inline error so the user can fix or remove the broken
           // @reference (REQ-IR-007). Keeping the message in the queue as
           // "failed" would duplicate it alongside the restored draft.
-          dismissRef.current(localId);
+          dismissSubmitted(localId);
           rollbackOptimisticPhase();
           // Re-throw so InputArea can display inline error (REQ-IR-007)
           throw err;

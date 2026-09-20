@@ -937,7 +937,29 @@ export class ExpansionError extends Error {
  *  Branch-mode conversation on the same branch). `continuation_id` is set
  *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
  *  route to the continuation without parsing the error message. */
-export interface ConflictErrorDetail {
+interface ConflictErrorDetailBase {
+  attempt_id?: string;
+  active_transcript_id?: string;
+  recovery_action?: {
+    method: 'POST';
+    path: string;
+  };
+  ambient_writer_indeterminate?: {
+    detector: "native_process_inventory" | "macos_proc_pidinfo" | "linux_procfs";
+    operation:
+      | "observe_ambient_writer"
+      | "read_process_incarnation"
+      | "read_process_credentials"
+      | "read_process_executable"
+      | "read_working_directory"
+      | "read_mappings"
+      | "enumerate_descriptors"
+      | "enumerate_descriptor"
+      | "read_descriptor_target"
+      | "read_descriptor_metadata"
+      | "read_descriptor_access_mode";
+    error_kind: "permission_denied" | "not_found" | "invalid_data" | "indeterminate" | "other";
+  };
   error: string;
   error_type: string;
   conflict_slug?: string;
@@ -945,6 +967,11 @@ export interface ConflictErrorDetail {
   can_auto_stash?: boolean;
   continuation_id?: string;
 }
+
+export type ConflictErrorDetail = ConflictErrorDetailBase & (
+  | { failed_invariant: string; failed_relation: string }
+  | { failed_invariant?: never; failed_relation?: never }
+);
 
 /** Thrown by API methods that return 409 with a typed conflict payload. */
 export class ConflictError extends Error {
@@ -2312,7 +2339,8 @@ export const api = {
   async abandonTask(convId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/abandon-task`, { method: 'POST' });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to abandon task', resp.status, err.error_type);
     }
     return resp.json();
@@ -2321,7 +2349,8 @@ export const api = {
   async markMerged(conversationId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to mark as merged', resp.status, err.error_type);
     }
     return resp.json();
@@ -2350,7 +2379,8 @@ export const api = {
       body: JSON.stringify(request),
     });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to confirm Close losses', resp.status, err.error_type);
     }
     return resp.json();
@@ -2375,6 +2405,10 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ attempt_id: attemptId }),
     });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
       throw new ApiResponseError(err.error ?? 'Failed to retry Close retirement', resp.status, err.error_type);

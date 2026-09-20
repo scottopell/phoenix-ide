@@ -1,3 +1,4 @@
+import type { FileAttachment, ImageData } from '../api';
 import { RoutedStore } from './RoutedStore';
 
 /**
@@ -12,25 +13,36 @@ import { RoutedStore } from './RoutedStore';
  * dispatch from a previous conversation's effect lands on the old slug's
  * draft and can't corrupt the active one.
  */
+export interface FencedSendRecovery {
+  text: string;
+  restoreTo: 'draft' | 'voice';
+  error?: string;
+  images: ImageData[];
+  files: FileAttachment[];
+}
+
 export interface DraftAtom {
   draft: string;
+  fencedSendRecoveries: FencedSendRecovery[];
 }
 
 export type DraftAction =
   | { type: 'set_draft'; text: string }
   | { type: 'set_draft_if_empty'; text: string }
   | { type: 'append_draft'; text: string }
-  | { type: 'clear_draft' };
+  | { type: 'clear_draft' }
+  | { type: 'enqueue_fenced_send_recovery'; recovery: FencedSendRecovery }
+  | { type: 'shift_fenced_send_recovery' };
 
 export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
   switch (action.type) {
     case 'set_draft':
       if (atom.draft === action.text) return atom;
-      return { draft: action.text };
+      return { ...atom, draft: action.text };
 
     case 'set_draft_if_empty':
       if (atom.draft.trim() || atom.draft === action.text) return atom;
-      return { draft: action.text };
+      return { ...atom, draft: action.text };
 
     case 'append_draft': {
       if (!action.text) return atom;
@@ -40,18 +52,28 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
       const next = atom.draft !== ''
         ? atom.draft + '\n\n' + action.text
         : action.text;
-      return { draft: next };
+      return { ...atom, draft: next };
     }
 
     case 'clear_draft':
       if (atom.draft === '') return atom;
-      return { draft: '' };
+      return { ...atom, draft: '' };
+
+    case 'enqueue_fenced_send_recovery':
+      return {
+        ...atom,
+        fencedSendRecoveries: [...atom.fencedSendRecoveries, action.recovery],
+      };
+
+    case 'shift_fenced_send_recovery':
+      if (atom.fencedSendRecoveries.length === 0) return atom;
+      return { ...atom, fencedSendRecoveries: atom.fencedSendRecoveries.slice(1) };
   }
 }
 
 export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
   constructor() {
-    super(() => ({ draft: '' }), draftReducer);
+    super(() => ({ draft: '', fencedSendRecoveries: [] }), draftReducer);
   }
 
   /**

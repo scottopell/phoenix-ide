@@ -729,7 +729,10 @@ fn close_view(projection: crate::db::CloseProjection) -> ProductConversationClos
                     resource_kind: residual.resource.kind().as_str().to_string(),
                     identity: residual.resource.identity().value(),
                     reason: residual_reason.as_str().to_string(),
-                    detail: residual.detail,
+                    detail: residual.detail.and_then(|detail| {
+                        (!detail.contains("(code: 787) FOREIGN KEY constraint failed"))
+                            .then_some(detail)
+                    }),
                 })
             })
             .collect(),

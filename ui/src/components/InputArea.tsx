@@ -13,9 +13,16 @@ import {
 } from 'react';
 import { Square, SendHorizontal, Zap } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
-import { useDraftActions, useDraftValue, useScopedState, useInlineReferences } from '../hooks';
+import {
+  useDraftActions,
+  useDraftValue,
+  useFencedSendRecovery,
+  useScopedState,
+  useInlineReferences,
+} from '../hooks';
 import type { ConversationState, FileAttachment, ImageData } from '../api';
-import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
+import type { FencedSendRecovery } from '../conversation/DraftStore';
+import { api, ConflictError, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
@@ -77,6 +84,9 @@ interface InputAreaProps {
    * InputArea is unmounted lands as a fresh effect tick on re-mount.
    */
   focusToken?: number;
+  enqueueFencedSendRecovery?: (recovery: FencedSendRecovery) => void;
+  fencedSendRecovery?: FencedSendRecovery | undefined;
+  onFencedSendRecoverySent?: () => void;
   /** Optional action and context displayed directly above the composer. */
   quickAction?: ComposerQuickAction | undefined;
   /**
@@ -146,6 +156,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   focusToken,
   onSend,
   quickAction,
+  enqueueFencedSendRecovery,
+  fencedSendRecovery,
+  onFencedSendRecoverySent,
   onCancel,
   onRetry,
   onDismissError,
@@ -186,7 +199,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
-
+  const ignoreSubmittedVoiceEndRef = useRef(false);
+  const composerContentRef = useRef({ draft, images, files });
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    composerContentRef.current = { draft, images, files };
+  }, [draft, images, files, voiceBase, voiceInterim]);
+  const draftRef = useRef(draft);
+  const voiceBaseRef = useRef(voiceBase);
+  draftRef.current = draft;
+  voiceBaseRef.current = voiceBase;
+  const loadedRecoveryRef = useRef<FencedSendRecovery | undefined>(undefined);
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
   // =========================================================================
@@ -215,6 +244,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Inline expansion-error surface is shared between @ref/skill expansion and
   // attachment-upload failures, so the file-drop handlers reuse it.
   const { reset: resetRefs, setExpansionError, expansionError } = ir;
+  const setExpansionErrorRef = useRef(setExpansionError);
+  setExpansionErrorRef.current = setExpansionError;
+  useEffect(() => {
+    if (!fencedSendRecovery || loadedRecoveryRef.current === fencedSendRecovery) return;
+    loadedRecoveryRef.current = fencedSendRecovery;
+    if (fencedSendRecovery.restoreTo === 'voice') {
+      setVoiceBase(fencedSendRecovery.text);
+      setVoiceInterim('');
+    } else {
+      setDraft(draftRef.current.length > 0
+        ? `${fencedSendRecovery.text}\n${draftRef.current}`
+        : fencedSendRecovery.text);
+    }
+    setImages([...fencedSendRecovery.images, ...composerContentRef.current.images]);
+    setFiles(current => [...fencedSendRecovery.files, ...current]);
+    if (fencedSendRecovery.error) setExpansionErrorRef.current(fencedSendRecovery.error);
+  }, [fencedSendRecovery, setDraft, setFiles, setImages, setVoiceBase, setVoiceInterim]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -436,7 +482,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // restore the draft if an ExpansionError comes back (user must fix the
     // broken @reference before re-sending).
     const previousVoiceBase = voiceBase;
+    const submittedScopeKey = scopeKey;
+    const enqueueSubmittedRecovery = enqueueFencedSendRecovery;
     if (voiceBase !== null) {
+      ignoreSubmittedVoiceEndRef.current = true;
       setVoiceBase(null);
       setVoiceInterim('');
     }
@@ -447,25 +496,55 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
     try {
       await onSend(text, images, files);
-    } catch (err) {
-      if (err instanceof ExpansionError) {
-        // Surface expansion error inline and restore the draft (REQ-IR-007)
-        // so the user can fix or remove the broken @reference.
-        setExpansionError(err.detail.error);
-        if (previousVoiceBase !== null) {
-          setVoiceBase(previousVoiceBase);
-        } else {
-          setDraft(text);
-        }
-        setImages(images);
-        setFiles(files);
+      if (loadedRecoveryRef.current) {
+        loadedRecoveryRef.current = undefined;
+        onFencedSendRecoverySent?.();
       }
-      // Non-expansion errors: draft is already cleared; the message queue
-      // shows the failure with a retry button.
+    } catch (err) {
+      const closeFenced = err instanceof ConflictError
+        && err.detail.error_type === 'close_admission_fenced';
+      if (err instanceof ExpansionError) {
+        if (scopeKeyRef.current === submittedScopeKey) {
+          setExpansionError(err.detail.error);
+          const current = composerContentRef.current;
+          setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          setImages([...images, ...current.images]);
+          setFiles([...files, ...current.files]);
+        } else {
+          enqueueSubmittedRecovery?.({
+            text,
+            restoreTo: 'draft',
+            error: err.detail.error ?? 'Reference expansion failed',
+            images,
+            files,
+          });
+        }
+      } else if (closeFenced) {
+        if (mountedRef.current && scopeKeyRef.current === submittedScopeKey) {
+          const current = composerContentRef.current;
+          if (previousVoiceBase !== null) {
+            setVoiceBase(text);
+            setVoiceInterim('');
+          } else {
+            setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          }
+          setImages([...images, ...current.images]);
+          setFiles([...files, ...current.files]);
+        } else {
+          enqueueSubmittedRecovery?.({
+            text,
+            restoreTo: previousVoiceBase !== null ? 'voice' : 'draft',
+            images,
+            files,
+          });
+        }
+      }
+      // Other errors remain visible in the message queue with a retry button.
     }
   }, [
     voiceBase,
     voiceInterim,
+    scopeKey,
     draft,
     images,
     files,
@@ -473,6 +552,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     expansionError,
     isUploadingFiles,
     onSend,
+    onFencedSendRecoverySent,
+    enqueueFencedSendRecovery,
     clearDraft,
     resetRefs,
     setExpansionError,
@@ -506,17 +587,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   const handleVoiceStart = useCallback(() => {
+    ignoreSubmittedVoiceEndRef.current = false;
     setVoiceBase(draft);
+    clearDraft();
     setVoiceInterim('');
-  }, [draft, setVoiceBase, setVoiceInterim]);
+  }, [draft, clearDraft, setVoiceBase, setVoiceInterim]);
 
   const handleVoiceEnd = useCallback(() => {
-    setVoiceBase(prev => {
-      if (prev !== null) {
-        setDraft(prev);
-      }
-      return null;
-    });
+    if (ignoreSubmittedVoiceEndRef.current) {
+      ignoreSubmittedVoiceEndRef.current = false;
+      return;
+    }
+    const currentVoiceBase = voiceBaseRef.current;
+    if (currentVoiceBase !== null) {
+      const currentDraft = draftRef.current;
+      setDraft(currentDraft.length > 0 ? `${currentVoiceBase}\n${currentDraft}` : currentVoiceBase);
+    }
+    setVoiceBase(null);
     setVoiceInterim('');
   }, [setDraft, setVoiceBase, setVoiceInterim]);
 
@@ -806,7 +893,18 @@ export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftCha
 export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputAreaProps>(
   function ConnectedInputArea({ slug, ...rest }, ref) {
     const draft = useDraftValue(slug);
-    const { setDraft } = useDraftActions(slug);
-    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} />;
+    const recovery = useFencedSendRecovery(slug);
+    const { setDraft, enqueueFencedSendRecovery, shiftFencedSendRecovery } = useDraftActions(slug);
+    return (
+      <InputArea
+        ref={ref}
+        {...rest}
+        draft={draft}
+        onDraftChange={setDraft}
+        enqueueFencedSendRecovery={enqueueFencedSendRecovery}
+        fencedSendRecovery={recovery}
+        onFencedSendRecoverySent={shiftFencedSendRecovery}
+      />
+    );
   },
 );

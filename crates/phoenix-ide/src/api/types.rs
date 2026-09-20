@@ -1106,6 +1106,37 @@ pub struct ForkProposalListResponse {
     pub proposals: Vec<ForkProposalSummary>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum CloseRecoveryMethod {
+    #[serde(rename = "POST")]
+    Post,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CloseRecoveryAction {
+    pub method: CloseRecoveryMethod,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CloseFailedEvidence {
+    pub failed_invariant: String,
+    pub failed_relation: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum CloseConflictRouting {
+    ActiveTranscript {
+        active_transcript_id: String,
+    },
+    Recovery {
+        attempt_id: String,
+        active_transcript_id: String,
+        recovery_action: CloseRecoveryAction,
+    },
+}
+
 /// 409 Conflict error with typed `error_type` for frontend dispatch
 #[derive(Debug, Serialize)]
 pub struct ConflictErrorResponse {
@@ -1126,6 +1157,13 @@ pub struct ConflictErrorResponse {
     /// the parent has been continued (`error_type = "continuation_exists"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub close_routing: Option<CloseConflictRouting>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub failed_evidence: Option<CloseFailedEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient_writer_indeterminate:
+        Option<crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic>,
 }
 
 impl ConflictErrorResponse {
@@ -1137,6 +1175,57 @@ impl ConflictErrorResponse {
             can_auto_stash: false,
             conflict_slug: None,
             continuation_id: None,
+            close_routing: None,
+            failed_evidence: None,
+            ambient_writer_indeterminate: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_close_recovery(
+        mut self,
+        attempt_id: impl Into<String>,
+        active_transcript_id: impl Into<String>,
+    ) -> Self {
+        let attempt_id = attempt_id.into();
+        let active_transcript_id = active_transcript_id.into();
+        self.close_routing = Some(CloseConflictRouting::Recovery {
+            recovery_action: CloseRecoveryAction {
+                method: CloseRecoveryMethod::Post,
+                path: format!("/api/conversations/{active_transcript_id}/close/retry-retirement"),
+            },
+            attempt_id,
+            active_transcript_id,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_active_close_transcript(mut self, active_transcript_id: impl Into<String>) -> Self {
+        self.close_routing = Some(CloseConflictRouting::ActiveTranscript {
+            active_transcript_id: active_transcript_id.into(),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub fn close_recovery_parts(
+        &self,
+    ) -> (Option<&str>, Option<&str>, Option<&CloseRecoveryAction>) {
+        match self.close_routing.as_ref() {
+            Some(CloseConflictRouting::ActiveTranscript {
+                active_transcript_id,
+            }) => (None, Some(active_transcript_id), None),
+            Some(CloseConflictRouting::Recovery {
+                attempt_id,
+                active_transcript_id,
+                recovery_action,
+            }) => (
+                Some(attempt_id),
+                Some(active_transcript_id),
+                Some(recovery_action),
+            ),
+            None => (None, None, None),
         }
     }
 

@@ -53,6 +53,16 @@ value RetirementResidual {
     detail: String?
 }
 
+value AmbientWriterEvidence {
+    detector: AmbientWriterDetector
+    process_id: Integer
+    process_incarnation: String
+    executable: String
+    matched_path: String
+    match_kind: AmbientPathMatchKind
+    access_mode: DescriptorAccessMode
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -87,6 +97,34 @@ enum RetirementFailureReason {
     | manual_repair_required
 }
 
+enum AmbientWriterDetector {
+    macos_proc_pidinfo
+    | linux_procfs
+}
+
+enum AmbientPathMatchKind {
+    descriptor
+    | mapping
+    | current_working_directory
+    | process_root
+    | executable_text
+    | namespace_directory
+}
+
+enum DescriptorAccessMode {
+    read_only
+    | write_only
+    | read_write
+    | writable_shared_mapping
+    | namespace_write
+}
+
+enum AmbientReferenceClassification {
+    no_write_authority
+    | positive_writer
+    | detector_indeterminate
+}
+
 enum PrDisplayState {
     open
     | draft
@@ -99,6 +137,16 @@ enum PrCheckState {
     | pending
     | failing
     | unknown
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    ambient_writer_max_observations: Integer = 3
+    ambient_writer_observation_spacing: Duration = 100.milliseconds
+    ambient_writer_required_consecutive_clean_observations: Integer = 2
 }
 
 ------------------------------------------------------------
@@ -162,6 +210,20 @@ external entity RetirementAbsenceEvidence {
 external entity RestartRepairEvidenceAdoption {
     attempt: RetirementAttempt
     restart_repair_evidence: gitrep/RestartRepairEvidence
+}
+
+external entity AmbientWriterEvidenceRow {
+    attempt: RetirementAttempt
+    inspection: RetirementInspection
+    resource_identity: String
+    evidence: AmbientWriterEvidence
+}
+
+external entity RetainedCleanupEvidenceAdoption {
+    attempt: RetirementAttempt
+    source_inspection: RetirementInspection
+    target_inspection: RetirementInspection
+    resource_identity: String
 }
 
 ------------------------------------------------------------
@@ -573,6 +635,135 @@ rule RestartRetirementRequiresExactTmuxIdentity {
         -- socket path alone is never destructive authority.
 }
 
+rule ReadOnlyAmbientReferenceNeverAuthorizesWriter {
+    when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    requires: access_mode = read_only
+    ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: no_write_authority)
+
+    @guidance
+        -- A pathname relationship is not write authority. Process root,
+        -- executable text, mappings, and read-only non-directory descriptors remain
+        -- non-authorizing observations even when their path lies below quarantine.
+}
+
+rule NamespaceAmbientReferenceAuthorizesWriter {
+    when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    let attempt = RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope}
+    requires: access_mode = namespace_write
+    requires: match_kind = namespace_directory
+    requires: complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    ensures: AmbientWriterEvidenceRow.created(
+        attempt: attempt,
+        inspection: attempt.inspection,
+        resource_identity: ambient_worktree_identity(product_conversation, scope),
+        evidence: AmbientWriterEvidence {
+            detector: detector,
+            process_id: process_id,
+            process_incarnation: process_incarnation,
+            executable: executable,
+            matched_path: matched_path,
+            match_kind: match_kind,
+            access_mode: access_mode
+        }
+    )
+    ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: positive_writer)
+
+    @guidance
+        -- A retained current working directory or read-only directory descriptor
+        -- authorizes namespace mutation through relative path operations.
+}
+
+rule WritableAmbientDescriptorRecordsAuditableEvidence {
+    when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    let attempt = RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope}
+    requires: access_mode in { write_only, read_write, writable_shared_mapping }
+    requires: complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    ensures: AmbientWriterEvidenceRow.created(
+        attempt: attempt,
+        inspection: attempt.inspection,
+        resource_identity: ambient_worktree_identity(product_conversation, scope),
+        evidence: AmbientWriterEvidence {
+            detector: detector,
+            process_id: process_id,
+            process_incarnation: process_incarnation,
+            executable: executable,
+            matched_path: matched_path,
+            match_kind: match_kind,
+            access_mode: access_mode
+        }
+    )
+    ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: positive_writer)
+}
+
+rule IncompleteAmbientWriterIdentityIsIndeterminate {
+    when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    requires: access_mode in { write_only, read_write, writable_shared_mapping, namespace_write }
+    requires: not complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
+    ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: detector_indeterminate)
+}
+
+rule ConsecutiveCleanAmbientObservationsPermitRemoval {
+    when: OwnedRetirementResourcesStopped(product_conversation, attempt_id, scope)
+    requires: authoritative_ambient_observation_count(product_conversation, attempt_id, scope) <= config.ambient_writer_max_observations
+    requires: consecutive_clean_ambient_observation_count(product_conversation, attempt_id, scope) = config.ambient_writer_required_consecutive_clean_observations
+    ensures: WorktreeFinalRemovalPermitted(product_conversation, attempt_id, scope)
+
+    @guidance
+        -- Observations use a monotonic schedule separated by
+        -- config.ambient_writer_observation_spacing. A writable process incarnation
+        -- may disappear, but retirement proceeds only after the required consecutive
+        -- authoritative no-writer observations. Observation count, spacing, and the
+        -- clock are injectable so tests advance deterministically without sleeping.
+}
+
+rule StableOrUnresolvedAmbientWriterPreservesQuarantine {
+    when: AmbientWriterObservationBudgetCompleted(product_conversation, attempt_id, scope)
+    requires:
+        stable_writable_process_incarnation_observed(product_conversation, attempt_id, scope)
+        or final_ambient_observation_reports_writer(product_conversation, attempt_id, scope)
+        or consecutive_clean_ambient_observation_count(product_conversation, attempt_id, scope) < config.ambient_writer_required_consecutive_clean_observations
+        or ambient_detector_became_indeterminate(product_conversation, attempt_id, scope)
+    ensures: quarantined_worktree_preserved(product_conversation, attempt_id, scope)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+}
+
+rule ExactAttemptRetryAtomicallyAdoptsRetainedCleanupEvidence {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    let attempt = RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: pending_worktree_retirement_scope(product_conversation, attempt_id).scope}
+    let source_inspection = uniquely_newest_compatible_prior_cleanup_inspection(product_conversation, attempt_id, attempt.scope)
+    let target_inspection = attempt.inspection
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    requires: exists source_inspection
+    requires: source_inspection != target_inspection
+    requires: retained_dispatch_and_cleanup_identity_matches(attempt, source_inspection, target_inspection)
+    ensures: RetainedCleanupEvidenceAdoption.created(
+        attempt: attempt,
+        source_inspection: source_inspection,
+        target_inspection: target_inspection,
+        resource_identity: ambient_worktree_identity(product_conversation, attempt.scope)
+    )
+    ensures: RetainedCleanupDispatchAndPlanCommitted(product_conversation, attempt_id, attempt.scope, target_inspection)
+
+    @guidance
+        -- One transaction validates exact attempt, scope, worktree identity and
+        -- fingerprint, typed locator, administrative-directory identity, sealed target
+        -- inventory, and expected target resource. It inserts or idempotently adopts
+        -- the target-generation dispatch parent before its cleanup-plan child. Any
+        -- conflict rolls back both; source-generation rows remain immutable. When
+        -- multiple compatible prior generations exist, captured-at chronology and
+        -- insertion order select the uniquely newest persisted generation.
+}
+
+rule RetainedCleanupAdoptionConflictNamesInvariant {
+    when: RetainedCleanupEvidenceAdoptionRejected(product_conversation, attempt_id, scope, invariant, relation)
+    ensures: TypedCloseEvidenceInvariantFailure(product_conversation, attempt_id, scope, invariant, relation)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Repair output names the violated evidence invariant and persistence relation;
+        -- storage-engine error numbers are diagnostic internals, not user guidance.
+}
+
 rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
@@ -695,6 +886,22 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
 }
 
 
+rule PartialRetryCanResumeFromPriorCleanupAuthority {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    let obligation = bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}
+    requires: obligation.phase = awaiting_retirement_inspection
+    requires: exists obligation.active_retirement_snapshot
+    requires: active_generation_is_partial_retry(product_conversation, attempt_id)
+    requires: every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(product_conversation, attempt_id)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Preserve historical evidence and resume through the ordinary retirement
+        -- executor. It freshly validates each retained worktree identity and
+        -- adopts exact prior cleanup authority before
+        -- destructive cleanup. Every other shape remains in repair/reinspection.
+}
+
 rule PrStatusObservedAsAdvisoryCloseGuidance {
     when: PrStatusQueried(product_conversation)
     ensures: PrStatusResultDelivered(product_conversation, found: Boolean, display_state: PrDisplayState?, check_state: PrCheckState?, number: Integer?, unavailable_reason: String?)
@@ -744,6 +951,23 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       A deterministic digest of the canonical length-prefixed sequence of each
 --       ordered scope identity and inspection fingerprint. Any target-set, order, or
 --       per-scope fingerprint change produces a different aggregate fingerprint.
+--
+--   active_generation_is_partial_retry(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True iff every captured WorkScope has an active retry inspection and sealed
+--       inventory, the active generation has no dispatch or cleanup plan, and each exact
+--       captured worktree has an active manual-repair residual from rejected cleanup-plan
+--       persistence.
+--
+--   every_captured_worktree_has_prior_same_attempt_dispatch_and_cleanup_plan(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True iff every exact captured worktree identity has a dispatch and cleanup
+--       plan under a different snapshot generation of the same attempt. Another
+--       attempt never supplies authority.
 --
 --   pending_worktree_retirement_scope(
 --       product_conversation: bedrock/ProductConversation,
