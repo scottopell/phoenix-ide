@@ -464,6 +464,7 @@ pub enum Event {
         /// running and may resolve this error. The transition function uses this
         /// to choose `AwaitingRecovery` vs `Error` (REQ-BED-030).
         recovery_in_progress: bool,
+        observed_at: DateTime<Utc>,
         /// Upstream quota window reset time, when known. Populated only for
         /// rate-limit errors whose `LlmError.quota` carried a `resets_at`
         /// value (see `llm/rate_limit.rs::QuotaDetails`). Threaded onto
@@ -531,6 +532,7 @@ pub enum Event {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        observed_at: DateTime<Utc>,
         resets_at: Option<DateTime<Utc>>,
     },
     /// User manually triggered continuation (REQ-BED-023)
@@ -743,6 +745,7 @@ pub enum CoreEvent {
         error_kind: ErrorKind,
         attempt: u32,
         recovery_in_progress: bool,
+        observed_at: DateTime<Utc>,
         /// Quota reset timestamp; see `Event::LlmError::resets_at`.
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -789,6 +792,7 @@ pub enum CoreEvent {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        observed_at: DateTime<Utc>,
         resets_at: Option<DateTime<Utc>>,
     },
     UserTriggerContinuation {
@@ -937,12 +941,14 @@ impl TryFrom<Event> for ParentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             })),
             Event::ServerOverloaded {
@@ -1013,11 +1019,13 @@ impl TryFrom<Event> for ParentEvent {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {
@@ -1140,12 +1148,14 @@ impl TryFrom<Event> for SubAgentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at,
             })),
             Event::ServerOverloaded {
@@ -1218,11 +1228,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                observed_at,
                 resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {

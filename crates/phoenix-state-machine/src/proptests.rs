@@ -338,6 +338,7 @@ fn arb_llm_error_event() -> impl Strategy<Value = Event> {
             error_kind,
             attempt,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         }
     })
@@ -798,6 +799,7 @@ proptest! {
             error_kind,
             attempt,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -829,6 +831,7 @@ proptest! {
             error_kind: error_kind.clone(),
             attempt,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -855,6 +858,7 @@ proptest! {
             error_kind: ErrorKind::Network, // Retryable but exhausted
             attempt: 3,
             recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
         resets_at: None,
         };
 
@@ -1201,6 +1205,7 @@ fn test_retry_cycle() {
             error_kind: ErrorKind::Network,
             attempt: 1,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         },
     )

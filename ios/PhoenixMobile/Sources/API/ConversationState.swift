@@ -49,6 +49,7 @@ enum ConversationState: Equatable {
     /// Covers `llm_requesting` and `seeded_llm_requesting` (identical for
     /// display purposes).
     case llmRequesting(attempt: Int)
+    case serverOverloadRetrying(attempt: Int, retryAt: String?)
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
@@ -83,6 +84,11 @@ enum ConversationState: Equatable {
             return .awaitingLlm
         case "llm_requesting", "seeded_llm_requesting":
             return .llmRequesting(attempt: json["attempt"]?.intValue ?? 1)
+        case "server_overload_retrying":
+            return .serverOverloadRetrying(
+                attempt: json["retry"]?["attempt"]?.intValue ?? json["attempt"]?.intValue ?? 1,
+                retryAt: json["retry"]?["phase"]?["retry_at"]?.stringValue
+                    ?? json["retry_at"]?.stringValue)
         case "tool_executing":
             return .toolExecuting(
                 toolName: json["current_tool"]?["name"]?.stringValue ?? "tool",
@@ -147,7 +153,7 @@ enum ConversationState: Equatable {
             return true
         case .error(_, let kind):
             return kind.isUserResumable
-        case .awaitingLlm, .awaitingContinuation, .cancelling,
+        case .awaitingLlm, .serverOverloadRetrying, .awaitingContinuation, .cancelling,
              .awaitingUserResponse, .awaitingTaskApproval,
              .awaitingRecovery, .provisioning,
              .contextExhausted,
@@ -158,7 +164,7 @@ enum ConversationState: Equatable {
 
     var isCancellable: Bool {
         switch self {
-        case .llmRequesting, .toolExecuting, .awaitingSubAgents,
+        case .llmRequesting, .serverOverloadRetrying, .toolExecuting, .awaitingSubAgents,
              .awaitingTaskApproval,
              .awaitingRecovery, .provisioning:
             return true
@@ -172,7 +178,7 @@ enum ConversationState: Equatable {
 
     var isKnownWorkingState: Bool {
         switch self {
-        case .awaitingLlm, .llmRequesting, .toolExecuting,
+        case .awaitingLlm, .llmRequesting, .serverOverloadRetrying, .toolExecuting,
              .awaitingSubAgents, .awaitingContinuation, .awaitingRecovery,
              .provisioning, .cancelling,
              .cancellingTool, .cancellingSubAgents:

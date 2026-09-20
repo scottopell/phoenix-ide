@@ -660,6 +660,7 @@ mod random_walk {
                             error_kind,
                             attempt: *attempt,
                             recovery_in_progress: recovery,
+                            observed_at: chrono::Utc::now(),
                             resets_at: None,
                         }
                     }
@@ -817,6 +818,7 @@ mod random_walk {
                         error_kind,
                         attempt: request.attempt,
                         recovery_in_progress: false,
+                        observed_at: chrono::Utc::now(),
                         resets_at: None,
                     }
                 }

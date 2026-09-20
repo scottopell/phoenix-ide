@@ -147,6 +147,13 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
+        case .serverOverloadRetrying(let attempt, _):
+            workingRow {
+                Text("Model overloaded… (attempt \(attempt)/5)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
         case .awaitingSubAgents(let pending, let completed):
             workingRow {
                 Text("Sub-agents: \(completed) done, \(pending) running")

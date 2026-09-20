@@ -465,26 +465,12 @@ pub fn transition(
     if let ConvState::ServerOverloadRetrying { retry } = state {
         if matches!(retry.phase, ServerOverloadPhase::InFlight) {
             if let Event::LlmResponse { .. } = event {
-                let delegated = match &retry.target {
-                    ServerOverloadTarget::Ordinary => ConvState::LlmRequesting {
-                        attempt: retry.attempt,
-                    },
-                    ServerOverloadTarget::Continuation {
-                        operation_id,
-                        rejected_tool_calls,
-                    } => ConvState::AwaitingContinuation {
-                        request: ServerOverloadTarget::continuation_request_from_parts(
-                            operation_id,
-                            rejected_tool_calls,
-                            retry.attempt,
-                        ),
-                    },
-                };
-                return transition(&delegated, context, event);
+                return transition(&overload_in_flight_state(retry), context, event);
             }
             if let Event::LlmError {
                 message,
                 error_kind,
+                observed_at,
                 ..
             } = &event
             {
@@ -494,12 +480,10 @@ pub fn transition(
                         context,
                         message.clone(),
                         error_kind.clone(),
+                        *observed_at,
                     );
                 }
-                let delegated = ConvState::LlmRequesting {
-                    attempt: retry.attempt,
-                };
-                return transition(&delegated, context, event);
+                return transition(&overload_in_flight_state(retry), context, event);
             }
         }
     }
@@ -546,6 +530,7 @@ pub fn transition(
                 if let Event::ContinuationError {
                     message,
                     error_kind,
+                    observed_at,
                     ..
                 } = &event
                 {
@@ -555,6 +540,7 @@ pub fn transition(
                             context,
                             message.clone(),
                             error_kind.clone(),
+                            *observed_at,
                         );
                     }
                 }
@@ -1711,6 +1697,19 @@ fn overload_retry_delay(attempt: u32, identity: &str) -> Duration {
     Duration::from_millis(base_ms * (75 + hash % 51) / 100)
 }
 
+fn overload_in_flight_state(retry: &ServerOverloadRetry) -> ConvState {
+    match &retry.target {
+        ServerOverloadTarget::Ordinary => ConvState::LlmRequesting {
+            attempt: retry.attempt,
+        },
+        target @ ServerOverloadTarget::Continuation { .. } => ConvState::AwaitingContinuation {
+            request: target
+                .continuation_request(retry.attempt)
+                .expect("continuation target reconstructs its request"),
+        },
+    }
+}
+
 #[allow(clippy::unnecessary_wraps)]
 fn overload_terminal(
     retry: &ServerOverloadRetry,
@@ -1807,6 +1806,7 @@ fn continue_overload_after_mixed_transient(
     context: &ConvContext,
     message: String,
     error_kind: ErrorKind,
+    observed_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<TransitionResult, TransitionError> {
     let next_attempt = retry.attempt + 1;
     if next_attempt > OVERLOAD_MAX_ATTEMPTS {
@@ -1818,11 +1818,8 @@ fn continue_overload_after_mixed_transient(
         ServerOverloadTarget::Continuation { operation_id, .. } => operation_id,
     };
     let delay = overload_retry_delay(next_attempt, identity);
-    let elapsed = (2..=next_attempt)
-        .map(|attempt| overload_retry_delay(attempt, identity))
-        .map(|delay| chrono::Duration::from_std(delay).expect("overload delay fits chrono"))
-        .sum::<chrono::Duration>();
-    let retry_at = retry.started_at + elapsed;
+    let retry_at =
+        observed_at + chrono::Duration::from_std(delay).expect("overload delay fits chrono");
     if retry_at >= retry.deadline_at {
         return overload_terminal(retry, message, error_kind, None)
             .map(CoreTransitionResult::into_conv_result);
@@ -3480,7 +3477,10 @@ pub fn transition_sub_agent(
         // Error for ordinary conversations; translate that terminal result into
         // Failed and notify the parent so fan-in cannot remain stranded.
         (
-            SubAgentState::Core(core_state @ CoreState::ServerOverloadRetrying { .. }),
+            SubAgentState::Core(
+                core_state @ (CoreState::LlmRequesting { .. }
+                | CoreState::ServerOverloadRetrying { .. }),
+            ),
             SubAgentEvent::Core(
                 core_event @ (CoreEvent::ServerOverloaded { .. }
                 | CoreEvent::ContinuationServerOverloaded { .. }
@@ -3779,6 +3779,7 @@ pub fn handle_outcome(
 /// Convert `LlmOutcome` to the equivalent `Event` for delegation to `transition()`.
 #[allow(clippy::too_many_lines)] // Pure-data dispatch over a wide LlmOutcome enum
 fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
+    let observed_at = chrono::Utc::now();
     match outcome {
         LlmOutcome::Response {
             content,
@@ -3803,6 +3804,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::RateLimit,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at,
             }
         }
@@ -3813,6 +3815,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::UsageLimitReached,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 // Carry the quota-window reset time through to
                 // `ConvState::Error.resets_at` so the auto-clear sweep returns
                 // the conversation to Idle once the window passes. Not used for
@@ -3828,6 +3831,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ServerError,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3838,6 +3842,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::InvalidResponse,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3857,6 +3862,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Network,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3867,6 +3873,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::TimedOut,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3877,6 +3884,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3890,6 +3898,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Auth,
                 attempt,
                 recovery_in_progress,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3900,6 +3909,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3910,6 +3920,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ContentFilter,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3920,6 +3931,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::PromptRejected,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -3930,6 +3942,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Cancelled,
                 attempt,
                 recovery_in_progress: false,
+                observed_at,
                 resets_at: None,
             }
         }
@@ -4383,6 +4396,7 @@ mod tests {
         let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
+        let observed_at = at + chrono::Duration::seconds(37);
         for target in [
             ServerOverloadTarget::Ordinary,
             ServerOverloadTarget::Continuation {
@@ -4405,6 +4419,7 @@ mod tests {
                     error_kind: ErrorKind::Network,
                     attempt: 3,
                     recovery_in_progress: false,
+                    observed_at,
                     resets_at: None,
                 },
                 ServerOverloadTarget::Continuation { operation_id, .. } => {
@@ -4412,27 +4427,139 @@ mod tests {
                         operation_id,
                         message: "upstream 500".to_string(),
                         error_kind: ErrorKind::ServerError,
+                        observed_at,
                         resets_at: None,
                     }
                 }
             };
             let result = transition(&state, &test_context(), event).unwrap();
-            let ConvState::ServerOverloadRetrying { retry } = result.new_state else {
+            let ConvState::ServerOverloadRetrying { retry } = &result.new_state else {
                 panic!("mixed transient must remain in overload incident")
             };
             assert_eq!(retry.started_at, at);
             assert_eq!(retry.deadline_at, at + chrono::Duration::seconds(120));
             assert_eq!(retry.attempt, 4);
-            assert!(matches!(retry.phase, ServerOverloadPhase::Waiting { .. }));
-            assert!(result.effects.iter().any(|effect| matches!(
-                effect,
-                Effect::ScheduleRetry {
-                    attempt: 4,
-                    max_attempts: 5,
-                    ..
-                }
-            )));
+            let ServerOverloadPhase::Waiting { retry_at } = &retry.phase else {
+                panic!("mixed transient must wait before redispatch")
+            };
+            let delay = result
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::ScheduleRetry {
+                        delay,
+                        attempt: 4,
+                        max_attempts: 5,
+                        ..
+                    } => Some(*delay),
+                    _ => None,
+                })
+                .expect("mixed transient schedules the next overload attempt");
+            assert_eq!(
+                *retry_at,
+                observed_at + chrono::Duration::from_std(delay).unwrap()
+            );
+            let restored: ConvState =
+                serde_json::from_str(&serde_json::to_string(&result.new_state).unwrap()).unwrap();
+            assert_eq!(restored, result.new_state);
         }
+    }
+
+    #[test]
+    fn continuation_overload_in_flight_failures_preserve_resume_target() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rejected_tool_calls = vec![test_tool_call("rejected")];
+        let state = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Continuation {
+                    operation_id: "continuation-auth".to_string(),
+                    rejected_tool_calls: rejected_tool_calls.clone(),
+                },
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 3,
+                started_at: at,
+                deadline_at: at + chrono::Duration::seconds(120),
+            },
+        };
+
+        let recovered = transition(
+            &state,
+            &test_context(),
+            Event::LlmError {
+                message: "refreshing credentials".to_string(),
+                error_kind: ErrorKind::Auth,
+                attempt: 3,
+                recovery_in_progress: true,
+                observed_at: at + chrono::Duration::seconds(9),
+                resets_at: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.new_state,
+            ConvState::AwaitingRecovery {
+                resume: RecoveryResumeTarget::ContinuationSummary { request },
+                ..
+            } if request.operation_id == "continuation-auth"
+                && request.attempt == 3
+                && request.rejected_tool_calls == rejected_tool_calls
+        ));
+
+        let failed = transition(
+            &state,
+            &test_context(),
+            Event::ContinuationError {
+                operation_id: "continuation-auth".to_string(),
+                message: "rejected".to_string(),
+                error_kind: ErrorKind::InvalidRequest,
+                observed_at: at + chrono::Duration::seconds(10),
+                resets_at: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            failed.new_state,
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request.operation_id == "continuation-auth"
+                    && failure.request.attempt == 3
+                    && failure.request.rejected_tool_calls == rejected_tool_calls
+        ));
+    }
+
+    #[test]
+    fn sub_agent_initial_overload_terminal_notifies_parent() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &sub_agent_context(),
+            Event::ServerOverloaded {
+                message: "capacity".to_string(),
+                detected_at: at,
+                guidance: Some(OverloadRetryGuidance::ExceedsLimit(Duration::from_secs(31))),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &result.new_state,
+            ConvState::Failed { error, error_kind: ErrorKind::ServerOverloaded }
+                if error == "capacity"
+        ));
+        assert!(matches!(
+            result.effects.as_slice(),
+            [
+                Effect::PersistState,
+                Effect::NotifyParent {
+                    outcome: SubAgentOutcome::Failure {
+                        error_kind: ErrorKind::ServerOverloaded,
+                        ..
+                    }
+                }
+            ]
+        ));
     }
 
     #[test]
@@ -4462,6 +4589,7 @@ mod tests {
                     error_kind: ErrorKind::InvalidRequest,
                     attempt: 5,
                     recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
                 ErrorKind::InvalidRequest,
@@ -4575,6 +4703,7 @@ mod tests {
                 operation_id: "stale-op".to_string(),
                 message: "network".to_string(),
                 error_kind: ErrorKind::Network,
+                observed_at: at,
                 resets_at: None,
             },
         ] {
@@ -4792,6 +4921,7 @@ mod tests {
                 error_kind: ErrorKind::UsageLimitReached,
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: Some(resets),
             },
         )
@@ -4820,6 +4950,7 @@ mod tests {
                 error_kind: ErrorKind::Auth,
                 attempt: 1,
                 recovery_in_progress: true,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -4867,6 +4998,7 @@ mod tests {
                 error_kind: ErrorKind::Auth,
                 attempt: 1,
                 recovery_in_progress: true,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -5024,6 +5156,7 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt: MAX_RETRY_ATTEMPTS,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -5065,6 +5198,7 @@ mod tests {
                     error_kind: ErrorKind::Network,
                     attempt,
                     recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
             )
@@ -5092,6 +5226,7 @@ mod tests {
                 error_kind: ErrorKind::ServerOverloaded,
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         );
@@ -5219,6 +5354,7 @@ mod tests {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -5256,6 +5392,7 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -5284,6 +5421,7 @@ mod tests {
                     error_kind: ErrorKind::ContextExhausted,
                     attempt,
                     recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
             )
@@ -6474,6 +6612,7 @@ mod tests {
                 error_kind: ErrorKind::Network, // retryable
                 attempt: 3,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -6539,6 +6678,7 @@ mod tests {
                 error_kind: ErrorKind::Auth, // non-retryable
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -6692,6 +6832,7 @@ mod tests {
                 error_kind: ErrorKind::TimedOut,
                 attempt: 1,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -6724,6 +6865,7 @@ mod tests {
                 error_kind: ErrorKind::TimedOut,
                 attempt: MAX_RETRY_ATTEMPTS,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )
@@ -6758,6 +6900,7 @@ mod tests {
                 error_kind: ErrorKind::Network,
                 attempt: 3,
                 recovery_in_progress: false,
+                observed_at: chrono::Utc::now(),
                 resets_at: None,
             },
         )

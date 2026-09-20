@@ -33,6 +33,24 @@ final class ConversationStateTests: XCTestCase {
             .llmRequesting(attempt: 1))
     }
 
+    func testServerOverloadRetryingCarriesScheduleAndLifecycleBehavior() {
+        let waiting = parse("""
+        {"type":"server_overload_retrying","retry":{"attempt":3,"phase":{"type":"waiting","retry_at":"2026-01-01T00:00:20Z"}}}
+        """)
+        XCTAssertEqual(
+            waiting,
+            .serverOverloadRetrying(attempt: 3, retryAt: "2026-01-01T00:00:20Z"))
+        XCTAssertTrue(waiting.isKnownWorkingState)
+        XCTAssertTrue(waiting.isCancellable)
+        XCTAssertFalse(waiting.acceptsChatMessage)
+
+        XCTAssertEqual(
+            parse("""
+            {"type":"server_overload_retrying","retry":{"attempt":4,"phase":{"type":"in_flight"}}}
+            """),
+            .serverOverloadRetrying(attempt: 4, retryAt: nil))
+    }
+
     func testToolExecutingCarriesToolAndCounts() {
         let raw = """
         {"type":"tool_executing",

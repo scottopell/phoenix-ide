@@ -3922,6 +3922,7 @@ where
                             operation_id: request.operation_id.clone(),
                             message: error,
                             error_kind: crate::db::ErrorKind::InvalidRequest,
+                            observed_at: Utc::now(),
                             resets_at: None,
                         });
                         None
@@ -6781,6 +6782,7 @@ where
             error_kind: crate::db::ErrorKind::InvalidRequest,
             attempt,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         }
     }
@@ -8637,6 +8639,7 @@ where
                             error_kind: llm_error_to_db_error(e.kind),
                             attempt: retry_attempt,
                             recovery_in_progress: true,
+                            observed_at: chrono::Utc::now(),
                             resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
                         }
                     } else {
@@ -8644,6 +8647,7 @@ where
                             operation_id,
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
+                            observed_at: Utc::now(),
                             resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
                         }
                     };
@@ -14226,6 +14230,7 @@ mod authoritative_user_message_effect_tests {
                     error_kind: crate::db::ErrorKind::InvalidRequest,
                     attempt: 1,
                     recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
                 ConvState::Error {
@@ -14242,6 +14247,7 @@ mod authoritative_user_message_effect_tests {
                     operation_id: "direct-turn-continuation-op".to_string(),
                     message: "continuation capacity".to_string(),
                     error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    observed_at: chrono::Utc::now(),
                     resets_at: None,
                 },
                 ConvState::RecoverableContinuationFailure {
@@ -20914,6 +20920,7 @@ mod retry_timer_epoch_tests {
             error_kind: crate::db::ErrorKind::Network,
             attempt: 0,
             recovery_in_progress: false,
+            observed_at: chrono::Utc::now(),
             resets_at: None,
         }
     }
@@ -22192,6 +22199,33 @@ mod overload_startup_tests {
         assert_eq!(
             overload_startup_action(&due, now),
             OverloadStartupAction::Dispatch
+        );
+    }
+
+    #[test]
+    fn recovered_mixed_failure_wait_uses_persisted_observation_relative_schedule() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:37Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_at = observed_at + chrono::Duration::seconds(11);
+        let persisted = ServerOverloadRetry {
+            target: ServerOverloadTarget::Continuation {
+                operation_id: "mixed-op".to_string(),
+                rejected_tool_calls: vec![],
+            },
+            phase: ServerOverloadPhase::Waiting { retry_at },
+            attempt: 4,
+            started_at: observed_at - chrono::Duration::seconds(37),
+            deadline_at: observed_at + chrono::Duration::seconds(83),
+        };
+        let restored: ServerOverloadRetry =
+            serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        assert_eq!(
+            overload_startup_action(&restored, observed_at + chrono::Duration::seconds(3)),
+            OverloadStartupAction::Schedule {
+                delay: std::time::Duration::from_secs(8),
+                attempt: 4,
+            }
         );
     }
 
