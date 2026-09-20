@@ -4574,7 +4574,11 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
     })?;
     let pids = macos_all_pids()
         .map_err(|error| format!("cannot enumerate processes for mapping inspection: {error}"))?;
+    let effective_uid = unsafe { libc::geteuid() };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        if !macos_process_is_relevant(pid, effective_uid)? {
+            continue;
+        }
         let mut address = 0_u64;
         loop {
             let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
@@ -4774,7 +4778,7 @@ fn macos_all_pids_with(
         let capacity_bytes_i32 = i32::try_from(capacity_bytes)
             .map_err(|_| "process inventory exceeds platform limits".to_string())?;
         let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
-        if pid_bytes < 0 {
+        if pid_bytes <= 0 {
             return Err("cannot enumerate process inventory".to_string());
         }
         let pid_bytes = usize::try_from(pid_bytes)
@@ -5927,7 +5931,10 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 let revalidated = unsafe { revalidated.assume_init() };
                 let revalidated_path_bytes = revalidated.vnode.vip_path.as_flattened();
                 let revalidated_path = unsafe { CStr::from_ptr(revalidated_path_bytes.as_ptr()) };
-                let resource_still_matches = revalidated.vnode.vip_vi.vi_stat.vst_nlink > 0
+                let revalidated_is_directory =
+                    revalidated.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
+                let resource_still_matches = (revalidated.vnode.vip_vi.vi_stat.vst_nlink > 0
+                    || revalidated_is_directory)
                     && revalidated_path.to_bytes() == candidate.to_bytes()
                     && macos_descriptor_access_mode(revalidated.file.open_flags)
                         == macos_descriptor_access_mode(info.file.open_flags);

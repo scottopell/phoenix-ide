@@ -188,6 +188,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
   const composerContentRef = useRef({ draft, images, files });
+  const deferredExpansionErrorRef = useRef<{ scopeKey: string; error: string } | null>(null);
   useEffect(() => {
     composerContentRef.current = { draft, images, files };
     composerHasContentRef.current = draft.length > 0
@@ -196,6 +197,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       || voiceBase !== null
       || voiceInterim.length > 0;
   }, [draft, images, files, voiceBase, voiceInterim]);
+  useEffect(() => {
+    if (deferredExpansionErrorRef.current?.scopeKey === scopeKey) {
+      setExpansionError(deferredExpansionErrorRef.current.error);
+      deferredExpansionErrorRef.current = null;
+    }
+  }, [scopeKey]);
 
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -471,8 +478,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setImages([...images, ...current.images]);
           setFiles([...files, ...current.files]);
         } else {
-          // This render's callback remains bound to the submitted conversation's DraftStore key.
+          // This render's callbacks remain bound to the submitted conversation's stores.
+          deferredExpansionErrorRef.current = {
+            scopeKey: submittedScopeKey,
+            error: err.detail.error,
+          };
           setDraft(text);
+          setImages(images);
+          setFiles(files);
         }
       } else if (closeFenced
         && scopeKeyRef.current === submittedScopeKey
