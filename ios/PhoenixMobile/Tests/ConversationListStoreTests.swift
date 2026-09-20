@@ -12,7 +12,8 @@ final class ConversationListStoreTests: XCTestCase {
         id: String,
         aggregateId: String? = nil,
         title: String,
-        archived: Bool = false
+        archived: Bool = false,
+        state: [String: Any]? = nil
     ) throws -> Conversation {
         var json: [String: Any] = [
             "id": id,
@@ -21,6 +22,7 @@ final class ConversationListStoreTests: XCTestCase {
             "archived": archived,
         ]
         json["product_conversation_id"] = aggregateId
+        json["state"] = state
         let data = try JSONSerialization.data(withJSONObject: json)
         return try JSONDecoder().decode(Conversation.self, from: data)
     }
@@ -76,6 +78,50 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(
             Set(merged.map(\.aggregateIdentity)),
             ["pc-active", "pc-archived", "pc-pushed-archived"])
+    }
+
+    @MainActor
+    func testExternalRefreshPreservesMissingTypedProvisioningShell() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(
+            id: "shell",
+            aggregateId: "pc-shell",
+            title: "Creating",
+            state: ["type": "provisioning", "job_id": "job-shell"]))
+        let token = store.externalRefreshToken()
+
+        XCTAssertTrue(store.applyExternal(
+            [try conversation(id: "ready", aggregateId: "pc-ready", title: "Ready")],
+            startedAt: token))
+
+        XCTAssertEqual(
+            Set(store.conversations.map(\.aggregateIdentity)),
+            ["pc-shell", "pc-ready"])
+        XCTAssertTrue(ConversationState.parse(
+            store.conversations.first { $0.aggregateIdentity == "pc-shell" }?.state
+        ).isProvisioningCreationShell)
+    }
+
+    func testRefreshBoundaryPreservesOnlyProvisioningShellsMissingFromFreshList() throws {
+        let provisioning = try conversation(
+            id: "shell",
+            aggregateId: "pc-shell",
+            title: "Creating",
+            state: ["type": "provisioning", "job_id": "job-shell"])
+        let staleReady = try conversation(id: "stale", aggregateId: "pc-stale", title: "Stale")
+        let freshReady = try conversation(id: "ready", aggregateId: "pc-ready", title: "Ready")
+
+        let preserved = ConversationListStore.preservingMissing(
+            [
+                provisioning.aggregateIdentity: provisioning,
+                staleReady.aggregateIdentity: staleReady,
+            ],
+            in: [freshReady])
+        let merged = ConversationListStore.merging([freshReady], preserving: preserved)
+
+        XCTAssertEqual(Set(merged.map(\.aggregateIdentity)), ["pc-shell", "pc-ready"])
     }
 
     @MainActor

@@ -84,14 +84,37 @@ final class ConversationListStore {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
             externalMutationGeneration += 1
+            let missingProvisioningShells = Self.preservingMissing(
+                provisioningShells(),
+                in: fresh + Array(upsertsDuringRefresh.values))
             apply(Self.merging(
                 fresh,
-                preserving: upsertsDuringRefresh,
+                preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },
                 excluding: exclusionsDuringRefresh))
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
             lastError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func provisioningShells() -> [String: Conversation] {
+        Dictionary(uniqueKeysWithValues: conversations.compactMap { conversation in
+            guard ConversationState.parse(conversation.state).isProvisioningCreationShell else {
+                return nil
+            }
+            return (conversation.aggregateIdentity, conversation)
+        })
+    }
+
+    nonisolated static func preservingMissing(
+        _ preserved: [String: Conversation],
+        in fresh: [Conversation]
+    ) -> [String: Conversation] {
+        let freshAggregates = Set(fresh.map(\.aggregateIdentity))
+        return preserved.filter { aggregateIdentity, conversation in
+            !freshAggregates.contains(aggregateIdentity)
+                && ConversationState.parse(conversation.state).isProvisioningCreationShell
         }
     }
 
@@ -234,7 +257,10 @@ final class ConversationListStore {
         let preservedByAggregate = Dictionary(uniqueKeysWithValues: localRows.map {
             ($0.aggregateIdentity, $0)
         })
-        apply(Self.merging(fresh, preserving: preservedByAggregate))
+        let missingProvisioningShells = Self.preservingMissing(provisioningShells(), in: fresh)
+        apply(Self.merging(
+            fresh,
+            preserving: missingProvisioningShells.merging(preservedByAggregate) { _, local in local }))
         lastError = nil
         return true
     }

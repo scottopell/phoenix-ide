@@ -410,6 +410,33 @@ pub async fn archive_chain_handler(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+async fn aggregate_is_absent_after_delete_serialization(
+    state: &AppState,
+    root_id: &str,
+) -> Result<bool, AppError> {
+    Ok(validate_aggregate_delete_root(state, root_id)
+        .await?
+        .is_none())
+}
+
+async fn lock_aggregate_admissions(
+    state: &AppState,
+    product_conversation_id: &str,
+    member_ids: &[String],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut sorted_keys = member_ids.to_vec();
+    sorted_keys.push(product_conversation_id.to_string());
+    sorted_keys.sort();
+    sorted_keys.dedup();
+    let mut guards = Vec::with_capacity(sorted_keys.len());
+    for key in sorted_keys {
+        let admission: Arc<tokio::sync::Mutex<()>> =
+            state.runtime.conversation_admission(&key).await;
+        guards.push(admission.lock_owned().await);
+    }
+    guards
+}
+
 async fn lock_chain_admissions(
     state: &AppState,
     root_id: &str,
@@ -420,17 +447,26 @@ async fn lock_chain_admissions(
         .get_conversation(root_id)
         .await
         .map_err(db_to_app)?;
-    let mut sorted_keys = member_ids.to_vec();
-    sorted_keys.push(root.product_conversation_id.to_string());
-    sorted_keys.sort();
-    sorted_keys.dedup();
-    let mut guards = Vec::with_capacity(sorted_keys.len());
-    for key in sorted_keys {
-        let admission: Arc<tokio::sync::Mutex<()>> =
-            state.runtime.conversation_admission(&key).await;
-        guards.push(admission.lock_owned().await);
+    Ok(lock_aggregate_admissions(state, root.product_conversation_id.as_str(), member_ids).await)
+}
+
+async fn refuse_busy_chain_members(
+    state: &AppState,
+    member_ids: &[String],
+) -> Result<(), AppError> {
+    for id in member_ids {
+        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
+        if chain_member_blocks_cascade(&conv.state) {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot delete chain: member {id} is busy. Cancel the in-flight \
+                     operation first, then retry.",
+                ),
+                "cancel_first",
+            ))));
+        }
     }
-    Ok(guards)
+    Ok(())
 }
 
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
@@ -455,24 +491,17 @@ pub async fn delete_chain_handler(
         .product_conversation_member_ids(&root_id)
         .await
         .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
+    let _admission_guards =
+        lock_aggregate_admissions(&state, root.product_conversation_id.as_str(), &member_ids).await;
+    if aggregate_is_absent_after_delete_serialization(&state, &root_id).await? {
+        return Ok(Json(SuccessResponse { success: true }));
+    }
     require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
     }
 
-    for id in &member_ids {
-        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if chain_member_blocks_cascade(&conv.state) {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!(
-                    "Cannot delete chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
-                ),
-                "cancel_first",
-            ))));
-        }
-    }
+    refuse_busy_chain_members(&state, &member_ids).await?;
     let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo

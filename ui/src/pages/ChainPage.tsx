@@ -671,13 +671,14 @@ function ChainPageHeader({
 
   const commit = async () => {
     const trimmed = value.trim();
-    if (!trimmed || trimmed === chain.display_name) {
+    const name = trimmed || null;
+    if (name === chain.display_name) {
       setValue(chain.display_name);
       setEditing(false);
       return;
     }
     try {
-      await onRename(trimmed);
+      await onRename(name);
       setRenameError(null);
       setEditing(false);
     } catch (err) {
