@@ -590,6 +590,41 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(model.isResolvingPendingProductClose)
     }
 
+    func testRepairNotNowKeepsAggregateMessageAdmissionFenced() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-repair-fence-tests-\(UUID().uuidString)")
+        let model = AppModel()
+        try model.configure(serverURL: "http://127.0.0.1:1", password: "", trustSelfSigned: true)
+        model.connectivity.setOnlineForTesting(true)
+        let row = conversation(id: "latest", aggregateId: "product")
+        model.listStore.upsert(row)
+        let session = try XCTUnwrap(model.session(for: row.id))
+        model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: row.id,
+            close: closeSnapshot(phase: .needs_repair)))
+
+        await model.resolvePendingProductCloseConfirmation(confirm: false)
+
+        XCTAssertNil(model.pendingProductCloseConfirmation)
+        XCTAssertTrue(session.isArchiving)
+        XCTAssertFalse(session.acceptsConversationActions)
+        XCTAssertFalse(session.acceptsChatMessage)
+    }
+
+    func testActiveCloseFenceAppliesToSessionCreatedAfterRehydration() throws {
+        let model = AppModel()
+        try model.configure(serverURL: "http://127.0.0.1:1", password: "", trustSelfSigned: true)
+        let row = conversation(id: "latest", aggregateId: "product")
+        model.listStore.upsert(row)
+        model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
+
+        let session = try XCTUnwrap(model.session(for: row.id))
+
+        XCTAssertTrue(session.isArchiving)
+        XCTAssertFalse(session.acceptsConversationActions)
+    }
+
     func testPendingCloseConfirmationBlocksPersistedAggregateOutboxWithoutRequest() async {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-outbox-tests-\(UUID().uuidString)")

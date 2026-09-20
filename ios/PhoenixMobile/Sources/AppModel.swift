@@ -286,6 +286,7 @@ final class AppModel {
     /// Invalidates responses started with earlier server credentials or URL.
     private var apiGeneration = 0
     private var aggregateEventTask: Task<Void, Never>?
+    private var aggregateEventTaskId: UUID?
     private var aggregateReconciliationTask: Task<Bool, Never>?
     private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
@@ -298,6 +299,7 @@ final class AppModel {
     /// through the session's single drain task.
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
+    private var closeAdmissionFencedProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
     private var productHistoryGenerations = ProductActionGenerationTracker()
     private var confirmationRehydrationGenerations = ProductActionGenerationTracker()
@@ -327,6 +329,7 @@ final class AppModel {
         apiGeneration += 1
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
+        aggregateEventTaskId = nil
         cancelAggregateReconciliation()
         guard let url = URL(string: serverURLString), url.host != nil else {
             api = nil
@@ -380,6 +383,11 @@ final class AppModel {
                 onHardDeleted: onHardDeleted)
         }
         sessions[conversationId] = session
+        if let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId),
+           closeAdmissionFencedProductConversationIds.contains(aggregateId)
+        {
+            session.setCloseAdmissionFenced(true)
+        }
         return session
     }
 
@@ -451,7 +459,15 @@ final class AppModel {
 
     private func startAggregateEventStream(api: PhoenixAPI, generation: Int) {
         guard aggregateEventTask == nil else { return }
+        let taskId = UUID()
+        aggregateEventTaskId = taskId
         aggregateEventTask = Task { [weak self] in
+            defer {
+                if self?.aggregateEventTaskId == taskId {
+                    self?.aggregateEventTask = nil
+                    self?.aggregateEventTaskId = nil
+                }
+            }
             var retryDelay = 1.0
             while !Task.isCancelled {
                 guard let self, self.apiGeneration == generation, self.isForeground else { return }
@@ -523,6 +539,22 @@ final class AppModel {
         }
     }
 
+    private func setProductCloseAdmissionFence(
+        productConversationId: String,
+        fenced: Bool
+    ) {
+        if fenced {
+            closeAdmissionFencedProductConversationIds.insert(productConversationId)
+        } else {
+            closeAdmissionFencedProductConversationIds.remove(productConversationId)
+        }
+        let transcriptIds = listStore.transcriptRowIds(forAggregateId: productConversationId)
+        for transcriptId in transcriptIds {
+            sessions[transcriptId]?.setCloseAdmissionFenced(fenced)
+            drainSessions[transcriptId]?.setCloseAdmissionFenced(fenced)
+        }
+    }
+
     private func rehydratePendingProductCloseConfirmation(api: PhoenixAPI) async {
         guard pendingProductCloseConfirmation == nil else { return }
         let fenceIdentity = "pending-close-confirmation"
@@ -539,6 +571,11 @@ final class AppModel {
                   confirmationRehydrationGenerations.isCurrent(
                     rehydrationGeneration, productConversationId: fenceIdentity)
             else { continue }
+            if let close = snapshot.close, close.phase != .completed {
+                setProductCloseAdmissionFence(
+                    productConversationId: snapshot.product_conversation_id,
+                    fenced: true)
+            }
             if let pending = PendingProductCloseConfirmation(snapshot: snapshot) {
                 pendingProductCloseConfirmation = pending
                 return
@@ -910,7 +947,13 @@ final class AppModel {
             fencedSessions.append(session)
         }
         var closed = false
-        defer { if !closed { fencedSessions.forEach { $0.endArchiving() } } }
+        defer {
+            if !closed,
+               !closeAdmissionFencedProductConversationIds.contains(conversation.aggregateIdentity)
+            {
+                fencedSessions.forEach { $0.endArchiving() }
+            }
+        }
         do {
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
@@ -948,6 +991,9 @@ final class AppModel {
                     productConversationId: conversation.aggregateIdentity,
                     transcriptRowId: snapshot.latest_transcript_row_id,
                     close: close)
+                setProductCloseAdmissionFence(
+                    productConversationId: conversation.aggregateIdentity,
+                    fenced: true)
                 await listStore.refresh(api: api)
                 return false
             }
@@ -1044,6 +1090,9 @@ final class AppModel {
                 try await api.cancelClose(
                     conversationId: pending.transcriptRowId,
                     attemptId: pending.close.attempt_id)
+                setProductCloseAdmissionFence(
+                    productConversationId: pending.productConversationId,
+                    fenced: false)
             }
             guard isCurrentPendingCloseAction(
                 actionGeneration,
@@ -1072,6 +1121,11 @@ final class AppModel {
                         api: api)
                 } else {
                     pendingProductCloseConfirmation = nil
+                    if snapshot.close?.phase == .completed || snapshot.close == nil {
+                        setProductCloseAdmissionFence(
+                            productConversationId: pending.productConversationId,
+                            fenced: false)
+                    }
                     await listStore.refresh(api: api)
                 }
             } else if confirm {
@@ -1203,6 +1257,7 @@ final class AppModel {
             pendingProductCloseResolution.reset()
         }
         closingProductConversationIds.remove(productConversationId)
+        setProductCloseAdmissionFence(productConversationId: productConversationId, fenced: false)
         _ = closeActionGenerations.begin(productConversationId: productConversationId)
         _ = confirmationRehydrationGenerations.begin(
             productConversationId: "pending-close-confirmation")
@@ -1224,6 +1279,19 @@ final class AppModel {
         rebuildAPI()
     }
 
+    var aggregateEventStreamOwnedForTesting: Bool {
+        aggregateEventTask != nil
+    }
+
+    func fenceProductCloseForTesting(
+        productConversationId: String,
+        fenced: Bool
+    ) {
+        setProductCloseAdmissionFence(
+            productConversationId: productConversationId,
+            fenced: fenced)
+    }
+
     func installPendingProductCloseConfirmationForTesting(
         _ pending: PendingProductCloseConfirmation,
         resolving: Bool = false
@@ -1231,6 +1299,9 @@ final class AppModel {
         _ = confirmationRehydrationGenerations.begin(
             productConversationId: "pending-close-confirmation")
         pendingProductCloseConfirmation = pending
+        setProductCloseAdmissionFence(
+            productConversationId: pending.productConversationId,
+            fenced: true)
         if resolving {
             _ = pendingProductCloseResolution.begin(
                 productConversationId: pending.productConversationId)
@@ -1399,6 +1470,9 @@ final class AppModel {
             guard self.aggregateReconciliationId == id else { return false }
             self.aggregateReconciliationTask = nil
             self.aggregateReconciliationId = nil
+            if reconciled, let api = self.api, self.isForeground, self.connectivity.isOnline {
+                self.startAggregateEventStream(api: api, generation: self.apiGeneration)
+            }
             return reconciled
         }
         aggregateReconciliationTask = task
@@ -1549,6 +1623,7 @@ final class AppModel {
         cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
+        aggregateEventTaskId = nil
         // Streams die in the background anyway; stop them cleanly and
         // persist snapshots. Outboxes are already disk-backed.
         for session in sessions.values { session.pauseForBackground() }
@@ -1585,6 +1660,7 @@ final class AppModel {
         cancelAggregateReconciliation()
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
+        aggregateEventTaskId = nil
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
         for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
@@ -1597,6 +1673,7 @@ final class AppModel {
         productHistoryGenerations.reset()
         confirmationRehydrationGenerations.reset()
         closingProductConversationIds.removeAll()
+        closeAdmissionFencedProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
         deletedProductHistoryIds.removeAll()

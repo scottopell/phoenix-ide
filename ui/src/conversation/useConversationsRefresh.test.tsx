@@ -38,6 +38,7 @@ vi.mock('../api', async () => {
       ...actual.api,
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
+      listProductConversations: vi.fn(() => Promise.resolve({ product_conversations: [] })),
     },
   };
 });
@@ -110,6 +111,36 @@ describe('aggregate deletion event subscription', () => {
     });
     unsubscribe();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps exponential stream backoff across successful REST reconciliation', async () => {
+    vi.useFakeTimers();
+    const delays: number[] = [];
+    const originalSetTimeout = window.setTimeout;
+    const timeoutSpy = vi.spyOn(window, 'setTimeout').mockImplementation(((handler: TimerHandler, timeout?: number) => {
+      if ((timeout ?? 0) >= 1_000) delays.push(timeout ?? 0);
+      return originalSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    const instances: Array<{ onerror: (() => void) | null; onopen: (() => void) | null }> = [];
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      onopen: (() => void) | null = null;
+      close = vi.fn();
+      constructor() { instances.push(this); }
+      addEventListener() {}
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    instances[0]!.onerror?.();
+    await vi.advanceTimersByTimeAsync(2_000);
+    instances[1]!.onerror?.();
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(delays.slice(0, 2)).toEqual([2_000, 4_000]);
+    unsubscribe();
+    await vi.runAllTimersAsync();
+    timeoutSpy.mockRestore();
   });
 
   it('bounds reconnect delay and cleanup cancels the pending retry', () => {
