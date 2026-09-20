@@ -1597,6 +1597,11 @@ impl BrowserSessionManager {
         let old_key = session_key(work_scope, &restricted);
         let new_key = work_scope.stable_key();
         let mut state = self.state.write().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &restricted).is_some()
+        {
+            return false;
+        }
         if state.sessions.contains_key(&new_key) {
             return false;
         }

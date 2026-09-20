@@ -219,6 +219,18 @@ rule ContinuationReusesSession {
 -- that case and both cascade rules below remain exact. This is the opposite
 -- of the idle reaper, which fails closed and preserves on an unreadable DB —
 -- there preserving is the safe error response, here it is the unsafe one.
+rule BrowserScopeRetirementBlocksAuthorityPromotion {
+    when: BrowserScopeRetirementRequested(work_scope)
+
+    ensures: BrowserScopeRetirementFenceEstablished(work_scope)
+    ensures: not BrowserSessionAuthorityPromoted(work_scope)
+
+    @guidance
+        -- Promotion and retirement admission share the manager-state write lock.
+        -- A fenced scope or actor key rejects promotion before its session entry
+        -- can move to the shared WorkScope key.
+}
+
 rule CascadeTearsDownWhenNoInheritor {
     when: BrowserTeardownSucceeded(conversation, inheritor_scope)
 
