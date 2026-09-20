@@ -6,13 +6,14 @@
 // recycles a slug, an orphan entry would silently restore a viewer under
 // the wrong conversation.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act, waitFor } from '@testing-library/react';
 import { useContext } from 'react';
 import {
   ConversationProvider,
   ConversationStore,
 } from './';
+import { subscribeToAggregateDeletionEvents } from './useConversationsRefresh';
 import { ConversationContext } from './ConversationContext';
 import { DraftContext } from './DraftContext';
 import type { DraftStore } from './DraftStore';
@@ -22,6 +23,10 @@ import {
 } from '../storage/lastViewerStorage';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import type { Conversation } from '../api';
+import {
+  subscribeProductConversationListRevision,
+  subscribeProductConversationSnapshotChanged,
+} from '../notifications';
 
 // The polling refresh tries to call api.listConversations on mount.
 // No-op so the test isolates the hard-delete listener.
@@ -33,6 +38,7 @@ vi.mock('../api', async () => {
       ...actual.api,
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
+      listProductConversations: vi.fn(() => Promise.resolve({ product_conversations: [] })),
     },
   };
 });
@@ -67,6 +73,96 @@ function CaptureStore({
   if (store) onStore(store);
   return null;
 }
+
+describe('aggregate deletion event subscription', () => {
+  const originalEventSource = globalThis.EventSource;
+
+  afterEach(() => {
+    globalThis.EventSource = originalEventSource;
+    vi.useRealTimers();
+  });
+
+  it('forwards the aggregate member set and closes on cleanup', () => {
+    const listeners = new Map<string, EventListener>();
+    const close = vi.fn();
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      constructor(public url: string) {}
+      addEventListener(type: string, listener: EventListener) { listeners.set(type, listener); }
+      close = close;
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const received = vi.fn();
+    window.addEventListener('phoenix:conversation-hard-deleted', received, { once: true });
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    listeners.get('conversation_hard_deleted')?.(new MessageEvent('conversation_hard_deleted', {
+      data: JSON.stringify({
+        sequence_id: 0,
+        conversation_id: 'product-id',
+        deleted_conversation_ids: ['root-id', 'leaf-id'],
+      }),
+    }));
+
+    expect(received).toHaveBeenCalledOnce();
+    expect((received.mock.calls[0]![0] as CustomEvent).detail).toEqual({
+      conversationId: 'product-id',
+      deletedConversationIds: ['root-id', 'leaf-id'],
+    });
+    unsubscribe();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps exponential stream backoff across successful REST reconciliation', async () => {
+    vi.useFakeTimers();
+    const delays: number[] = [];
+    const originalSetTimeout = window.setTimeout;
+    const timeoutSpy = vi.spyOn(window, 'setTimeout').mockImplementation(((handler: TimerHandler, timeout?: number) => {
+      if ((timeout ?? 0) >= 1_000) delays.push(timeout ?? 0);
+      return originalSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    const instances: Array<{ onerror: (() => void) | null; onopen: (() => void) | null }> = [];
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      onopen: (() => void) | null = null;
+      close = vi.fn();
+      constructor() { instances.push(this); }
+      addEventListener() {}
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    instances[0]!.onerror?.();
+    await vi.advanceTimersByTimeAsync(2_000);
+    instances[1]!.onerror?.();
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(delays.slice(0, 2)).toEqual([2_000, 4_000]);
+    unsubscribe();
+    await vi.runAllTimersAsync();
+    timeoutSpy.mockRestore();
+  });
+
+  it('bounds reconnect delay and cleanup cancels the pending retry', () => {
+    vi.useFakeTimers();
+    const instances: Array<{ onerror: (() => void) | null; close: ReturnType<typeof vi.fn> }> = [];
+    class FakeEventSource {
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor() { instances.push(this); }
+      addEventListener() {}
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+
+    const unsubscribe = subscribeToAggregateDeletionEvents();
+    instances[0]!.onerror?.();
+    unsubscribe();
+    vi.runAllTimers();
+
+    expect(instances).toHaveLength(1);
+    expect(instances[0]!.close).toHaveBeenCalledOnce();
+  });
+});
 
 describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () => {
   beforeEach(() => {
@@ -246,6 +342,79 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
       expect(localStorage.getItem(terminalPaneStorageKey('new-slug'))).toBeNull();
       expect(draftStore!.getSnapshot('old-slug').draft).toBe('');
       expect(draftStore!.getSnapshot('new-slug').draft).toBe('');
+    });
+  });
+
+  it('notifies mounted product list and exact aggregate snapshot projections', async () => {
+    const listChanged = vi.fn();
+    const snapshotChanged = vi.fn();
+    const unsubscribeList = subscribeProductConversationListRevision(listChanged);
+    const unsubscribeSnapshot = subscribeProductConversationSnapshotChanged('product-id', snapshotChanged);
+
+    render(
+      <ConversationProvider>
+        <CaptureStore onStore={() => {}} />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: {
+            conversationId: 'product-id',
+            deletedConversationIds: ['root-id', 'leaf-id'],
+          },
+        }),
+      );
+    });
+
+    expect(snapshotChanged).toHaveBeenCalledOnce();
+    await waitFor(() => expect(listChanged).toHaveBeenCalledOnce());
+    unsubscribeList();
+    unsubscribeSnapshot();
+  });
+
+  it('clears every transcript store and draft named by one aggregate delete event', async () => {
+    let store: ConversationStore | undefined;
+    let draftStore: DraftStore | undefined;
+    function CaptureBoth() {
+      store = useContext(ConversationContext) ?? undefined;
+      draftStore = useContext(DraftContext) ?? undefined;
+      return null;
+    }
+
+    render(
+      <ConversationProvider>
+        <CaptureBoth />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.upsertSnapshot('root-slug', makeConv('root-slug', 'root-id'));
+      store!.upsertSnapshot('leaf-slug', makeConv('leaf-slug', 'leaf-id'));
+      draftStore!.dispatch('root-slug', { type: 'set_draft', text: 'root draft' });
+      draftStore!.dispatch('leaf-slug', { type: 'set_draft', text: 'leaf draft' });
+    });
+    localStorage.setItem('phoenix:draft:root-id', 'root draft');
+    localStorage.setItem('phoenix:draft:leaf-id', 'leaf draft');
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: {
+            conversationId: 'product-id',
+            deletedConversationIds: ['root-id', 'leaf-id'],
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(store!.listSnapshots()).toEqual([]);
+      expect(draftStore!.getSnapshot('root-slug').draft).toBe('');
+      expect(draftStore!.getSnapshot('leaf-slug').draft).toBe('');
+      expect(localStorage.getItem('phoenix:draft:root-id')).toBeNull();
+      expect(localStorage.getItem('phoenix:draft:leaf-id')).toBeNull();
     });
   });
 

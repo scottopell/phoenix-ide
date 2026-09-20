@@ -8,6 +8,8 @@ interface ConfirmDialogProps {
   confirmText?: string;
   cancelText?: string;
   danger?: boolean;
+  error?: string;
+  submitting?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -19,6 +21,8 @@ export function ConfirmDialog({
   confirmText = 'Confirm',
   cancelText = 'Cancel',
   danger = false,
+  error,
+  submitting = false,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -28,20 +32,20 @@ export function ConfirmDialog({
   useEffect(() => {
     if (visible) {
       const handleEscape = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') onCancel();
+        if (e.key === 'Escape' && !submitting) onCancel();
       };
       document.addEventListener('keydown', handleEscape);
       return () => document.removeEventListener('keydown', handleEscape);
     }
     return undefined;
-  }, [visible, onCancel]);
+  }, [visible, submitting, onCancel]);
 
   if (!visible) return null;
 
   return (
     <div
       className="modal-overlay"
-      onClick={onCancel}
+      onClick={() => { if (!submitting) onCancel(); }}
       title="Cancel and close dialog"
       aria-label="Cancel and close dialog"
     >
@@ -53,13 +57,15 @@ export function ConfirmDialog({
       >
         <h3>{title}</h3>
         <p className="confirm-message">{message}</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
         <div className="modal-actions">
-          <button className="btn-secondary" onClick={onCancel} title={cancelText}>
+          <button className="btn-secondary" onClick={onCancel} title={cancelText} disabled={submitting}>
             {cancelText}
           </button>
           <button
             className={danger ? 'btn-danger' : 'btn-primary'}
             onClick={onConfirm}
+            disabled={submitting}
             title={danger ? `${confirmText} (can't be undone)` : confirmText}
           >
             {confirmText}

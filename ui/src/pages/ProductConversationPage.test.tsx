@@ -16,7 +16,12 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
-import { notifyCloseSnapshotChanged } from '../notifications';
+import {
+  notifyCloseSnapshotChanged,
+  notifyProductConversationDeleted,
+  notifyProductConversationSnapshotChanged,
+  notifyProductConversationsReconciled,
+} from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -267,6 +272,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
 function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   return {
     root_conv_id: 'root-chain',
+    product_conversation_id: 'pc-1',
     chain_name: null,
     display_name: 'Product Alpha',
     archived: false,
@@ -419,6 +425,128 @@ describe('ProductConversationPage', () => {
     await Promise.resolve();
     expect(screen.queryByRole('heading', { name: 'Stale Alpha' })).not.toBeInTheDocument();
     expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes the active title from the aggregate snapshot invalidation authority', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Renamed Product', presentation_mode: 'idle' },
+      }));
+    renderPage();
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Renamed Product' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears a writable open snapshot when its aggregate is deleted', async () => {
+    renderPage();
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationDeleted('pc-1', ['row-1', 'row-2']));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+      mutationEnabled: false,
+      aggregateLifecycleOpen: false,
+    }));
+  });
+
+  it('clears an alias-routed writable snapshot when a deleted member matches', async () => {
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationDeleted('pc-other', ['row-2']));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+  });
+
+  it('defers authoritative absence for an unresolved legacy alias until canonical snapshot', async () => {
+    const { api } = await import('../api');
+    let resolveSnapshot: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
+    vi.mocked(api.getProductConversationSnapshot).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveSnapshot = resolve; }),
+    );
+    renderPage('/product-conversations/root-alias');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledOnce());
+
+    act(() => notifyProductConversationsReconciled(new Set(['pc-1'])));
+    expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
+
+    act(() => resolveSnapshot?.(makeSnapshot()));
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+    expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
+  });
+
+  it('clears a writable snapshot when stream reconciliation proves the aggregate absent', async () => {
+    renderPage();
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationsReconciled(new Set(['pc-other'])));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+  });
+
+  it('refreshes an alias route from canonical aggregate invalidation', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays a canonical rename invalidation received while an alias snapshot is loading', async () => {
+    const { api } = await import('../api');
+    let resolveInitial: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve; }))
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Canonical Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    act(() => resolveInitial?.(makeSnapshot()));
+
+    expect(await screen.findByRole('heading', { name: 'Canonical Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('rearms canonical snapshot invalidation after each refresh', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'First Rename', presentation_mode: 'idle' },
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Second Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    expect(await screen.findByRole('heading', { name: 'First Rename' })).toBeInTheDocument();
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Second Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3);
   });
 
   it('starts a new measured open when revisiting a previously loaded product route', async () => {

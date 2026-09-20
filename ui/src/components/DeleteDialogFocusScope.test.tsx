@@ -14,6 +14,7 @@ function ScopeCapture({ onScope }: { onScope: (scope: string | null) => void }) 
 
 const chain: ChainView = {
   root_conv_id: 'root',
+  product_conversation_id: 'pc-root',
   chain_name: 'chain',
   display_name: 'chain',
   archived: false,

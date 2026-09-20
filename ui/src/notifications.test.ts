@@ -12,10 +12,12 @@ import {
   notifyConversationSnapshotChange,
   notifyArchiveCloseConflict,
   notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
   subscribeCloseSnapshotChanged,
   subscribeProductConversationListRevision,
+  subscribeProductConversationSnapshotChanged,
 } from './notifications';
 
 const notifications: MockNotification[] = [];
@@ -109,6 +111,22 @@ describe('product conversation list revision notifications', () => {
   });
 });
 
+describe('product conversation snapshot notifications', () => {
+  it('invalidates only the addressed aggregate snapshot', () => {
+    const addressed = vi.fn();
+    const other = vi.fn();
+    const unsubscribeAddressed = subscribeProductConversationSnapshotChanged('pc-1', addressed);
+    const unsubscribeOther = subscribeProductConversationSnapshotChanged('pc-2', other);
+
+    notifyProductConversationSnapshotChanged('pc-1');
+
+    expect(addressed).toHaveBeenCalledTimes(1);
+    expect(other).not.toHaveBeenCalled();
+    unsubscribeAddressed();
+    unsubscribeOther();
+  });
+});
+
 describe('archive close conflict notifications', () => {
   it('notifies for every durable Close conflict', () => {
     const closeListener = vi.fn();
@@ -146,6 +164,10 @@ describe('archive close conflict notifications', () => {
       }))).toBe(true);
     }
     expect(closeListener).toHaveBeenCalledTimes(6);
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'close could not start',
+      error_type: 'close_start_failed',
+    }))).toBe(false);
 
     vi.runAllTimers();
 

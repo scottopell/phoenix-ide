@@ -7,8 +7,91 @@ import { cacheDB } from '../cache';
 import { clearLastViewer } from '../storage/lastViewerStorage';
 import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
+import {
+  notifyProductConversationDeleted,
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
+  notifyProductConversationsReconciled,
+} from '../notifications';
 
 const POLL_INTERVAL_MS = 5000;
+const AGGREGATE_EVENT_RETRY_MAX_MS = 30_000;
+
+export function subscribeToAggregateDeletionEvents(): () => void {
+  let source: EventSource | null = null;
+  let retryTimer: number | null = null;
+  let retryDelayMs = 1_000;
+  let stopped = false;
+
+  const connect = () => {
+    if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
+    source = new EventSource('/api/product-conversations/events');
+    source.onopen = () => {
+      retryDelayMs = 1_000;
+    };
+    source.addEventListener('conversation_hard_deleted', (event) => {
+      let payload: unknown;
+      try {
+        payload = JSON.parse((event as MessageEvent<string>).data);
+      } catch {
+        return;
+      }
+      if (
+        typeof payload !== 'object' || payload === null
+        || typeof (payload as { conversation_id?: unknown }).conversation_id !== 'string'
+        || !Array.isArray((payload as { deleted_conversation_ids?: unknown }).deleted_conversation_ids)
+        || !(payload as { deleted_conversation_ids: unknown[] }).deleted_conversation_ids.every(
+          (id) => typeof id === 'string',
+        )
+      ) return;
+      const data = payload as { conversation_id: string; deleted_conversation_ids: string[] };
+      window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+        detail: {
+          conversationId: data.conversation_id,
+          deletedConversationIds: data.deleted_conversation_ids,
+        },
+      }));
+    });
+    source.onerror = () => {
+      source?.close();
+      source = null;
+      retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+      scheduleReconciliation();
+    };
+  };
+
+  const scheduleReconciliation = () => {
+    if (stopped || retryTimer !== null) return;
+    retryTimer = window.setTimeout(() => {
+      retryTimer = null;
+      void api.listProductConversations()
+        .then(({ product_conversations: rows }) => {
+          if (stopped) return;
+          notifyProductConversationsReconciled(new Set(rows.map((row) => (
+            row.product_conversation_id
+          ))));
+          notifyProductConversationListMayHaveChanged();
+          connect();
+        })
+        .catch(() => {
+          retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+          scheduleReconciliation();
+        });
+    }, retryDelayMs);
+  };
+
+  const handleOnline = () => {
+    if (!stopped && source === null && retryTimer === null) scheduleReconciliation();
+  };
+  window.addEventListener('online', handleOnline);
+  connect();
+  return () => {
+    stopped = true;
+    source?.close();
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    window.removeEventListener('online', handleOnline);
+  };
+}
 
 /**
  * Pure refresh implementation. Reconciles the store with the cache and
@@ -172,25 +255,32 @@ export function useConversationsRefreshDriver(): void {
     return () => window.clearInterval(interval);
   }, []);
 
+  useEffect(() => subscribeToAggregateDeletionEvents(), []);
+
   // REQ-BED-032: hard-delete cascade. The per-conversation SSE channel
   // emits this after the row is gone server-side. Remove the atom
   // directly so the sidebar updates immediately rather than waiting
   // for the next poll tick.
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
+      const detail = (e as CustomEvent<{
+        conversationId?: string;
+        deletedConversationIds?: string[];
+      }>).detail;
       if (!detail?.conversationId) return;
-      const removedSlugs = store.removeByConversationId(detail.conversationId);
-      for (const slug of removedSlugs) {
-        // REQ-VS-014: drop all per-slug state so a future conversation
-        // that reuses this slug doesn't inherit any of it.
-        clearLastViewer(slug);
-        clearTerminalPaneStorage(slug);
-        draftStore.remove(slug);
+      notifyProductConversationListMayHaveChanged();
+      notifyProductConversationSnapshotChanged(detail.conversationId);
+      const deletedConversationIds = detail.deletedConversationIds ?? [detail.conversationId];
+      notifyProductConversationDeleted(detail.conversationId, deletedConversationIds);
+      for (const conversationId of deletedConversationIds) {
+        const removedSlugs = store.removeByConversationId(conversationId);
+        for (const slug of removedSlugs) {
+          clearLastViewer(slug);
+          clearTerminalPaneStorage(slug);
+          draftStore.remove(slug);
+        }
+        clearDraftStorage(conversationId);
       }
-      // localStorage drafts are keyed by conversationId, not slug — clear
-      // by id regardless of whether we still hold an atom for the slug.
-      clearDraftStorage(detail.conversationId);
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();

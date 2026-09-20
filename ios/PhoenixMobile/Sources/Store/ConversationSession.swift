@@ -108,7 +108,18 @@ final class ConversationSession {
         return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
+    static func cachedConversation(conversationId: String) -> Conversation? {
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion),
+              snapshot.syncedAt != nil
+        else { return nil }
+        return snapshot.conversation
+    }
+
     private var transcriptGeneration: Int64?
+    private var deliveryAllowed = true
     private(set) var snapshotSyncedAt: Date?
 
     init(
@@ -204,6 +215,9 @@ final class ConversationSession {
     /// foreground transition resumes only that conversation's live stream.
     func pauseForBackground() {
         pauseLiveTasks()
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
     }
 
     private func pauseLiveTasks() {
@@ -227,10 +241,17 @@ final class ConversationSession {
         }
     }
 
+    func suspendDeliveryForReconciliation() {
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
+    }
+
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
         guard !isHardDeleted else { return }
+        deliveryAllowed = true
         resumeLiveTasks()
         drainOutbox()
     }
@@ -246,6 +267,9 @@ final class ConversationSession {
     }
 
     private func connectivityLost() {
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
         streamTask?.cancel()
         streamTask = nil
         staleCheckTask?.cancel()
@@ -364,12 +388,20 @@ final class ConversationSession {
 
     func beginArchiving() -> Bool {
         guard !isArchiving, outbox.visibleEntries.isEmpty else { return false }
-        isArchiving = true
+        setCloseAdmissionFenced(true)
         return true
     }
 
+    func setCloseAdmissionFenced(_ fenced: Bool) {
+        isArchiving = fenced
+        if fenced {
+            drainTask?.cancel()
+            drainTask = nil
+        }
+    }
+
     func endArchiving() {
-        isArchiving = false
+        setCloseAdmissionFenced(false)
     }
 
     /// Attempt delivery of every sendable entry, oldest first. Safe to call
@@ -377,7 +409,7 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard drainTask == nil, !isHardDeleted else { return }
+        guard drainTask == nil, !isHardDeleted, !isArchiving, deliveryAllowed else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
@@ -852,6 +884,10 @@ final class ConversationSession {
         case .other(_, let seq):
             if let seq { _ = applyIfNewer(seq) }
         }
+    }
+
+    func markHardDeleted() {
+        handleHardDeletion()
     }
 
     private func handleHardDeletion() {

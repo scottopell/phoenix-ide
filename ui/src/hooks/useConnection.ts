@@ -692,7 +692,10 @@ export function useConnection({
             stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
             window.dispatchEvent(
               new CustomEvent('phoenix:conversation-hard-deleted', {
-                detail: { conversationId: res.data.conversation_id },
+                detail: {
+                  conversationId: res.data.conversation_id,
+                  deletedConversationIds: res.data.deleted_conversation_ids,
+                },
               }),
             );
           });

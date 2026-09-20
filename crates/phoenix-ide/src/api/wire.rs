@@ -401,6 +401,7 @@ pub enum SseWireEvent {
     ConversationHardDeleted {
         sequence_id: i64,
         conversation_id: String,
+        deleted_conversation_ids: Vec<String>,
     },
     /// Browser session liveness changed for the conversation this SSE
     /// stream represents. `active = true` is fired exactly once when a
@@ -611,9 +612,11 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             } => SseWireEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             },
             SseEvent::BrowserSessionState {
                 sequence_id,

@@ -1071,8 +1071,8 @@ async fn resolve_work(
     let title = root
         .chain_name
         .clone()
-        .or(current.title.clone())
         .or(root.title.clone())
+        .or(current.title.clone())
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
     Ok(ResolveGlobalReferenceResponse {
@@ -1109,6 +1109,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::ProductConversationUnavailable(_)
         | DbError::SteeringQueueFull
         | DbError::CloseFoundationPrecondition(_)
+        | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ForkProposalConflict(_)

@@ -24,7 +24,8 @@ use super::lifecycle_handlers::{
     retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{
-    get_product_conversation, list_product_conversation_creations, list_product_conversations,
+    close_product_conversation, get_product_conversation, list_product_conversation_creations,
+    list_product_conversations, rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -138,12 +139,24 @@ pub fn create_router(state: AppState) -> Router {
             get(list_product_conversations),
         )
         .route(
+            "/api/product-conversations/events",
+            get(stream_aggregate_events),
+        )
+        .route(
             "/api/product-conversations/creation",
             get(list_product_conversation_creations),
         )
         .route(
             "/api/product-conversations/:reference",
             get(get_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/title",
+            axum::routing::patch(rename_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/close",
+            axum::routing::post(close_product_conversation),
         )
         .route(
             "/api/product-conversations/:reference/route",
@@ -4296,6 +4309,10 @@ async fn read_stream_init_messages_with_tail(
     ))
 }
 
+async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
+    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -5951,7 +5968,10 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         ))));
     }
 
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+            .await?;
 
     if let Err(error) = state
         .runtime
@@ -5992,6 +6012,7 @@ async fn scope_still_owned_after_delete(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
@@ -6028,7 +6049,9 @@ async fn scope_still_owned_after_delete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
-        candidate.id != id && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
+        candidate.id != id
+            && !deleting_conversation_ids.contains(&candidate.id)
+            && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
     }))
 }
 
@@ -6120,16 +6143,10 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
 /// last live conversation on the scope is the one being deleted, every
 /// cascade tears down. Projects retains a conv-shaped API: it inspects
 /// `conv.conv_mode` for the branch/worktree mode discriminant.
-pub(super) async fn run_resource_cleanup_cascade(
-    state: &AppState,
-    conv: &crate::db::Conversation,
-) -> Result<ResourceCleanupReceipt, AppError> {
-    run_runtime_resource_cleanup_cascade(&state.runtime, conv).await
-}
-
 pub(crate) async fn run_runtime_resource_cleanup_cascade(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
 ) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
     let resolved_authority =
@@ -6141,7 +6158,9 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let scope_still_owned = scope_still_owned_after_delete(runtime, conv, &work_scope).await?;
+    let scope_still_owned =
+        scope_still_owned_after_delete(runtime, conv, &work_scope, deleting_conversation_ids)
+            .await?;
     let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
@@ -6299,7 +6318,29 @@ async fn delete_conversation(
 /// on success. Loss of fatal-authority admission or DB row deletion fails the
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
-pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+pub(super) enum PreparedHardDelete {
+    AlreadyDeleted,
+    Ready {
+        conversation: Box<crate::db::Conversation>,
+        cleanup: ResourceCleanupReceipt,
+        _authority: crate::runtime::AdmittedOperation,
+    },
+}
+
+impl PreparedHardDelete {
+    pub(super) fn release_authority(self) -> Option<Box<crate::db::Conversation>> {
+        match self {
+            Self::AlreadyDeleted => None,
+            Self::Ready { conversation, .. } => Some(conversation),
+        }
+    }
+}
+
+pub(super) async fn prepare_hard_delete_cascade(
+    state: &AppState,
+    id: &str,
+    deleting_conversation_ids: &std::collections::HashSet<String>,
+) -> Result<PreparedHardDelete, AppError> {
     let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
@@ -6347,7 +6388,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         delete_conversation_attachments(id).await;
         broadcast_conversation_hard_deleted(state, id).await;
         state.runtime.kick_creation_worker();
-        return Ok(());
+        return Ok(PreparedHardDelete::AlreadyDeleted);
     }
 
     if conv.state.is_busy() {
@@ -6392,7 +6433,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    let _owner = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
+    let authority = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; a
@@ -6400,30 +6441,81 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // retry. Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
-    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup =
+        run_runtime_resource_cleanup_cascade(&state.runtime, &conv, deleting_conversation_ids)
+            .await?;
 
-    // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
-    // rows. This is the only step whose failure is fatal to the request
-    // — partial cleanup above is non-fatal but a missing row deletion
-    // means the user's "delete this conversation" never actually
-    // happened.
-    if let Err(error) = state.runtime.db().delete_conversation(id).await {
-        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
-        return Err(AppError::Internal(format!(
-            "Failed to delete conversation row: {error}"
-        )));
+    Ok(PreparedHardDelete::Ready {
+        conversation: Box::new(conv),
+        cleanup,
+        _authority: authority,
+    })
+}
+
+pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &PreparedHardDelete) {
+    if let PreparedHardDelete::Ready {
+        conversation,
+        cleanup,
+        ..
+    } = prepared
+    {
+        reopen_bash_after_failed_lifecycle_mutation(state, conversation, cleanup).await;
     }
+}
 
-    // Scope retirement belongs to explicit scope cleanup, not to a terminal
-    // transcript transition. The row deletion above removes this conversation's
-    // ownership claim; runtime inventory and the database CAS independently
-    // recheck the remaining in-memory and durable obligations.
-    retire_work_scope_after_hard_delete(state, &conv).await;
+pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: PreparedHardDelete) {
+    let Some(conversation) = prepared.release_authority() else {
+        return;
+    };
+    finish_hard_deleted_conversation(state, conversation).await;
+}
 
-    delete_conversation_attachments(id).await;
+pub(super) async fn finalize_hard_deleted_conversation_resources(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) {
+    retire_work_scope_after_hard_delete(state, conversation).await;
+    delete_conversation_attachments(&conversation.id).await;
+}
 
-    broadcast_conversation_hard_deleted(state, id).await;
+pub(super) async fn finish_hard_deleted_conversation(
+    state: &AppState,
+    conversation: Box<crate::db::Conversation>,
+) {
+    let id = conversation.id.clone();
+    finalize_hard_deleted_conversation_resources(state, &conversation).await;
+    broadcast_conversation_hard_deleted(state, &id).await;
+}
 
+pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let deleting_conversation_ids = std::collections::HashSet::from([id.to_string()]);
+    let prepared = prepare_hard_delete_cascade(state, id, &deleting_conversation_ids).await?;
+    if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
+        return Ok(());
+    }
+    match state
+        .runtime
+        .db()
+        .delete_conversations_atomically_with_authority(&[id.to_string()])
+        .await
+    {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+            reopen_prepared_hard_delete(state, &prepared).await;
+            return Err(AppError::Internal(format!(
+                "Failed to delete conversation row: {error}"
+            )));
+        }
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+            state
+                .runtime
+                .signal_fatal_local_authority("conversation_hard_delete_commit");
+            return Err(AppError::Internal(
+                "conversation deletion lost local commit authority".to_string(),
+            ));
+        }
+    }
+    finish_prepared_hard_delete(state, prepared).await;
     Ok(())
 }
 
@@ -6478,10 +6570,30 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
         let _ = handle
             .broadcast_tx
-            .send_hard_deleted_and_close(id.to_string());
+            .send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
-        let _ = tx.send_hard_deleted_and_close(id.to_string());
+        let _ = tx.send_hard_deleted_and_close(id.to_string(), vec![id.to_string()]);
+    }
+}
+
+pub(super) async fn broadcast_aggregate_hard_deleted(
+    state: &AppState,
+    _root_id: &str,
+    product_conversation_id: &str,
+    deleted_conversation_ids: Vec<String>,
+) {
+    state.runtime.publish_aggregate_hard_deleted(
+        product_conversation_id.to_string(),
+        deleted_conversation_ids.clone(),
+    );
+    for member_id in deleted_conversation_ids {
+        if let Some(handle) = state.runtime.try_get_handle(&member_id).await {
+            handle.broadcast_tx.close_publication();
+        }
+        if let Some(tx) = state.runtime.take_evicted_broadcaster(&member_id).await {
+            tx.close_publication();
+        }
     }
 }
 
@@ -9471,9 +9583,14 @@ pub(crate) mod hard_delete_cascade_tests {
         create_approved_explore(&state, id).await;
         let conversation = state.db.get_conversation(id).await.expect("conversation");
 
-        let receipt = super::run_runtime_resource_cleanup_cascade(&state.runtime, &conversation)
-            .await
-            .expect("lifecycle cleanup");
+        let deleting_conversation_ids = std::collections::HashSet::from([conversation.id.clone()]);
+        let receipt = super::run_runtime_resource_cleanup_cascade(
+            &state.runtime,
+            &conversation,
+            &deleting_conversation_ids,
+        )
+        .await
+        .expect("lifecycle cleanup");
         assert_eq!(
             receipt.work_scope,
             crate::resource_authority::resolve_resource_authority(&state.db, &conversation)
@@ -13822,7 +13939,34 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn chain_delete_handler_removes_every_member() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
+        let root = state.db.get_conversation("cd-a").await.expect("root");
+        let subordinate = state
+            .db
+            .create_conversation_with_project(
+                "cd-agent",
+                "cd-agent",
+                "/tmp",
+                false,
+                Some("cd-a"),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("subordinate participant");
+        assert_eq!(
+            subordinate.product_conversation_id,
+            root.product_conversation_id
+        );
         mark_chain_history(&state, "cd-a").await;
+        let mut events = state.runtime.subscribe_aggregate_events();
 
         let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
@@ -13831,12 +13975,141 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .expect("chain delete");
 
-        for id in ["cd-a", "cd-b", "cd-c"] {
+        for id in ["cd-a", "cd-b", "cd-c", "cd-agent"] {
             assert!(
                 state.db.get_conversation(id).await.is_err(),
                 "{id} must be gone after chain delete"
             );
         }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("aggregate hard-delete event timeout")
+            .expect("aggregate hard-delete event");
+        assert!(matches!(
+            event,
+            SseEvent::ConversationHardDeleted {
+                conversation_id,
+                deleted_conversation_ids,
+                ..
+            } if conversation_id == root.product_conversation_id.as_str()
+                && deleted_conversation_ids
+                    == vec!["cd-agent", "cd-a", "cd-b", "cd-c"]
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "aggregate deletion must emit exactly one hard-delete event"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_delete_retry_after_success_is_idempotent_success() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["retry-a", "retry-b"]).await;
+        mark_chain_history(&state, "retry-a").await;
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("first delete");
+        let retry = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("retry-a".to_string()),
+        )
+        .await
+        .expect("missing aggregate is an idempotent success");
+
+        assert!(retry.0.success);
+    }
+
+    #[tokio::test]
+    async fn overlapping_chain_deletes_recheck_absence_after_admission_serialization() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["overlap-a", "overlap-b"]).await;
+        mark_chain_history(&state, "overlap-a").await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state
+            .runtime
+            .install_hard_delete_barrier(Arc::clone(&barrier))
+            .await;
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        barrier.wait().await;
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
+
+        assert!(
+            first
+                .await
+                .expect("first delete task")
+                .expect("first delete")
+                .0
+                .success
+        );
+        assert!(
+            second
+                .await
+                .expect("second delete task")
+                .expect("overlap is idempotent")
+                .0
+                .success
+        );
+        assert!(state.db.get_conversation("overlap-a").await.is_err());
+        assert!(state.db.get_conversation("overlap-b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_database_failure() {
+        let state = make_test_state().await;
+        state.db.pool().close().await;
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("unreadable-root".to_string()),
+        )
+        .await
+        .expect_err("database failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_delete_propagates_root_decode_failure() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["decode-a", "decode-b"]).await;
+        sqlx::query("UPDATE conversations SET user_initiated = 'not-a-bool' WHERE id = 'decode-a'")
+            .execute(state.db.pool())
+            .await
+            .expect("corrupt persisted state");
+
+        let error = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state),
+            axum::extract::Path("decode-a".to_string()),
+        )
+        .await
+        .expect_err("decode failure must not become idempotent success");
+
+        assert!(matches!(error, AppError::Internal(_)));
     }
 
     #[tokio::test]
@@ -15101,7 +15374,10 @@ pub(crate) mod hard_delete_cascade_tests {
         // must propagate rather than swallow to "assume live".
         state.db.pool().close().await;
 
-        let result = run_resource_cleanup_cascade(&state, &conv).await;
+        let deleting_conversation_ids = std::collections::HashSet::from([conv.id.clone()]);
+        let result =
+            run_runtime_resource_cleanup_cascade(&state.runtime, &conv, &deleting_conversation_ids)
+                .await;
 
         assert!(
             matches!(result, Err(AppError::Internal(_))),

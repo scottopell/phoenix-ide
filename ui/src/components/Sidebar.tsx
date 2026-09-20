@@ -1,8 +1,9 @@
 import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, getConvDisplayState } from '../api';
+import { ApiResponseError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
 import { SettingsDropdown } from './SettingsDropdown';
@@ -14,6 +15,10 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationDeleted,
+  notifyProductConversationListMayHaveChanged,
+  notifyProductConversationSnapshotChanged,
+  subscribeProductConversationDeleted,
   subscribeProductConversationListRevision,
 } from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
@@ -38,17 +43,6 @@ function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: 
     || row.canonical_root.transcript_row_id === routeIdentity
     || row.canonical_root.slug === routeIdentity
   );
-}
-
-function productRowDotClass(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
-  switch (row.presentation.presentation_mode) {
-    case 'needs_action': return 'awaiting-approval';
-    case 'working': return 'working';
-    case 'error': return 'error';
-    case 'done': return 'terminal';
-    default: return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
-  }
 }
 
 function collapsedDotProductConversations(
@@ -119,6 +113,8 @@ export function Sidebar({
   const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
   const refreshScheduledRef = useRef<number | null>(null);
+  const productConversationRefreshSeqRef = useRef(0);
+  const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
     getProductConversationListRevision,
@@ -127,6 +123,19 @@ export function Sidebar({
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
+  const [productCloseTarget, setProductCloseTarget] = useState<ProductConversationListRow | null>(null);
+  const [productDeleteTarget, setProductDeleteTarget] = useState<ProductConversationListRow | null>(null);
+  const productCloseTargetRef = useRef<ProductConversationListRow | null>(null);
+  const [productCloseSubmittingId, setProductCloseSubmittingId] = useState<string | null>(null);
+  const [productCloseError, setProductCloseError] = useState<{ productId: string; message: string } | null>(null);
+  const [productDeleteSubmittingId, setProductDeleteSubmittingId] = useState<string | null>(null);
+  const [productDeleteError, setProductDeleteError] = useState<{ productId: string; message: string } | null>(null);
+  const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
+  const [productRenameError, setProductRenameError] = useState<string | undefined>();
+
+  useEffect(() => {
+    productCloseTargetRef.current = productCloseTarget;
+  }, [productCloseTarget]);
 
   // Fetch once at mount, and refetch whenever the credential health flips.
   // The shared models poller fires on credential transitions (login completes,
@@ -146,15 +155,17 @@ export function Sidebar({
 
   useEffect(() => {
     let cancelled = false;
+    const requestSeq = productConversationRefreshSeqRef.current + 1;
+    productConversationRefreshSeqRef.current = requestSeq;
     api.listProductConversations()
       .then((response) => {
-        if (!cancelled) {
+        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
           setProductConversations(response.product_conversations);
           setProductConversationsError(null);
         }
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && productConversationRefreshSeqRef.current === requestSeq) {
           setProductConversationsError(error instanceof Error ? error.message : 'Failed to refresh conversations');
         }
       });
@@ -191,10 +202,38 @@ export function Sidebar({
     };
   }, [scheduleProductRefresh]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
-  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
-  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
+  const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
+  useEffect(() => {
+    const unsubscribes = productConversations.map((row) => {
+      const productId = row.product_conversation_id;
+      return subscribeProductConversationDeleted(new Set([
+        productId,
+        row.canonical_root.transcript_row_id,
+        row.latest_transcript_row_id,
+      ]), () => {
+        setProductConversations((current) => current.filter((candidate) => (
+          candidate.product_conversation_id !== productId
+        )));
+      });
+    });
+    return () => { unsubscribes.forEach((unsubscribe) => unsubscribe()); };
+  }, [productConversations]);
+  useEffect(() => {
+    if (!activeSlug || !location.pathname.startsWith('/product-conversations/')) {
+      setActiveProductSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    api.getProductConversationSnapshot(activeSlug, { message_limit: 1 })
+      .then((snapshot) => { if (!cancelled) setActiveProductSnapshot(snapshot); })
+      .catch(() => { if (!cancelled) setActiveProductSnapshot(null); });
+    return () => { cancelled = true; };
+  }, [activeSlug, location.pathname, productConversationListRevision]);
+
   const scopedActiveCount = openProductConversations.length;
   const scopedArchivedCount = archivedProductConversations.length;
+  const activeProductRouteIdentity = activeProductSnapshot?.product_conversation_id ?? activeSlug;
 
   useEffect(() => {
     if (!activeSlug) {
@@ -204,9 +243,9 @@ export function Sidebar({
     if (lastArchiveRevealSlugRef.current === activeSlug) return;
 
     const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || openProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+      || openProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
     const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
     if (!inActiveList && !inArchivedList) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
@@ -215,7 +254,7 @@ export function Sidebar({
       setShowArchived(false);
     }
     lastArchiveRevealSlugRef.current = activeSlug;
-  }, [activeSlug, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
+  }, [activeSlug, activeProductRouteIdentity, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
     beginNewProductConversationIntent();
@@ -274,6 +313,23 @@ export function Sidebar({
     }
   }, [renameTarget, onConversationCreated, applyRenameSnapshot]);
 
+  const handleProductRename = useCallback(async (newName: string) => {
+    if (!productRenameTarget) return;
+    try {
+      const renamed = await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
+      setProductConversations((rows) => rows.map((row) =>
+        row.product_conversation_id === renamed.product_conversation_id ? renamed : row));
+      notifyProductConversationSnapshotChanged(renamed.product_conversation_id);
+      notifyProductConversationListMayHaveChanged();
+      setProductRenameTarget(null);
+      setProductRenameError(undefined);
+      onConversationCreated();
+      setProductConversationsRetry((revision) => revision + 1);
+    } catch (err) {
+      setProductRenameError(err instanceof Error ? err.message : 'Failed to rename');
+    }
+  }, [productRenameTarget, onConversationCreated]);
+
   const handleGenerateRename = useCallback(async () => {
     if (!renameTarget) return;
     try {
@@ -297,6 +353,98 @@ export function Sidebar({
     setRenameTarget(conv);
   }, []);
 
+  const handleSetProductRenameTarget = useCallback((row: ProductConversationListRow) => {
+    setProductRenameError(undefined);
+    setProductRenameTarget(row);
+  }, []);
+
+  const handleSetProductCloseTarget = useCallback((row: ProductConversationListRow) => {
+    setProductCloseError(null);
+    setProductCloseTarget(row);
+  }, []);
+
+  const handleSetProductDeleteTarget = useCallback((row: ProductConversationListRow) => {
+    setProductDeleteError(null);
+    setProductDeleteTarget(row);
+  }, []);
+
+  const handleProductClose = useCallback(async () => {
+    if (!productCloseTarget) return;
+    if (productCloseSubmittingId === productCloseTarget.product_conversation_id) return;
+    setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
+    try {
+      await api.closeProductConversation(productCloseTarget.product_conversation_id);
+      setProductCloseTarget((current) =>
+        current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
+      onConversationCreated();
+      setProductConversationsRetry((revision) => revision + 1);
+      notifyProductConversationListMayHaveChanged();
+      notifyProductConversationSnapshotChanged(productCloseTarget.product_conversation_id);
+      setProductCloseError((current) =>
+        current?.productId === productCloseTarget.product_conversation_id ? null : current);
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
+    } catch (err) {
+      if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        const confirmationRoute = productCloseTarget.canonical_route;
+        if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
+          setProductCloseTarget(null);
+          navigate(confirmationRoute);
+        }
+      } else {
+        setProductCloseError({
+          productId: productCloseTarget.product_conversation_id,
+          message: err instanceof Error ? err.message : 'Failed to close product conversation',
+        });
+      }
+      setProductCloseSubmittingId((current) =>
+        current === productCloseTarget.product_conversation_id ? null : current);
+      console.error('Failed to close product conversation:', err);
+    }
+  }, [productCloseTarget, productCloseSubmittingId, onConversationCreated, navigate]);
+
+  const handleProductDelete = useCallback(async () => {
+    if (!productDeleteTarget) return;
+    const productId = productDeleteTarget.product_conversation_id;
+    if (productDeleteSubmittingId === productId) return;
+    const rootId = productDeleteTarget.canonical_root.transcript_row_id;
+    setProductDeleteSubmittingId(productId);
+    setProductDeleteError(null);
+    try {
+      await api.deleteChain(rootId);
+      setProductDeleteTarget((current) =>
+        current?.product_conversation_id === productId ? null : current);
+      notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
+      notifyProductConversationListMayHaveChanged();
+      const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
+        && activeProductSnapshot.segments.some((segment) => (
+          segment.transcript_row_id === activeSlug || segment.slug === activeSlug
+        ));
+      if (productRowMatchesRoute(productDeleteTarget, activeSlug) || activeSnapshotMatches) {
+        navigate('/');
+      }
+    } catch (error) {
+      if (error instanceof ApiResponseError && error.status === 404) {
+        setProductDeleteTarget((current) =>
+          current?.product_conversation_id === productId ? null : current);
+        notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
+        notifyProductConversationListMayHaveChanged();
+        if (productRowMatchesRoute(productDeleteTarget, activeSlug)
+          || activeProductSnapshot?.product_conversation_id === productId) {
+          navigate('/');
+        }
+        return;
+      }
+      setProductDeleteError({
+        productId,
+        message: error instanceof Error ? error.message : 'Failed to delete product conversation',
+      });
+      console.error('Failed to delete product conversation:', error);
+    } finally {
+      setProductDeleteSubmittingId((current) => current === productId ? null : current);
+    }
+  }, [productDeleteTarget, productDeleteSubmittingId, activeSlug, activeProductSnapshot, navigate]);
+
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
   }, []);
@@ -304,7 +452,7 @@ export function Sidebar({
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
   const isOnGlobalPage = location.pathname === '/global';
-  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeSlug);
+  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeProductRouteIdentity);
   const collapsedConversations = productConversationsError && productConversations.length === 0
     ? collapsedDotConversations(conversations, activeSlug)
     : [];
@@ -353,17 +501,24 @@ export function Sidebar({
           compact
         />
         <div className="sidebar-collapsed-dots">
-          {collapsedProductConversations.map((row) => (
-            <button
-              key={row.product_conversation_id}
-              className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
-              onClick={() => navigate(row.canonical_route)}
-              title={row.presentation.display_name}
-              aria-label={`Open ${row.presentation.display_name}`}
-            >
-              <span className={`conv-state-dot ${productRowDotClass(row)}`} />
-            </button>
-          ))}
+          {collapsedProductConversations.map((row) => {
+            const indicator = productConversationPresentationIndicator(row);
+            return (
+              <button
+                key={row.product_conversation_id}
+                className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeProductRouteIdentity) ? 'active' : ''}`}
+                onClick={() => navigate(row.canonical_route)}
+                title={row.presentation.display_name}
+                aria-label={`Open ${row.presentation.display_name}`}
+              >
+                <span
+                  className={`conv-state-dot ${indicator.dotClass}`}
+                  role="img"
+                  aria-label={indicator.ariaLabel}
+                />
+              </button>
+            );
+          })}
           {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = matchesRouteSegment(conv, activeSlug);
@@ -478,9 +633,12 @@ export function Sidebar({
           onNewConversation={handleNewClick}
           onArchive={handleArchive}
           onDelete={handleSetDeleteTarget}
-          onRename={handleSetRenameTarget}
+          {...(!productConversationsError ? { onRename: handleSetRenameTarget } : {})}
           onConversationClick={handleConversationClick}
           onProductConversationClick={(row) => navigate(row.canonical_route)}
+          onProductConversationRename={handleSetProductRenameTarget}
+          onProductConversationClose={handleSetProductCloseTarget}
+          onProductConversationDelete={handleSetProductDeleteTarget}
           activeSlug={activeSlug}
           sidebarMode
         />
@@ -493,6 +651,43 @@ export function Sidebar({
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ConfirmDialog
+        visible={productCloseTarget !== null}
+        title="Close Product Conversation"
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will move the entire product conversation to read-only History and stop its active work.`}
+        confirmText="Close"
+        danger
+        onConfirm={handleProductClose}
+        submitting={productCloseSubmittingId === productCloseTarget?.product_conversation_id}
+        {...(productCloseError && productCloseError.productId === productCloseTarget?.product_conversation_id
+          ? { error: productCloseError.message }
+          : {})}
+        onCancel={() => { setProductCloseTarget(null); setProductCloseError(null); }}
+      />
+      <ConfirmDialog
+        visible={productDeleteTarget !== null}
+        title="Delete Product Conversation"
+        message="Permanently delete this product conversation and its transcript history? This cannot be undone."
+        confirmText="Delete"
+        danger
+        onConfirm={handleProductDelete}
+        submitting={productDeleteSubmittingId === productDeleteTarget?.product_conversation_id}
+        {...(productDeleteError && productDeleteError.productId === productDeleteTarget?.product_conversation_id
+          ? { error: productDeleteError.message }
+          : {})}
+        onCancel={() => { setProductDeleteTarget(null); setProductDeleteError(null); }}
+      />
+      <RenameDialog
+        visible={productRenameTarget !== null}
+        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
+        error={productRenameError ?? undefined}
+        onRename={handleProductRename}
+        normalizeInput={(value) => value}
+        isValidName={(value) => value.trim().length > 0}
+        helpText="Enter a title"
+        maxLength={200}
+        onCancel={() => { setProductRenameTarget(null); setProductRenameError(undefined); }}
       />
       <RenameDialog
         visible={renameTarget !== null}

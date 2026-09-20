@@ -142,7 +142,7 @@ struct SettingsView: View {
                 isPresented: $confirmForgetPin, titleVisibility: .visible
             ) {
                 Button("Forget pin", role: .destructive) {
-                    CertPinStore.forget()
+                    model.forgetPinnedCertificate()
                     pinRefresh += 1
                 }
             }

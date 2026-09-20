@@ -55,7 +55,7 @@ enum ConversationState: Equatable {
     case awaitingUserResponse(questions: [UserQuestion])
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
-    case provisioning
+    case provisioning(jobId: String)
     case error(message: String, kind: ConversationErrorKind)
     case creationFailed(message: String)
     case contextExhausted(summary: String?)
@@ -109,7 +109,10 @@ enum ConversationState: Equatable {
             return .awaitingRecovery(
                 message: json["message"]?.stringValue ?? "Recovery in progress")
         case "provisioning":
-            return .provisioning
+            guard let jobId = json["job_id"]?.stringValue, !jobId.isEmpty else {
+                return .other(type: type)
+            }
+            return .provisioning(jobId: jobId)
         case "error":
             let errorKind = json["error_kind"]?.stringValue
                 .flatMap(ConversationErrorKind.init(rawValue:)) ?? .unknown
@@ -168,6 +171,11 @@ enum ConversationState: Equatable {
              .other, .unknown:
             return false
         }
+    }
+
+    var isProvisioningCreationShell: Bool {
+        if case .provisioning = self { return true }
+        return false
     }
 
     var isKnownWorkingState: Bool {

@@ -37,6 +37,7 @@ vi.mock('../utils', async () => {
 });
 
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
 describe('ConversationList — global navigation', () => {
   it('exposes a labeled Coordinator entry from the mobile list header', () => {
@@ -154,11 +155,109 @@ const makeProductConversation = (id: string, overrides: Partial<ProductConversat
     slug: `root-${id}`,
     title: `Root ${id}`,
   },
-  ordinary_lifecycle: 'open',
+  lifecycle: { state: 'open', close_action: { availability: 'available' } },
   latest_transcript_row_id: `latest-${id}`,
   updated_at: '2024-01-01T00:00:00Z',
   presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
   ...overrides,
+});
+
+describe('ProductConversation presentation indicator', () => {
+  it.each([
+    ['needs_action kind', makeProductConversation('needs-kind', { presentation: { kind: 'needs_action', display_name: 'Needs Kind' } }), 'Needs action', 'awaiting-approval'],
+    ['awaiting user response mode', makeProductConversation('awaiting-mode', { presentation: { kind: 'state', display_name: 'Awaiting', presentation_mode: 'needs_action' } }), 'Needs action', 'awaiting-approval'],
+    ['working mode', makeProductConversation('working-mode', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } }), 'Working', 'working'],
+    ['error mode', makeProductConversation('error-mode', { presentation: { kind: 'state', display_name: 'Error', presentation_mode: 'error' } }), 'Error', 'error'],
+    ['done mode', makeProductConversation('done-mode', { presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }), 'Completed', 'terminal'],
+    ['history idle', makeProductConversation('history-idle', { lifecycle: { state: 'history' }, presentation: { kind: 'state', display_name: 'History', presentation_mode: 'idle' } }), 'History', 'terminal'],
+  ])('%s maps to one authoritative indicator', (_name, row, label, dotClass) => {
+    expect(productConversationPresentationIndicator(row)).toEqual({ label, ariaLabel: label, dotClass });
+  });
+
+  it('renders one indicator element for a continued product conversation row', () => {
+    const row = makeProductConversation('continued-indicator', {
+      canonical_root: { transcript_row_id: 'root-row', slug: 'root-slug', title: 'Root Title' },
+      latest_transcript_row_id: 'latest-row',
+      presentation: { kind: 'state', display_name: 'Awaiting User', presentation_mode: 'needs_action' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[row]} />
+      </MemoryRouter>,
+    );
+
+    const rowNode = container.querySelector('[data-product-conversation-id="continued-indicator"]');
+    expect(rowNode).not.toBeNull();
+    expect(rowNode!.querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(rowNode as HTMLElement).getByLabelText('Needs action')).toBeInTheDocument();
+  });
+});
+
+describe('ProductConversation presentation transitions', () => {
+  it('rerenders working to needs action to done with exactly one indicator', () => {
+    const base = makeProductConversation('transition-row', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } });
+    const { container, rerender } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[base]} />
+      </MemoryRouter>,
+    );
+    const row = () => container.querySelector('[data-product-conversation-id="transition-row"]') as HTMLElement;
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Working')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Needs Action', presentation_mode: 'needs_action' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Needs action')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Completed')).toBeInTheDocument();
+  });
+});
+
+describe('ProductConversation row actions', () => {
+  it('exposes keyboard/touch accessible row actions without triggering row navigation', () => {
+    const row = makeProductConversation('actions-open', { canonical_root: { transcript_row_id: 'root-actions', slug: 'Action Product', title: 'Action Product' } });
+    const onOpen = vi.fn();
+    const onRename = vi.fn();
+    const onClose = vi.fn();
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[row]}
+          onProductConversationClick={onOpen}
+          onProductConversationRename={onRename}
+          onProductConversationClose={onClose}
+        />
+      </MemoryRouter>,
+    );
+
+    const rename = getByRole('button', { name: /Rename product conversation Action Product/ });
+    const close = getByRole('button', { name: /Close product conversation Action Product/ });
+    expect(rename).toBeInTheDocument();
+    expect(close).toBeInTheDocument();
+
+    rename.focus();
+    fireEvent.click(rename);
+    close.focus();
+    fireEvent.click(close);
+
+    expect(onRename).toHaveBeenCalledWith(row);
+    expect(onClose).toHaveBeenCalledWith(row);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
 });
 
 describe('ConversationRow — cached PR badge', () => {
@@ -316,7 +415,7 @@ describe('ConversationList — product conversations', () => {
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
     });
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' },
       presentation: { kind: 'state', display_name: 'Retained history', presentation_mode: 'done' },
     });
@@ -359,9 +458,38 @@ describe('ConversationList — product conversations', () => {
     expect(historyRow).not.toHaveTextContent('Retained history');
   });
 
+  it('uses server-authoritative Close availability without inferring from lifecycle or presentation', () => {
+    const close = vi.fn();
+    const blocked = makeProductConversation('pc-blocked', {
+      lifecycle: { state: 'open', close_action: { availability: 'unavailable', reason: 'awaiting_task_approval' } },
+      presentation: { kind: 'state', display_name: 'Blocked', presentation_mode: 'idle' },
+    });
+    const available = makeProductConversation('pc-available', {
+      lifecycle: { state: 'open', close_action: { availability: 'available' } },
+      presentation: { kind: 'needs_action', display_name: 'Needs action' },
+    });
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[blocked, available]}
+          onProductConversationClose={close}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(getByRole('button', {
+      name: /Close product conversation Root pc-blocked\. Resolve the pending task approval before closing/,
+    })).toBeDisabled();
+    fireEvent.click(getByRole('button', { name: 'Close product conversation Root pc-available' }));
+    expect(close).toHaveBeenCalledWith(available);
+  });
+
   it('renders History working directory from archived member rows', () => {
     const archived = makeProductConversation('pc-archived', {
-      ordinary_lifecycle: 'history',
+      lifecycle: { state: 'history' },
       latest_transcript_row_id: 'archived-member',
       canonical_root: { transcript_row_id: 'archived-member', slug: 'archived-root', title: 'Archived Root' },
     });

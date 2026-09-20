@@ -203,6 +203,36 @@ pub fn sse_stream(
     (headers, sse)
 }
 
+fn aggregate_broadcast_events(
+    broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    BroadcastStream::new(broadcast_rx)
+        .take_while(|result| match result {
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(
+                    lagged_by = n,
+                    "aggregate SSE broadcast lagged; closing stream so client reconnects and reconciles"
+                );
+                false
+            }
+            _ => true,
+        })
+        .filter_map(|result| match result {
+            Ok(event) => Some(Ok(sse_event_to_axum(event))),
+            Err(_) => None,
+        })
+}
+
+pub(crate) fn aggregate_event_stream(
+    broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
+) -> impl IntoResponse {
+    let sse =
+        Sse::new(aggregate_broadcast_events(broadcast_rx)).keep_alive(conversation_keep_alive());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    (headers, sse)
+}
+
 fn sse_event_to_axum(event: SseEvent) -> Event {
     let wire: SseWireEvent = event.into();
     let event_type = wire.event_type();
@@ -403,10 +433,12 @@ mod tests {
             SseEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             } => json!({
                 "type": "conversation_hard_deleted",
                 "sequence_id": sequence_id,
                 "conversation_id": conversation_id,
+                "deleted_conversation_ids": deleted_conversation_ids,
             }),
             SseEvent::BrowserSessionState {
                 sequence_id,
@@ -1007,7 +1039,8 @@ mod tests {
     fn parity_conversation_hard_deleted() {
         let event = SseEvent::ConversationHardDeleted {
             sequence_id: 21,
-            conversation_id: "conv-1".to_string(),
+            conversation_id: "product-1".to_string(),
+            deleted_conversation_ids: vec!["conv-1".to_string(), "conv-2".to_string()],
         };
         assert_parity(&event);
     }
@@ -1368,6 +1401,21 @@ mod tests {
         assert_eq!(typed["pending_anchor_sequence_id"], 5);
         assert_eq!(typed["pending_truncated"], false);
         assert!(typed["pending_events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_broadcast_lag_terminates_stream() {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let event = || SseEvent::ConversationHardDeleted {
+            sequence_id: 1,
+            conversation_id: "aggregate".to_string(),
+            deleted_conversation_ids: Vec::new(),
+        };
+        tx.send(event()).unwrap();
+        tx.send(event()).unwrap();
+
+        let mut stream = Box::pin(aggregate_broadcast_events(rx));
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

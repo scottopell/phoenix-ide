@@ -12,6 +12,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// additive-optional: legacy `/api/conversations` rows omit it; nil means
     /// the transcript-row id is the only available identity.
     var product_conversation_id: String?
+    var chain_root_id: String?
     var slug: String?
     var title: String?
     var model: String?
@@ -24,6 +25,8 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var branch_name: String?
     var task_title: String?
     var archived: Bool?
+    // Additive optional for pre-aggregate persisted list/session caches (REQ-IOS-014).
+    var product_close_action: ProductConversationCloseAction?
     var project_name: String?
     var conv_mode_label: String?
     /// Server-derived display mode: idle | working | needs_action | error |
@@ -91,7 +94,7 @@ struct ProductConversationListRow: Codable, Equatable, Sendable {
     var product_conversation_id: String
     var canonical_route: String
     var canonical_root: ProductConversationTranscriptRow
-    var ordinary_lifecycle: ProductConversationOrdinaryLifecycle
+    var lifecycle: ProductConversationLifecycle
     var latest_transcript_row_id: String
     var updated_at: String
     var presentation: ProductConversationPresentation
@@ -125,6 +128,71 @@ struct ProductConversationTranscriptRow: Codable, Equatable, Sendable {
 enum ProductConversationOrdinaryLifecycle: String, Codable, Equatable, Sendable {
     case open
     case history
+}
+
+enum ProductConversationLifecycle: Codable, Equatable, Sendable {
+    case open(closeAction: ProductConversationCloseAction)
+    case history
+
+    private enum CodingKeys: String, CodingKey { case state, close_action }
+    private enum State: String, Codable { case open, history }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(State.self, forKey: .state) {
+        case .open:
+            self = .open(closeAction: try container.decode(ProductConversationCloseAction.self, forKey: .close_action))
+        case .history:
+            self = .history
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .open(let closeAction):
+            try container.encode(State.open, forKey: .state)
+            try container.encode(closeAction, forKey: .close_action)
+        case .history:
+            try container.encode(State.history, forKey: .state)
+        }
+    }
+}
+
+enum ProductConversationCloseAction: Codable, Equatable, Hashable, Sendable {
+    case available
+    case unavailable(reason: ProductConversationCloseUnavailableReason)
+
+    private enum CodingKeys: String, CodingKey { case availability, reason }
+    private enum Availability: String, Codable { case available, unavailable }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Availability.self, forKey: .availability) {
+        case .available:
+            self = .available
+        case .unavailable:
+            self = .unavailable(reason: try container.decode(ProductConversationCloseUnavailableReason.self, forKey: .reason))
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .available:
+            try container.encode(Availability.available, forKey: .availability)
+        case .unavailable(let reason):
+            try container.encode(Availability.unavailable, forKey: .availability)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+}
+
+enum ProductConversationCloseUnavailableReason: String, Codable, Equatable, Hashable, Sendable {
+    case active_close_attempt
+    case awaiting_task_approval
+    case awaiting_continuation
+    case handed_off_without_continuation
 }
 
 enum ProductConversationPresentation: Codable, Equatable, Sendable {

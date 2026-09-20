@@ -37,7 +37,11 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{require_hard_delete_admission, run_hard_delete_cascade, AppError};
+use super::handlers::{
+    broadcast_aggregate_hard_deleted, finalize_hard_deleted_conversation_resources,
+    prepare_hard_delete_cascade, reopen_prepared_hard_delete, require_hard_delete_admission,
+    AppError, PreparedHardDelete,
+};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
@@ -49,7 +53,7 @@ use crate::state_machine::ConvState;
 /// — short enough that the value comfortably fits as a sidebar label and the
 /// chain page header without truncation, long enough that a reasonable label
 /// like "auth refactor — staged migration" is not rejected.
-const CHAIN_NAME_MAX_CHARS: usize = 200;
+pub(super) const CHAIN_NAME_MAX_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Response/request shapes
@@ -68,13 +72,10 @@ const CHAIN_NAME_MAX_CHARS: usize = 200;
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ChainView {
     pub root_conv_id: String,
+    pub product_conversation_id: String,
     pub chain_name: Option<String>,
     pub display_name: String,
-    /// `true` when the chain is archived. Chain archive is a write-cascade
-    /// across all members, so any member's `archived` flag is authoritative;
-    /// we read it off the root for clarity. Archive is a terminal lifecycle
-    /// transition — archived chain roots 404 on the chain route, so the UI
-    /// has no unarchive affordance.
+    /// `true` when the owning `ProductConversation` is in History.
     pub archived: bool,
     pub members: Vec<ChainMemberSummary>,
     pub qa_history: Vec<ChainQaRow>,
@@ -214,7 +215,10 @@ pub async fn submit_chain_question(
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
 }
 
-/// `PATCH /api/chains/:rootId/name`
+/// Compatibility route for `PATCH /api/chains/:rootId/name`.
+///
+/// Non-empty names set the compatibility override without replacing the root title. A null or
+/// whitespace-only name clears that override so the original title fallback applies.
 pub async fn set_chain_name(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -228,14 +232,19 @@ pub async fn set_chain_name(
     // to a single state rather than persisting invisible names.
     let normalized = normalize_chain_name(req.name.as_deref())?;
 
-    state
-        .db
-        .set_chain_name(&root_id, normalized.as_deref())
-        .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+    if let Some(title) = normalized.as_deref() {
+        state
+            .db
+            .set_ordinary_product_conversation_legacy_title(&root_id, title)
+            .await
+            .map_err(db_to_app)?;
+    } else {
+        state
+            .db
+            .clear_ordinary_product_conversation_legacy_title(&root_id)
+            .await
+            .map_err(db_to_app)?;
+    }
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
@@ -244,10 +253,9 @@ pub async fn set_chain_name(
 /// `POST /api/chains/:rootId/regenerate-name` (REQ-CHN-010).
 ///
 /// Derives a prose display name by summarizing the first user message of each
-/// chain member (in chain order) via a cheap LLM, then persists it as the
-/// chain's `chain_name` override on the root — the same write path the typed
-/// PATCH uses. Takes no request body; the chain root id in the path is the only
-/// input.
+/// chain member (in chain order) via a cheap LLM, then updates the
+/// `ProductConversation` root title through the same authority as the typed PATCH.
+/// Takes no request body; the chain root id in the path is the only input.
 ///
 /// Status choices:
 /// - `<2` members or non-root: 404 via [`validate_chain_root`], matching every
@@ -337,12 +345,14 @@ pub async fn regenerate_chain_name(
 
     state
         .db
-        .set_chain_name(&root_id, normalized.as_deref())
+        .set_ordinary_product_conversation_title(
+            &root_id,
+            normalized
+                .as_deref()
+                .expect("empty generated name rejected"),
+        )
         .await
-        .map_err(|e| match e {
-            DbError::ConversationNotFound(_) => AppError::NotFound(format!("chain {root_id}")),
-            other => AppError::Internal(other.to_string()),
-        })?;
+        .map_err(db_to_app)?;
 
     let view = build_chain_view(&state, &root_id).await?;
     Ok(Json(view))
@@ -400,6 +410,33 @@ pub async fn archive_chain_handler(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+async fn aggregate_is_absent_after_delete_serialization(
+    state: &AppState,
+    root_id: &str,
+) -> Result<bool, AppError> {
+    Ok(validate_aggregate_delete_root(state, root_id)
+        .await?
+        .is_none())
+}
+
+async fn lock_aggregate_admissions(
+    state: &AppState,
+    product_conversation_id: &str,
+    member_ids: &[String],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut sorted_keys = member_ids.to_vec();
+    sorted_keys.push(product_conversation_id.to_string());
+    sorted_keys.sort();
+    sorted_keys.dedup();
+    let mut guards = Vec::with_capacity(sorted_keys.len());
+    for key in sorted_keys {
+        let admission: Arc<tokio::sync::Mutex<()>> =
+            state.runtime.conversation_admission(&key).await;
+        guards.push(admission.lock_owned().await);
+    }
+    guards
+}
+
 async fn lock_chain_admissions(
     state: &AppState,
     root_id: &str,
@@ -410,49 +447,14 @@ async fn lock_chain_admissions(
         .get_conversation(root_id)
         .await
         .map_err(db_to_app)?;
-    let mut sorted_keys = member_ids.to_vec();
-    sorted_keys.push(root.product_conversation_id.to_string());
-    sorted_keys.sort();
-    sorted_keys.dedup();
-    let mut guards = Vec::with_capacity(sorted_keys.len());
-    for key in sorted_keys {
-        let admission: Arc<tokio::sync::Mutex<()>> =
-            state.runtime.conversation_admission(&key).await;
-        guards.push(admission.lock_owned().await);
-    }
-    Ok(guards)
+    Ok(lock_aggregate_admissions(state, root.product_conversation_id.as_str(), member_ids).await)
 }
 
-/// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
-///
-/// Acquires every member's admission guard, then admits the aggregate exactly
-/// once through its root. Only History chains proceed to preflight and cleanup.
-/// Pre-checks every member's busy state up front and refuses the whole
-/// operation if any member is busy (atomic refuse — no partial wipe).
-/// Iterates root-first so the existing FK on `continued_in_conv_id`
-/// (`NO ACTION`) does not reject the row delete: the root has no
-/// incoming reference, and removing it frees its successor to be
-/// deleted next. Reuses [`run_hard_delete_cascade`] per-member so
-/// bash / tmux / worktree cleanup runs identically to the per-
-/// conversation path.
-pub async fn delete_chain_handler(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-
-    let member_ids = state
-        .db
-        .chain_members_forward(&root_id)
-        .await
-        .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
-    require_hard_delete_admission(&state, &root_id).await?;
-    for id in &member_ids {
-        super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
-    }
-
-    for id in &member_ids {
+async fn refuse_busy_chain_members(
+    state: &AppState,
+    member_ids: &[String],
+) -> Result<(), AppError> {
+    for id in member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
         if chain_member_blocks_cascade(&conv.state) {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -464,6 +466,42 @@ pub async fn delete_chain_handler(
             ))));
         }
     }
+    Ok(())
+}
+
+/// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
+///
+/// Acquires every member's admission guard, then admits the aggregate exactly
+/// once through its root. Only History chains proceed to preflight and cleanup.
+/// Pre-checks every member's busy state up front and refuses the whole
+/// operation if any member is busy (atomic refuse — no partial wipe).
+/// External cleanup runs for every member before any conversation row is
+/// removed. The rows are then deleted root-first in one immediate transaction
+/// so any member failure rolls the whole aggregate back.
+pub async fn delete_chain_handler(
+    State(state): State<AppState>,
+    Path(root_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
+        return Ok(Json(SuccessResponse { success: true }));
+    };
+    let product_conversation_id = root.product_conversation_id.to_string();
+    let member_ids = state
+        .db
+        .product_conversation_member_ids(&root_id)
+        .await
+        .map_err(db_to_app)?;
+    let _admission_guards =
+        lock_aggregate_admissions(&state, root.product_conversation_id.as_str(), &member_ids).await;
+    if aggregate_is_absent_after_delete_serialization(&state, &root_id).await? {
+        return Ok(Json(SuccessResponse { success: true }));
+    }
+    require_hard_delete_admission(&state, &root_id).await?;
+    for id in &member_ids {
+        super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
+    }
+
+    refuse_busy_chain_members(&state, &member_ids).await?;
     let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo
@@ -478,9 +516,64 @@ pub async fn delete_chain_handler(
         }
     }
 
+    let deleting_conversation_ids = member_ids.iter().cloned().collect();
+    let mut prepared = Vec::with_capacity(member_ids.len());
     for id in &member_ids {
-        run_hard_delete_cascade(&state, id).await?;
+        match prepare_hard_delete_cascade(&state, id, &deleting_conversation_ids).await {
+            Ok(member) => prepared.push(member),
+            Err(error) => {
+                for member in &prepared {
+                    reopen_prepared_hard_delete(&state, member).await;
+                }
+                return Err(error);
+            }
+        }
     }
+
+    if prepared
+        .iter()
+        .any(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        for member in &prepared {
+            reopen_prepared_hard_delete(&state, member).await;
+        }
+        return Err(AppError::Internal(
+            "chain member entered creation cleanup during aggregate deletion".to_string(),
+        ));
+    }
+
+    match state
+        .db
+        .delete_conversations_atomically_with_authority(&member_ids)
+        .await
+    {
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+            for member in &prepared {
+                reopen_prepared_hard_delete(&state, member).await;
+            }
+            return Err(AppError::Internal(format!(
+                "Failed to delete chain conversation rows: {error}"
+            )));
+        }
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+            state
+                .runtime
+                .signal_fatal_local_authority("aggregate_hard_delete_commit");
+            return Err(AppError::Internal(
+                "aggregate deletion lost local commit authority".to_string(),
+            ));
+        }
+    }
+
+    let conversations = prepared
+        .into_iter()
+        .filter_map(PreparedHardDelete::release_authority)
+        .collect::<Vec<_>>();
+    for conversation in &conversations {
+        finalize_hard_deleted_conversation_resources(&state, conversation).await;
+    }
+    broadcast_aggregate_hard_deleted(&state, &root_id, &product_conversation_id, member_ids).await;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -558,6 +651,24 @@ pub async fn stream_chain(
 ///
 /// Mirrors the check in `ChainQa::prepare_invocation` so failures are
 /// surfaced as 404 here instead of bubbling up as 500 from the Q&A backend.
+async fn validate_aggregate_delete_root(
+    state: &AppState,
+    root_id: &str,
+) -> Result<Option<Conversation>, AppError> {
+    let root = match state.db.get_conversation(root_id).await {
+        Ok(root) => root,
+        Err(DbError::ConversationNotFound(_)) => return Ok(None),
+        Err(error) => return Err(db_to_app(error)),
+    };
+    let canonical_root = state.db.chain_root_of(root_id).await.map_err(db_to_app)?;
+    if canonical_root.as_deref() != Some(root_id) || !root.user_initiated {
+        return Err(AppError::NotFound(format!(
+            "no ProductConversation rooted at {root_id}"
+        )));
+    }
+    Ok(Some(root))
+}
+
 async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppError> {
     if let Some(coordinator_id) = state
         .db
@@ -608,6 +719,12 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         .ok_or_else(|| AppError::Internal("chain validation passed but members empty".to_string()))?
         .clone();
 
+    let product_conversation = state
+        .db
+        .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+
     let qa_history = state
         .chain_qa
         .list_history(root_id)
@@ -623,9 +740,11 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
 
     Ok(ChainView {
         root_conv_id: root_conv.id.clone(),
+        product_conversation_id: root_conv.product_conversation_id.to_string(),
         chain_name: root_conv.chain_name.clone(),
         display_name,
-        archived: root_conv.archived,
+        archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
         members: summaries,
         qa_history,
         current_member_count,
@@ -725,6 +844,21 @@ fn resolve_display_name(root: &Conversation) -> String {
 fn db_to_app(e: DbError) -> AppError {
     match e {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!("ProductConversation {id} is read-only in History"),
+                "product_conversation_not_open",
+            )))
+        }
+        DbError::CloseAdmissionFenced(fence) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!(
+                    "ProductConversation {} has an active Close attempt {} in phase {:?}",
+                    fence.product_conversation_id, fence.attempt_id, fence.phase
+                ),
+                "close_admission_fenced",
+            )))
+        }
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -870,6 +1004,10 @@ mod tests {
             members.push(db.get_conversation(id).await.map_err(db_to_app)?);
         }
         let root_conv = members.first().unwrap().clone();
+        let product_conversation = db
+            .get_ordinary_product_conversation(&root_conv.product_conversation_id)
+            .await
+            .map_err(db_to_app)?;
         let qa_history = chain_qa
             .list_history(root_id)
             .await
@@ -881,9 +1019,11 @@ mod tests {
         let work_identity = resolve_work_identity(&members);
         Ok(ChainView {
             root_conv_id: root_conv.id.clone(),
+            product_conversation_id: root_conv.product_conversation_id.to_string(),
             chain_name: root_conv.chain_name.clone(),
             display_name,
-            archived: root_conv.archived,
+            archived: product_conversation.product_conversation.ordinary_lifecycle()
+            == Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History),
             members: summaries,
             qa_history,
             current_member_count,
@@ -954,6 +1094,31 @@ mod tests {
         assert_eq!(view.current_member_count, 3);
         assert_eq!(view.current_total_messages, 3);
         assert!(view.qa_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_view_uses_product_lifecycle_when_legacy_archived_bit_drifts() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["history-a", "history-b"]).await;
+        let root = db.get_conversation("history-a").await.unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(db.fts_retriever()),
+        );
+        let view = build_view_for_test(&db, &chain_qa, "history-a")
+            .await
+            .unwrap();
+
+        assert!(view.archived);
     }
 
     /// REQ-CHN-008: the work identity is resolved from the chain's

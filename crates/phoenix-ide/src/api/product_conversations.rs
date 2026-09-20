@@ -12,11 +12,13 @@ use tracing::Instrument;
 use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseActionView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationClosePhaseView,
+    ProductConversationCloseResidualView, ProductConversationCloseUnavailableReasonView,
     ProductConversationCloseView, ProductConversationCreationAllowedActionView,
     ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
-    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationHandoffView, ProductConversationLifecycleView,
+    ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
@@ -24,9 +26,11 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{
-    DbError, ProductConversationAggregate, ProductConversationHandoff,
-    ProductConversationListProjection, ProductConversationSegment,
-    ProductConversationSegmentCeiling, ProductConversationSource, ProductConversationSourceKind,
+    CloseProjection, DbError, ProductConversationAggregate, ProductConversationCloseAvailability,
+    ProductConversationCloseUnavailableReason, ProductConversationHandoff,
+    ProductConversationListLifecycle, ProductConversationListProjection,
+    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSource,
+    ProductConversationSourceKind,
 };
 use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
@@ -39,6 +43,83 @@ pub struct SnapshotQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
     pub open_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameProductConversationRequest {
+    pub title: String,
+}
+
+fn should_retry_aggregate_close(attempt: usize, error_type: &str) -> bool {
+    attempt == 0
+        && matches!(
+            error_type,
+            "inactive_close_transcript" | "stale_latest_close_transcript"
+        )
+}
+
+pub async fn close_product_conversation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<super::types::SuccessResponse>, AppError> {
+    for attempt in 0..2 {
+        let product_conversation = state
+            .db
+            .read_ordinary_product_conversation_snapshot(&reference, None, None, 1)
+            .await
+            .map_err(db_to_app)?
+            .aggregate;
+        match crate::api::lifecycle_handlers::close_product_conversation_with_active_work(
+            &state,
+            &product_conversation.latest_transcript_row_id,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(AppError::Conflict(conflict))
+                if should_retry_aggregate_close(attempt, &conflict.error_type) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(super::types::SuccessResponse { success: true }))
+}
+
+pub async fn rename_product_conversation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(req): Json<RenameProductConversationRequest>,
+) -> Result<Json<ProductConversationListRow>, AppError> {
+    let title = normalize_product_conversation_title(&req.title)?;
+    let product_conversation_id = state
+        .db
+        .set_ordinary_product_conversation_title(&reference, &title)
+        .await
+        .map_err(db_to_app)?;
+    let projection = state
+        .db
+        .list_ordinary_product_conversation_projections()
+        .await
+        .map_err(db_to_app)?
+        .into_iter()
+        .find(|projection| projection.product_conversation_id == product_conversation_id)
+        .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
+    Ok(Json(list_row(&projection)))
+}
+
+fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
+    let normalized = title.trim();
+    if normalized.is_empty() {
+        return Err(AppError::BadRequest(
+            "Product conversation title cannot be empty".to_string(),
+        ));
+    }
+    if normalized.chars().count() > super::chains::CHAIN_NAME_MAX_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "Product conversation title must be at most {} characters",
+            super::chains::CHAIN_NAME_MAX_CHARS,
+        )));
+    }
+    Ok(normalized.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -173,6 +254,7 @@ pub async fn get_product_conversation(
             snapshot_view(
                 &state,
                 snapshot.aggregate,
+                snapshot.close,
                 snapshot.requested_transcript_row_id,
                 cursor,
                 message_limit,
@@ -269,7 +351,14 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
             slug: projection.root_slug.clone(),
             title: projection.root_title.clone(),
         },
-        ordinary_lifecycle: lifecycle_view(projection.lifecycle),
+        lifecycle: match projection.lifecycle {
+            ProductConversationListLifecycle::Open { close_availability } => {
+                ProductConversationLifecycleView::Open {
+                    close_action: close_action_view(close_availability),
+                }
+            }
+            ProductConversationListLifecycle::History => ProductConversationLifecycleView::History,
+        },
         latest_transcript_row_id: projection.latest_transcript_row_id.clone(),
         updated_at: projection.updated_at.to_rfc3339(),
         presentation: presentation(
@@ -282,9 +371,37 @@ fn list_row(projection: &ProductConversationListProjection) -> ProductConversati
     }
 }
 
+fn close_action_view(
+    availability: ProductConversationCloseAvailability,
+) -> ProductConversationCloseActionView {
+    match availability {
+        ProductConversationCloseAvailability::Available => {
+            ProductConversationCloseActionView::Available
+        }
+        ProductConversationCloseAvailability::Unavailable(reason) => {
+            let reason = match reason {
+                ProductConversationCloseUnavailableReason::ActiveCloseAttempt => {
+                    ProductConversationCloseUnavailableReasonView::ActiveCloseAttempt
+                }
+                ProductConversationCloseUnavailableReason::AwaitingTaskApproval => {
+                    ProductConversationCloseUnavailableReasonView::AwaitingTaskApproval
+                }
+                ProductConversationCloseUnavailableReason::AwaitingContinuation => {
+                    ProductConversationCloseUnavailableReasonView::AwaitingContinuation
+                }
+                ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation => {
+                    ProductConversationCloseUnavailableReasonView::HandedOffWithoutContinuation
+                }
+            };
+            ProductConversationCloseActionView::Unavailable { reason }
+        }
+    }
+}
+
 async fn snapshot_view(
     state: &AppState,
     mut aggregate: ProductConversationAggregate,
+    close: Option<CloseProjection>,
     requested_transcript_row_id: String,
     cursor: Option<AggregateCursor>,
     message_limit: usize,
@@ -294,12 +411,8 @@ async fn snapshot_view(
         .product_conversation
         .ordinary_lifecycle()
         .expect("ordinary aggregate read returned Coordinator");
-    let close = state
-        .db
-        .get_active_close_projection_for_product(aggregate.product_conversation.id())
-        .await
-        .map_err(db_to_app)?
-        .map(close_view);
+    let writable = close.is_none();
+    let close = close.map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -319,6 +432,12 @@ async fn snapshot_view(
         None => None,
     };
     let root_id = aggregate.root.conversation.id.clone();
+    let root_title = aggregate
+        .root
+        .conversation
+        .chain_name
+        .as_deref()
+        .or(aggregate.root.conversation.title.as_deref());
     let latest_id = aggregate.latest_transcript_row_id.clone();
     let segments = aggregate
         .segments
@@ -331,13 +450,21 @@ async fn snapshot_view(
         close,
 
         requested_transcript_row_id,
-        canonical_root: transcript_row_view(&aggregate.root),
+        canonical_root: ProductConversationTranscriptRowView {
+            transcript_row_id: aggregate.root.conversation.id.clone(),
+            slug: aggregate.root.conversation.slug.clone(),
+            title: root_title.map(str::to_owned),
+        },
         ordinary_lifecycle: lifecycle_view(lifecycle),
         latest_transcript_row_id: latest_id.clone(),
-        writable_transcript_row_id: writable_transcript_row_id(state, lifecycle, &aggregate).await,
+        writable_transcript_row_id: if writable {
+            writable_transcript_row_id(lifecycle, &aggregate)
+        } else {
+            None
+        },
         updated_at: aggregate.updated_at.to_rfc3339(),
         presentation: presentation(
-            aggregate.root.conversation.title.as_deref(),
+            root_title,
             aggregate.root.conversation.slug.as_deref(),
             &aggregate
                 .segments
@@ -506,16 +633,6 @@ fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHand
     }
 }
 
-fn transcript_row_view(
-    row: &crate::db::ProductConversationTranscriptRow,
-) -> ProductConversationTranscriptRowView {
-    ProductConversationTranscriptRowView {
-        transcript_row_id: row.conversation.id.clone(),
-        slug: row.conversation.slug.clone(),
-        title: row.conversation.title.clone(),
-    }
-}
-
 fn presentation(
     root_title: Option<&str>,
     root_slug: Option<&str>,
@@ -613,26 +730,15 @@ fn aggregate_segment_ceilings(
         .collect()
 }
 
-async fn writable_transcript_row_id(
-    state: &AppState,
+fn writable_transcript_row_id(
     lifecycle: OrdinaryProductConversationLifecycle,
     aggregate: &ProductConversationAggregate,
 ) -> Option<String> {
     if lifecycle != OrdinaryProductConversationLifecycle::Open {
         return None;
     }
-    let latest = aggregate
-        .segments
-        .last()?
-        .transcript_row
-        .conversation
-        .clone();
-    let effective_state = state
-        .runtime
-        .effective_conversation_state(&latest.id)
-        .await
-        .unwrap_or(latest.state);
-    accepts_user_message_direct_or_steering(&effective_state).then_some(latest.id)
+    let latest = &aggregate.segments.last()?.transcript_row.conversation;
+    accepts_user_message_direct_or_steering(&latest.state).then(|| latest.id.clone())
 }
 
 fn validate_cursor(
@@ -775,6 +881,21 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!("ProductConversation {id} is read-only in History"),
+                "product_conversation_not_open",
+            )))
+        }
+        DbError::CloseAdmissionFenced(fence) => {
+            AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+                format!(
+                    "ProductConversation {} has an active Close attempt {} in phase {:?}",
+                    fence.product_conversation_id, fence.attempt_id, fence.phase
+                ),
+                "close_admission_fenced",
+            )))
+        }
         error => AppError::Internal(error.to_string()),
     }
 }
@@ -873,7 +994,15 @@ mod tests {
             .iter()
             .find(|row| row["latest_transcript_row_id"] == reference)
             .unwrap();
-        assert_eq!(listed["ordinary_lifecycle"], expected);
+        assert_eq!(listed["lifecycle"]["state"], expected);
+        if expected == "open" {
+            assert_eq!(
+                listed["lifecycle"]["close_action"]["availability"],
+                "available"
+            );
+        } else {
+            assert!(listed["lifecycle"].get("close_action").is_none());
+        }
 
         let snapshot = create_router(state.clone())
             .oneshot(
@@ -1063,6 +1192,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_renames_product_conversation_title_without_changing_slug() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("pc-rename-root", "original-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let _successor =
+            create_completed_continuation(&state, &root, "rename-handoff", "rename-opening").await;
+        sqlx::query("UPDATE conversations SET chain_name = 'Legacy Chain Name' WHERE id = ?1")
+            .bind(&root.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/product-conversations/pc-rename-root/title")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Renamed Product Conversation"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["canonical_root"]["title"],
+            "Renamed Product Conversation"
+        );
+        assert_eq!(body["canonical_root"]["slug"], "original-slug");
+        assert_eq!(
+            body["presentation"]["display_name"],
+            "Renamed Product Conversation"
+        );
+
+        let root_after = state.db.get_conversation(&root.id).await.unwrap();
+        assert_eq!(
+            root_after.title.as_deref(),
+            Some("Renamed Product Conversation")
+        );
+        assert_eq!(root_after.slug.as_deref(), Some("original-slug"));
+        assert_eq!(root_after.chain_name, None);
+
+        let legacy_chain = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chains/pc-rename-root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_chain.status(), StatusCode::OK);
+        let legacy_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(legacy_chain.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_body["chain_name"], serde_json::Value::Null);
+        assert_eq!(legacy_body["display_name"], "Renamed Product Conversation");
+    }
+
+    #[test]
+    fn aggregate_close_retries_only_once_for_stale_latest_conflicts() {
+        assert!(should_retry_aggregate_close(0, "inactive_close_transcript"));
+        assert!(should_retry_aggregate_close(
+            0,
+            "stale_latest_close_transcript"
+        ));
+        assert!(!should_retry_aggregate_close(
+            1,
+            "stale_latest_close_transcript"
+        ));
+        assert!(!should_retry_aggregate_close(0, "close_start_failed"));
+    }
+
+    #[tokio::test]
+    async fn router_rejects_overlong_product_conversation_title() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("pc-long-title", "pc-long-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let title = "x".repeat(super::super::chains::CHAIN_NAME_MAX_CHARS + 1);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/product-conversations/{}/title",
+                        root.product_conversation_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "title": title }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn router_lists_one_ordinary_row_and_resolves_member_snapshot() {
         let state = make_test_state().await;
         let root = state
@@ -1143,7 +1384,7 @@ mod tests {
             .all(
                 |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
             ));
-        assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
+        assert!(snapshot["writable_transcript_row_id"].is_null());
         assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
         assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
     }
@@ -1370,6 +1611,43 @@ mod tests {
                     .unwrap();
             assert_eq!(snapshot["canonical_route"], expected_route);
         }
+    }
+
+    #[tokio::test]
+    async fn rename_history_returns_typed_conflict() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("history-title", "history-title", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/product-conversations/{}/title",
+                        root.product_conversation_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Changed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error_type"], "product_conversation_not_open");
     }
 
     #[tokio::test]
@@ -1827,6 +2105,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(appended_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_refuses_product_title_rename_for_excluded_references() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("ordinary-root", "ordinary-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let subagent = state
+            .db
+            .create_subagent_conversation(
+                "sub-title-denied",
+                "sub-title-denied",
+                "/tmp",
+                &root.id,
+                "model",
+                &root.conv_mode,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                root.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let absent = "absent-title-denied".to_string();
+        for reference in [&subagent.id, &coordinator.id, &absent] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/product-conversations/{reference}/title"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"title":"Denied"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
