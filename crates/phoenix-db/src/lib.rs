@@ -4478,6 +4478,27 @@ impl Database {
         .transpose()
     }
 
+    /// Returns the reserved opening intent for a continuation successor.
+    ///
+    /// # Errors
+    /// Returns a database error when the query fails.
+    pub async fn continuation_dispatch_intent_for_successor(
+        &self,
+        successor_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        let parent_id: Option<String> = sqlx::query_scalar(
+            "SELECT parent_conversation_id FROM continuation_dispatch_intents
+             WHERE successor_conversation_id = ?1",
+        )
+        .bind(successor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match parent_id {
+            Some(parent_id) => self.continuation_dispatch_intent(&parent_id).await,
+            None => Ok(None),
+        }
+    }
+
     /// Deletes a continuation intent after its message is durably represented elsewhere.
     ///
     /// # Errors

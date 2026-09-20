@@ -318,6 +318,35 @@ impl SendChatApplicationService {
             .is_reserved_continuation_opening(&conversation.id, req.message_id.as_str())
             .await
             .map_err(|error| map_db_internal_error(&error))?;
+        if reserved_opening {
+            let Some(intent) = self
+                .db
+                .continuation_dispatch_intent_for_successor(&conversation.id)
+                .await
+                .map_err(|error| map_db_internal_error(&error))?
+            else {
+                return Err(SendChatServiceError::Internal(
+                    "reserved continuation opening intent disappeared".to_string(),
+                ));
+            };
+            let submitted_authority = match req.expansion_policy {
+                MessageExpansionPolicy::GeneratedPredecessorContext => {
+                    phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+                }
+                MessageExpansionPolicy::ExpandReferences | MessageExpansionPolicy::LiteralText => {
+                    phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction
+                }
+            };
+            if intent.handoff != req.text
+                || intent.opening_authority != submitted_authority
+                || intent.user_agent != req.user_agent
+            {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "reserved continuation opening payload does not match".to_string(),
+                    code: "continuation_opening_mismatch",
+                });
+            }
+        }
         if !reserved_opening
             && self
                 .db
