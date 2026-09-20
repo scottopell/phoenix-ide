@@ -61,6 +61,7 @@ AND SHALL map `gpt-5.4-mini` to `gpt-5.6-luna`
 AND SHALL require the mapped replacement to be available instead of falling back to the deployment default
 
 THE SYSTEM SHALL preserve the original model identity on historical turns and requests or runtimes whose model was already resolved
+AND SHALL NOT use catalog family or version ordering to infer orchestration qualification for an unlisted model
 
 **Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative.
 

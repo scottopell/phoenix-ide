@@ -12,10 +12,12 @@ when such requests are received. Top-level Explore always exposes `spawn_agents`
 process-wide sandbox support gates only whether Explore parents and spawned
 Explore sub-agents receive sandboxed bash. Without sandbox support, delegation
 still works with read/browser/submit tools and no bash. Work, Branch, and Direct
-parents can spawn either, with at
-most one Work sub-agent active at a time per parent (and per
-`spawn_agents` call). When the parent owns a worktree (Work or Branch
-mode), a Work sub-agent's effective cwd — including any `task.cwd`
+parents can spawn either. The normative target qualifies the parent's resolved
+model by exact identifier: Sol, Terra, and Astra may admit parallel Work children;
+Luna and every unlisted model remain sequential. Child execution choices do not
+change that decision. Admitted Work children intentionally share the parent's
+exact `WorkScope` as trusted collaborators. When the parent owns a worktree (Work
+or Branch mode), a Work sub-agent's effective cwd — including any `task.cwd`
 override — must stay inside that worktree; a Work sub-agent spawned
 from a Direct parent has no worktree to scope against, matching
 Direct's unscoped write semantics. Results are submitted via dedicated
@@ -31,18 +33,19 @@ only the architectural seams.
 
 - **State machine** lives in bedrock: `executing_tools` accumulates
   `pending_sub_agents`; the parent transitions to `awaiting_sub_agents`
-  when all tools complete; fan-in uses a bounded buffer (capacity = the
-  spawn batch size) for results that arrive before the parent enters the
-  await state. Cancellation flows through `cancelling_sub_agents` and
-  back to idle.
+  when all tools complete. The normative target atomically admits complete
+  batches, durably tracks each admitted child, removes the exact pending identity
+  on terminal acceptance, and makes duplicate acceptance idempotent. Cancellation
+  includes admitted children that have not started; ordinary settlement waits for
+  complete fan-in.
 - **Sub-agent terminal states** are `completed { result }` and
   `failed { error, error_kind }`. The `submit_result` / `submit_error`
   tools must be the sole tool in their LLM response; the transition
   function enforces this structurally.
 - **Spawn-layer** (`tools/subagent.rs` + `runtime/executor.rs::
   handle_spawn_agents_tool`) validates the call, applies defaults
-  (mode, model, max_turns, cwd, timeout), enforces the one-writer +
-  cwd-scoping invariants, then hands each task to
+  (mode, model, max_turns, cwd, timeout), enforces exact parent-model
+  qualification plus cwd scoping, then hands each task to
   `RuntimeManager::handle_spawn_request`. `runtime.rs` derives the
   sub-agent's `ConvMode` from the parent's mode and selects the
   per-mode tool registry (`for_subagent_explore` /
@@ -75,11 +78,11 @@ only the architectural seams.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Mode/model/max-turns wired; max 10 tasks per call |
+| **REQ-SA-001:** Parallel Task Execution | 🚧 Partial | Existing Explore parallelism and bounds are live; atomic qualified Work batch admission is normative but not implemented |
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
-| **REQ-SA-003:** Result Submission | ✅ Complete | `submit_result` / `submit_error`; terminal-tool-must-be-sole enforced structurally |
-| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer; conservation invariant tested in proptests |
-| **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `cancelling_sub_agents` state, propagates `UserCancel`; missing-runtime synthesises failure |
+| **REQ-SA-003:** Result Submission | 🚧 Partial | Terminal tools are live; durable parent-identity delivery and idempotent acceptance remain to be implemented |
+| **REQ-SA-004:** Parent Fan-In | 🚧 Partial | Existing fan-in is live; exact durable pending removal, idempotent duplicate acceptance, and settlement fencing remain to be implemented |
+| **REQ-SA-005:** Cancellation Propagation | 🚧 Partial | Installed-child cancellation is live; durable cancel-before-start and joined materialization remain to be implemented |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
@@ -87,7 +90,7 @@ only the architectural seams.
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
 | **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | `omitted_execution_and_blank_cwd_use_defaults`, `relative_cwd_resolves_from_parent_working_directory`, and `advertised_model_removed_from_live_registry_is_rejected` |
 
-**Progress:** 9 complete; 1 deferred; 1 proposed for wake runtime.
+**Progress:** 5 complete; 4 partial; 1 deferred; 1 proposed for wake runtime.
 
 ## Execution-selection verification
 

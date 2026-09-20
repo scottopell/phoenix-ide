@@ -279,6 +279,7 @@ entity Conversation {
     -- Context tracking (REQ-BED-012)
     context_usage_ratio: Decimal
     model_context_window: Integer
+    resolved_model_id: String
 
 
     -- Core status transitions (shared)
@@ -366,10 +367,6 @@ entity Conversation {
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
-    -- Entity-level invariants
-    invariant OneWorkSubAgent {
-        write_capable_sub_agents.count <= 1
-    }
 }
 
 -- Parent conversations: user-facing. Can propose tasks, recover from auth
@@ -681,7 +678,9 @@ rule CancelDuringSubAgentWait {
 rule LastSubAgentDuringCancellation {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
@@ -690,7 +689,9 @@ rule LastSubAgentDuringCancellation {
 rule SubAgentResultDuringCancellation {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = cancelling_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
 }
 
@@ -825,18 +826,34 @@ rule UserDismissesError {
 rule SubAgentReportsResultMorePending {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = awaiting_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count > 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
 }
 
 rule LastSubAgentReportsResult {
     when: SubAgentReportsResult(conversation, result)
     requires: conversation.core_status = awaiting_sub_agents
+    requires: result.agent_id in conversation.sub_agents_pending
     requires: conversation.sub_agents_pending.count = 1
+    ensures: conversation.sub_agents_pending.remove(result.agent_id)
     ensures: conversation.sub_agents_completed.add(result)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
+}
+
+rule DuplicateSubAgentResultIsIdempotent {
+    when: SubAgentReportsResult(conversation, result)
+    requires: conversation.core_status in { awaiting_sub_agents, cancelling_sub_agents }
+    requires: result.agent_id not in conversation.sub_agents_pending
+    requires: conversation.sub_agents_completed.any(r => r.agent_id = result.agent_id)
+    ensures: DuplicateSubAgentResultAccepted(conversation, result.agent_id)
+    ensures: conversation.sub_agents_pending = previous(conversation.sub_agents_pending)
+    ensures: conversation.sub_agents_completed = previous(conversation.sub_agents_completed)
+    ensures: LlmDispatchCountForSubAgent(conversation, result.agent_id)
+        = previous(LlmDispatchCountForSubAgent(conversation, result.agent_id))
 }
 
 ------------------------------------------------------------
@@ -2324,6 +2341,17 @@ rule ModeChangeNotification {
 --       when any target or inspection is absent, unsealed, superseded, or belongs
 --       to another attempt.
 --
+--   admitted_sub_agent_count(conversation: Conversation) -> Integer
+--       Returns the durable number of child identities admitted for the tool
+--       round represented by conversation's pending and completed collections.
+--
+--   no_duplicate_agent_ids(results: List<SubAgentResult>) -> Boolean
+--       True exactly when each child identity occurs at most once.
+--
+--   SubAgentFanInSettled(conversation: Conversation) -> Boolean
+--       True exactly when the parent leaves sub-agent awaiting or cancellation
+--       fan-in through the ordinary settlement path.
+--
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,
 --       prompt_rejected, invalid_request, invalid_response, server_error,
@@ -2588,9 +2616,20 @@ invariant GraceTurnOutcome {
 -- REQ-BED-004: Tool round atomicity
 -- tool_use count = tool_result count at checkpoint time.
 
--- REQ-BED-008: Sub-agent fan-in conservation
--- pending + completed = total spawned (constant).
--- Enforced by construction: each SubAgentReportsResult moves one.
+-- REQ-BED-008: Sub-agent fan-in conservation. Every accepted result removes
+-- the same durable child identity from pending and adds one completed outcome;
+-- duplicates leave both collections and parent dispatch unchanged.
+invariant SubAgentFanInConservesAdmittedChildren {
+    for c in Conversations where c.core_status in { awaiting_sub_agents, cancelling_sub_agents }:
+        c.sub_agents_pending.count + c.sub_agents_completed.count
+            = admitted_sub_agent_count(c)
+        and no_duplicate_agent_ids(c.sub_agents_completed)
+}
+
+invariant ParentSettlementRequiresCompleteSubAgentFanIn {
+    for c in Conversations:
+        SubAgentFanInSettled(c) implies c.sub_agents_pending?.count = 0
+}
 
 invariant ThresholdOrdering {
     config.context_continuation_threshold > config.context_warning_threshold
