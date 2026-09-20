@@ -90,6 +90,7 @@ fn bounded_diff(diff: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PatchScope {
     Unrestricted,
+    Worktree,
     TaskProposalDraft { tasks_dir_name: String },
 }
 
@@ -125,6 +126,14 @@ impl PatchTool {
         }
     }
 
+    #[must_use]
+    pub fn for_worktree() -> Self {
+        Self {
+            planner: Mutex::new(PatchPlanner::new()),
+            scope: PatchScope::Worktree,
+        }
+    }
+
     fn resolve_path(ctx: &ToolContext, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -140,8 +149,17 @@ impl PatchTool {
         raw_path: &str,
         resolved: &std::path::Path,
     ) -> Option<String> {
-        let PatchScope::TaskProposalDraft { tasks_dir_name } = &self.scope else {
-            return None;
+        let allowed_root = match &self.scope {
+            PatchScope::Unrestricted => return None,
+            PatchScope::Worktree => {
+                let Some(worktree_path) = ctx.worktree_path.as_ref() else {
+                    return Some("patch requires an attached WorkScope worktree".to_string());
+                };
+                worktree_path.clone()
+            }
+            PatchScope::TaskProposalDraft { tasks_dir_name } => {
+                ctx.working_dir().join(tasks_dir_name)
+            }
         };
 
         if std::path::Path::new(raw_path)
@@ -149,46 +167,76 @@ impl PatchTool {
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Some(format!(
-                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
-                 '..' components are not allowed (got '{raw_path}')."
+                "patch cannot use '..' outside its allowed WorkScope (got '{raw_path}')."
             ));
         }
 
-        let filename = std::path::Path::new(raw_path)
-            .file_name()
-            .and_then(|name| name.to_str());
-        if filename.is_none_or(|name| phoenix_core::task_source::TaskSource::detect(name).is_none())
-        {
-            return Some(format!(
-                "patch is restricted to markdown task proposal drafts under '{tasks_dir_name}/' \
-                 in this mode (got '{raw_path}')."
-            ));
+        if let PatchScope::TaskProposalDraft { tasks_dir_name } = &self.scope {
+            let filename = std::path::Path::new(raw_path)
+                .file_name()
+                .and_then(|name| name.to_str());
+            if filename
+                .is_none_or(|name| phoenix_core::task_source::TaskSource::detect(name).is_none())
+            {
+                return Some(format!(
+                    "patch is restricted to markdown task proposal drafts under '{tasks_dir_name}/' \
+                     in this mode (got '{raw_path}')."
+                ));
+            }
         }
 
-        let allowed_root = ctx.working_dir().join(tasks_dir_name);
-        let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
+        let canon_allowed =
+            canonicalize_existing_ancestor(&allowed_root).unwrap_or_else(|_| allowed_root.clone());
         let canon_resolved =
-            std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+            canonicalize_existing_ancestor(resolved).unwrap_or_else(|_| resolved.to_path_buf());
         if canon_resolved.starts_with(&canon_allowed) {
             None
         } else {
-            Some(format!(
-                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
-                 '{}' is outside the allowed directory.",
-                resolved.display()
-            ))
+            match &self.scope {
+                PatchScope::TaskProposalDraft { tasks_dir_name } => Some(format!(
+                    "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
+                     '{}' is outside the allowed directory.",
+                    resolved.display()
+                )),
+                PatchScope::Worktree => Some(format!(
+                    "patch is restricted to the allowed WorkScope; target '{}' is outside '{}'.",
+                    resolved.display(),
+                    canon_allowed.display()
+                )),
+                PatchScope::Unrestricted => None,
+            }
         }
     }
 
     fn proposal_next_step(&self, raw_path: &str) -> Option<String> {
         match &self.scope {
-            PatchScope::Unrestricted => None,
+            PatchScope::Unrestricted | PatchScope::Worktree => None,
             PatchScope::TaskProposalDraft { .. } => Some(format!(
                 "\n<next_step>Call propose_task with task_file=\"{}\" if this is the task you want the user to approve.</next_step>",
                 escape_xml_attribute(raw_path)
             )),
         }
     }
+}
+
+fn canonicalize_existing_ancestor(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return Ok(path.to_path_buf());
+        };
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
+        }
+        existing = parent;
+    }
+
+    let mut canonical = existing.canonicalize()?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 fn escape_xml_attribute(value: &str) -> String {
@@ -441,6 +489,61 @@ mod tests {
 
         assert!(result.is_success(), "Error: {}", result.output());
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "Hello Rust");
+    }
+
+    #[tokio::test]
+    async fn worktree_patch_rejects_absolute_path_outside_worktree() {
+        let worktree = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, "original\n").unwrap();
+        let tool = PatchTool::for_worktree();
+        let mut ctx = test_context(worktree.path().to_path_buf());
+        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
+
+        let blocked = tool
+            .run(
+                json!({
+                    "path": outside_file,
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "escaped\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(!blocked.is_success());
+        assert!(blocked.output().contains("outside"));
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_patch_rejects_new_file_through_outside_symlink() {
+        let worktree = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), worktree.path().join("escape")).unwrap();
+        let tool = PatchTool::for_worktree();
+        let mut ctx = test_context(worktree.path().to_path_buf());
+        ctx.worktree_path = Some(worktree.path().canonicalize().unwrap());
+
+        let blocked = tool
+            .run(
+                json!({
+                    "path": "escape/new.txt",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "escaped\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(!blocked.is_success());
+        assert!(!outside.path().join("new.txt").exists());
     }
 
     #[tokio::test]

@@ -4071,6 +4071,9 @@ impl RuntimeManager {
         let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
         let registry = match spec.mode {
             SubAgentMode::Explore => ToolRegistry::for_subagent_explore(explore_policy),
+            SubAgentMode::Work if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. }) => {
+                ToolRegistry::for_attached_subagent_work()
+            }
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
         // Sub-agents cannot spawn, so they carry an empty agent catalog.

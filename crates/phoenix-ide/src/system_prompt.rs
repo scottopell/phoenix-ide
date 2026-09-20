@@ -986,7 +986,10 @@ mod tests {
             .contains("`bash` is available with the approved WorkScope's full write authority"));
         assert!(prompt.contains("retains Explore provenance"));
         assert!(prompt.contains("approved WorkScope grants full write authority"));
-        assert!(prompt.contains("Execute the approved task directly"));
+        assert!(prompt.contains("Execute the current approved task directly"));
+        assert!(prompt.contains("do not re-propose that same objective"));
+        assert!(prompt.contains("A distinct follow-up task may still be proposed"));
+        assert!(!prompt.contains("do not propose another task"));
         assert!(!prompt.contains("`bash` is unavailable"));
         assert!(!prompt.contains("The conversation mode remains Explore"));
         assert!(!prompt.contains("you cannot modify code"));

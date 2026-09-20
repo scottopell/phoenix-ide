@@ -272,6 +272,54 @@ fn explore_sandbox_enforces_read_only_policy() {
     assert!(!network.status.success(), "network unexpectedly succeeded");
 }
 
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn worktree_sandbox_confines_writes_to_inherited_worktree() {
+    if !phoenix_core::platform::PlatformCapability::detect().has_sandbox() {
+        eprintln!("skipping: nono sandbox backend is unavailable");
+        return;
+    }
+
+    let fixture = tempfile::TempDir::new().expect("fixture");
+    let worktree = fixture.path().join("worktree");
+    let scratch = worktree.join(".phoenix-bash-scratch/test");
+    let outside = fixture.path().join("outside.txt");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(&outside, "outside\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_phoenix_ide"))
+        .args([
+            "--sandbox-exec",
+            "--",
+            &format!(
+                "echo inside > inside.txt; echo escaped > {}",
+                shell_quote(&outside)
+            ),
+        ])
+        .current_dir(&worktree)
+        .env("PHOENIX_SANDBOX_REPO_ROOT", &worktree)
+        .env("PHOENIX_SANDBOX_SCRATCH", &scratch)
+        .env("HOME", fixture.path())
+        .env(
+            "PHOENIX_SANDBOX_PLATFORM_TEMP",
+            scratch.join("platform-temp"),
+        )
+        .env("PHOENIX_SANDBOX_WORKTREE_WRITE", "1")
+        .env("PHOENIX_SANDBOX_WORKTREE_ROOT", &worktree)
+        .output()
+        .expect("run worktree sandbox child");
+
+    assert!(
+        !output.status.success(),
+        "outside write unexpectedly succeeded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("inside.txt")).unwrap(),
+        "inside\n"
+    );
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
+}
+
 struct RemoveDirOnDrop(std::path::PathBuf);
 
 impl Drop for RemoveDirOnDrop {

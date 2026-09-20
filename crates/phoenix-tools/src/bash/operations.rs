@@ -424,6 +424,7 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 pub enum BashSpawnMode {
     Direct,
     ExploreReadOnly,
+    WorktreeSandboxed,
     ExplicitTarget(ValidatedBashSpawnTarget),
 }
 
@@ -437,7 +438,7 @@ struct SpawnContext {
 impl BashSpawnMode {
     fn authority(&self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
-            Self::Direct | Self::ExplicitTarget(_) => {
+            Self::Direct | Self::WorktreeSandboxed | Self::ExplicitTarget(_) => {
                 phoenix_core::work_scope::ResourceAuthority::Work
             }
             Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
@@ -452,6 +453,10 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
     dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+}
+
+pub async fn dispatch_worktree_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::WorktreeSandboxed).await
 }
 
 pub async fn dispatch_explicit_target(
@@ -482,7 +487,9 @@ async fn dispatch_with_spawn_mode(
             read_args,
         } => {
             let spawn_context = match &spawn_mode {
-                BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
+                BashSpawnMode::Direct
+                | BashSpawnMode::ExploreReadOnly
+                | BashSpawnMode::WorktreeSandboxed => SpawnContext {
                     working_dir: ctx.working_dir().to_path_buf(),
                     lifecycle_scope: ctx.work_scope.clone(),
                     terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
@@ -729,6 +736,18 @@ fn spawn_child(
                 .arg(cmd)
                 .current_dir(&spawn_context.working_dir);
             command
+        }
+        BashSpawnMode::WorktreeSandboxed => {
+            let worktree_root = ctx.worktree_path.as_deref().ok_or_else(|| {
+                "attached Work sub-agent is missing its worktree root".to_string()
+            })?;
+            let sandbox_command = ExploreSandboxLauncher::worktree_write_command(
+                cmd,
+                &spawn_context.working_dir,
+                worktree_root,
+            )?;
+            sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
+            Command::from(sandbox_command.command)
         }
         BashSpawnMode::ExploreReadOnly => {
             let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;

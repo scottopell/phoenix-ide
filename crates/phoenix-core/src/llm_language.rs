@@ -289,10 +289,10 @@ pub fn mode_explore(
 pub fn mode_approved_explore_work(lang: LlmLanguage, worktree_path: &str) -> String {
     match lang {
         LlmLanguage::PhoenixNative => format!(
-            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Execute the approved task directly; do not propose another task. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
+            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
         ),
         LlmLanguage::Caveman => format!(
-            "\n\nTask approved. Work power in {worktree_path}. Do work now. No new plan."
+            "\n\nTask approved. Work power in {worktree_path}. Do this task now. No same plan again. User ask different next task? New plan allowed."
         ),
     }
 }

@@ -51,6 +51,8 @@ pub struct BashTool;
 
 pub struct SandboxedBashTool;
 
+pub struct WorktreeSandboxedBashTool;
+
 #[derive(Debug, Clone)]
 pub struct ValidatedBashSpawnTarget {
     pub working_dir: std::path::PathBuf,
@@ -247,6 +249,32 @@ impl Tool for SandboxedBashTool {
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         operations::dispatch_sandboxed(input, ctx).await
+    }
+}
+
+#[async_trait]
+impl Tool for WorktreeSandboxedBashTool {
+    fn clearable(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "{}\n\nWork sub-agent sandbox: filesystem writes are OS-enforced to stay inside the inherited WorkScope worktree.",
+            BashTool.description()
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        BashTool.input_schema()
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        operations::dispatch_worktree_sandboxed(input, ctx).await
     }
 }
 

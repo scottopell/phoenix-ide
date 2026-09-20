@@ -28,7 +28,7 @@ pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
     BashOp, BashTerminalEffect, BashTool, BashToolInput,
     ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
-    ValidatedBashSpawnTarget,
+    ValidatedBashSpawnTarget, WorktreeSandboxedBashTool,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -1196,6 +1196,17 @@ impl ToolRegistry {
         Self { tools }
     }
 
+    /// Tool registry for a Work sub-agent attached to its parent's worktree.
+    #[must_use]
+    pub fn for_attached_subagent_work() -> Self {
+        let mut tools = read_only_tools();
+        tools.push(Arc::new(WorktreeSandboxedBashTool));
+        tools.extend(browser_tools());
+        tools.extend(sub_agent_terminal_tools());
+        tools.push(Arc::new(PatchTool::for_worktree()));
+        Self { tools }
+    }
+
     /// Create tool registry for sub-agents (different tool set)
     #[deprecated(note = "Use for_subagent_explore() or for_subagent_work() instead")]
     #[must_use]
@@ -1506,6 +1517,10 @@ mod tests {
                 ToolRegistry::for_subagent_explore(sandbox_policy()),
             ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
+            (
+                "attached_subagent_work",
+                ToolRegistry::for_attached_subagent_work(),
+            ),
         ];
 
         for (label, registry) in &registries {
@@ -1685,6 +1700,10 @@ mod tests {
                 ToolRegistry::for_subagent_explore(sandbox_policy()),
             ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
+            (
+                "attached_subagent_work",
+                ToolRegistry::for_attached_subagent_work(),
+            ),
         ] {
             let bash = registry
                 .find_tool("bash")
