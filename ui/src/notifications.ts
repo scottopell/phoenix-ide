@@ -165,6 +165,32 @@ export function getProductConversationListRevision(): number {
   return productConversationListRevision;
 }
 
+const PRODUCT_CONVERSATIONS_RECONCILED_EVENT = 'phoenix:product-conversations-reconciled';
+
+type ProductConversationsReconciledDetail = {
+  authoritativeIdentities: ReadonlySet<string>;
+};
+
+export function notifyProductConversationsReconciled(
+  authoritativeIdentities: ReadonlySet<string>,
+): void {
+  window.dispatchEvent(new CustomEvent<ProductConversationsReconciledDetail>(
+    PRODUCT_CONVERSATIONS_RECONCILED_EVENT,
+    { detail: { authoritativeIdentities } },
+  ));
+}
+
+export function subscribeProductConversationsReconciled(
+  listener: (authoritativeIdentities: ReadonlySet<string>) => void,
+): () => void {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<ProductConversationsReconciledDetail>).detail;
+    if (detail) listener(detail.authoritativeIdentities);
+  };
+  window.addEventListener(PRODUCT_CONVERSATIONS_RECONCILED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATIONS_RECONCILED_EVENT, handler);
+}
+
 const PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT = 'phoenix:product-conversation-snapshot-changed';
 let productConversationSnapshotChangeSequence = 0;
 const productConversationSnapshotChangeSequencesById = new Map<string, number>();
