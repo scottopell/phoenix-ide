@@ -31,6 +31,7 @@ import {
   subscribeCloseSnapshotChanged,
   subscribeProductConversationDeleted,
   subscribeProductConversationSnapshotChanged,
+  subscribeProductConversationsReconciled,
 } from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
@@ -910,6 +911,18 @@ function ProductConversationPageInner() {
       setError('This product conversation was deleted.');
     });
   }, [productConversationId, snapshot]);
+
+  useEffect(() => subscribeProductConversationsReconciled((authoritativeIdentities) => {
+    const canonicalId = snapshot?.product_conversation_id ?? productConversationId;
+    if (!canonicalId || authoritativeIdentities.has(canonicalId)) return;
+    aggregateDeletedRef.current = true;
+    routeGenerationRef.current += 1;
+    paginationRequestRef.current += 1;
+    setOwnedSnapshot(null);
+    setLatestProjection(null);
+    setLoading(false);
+    setError('This product conversation was deleted.');
+  }), [productConversationId, snapshot?.product_conversation_id]);
 
   useEffect(() => {
     const notificationIds = new Set([

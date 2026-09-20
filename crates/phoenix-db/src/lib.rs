@@ -9709,6 +9709,17 @@ impl Database {
         .execute(&mut *connection)
         .await?;
         sqlx::query(
+            "DELETE FROM approved_task_creation_bindings
+             WHERE source_product_conversation_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
@@ -25153,6 +25164,71 @@ mod tests {
         let members = db.product_conversation_member_ids(&root.id).await.unwrap();
 
         assert_eq!(members, vec![child.id, root.id, continuation.id]);
+    }
+
+    #[tokio::test]
+    async fn delete_source_aggregate_removes_creation_binding_and_preserves_target_provenance() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("binding-source", "binding-source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "4056841909".to_string(),
+            task_title: "Preserve provenance".to_string(),
+            title: "Preserve provenance".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "delete only source-owned admission binding".to_string(),
+            task_file: "tasks/4056841909-p1-ready--preserve-provenance.md".to_string(),
+            artifact_body: "# Preserve provenance\n".to_string(),
+        };
+        let target = db
+            .create_task_approval_handoff_creation_job(&source.id, &approval)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_sources (
+                 target_product_conversation_id, source_product_conversation_id,
+                 source_conversation_id, relation_kind, relation_key, created_at_us,
+                 approved_title, approved_priority, approved_artifact_body,
+                 approved_task_title, approved_plan, approved_task_file
+             ) VALUES (?1, ?2, ?3, 'approved_task', ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(target.product_conversation_id.as_str())
+        .bind(source.product_conversation_id.as_str())
+        .bind(&source.id)
+        .bind(&approval.task_id)
+        .bind(&approval.title)
+        .bind(serde_json::to_string(&approval.priority).unwrap())
+        .bind(&approval.artifact_body)
+        .bind(&approval.task_title)
+        .bind(&approval.plan)
+        .bind(&approval.task_file)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.delete_conversation(&source.id).await.unwrap();
+
+        let binding_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approved_task_creation_bindings
+             WHERE source_product_conversation_id = ?1",
+        )
+        .bind(source.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let provenance_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_sources
+             WHERE target_product_conversation_id = ?1",
+        )
+        .bind(target.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(binding_count, 0);
+        assert_eq!(provenance_count, 1);
+        assert!(db.get_conversation(&target.id).await.is_ok());
     }
 
     #[tokio::test]

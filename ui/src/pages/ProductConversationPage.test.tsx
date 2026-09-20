@@ -20,6 +20,7 @@ import {
   notifyCloseSnapshotChanged,
   notifyProductConversationDeleted,
   notifyProductConversationSnapshotChanged,
+  notifyProductConversationsReconciled,
 } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
@@ -461,6 +462,16 @@ describe('ProductConversationPage', () => {
     expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
 
     act(() => notifyProductConversationDeleted('pc-other', ['row-2']));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+  });
+
+  it('clears a writable snapshot when stream reconciliation proves the aggregate absent', async () => {
+    renderPage();
+    expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    act(() => notifyProductConversationsReconciled(new Set(['pc-other'])));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('This product conversation was deleted.');
     expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();

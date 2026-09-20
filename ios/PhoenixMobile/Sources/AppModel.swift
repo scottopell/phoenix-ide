@@ -477,8 +477,14 @@ final class AppModel {
                     return
                 } catch is CancellationError {
                     return
+                } catch let error as APIError {
+                    guard error.isRetryableAggregateReconciliationFailure,
+                          await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
+                    else { return }
                 } catch {
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled,
+                          await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
+                    else { return }
                 }
                 let jitter = Double.random(in: 0...0.3) * retryDelay
                 try? await Task.sleep(for: .seconds(retryDelay + jitter))
@@ -906,8 +912,6 @@ final class AppModel {
         var closed = false
         defer { if !closed { fencedSessions.forEach { $0.endArchiving() } } }
         do {
-            _ = try await loadProductHistory(productConversationId: conversation.aggregateIdentity)
-            guard apiGeneration == startedGeneration else { return false }
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
             closed = true
@@ -1385,6 +1389,8 @@ final class AppModel {
     private func startAggregateReconciliation() -> Task<Bool, Never>? {
         guard isForeground, connectivity.isOnline, api != nil else { return nil }
         aggregateReconciliationTask?.cancel()
+        for session in sessions.values { session.suspendDeliveryForReconciliation() }
+        for session in drainSessions.values { session.suspendDeliveryForReconciliation() }
         let id = UUID()
         aggregateReconciliationId = id
         let task = Task { [weak self] in
@@ -1401,7 +1407,6 @@ final class AppModel {
 
     private func reconcileAfterAggregateStreamDisconnect(generation: Int) async -> Bool {
         guard apiGeneration == generation, isForeground, connectivity.isOnline else { return false }
-        for session in sessions.values { session.suspendDeliveryForReconciliation() }
         guard let task = startAggregateReconciliation() else { return false }
         return await task.value
             && apiGeneration == generation
@@ -1493,6 +1498,7 @@ final class AppModel {
             preservingAggregateIds: rememberedCoordinatorAggregateIds())
         if isForeground {
             for session in sessions.values { session.resyncAfterForeground() }
+            for session in drainSessions.values { session.resyncAfterForeground() }
         }
         drainPersistedOutboxes()
         return true

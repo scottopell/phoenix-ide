@@ -11,6 +11,7 @@ import {
   notifyProductConversationDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
+  notifyProductConversationsReconciled,
 } from '../notifications';
 
 const POLL_INTERVAL_MS = 5000;
@@ -52,17 +53,33 @@ export function subscribeToAggregateDeletionEvents(): () => void {
     source.onerror = () => {
       source?.close();
       source = null;
-      if (stopped || retryTimer !== null) return;
-      retryTimer = window.setTimeout(() => {
-        retryTimer = null;
-        connect();
-      }, retryDelayMs);
-      retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+      scheduleReconciliation();
     };
   };
 
+  const scheduleReconciliation = () => {
+    if (stopped || retryTimer !== null) return;
+    retryTimer = window.setTimeout(() => {
+      retryTimer = null;
+      void api.listProductConversations()
+        .then(({ product_conversations: rows }) => {
+          if (stopped) return;
+          notifyProductConversationsReconciled(new Set(rows.map((row) => (
+            row.product_conversation_id
+          ))));
+          notifyProductConversationListMayHaveChanged();
+          retryDelayMs = 1_000;
+          connect();
+        })
+        .catch(() => {
+          retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+          scheduleReconciliation();
+        });
+    }, retryDelayMs);
+  };
+
   const handleOnline = () => {
-    if (!stopped && source === null && retryTimer === null) connect();
+    if (!stopped && source === null && retryTimer === null) scheduleReconciliation();
   };
   window.addEventListener('online', handleOnline);
   connect();
