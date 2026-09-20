@@ -200,7 +200,9 @@ impl ContinuationApplicationService {
                 .get_conversation(&admission.predecessor_conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            if predecessor.attached_work_scope_id == successor.attached_work_scope_id {
+            let shared_work_scope =
+                predecessor.attached_work_scope_id == successor.attached_work_scope_id;
+            if shared_work_scope {
                 crate::runtime::wake::transfer_active_for_continuation(
                     &self.runtime,
                     &admission.predecessor_conversation_id,
@@ -212,12 +214,16 @@ impl ContinuationApplicationService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-            let transfer_settled = crate::runtime::wake::continuation_transfer_is_settled(
-                &self.runtime,
-                &admission.predecessor_conversation_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let transfer_settled = if shared_work_scope {
+                crate::runtime::wake::continuation_transfer_is_settled(
+                    &self.runtime,
+                    &admission.predecessor_conversation_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            } else {
+                true
+            };
             if !transfer_settled {
                 return Err("continuation ownership transfer remains pending".to_string());
             }

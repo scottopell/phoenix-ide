@@ -192,15 +192,29 @@ impl SendChatApplicationService {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn send(
         &self,
-        req: SendChatRequest,
+        mut req: SendChatRequest,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
-        let request_fingerprint = request_fingerprint(&req)?;
         let conversation = self
             .runtime
             .db()
             .get_conversation(&req.conversation_id)
             .await
             .map_err(map_conversation_load_error)?;
+        if let Some(intent) = self
+            .db
+            .continuation_dispatch_intent_for_successor(&conversation.id)
+            .await
+            .map_err(|error| map_db_internal_error(&error))?
+            .filter(|intent| {
+                intent.message_id.as_str() == req.message_id
+                    || format!("{}:{}", conversation.id, intent.message_id.as_str())
+                        == req.message_id
+            })
+        {
+            req.text = intent.handoff;
+            req.user_agent = intent.user_agent;
+        }
+        let request_fingerprint = request_fingerprint(&req)?;
         let submitted = submitted_identity_from_request(&req);
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
             DurableReplayOutcome::Missing => {}
