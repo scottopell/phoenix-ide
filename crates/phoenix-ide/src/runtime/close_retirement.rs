@@ -1706,7 +1706,14 @@ impl RuntimeManager {
                                 ))
                             })
                             .await
-                            .map_err(|error| error.to_string())??;
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| {
+                                CloseRetirementError::EvidenceInvariant {
+                                    scope: Some(scope.clone()),
+                                    invariant: "cleanup_plan_discovery".to_string(),
+                                    relation: error,
+                                }
+                            })?;
                             self.db()
                                 .record_close_worktree_cleanup_plan(
                                     RecordCloseWorktreeCleanupPlanRequest {
@@ -1719,7 +1726,19 @@ impl RuntimeManager {
                                     },
                                 )
                                 .await
-                                .map_err(|error| error.to_string())?;
+                                .map_err(map_close_retirement_db_error)
+                                .map_err(|error| match error {
+                                    CloseRetirementError::EvidenceInvariant {
+                                        invariant,
+                                        relation,
+                                        ..
+                                    } => CloseRetirementError::EvidenceInvariant {
+                                        scope: Some(scope.clone()),
+                                        invariant,
+                                        relation,
+                                    },
+                                    error @ CloseRetirementError::Message(_) => error,
+                                })?;
                             crate::db::CloseWorktreeCleanupPlan {
                                 administrative_dir: discovered.0,
                                 administrative_dir_incarnation: discovered.1,
