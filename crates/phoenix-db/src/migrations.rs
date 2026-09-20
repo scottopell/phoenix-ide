@@ -520,6 +520,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_svg_artifacts",
         sql: MIGRATION_101,
     },
+    Migration {
+        version: 102,
+        name: "add_automatic_continuation_superseded_phase",
+        sql: MIGRATION_102,
+    },
+    Migration {
+        version: 103,
+        name: "preserve_automatic_continuation_resume_phase",
+        sql: MIGRATION_103,
+    },
 ];
 
 const MIGRATION_101: &str = r"
@@ -643,6 +653,14 @@ WHEN EXISTS (
     WHERE (NEW.message_id = intent.message_id
            OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
+      AND (
+          (intent.opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation'
+           AND NEW.content = json_object('summary', intent.handoff))
+          OR (intent.opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = intent.handoff)
+      )
 )
 BEGIN
     INSERT INTO completed_continuation_handoffs (
@@ -658,13 +676,29 @@ BEGIN
     WHERE (NEW.message_id = intent.message_id
            OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
+      AND (
+          (intent.opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation'
+           AND NEW.content = json_object('summary', intent.handoff))
+          OR (intent.opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = intent.handoff)
+      )
     ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
     LIMIT 1;
 
     DELETE FROM continuation_dispatch_intents
     WHERE successor_conversation_id = NEW.conversation_id
       AND (message_id = NEW.message_id
-           OR NEW.message_id = successor_conversation_id || ':' || message_id);
+           OR NEW.message_id = successor_conversation_id || ':' || message_id)
+      AND (
+          (opening_authority = 'generated_predecessor_context'
+           AND NEW.message_type = 'continuation'
+           AND NEW.content = json_object('summary', handoff))
+          OR (opening_authority = 'user_authorized_instruction'
+              AND NEW.message_type = 'user'
+              AND json_extract(NEW.content, '$.text') = handoff)
+      );
 END;
 
 CREATE TABLE automatic_continuation_admissions (
@@ -693,6 +727,124 @@ CREATE TABLE automatic_continuation_admissions (
     CHECK ((phase = 'failed') = (last_error IS NOT NULL)),
     UNIQUE (predecessor_conversation_id, product_conversation_id)
 );
+
+CREATE TRIGGER automatic_continuation_admissions_immutable_identity
+BEFORE UPDATE OF predecessor_conversation_id, product_conversation_id,
+                 summary_message_id, operation_id, first_message_id,
+                 opening_authority, admitted_at_unix_micros
+ON automatic_continuation_admissions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'automatic continuation admission identity is immutable');
+END;
+
+CREATE TRIGGER automatic_continuation_admissions_validate_insert
+BEFORE INSERT ON automatic_continuation_admissions
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM conversations predecessor
+    JOIN product_conversations product
+      ON product.id = predecessor.product_conversation_id
+    JOIN messages summary
+      ON summary.message_id = NEW.summary_message_id
+     AND summary.conversation_id = predecessor.id
+     AND summary.message_type = 'continuation'
+    WHERE predecessor.id = NEW.predecessor_conversation_id
+      AND predecessor.product_conversation_id = NEW.product_conversation_id
+      AND predecessor.parent_conversation_id IS NULL
+      AND predecessor.runtime_role IN ('user', 'coordinator')
+      AND predecessor.state_kind = 'context_exhausted'
+      AND predecessor.continued_in_conv_id IS NULL
+      AND product.auto_continue_on_context_exhaustion = 1
+      AND (
+          product.kind = 'coordinator'
+          OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM close_obligations obligation
+          WHERE obligation.product_conversation_id = product.id
+            AND obligation.phase <> 'completed'
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'automatic continuation admission requires eligible opted-in context exhaustion');
+END;
+";
+
+const MIGRATION_103: &str = r"
+ALTER TABLE automatic_continuation_admissions
+ADD COLUMN resume_phase TEXT NOT NULL DEFAULT 'admitted'
+CHECK (resume_phase IN (
+    'admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted'
+));
+
+UPDATE automatic_continuation_admissions
+SET resume_phase = CASE
+    WHEN phase IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+        THEN phase
+    WHEN EXISTS (
+        SELECT 1
+        FROM continuation_dispatch_intents intent
+        JOIN durable_turns turn
+          ON turn.conversation_id = intent.successor_conversation_id
+         AND turn.client_turn_key = intent.message_id
+        WHERE intent.parent_conversation_id = automatic_continuation_admissions.predecessor_conversation_id
+    ) THEN 'dispatch_accepted'
+    WHEN EXISTS (
+        SELECT 1 FROM continuation_dispatch_intents intent
+        WHERE intent.parent_conversation_id = automatic_continuation_admissions.predecessor_conversation_id
+    ) THEN 'successor_reserved'
+    ELSE 'admitted'
+END;
+";
+
+const MIGRATION_102: &str = r"
+ALTER TABLE automatic_continuation_admissions
+RENAME TO automatic_continuation_admissions_migration_101_old;
+
+DROP TRIGGER automatic_continuation_admissions_immutable_identity;
+DROP TRIGGER automatic_continuation_admissions_validate_insert;
+
+CREATE TABLE automatic_continuation_admissions (
+    predecessor_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    product_conversation_id TEXT NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    summary_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    operation_id TEXT NOT NULL CHECK (length(trim(operation_id)) > 0),
+    first_message_id TEXT UNIQUE NOT NULL CHECK (length(trim(first_message_id)) > 0),
+    opening_authority TEXT NOT NULL DEFAULT 'generated_predecessor_context'
+        CHECK (opening_authority = 'generated_predecessor_context'),
+    phase TEXT NOT NULL DEFAULT 'admitted'
+        CHECK (phase IN (
+            'admitted', 'successor_reserved', 'ownership_transferred',
+            'dispatch_accepted', 'message_settled', 'superseded', 'failed'
+        )),
+    no_progress_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(no_progress_attempts) = 'integer' AND no_progress_attempts >= 0),
+    last_error TEXT,
+    admitted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(admitted_at_unix_micros) = 'integer' AND admitted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    CHECK ((phase = 'failed') = (last_error IS NOT NULL)),
+    UNIQUE (predecessor_conversation_id, product_conversation_id)
+);
+
+INSERT INTO automatic_continuation_admissions (
+    predecessor_conversation_id, product_conversation_id, summary_message_id,
+    operation_id, first_message_id, opening_authority, phase,
+    no_progress_attempts, last_error, admitted_at_unix_micros,
+    updated_at_unix_micros
+)
+SELECT predecessor_conversation_id, product_conversation_id, summary_message_id,
+       operation_id, first_message_id, opening_authority, phase,
+       no_progress_attempts, last_error, admitted_at_unix_micros,
+       updated_at_unix_micros
+FROM automatic_continuation_admissions_migration_101_old;
+
+DROP TABLE automatic_continuation_admissions_migration_101_old;
 
 CREATE TRIGGER automatic_continuation_admissions_immutable_identity
 BEFORE UPDATE OF predecessor_conversation_id, product_conversation_id,
@@ -10612,6 +10764,107 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn migration_102_preserves_rows_and_adds_superseded_phase() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 ordinary_lifecycle TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT REFERENCES product_conversations(id),
+                 parent_conversation_id TEXT,
+                 runtime_role TEXT NOT NULL,
+                 state_kind TEXT NOT NULL,
+                 continued_in_conv_id TEXT
+             );
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                 message_type TEXT NOT NULL,
+                 content TEXT NOT NULL DEFAULT '{}',
+                 sequence_id INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE close_obligations (
+                 product_conversation_id TEXT NOT NULL,
+                 phase TEXT NOT NULL
+             );
+             CREATE TABLE completed_continuation_handoffs (
+                 predecessor_conversation_id TEXT PRIMARY KEY NOT NULL,
+                 successor_conversation_id TEXT UNIQUE NOT NULL,
+                 continuation_message_id TEXT UNIQUE NOT NULL,
+                 accepted_successor_message_id TEXT UNIQUE NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_045).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversations (
+                 id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion
+             ) VALUES ('ordinary', 'ordinary', 'open', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 state_kind, continued_in_conv_id
+             ) VALUES ('parent', 'ordinary', NULL, 'user', 'context_exhausted', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, message_type)
+             VALUES ('summary', 'parent', 'continuation')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO automatic_continuation_admissions (
+                 predecessor_conversation_id, product_conversation_id, summary_message_id,
+                 operation_id, first_message_id, opening_authority, phase,
+                 no_progress_attempts, last_error, admitted_at_unix_micros,
+                 updated_at_unix_micros
+             ) VALUES (
+                 'parent', 'ordinary', 'summary', 'operation', 'opening',
+                 'generated_predecessor_context', 'admitted', 0, NULL, 1, 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+
+        let phase: String = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET phase = 'superseded'
+             WHERE predecessor_conversation_id = 'parent'
+             RETURNING phase",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(phase, "superseded");
+        assert!(sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET first_message_id = 'changed'
+             WHERE predecessor_conversation_id = 'parent'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
     #[test]
     fn compiled_migration_digest_binds_version_name_and_sql_body() {
         let baseline =
@@ -10665,6 +10918,69 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_103_backfills_highest_derivable_resume_phase() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE automatic_continuation_admissions (
+                 predecessor_conversation_id TEXT PRIMARY KEY,
+                 phase TEXT NOT NULL
+             );
+             CREATE TABLE continuation_dispatch_intents (
+                 parent_conversation_id TEXT PRIMARY KEY,
+                 successor_conversation_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 conversation_id TEXT NOT NULL,
+                 client_turn_key TEXT NOT NULL
+             );
+             INSERT INTO automatic_continuation_admissions VALUES
+                 ('admitted', 'admitted'),
+                 ('reserved', 'successor_reserved'),
+                 ('transferred', 'ownership_transferred'),
+                 ('accepted', 'dispatch_accepted'),
+                 ('failed-intent', 'failed'),
+                 ('failed-turn', 'failed'),
+                 ('failed-empty', 'failed');
+             INSERT INTO continuation_dispatch_intents VALUES
+                 ('failed-intent', 'successor-intent', 'opening-intent'),
+                 ('failed-turn', 'successor-turn', 'opening-turn');
+             INSERT INTO durable_turns VALUES ('successor-turn', 'opening-turn');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_103).execute(&pool).await.unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT predecessor_conversation_id, resume_phase
+             FROM automatic_continuation_admissions ORDER BY predecessor_conversation_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("accepted".to_string(), "dispatch_accepted".to_string()),
+                ("admitted".to_string(), "admitted".to_string()),
+                ("failed-empty".to_string(), "admitted".to_string()),
+                (
+                    "failed-intent".to_string(),
+                    "successor_reserved".to_string()
+                ),
+                ("failed-turn".to_string(), "dispatch_accepted".to_string()),
+                ("reserved".to_string(), "successor_reserved".to_string()),
+                (
+                    "transferred".to_string(),
+                    "ownership_transferred".to_string()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -15251,7 +15567,10 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(&pool)
         .await
@@ -16144,7 +16463,10 @@ mod tests {
                     (92, 'temporarily_skip_creation_checkout_pin'),
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission')",
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
         )
         .execute(pool)
         .await

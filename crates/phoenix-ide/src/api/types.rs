@@ -277,6 +277,60 @@ pub struct ProductConversationListRow {
     pub presentation: ProductConversationPresentationView,
 }
 
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAutomaticContinuationRequest {
+    pub auto_continue_on_context_exhaustion: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct AutomaticContinuationView {
+    pub aggregate: AutomaticContinuationAggregateView,
+    pub auto_continue_on_context_exhaustion: bool,
+    pub admission: Option<AutomaticContinuationAdmissionView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum AutomaticContinuationAggregateView {
+    Ordinary { product_conversation_id: String },
+    Coordinator { product_conversation_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct AutomaticContinuationAdmissionView {
+    pub predecessor_transcript_row_id: String,
+    pub phase: AutomaticContinuationAdmissionPhaseView,
+    pub no_progress_attempts: u32,
+    pub actionable_failure: Option<AutomaticContinuationFailureView>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum AutomaticContinuationAdmissionPhaseView {
+    Admitted,
+    SuccessorReserved,
+    OwnershipTransferred,
+    DispatchAccepted,
+    MessageSettled,
+    Superseded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct AutomaticContinuationFailureView {
+    pub message: String,
+    pub first_message_id: String,
+    pub accepted_handoff: String,
+    pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationSnapshotView {
@@ -623,6 +677,8 @@ pub struct ContinueConversationRequest {
     pub message_id: String,
     #[serde(default)]
     pub user_agent: Option<String>,
+    #[serde(default)]
+    pub retry_failed_automatic: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

@@ -45,6 +45,7 @@ export type HistoricalUnit =
   | AgentTurnUnit
   | ToolOnlyAgentTurnGroup
   | { kind: 'system'; key: string; message: Message }
+  | { kind: 'continuation'; key: string; message: Message }
   | { kind: 'pending_user'; key: string; message: PendingUserMessage };
 
 export type TailUnit =
@@ -280,6 +281,11 @@ export function buildHistoricalUnits(
       historicalUnits.push(unit);
       activeAgentTurn = unit;
       inAgentRun = true;
+      i++;
+    } else if (type === 'continuation') {
+      historicalUnits.push({ kind: 'continuation', key: msg.message_id, message: msg });
+      activeAgentTurn = null;
+      inAgentRun = false;
       i++;
     } else if (type === 'system') {
       if (isHiddenSystemMessage(msg)) {

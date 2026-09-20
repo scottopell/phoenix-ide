@@ -1432,13 +1432,20 @@ fn render_messages<'a>(
                 });
             }
 
-            // Ignore system, error, and continuation messages.
-            // System messages are UI-only bookkeeping (restart markers, task
-            // file renames, diff snapshots). LLM-directed messages use
-            // MessageContent::User with is_meta (e.g., grace turn prompt).
-            MessageContent::System(_)
-            | MessageContent::Error(_)
-            | MessageContent::Continuation(_) => {}
+            MessageContent::Continuation(continuation) => {
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::text(
+                        crate::send_chat_service::generated_predecessor_context_projection(
+                            &continuation.summary,
+                        ),
+                    )],
+                });
+            }
+
+            // System and error messages are UI-only bookkeeping. LLM-directed
+            // messages use a typed content variant.
+            MessageContent::System(_) | MessageContent::Error(_) => {}
         }
     }
     messages
@@ -2311,21 +2318,36 @@ where
             }
         }
 
-        let startup_drain = match self.commit_startup_steering_queue().await {
-            Ok(outcome) => outcome,
+        let continuation_opening_pending = match self
+            .storage
+            .has_pending_continuation_opening(&self.context.conversation_id)
+            .await
+        {
+            Ok(pending) => pending,
             Err(error) => {
-                tracing::error!(
-                    conversation_id = %self.context.conversation_id,
-                    %error,
-                    "Startup steering drain failed; leaving durable queue intact for retry"
-                );
-                let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
-                    sequence_id,
-                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                        "recover queued steering messages",
-                    ),
-                });
-                return RuntimeExitDisposition::Interrupted;
+                tracing::error!(%error, "pending continuation opening is unclassified");
+                return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+            }
+        };
+        let startup_drain = if continuation_opening_pending {
+            StartupSteeringDrainOutcome::NotNeeded
+        } else {
+            match self.commit_startup_steering_queue().await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(
+                        conversation_id = %self.context.conversation_id,
+                        %error,
+                        "Startup steering drain failed; leaving durable queue intact for retry"
+                    );
+                    let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                        sequence_id,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "recover queued steering messages",
+                        ),
+                    });
+                    return RuntimeExitDisposition::Interrupted;
+                }
             }
         };
 

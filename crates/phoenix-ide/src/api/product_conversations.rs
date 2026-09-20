@@ -1,26 +1,34 @@
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    routing::get,
+    Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
-use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+use phoenix_core::domain::db_schema::MessageContent;
+use phoenix_core::domain::product_conversation::{
+    AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
+    OrdinaryProductConversationLifecycle, ProductConversationId,
+};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
-    OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
-    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
-    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
-    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
-    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
+    AutomaticContinuationAdmissionPhaseView, AutomaticContinuationAdmissionView,
+    AutomaticContinuationAggregateView, AutomaticContinuationFailureView,
+    AutomaticContinuationView, OrdinaryProductConversationLifecycleView,
+    ProductConversationChainQaCompatibilityView, ProductConversationCloseInspectionView,
+    ProductConversationCloseLossView, ProductConversationClosePhaseView,
+    ProductConversationCloseResidualView, ProductConversationCloseView,
+    ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
+    ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
+    ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView,
+    ProductConversationWorkIdentityView, UpdateAutomaticContinuationRequest,
 };
 use super::AppState;
 use crate::db::{
@@ -63,6 +71,222 @@ struct AggregateSegmentCeiling {
     transcript_row_id: String,
     tail_sequence_id: i64,
     tail_message_id: Option<String>,
+}
+
+pub fn automatic_continuation_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/product-conversations/:reference/automatic-continuation",
+            get(get_product_conversation_automatic_continuation)
+                .put(put_product_conversation_automatic_continuation),
+        )
+        .route(
+            "/api/global/coordinator/automatic-continuation",
+            get(get_coordinator_automatic_continuation).put(put_coordinator_automatic_continuation),
+        )
+}
+
+pub async fn get_product_conversation_automatic_continuation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let product_conversation_id = reference
+        .parse::<ProductConversationId>()
+        .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
+    state
+        .db
+        .get_ordinary_product_conversation(&product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(&state, product_conversation_id, false)
+        .await
+        .map(Json)
+}
+
+pub async fn put_product_conversation_automatic_continuation(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(request): Json<UpdateAutomaticContinuationRequest>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let product_conversation_id = reference
+        .parse::<ProductConversationId>()
+        .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
+    state
+        .db
+        .get_ordinary_product_conversation(&product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    state
+        .db
+        .set_auto_continue_on_context_exhaustion(
+            &product_conversation_id,
+            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+        )
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(&state, product_conversation_id, false)
+        .await
+        .map(Json)
+}
+
+pub async fn get_coordinator_automatic_continuation(
+    State(state): State<AppState>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    coordinator_automatic_continuation_view(&state)
+        .await
+        .map(Json)
+}
+
+pub async fn put_coordinator_automatic_continuation(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAutomaticContinuationRequest>,
+) -> Result<Json<AutomaticContinuationView>, AppError> {
+    let coordinator_id = coordinator_conversation_id(&state).await?;
+    let coordinator = state
+        .db
+        .get_conversation(&coordinator_id)
+        .await
+        .map_err(db_to_app)?;
+    state
+        .db
+        .set_auto_continue_on_context_exhaustion(
+            &coordinator.product_conversation_id,
+            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+        )
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(&state, coordinator.product_conversation_id, true)
+        .await
+        .map(Json)
+}
+
+async fn coordinator_automatic_continuation_view(
+    state: &AppState,
+) -> Result<AutomaticContinuationView, AppError> {
+    let coordinator_id = coordinator_conversation_id(state).await?;
+    let coordinator = state
+        .db
+        .get_conversation(&coordinator_id)
+        .await
+        .map_err(db_to_app)?;
+    automatic_continuation_view(state, coordinator.product_conversation_id, true).await
+}
+
+async fn coordinator_conversation_id(state: &AppState) -> Result<String, AppError> {
+    state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(db_to_app)?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))
+}
+
+async fn automatic_continuation_view(
+    state: &AppState,
+    product_conversation_id: ProductConversationId,
+    coordinator: bool,
+) -> Result<AutomaticContinuationView, AppError> {
+    let preference = state
+        .db
+        .auto_continue_on_context_exhaustion(&product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    let admission = state
+        .db
+        .latest_automatic_continuation_admission(&product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    let admission = if let Some(admission) = admission {
+        let actionable_failure = if let Some(message) = admission.last_error {
+            let summary = state
+                .db
+                .get_message_by_id_in_conversation(
+                    &admission.predecessor_conversation_id,
+                    &admission.summary_message_id,
+                )
+                .await
+                .map_err(db_to_app)?;
+            let MessageContent::Continuation(summary) = summary.content else {
+                return Err(AppError::Internal(
+                    "automatic continuation summary has the wrong message type".to_string(),
+                ));
+            };
+            let persisted_winner = state
+                .db
+                .continuation_dispatch_intent(&admission.predecessor_conversation_id)
+                .await
+                .map_err(db_to_app)?;
+            let (first_message_id, accepted_handoff, opening_authority) = persisted_winner
+                .map(|intent| {
+                    (
+                        intent.message_id.as_str().to_string(),
+                        intent.handoff,
+                        intent.opening_authority,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        admission.first_message_id.as_str().to_string(),
+                        summary.summary,
+                        admission.opening_authority,
+                    )
+                });
+            Some(AutomaticContinuationFailureView {
+                message,
+                first_message_id,
+                accepted_handoff,
+                opening_authority,
+            })
+        } else {
+            None
+        };
+        Some(AutomaticContinuationAdmissionView {
+            predecessor_transcript_row_id: admission.predecessor_conversation_id,
+            phase: admission_phase_view(admission.phase),
+            no_progress_attempts: admission.no_progress_attempts,
+            actionable_failure,
+        })
+    } else {
+        None
+    };
+    let id = product_conversation_id.to_string();
+    Ok(AutomaticContinuationView {
+        aggregate: if coordinator {
+            AutomaticContinuationAggregateView::Coordinator {
+                product_conversation_id: id,
+            }
+        } else {
+            AutomaticContinuationAggregateView::Ordinary {
+                product_conversation_id: id,
+            }
+        },
+        auto_continue_on_context_exhaustion: preference.is_enabled(),
+        admission,
+    })
+}
+
+fn admission_phase_view(
+    phase: AutomaticContinuationPhase,
+) -> AutomaticContinuationAdmissionPhaseView {
+    match phase {
+        AutomaticContinuationPhase::Admitted => AutomaticContinuationAdmissionPhaseView::Admitted,
+        AutomaticContinuationPhase::SuccessorReserved => {
+            AutomaticContinuationAdmissionPhaseView::SuccessorReserved
+        }
+        AutomaticContinuationPhase::OwnershipTransferred => {
+            AutomaticContinuationAdmissionPhaseView::OwnershipTransferred
+        }
+        AutomaticContinuationPhase::DispatchAccepted => {
+            AutomaticContinuationAdmissionPhaseView::DispatchAccepted
+        }
+        AutomaticContinuationPhase::MessageSettled => {
+            AutomaticContinuationAdmissionPhaseView::MessageSettled
+        }
+        AutomaticContinuationPhase::Superseded => {
+            AutomaticContinuationAdmissionPhaseView::Superseded
+        }
+        AutomaticContinuationPhase::Failed => AutomaticContinuationAdmissionPhaseView::Failed,
+    }
 }
 
 pub async fn list_product_conversations(
@@ -775,6 +999,7 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 fn db_to_app(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        DbError::ProductConversationUnavailable(id) => AppError::NotFound(id.to_string()),
         error => AppError::Internal(error.to_string()),
     }
 }
@@ -1063,6 +1288,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_continuation_settings_reject_transcript_row_references() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("auto-route-row", "auto-route", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let uri = "/api/product-conversations/auto-route-row/automatic-continuation";
+
+        let get = create_router(state.clone())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+        let put = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"auto_continue_on_context_exhaustion":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn automatic_continuation_api_is_prospective_and_projects_predecessor_admission() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("auto-api", "auto-api", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reference = root.product_conversation_id.to_string();
+        let uri = format!("/api/product-conversations/{reference}/automatic-continuation");
+
+        let initial = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial: serde_json::Value =
+            serde_json::from_slice(&to_bytes(initial.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(initial["aggregate"]["kind"], "ordinary");
+        assert_eq!(initial["auto_continue_on_context_exhaustion"], false);
+        assert!(initial["admission"].is_null());
+
+        let enabled = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"auto_continue_on_context_exhaustion":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert!(state
+            .db
+            .automatic_continuation_admission(&root.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "auto-api-operation".to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let content = MessageContent::continuation("persisted API handoff");
+        let message = crate::db::Message {
+            message_id: "auto-api-summary".to_string(),
+            conversation_id: root.id.clone(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        state
+            .db
+            .commit_continuation(
+                &root.id,
+                "auto-api-operation",
+                &message,
+                &ConvState::ContextExhausted {
+                    summary: "persisted API handoff".to_string(),
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .continue_conversation_with_intent(
+                &root.id,
+                crate::db::NewContinuationDispatchIntent::generated_predecessor_context(
+                    ClientTurnKey::try_from("auto-api-opening").unwrap(),
+                    "persisted API handoff".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let projected = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(projected.status(), StatusCode::OK);
+        let projected: serde_json::Value =
+            serde_json::from_slice(&to_bytes(projected.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            projected["admission"]["predecessor_transcript_row_id"],
+            root.id
+        );
+        assert_eq!(projected["admission"]["phase"], "admitted");
+
+        for _ in 0..crate::db::AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+            state
+                .db
+                .record_automatic_continuation_no_progress(&root.id, "dispatch unavailable")
+                .await
+                .unwrap();
+        }
+        let failed = create_router(state)
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::OK);
+        let failed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(failed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(failed["admission"]["phase"], "failed");
+        assert_eq!(
+            failed["admission"]["actionable_failure"]["accepted_handoff"],
+            "persisted API handoff"
+        );
+        assert_eq!(
+            failed["admission"]["actionable_failure"]["first_message_id"],
+            "auto-api-opening"
+        );
+    }
+
+    #[tokio::test]
     async fn router_lists_one_ordinary_row_and_resolves_member_snapshot() {
         let state = make_test_state().await;
         let root = state
@@ -1126,23 +1517,23 @@ mod tests {
             format!("/product-conversations/{}", root.product_conversation_id)
         );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
-        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert_eq!(
             snapshot["segments"][0]["handoff"]["continuation_message_id"],
             "handoff"
-        );
-        assert_eq!(
-            snapshot["segments"][0]["handoff"]["accepted_successor_message_id"],
-            "opening"
         );
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(
-                |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
-            ));
+            .all(|message| message["message_id"] != "handoff"));
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .any(|message| message["message_id"] == "opening"));
         assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
         assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
         assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
@@ -1179,7 +1570,7 @@ mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "historical");
         assert!(snapshot["segments"]
             .as_array()
             .unwrap()
@@ -1617,7 +2008,10 @@ mod tests {
             }
         }
         seen.sort();
-        assert_eq!(seen, vec!["root-1", "successor-1", "successor-2"]);
+        assert_eq!(
+            seen,
+            vec!["opening", "root-1", "successor-1", "successor-2"]
+        );
         assert_eq!(seen_handoffs, vec!["root-handoff"]);
 
         state
@@ -1658,7 +2052,7 @@ mod tests {
             .flat_map(|segment| segment["messages"].as_array().unwrap())
             .map(|message| message["message_id"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(appended_ids, vec!["root-1"]);
+        assert_eq!(appended_ids, vec!["root-1", "opening"]);
     }
 
     #[tokio::test]

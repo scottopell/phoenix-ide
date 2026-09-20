@@ -704,6 +704,22 @@ export function buildConversationSearchProjection(
       case 'skill':
         addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageParts(unit.message));
         break;
+      case 'continuation': {
+        const summary = (unit.message.content as { summary?: string }).summary;
+        if (summary) {
+          addConversationSource(
+            sources,
+            unitIndex,
+            unit.kind,
+            unit.key,
+            'system-message',
+            summary,
+            'message-text',
+            { kind: 'message-text', fragmentId: 'message-text' },
+          );
+        }
+        break;
+      }
       case 'system':
         if (!isHiddenSystemMessage(unit.message)) {
           addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageParts(unit.message));

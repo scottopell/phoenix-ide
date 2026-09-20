@@ -154,6 +154,7 @@ enum AutoContinuationPhase {
     | ownership_transferred
     | dispatch_accepted
     | message_settled
+    | superseded
     | failed
 }
 enum ContinuationOpeningAuthority {
@@ -1383,7 +1384,7 @@ rule ProspectiveAutoContinuationSettingChanged {
 
 rule AdmittedAutomaticContinuationUsesManualOperation {
     when: AutomaticContinuationAdmissionRuns(admission, new_conv)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: admission.predecessor.parent_status = context_exhausted
     requires: admission.no_progress_attempts < config.max_auto_continuation_attempts_without_durable_progress
     ensures: ContinuationSuccessorOperationRuns(
@@ -1399,9 +1400,22 @@ rule AdmittedAutomaticContinuationUsesManualOperation {
         -- compare-and-commit and resolve to its winner.
 }
 
+rule ManualContinuationWinnerSupersedesAutomaticAdmission {
+    when: ContinuationSuccessorAttemptLosesRace(conversation, requested_handoff, first_message_id)
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
+        requires: conversation.continued_in_conv_id != absent
+        requires: not SuccessorOpeningAcceptedExactlyOnce(
+            conversation.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
+        requires: committed_successor_opening_message_id(conversation) != admission.first_message_id
+        ensures: admission.phase = superseded
+        ensures: not SafeManualContinuationRetryOffered(admission)
+}
+
 rule AutomaticContinuationDurablePhaseAdvances {
     when: AutomaticContinuationDurableProgress(admission, phase)
-    requires: admission.phase not in { message_settled, failed }
+    requires: admission.phase not in { message_settled, superseded, failed }
     requires: phase = next_auto_continuation_phase(admission.phase)
     ensures: admission.phase = phase
     ensures: admission.no_progress_attempts = 0
@@ -1433,20 +1447,18 @@ rule AutomaticContinuationBreakerPersistsActionableFailure {
     ensures: SafeManualContinuationRetryOffered(admission)
 }
 
-rule FailedAutomaticContinuationUsesAcceptedManualPayload {
+rule FailedAutomaticContinuationUsesPersistedWinner {
     when: UserRetriesFailedAutomaticContinuation(admission, new_conv)
     requires: admission.phase = failed
-    ensures: ContinuationSuccessorOperationRuns(
+    ensures: ContinuationSuccessorOperationRunsWithPersistedWinner(
         admission.predecessor,
         new_conv,
-        accepted_auto_continuation_payload(admission),
-        admission.first_message_id,
-        generated_predecessor_context)
+        admission)
 }
 
 rule ServerRestartResumesAdmittedAutomaticContinuation {
     when: ServerRestarted(conversation)
-    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, failed }:
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, superseded, failed }:
         ensures: AutomaticContinuationAdmissionRuns(admission, auto_continuation_successor_identity(admission))
 }
 
@@ -2351,6 +2363,16 @@ rule ModeChangeNotification {
 --       ownership; runtime acceptance of dispatch; or settlement of the opening
 --       message. It never infers progress from an in-memory attempt.
 --
+--   ContinuationSuccessorOperationRunsWithPersistedWinner(
+--       predecessor: Conversation,
+--       new_conv: Conversation,
+--       admission: AutoContinuationAdmission
+--   ) -> Boolean
+--       Runs or rearms the persisted winning continuation intent with its exact
+--       handoff bytes, message identity, opening authority, user agent, and
+--       matching expansion policy. If no winner has been reserved, it uses the
+--       admission's immutable generated payload and identity.
+--
 --   accepted_auto_continuation_payload(
 --       admission: AutoContinuationAdmission
 --   ) -> String
@@ -2369,9 +2391,10 @@ rule ModeChangeNotification {
 --       admission: AutoContinuationAdmission
 --   ) -> Boolean
 --       True when the persisted actionable failure offers explicit retry or
---       fallback through ContinuationSuccessorOperationRuns with the same
---       predecessor summary, first-message identity, and generated-context
---       authority.
+--       fallback through ContinuationSuccessorOperationRunsWithPersistedWinner,
+--       preserving the reserved winner's exact bytes, identity, authority, user
+--       agent, and matching expansion policy. Before reservation it uses the
+--       admission's immutable generated payload and identity.
 --
 --   auto_continuation_successor_identity(
 --       admission: AutoContinuationAdmission
@@ -2595,6 +2618,15 @@ invariant AutoContinuationAdmissionProvenanceMatchesOperation {
             continuation_summary_message_id(admission.continuation_operation_id)
         and admission.first_message_id =
             auto_continuation_first_message_id(admission.continuation_operation_id)
+}
+
+invariant SupersededAutoContinuationHasDifferentSuccessorAcceptance {
+    for admission in AutoContinuationAdmission where admission.phase = superseded:
+        admission.predecessor.continued_in_conv_id != absent
+        and not SuccessorOpeningAcceptedExactlyOnce(
+            admission.predecessor.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
 }
 
 invariant SettledAutoContinuationHasExactlyOneSuccessorAcceptance {

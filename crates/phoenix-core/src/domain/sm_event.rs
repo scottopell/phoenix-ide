@@ -65,6 +65,7 @@ impl DirectTurnAttemptAuthority {
 pub enum SubmittedDirectTurnExpansionPolicy {
     ExpandReferences,
     LiteralText,
+    GeneratedPredecessorContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +313,15 @@ impl PreparedDirectTurnPayload {
         crate::domain::db_schema::MessageContent,
         Option<serde_json::Value>,
     ) {
-        let content = if let Some(invocation) = &self.delivery.skill_invocation {
+        let content = if self.submitted.expansion_policy
+            == SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
+        {
+            crate::domain::db_schema::MessageContent::Continuation(
+                crate::domain::db_schema::ContinuationContent {
+                    summary: self.delivery.text.clone(),
+                },
+            )
+        } else if let Some(invocation) = &self.delivery.skill_invocation {
             crate::domain::db_schema::MessageContent::Skill(
                 crate::domain::db_schema::SkillContent {
                     name: invocation.name.clone(),
@@ -1352,6 +1361,22 @@ mod direct_turn_payload_tests {
                 if actual == PreparedDirectTurnPayload::VERSION + 1
                     && expected == PreparedDirectTurnPayload::VERSION
         ));
+    }
+
+    #[test]
+    fn generated_predecessor_context_materializes_as_typed_continuation() {
+        let payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-generated",
+                SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext,
+            ),
+            delivery("display summary", Some("authority-wrapped context")),
+        );
+        let (content, _) = payload.message_content_and_display_data();
+        let crate::domain::db_schema::MessageContent::Continuation(continuation) = content else {
+            panic!("expected typed continuation content");
+        };
+        assert_eq!(continuation.summary, "display summary");
     }
 
     #[test]
