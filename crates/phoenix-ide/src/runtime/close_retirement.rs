@@ -1382,6 +1382,17 @@ impl RuntimeManager {
                                     relation,
                                 });
                             }
+                            Err(CloseRetirementError::EvidenceInvariant {
+                                invariant,
+                                relation,
+                                ..
+                            }) => {
+                                return Err(CloseRetirementError::EvidenceInvariant {
+                                    scope: Some(scope.clone()),
+                                    invariant,
+                                    relation,
+                                });
+                            }
                             Err(error) => return Err(error),
                         }
                     } else {
@@ -3555,7 +3566,6 @@ where
         return Err(error);
     }
     if observe_identity(deletion_target)? != expected_identity {
-        let _ = std::fs::remove_dir(&tombstone_root);
         return Err(format!(
             "{description} identity changed before final deletion; replacement preserved at {}",
             deletion_target.display()
@@ -4140,6 +4150,11 @@ fn inspect_ambient_writer_until_quiescent(
             wait(policy.spacing);
         }
     }
+    if consecutive_clean > 0 {
+        return Err(
+            "ambient writer observation budget ended without two clean observations".to_string(),
+        );
+    }
     final_writer.map_or_else(
         || {
             Err(
@@ -4593,16 +4608,7 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 )
             };
             if bytes == 0 {
-                let error = std::io::Error::last_os_error();
-                if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
-                    break;
-                }
-                return Err(AmbientWriterIndeterminateDiagnostic {
-                    detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
-                    operation: AmbientWriterDiagnosticOperation::ReadMappings,
-                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
-                }
-                .marker());
+                break;
             }
             if bytes
                 != i32::try_from(size_of::<ProcRegionWithPathInfo>())
@@ -8681,20 +8687,19 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_clean_streak_preserves_the_last_writer() {
+    fn exhausted_clean_streak_is_not_reported_as_a_live_writer() {
         let mut observations = vec![
             super::ExternalWriterEvidence::NoPositiveEvidence,
             super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("transient")),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         ];
-        let evidence = super::inspect_ambient_writer_until_quiescent(
+        let error = super::inspect_ambient_writer_until_quiescent(
             observation_policy(3, 2, 0),
             || Ok(observations.pop().unwrap()),
             |_| {},
         )
-        .unwrap()
-        .expect("one final clean observation does not erase stable writer evidence");
-        assert_eq!(evidence.process_incarnation, "transient");
+        .expect_err("an incomplete clean streak is not a current live writer");
+        assert!(error.contains("without two clean observations"));
     }
 
     #[test]
