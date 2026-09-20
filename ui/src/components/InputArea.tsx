@@ -463,12 +463,17 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } catch (err) {
       const closeFenced = err instanceof ConflictError
         && err.detail.error_type === 'close_admission_fenced';
-      if (err instanceof ExpansionError && scopeKeyRef.current === submittedScopeKey) {
-        setExpansionError(err.detail.error);
-        const current = composerContentRef.current;
-        setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
-        setImages([...images, ...current.images]);
-        setFiles([...files, ...current.files]);
+      if (err instanceof ExpansionError) {
+        if (scopeKeyRef.current === submittedScopeKey) {
+          setExpansionError(err.detail.error);
+          const current = composerContentRef.current;
+          setDraft(current.draft.length > 0 ? `${text}\n${current.draft}` : text);
+          setImages([...images, ...current.images]);
+          setFiles([...files, ...current.files]);
+        } else {
+          // This render's callback remains bound to the submitted conversation's DraftStore key.
+          setDraft(text);
+        }
       } else if (closeFenced
         && scopeKeyRef.current === submittedScopeKey
         && !composerHasContentRef.current) {
