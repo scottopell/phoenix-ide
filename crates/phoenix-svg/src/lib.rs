@@ -952,7 +952,19 @@ fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
         "stroke-linejoin" => keyword(value, &["miter", "round", "bevel"])?,
         "fill-rule" | "clip-rule" => keyword(value, &["nonzero", "evenodd"])?,
         "text-anchor" => keyword(value, &["start", "middle", "end"])?,
-        "dominant-baseline" | "alignment-baseline" => keyword(
+        "dominant-baseline" => keyword(
+            value,
+            &[
+                "auto",
+                "alphabetic",
+                "middle",
+                "central",
+                "hanging",
+                "text-before-edge",
+                "text-after-edge",
+            ],
+        )?,
+        "alignment-baseline" => keyword(
             value,
             &[
                 "auto",
@@ -965,16 +977,7 @@ fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
                 "baseline",
             ],
         )?,
-        "font-family" => {
-            if value.is_empty()
-                || value.len() > 256
-                || !value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b" ,-_'\"".contains(&b))
-            {
-                return Err(policy("font-family supports simple local font names only."));
-            }
-        }
+        "font-family" => font_family(value)?,
         "font-style" => keyword(value, &["normal", "italic", "oblique"])?,
         "font-weight" => keyword(
             value,
@@ -1008,6 +1011,97 @@ fn presentation(name: &str, value: &str) -> Result<Option<LocalReference>> {
     }
     Ok(None)
 }
+fn font_family(value: &str) -> Result<()> {
+    let error = || {
+        policy("font-family requires 1–16 comma-separated local names (256 bytes maximum): quote numeric names, balance quotes, and use identifier words for unquoted names; inherit is allowed only alone.")
+    };
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" ,-_'\"".contains(&b))
+    {
+        return Err(error());
+    }
+    if value.eq_ignore_ascii_case("inherit") {
+        return Ok(());
+    }
+    let mut quote = None;
+    let mut start = 0;
+    let mut families = Vec::new();
+    for (index, ch) in value.char_indices() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == ',' {
+            families.push(value.get(start..index).ok_or_else(error)?);
+            start = index + 1;
+        }
+    }
+    if quote.is_some() {
+        return Err(error());
+    }
+    families.push(value.get(start..).ok_or_else(error)?);
+    if families.len() > 16 {
+        return Err(error());
+    }
+    for family in families {
+        let family = family.trim();
+        if let Some(delimiter) = family.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
+            let name = family
+                .strip_prefix(delimiter)
+                .and_then(|name| name.strip_suffix(delimiter))
+                .ok_or_else(error)?;
+            if name.trim().is_empty() || name.contains(['\'', '"']) {
+                return Err(error());
+            }
+        } else {
+            let mut words = family.split_ascii_whitespace();
+            let first = words.next().ok_or_else(error)?;
+            let first_lower = first.to_ascii_lowercase();
+            if matches!(
+                first_lower.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer" | "default"
+            ) {
+                return Err(error());
+            }
+            let rest: Vec<_> = words.collect();
+            let generic = matches!(
+                first_lower.as_str(),
+                "serif"
+                    | "sans-serif"
+                    | "monospace"
+                    | "cursive"
+                    | "fantasy"
+                    | "system-ui"
+                    | "ui-serif"
+                    | "ui-sans-serif"
+                    | "ui-monospace"
+                    | "ui-rounded"
+                    | "math"
+                    | "fangsong"
+            );
+            if (generic && !rest.is_empty())
+                || !std::iter::once(first).chain(rest).all(font_identifier)
+            {
+                return Err(error());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn font_identifier(value: &str) -> bool {
+    let mut bytes = value.strip_prefix('-').unwrap_or(value).bytes();
+    bytes
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && bytes.all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+
 fn stylesheet(mut value: &str, budget: &mut [usize; 3], elements: &[Node<'_, '_>]) -> Result<()> {
     while !value.trim().is_empty() {
         budget[0] += 1;
@@ -1636,5 +1730,65 @@ mod tests {
             assert!(validate(svg(body).as_bytes()).is_err(), "accepted {body}");
         }
         validate(svg(r##"<title>Title</title><desc>Description</desc><defs><path id="p" d="M0 0L1 1"/><clipPath id="c"><title>Clip</title><use href="#p"/><text>Clip text<tspan>x</tspan></text></clipPath><linearGradient><title>Gradient</title><stop offset="0"><desc>Stop</desc></stop></linearGradient></defs><g><rect width="10" height="10"><title>Rectangle</title></rect><text>Text<tspan>Span<tspan>Nested span</tspan></tspan></text></g>"##).as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn font_family_grammar_is_shared_by_attributes_inline_styles_and_stylesheets() {
+        let cases = [
+            ("Arial", true),
+            ("Times New Roman", true),
+            ("'Helvetica Neue', Arial, sans-serif", true),
+            ("\"123\", \"Font, With Comma\", monospace", true),
+            ("inherit", true),
+            ("-Local_Font", true),
+            ("Arial,,sans-serif", false),
+            ("123", false),
+            ("Arial 123", false),
+            ("'Arial", false),
+            ("Arial,", false),
+            (",Arial", false),
+            ("''", false),
+            ("'Arial' extra", false),
+            ("Arial, inherit", false),
+            ("inherit, Arial", false),
+            ("serif extra", false),
+            ("default", false),
+            ("initial", false),
+            ("--Font", false),
+        ];
+        for (value, accepted) in cases {
+            let escaped = value.replace('"', "&quot;");
+            let bodies = [
+                format!(r#"<text font-family="{escaped}">Label</text>"#),
+                format!(r#"<text style="font-family: {escaped}">Label</text>"#),
+                format!("<style>text {{font-family: {value}}}</style><text>Label</text>"),
+            ];
+            for body in bodies {
+                assert_eq!(
+                    validate(svg(&body).as_bytes()).is_ok(),
+                    accepted,
+                    "font family {value} in {body}"
+                );
+            }
+        }
+        let exact = std::iter::repeat_n("Arial", 16)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(font_family(&exact).is_ok());
+        assert!(font_family(&format!("{exact},Arial")).is_err());
+        assert!(font_family(&"A".repeat(256)).is_ok());
+        assert!(font_family(&"A".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn baseline_keywords_are_specific_to_each_property_in_every_style_surface() {
+        for body in [
+            r#"<text dominant-baseline="baseline">Label</text>"#,
+            r#"<text style="dominant-baseline: baseline">Label</text>"#,
+            r"<style>text {dominant-baseline: baseline}</style><text>Label</text>",
+        ] {
+            assert_eq!(rejected(body).category, ValidationCategory::Policy);
+        }
+        validate(svg(r#"<style>tspan {alignment-baseline: baseline}</style><text dominant-baseline="middle"><tspan alignment-baseline="baseline">A</tspan><tspan style="alignment-baseline: baseline">B</tspan><tspan>C</tspan></text>"#).as_bytes()).unwrap();
     }
 }

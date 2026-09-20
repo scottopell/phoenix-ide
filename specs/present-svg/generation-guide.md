@@ -68,6 +68,10 @@ Stylesheet applicability is checked for each selector and declaration. A selecto
 
 The profile follows the [SVG property applicability and inheritance model](https://www.w3.org/TR/SVG11/propidx.html) and restricts accepted combinations explicitly rather than relying on a browser to discard unsupported declarations.
 
+`font-family` accepts at most 16 comma-separated names in 256 bytes. Unquoted names contain one or more identifier words: each word starts with an ASCII letter or underscore, optionally preceded by one hyphen, followed by ASCII letters, digits, underscores or hyphens. Multiword names such as `Times New Roman` are supported. A generic family such as `sans-serif`, `serif`, or `monospace` stands alone within its list entry. Single- or double-quoted names allow ASCII letters, digits, spaces, underscores, hyphens and commas; quotes must balance, names must be nonempty, and quotes/escapes inside a name are unsupported. Thus `'Helvetica Neue', Arial, sans-serif` and `"123", serif` are accepted, while `Arial,,sans-serif`, bare `123`, and an unclosed quote are rejected. `inherit` is accepted only as the entire value; other CSS-wide/default keywords are outside this font-family subset.
+
+Baseline keywords are property-specific: `dominant-baseline` accepts `auto`, `alphabetic`, `middle`, `central`, `hanging`, `text-before-edge`, and `text-after-edge`. `alignment-baseline` accepts these plus `baseline`; `dominant-baseline: baseline` is rejected.
+
 ## Limits
 
 | Resource | Maximum |
