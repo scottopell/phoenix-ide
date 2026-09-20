@@ -52,6 +52,13 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
         self.assertNotIn("SCCACHE_CACHE_SIZE", env)
 
+    def test_auto_reports_none_when_no_backend_is_installed(self):
+        with mock.patch("builtins.print") as output:
+            selected, env = self.configure(installed=set())
+        self.assertEqual("none", selected)
+        self.assertNotIn("RUSTC_WRAPPER", env)
+        output.assert_called_once_with("  Compiler cache: none")
+
     def test_sccache_limit_warning_reports_running_server_mismatch(self):
         completed = mock.Mock(
             returncode=0,
@@ -157,9 +164,12 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev.shutil, "which", side_effect=lambda name: "/bin/kache" if name == "kache" else None
         ), mock.patch.object(
             self.dev, "_kache_version", return_value=("0.26.0", None)
-        ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"):
+        ), mock.patch.object(self.dev, "_ensure_kache_daemon", return_value="socket failed"), mock.patch(
+            "builtins.print"
+        ) as output:
             self.assertEqual("none", self.dev._configure_compiler_cache("auto"))
             self.assertNotIn("RUSTC_WRAPPER", os.environ)
+            output.assert_any_call("  Compiler cache: none")
 
     def test_explicit_kache_fails_when_daemon_fails(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -174,13 +184,25 @@ class CompilerCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "kache.*not installed"):
             self.configure("kache")
 
-    def test_kache_version_accepts_released_series(self):
+    def test_kache_version_accepts_qualified_release(self):
         with mock.patch.object(
             self.dev, "_command_version", return_value=("kache 0.26.0", None)
         ):
             self.assertEqual(("0.26.0", None), self.dev._kache_version("/bin/kache"))
 
-    def test_explicit_kache_rejects_unsupported_series(self):
+    def test_kache_version_rejects_unqualified_patch_and_prerelease(self):
+        for output, expected in (
+            ("kache 0.26.1", "unsupported"),
+            ("kache 0.26.0-rc1", "unrecognized"),
+        ):
+            with self.subTest(output=output), mock.patch.object(
+                self.dev, "_command_version", return_value=(output, None)
+            ):
+                version, error = self.dev._kache_version("/bin/kache")
+                self.assertIsNone(version)
+                self.assertIn(expected, error or "")
+
+    def test_explicit_kache_rejects_unsupported_release(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             self.dev.shutil, "which", side_effect=lambda name: "/bin/kache" if name == "kache" else None
         ), mock.patch.object(

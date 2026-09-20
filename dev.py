@@ -4837,7 +4837,7 @@ def _append_git_config_override(key, value, environ=None):
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
 
 
-_SUPPORTED_KACHE_SERIES = (0, 26)
+_SUPPORTED_KACHE_VERSION = "0.26.0"
 
 
 def _command_version(binary: str) -> tuple[str | None, str | None]:
@@ -4861,13 +4861,12 @@ def _kache_version(binary: str) -> tuple[str | None, str | None]:
     if error:
         return None, error
     assert detail is not None
-    match = re.fullmatch(r"kache (\d+)\.(\d+)\.(\d+)(?:[-+].*)?", detail)
+    match = re.fullmatch(r"kache (\d+\.\d+\.\d+)", detail)
     if match is None:
         return None, f"unrecognized version output: {detail}"
-    version = ".".join(match.groups())
-    series = tuple(int(part) for part in match.groups()[:2])
-    if series != _SUPPORTED_KACHE_SERIES:
-        return None, f"unsupported kache {version}; Phoenix supports released kache 0.26.x"
+    version = match.group(1)
+    if version != _SUPPORTED_KACHE_VERSION:
+        return None, f"unsupported kache {version}; Phoenix supports released kache 0.26.0"
     return version, None
 
 
@@ -4954,6 +4953,7 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
         else:
             if kache_error:
                 print(f"  ⚠ kache unavailable; continuing without compiler cache: {kache_error}")
+            print("  Compiler cache: none")
             return "none"
     elif backend == "kache":
         if not kache_binary:
@@ -4985,6 +4985,7 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
                 print("  Compiler cache: sccache")
                 return "sccache"
             print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
+            print("  Compiler cache: none")
             return "none"
         print(f"  Compiler cache: kache {kache_version}")
     else:

@@ -18,14 +18,14 @@ A controlled devmbp comparison shows a genuine tradeoff. Kache has higher cold-p
 
 ## Decision
 
-Automatic compiler-cache selection prefers Kache when the executable reports the supported released `0.26.x` command series and its daemon starts successfully. It otherwise falls through to sccache and then no cache, reporting the actual backend and fallback reason. Explicit Kache or sccache requests fail when unusable instead of changing backend. Explicit `none` and `RUSTC_WRAPPER` remain authoritative.
+Automatic compiler-cache selection prefers Kache when the executable reports the qualified released `0.26.0` version and its daemon starts successfully. It otherwise falls through to sccache and then no cache, reporting the actual backend and fallback reason. Explicit Kache or sccache requests fail when unusable instead of changing backend. Explicit `none` and `RUSTC_WRAPPER` remain authoritative.
 
-The same selector owns checks, ordinary development builds, and production build preparation. Phoenix does not install cache tools, configure remotes, purge storage, or promise an acceleration. Support for another Kache command series requires deliberate qualification rather than assumed cross-version compatibility.
+The same selector owns checks, ordinary development builds, and production build preparation. Phoenix does not install cache tools, configure remotes, purge storage, or promise an acceleration. Support for another Kache release requires deliberate qualification rather than assumed cross-version compatibility.
 
 ## Consequences
 
 - **Positive:** Phoenix's default matches its isolated multi-worktree build shape, and fallback cannot be mislabeled as Kache.
-- **Negative:** A first build can take longer with Kache, and each new Kache command series needs explicit qualification.
+- **Negative:** A first build can take longer with Kache, and each new Kache release needs explicit qualification.
 - **Neutral:** sccache remains available explicitly and as automatic fallback; environments without either tool continue uncached.
 
 ## References

@@ -4,7 +4,7 @@ Phoenix uses one compiler-cache selection path for Rust checks, ordinary develop
 
 ## Installation
 
-Phoenix supports the released Kache `0.26.x` command contract. Download the archive for the host architecture from the immutable [Kache v0.26.0 release](https://github.com/kunobi-ninja/kache/releases/tag/v0.26.0), verify its adjacent SHA-256 file, and put `kache` on `PATH`. `PHOENIX_KACHE_BIN=/absolute/path/to/kache` selects a verified executable outside `PATH`. Kache's interactive `init` is not required because `dev.py` provides `RUSTC_WRAPPER`, starts the daemon, and supplies a short private socket when an isolated `KACHE_CACHE_DIR` is used.
+Phoenix supports the qualified released Kache `0.26.0` command contract. Download the archive for the host architecture from the immutable [Kache v0.26.0 release](https://github.com/kunobi-ninja/kache/releases/tag/v0.26.0), verify its adjacent SHA-256 file, and put `kache` on `PATH`. `PHOENIX_KACHE_BIN=/absolute/path/to/kache` selects a verified executable outside `PATH`. Kache's interactive `init` is not required because `dev.py` provides `RUSTC_WRAPPER`, starts the daemon, and supplies a short private socket when an isolated `KACHE_CACHE_DIR` is used.
 
 `sccache` remains supported when its executable is on `PATH`. Run `./dev.py doctor` to see the detected cache tools and versions; both are optional development prerequisites.
 
