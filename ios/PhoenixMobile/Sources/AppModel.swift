@@ -618,27 +618,64 @@ final class AppModel {
     }
 
     private func rehydratePendingProductCloseConfirmation(api: PhoenixAPI) async {
-        guard pendingProductCloseConfirmation == nil else { return }
-        let fenceIdentity = "pending-close-confirmation"
-        let rehydrationGeneration = confirmationRehydrationGenerations.begin(
-            productConversationId: fenceIdentity)
-        let startedGeneration = apiGeneration
+        await rehydratePendingProductCloseConfirmation { productConversationId in
+            try await api.getProductConversation(reference: productConversationId)
+        }
+    }
+
+    private func rehydratePendingProductCloseConfirmation(
+        fetch: (String) async throws -> ProductConversationSnapshot
+    ) async {
         let activeCloseIds = Set(listStore.conversations.compactMap { row in
             row.product_close_action == .unavailable(reason: .active_close_attempt)
                 ? row.aggregateIdentity : nil
         }).union(closeConfirmationReconciliationProductConversationIds)
+        for productConversationId in activeCloseIds {
+            setProductCloseAdmissionFence(
+                productConversationId: productConversationId,
+                fenced: true)
+        }
+        guard pendingProductCloseConfirmation == nil else { return }
+
+        let fenceIdentity = "pending-close-confirmation"
+        let rehydrationGeneration = confirmationRehydrationGenerations.begin(
+            productConversationId: fenceIdentity)
+        let startedGeneration = apiGeneration
+        var selectedConfirmation: PendingProductCloseConfirmation?
         for productConversationId in activeCloseIds.sorted() {
-            guard let snapshot = try? await api.getProductConversation(reference: productConversationId),
+            guard let snapshot = try? await fetch(productConversationId),
+                  !Task.isCancelled,
                   apiGeneration == startedGeneration,
                   pendingProductCloseConfirmation == nil,
                   confirmationRehydrationGenerations.isCurrent(
                     rehydrationGeneration, productConversationId: fenceIdentity)
             else { continue }
-            completeCloseConfirmationReconciliation(
-                snapshot,
-                productConversationId: productConversationId)
-            if pendingProductCloseConfirmation != nil { return }
+
+            closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
+            if let confirmation = PendingProductCloseConfirmation(snapshot: snapshot) {
+                selectedConfirmation = selectedConfirmation ?? confirmation
+                setProductCloseAdmissionFence(
+                    productConversationId: productConversationId,
+                    fenced: true)
+            } else if snapshot.close != nil
+                        && !PendingProductCloseConfirmation.isCompleted(snapshot: snapshot)
+            {
+                setProductCloseAdmissionFence(
+                    productConversationId: productConversationId,
+                    fenced: true)
+            } else {
+                setProductCloseAdmissionFence(
+                    productConversationId: productConversationId,
+                    fenced: false)
+            }
         }
+        guard !Task.isCancelled,
+              apiGeneration == startedGeneration,
+              pendingProductCloseConfirmation == nil,
+              confirmationRehydrationGenerations.isCurrent(
+                rehydrationGeneration, productConversationId: fenceIdentity)
+        else { return }
+        pendingProductCloseConfirmation = selectedConfirmation
     }
 
     // MARK: - Needs-attention nudges
@@ -1358,7 +1395,44 @@ final class AppModel {
 
     #if DEBUG
     func installAPIForTesting(baseURL: URL = URL(string: "http://127.0.0.1:1")!) {
+        apiGeneration &+= 1
+        aggregateEventTask?.cancel()
+        aggregateEventTask = nil
+        aggregateEventTaskId = nil
+        cancelAggregateReconciliation()
         api = PhoenixAPI(baseURL: baseURL, password: nil, allowSelfSigned: false)
+    }
+
+    var apiGenerationForTesting: Int { apiGeneration }
+
+    func prepareAggregateReconciliationForTesting() -> UUID {
+        cancelAggregateReconciliation()
+        let id = UUID()
+        aggregateReconciliationId = id
+        return id
+    }
+
+    func applyAggregateListForReconciliationForTesting(
+        _ fresh: [Conversation],
+        reconciliationId: UUID
+    ) -> Bool {
+        applyAggregateListForReconciliation(
+            fresh,
+            startedAt: listStore.externalRefreshToken(),
+            startedGeneration: apiGeneration,
+            reconciliationId: reconciliationId)
+    }
+
+    func rehydratePendingProductCloseConfirmationForTesting(
+        fetch: (String) async throws -> ProductConversationSnapshot
+    ) async {
+        await rehydratePendingProductCloseConfirmation(fetch: fetch)
+    }
+
+    var attentionEvidenceGenerationForTesting: Int { attentionEvidenceGeneration }
+
+    func seedForegroundAttentionForTesting() {
+        seedForegroundAttention()
     }
 
     func cancelAggregateReconciliationForTesting() {
@@ -1606,7 +1680,7 @@ final class AppModel {
         aggregateReconciliationId = id
         let task = Task { [weak self] in
             guard let self else { return false }
-            let reconciled = await self.reconcileListThenResumeAndDrain()
+            let reconciled = await self.reconcileListThenResumeAndDrain(reconciliationId: id)
             guard self.aggregateReconciliationId == id else { return false }
             self.aggregateReconciliationTask = nil
             self.aggregateReconciliationId = nil
@@ -1661,7 +1735,29 @@ final class AppModel {
         return nil
     }
 
-    private func reconcileListThenResumeAndDrain() async -> Bool {
+    private func applyAggregateListForReconciliation(
+        _ fresh: [Conversation],
+        startedAt token: ConversationListStore.ExternalRefreshToken,
+        startedGeneration: Int,
+        reconciliationId: UUID
+    ) -> Bool {
+        guard !Task.isCancelled,
+              aggregateReconciliationId == reconciliationId,
+              apiGeneration == startedGeneration,
+              connectivity.isOnline,
+              isForeground
+        else { return false }
+        return listStore.applyExternal(fresh, startedAt: token)
+    }
+
+    private func seedForegroundAttention() {
+        attentionEvidenceGeneration &+= 1
+        attention.seedOrdinary(
+            with: listStore.conversations,
+            preservingAggregateIds: rememberedCoordinatorAggregateIds())
+    }
+
+    private func reconcileListThenResumeAndDrain(reconciliationId: UUID) async -> Bool {
         guard let api, connectivity.isOnline, isForeground else { return false }
         let startedGeneration = apiGeneration
         let locallyOwned = locallyOwnedOrdinaryAggregates()
@@ -1671,16 +1767,18 @@ final class AppModel {
                 guard let self else { return nil }
                 let token = self.listStore.externalRefreshToken()
                 let fresh = try await api.listConversations()
-                guard self.apiGeneration == startedGeneration,
-                      self.connectivity.isOnline,
-                      self.isForeground,
-                      self.listStore.applyExternal(fresh, startedAt: token)
+                guard self.applyAggregateListForReconciliation(
+                    fresh,
+                    startedAt: token,
+                    startedGeneration: startedGeneration,
+                    reconciliationId: reconciliationId)
                 else { return nil }
                 return fresh
             },
             canContinue: { [weak self] in
                 guard let self else { return false }
-                return self.apiGeneration == startedGeneration
+                return self.aggregateReconciliationId == reconciliationId
+                    && self.apiGeneration == startedGeneration
                     && self.connectivity.isOnline
                     && self.isForeground
             },
@@ -1706,10 +1804,11 @@ final class AppModel {
               isForeground
         else { return false }
         await rehydratePendingProductCloseConfirmation(api: api)
-        guard apiGeneration == startedGeneration else { return false }
-        attention.seedOrdinary(
-            with: listStore.conversations,
-            preservingAggregateIds: rememberedCoordinatorAggregateIds())
+        guard !Task.isCancelled,
+              aggregateReconciliationId == reconciliationId,
+              apiGeneration == startedGeneration
+        else { return false }
+        seedForegroundAttention()
         if isForeground {
             for session in sessions.values { session.resyncAfterForeground() }
             for session in drainSessions.values { session.resyncAfterForeground() }
