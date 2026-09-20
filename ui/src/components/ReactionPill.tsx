@@ -86,6 +86,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const pillWidth = Math.min(420, width - 24);
       el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
+      if (touchDocked) scroller.style.setProperty('--reaction-dock-height', `${height + 12}px`);
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
@@ -100,6 +101,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       el.style.top = `${Math.max(top + 12, Math.min(y, bottom - height - 12))}px`;
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(position); };
+    if (touchDocked) scroller.classList.add('reaction-dock-reserved');
     position();
     const mutations = new MutationObserver(schedule);
     mutations.observe(scroller, { childList: true, subtree: true });
@@ -115,6 +117,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     window.visualViewport?.addEventListener('scroll', schedule);
     return () => {
       cancelAnimationFrame(frame);
+      scroller.classList.remove('reaction-dock-reserved');
+      scroller.style.removeProperty('--reaction-dock-height');
       mutations.disconnect();
       resize.disconnect();
       window.removeEventListener('scroll', schedule, true);
@@ -171,7 +175,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
             <>
               {touchDocked && (sourceDocked ? (
                 <button type="button" className="reaction-pill-source" aria-label={`Return to passage: ${source.quote}`} title="Return to passage" onClick={returnToPassage} disabled={returnPending}>
-                  {returnPending ? 'Returning…' : `“${source.quote}”`}
+                  {returnPending ? 'Returning…' : error || `“${source.quote}”`}
                 </button>
               ) : (
                 <span className="reaction-pill-source" title={source.quote}>“{source.quote}”</span>

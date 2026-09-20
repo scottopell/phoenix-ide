@@ -110,6 +110,27 @@ describe('reaction pill', () => {
     await act(async () => { finish(false); });
   });
 
+  it('shows touch users a retryable source-return failure', async () => {
+    navigate.mockResolvedValue(false);
+    render(<Fixture mounted={false} touchDocked />);
+    fireEvent.click(screen.getByRole('button', { name: /Return to passage/ }));
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Passage unavailable. Your reaction is saved here.');
+  });
+
+  it('reserves transcript space equal to the touch dock height and releases it on unmount', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const view = render(<Fixture touchDocked />);
+    const scroller = document.getElementById('messages')!;
+    expect(scroller).toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('66px');
+    view.unmount();
+    expect(scroller).not.toHaveClass('reaction-dock-reserved');
+    expect(scroller.style.getPropertyValue('--reaction-dock-height')).toBe('');
+  });
+
   it('automatically undocks on manual return and preserves the same one-line editor for long text', async () => {
     const body = 'A detailed reaction '.repeat(40);
     render(<Fixture body={body} />);
