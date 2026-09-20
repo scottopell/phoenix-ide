@@ -446,13 +446,7 @@ pub async fn delete_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-
-    let root = state
-        .db
-        .get_conversation(&root_id)
-        .await
-        .map_err(db_to_app)?;
+    let root = validate_aggregate_delete_root(&state, &root_id).await?;
     let product_conversation_id = root.product_conversation_id.to_string();
     let member_ids = state
         .db
@@ -626,6 +620,23 @@ pub async fn stream_chain(
 ///
 /// Mirrors the check in `ChainQa::prepare_invocation` so failures are
 /// surfaced as 404 here instead of bubbling up as 500 from the Q&A backend.
+async fn validate_aggregate_delete_root(
+    state: &AppState,
+    root_id: &str,
+) -> Result<Conversation, AppError> {
+    let root =
+        state.db.get_conversation(root_id).await.map_err(|_| {
+            AppError::NotFound(format!("no ProductConversation rooted at {root_id}"))
+        })?;
+    let canonical_root = state.db.chain_root_of(root_id).await.map_err(db_to_app)?;
+    if canonical_root.as_deref() != Some(root_id) || !root.user_initiated {
+        return Err(AppError::NotFound(format!(
+            "no ProductConversation rooted at {root_id}"
+        )));
+    }
+    Ok(root)
+}
+
 async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppError> {
     if let Some(coordinator_id) = state
         .db

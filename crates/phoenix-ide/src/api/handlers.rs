@@ -139,6 +139,10 @@ pub fn create_router(state: AppState) -> Router {
             get(list_product_conversations),
         )
         .route(
+            "/api/product-conversations/events",
+            get(stream_aggregate_events),
+        )
+        .route(
             "/api/product-conversations/creation",
             get(list_product_conversation_creations),
         )
@@ -4305,6 +4309,10 @@ async fn read_stream_init_messages_with_tail(
     ))
 }
 
+async fn stream_aggregate_events(State(state): State<AppState>) -> impl IntoResponse {
+    super::sse::aggregate_event_stream(state.runtime.subscribe_aggregate_events())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -6571,21 +6579,21 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
 
 pub(super) async fn broadcast_aggregate_hard_deleted(
     state: &AppState,
-    root_id: &str,
+    _root_id: &str,
     product_conversation_id: &str,
     deleted_conversation_ids: Vec<String>,
 ) {
-    if let Some(handle) = state.runtime.try_get_handle(root_id).await {
-        let _ = handle.broadcast_tx.send_hard_deleted_and_close(
-            product_conversation_id.to_string(),
-            deleted_conversation_ids.clone(),
-        );
-    }
-    if let Some(tx) = state.runtime.take_evicted_broadcaster(root_id).await {
-        let _ = tx.send_hard_deleted_and_close(
-            product_conversation_id.to_string(),
-            deleted_conversation_ids,
-        );
+    state.runtime.publish_aggregate_hard_deleted(
+        product_conversation_id.to_string(),
+        deleted_conversation_ids.clone(),
+    );
+    for member_id in deleted_conversation_ids {
+        if let Some(handle) = state.runtime.try_get_handle(&member_id).await {
+            handle.broadcast_tx.close_publication();
+        }
+        if let Some(tx) = state.runtime.take_evicted_broadcaster(&member_id).await {
+            tx.close_publication();
+        }
     }
 }
 
@@ -13958,7 +13966,7 @@ pub(crate) mod hard_delete_cascade_tests {
             root.product_conversation_id
         );
         mark_chain_history(&state, "cd-a").await;
-        let mut events = state.runtime.subscribe("cd-a").await.expect("subscribe");
+        let mut events = state.runtime.subscribe_aggregate_events();
 
         let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),

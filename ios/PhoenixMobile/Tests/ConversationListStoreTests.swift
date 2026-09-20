@@ -116,9 +116,13 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(store.conversations.count, 1)
         XCTAssertEqual(store.conversations.first?.aggregateIdentity, "pc-1")
         XCTAssertEqual(store.conversations.first?.archived, true)
+        XCTAssertEqual(store.conversations.first?.presentation_mode, "done")
+        XCTAssertEqual(store.conversations.first?.requires_action, false)
 
         let reloaded = ConversationListStore()
         XCTAssertEqual(reloaded.conversations.first?.archived, true)
+        XCTAssertEqual(reloaded.conversations.first?.presentation_mode, "done")
+        XCTAssertEqual(reloaded.conversations.first?.requires_action, false)
     }
 
     @MainActor

@@ -106,7 +106,7 @@ final class ConversationListStore {
         for (id, conversation) in upserts where !exclusions.contains(id) {
             byId[id] = conversation
         }
-        return Array(byId.values)
+        return byId.values.map(Self.terminalizingHistory)
     }
 
     private func rebuildIndexes(from cache: Cache) {
@@ -156,9 +156,9 @@ final class ConversationListStore {
         })
         return fresh.map { incoming in
             guard let existing = existingByAggregate[incoming.aggregateIdentity] else {
-                return incoming
+                return Self.terminalizingHistory(incoming)
             }
-            return Conversation(
+            return Self.terminalizingHistory(Conversation(
                 id: incoming.id,
                 product_conversation_id: incoming.product_conversation_id,
                 chain_root_id: incoming.chain_root_id,
@@ -180,8 +180,16 @@ final class ConversationListStore {
                 presentation_mode: incoming.presentation_mode,
                 requires_action: incoming.requires_action,
                 transcript_generation: incoming.transcript_generation,
-                runtime_role: incoming.runtime_role)
+                runtime_role: incoming.runtime_role))
         }
+    }
+
+    nonisolated static func terminalizingHistory(_ conversation: Conversation) -> Conversation {
+        guard conversation.archived == true else { return conversation }
+        var history = conversation
+        history.presentation_mode = "done"
+        history.requires_action = false
+        return history
     }
 
     private func apply(_ fresh: [Conversation]) {
@@ -227,6 +235,7 @@ final class ConversationListStore {
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
+        let conversation = Self.terminalizingHistory(conversation)
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
         let aggregateIdentity = conversation.aggregateIdentity
@@ -280,8 +289,8 @@ final class ConversationListStore {
             product_close_action: nil,
             project_name: existing.project_name,
             conv_mode_label: existing.conv_mode_label,
-            presentation_mode: existing.presentation_mode,
-            requires_action: existing.requires_action,
+            presentation_mode: "done",
+            requires_action: false,
             transcript_generation: existing.transcript_generation,
             runtime_role: existing.runtime_role))
     }

@@ -9,6 +9,65 @@ import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
 
 const POLL_INTERVAL_MS = 5000;
+const AGGREGATE_EVENT_RETRY_MAX_MS = 30_000;
+
+export function subscribeToAggregateDeletionEvents(): () => void {
+  let source: EventSource | null = null;
+  let retryTimer: number | null = null;
+  let retryDelayMs = 1_000;
+  let stopped = false;
+
+  const connect = () => {
+    if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
+    source = new EventSource('/api/product-conversations/events');
+    source.addEventListener('conversation_hard_deleted', (event) => {
+      let payload: unknown;
+      try {
+        payload = JSON.parse((event as MessageEvent<string>).data);
+      } catch {
+        return;
+      }
+      if (
+        typeof payload !== 'object' || payload === null
+        || typeof (payload as { conversation_id?: unknown }).conversation_id !== 'string'
+        || !Array.isArray((payload as { deleted_conversation_ids?: unknown }).deleted_conversation_ids)
+        || !(payload as { deleted_conversation_ids: unknown[] }).deleted_conversation_ids.every(
+          (id) => typeof id === 'string',
+        )
+      ) return;
+      retryDelayMs = 1_000;
+      const data = payload as { conversation_id: string; deleted_conversation_ids: string[] };
+      window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+        detail: {
+          conversationId: data.conversation_id,
+          deletedConversationIds: data.deleted_conversation_ids,
+        },
+      }));
+    });
+    source.onerror = () => {
+      source?.close();
+      source = null;
+      if (stopped || retryTimer !== null) return;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, retryDelayMs);
+      retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+    };
+  };
+
+  const handleOnline = () => {
+    if (!stopped && source === null && retryTimer === null) connect();
+  };
+  window.addEventListener('online', handleOnline);
+  connect();
+  return () => {
+    stopped = true;
+    source?.close();
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    window.removeEventListener('online', handleOnline);
+  };
+}
 
 /**
  * Pure refresh implementation. Reconciles the store with the cache and
@@ -171,6 +230,8 @@ export function useConversationsRefreshDriver(): void {
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(() => subscribeToAggregateDeletionEvents(), []);
 
   // REQ-BED-032: hard-delete cascade. The per-conversation SSE channel
   // emits this after the row is gone server-side. Remove the atom

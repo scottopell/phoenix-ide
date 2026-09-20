@@ -546,6 +546,7 @@ pub struct RuntimeManager {
     /// it. Without inheritance the clients would sit on a dead channel until
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
+    aggregate_event_tx: broadcast::Sender<SseEvent>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
@@ -2179,6 +2180,7 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
+        let (aggregate_event_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
@@ -2239,6 +2241,7 @@ impl RuntimeManager {
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
+            aggregate_event_tx,
             startup_obligated_conversations: RwLock::new(HashSet::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -6012,6 +6015,24 @@ impl RuntimeManager {
             .write()
             .await
             .remove(conversation_id)
+    }
+
+    pub fn subscribe_aggregate_events(&self) -> broadcast::Receiver<SseEvent> {
+        self.aggregate_event_tx.subscribe()
+    }
+
+    pub fn publish_aggregate_hard_deleted(
+        &self,
+        product_conversation_id: String,
+        deleted_conversation_ids: Vec<String>,
+    ) {
+        let _ = self
+            .aggregate_event_tx
+            .send(SseEvent::ConversationHardDeleted {
+                sequence_id: 0,
+                conversation_id: product_conversation_id,
+                deleted_conversation_ids,
+            });
     }
 
     /// Determine the resume state for a conversation.

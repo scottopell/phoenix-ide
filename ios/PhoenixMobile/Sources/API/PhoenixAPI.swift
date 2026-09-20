@@ -456,18 +456,8 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
-    func deleteConversation(reference: String, chainRootId: String?) async throws {
-        let path = if let chainRootId {
-            "api/chains/\(chainRootId)"
-        } else {
-            "api/conversations/\(reference)"
-        }
-        var request = try request(path: path)
-        if chainRootId == nil {
-            struct OkResponse: Codable { var ok: Bool? }
-            _ = try await post("api/conversations/\(reference)/delete", body: [:], as: OkResponse.self)
-            return
-        }
+    func deleteProductConversation(rootTranscriptRowId: String) async throws {
+        var request = try request(path: "api/chains/\(rootTranscriptRowId)")
         request.httpMethod = "DELETE"
         let (data, response) = try await session.data(for: request)
         try validateStatus(response, data: data)
@@ -566,6 +556,26 @@ struct PhoenixAPI: Sendable {
     }
 
     // MARK: - SSE
+
+    func openProductConversationEventStream() async throws -> URLSession.AsyncBytes {
+        var req = try request(path: "api/product-conversations/events")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 90
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await streamSession.bytes(for: req, delegate: trustDelegate)
+        } catch {
+            if hasCertificatePinMismatch { throw APIError.certificatePinMismatch }
+            throw APIError.transport(underlying: error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport(underlying: URLError(.badServerResponse))
+        }
+        guard http.statusCode == 200 else {
+            throw APIError.http(status: http.statusCode, body: "")
+        }
+        return bytes
+    }
 
     /// Open the conversation event stream. The caller consumes raw bytes via
     /// SSEParser; each (re)connect delivers a fresh `init` snapshot including

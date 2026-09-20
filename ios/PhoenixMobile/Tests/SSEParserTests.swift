@@ -33,6 +33,18 @@ final class SSEParserTests: XCTestCase {
         return out
     }
 
+    func testAggregateDeletionEventDecodesExactMemberSet() {
+        let frame = SSEFrame(
+            event: "conversation_hard_deleted",
+            data: #"{"sequence_id":0,"conversation_id":"product","deleted_conversation_ids":["root","leaf"]}"#)
+
+        XCTAssertEqual(
+            ProductConversationDeletionEvent.decode(frame: frame),
+            ProductConversationDeletionEvent(
+                conversation_id: "product",
+                deleted_conversation_ids: ["root", "leaf"]))
+    }
+
     func testNamedEventWithDataDispatchesOnBlankLine() {
         let out = frames(from: "event: message\ndata: {\"a\":1}\n\n")
         XCTAssertEqual(out.count, 1)
