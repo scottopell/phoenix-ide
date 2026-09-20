@@ -9423,6 +9423,34 @@ def _linux_musl_target() -> str:
     return f"{architecture}-unknown-linux-musl"
 
 
+_RELEASE_VERSION_NUMBER = r"(?:0|[1-9][0-9]*)"
+_RELEASE_TAG_RE = re.compile(
+    rf"v({_RELEASE_VERSION_NUMBER})\.({_RELEASE_VERSION_NUMBER})\.({_RELEASE_VERSION_NUMBER})"
+    rf"(?:-rc\.({_RELEASE_VERSION_NUMBER}))?"
+)
+
+
+def _parse_supported_release_tag(tag: str) -> tuple[str, bool]:
+    match = _RELEASE_TAG_RE.fullmatch(tag)
+    if match is None:
+        raise SystemExit(
+            f"unsupported release tag {tag!r}; expected vX.Y.Z or vX.Y.Z-rc.N"
+        )
+    major, minor, patch = (int(part) for part in match.group(1, 2, 3))
+    rc = int(match.group(4)) if match.group(4) is not None else None
+    if major >= 9_999 or minor >= 100 or patch >= 99:
+        raise SystemExit(f"unsupported release tag {tag!r}; version components exceed release bounds")
+    if rc is not None and not 1 <= rc <= 98:
+        raise SystemExit(
+            f"unsupported release tag {tag!r}; release candidate number must be between 1 and 98"
+        )
+    if rc is not None and (major, minor, patch) < (0, 13, 0):
+        raise SystemExit(
+            f"unsupported release tag {tag!r}; release candidates require version 0.13.0 or newer"
+        )
+    return tag.removeprefix("v"), rc is not None
+
+
 def _release_asset_name() -> str:
     import platform
 
@@ -9454,6 +9482,9 @@ def _prepare_release_candidate(
 ) -> PreparedCandidate:
     if expected_full_commit is not None and requested == "latest":
         raise SystemExit("controller mode requires an exact release tag, not 'latest'")
+    requested_is_prerelease = (
+        False if requested == "latest" else _parse_supported_release_tag(requested)[1]
+    )
     if requested == "latest":
         view = subprocess.run(
             ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease,isDraft"],
@@ -9468,10 +9499,21 @@ def _prepare_release_candidate(
     tag = release["tagName"]
     if release.get("isDraft"):
         raise SystemExit("release candidate must be public; private drafts are not deployable")
-    if requested == "latest" and release.get("isPrerelease"):
-        raise SystemExit("latest resolved to a prerelease; name an exact prerelease tag to opt in")
     if requested != "latest" and tag != requested:
         raise SystemExit(f"release resolution mismatch: requested {requested}, resolved {tag}")
+    resolved_version, resolved_is_prerelease = _parse_supported_release_tag(tag)
+    metadata_is_prerelease = release.get("isPrerelease")
+    if requested == "latest":
+        if resolved_is_prerelease or metadata_is_prerelease is not False:
+            raise SystemExit(
+                "latest must resolve to a stable supported release; "
+                "name an exact prerelease tag to opt in"
+            )
+    elif metadata_is_prerelease is not requested_is_prerelease:
+        expected_metadata = "true" if requested_is_prerelease else "false"
+        raise SystemExit(
+            f"release metadata mismatch: {tag} requires isPrerelease={expected_metadata}"
+        )
 
     if expected_full_commit is None:
         commit_result = subprocess.run(
@@ -9524,10 +9566,9 @@ def _prepare_release_candidate(
         raise SystemExit(f"checksum mismatch for release asset {asset_name}")
     binary.chmod(0o755)
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
-    expected_version = tag.removeprefix("v")
-    if identity.version != expected_version:
+    if identity.version != resolved_version:
         raise SystemExit(
-            f"release {tag} embeds version {identity.version}, expected {expected_version}"
+            f"release {tag} embeds version {identity.version}, expected {resolved_version}"
         )
     if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")

@@ -66,8 +66,37 @@ THE SYSTEM SHALL refuse the release from the current commit.
 
 ## REQ-DESKTOP-REL-008 — Stamp release-specific app versions truthfully
 
-WHEN packaging a desktop release for tag `vX.Y.Z`,
-THE SYSTEM SHALL use `MARKETING_VERSION=X.Y.Z`,
-SHALL use a deterministic dotted `CURRENT_PROJECT_VERSION` whose positive major component equals `X+1` and has at most four digits and whose minor and patch components equal `Y` and `Z` and each have at most two digits,
-SHALL reject a version outside those bounds before packaging or publication and before creating a release tag,
-AND SHALL verify the built app carries those exact resolved values before publication.
+WHEN packaging a desktop release for a supported stable `X.Y.Z` or release-candidate `X.Y.Z-rc.N` version,
+THE SYSTEM SHALL reject the release before tag creation unless `X < 9999`, `Y < 100`, `Z < 99`, and any release-candidate number satisfies `1 <= N <= 98`,
+SHALL use `MARKETING_VERSION=X.Y.Z`,
+SHALL map versions before `0.13.0` to the established numeric `CURRENT_PROJECT_VERSION=X+1.Y.Z`,
+SHALL map `X.Y.Z-rc.N` to `CURRENT_PROJECT_VERSION=X+1.Y.(Z*100+N)`,
+SHALL map final stable `X.Y.Z` versions at or after `0.13.0` to `CURRENT_PROJECT_VERSION=X+1.Y.(Z*100+99)`,
+AND SHALL verify the built app carries both exact resolved values before publication.
+
+The authoritative helper and release identity SHALL remain the complete SemVer, including `-rc.N`; numeric Apple bundle fields SHALL NOT replace it.
+
+## REQ-DESKTOP-REL-009 — Bound release channels to validated versions
+
+WHEN a release version is validated,
+THE SYSTEM SHALL accept only stable `X.Y.Z` or release-candidate `X.Y.Z-rc.N` syntax with a positive bounded `N`
+AND SHALL derive the release channel from that version.
+
+WHEN a release candidate is prepared or retried,
+THE SYSTEM SHALL produce the same complete signed, notarized, stapled, Gatekeeper-validated, checksummed artifact set as a stable release
+AND SHALL keep the GitHub Release private until exact verification succeeds
+AND SHALL publish it with `prerelease = true` and `make_latest = false`.
+
+WHEN a stable release is prepared or retried,
+THE SYSTEM SHALL publish it with `prerelease = false` and `make_latest = true`.
+
+IF existing private or public release metadata differs from the channel derived from its validated version,
+THEN THE SYSTEM SHALL fail without rewriting public metadata or mutating public assets.
+
+Stable promotion SHALL use a new stable version and the normal version-bump release flow; the system SHALL NOT relabel release-candidate bytes as stable or move an existing tag.
+
+WHEN creating a new release tag,
+THE SYSTEM SHALL require its supported version to follow every existing supported release tag.
+
+WHEN retrying an existing exact release tag,
+THE SYSTEM SHALL preserve the historical tagged build identity while using the protected workflow's current publication verifier.

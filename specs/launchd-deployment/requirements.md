@@ -54,6 +54,12 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 The local command shall deploy exact local `HEAD` after checks and compilation and require the candidate to embed that complete 40-character lowercase commit SHA. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry, and require its complete 40-character lowercase embedded git SHA to equal that commit exactly; it shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
+WHEN `latest` is requested,
+THE release command SHALL require the resolved tag and GitHub release metadata to identify a stable supported release.
+
+WHEN an exact release-candidate tag is requested,
+THE release command SHALL require the tag, GitHub prerelease metadata, full embedded version, and exact commit identity to agree.
+
 ### REQ-LDD-012 — Unambiguous command surface
 
 The deployment command shall accept `prod deploy` for local `HEAD` and `prod deploy --release TAG|latest` for published releases, and shall reject positional versions with migration guidance rather than building a local source tag.

@@ -25,7 +25,7 @@ git tag --sort=-creatordate | head -5
 git rev-list <last-tag>..HEAD --count   # how much accumulated
 ```
 
-Default bump is minor (`0.X.0 → 0.X+1.0`). Confirm with the user — never auto-pick the major bump. The pre-1.0 convention here is: minor for features and breaking-but-low-impact changes; only call something a major bump if there's a deliberate compatibility break the user has named.
+Choose the exact target with the user. Supported targets are stable `X.Y.Z` and bounded release candidate `X.Y.Z-rc.N`. With no explicit target the helper proposes the next version from authoritative remote release tags: stable advances the patch and RC advances `rc.N`. Never infer a major bump or promote an RC to stable automatically. The exact target still requires user authorization before the helper may create shared state.
 
 ## Step 2 — Open the version-bump PR (requires user authorization)
 
@@ -34,10 +34,11 @@ The release is triggered by a bump landing on `main`, so this step opens the PR;
 The helper script bumps `crates/phoenix-ide/Cargo.toml` on a fresh branch off `origin/main`, commits, pushes, and opens the PR. It does **not** create a tag — the workflow does that on merge.
 
 ```bash
-./scripts/tag-release.sh vX.Y.Z   # the v-prefix is optional here; the script normalizes it
+./scripts/tag-release.sh vX.Y.Z        # stable; v-prefix optional
+./scripts/tag-release.sh vX.Y.Z-rc.N   # release candidate; v-prefix optional
 ```
 
-It refuses if `vX.Y.Z` already exists (that version already shipped) or if Cargo.toml is already at that version. `main` is branch-protected — never try to commit the bump straight to `main`; it will be rejected. The script always routes through a branch + PR for exactly this reason.
+It refuses if the exact stable or RC tag already exists, if the target syntax/bounds are unsupported, if the target does not follow every supported remote release tag, or if Cargo.toml is already at that version. `main` is branch-protected — never try to commit the bump straight to `main`; it will be rejected. The script always routes through a branch + PR for exactly this reason.
 
 You do *not* hand-craft or push a tag. A tag pushed by a human is the historical source of two failures this flow now prevents by construction: a missing `v` prefix (silently no-ops the old `v[0-9]+.*` trigger) and a tag pointing off-`main`. The workflow generates the `v`-prefixed tag at the merged main commit instead.
 
@@ -47,7 +48,7 @@ Merge the bump PR only after the user separately authorizes release publication.
 
 ```bash
 gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId') --exit-status
-bash scripts/verify-published-release.sh scottopell/phoenix-ide vX.Y.Z \
+bash scripts/verify-published-release.sh scottopell/phoenix-ide vX.Y.Z stable \
   phoenix_ide-x86_64-unknown-linux-musl \
   phoenix_ide-aarch64-unknown-linux-musl \
   phoenix_ide-x86_64-unknown-linux-musl-debug \
@@ -60,6 +61,8 @@ gh release view vX.Y.Z --json url -q .url
 ```
 
 The verifier downloads by captured asset IDs and checks the exact nine-name set, `SHA256SUMS`, downloaded bytes, GitHub-reported digests, stable-release classification, and tag identity. Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; architecture-specific `Phoenix.app` ZIPs for Apple Silicon and Intel; and `SHA256SUMS` covering all eight payload assets. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+
+For an explicitly authorized RC, substitute the exact `vX.Y.Z-rc.N` tag and `rc` channel. Verify GitHub reports `prerelease=true` and `isLatest=false`; artifact names include the full RC tag. RCs use the same signed, notarized, stapled, Gatekeeper-validated, checksummed path. Final stable promotion is a new version bump and build, never relabeling RC bytes.
 
 If the build fails, do not retry blindly. Open the run and fix the underlying issue. A manual dispatch may retry only when the existing version tag still points at that exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
 

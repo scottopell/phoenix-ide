@@ -92,8 +92,11 @@ external entity TargetService {
 --   rollback predecessor. No database is restored or verified.
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD, or release source is one resolved tag
---   and commit with matching host asset and checksum. In either case the
---   candidate's 40-character lowercase embedded git_sha equals source_commit.
+--   and commit with a host-architecture asset matching its checksum and version.
+--   A latest selection resolves to stable tag and metadata; an exact RC selection
+--   has matching tag, prerelease metadata, full embedded version, and commit. In
+--   either case the candidate's 40-character lowercase embedded git_sha equals
+--   source_commit.
 -- previous_rollback_identity_is_valid(transaction) -> Boolean
 --   No previous runtime exists, or previous is the captured already-installed
 --   predecessor and its git_sha is exactly 12 or 40 lowercase hexadecimal
