@@ -11676,6 +11676,60 @@ impl Database {
         Ok(rows)
     }
 
+    /// Returns whether a live durable direct-turn owner in this conversation
+    /// permits materializing an oversized message ID.
+    ///
+    /// # Errors
+    /// Returns an error if the owner relations cannot be queried.
+    pub async fn is_legacy_direct_message_id(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM durable_turns
+                 WHERE conversation_id = ?1
+                   AND COALESCE(canonical_message_id, conversation_id || ':' || client_turn_key) = ?2
+                 UNION ALL
+                 SELECT 1 FROM conversation_creation_jobs
+                 WHERE conversation_id = ?1 AND message_id = ?2
+                 UNION ALL
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE successor_conversation_id = ?1
+                   AND (message_id = ?2 OR successor_conversation_id || ':' || message_id = ?2)
+             )",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a live steering owner in this conversation permits
+    /// materializing an oversized raw steering message ID.
+    ///
+    /// # Errors
+    /// Returns an error if the steering owner relation cannot be queried.
+    pub async fn is_legacy_steering_message_id(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_messages
+                 WHERE conversation_id = ?1 AND message_id = ?2
+             )",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Returns whether a live pre-bound owner permits materializing an oversized message ID.
     ///
     /// # Errors

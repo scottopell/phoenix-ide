@@ -1421,12 +1421,7 @@ async fn render_message_page_bounded_as(
                     .as_ref()
                     .is_some_and(|start| start.message_id != message.message_id)
             {
-                next_cursor = Some(PreviousReadPosition {
-                    message_sequence: message.sequence_id,
-                    byte_offset: 0,
-                    message_id: Some(message.message_id.clone()),
-                    rendered_sha256: None,
-                });
+                next_cursor = last_completed_position.clone();
                 break;
             }
             let message = db
@@ -1513,7 +1508,9 @@ async fn render_message_page_bounded_as(
     let legacy_identity_bytes = page_start
         .as_ref()
         .filter(|start| start.message_id.len() > PREVIOUS_TITLE_BYTES)
-        .map_or(0, |start| start.message_id.len());
+        .map_or(0, |start| {
+            percent_encode_url_component(&start.message_id).len()
+        });
     Ok(BoundedMessagePage {
         start: page_start,
         content: out,
