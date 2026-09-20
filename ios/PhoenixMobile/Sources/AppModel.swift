@@ -86,6 +86,7 @@ private struct PendingHardDeleteCleanup {
     var triggerConversationId: String?
     var memberConversationIds: Set<String>
     var fenceState: HardDeleteFenceState
+    var committedFence: PersistedHardDeleteFence?
 }
 
 enum HardDeleteFenceState: Sendable {
@@ -1353,7 +1354,11 @@ final class AppModel {
             configurationIdentity: context.configurationIdentity,
             triggerConversationId: context.triggerConversationId,
             memberConversationIds: context.memberConversationIds,
-            fenceState: context.fenceState)
+            fenceState: context.fenceState,
+            committedFence: {
+                if case .committed(let fence) = context.fenceState { return fence }
+                return nil
+            }())
         defer { pendingHardDeleteCleanups.removeValue(forKey: context.aggregateAuthority) }
 
         func contextIsCurrent() -> Bool {
@@ -1369,9 +1374,19 @@ final class AppModel {
                     persistenceScope: pending.configurationIdentity.persistenceScope,
                     aggregateAuthority: context.aggregateAuthority,
                     memberConversationIds: pending.memberConversationIds.sorted())
-                guard case .replaced = await conversationPersistenceStore.replaceHardDeleteFence(
-                    expected: nil, replacement: fence)
-                else {
+                let expected = pending.committedFence
+                switch await conversationPersistenceStore.replaceHardDeleteFence(
+                    expected: expected, replacement: fence) {
+                case .replaced:
+                    guard var updated = pendingHardDeleteCleanups[context.aggregateAuthority] else { return }
+                    updated.fenceState = .committed(fence)
+                    updated.committedFence = fence
+                    pendingHardDeleteCleanups[context.aggregateAuthority] = updated
+                case .expectationMismatch:
+                    persistedOutboxHydrated = false
+                    finishStartupHydration()
+                    return
+                case .persistenceFailed:
                     NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
                     hardDeleteFenceRetryObligations.insert(.init(fence: fence))
                     hardDeletedConversationIds.formUnion(fence.memberConversationIds)
