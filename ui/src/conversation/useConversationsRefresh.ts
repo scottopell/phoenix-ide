@@ -178,19 +178,21 @@ export function useConversationsRefreshDriver(): void {
   // for the next poll tick.
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
+      const detail = (e as CustomEvent<{
+        conversationId?: string;
+        deletedConversationIds?: string[];
+      }>).detail;
       if (!detail?.conversationId) return;
-      const removedSlugs = store.removeByConversationId(detail.conversationId);
-      for (const slug of removedSlugs) {
-        // REQ-VS-014: drop all per-slug state so a future conversation
-        // that reuses this slug doesn't inherit any of it.
-        clearLastViewer(slug);
-        clearTerminalPaneStorage(slug);
-        draftStore.remove(slug);
+      const deletedConversationIds = detail.deletedConversationIds ?? [detail.conversationId];
+      for (const conversationId of deletedConversationIds) {
+        const removedSlugs = store.removeByConversationId(conversationId);
+        for (const slug of removedSlugs) {
+          clearLastViewer(slug);
+          clearTerminalPaneStorage(slug);
+          draftStore.remove(slug);
+        }
+        clearDraftStorage(conversationId);
       }
-      // localStorage drafts are keyed by conversationId, not slug — clear
-      // by id regardless of whether we still hold an atom for the slug.
-      clearDraftStorage(detail.conversationId);
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();

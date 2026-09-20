@@ -394,8 +394,7 @@ export function Sidebar({
     setProductDeleteSubmittingId(productId);
     setProductDeleteError(null);
     try {
-      if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
-      else await api.deleteChain(rootId);
+      await api.deleteChain(rootId);
       setProductDeleteTarget((current) =>
         current?.product_conversation_id === productId ? null : current);
       notifyProductConversationListMayHaveChanged();

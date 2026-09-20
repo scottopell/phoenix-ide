@@ -403,10 +403,12 @@ mod tests {
             SseEvent::ConversationHardDeleted {
                 sequence_id,
                 conversation_id,
+                deleted_conversation_ids,
             } => json!({
                 "type": "conversation_hard_deleted",
                 "sequence_id": sequence_id,
                 "conversation_id": conversation_id,
+                "deleted_conversation_ids": deleted_conversation_ids,
             }),
             SseEvent::BrowserSessionState {
                 sequence_id,
@@ -1007,7 +1009,8 @@ mod tests {
     fn parity_conversation_hard_deleted() {
         let event = SseEvent::ConversationHardDeleted {
             sequence_id: 21,
-            conversation_id: "conv-1".to_string(),
+            conversation_id: "product-1".to_string(),
+            deleted_conversation_ids: vec!["conv-1".to_string(), "conv-2".to_string()],
         };
         assert_parity(&event);
     }

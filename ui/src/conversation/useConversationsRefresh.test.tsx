@@ -249,6 +249,50 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
     });
   });
 
+  it('clears every transcript store and draft named by one aggregate delete event', async () => {
+    let store: ConversationStore | undefined;
+    let draftStore: DraftStore | undefined;
+    function CaptureBoth() {
+      store = useContext(ConversationContext) ?? undefined;
+      draftStore = useContext(DraftContext) ?? undefined;
+      return null;
+    }
+
+    render(
+      <ConversationProvider>
+        <CaptureBoth />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.upsertSnapshot('root-slug', makeConv('root-slug', 'root-id'));
+      store!.upsertSnapshot('leaf-slug', makeConv('leaf-slug', 'leaf-id'));
+      draftStore!.dispatch('root-slug', { type: 'set_draft', text: 'root draft' });
+      draftStore!.dispatch('leaf-slug', { type: 'set_draft', text: 'leaf draft' });
+    });
+    localStorage.setItem('phoenix:draft:root-id', 'root draft');
+    localStorage.setItem('phoenix:draft:leaf-id', 'leaf draft');
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: {
+            conversationId: 'product-id',
+            deletedConversationIds: ['root-id', 'leaf-id'],
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(store!.listSnapshots()).toEqual([]);
+      expect(draftStore!.getSnapshot('root-slug').draft).toBe('');
+      expect(draftStore!.getSnapshot('leaf-slug').draft).toBe('');
+      expect(localStorage.getItem('phoenix:draft:root-id')).toBeNull();
+      expect(localStorage.getItem('phoenix:draft:leaf-id')).toBeNull();
+    });
+  });
+
   it('does not throw when the deleted id is unknown to the store', () => {
     render(
       <ConversationProvider>

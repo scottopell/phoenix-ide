@@ -379,6 +379,7 @@ export const SseErrorDataSchema = v.looseObject({
 export const SseConversationHardDeletedDataSchema = v.looseObject({
   sequence_id: v.number(),
   conversation_id: v.string(),
+  deleted_conversation_ids: v.array(v.string()),
 }) satisfies v.GenericSchema<unknown, WireConversationHardDeletedData>;
 
 /** `browser_session_state`: fired on the server's create / destroy edge for

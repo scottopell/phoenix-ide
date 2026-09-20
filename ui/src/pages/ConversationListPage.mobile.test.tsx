@@ -120,6 +120,24 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.queryByRole('button', { name: 'Close product conversation Mobile Product' })).toBeNull();
   });
 
+  it('uses aggregate deletion for History with one parent transcript', async () => {
+    const history = {
+      ...productConversation(),
+      lifecycle: { state: 'history' as const },
+      latest_transcript_row_id: 'root-mobile',
+    };
+    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
+    vi.mocked(api.deleteChain).mockResolvedValue(undefined);
+    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
+
+    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(screen.getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
+    expect(api.deleteConversation).not.toHaveBeenCalled();
+  });
+
   it('treats an authoritative 404 while deleting History as completed', async () => {
     const history = {
       ...productConversation(),
