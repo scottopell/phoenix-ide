@@ -206,21 +206,22 @@ PY
 
 ### Latest 30 completed PR Actions runs
 
-The sampled window is pinned to these exact 30 run IDs, ordered newest to oldest, from **2026-09-19T20:58:51Z through 2026-09-19T23:22:49Z**. A lightweight verification of representative run `35475964002` with the published REST mapping returned non-null `headSha` `8164d567798e43ded907c6dbbcbf739976faf8a6`. The query requests 100 jobs for each run; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persists immutable run metadata and each run's job names/outcomes. The second extracts the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
+The sampled window is pinned to these exact 30 run ID/attempt pairs, ordered newest to oldest, from **2026-09-19T20:58:51Z through 2026-09-19T23:22:49Z**. A lightweight verification of representative run `35475964002` with the published REST mapping returned non-null `headSha` `8164d567798e43ded907c6dbbcbf739976faf8a6`. The query requests 100 jobs for each run; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persists immutable run metadata and each run's job names/outcomes. The second extracts the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
 
 ```bash
-run_ids=(
-  35475964002 35475484251 35475440124 35474960980 35474944626
-  35474694703 35474651320 35474599742 35474532227 35474291809
-  35474219249 35473989772 35473502338 35473451771 35472910524
-  35472530750 35472389248 35471754617 35471686356 35471485123
-  35471393512 35471178535 35470682089 35470276834 35470114295
-  35470050709 35469704604 35469363717 35469198459 35469019544
+run_attempts=(
+  35475964002:1 35475484251:1 35475440124:1 35474960980:1 35474944626:1
+  35474694703:1 35474651320:1 35474599742:1 35474532227:1 35474291809:1
+  35474219249:1 35473989772:1 35473502338:1 35473451771:1 35472910524:1
+  35472530750:1 35472389248:1 35471754617:2 35471686356:1 35471485123:1
+  35471393512:1 35471178535:1 35470682089:1 35470276834:1 35470114295:1
+  35470050709:1 35469704604:1 35469363717:1 35469198459:1 35469019544:1
 )
 printf '[]\n' > target/check-roi-audit/gh-pr-runs.json
-for run_id in "${run_ids[@]}"; do
-  gh api "repos/scottopell/phoenix-ide/actions/runs/$run_id" \
-    --jq '{databaseId:.id,headSha:.head_sha,createdAt:.created_at,conclusion,url:.html_url}' \
+for run_attempt in "${run_attempts[@]}"; do
+  run_id=${run_attempt%:*}; attempt=${run_attempt#*:}
+  gh api "repos/scottopell/phoenix-ide/actions/runs/$run_id/attempts/$attempt" \
+    --jq '{databaseId:.id,runAttempt:.run_attempt,headSha:.head_sha,createdAt:.created_at,conclusion,url:.html_url}' \
     > target/check-roi-audit/run.json
   jq -s '.[0] + [.[1]]' target/check-roi-audit/gh-pr-runs.json \
     target/check-roi-audit/run.json > target/check-roi-audit/runs-next.json
@@ -233,7 +234,7 @@ out = []
 for run in runs:
   response = subprocess.run([
     'gh', 'api',
-    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/jobs?per_page=100"
+    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/attempts/{run['runAttempt']}/jobs?per_page=100"
   ], capture_output=True, text=True)
   if response.returncode:
     run['jobs_error'] = response.stderr.strip()
@@ -251,7 +252,7 @@ rows = []
 for run in runs:
   raw = subprocess.check_output([
     'gh', 'api',
-    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/jobs?per_page=100"
+    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/attempts/{run['runAttempt']}/jobs?per_page=100"
   ], text=True)
   for job in json.loads(raw)['jobs']:
     if job['name'] == 'check (rust)':
