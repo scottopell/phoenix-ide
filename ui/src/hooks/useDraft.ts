@@ -1,5 +1,6 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { DraftContext } from '../conversation/DraftContext';
+import type { FencedSendRecovery } from '../conversation/DraftStore';
 import { useConversationSnapshot } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
@@ -69,11 +70,26 @@ export function useDraftValue(slug: string): string {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
+export function useFencedSendRecovery(slug: string): FencedSendRecovery | undefined {
+  const store = useDraftStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).fencedSendRecoveries[0],
+    [store, slug],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 export interface DraftActions {
   setDraft: (text: string) => void;
   setDraftIfEmpty: (text: string) => void;
   appendDraft: (text: string) => void;
   clearDraft: () => void;
+  enqueueFencedSendRecovery: (recovery: FencedSendRecovery) => void;
+  shiftFencedSendRecovery: () => void;
 }
 
 /**
@@ -91,6 +107,10 @@ export function useDraftActions(slug: string): DraftActions {
       appendDraft: (text: string) =>
         store.dispatch(slug, { type: 'append_draft', text }),
       clearDraft: () => store.dispatch(slug, { type: 'clear_draft' }),
+      enqueueFencedSendRecovery: (recovery: FencedSendRecovery) =>
+        store.dispatch(slug, { type: 'enqueue_fenced_send_recovery', recovery }),
+      shiftFencedSendRecovery: () =>
+        store.dispatch(slug, { type: 'shift_fenced_send_recovery' }),
     }),
     [store, slug],
   );

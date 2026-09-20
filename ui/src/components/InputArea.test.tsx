@@ -299,6 +299,18 @@ describe('InputArea close-fenced recovery', () => {
             onSend={() => response.promise}
             onCancel={() => {}}
             onRetry={() => {}}
+            enqueueFencedSendRecovery={(recovery) => {
+              setDrafts(current => ({
+                ...current,
+                'conv-a': current['conv-a'].length > 0
+                  ? `${recovery.text}\n${current['conv-a']}`
+                  : recovery.text,
+              }));
+              if (scope === 'conv-a') {
+                setImages(recovery.images);
+                setFiles(recovery.files);
+              }
+            }}
           />
           <output data-testid="scope-state">{scope}</output>
           <output data-testid="draft-state">{drafts[scope]}</output>
@@ -311,8 +323,8 @@ describe('InputArea close-fenced recovery', () => {
           }}>switch to B</button>
           <button type="button" onClick={() => {
             setScope('conv-a');
-            setImages([]);
-            setFiles([]);
+            setImages([submittedImage]);
+            setFiles([submittedFile]);
           }}>return to A</button>
         </>
       );
