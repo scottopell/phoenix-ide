@@ -47,6 +47,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     setSaving(false);
     setFeedback(null);
     savePending.current = false;
+    retryPending.current = false;
     setFailedValue(null);
     setRetrying(false);
     const refresh = (initial: boolean) => {
@@ -70,7 +71,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         })
         .finally(() => {
           refreshPending = false;
-          if (initial && requestGeneration.current === generation) setLoading(false);
+          if (requestGeneration.current === generation) setLoading(false);
         });
     };
     refresh(true);

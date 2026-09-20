@@ -2322,25 +2322,25 @@ where
                 tracing::error!(%error, "failed to classify pending continuation opening");
                 true
             });
-        if continuation_opening_pending {
-            return RuntimeExitDisposition::Interrupted;
-        }
-
-        let startup_drain = match self.commit_startup_steering_queue().await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::error!(
-                    conversation_id = %self.context.conversation_id,
-                    %error,
-                    "Startup steering drain failed; leaving durable queue intact for retry"
-                );
-                let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
-                    sequence_id,
-                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                        "recover queued steering messages",
-                    ),
-                });
-                return RuntimeExitDisposition::Interrupted;
+        let startup_drain = if continuation_opening_pending {
+            StartupSteeringDrainOutcome::NotNeeded
+        } else {
+            match self.commit_startup_steering_queue().await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(
+                        conversation_id = %self.context.conversation_id,
+                        %error,
+                        "Startup steering drain failed; leaving durable queue intact for retry"
+                    );
+                    let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                        sequence_id,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "recover queued steering messages",
+                        ),
+                    });
+                    return RuntimeExitDisposition::Interrupted;
+                }
             }
         };
 
