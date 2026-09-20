@@ -439,6 +439,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
 ///
 /// Returns [`TransitionError`] when the event is not valid for the current
 /// state.
+#[allow(clippy::too_many_lines, clippy::wildcard_enum_match_arm)]
 pub fn transition(
     state: &ConvState,
     context: &ConvContext,
@@ -469,19 +470,26 @@ pub fn transition(
                 ServerOverloadTarget::Ordinary => ConvState::LlmRequesting {
                     attempt: retry.attempt,
                 },
-                target @ ServerOverloadTarget::Continuation { .. } => {
-                    ConvState::AwaitingContinuation {
-                        request: target
-                            .continuation_request(retry.attempt)
-                            .expect("continuation target reconstructs its request"),
-                    }
-                }
+                ServerOverloadTarget::Continuation {
+                    operation_id,
+                    rejected_tool_calls,
+                } => ConvState::AwaitingContinuation {
+                    request: ServerOverloadTarget::continuation_request_from_parts(
+                        operation_id,
+                        rejected_tool_calls,
+                        retry.attempt,
+                    ),
+                },
             };
             return transition(&delegated, context, event);
         }
     }
     if let ConvState::ServerOverloadRetrying { retry } = state {
-        if let ServerOverloadTarget::Continuation { operation_id, .. } = &retry.target {
+        if let ServerOverloadTarget::Continuation {
+            operation_id,
+            rejected_tool_calls,
+        } = &retry.target
+        {
             let is_matching_continuation = match &event {
                 Event::ContinuationError {
                     operation_id: event_operation_id,
@@ -499,10 +507,11 @@ pub fn transition(
             };
             if matches!(retry.phase, ServerOverloadPhase::InFlight) && is_matching_continuation {
                 let delegated = ConvState::AwaitingContinuation {
-                    request: retry
-                        .target
-                        .continuation_request(retry.attempt)
-                        .expect("continuation target reconstructs its request"),
+                    request: ServerOverloadTarget::continuation_request_from_parts(
+                        operation_id,
+                        rejected_tool_calls,
+                        retry.attempt,
+                    ),
                 };
                 return transition(&delegated, context, event);
             }
@@ -1639,6 +1648,7 @@ fn overload_retry_delay(attempt: u32, identity: &str) -> Duration {
     Duration::from_millis(base_ms * (75 + hash % 51) / 100)
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn overload_terminal(
     retry: &ServerOverloadRetry,
     message: String,
@@ -1668,6 +1678,7 @@ fn overload_terminal(
         .with_effect(Effect::notify_state_change()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn schedule_server_overload(
     target: ServerOverloadTarget,
     attempt: u32,

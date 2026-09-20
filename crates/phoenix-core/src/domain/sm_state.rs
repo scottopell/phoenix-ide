@@ -1127,11 +1127,24 @@ impl ServerOverloadTarget {
             Self::Continuation {
                 operation_id,
                 rejected_tool_calls,
-            } => Some(ContinuationSummaryRequest {
-                operation_id: operation_id.clone(),
-                rejected_tool_calls: rejected_tool_calls.clone(),
+            } => Some(Self::continuation_request_from_parts(
+                operation_id,
+                rejected_tool_calls,
                 attempt,
-            }),
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn continuation_request_from_parts(
+        operation_id: &str,
+        rejected_tool_calls: &[ToolCall],
+        attempt: u32,
+    ) -> ContinuationSummaryRequest {
+        ContinuationSummaryRequest {
+            operation_id: operation_id.to_owned(),
+            rejected_tool_calls: rejected_tool_calls.to_vec(),
+            attempt,
         }
     }
 }
