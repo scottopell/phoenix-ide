@@ -189,6 +189,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const composerHasContentRef = useRef(false);
   const composerContentRef = useRef({ draft, images, files });
   const deferredExpansionErrorsRef = useRef(new Map<string | undefined, string>());
+  const deferredAttachmentsRef = useRef(new Map<string | undefined, {
+    images: ImageData[];
+    files: FileAttachment[];
+  }>());
   useEffect(() => {
     composerContentRef.current = { draft, images, files };
     composerHasContentRef.current = draft.length > 0
@@ -233,7 +237,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       setExpansionErrorRef.current(deferred);
       deferredExpansionErrorsRef.current.delete(scopeKey);
     }
-  }, [scopeKey]);
+    const attachments = deferredAttachmentsRef.current.get(scopeKey);
+    if (attachments) {
+      const current = composerContentRef.current;
+      setImages([...attachments.images, ...current.images]);
+      setFiles([...attachments.files, ...current.files]);
+      deferredAttachmentsRef.current.delete(scopeKey);
+    }
+  }, [scopeKey, setFiles, setImages]);
 
   // File-attachment drag/drop state.
   const [isDragOver, setIsDragOver] = useState(false);
@@ -486,8 +497,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             err.detail.error ?? 'Reference expansion failed',
           );
           setDraft(text);
-          setImages(images);
-          setFiles(files);
+          deferredAttachmentsRef.current.set(submittedScopeKey, { images, files });
         }
       } else if (closeFenced) {
         if (scopeKeyRef.current === submittedScopeKey) {
@@ -501,8 +511,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           }
         } else {
           setDraft(text);
-          setImages(images);
-          setFiles(files);
+          deferredAttachmentsRef.current.set(submittedScopeKey, { images, files });
         }
       }
       // Other errors remain visible in the message queue with a retry button.

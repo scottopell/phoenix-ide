@@ -4133,6 +4133,7 @@ fn inspect_ambient_writer_until_quiescent(
 ) -> Result<Option<AmbientWriterEvidence>, String> {
     let mut consecutive_clean = 0;
     let mut final_writer = None;
+    let mut final_writer_seen_count = 0;
     for observation in 0..policy.max_observations.get() {
         match observe()? {
             ExternalWriterEvidence::NoPositiveEvidence => {
@@ -4143,6 +4144,18 @@ fn inspect_ambient_writer_until_quiescent(
             }
             ExternalWriterEvidence::PositiveWriterFound(evidence) => {
                 consecutive_clean = 0;
+                final_writer_seen_count =
+                    if final_writer
+                        .as_ref()
+                        .is_some_and(|prior: &AmbientWriterEvidence| {
+                            prior.process_id == evidence.process_id
+                                && prior.process_incarnation == evidence.process_incarnation
+                        })
+                    {
+                        final_writer_seen_count + 1
+                    } else {
+                        1
+                    };
                 final_writer = Some(evidence);
             }
         }
@@ -4150,7 +4163,7 @@ fn inspect_ambient_writer_until_quiescent(
             wait(policy.spacing);
         }
     }
-    if consecutive_clean > 0 {
+    if consecutive_clean > 0 && final_writer_seen_count < 2 {
         return Err(
             "ambient writer observation budget ended without two clean observations".to_string(),
         );
