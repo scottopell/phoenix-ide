@@ -1707,11 +1707,12 @@ impl RuntimeManager {
                             })
                             .await
                             .map_err(|error| error.to_string())?
-                            .map_err(|error| {
+                            .map_err(|_error| {
                                 CloseRetirementError::EvidenceInvariant {
                                     scope: Some(scope.clone()),
                                     invariant: "cleanup_plan_discovery".to_string(),
-                                    relation: error,
+                                    relation: "captured_scope+close_worktree_cleanup_plans"
+                                        .to_string(),
                                 }
                             })?;
                             self.db()
