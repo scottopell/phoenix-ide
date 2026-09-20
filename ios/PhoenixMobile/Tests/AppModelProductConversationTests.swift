@@ -206,6 +206,58 @@ final class AppModelProductConversationTests: XCTestCase {
         }
     }
 
+    func testAuthoritativeProductHistoryRemovalCleansAggregateState() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
+        let aggregateId = "pc-deleted"
+        let row = conversation(id: "row-deleted", aggregateId: aggregateId)
+        persistReadableSnapshot(conversation: row)
+        DiskStore.save(["queued"], name: "outbox-row-deleted")
+        let history = historySnapshot(aggregateId: aggregateId, segments: [])
+        let writer = ProductHistorySnapshotStore.writer(productConversationId: aggregateId)
+        let revision = writer.reserveRevision()
+        let historySaved = await writer.save(
+            CachedProductHistory(snapshot: history, fetchedAt: Date()),
+            revision: revision)
+        XCTAssertTrue(historySaved)
+
+        let model = AppModel()
+        model.serverURLString = "http://localhost"
+        model.listStore.upsert(row)
+        XCTAssertNotNil(model.session(for: row.id))
+
+        let removed = await model.removeProductHistoryLocallyForTesting(
+            productConversationId: aggregateId,
+            transcriptIds: [row.id])
+        XCTAssertTrue(removed)
+
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+        XCTAssertTrue(model.deletedProductHistoryIds.contains(aggregateId))
+        XCTAssertNil(model.cachedProductHistory(productConversationId: aggregateId))
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: row.id))
+        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-row-deleted").contains("outbox-row-deleted"))
+    }
+
+    func testRetainedProductHistoryCacheShowsAgeAfterOnlineRefreshFailure() {
+        let now = Date()
+
+        XCTAssertTrue(ProductHistoryCachePresentation.shouldShowAge(
+            isOnline: true,
+            refreshFailed: true,
+            fetchedAt: now.addingTimeInterval(-121),
+            now: now))
+        XCTAssertFalse(ProductHistoryCachePresentation.shouldShowAge(
+            isOnline: true,
+            refreshFailed: false,
+            fetchedAt: now.addingTimeInterval(-121),
+            now: now))
+        XCTAssertFalse(ProductHistoryCachePresentation.shouldShowAge(
+            isOnline: true,
+            refreshFailed: true,
+            fetchedAt: now.addingTimeInterval(-119),
+            now: now))
+    }
+
     func testCloseCompletionGenerationsAreScopedByProduct() {
         var tracker = ProductActionGenerationTracker()
         let productA = tracker.begin(productConversationId: "product-a")

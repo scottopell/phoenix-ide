@@ -433,13 +433,15 @@ final class AppModel {
             guard apiGeneration == startedGeneration else {
                 throw ProductHistoryLoadError.staleServerGeneration
             }
-            let revision = writer.reserveRevision()
-            await writer.remove(revision: revision)
-            guard apiGeneration == startedGeneration else {
+            let transcriptIds = Set(listStore.transcriptRowIds(
+                forAggregateId: productConversationId))
+            guard await removeProductHistoryLocally(
+                productConversationId: productConversationId,
+                transcriptIds: transcriptIds,
+                startedGeneration: startedGeneration)
+            else {
                 throw ProductHistoryLoadError.staleServerGeneration
             }
-            deletedProductHistoryIds.insert(productConversationId)
-            listStore.remove(aggregateId: productConversationId)
             throw ProductHistoryLoadError.notFound
         }
 
@@ -642,18 +644,27 @@ final class AppModel {
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
             closed = true
+            listStore.projectHistory(aggregateId: conversation.aggregateIdentity)
             for (transcriptId, session) in aggregateSessions {
                 session.stop()
                 if sessions[transcriptId] === session {
                     sessions[transcriptId] = nil
                 }
             }
+            do {
+                _ = try await loadProductHistory(
+                    productConversationId: conversation.aggregateIdentity)
+            } catch ProductHistoryLoadError.notFound {
+                guard apiGeneration == startedGeneration else { return false }
+                removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
+                return true
+            } catch {
+                guard apiGeneration == startedGeneration else { return false }
+            }
             await listStore.refresh(api: api)
             guard apiGeneration == startedGeneration else { return false }
-            UNUserNotificationCenter.current().removeDeliveredNotifications(
-                withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
-            UNUserNotificationCenter.current().removePendingNotificationRequests(
-                withIdentifiers: ["attention-\(conversation.aggregateIdentity)"])
+            listStore.projectHistory(aggregateId: conversation.aggregateIdentity)
+            removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
             return true
         } catch {
             guard apiGeneration == startedGeneration,
@@ -682,33 +693,71 @@ final class AppModel {
             let transcriptIds = Set(
                 listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
                     + [conversation.transcriptRowIdentity])
-            let historyWriter = ProductHistorySnapshotStore.writer(
-                productConversationId: conversation.aggregateIdentity)
-            let revision = historyWriter.reserveRevision()
-            await historyWriter.remove(revision: revision)
-            guard apiGeneration == startedGeneration else { return false }
-            for transcriptId in transcriptIds {
-                let owners = [sessions[transcriptId], drainSessions[transcriptId]].compactMap { $0 }
-                for session in owners {
-                    session.stop()
-                    await session.clearCachedSnapshotAndWait()
-                    await session.outbox.clearAndWait()
-                }
-                sessions[transcriptId] = nil
-                drainSessions[transcriptId] = nil
-                DiskStore.remove(name: "conv-\(transcriptId)")
-                DiskStore.remove(name: "outbox-\(transcriptId)")
-            }
-            listStore.remove(aggregateId: conversation.aggregateIdentity)
-            deletedProductHistoryIds.insert(conversation.aggregateIdentity)
-            removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
-            return true
+            return await removeProductHistoryLocally(
+                productConversationId: conversation.aggregateIdentity,
+                transcriptIds: transcriptIds,
+                startedGeneration: startedGeneration)
         } catch {
             guard apiGeneration == startedGeneration else { return false }
             lastActionError = error.localizedDescription
             return false
         }
     }
+
+    private func removeProductHistoryLocally(
+        productConversationId: String,
+        transcriptIds: Set<String>,
+        startedGeneration: Int
+    ) async -> Bool {
+        guard apiGeneration == startedGeneration else { return false }
+
+        let historyWriter = ProductHistorySnapshotStore.writer(
+            productConversationId: productConversationId)
+        let revision = historyWriter.reserveRevision()
+        await historyWriter.remove(revision: revision)
+        guard apiGeneration == startedGeneration else { return false }
+
+        for transcriptId in transcriptIds {
+            guard apiGeneration == startedGeneration else { return false }
+            let openOwner = sessions.removeValue(forKey: transcriptId)
+            let drainOwner = drainSessions.removeValue(forKey: transcriptId)
+            let owners = [openOwner, drainOwner].compactMap { $0 }
+            owners.forEach { $0.stop() }
+
+            for session in owners {
+                guard apiGeneration == startedGeneration else { return false }
+                await session.clearCachedSnapshotAndWait()
+                guard apiGeneration == startedGeneration else { return false }
+                await session.outbox.clearAndWait()
+                guard apiGeneration == startedGeneration else { return false }
+            }
+            DiskStore.remove(name: "conv-\(transcriptId)")
+            DiskStore.remove(name: "outbox-\(transcriptId)")
+        }
+
+        guard apiGeneration == startedGeneration else { return false }
+        listStore.remove(aggregateId: productConversationId)
+        deletedProductHistoryIds.insert(productConversationId)
+        if pendingOpenConversationId == productConversationId
+            || transcriptIds.contains(pendingOpenConversationId ?? "")
+        {
+            pendingOpenConversationId = nil
+        }
+        removeAttentionNotifications(productConversationId: productConversationId)
+        return true
+    }
+
+    #if DEBUG
+    func removeProductHistoryLocallyForTesting(
+        productConversationId: String,
+        transcriptIds: Set<String>
+    ) async -> Bool {
+        await removeProductHistoryLocally(
+            productConversationId: productConversationId,
+            transcriptIds: transcriptIds,
+            startedGeneration: apiGeneration)
+    }
+    #endif
 
     private func removeAttentionNotifications(productConversationId: String) {
         let identifier = "attention-\(productConversationId)"

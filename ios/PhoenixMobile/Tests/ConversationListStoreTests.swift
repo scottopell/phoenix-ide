@@ -104,6 +104,24 @@ final class ConversationListStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectHistoryPersistsAuthoritativeLocalFallback() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(
+            id: "latest", aggregateId: "pc-1", title: "open"))
+
+        store.projectHistory(aggregateId: "pc-1")
+
+        XCTAssertEqual(store.conversations.count, 1)
+        XCTAssertEqual(store.conversations.first?.aggregateIdentity, "pc-1")
+        XCTAssertEqual(store.conversations.first?.archived, true)
+
+        let reloaded = ConversationListStore()
+        XCTAssertEqual(reloaded.conversations.first?.archived, true)
+    }
+
+    @MainActor
     func testBackgroundExternalRefreshPreservesHistoryRows() throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
