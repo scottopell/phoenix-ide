@@ -1,6 +1,6 @@
 # `./dev.py check` regression-ROI audit
 
-**Source audited:** `origin/main` `bed747b5bd231f495b8038163d63c72a9ebeb346` (the task commit was rebased above it as `da0fcf2d`). **Host:** `devmbp`, MacBookPro18,4, macOS 26.4.1, 10 logical CPUs, 64 GiB RAM, APFS. **Measured toolchain:** stable-aarch64 Rust with rustc/cargo 1.95.0, cargo-nextest 0.9.143, Node 26.7.0, pnpm 11.0.8, system Python 3.9.6, ast-grep 0.45.1, and Allium 3.5.3. Both optional CLIs were present for the measured runs; neither was absent. **Captured:** 2026-09-19. No cache was purged. No lane, test, gate, timeout, or workflow was changed.
+**Source audited:** `origin/main` `bed747b5bd231f495b8038163d63c72a9ebeb346` (the task commit was rebased above it as `da0fcf2d`). **Host:** `devmbp`, MacBookPro18,4, macOS 26.4.1, 10 logical CPUs, 64 GiB RAM, APFS. **Measured toolchain:** stable-aarch64 Rust with rustc/cargo 1.95.0, cargo-nextest 0.9.143, Node 26.7.0, pnpm 11.0.8, uv-selected Python 3.14.7 (the `dev.py`/spec-shape runner), system Python 3.9.6 (not the runner), ast-grep 0.45.1, and Allium 3.5.3. Both optional CLIs were present for the measured runs; neither was absent. **Captured:** 2026-09-19. No cache was purged. No lane, test, gate, timeout, or workflow was changed.
 
 ## Result
 
@@ -58,9 +58,9 @@ The workflow triggers on every PR and pushes to `main`. On PRs, `plan check lane
 
 **Unique protection:** compilation of the production-only `phoenix_ide/datadog-tracing` feature for Linux musl, target-specific `cfg`/dependency compatibility, and native C build configuration. Because this is `cargo check`, it does **not** prove final static linking or runtime behavior; release workflow builds both x86_64/aarch64 musl artifacts and supplies compilers.
 
-**Measured devmbp capability/cost:** the Rust std target was already installed and occupies **222,708 KiB allocated (217.5 MiB)**. Neither `musl-gcc` nor `x86_64-linux-musl-gcc` was installed. One exact-command attempt failed honestly after **10.33 s** at `aws-lc-sys` because `x86_64-linux-musl-gcc` was absent. The failed attempt allocated **51,260 KiB (50.1 MiB)** under `target/x86_64-unknown-linux-musl` plus 107,208 KiB in shared `target/debug`; this is a lower bound, not successful-musl footprint. Successful current-source wall time and total unique build-tree cost are therefore **unknown on devmbp**. Installing a cross compiler solely to complete this audit was not necessary and would have changed host-global state.
+**Measured devmbp capability/cost:** the repository-declared Rust std target was already installed and occupies **222,708 KiB allocated (217.5 MiB)**. It is part of the audited host/toolchain baseline, not incremental local-lane cost. Neither `musl-gcc` nor `x86_64-linux-musl-gcc` was installed. One exact-command attempt failed honestly after **10.33 s** at `aws-lc-sys` because `x86_64-linux-musl-gcc` was absent. The failed attempt allocated **51,260 KiB (50.1 MiB)** under `target/x86_64-unknown-linux-musl` plus 107,208 KiB in shared `target/debug`; this is a lower bound, not successful-musl footprint. Incremental local cost is therefore a cross compiler plus isolated build artifacts (**>50.1 MiB observed**); successful current-source wall time and successful artifact cost are **unknown on devmbp**. Installing a cross compiler solely to complete this audit was not necessary and would have changed host-global state.
 
-**Recommendation: CI-only (retain existing placement).** Removing it from local `check` saves **0 s** because it is already absent. Adding it locally would impose at least 217.5 MiB toolchain plus >50.1 MiB artifacts and a cross-compiler prerequisite. CI provides relevant Linux tooling and observed pre-merge execution; the tradeoff is delayed feedback after Rust tests. Keep release builds as the stronger final-link protection. Do not claim the historical 8.6 s figure as current.
+**Recommendation: CI-only (retain existing placement).** Removing it from local `check` saves **0 s** because it is already absent. Adding it locally would require a cross compiler and >50.1 MiB observed additional build artifacts; the pre-existing 217.5 MiB Rust target is not an incremental charge. CI provides relevant Linux tooling and observed pre-merge execution; the tradeoff is delayed feedback after Rust tests. Keep release builds as the stronger final-link protection. Do not claim the historical 8.6 s figure as current.
 
 ## CI mapping and recommendation summary
 
@@ -189,7 +189,7 @@ PY
 
 ### Latest 30 completed PR Actions runs
 
-The sampled window is pinned to these exact 30 run IDs, ordered newest to oldest, from **2026-09-19T20:58:51Z through 2026-09-19T23:22:49Z**. The query requests 100 jobs for each run; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persists immutable run metadata and each run's job names/outcomes. The second extracts the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
+The sampled window is pinned to these exact 30 run IDs, ordered newest to oldest, from **2026-09-19T20:58:51Z through 2026-09-19T23:22:49Z**. A lightweight verification of representative run `35475964002` with the published REST mapping returned non-null `headSha` `8164d567798e43ded907c6dbbcbf739976faf8a6`. The query requests 100 jobs for each run; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persists immutable run metadata and each run's job names/outcomes. The second extracts the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
 
 ```bash
 run_ids=(
@@ -203,7 +203,7 @@ run_ids=(
 printf '[]\n' > target/check-roi-audit/gh-pr-runs.json
 for run_id in "${run_ids[@]}"; do
   gh api "repos/scottopell/phoenix-ide/actions/runs/$run_id" \
-    --jq '{databaseId:.id,headSha,createdAt:.created_at,conclusion,url:.html_url}' \
+    --jq '{databaseId:.id,headSha:.head_sha,createdAt:.created_at,conclusion,url:.html_url}' \
     > target/check-roi-audit/run.json
   jq -s '.[0] + [.[1]]' target/check-roi-audit/gh-pr-runs.json \
     target/check-roi-audit/run.json > target/check-roi-audit/runs-next.json
