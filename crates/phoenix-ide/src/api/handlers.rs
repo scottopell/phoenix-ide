@@ -14024,6 +14024,61 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn overlapping_chain_deletes_recheck_absence_after_admission_serialization() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["overlap-a", "overlap-b"]).await;
+        mark_chain_history(&state, "overlap-a").await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state
+            .runtime
+            .install_hard_delete_barrier(Arc::clone(&barrier))
+            .await;
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        barrier.wait().await;
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::api::chains::delete_chain_handler(
+                    axum::extract::State(state),
+                    axum::extract::Path("overlap-a".to_string()),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
+
+        assert!(
+            first
+                .await
+                .expect("first delete task")
+                .expect("first delete")
+                .0
+                .success
+        );
+        assert!(
+            second
+                .await
+                .expect("second delete task")
+                .expect("overlap is idempotent")
+                .0
+                .success
+        );
+        assert!(state.db.get_conversation("overlap-a").await.is_err());
+        assert!(state.db.get_conversation("overlap-b").await.is_err());
+    }
+
+    #[tokio::test]
     async fn chain_delete_propagates_root_database_failure() {
         let state = make_test_state().await;
         state.db.pool().close().await;

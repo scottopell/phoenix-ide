@@ -599,25 +599,28 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
     expect(screen.getByRole('textbox', { name: 'Chain name' })).toHaveValue('new-name');
   });
 
-  it('restores the authoritative title when a blank edit is committed', async () => {
+  it('clears a legacy override while rendering the authoritative title fallback', async () => {
     const { api } = await import('../api');
-    const initial = makeChain({ chain_name: null, display_name: 'authoritative-title' });
+    const initial = makeChain({ chain_name: 'legacy-override', display_name: 'legacy-override' });
+    const cleared = makeChain({ chain_name: null, display_name: 'authoritative-title' });
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
-    (api.setChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
+    (api.setChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(cleared);
 
     renderAt(ROOT_ID);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /legacy-override/ })).toBeInTheDocument();
     });
-    fireEvent.click(screen.getByRole('button', { name: /authoritative-title/ }));
+    fireEvent.click(screen.getByRole('button', { name: /legacy-override/ }));
     const input = screen.getByRole('textbox', { name: 'Chain name' });
-    expect(input).toHaveValue('authoritative-title');
+    expect(input).toHaveValue('legacy-override');
     fireEvent.change(input, { target: { value: '   ' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    expect(api.setChainName).not.toHaveBeenCalled();
-    expect(screen.getByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(api.setChainName).toHaveBeenCalledWith(ROOT_ID, null);
+    });
+    expect(await screen.findByRole('button', { name: /authoritative-title/ })).toBeInTheDocument();
   });
 });
 
