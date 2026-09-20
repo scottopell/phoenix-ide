@@ -97,3 +97,32 @@ THE SYSTEM SHALL reject negative values
 THE SYSTEM SHALL format that integer as a human-readable date and time only at an application or presentation boundary
 
 **Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
+
+---
+
+### REQ-COMP-006 — Qualified Compiler-Cache Compatibility
+
+WHEN Phoenix automatically selects Kache for a Rust build subprocess
+THE SYSTEM SHALL require the executable to report exactly version `0.26.0`
+AND SHALL require its local daemon to accept the configured socket
+
+WHEN Kache is absent, disabled, reports another version, or cannot start its daemon
+THE SYSTEM SHALL fall through to an sccache executable that passes its version probe and then to no compiler cache
+AND SHALL report the fallback reason and the backend actually selected
+
+WHEN an operator explicitly selects Kache or sccache
+THE SYSTEM SHALL fail actionably if that backend is unusable
+AND SHALL NOT silently substitute another backend
+
+WHEN a caller supplies `RUSTC_WRAPPER`
+OR explicitly selects no compiler cache
+THE SYSTEM SHALL preserve that choice
+AND SHALL report it
+
+THE SYSTEM SHALL scope automatically generated compiler-cache environment variables to direct Cargo subprocesses and explicitly identified wrappers that own Cargo builds
+AND SHALL NOT propagate them into the Phoenix server or agent-executed commands
+
+THE SYSTEM SHALL guarantee this contract only for selection and local subprocess setup
+AND SHALL NOT guarantee compiler-cache performance, remote-cache compatibility, cross-version cache compatibility, or executable/debug-symbol fidelity outside the validated platform scope
+
+**Rationale:** Compiler caching is an optional development optimization. Exact qualification and subprocess scoping prevent an accelerator from becoming an implicit tool-version or unrelated-project compatibility promise.

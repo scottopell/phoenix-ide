@@ -35,6 +35,8 @@ at the repo)
 ./dev.py restart     # restart services
 ./dev.py status      # show running state
 ./dev.py check       # pre-commit checks (fmt, clippy, tests)
+./dev.py doctor      # prerequisites, including optional compiler caches
+# Compiler-cache setup and selection: docs/development/compiler-cache.md
 
 # Optional: run the dev backend over HTTPS with h2 ALPN enabled
 ./dev.py up --https

@@ -25,7 +25,12 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         with mock.patch.object(self.dev, "_run_cargo_build") as run:
             self.dev.build_rust()
 
-        run.assert_called_once_with(["cargo", "build"], self.dev.ROOT, "debug")
+        run.assert_called_once()
+        args, root, profile = run.call_args.args
+        self.assertEqual(["cargo", "build"], args)
+        self.assertEqual(self.dev.ROOT, root)
+        self.assertEqual("debug", profile)
+        self.assertIsNotNone(run.call_args.kwargs["env"])
 
     def test_up_builds_and_starts_debug_binary(self):
         with (
