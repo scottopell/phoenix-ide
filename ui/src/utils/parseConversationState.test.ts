@@ -16,6 +16,7 @@ describe('parseConversationState recovery', () => {
     expect(state).toEqual({
       type: 'server_overload_retrying',
       attempt: 3,
+      maxAttempts: 5,
       retryAt: Date.parse('2026-01-01T00:00:30Z'),
     });
     expect(isAgentWorking(state)).toBe(true);

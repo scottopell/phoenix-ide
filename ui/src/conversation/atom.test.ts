@@ -1546,7 +1546,7 @@ describe('conversationReducer', () => {
       const waiting = dispatch(atom, {
         type: 'sse_state_change',
         sequenceId: 1,
-        phase: { type: 'server_overload_retrying', attempt: 3, retryAt: Date.now() + 4_000 },
+        phase: { type: 'server_overload_retrying', attempt: 3, maxAttempts: 5, retryAt: Date.now() + 4_000 },
         stateUpdatedAt: 1,
       });
       expect(waiting.turnRetryContext).toBe(retryContext);
@@ -1868,7 +1868,7 @@ describe('conversationReducer', () => {
     it('accepts tokens during an in-flight ordinary overload retry', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        phase: { type: 'server_overload_retrying', attempt: 2, retryAt: null },
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null },
       };
 
       const next = dispatch(atom, {
@@ -1884,7 +1884,7 @@ describe('conversationReducer', () => {
     it('drops tokens while an overload retry is still waiting', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        phase: { type: 'server_overload_retrying', attempt: 2, retryAt: Date.now() + 10_000 },
+        phase: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: Date.now() + 10_000 },
       };
 
       const next = dispatch(atom, {

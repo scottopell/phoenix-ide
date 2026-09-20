@@ -49,7 +49,7 @@ enum ConversationState: Equatable {
     /// Covers `llm_requesting` and `seeded_llm_requesting` (identical for
     /// display purposes).
     case llmRequesting(attempt: Int)
-    case serverOverloadRetrying(attempt: Int, retryAt: String?)
+    case serverOverloadRetrying(attempt: Int, maxAttempts: Int, retryAt: String?)
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
@@ -87,6 +87,7 @@ enum ConversationState: Equatable {
         case "server_overload_retrying":
             return .serverOverloadRetrying(
                 attempt: json["retry"]?["attempt"]?.intValue ?? json["attempt"]?.intValue ?? 1,
+                maxAttempts: json["max_attempts"]?.intValue ?? 5,
                 retryAt: json["retry"]?["phase"]?["retry_at"]?.stringValue
                     ?? json["retry_at"]?.stringValue)
         case "tool_executing":
@@ -148,12 +149,12 @@ enum ConversationState: Equatable {
     /// still accept a follow-up for after the current turn.
     var acceptsChatMessage: Bool {
         switch self {
-        case .idle, .llmRequesting, .toolExecuting,
+        case .idle, .llmRequesting, .serverOverloadRetrying, .toolExecuting,
              .awaitingSubAgents, .cancellingTool, .cancellingSubAgents:
             return true
         case .error(_, let kind):
             return kind.isUserResumable
-        case .awaitingLlm, .serverOverloadRetrying, .awaitingContinuation, .cancelling,
+        case .awaitingLlm, .awaitingContinuation, .cancelling,
              .awaitingUserResponse, .awaitingTaskApproval,
              .awaitingRecovery, .provisioning,
              .contextExhausted,

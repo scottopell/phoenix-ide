@@ -39,16 +39,16 @@ final class ConversationStateTests: XCTestCase {
         """)
         XCTAssertEqual(
             waiting,
-            .serverOverloadRetrying(attempt: 3, retryAt: "2026-01-01T00:00:20Z"))
+            .serverOverloadRetrying(attempt: 3, maxAttempts: 5, retryAt: "2026-01-01T00:00:20Z"))
         XCTAssertTrue(waiting.isKnownWorkingState)
         XCTAssertTrue(waiting.isCancellable)
-        XCTAssertFalse(waiting.acceptsChatMessage)
+        XCTAssertTrue(waiting.acceptsChatMessage)
 
         XCTAssertEqual(
             parse("""
             {"type":"server_overload_retrying","retry":{"attempt":4,"phase":{"type":"in_flight"}}}
             """),
-            .serverOverloadRetrying(attempt: 4, retryAt: nil))
+            .serverOverloadRetrying(attempt: 4, maxAttempts: 5, retryAt: nil))
     }
 
     func testToolExecutingCarriesToolAndCounts() {

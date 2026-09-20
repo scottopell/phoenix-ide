@@ -1637,6 +1637,13 @@ pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value 
         ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
             "type": "server_overload_retrying",
             "attempt": retry.attempt,
+            "max_attempts": phoenix_core::domain::retry_policy::OVERLOAD_MAX_ATTEMPTS,
+            "retry_at": match &retry.phase {
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting { retry_at } => {
+                    Some(retry_at)
+                }
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => None,
+            },
         }),
         _ => serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
     }

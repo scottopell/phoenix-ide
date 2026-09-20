@@ -227,12 +227,12 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'server_overload_retrying': {
       const retry = isRecord(obj['retry']) ? obj['retry'] : obj;
       const phase = isRecord(retry['phase']) ? retry['phase'] : null;
-      const retryAt = phase && typeof phase['retry_at'] === 'string'
-        ? Date.parse(phase['retry_at'])
-        : null;
+      const retryAtRaw = phase?.['retry_at'] ?? obj['retry_at'];
+      const retryAt = typeof retryAtRaw === 'string' ? Date.parse(retryAtRaw) : null;
       return {
         type,
         attempt: typeof retry['attempt'] === 'number' ? retry['attempt'] : 1,
+        maxAttempts: typeof obj['max_attempts'] === 'number' ? obj['max_attempts'] : 5,
         retryAt: retryAt !== null && Number.isFinite(retryAt) ? retryAt : null,
       };
     }

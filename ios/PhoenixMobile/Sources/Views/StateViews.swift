@@ -147,11 +147,17 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .serverOverloadRetrying(let attempt, _):
+        case .serverOverloadRetrying(let attempt, let maxAttempts, let retryAt):
             workingRow {
-                Text("Model overloaded… (attempt \(attempt)/5)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(Self.overloadRetryText(
+                        attempt: attempt,
+                        maxAttempts: maxAttempts,
+                        retryAt: retryAt,
+                        now: context.date))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
         case .awaitingSubAgents(let pending, let completed):
@@ -251,6 +257,20 @@ struct StateDetailBody: View {
                 }
             }
         }
+    }
+
+    nonisolated static func overloadRetryText(
+        attempt: Int,
+        maxAttempts: Int,
+        retryAt: String?,
+        now: Date
+    ) -> String {
+        let prefix = "Model overloaded… (attempt \(attempt)/\(maxAttempts))"
+        guard let retryAt,
+              let deadline = ISO8601DateFormatter().date(from: retryAt)
+        else { return prefix }
+        let seconds = max(0, Int(ceil(deadline.timeIntervalSince(now))))
+        return "\(prefix) — retrying in \(seconds)s"
     }
 
     nonisolated static func fallbackErrorMessage(type: String, state: JSONValue?) -> String {

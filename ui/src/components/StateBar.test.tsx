@@ -969,7 +969,7 @@ describe('StateBar working-phase indicators', () => {
 
   it('shows streaming for an in-flight overload retry after first byte', () => {
     renderStateBar({
-      convState: { type: 'server_overload_retrying', attempt: 3, retryAt: null },
+      convState: { type: 'server_overload_retrying', attempt: 3, maxAttempts: 5, retryAt: null },
       phaseStateUpdatedAt: T_NOW - 2_000,
       lastSseEventAt: T_NOW - 200,
       firstByteRequestId: 'overload-req-3',
@@ -1103,7 +1103,7 @@ describe('StateBar working-phase indicators', () => {
   it('freezes overload in-flight streaming in the disconnected activity snapshot', () => {
     const props = {
       conversation: makeConversation(),
-      convState: { type: 'server_overload_retrying', attempt: 2, retryAt: null } as ConversationState,
+      convState: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt: null } as ConversationState,
       connectionAttempt: 0,
       nextRetryIn: null,
       contextWindowUsed: 0,
@@ -1134,7 +1134,7 @@ describe('StateBar working-phase indicators', () => {
   it('renders and decrements the persisted overload countdown after reconnect (REQ-LRV-008)', () => {
     const retryAt = T_NOW + 10_000;
     const { rerender } = renderStateBar({
-      convState: { type: 'server_overload_retrying', attempt: 2, retryAt },
+      convState: { type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt },
       phaseStateUpdatedAt: T_NOW,
       lastSseEventAt: T_NOW,
       turnRetryContext: { attempt: 2, maxAttempts: 5, reasonText: 'server overloaded' },
@@ -1148,7 +1148,7 @@ describe('StateBar working-phase indicators', () => {
       <MemoryRouter>
         <StateBar
           conversation={makeConversation()}
-          convState={{ type: 'server_overload_retrying', attempt: 2, retryAt }}
+          convState={{ type: 'server_overload_retrying', attempt: 2, maxAttempts: 5, retryAt }}
           connectionState="connected"
           connectionAttempt={0}
           nextRetryIn={null}
