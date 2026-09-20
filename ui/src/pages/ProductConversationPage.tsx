@@ -26,7 +26,12 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { subscribeCloseSnapshotChanged, subscribeProductConversationSnapshotChanged } from '../notifications';
+import {
+  getProductConversationSnapshotChangeSequence,
+  productConversationSnapshotChangedSince,
+  subscribeCloseSnapshotChanged,
+  subscribeProductConversationSnapshotChanged,
+} from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
@@ -814,6 +819,7 @@ function ProductConversationPageInner() {
     if (!isBackgroundRefresh) setLoading(true);
     setError(null);
     setOlderError(null);
+    const snapshotChangeSequence = getProductConversationSnapshotChangeSequence();
 
     const candidateMeasurement = openMeasurementRef.current;
     const measurement = candidateMeasurement && !candidateMeasurement.reported
@@ -838,6 +844,13 @@ function ProductConversationPageInner() {
             : next,
         }));
         if (!isBackgroundRefresh) setHistoryGeneration(0);
+        if (next.product_conversation_id !== productConversationId
+          && productConversationSnapshotChangedSince(
+            next.product_conversation_id,
+            snapshotChangeSequence,
+          )) {
+          setSnapshotRetry((retry) => retry + 1);
+        }
       })
       .catch((err) => {
         if (cancelled) return;

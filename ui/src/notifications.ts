@@ -166,16 +166,34 @@ export function getProductConversationListRevision(): number {
 }
 
 const PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT = 'phoenix:product-conversation-snapshot-changed';
+let productConversationSnapshotChangeSequence = 0;
+const productConversationSnapshotChangeSequencesById = new Map<string, number>();
 
 type ProductConversationSnapshotChangedDetail = {
   productConversationId: string;
 };
 
 export function notifyProductConversationSnapshotChanged(productConversationId: string): void {
+  productConversationSnapshotChangeSequence += 1;
+  productConversationSnapshotChangeSequencesById.set(
+    productConversationId,
+    productConversationSnapshotChangeSequence,
+  );
   window.dispatchEvent(new CustomEvent<ProductConversationSnapshotChangedDetail>(
     PRODUCT_CONVERSATION_SNAPSHOT_CHANGED_EVENT,
     { detail: { productConversationId } },
   ));
+}
+
+export function getProductConversationSnapshotChangeSequence(): number {
+  return productConversationSnapshotChangeSequence;
+}
+
+export function productConversationSnapshotChangedSince(
+  productConversationId: string,
+  sequence: number,
+): boolean {
+  return (productConversationSnapshotChangeSequencesById.get(productConversationId) ?? 0) > sequence;
 }
 
 export function subscribeProductConversationSnapshotChanged(
