@@ -117,6 +117,17 @@ describe('reaction pill', () => {
     expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Passage unavailable. Your reaction is saved here.');
   });
 
+  it('clears a touch return error when the source mounts through another retry path', async () => {
+    navigate.mockResolvedValue(false);
+    const view = render(<Fixture mounted={false} touchDocked />);
+    fireEvent.click(screen.getByRole('button', { name: /Return to passage/ }));
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('Passage unavailable. Your reaction is saved here.');
+    view.rerender(<Fixture touchDocked />);
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Return to passage/ })).not.toBeInTheDocument());
+    view.rerender(<Fixture mounted={false} touchDocked />);
+    expect(await screen.findByRole('button', { name: /Return to passage/ })).toHaveTextContent('“second”');
+  });
+
   it('reserves transcript space equal to the touch dock height and releases it on unmount', () => {
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);

@@ -129,8 +129,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
   }, [source, sourceRange, touchDocked, bubbleRef]);
 
   useEffect(() => {
-    if (!docked) setError('');
-  }, [docked]);
+    if (!sourceDocked) setError('');
+  }, [sourceDocked]);
 
   const returnToPassage = async () => {
     returnRequest.current?.abort();
