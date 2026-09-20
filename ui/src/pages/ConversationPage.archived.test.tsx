@@ -308,7 +308,7 @@ function renderPage(
   );
   const view = render(page());
 
-  return { store, ...view, rerenderPage: () => view.rerender(page()) };
+  return { store, draftStore, ...view, rerenderPage: () => view.rerender(page()) };
 }
 
 afterEach(() => {
@@ -616,6 +616,31 @@ describe('ConversationPage message delivery reconciliation', () => {
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
     expect(await screen.findByDisplayValue('do not lose this draft')).toBeInTheDocument();
+  });
+
+  it('merges a close-fenced submitted draft ahead of text entered while sending', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const { store, draftStore } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'submitted A' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    fireEvent.change(textbox, { target: { value: 'newer B' } });
+
+    await act(async () => {
+      response.reject(new ConflictError({
+        error: 'Conversation is closing and cannot accept new work.',
+        error_type: 'close_admission_fenced',
+      }));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      expect(draftStore.getSnapshot(slug).draft).toBe('submitted A\nnewer B');
+      expect(store.getSnapshot(slug).phase.type).toBe('idle');
+    });
+    expect(screen.queryByText('submitted A')).not.toBeInTheDocument();
   });
 
   it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
