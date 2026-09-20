@@ -10,6 +10,9 @@ pub use reference::{SvgArtifactReference, SvgValidationOutcome};
 mod invocation;
 pub use invocation::SvgInvocationId;
 
+mod metadata;
+pub use metadata::{SvgPresentationMetadata, MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS};
+
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_ELEMENTS: usize = 20_000;
 pub const MAX_DEPTH: usize = 64;
