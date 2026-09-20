@@ -184,6 +184,23 @@ verify_public_rc_is_not_latest() {
   [[ "$channel" != rc ]] || verify_latest_relationship
 }
 
+assert_stable_is_newest_before_publication() {
+  [[ "$channel" != stable ]] && return 0
+  local public_stable_tags="$work/public-stable-tags"
+  gh api --paginate --slurp "repos/$repo/releases?per_page=100" \
+    | jq -er '.[][] | select(.draft == false and .prerelease == false) | .tag_name' \
+      >"$public_stable_tags" || {
+        local statuses=("${PIPESTATUS[@]}")
+        [[ ${statuses[0]} -eq 0 && ${statuses[1]} -eq 4 ]] || return 1
+      }
+  [[ ! -s "$public_stable_tags" ]] && return 0
+  "$SCRIPT_DIR/release_version.py" validate-new-from-tags "$version" \
+    <"$public_stable_tags" >/dev/null || {
+      echo "error: refusing to make older stable release $tag latest over a newer public stable release" >&2
+      return 1
+    }
+}
+
 assert_private_release() {
   local metadata=$1
   "$PYTHON3" - "$metadata" "$tag" "$expected_prerelease" <<'PY'
@@ -227,8 +244,8 @@ upload_asset_to_draft() {
   local path=$2
   local name
   name=$(basename "$path")
-  gh api --hostname uploads.github.com --method POST \
-    "repos/$repo/releases/$release_id/assets?name=$name" \
+  gh api --method POST \
+    "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$name" \
     -H 'Content-Type: application/octet-stream' \
     --input "$path" >/dev/null
 }
@@ -296,6 +313,7 @@ verify_tag
 release_metadata_by_id "$release_id" >"$metadata_file"
 verify_complete_private_release "$metadata_file"
 assert_private_release "$metadata_file"
+assert_stable_is_newest_before_publication
 gh api --method PATCH "repos/$repo/releases/$release_id" \
   -F draft=false \
   -F prerelease="$expected_prerelease" \

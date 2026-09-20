@@ -122,7 +122,9 @@ if args and args[0] == "api":
                 value = value == "true"
             fields[key] = value
             index += 2
-        elif args[index] in {"-H", "--hostname"}:
+        elif args[index] == "--hostname":
+            raise SystemExit("upload requests must use an absolute uploads.github.com URL")
+        elif args[index] == "-H":
             index += 2
         elif args[index] in {"--paginate", "--slurp"}:
             index += 1
@@ -171,6 +173,9 @@ if args and args[0] == "api":
         raise SystemExit(0)
     if method == "GET" and endpoint.endswith("/releases?per_page=100"):
         page = [] if release is None else [api_release(release)]
+        latest_tag = os.environ.get("FAKE_LATEST_TAG")
+        if latest_tag is not None and latest_tag != (release or {}).get("tag_name"):
+            page.append({"tag_name": latest_tag, "draft": False, "prerelease": False, "assets": []})
         print(json.dumps([page] if slurp else page))
         raise SystemExit(0)
     if method == "GET" and endpoint.endswith("/releases/42"):
@@ -179,6 +184,8 @@ if args and args[0] == "api":
         print(json.dumps(api_release(release)))
         raise SystemExit(0)
     if method == "POST" and "/releases/42/assets?name=" in endpoint:
+        if not endpoint.startswith("https://uploads.github.com/"):
+            raise SystemExit("asset upload must target uploads.github.com")
         if release is None or not release["draft"] or input_path is None:
             raise SystemExit("asset upload requires a draft and input")
         fail_after = int(os.environ.get("FAKE_UPLOAD_FAIL_AFTER", "0"))
@@ -293,7 +300,7 @@ assert_published_exact
 grep -F -- '--method POST repos/owner/repo/releases' "$FAKE_STATE/gh.log" >/dev/null
 grep -F -- '-F draft=true -F prerelease=false -f make_latest=true' "$FAKE_STATE/gh.log" >/dev/null
 grep -F -- '-F draft=false -F prerelease=false -f make_latest=true' "$FAKE_STATE/gh.log" >/dev/null
-grep -F -- '--hostname uploads.github.com --method POST' "$FAKE_STATE/gh.log" >/dev/null
+grep -F -- '--method POST https://uploads.github.com/repos/owner/repo/releases/42/assets?name=' "$FAKE_STATE/gh.log" >/dev/null
 if grep -F -- '--method DELETE repos/owner/repo/releases/42' "$FAKE_STATE/gh.log" >/dev/null; then
   echo "draft recovery must not delete the release" >&2
   exit 1
@@ -315,6 +322,28 @@ if publish >/dev/null 2>&1; then
   echo "expected RC publication to reject becoming repository latest" >&2
   exit 1
 fi
+unset FAKE_LATEST_TAG
+
+# Resuming an older stable draft must not replace a newer stable latest release.
+reset_state
+export FAKE_PUBLISH_FAIL=1
+if publish >/dev/null 2>&1; then
+  echo "expected interrupted stable publication" >&2
+  exit 1
+fi
+unset FAKE_PUBLISH_FAIL
+export FAKE_LATEST_TAG=v1.2.4
+if publish >/dev/null 2>&1; then
+  echo "expected older stable draft retry to refuse latest replacement" >&2
+  exit 1
+fi
+python3 - "$FAKE_STATE/release.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+release = json.loads(Path(sys.argv[1]).read_text())
+assert release["draft"] is True
+PY
 unset FAKE_LATEST_TAG
 
 # The supplied channel must be derived from the validated tag before any API mutation.

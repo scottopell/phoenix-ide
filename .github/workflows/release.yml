@@ -22,6 +22,9 @@ jobs:
   # Cargo.toml whose version is already tagged is a no-op.
   gate:
     if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: release-tag-gate
+      cancel-in-progress: false
     permissions:
       contents: write
     runs-on: ubuntu-latest
