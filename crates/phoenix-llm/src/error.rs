@@ -1,6 +1,7 @@
 //! LLM error types
 
 use super::rate_limit::QuotaDetails;
+use super::retry_guidance::RetryAfter;
 use chrono::{DateTime, Datelike, Local, Utc};
 use thiserror::Error;
 
@@ -21,6 +22,7 @@ pub struct LlmError {
     /// small enough that `Result<_, LlmError>` stays under clippy's
     /// `result_large_err` threshold across the LLM hot path.
     pub quota: Option<Box<QuotaDetails>>,
+    retry_after: Option<RetryAfter>,
 }
 
 impl LlmError {
@@ -30,6 +32,7 @@ impl LlmError {
             message: message.into(),
             recovery_in_progress: false,
             quota: None,
+            retry_after: None,
         }
     }
 
@@ -50,7 +53,25 @@ impl LlmError {
     }
 
     pub fn server_overloaded(message: impl Into<String>) -> Self {
-        Self::new(LlmErrorKind::ServerOverloaded, message)
+        Self::server_overloaded_with_retry_after(message, None)
+    }
+
+    pub(crate) fn server_overloaded_with_retry_after(
+        message: impl Into<String>,
+        retry_after: Option<RetryAfter>,
+    ) -> Self {
+        Self {
+            kind: LlmErrorKind::ServerOverloaded,
+            message: message.into(),
+            recovery_in_progress: false,
+            quota: None,
+            retry_after,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_after(&self) -> Option<RetryAfter> {
+        self.retry_after
     }
 
     #[must_use]
@@ -61,6 +82,7 @@ impl LlmError {
             message,
             recovery_in_progress: false,
             quota: Some(Box::new(quota)),
+            retry_after: None,
         }
     }
 

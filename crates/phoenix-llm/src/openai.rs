@@ -6,6 +6,7 @@ use super::rate_limit::{
     normalize_credit_depletion, parse_active_limit, parse_credits_snapshot, parse_promo_message,
     parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
 };
+use super::retry_guidance::retry_after_from_headers;
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage};
 use super::LlmError;
@@ -119,6 +120,7 @@ pub async fn complete(
     })?;
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .text()
         .await
@@ -129,7 +131,11 @@ pub async fn complete(
     // means we're on the platform Responses API path, which doesn't emit the
     // codex `x-codex-*` headers or `usage_limit_reached` envelopes.
     if !status.is_success() {
-        return Err(responses_http_error(status.as_u16(), &body));
+        return Err(responses_http_error_with_headers(
+            status.as_u16(),
+            &headers,
+            &body,
+        ));
     }
 
     let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
@@ -225,6 +231,21 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
         // remain retryable so the executor can recover from provider failures.
         LlmError::server_error(responses_error_detail(code, message))
     })
+}
+
+fn overload_retry_guidance(error: LlmError, headers: &HeaderMap) -> LlmError {
+    if error.kind == super::LlmErrorKind::ServerOverloaded {
+        LlmError::server_overloaded_with_retry_after(
+            error.message,
+            retry_after_from_headers(headers),
+        )
+    } else {
+        error
+    }
+}
+
+fn responses_http_error_with_headers(status: u16, headers: &HeaderMap, body: &str) -> LlmError {
+    overload_retry_guidance(responses_http_error(status, body), headers)
 }
 
 fn responses_http_error(status: u16, body: &str) -> LlmError {
@@ -1389,7 +1410,11 @@ pub async fn complete_streaming(
                 return Err(err);
             }
         }
-        return Err(responses_http_error(status.as_u16(), &body));
+        return Err(responses_http_error_with_headers(
+            status.as_u16(),
+            &headers,
+            &body,
+        ));
     }
 
     // Codex bridge emits a fresh quota snapshot in response headers on
@@ -1973,9 +1998,12 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
         503 => {
             let envelope = serde_json::from_str::<CodexCodedErrorEnvelope>(body).ok()?;
             match envelope.error.code.as_deref() {
-                Some("server_is_overloaded" | "slow_down") => Some(LlmError::server_overloaded(
-                    "Selected model is at capacity. Try a different model.",
-                )),
+                Some("server_is_overloaded" | "slow_down") => {
+                    Some(LlmError::server_overloaded_with_retry_after(
+                        "Selected model is at capacity. Try a different model.",
+                        retry_after_from_headers(headers),
+                    ))
+                }
                 _ => None,
             }
         }
@@ -2444,13 +2472,19 @@ pub async fn complete_chat(
     })?;
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
-        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
+        return Err(openai_http_error_with_headers(
+            status.as_u16(),
+            status.as_str(),
+            &headers,
+            &body,
+        ));
     }
 
     let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|error| {
@@ -2508,11 +2542,17 @@ pub async fn complete_streaming_chat(
 
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
-        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
+        return Err(openai_http_error_with_headers(
+            status.as_u16(),
+            status.as_str(),
+            &headers,
+            &body,
+        ));
     }
 
     let mut acc = ChatStreamAccumulator::new(dispatch_at, request);
@@ -2904,6 +2944,18 @@ fn classify_chat_stream_error(code: Option<&serde_json::Value>, message: &str) -
         Some(value) => classify_responses_error(&value.to_string(), message),
         None => classify_responses_error("", message),
     }
+}
+
+fn openai_http_error_with_headers(
+    status_code: u16,
+    status_display: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> LlmError {
+    overload_retry_guidance(
+        openai_http_error(status_code, status_display, body),
+        headers,
+    )
 }
 
 fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmError {
@@ -3652,6 +3704,44 @@ mod tests {
             quota.primary.as_ref().and_then(|w| w.window_minutes),
             Some(15)
         );
+    }
+
+    #[test]
+    fn wrapped_websocket_capacity_preserves_retry_after() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "at capacity"
+            },
+            "headers": { "retry-after": "12" }
+        }))
+        .expect("wrapped overload");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            error.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn wrapped_websocket_quota_does_not_gain_retry_guidance() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "quota exhausted",
+                "plan_type": "pro"
+            },
+            "headers": { "retry-after": "12" }
+        }))
+        .expect("wrapped quota error");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::UsageLimitReached);
+        assert_eq!(error.retry_after(), None);
     }
 
     #[test]
@@ -4977,6 +5067,20 @@ mod tests {
         }
 
         #[test]
+        fn server_overloaded_503_preserves_retry_guidance() {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_static("9"));
+            let body = r#"{"error":{"code":"server_is_overloaded"}}"#;
+            let err = parse_codex_error(503, &headers, body).expect("parsed");
+            assert_eq!(
+                err.retry_after(),
+                Some(crate::RetryAfter::WithinLimit(
+                    std::time::Duration::from_secs(9)
+                ))
+            );
+        }
+
+        #[test]
         fn slow_down_503_returns_server_overloaded_terminal() {
             let body = r#"{"error":{"code":"slow_down"}}"#;
             let err = parse_codex_error(503, &HeaderMap::new(), body).expect("parsed");
@@ -5084,6 +5188,13 @@ mod tests {
             classify_responses_error("", "boom").kind,
             LlmErrorKind::ServerError
         );
+    }
+
+    #[test]
+    fn in_band_capacity_has_no_retry_guidance_without_headers() {
+        let error = classify_responses_error("server_is_overloaded", "at capacity");
+        assert_eq!(error.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(error.retry_after(), None);
     }
 
     #[test]
@@ -5788,6 +5899,38 @@ mod tests {
             let overload = openai_http_error(status, &status.to_string(), &body);
             assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
         }
+    }
+
+    #[test]
+    fn openai_http_capacity_preserves_retry_after_without_conflating_quota() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "6".parse().unwrap());
+        let capacity = openai_http_error_with_headers(
+            503,
+            "503",
+            &headers,
+            &serde_json::json!({
+                "error": {"message": "at capacity", "code": "server_is_overloaded"}
+            })
+            .to_string(),
+        );
+        assert_eq!(capacity.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            capacity.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(6)))
+        );
+
+        let quota = openai_http_error_with_headers(
+            429,
+            "429",
+            &headers,
+            &serde_json::json!({
+                "error": {"message": "quota", "code": "rate_limit_exceeded"}
+            })
+            .to_string(),
+        );
+        assert_eq!(quota.kind, crate::LlmErrorKind::RateLimit);
+        assert_eq!(quota.retry_after(), None);
     }
 
     #[test]

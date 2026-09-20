@@ -2997,6 +2997,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "httpdate",
  "phoenix-core",
  "proptest",
  "rand 0.10.1",
