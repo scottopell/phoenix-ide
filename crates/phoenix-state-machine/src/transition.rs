@@ -2501,6 +2501,28 @@ pub fn transition_parent(
                     }
                 };
 
+                if let Err(err) = input.validate() {
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
+                            "ask_user_question produces exactly one tool_use and one result",
+                        );
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
                 let tool_result = ToolResult::success(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
@@ -5293,6 +5315,680 @@ mod tests {
         .expect("filesystem-free stale tool response");
 
         assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_enters_existing_awaiting_state() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmResponse {
+                content: vec![
+                    ContentBlock::text("I need direction"),
+                    ContentBlock::tool_use(
+                        "auq-coordinator-1",
+                        "ask_user_question",
+                        serde_json::json!({
+                            "questions": [{
+                                "question": "Which path?",
+                                "header": "Choice",
+                                "options": [{
+                                    "label": "A",
+                                    "description": "Path A",
+                                    "preview": "Do A"
+                                }, {
+                                    "label": "B",
+                                    "description": "Path B",
+                                    "preview": "Do B"
+                                }],
+                                "multiSelect": false
+                            }]
+                        }),
+                    ),
+                ],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-1",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: Some("Path A".to_string()),
+                                    preview: Some("Do A".to_string()),
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: Some("Path B".to_string()),
+                                    preview: Some("Do B".to_string()),
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq".into(),
+            },
+        )
+        .expect("Coordinator AUQ uses existing parent interception");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingUserResponse { ref tool_use_id, .. }
+                if tool_use_id == "auq-coordinator-1"
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_typed_invalid_options_before_waiting() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "auq-coordinator-invalid",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-invalid",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![QuestionOption {
+                                label: "A".to_string(),
+                                description: None,
+                                preview: None,
+                            }],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-invalid".into(),
+            },
+        )
+        .expect("typed but invalid AUQ returns a tool error");
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("invalid typed AUQ persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains("requires 2-4 options"),
+                "error should explain option count validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for invalid typed AUQ, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_reserved_other_label_before_waiting() {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "auq-coordinator-other",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "Other" }, { "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "auq-coordinator-other",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "Other".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-other".into(),
+            },
+        )
+        .expect("reserved Other label returns a tool error");
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("reserved Other label persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains("reserved option label `Other`"),
+                "error should explain reserved Other label validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for reserved Other label, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_other_sentinel_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result(" __other__ ", "coordinator-auq-sentinel")
+                .expect("reserved sentinel label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `__other__`",
+            "reserved sentinel label",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_blank_option_label_before_waiting() {
+        let result = coordinator_invalid_option_label_result("   ", "coordinator-auq-blank")
+            .expect("blank option label returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "empty option label", "blank option label");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_whitespace_other_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result(" Other ", "coordinator-auq-other-spaced")
+                .expect("reserved display label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `Other`",
+            "reserved display label",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_case_variant_other_label_before_waiting() {
+        let result =
+            coordinator_invalid_option_label_result(" oThEr ", "coordinator-auq-other-case")
+                .expect("case-variant reserved display label returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "reserved option label `oThEr`",
+            "case-variant reserved display label",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_label_over_five_words_before_waiting() {
+        let result = coordinator_invalid_option_label_result(
+            "one two three four five six",
+            "coordinator-auq-long-label",
+        )
+        .expect("long option label returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "exceeds 5 words", "long option label");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_long_header_before_waiting() {
+        let result = coordinator_invalid_header_result("TooLongHeader")
+            .expect("long header returns a tool error");
+
+        assert_invalid_auq_label_result(&result, "header exceeds 12 characters", "long header");
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_accepts_full_question_text_before_waiting() {
+        let result = coordinator_invalid_question_text_result("one two three four five six")
+            .expect("long question text remains valid full text");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingUserResponse { ref tool_use_id, .. }
+                if tool_use_id == "coordinator-auq-long-question"
+        ));
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_duplicate_trimmed_question_text_before_waiting() {
+        let result = coordinator_duplicate_question_text_result()
+            .expect("duplicate trimmed question text returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "duplicates question text `Same?`",
+            "duplicate question text",
+        );
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_rejects_blank_option_description_before_waiting() {
+        let result = coordinator_invalid_description_result("   ")
+            .expect("blank option description returns a tool error");
+
+        assert_invalid_auq_label_result(
+            &result,
+            "has empty description",
+            "blank option description",
+        );
+    }
+
+    fn coordinator_invalid_option_label_result(
+        label: &str,
+        request_id: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    request_id,
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": label }, { "label": "A" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    request_id,
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: label.to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: request_id.into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_header_result(
+        header: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-long-header",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": header,
+                            "options": [{ "label": "A" }, { "label": "B" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-long-header",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: header.to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-long-header".into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_question_text_result(
+        question: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-long-question",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": question,
+                            "header": "Choice",
+                            "options": [{ "label": "A" }, { "label": "B" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-long-question",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: question.to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: None,
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-long-question".into(),
+            },
+        )
+    }
+
+    fn coordinator_duplicate_question_text_result() -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let options = || {
+            vec![
+                QuestionOption {
+                    label: "A".to_string(),
+                    description: Some("Alpha".to_string()),
+                    preview: None,
+                },
+                QuestionOption {
+                    label: "B".to_string(),
+                    description: Some("Beta".to_string()),
+                    preview: None,
+                },
+            ]
+        };
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-dup-question",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [
+                            { "question": "Same?", "header": "First", "options": [{ "label": "A", "description": "Alpha" }, { "label": "B", "description": "Beta" }], "multiSelect": false },
+                            { "question": " Same? ", "header": "Second", "options": [{ "label": "A", "description": "Alpha" }, { "label": "B", "description": "Beta" }], "multiSelect": false }
+                        ]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-dup-question",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![
+                            UserQuestion {
+                                question: "Same?".to_string(),
+                                header: "First".to_string(),
+                                options: options(),
+                                multi_select: false,
+                            },
+                            UserQuestion {
+                                question: " Same? ".to_string(),
+                                header: "Second".to_string(),
+                                options: options(),
+                                multi_select: false,
+                            },
+                        ],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-dup-question".into(),
+            },
+        )
+    }
+
+    fn coordinator_invalid_description_result(
+        description: &str,
+    ) -> Result<TransitionResult, TransitionError> {
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::LlmResponse {
+                content: vec![ContentBlock::tool_use(
+                    "coordinator-auq-blank-description",
+                    "ask_user_question",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Which path?",
+                            "header": "Choice",
+                            "options": [{ "label": "A", "description": description }, { "label": "B", "description": "Beta" }],
+                            "multiSelect": false
+                        }]
+                    }),
+                )],
+                tool_calls: vec![ToolCall::new(
+                    "coordinator-auq-blank-description",
+                    ToolInput::AskUserQuestion(AskUserQuestionInput {
+                        questions: vec![UserQuestion {
+                            question: "Which path?".to_string(),
+                            header: "Choice".to_string(),
+                            options: vec![
+                                QuestionOption {
+                                    label: "A".to_string(),
+                                    description: Some(description.to_string()),
+                                    preview: None,
+                                },
+                                QuestionOption {
+                                    label: "B".to_string(),
+                                    description: Some("Beta".to_string()),
+                                    preview: None,
+                                },
+                            ],
+                            multi_select: false,
+                        }],
+                        metadata: None,
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-auq-blank-description".into(),
+            },
+        )
+    }
+
+    fn assert_invalid_auq_label_result(
+        result: &TransitionResult,
+        expected_error: &str,
+        label_description: &str,
+    ) {
+        use crate::CheckpointData;
+        use phoenix_core::domain::db_schema::ToolOutcome;
+
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|effect| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match effect {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
+            })
+            .expect("invalid label persists tool error checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => assert!(
+                output.contains(expected_error),
+                "error should explain {label_description} validation, got: {output}"
+            ),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected tool error for {label_description}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn coordinator_ask_user_question_answer_resumes_existing_llm_flow() {
+        use crate::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which path?".to_string(),
+                header: "Choice".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "auq-coordinator-1".to_string(),
+        };
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("Which path?".to_string(), "A".to_string());
+
+        let result = transition(
+            &state,
+            &ConvContext::coordinator("coordinator", "test-model", 200_000),
+            Event::UserQuestionResponse {
+                answers,
+                annotations: None,
+            },
+        )
+        .expect("Coordinator AUQ answer uses existing response transition");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
     }
 
     #[test]

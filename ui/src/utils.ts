@@ -260,6 +260,7 @@ export function parseConversationState(raw: unknown): ConversationState {
       return {
         type: 'awaiting_user_response',
         questions: (obj['questions'] as UserQuestion[]) ?? [],
+        tool_use_id: stringOr(obj['tool_use_id'], ''),
       };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
