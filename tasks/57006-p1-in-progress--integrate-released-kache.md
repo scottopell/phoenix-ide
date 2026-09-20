@@ -1,5 +1,7 @@
 # Integrate released Kache v0.26.0 into Phoenix development workflows
 
+Task identity: approved provisionally as 57005 before current-main integration; current main already owned 57005 for merged PR #781 (`repair-tmux-test-watchdog-process-containment`). After rebasing, `taskmd new` allocated unique ID 57006 for this commission.
+
 ## Observed journey
 
 Phoenix exposes `auto`, `kache`, `sccache`, and `none`, but `auto` selects sccache whenever both tools exist. Kache is selectable but not normally adopted. Deliver a qualified integration of released upstream Kache v0.26.0 on devmbp—not another recommendation-only audit and not a revival of Phoenix’s private patch stack.
