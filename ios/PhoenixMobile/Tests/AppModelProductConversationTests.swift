@@ -594,8 +594,7 @@ final class AppModelProductConversationTests: XCTestCase {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-close-repair-fence-tests-\(UUID().uuidString)")
         let model = AppModel()
-        model.rebuildAPIForTesting()
-        model.cancelAggregateReconciliationForTesting()
+        model.installAPIForTesting()
         model.connectivity.setOnlineForTesting(true)
         let row = conversation(id: "latest", aggregateId: "product")
         model.listStore.upsert(row)
@@ -615,8 +614,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testActiveCloseFenceAppliesToSessionCreatedAfterRehydration() throws {
         let model = AppModel()
-        model.rebuildAPIForTesting()
-        model.cancelAggregateReconciliationForTesting()
+        model.installAPIForTesting()
         let row = conversation(id: "latest", aggregateId: "product")
         model.listStore.upsert(row)
         model.fenceProductCloseForTesting(productConversationId: "product", fenced: true)
