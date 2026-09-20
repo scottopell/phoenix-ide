@@ -241,6 +241,12 @@ final class ConversationSession {
         }
     }
 
+    func suspendDeliveryForReconciliation() {
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
+    }
+
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {

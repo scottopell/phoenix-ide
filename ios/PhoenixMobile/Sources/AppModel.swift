@@ -286,8 +286,8 @@ final class AppModel {
     /// Invalidates responses started with earlier server credentials or URL.
     private var apiGeneration = 0
     private var aggregateEventTask: Task<Void, Never>?
-    private var aggregateReconciliationTask: Task<Void, Never>?
-    private var aggregateReconciliationId: UUID?
+    private var aggregateReconciliationTask: Task<Bool, Never>?
+    private(set) var aggregateReconciliationId: UUID?
     private var isForeground = true
 
     /// Sessions for conversations the user has opened, kept alive so their
@@ -340,7 +340,15 @@ final class AppModel {
         guard let rebuiltAPI else { return }
         for session in sessions.values { session.replaceAPI(rebuiltAPI) }
         for session in drainSessions.values { session.replaceAPI(rebuiltAPI) }
-        if isForeground { startAggregateEventStream(api: rebuiltAPI, generation: apiGeneration) }
+        if isForeground {
+            startAggregateEventStream(api: rebuiltAPI, generation: apiGeneration)
+            startAggregateReconciliation()
+        }
+    }
+
+    func forgetPinnedCertificate() {
+        CertPinStore.forget()
+        rebuildAPI()
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
@@ -463,6 +471,8 @@ final class AppModel {
                             await self.handleAggregateHardDeleted(deletion, generation: generation)
                         }
                     }
+                    guard await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
+                    else { return }
                 } catch let error as APIError where error.isPermanentStreamAuthenticationFailure {
                     return
                 } catch is CancellationError {
@@ -1202,6 +1212,14 @@ final class AppModel {
     }
 
     #if DEBUG
+    func cancelAggregateReconciliationForTesting() {
+        cancelAggregateReconciliation()
+    }
+
+    func rebuildAPIForTesting() {
+        rebuildAPI()
+    }
+
     func installPendingProductCloseConfirmationForTesting(
         _ pending: PendingProductCloseConfirmation,
         resolving: Bool = false
@@ -1363,17 +1381,32 @@ final class AppModel {
         return locallyOwned.subtracting(authoritativeIds)
     }
 
-    private func startAggregateReconciliation() {
-        guard isForeground, connectivity.isOnline, api != nil else { return }
+    @discardableResult
+    private func startAggregateReconciliation() -> Task<Bool, Never>? {
+        guard isForeground, connectivity.isOnline, api != nil else { return nil }
         aggregateReconciliationTask?.cancel()
         let id = UUID()
         aggregateReconciliationId = id
-        aggregateReconciliationTask = Task { [weak self] in
-            await self?.reconcileListThenResumeAndDrain()
-            guard let self, self.aggregateReconciliationId == id else { return }
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            let reconciled = await self.reconcileListThenResumeAndDrain()
+            guard self.aggregateReconciliationId == id else { return false }
             self.aggregateReconciliationTask = nil
             self.aggregateReconciliationId = nil
+            return reconciled
         }
+        aggregateReconciliationTask = task
+        return task
+    }
+
+    private func reconcileAfterAggregateStreamDisconnect(generation: Int) async -> Bool {
+        guard apiGeneration == generation, isForeground, connectivity.isOnline else { return false }
+        for session in sessions.values { session.suspendDeliveryForReconciliation() }
+        guard let task = startAggregateReconciliation() else { return false }
+        return await task.value
+            && apiGeneration == generation
+            && isForeground
+            && connectivity.isOnline
     }
 
     private func cancelAggregateReconciliation() {
@@ -1409,8 +1442,8 @@ final class AppModel {
         return nil
     }
 
-    private func reconcileListThenResumeAndDrain() async {
-        guard let api, connectivity.isOnline, isForeground else { return }
+    private func reconcileListThenResumeAndDrain() async -> Bool {
+        guard let api, connectivity.isOnline, isForeground else { return false }
         let startedGeneration = apiGeneration
         let locallyOwned = locallyOwnedOrdinaryAggregates()
         var retryDelay = 1.0
@@ -1436,7 +1469,7 @@ final class AppModel {
                 try await Task.sleep(for: .seconds(retryDelay))
                 retryDelay = min(retryDelay * 2, 30)
             })
-        else { return }
+        else { return false }
 
         let removed = Self.removedAggregateIds(
             authoritative: fresh,
@@ -1446,15 +1479,15 @@ final class AppModel {
                 productConversationId: aggregateId,
                 transcriptIds: locallyOwned[aggregateId] ?? [],
                 startedGeneration: startedGeneration)
-            else { return }
+            else { return false }
         }
         guard !Task.isCancelled,
               apiGeneration == startedGeneration,
               connectivity.isOnline,
               isForeground
-        else { return }
+        else { return false }
         await rehydratePendingProductCloseConfirmation(api: api)
-        guard apiGeneration == startedGeneration else { return }
+        guard apiGeneration == startedGeneration else { return false }
         attention.seedOrdinary(
             with: listStore.conversations,
             preservingAggregateIds: rememberedCoordinatorAggregateIds())
@@ -1462,6 +1495,7 @@ final class AppModel {
             for session in sessions.values { session.resyncAfterForeground() }
         }
         drainPersistedOutboxes()
+        return true
     }
 
     func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {
