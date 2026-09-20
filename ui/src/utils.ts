@@ -57,7 +57,7 @@ export function isAgentWorking(state: ConversationState): boolean {
     case 'idle': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
     case 'awaiting_task_approval': case 'awaiting_user_response':
       return false;
-    case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
+    case 'awaiting_llm': case 'llm_requesting': case 'server_overload_retrying': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
     case 'awaiting_recovery': case 'provisioning':
@@ -68,7 +68,7 @@ export function isAgentWorking(state: ConversationState): boolean {
 
 export function canCancelConversationState(state: ConversationState): boolean {
   switch (state.type) {
-    case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
+    case 'llm_requesting': case 'server_overload_retrying': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_recovery': case 'provisioning':
       return true;
     case 'idle': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
@@ -85,7 +85,7 @@ export function isCancellingState(state: ConversationState): boolean {
       return true;
     case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'client_decode_error': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response':
-    case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
+    case 'awaiting_llm': case 'llm_requesting': case 'server_overload_retrying': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'awaiting_recovery':
       return false;
@@ -97,6 +97,8 @@ export function getStateDescription(state: ConversationState): string {
   switch (state.type) {
     case 'awaiting_llm':
       return 'preparing request...';
+    case 'server_overload_retrying':
+      return 'server overloaded; retrying...';
     case 'llm_requesting':
       // Pre-first-byte: request is on the wire but we have no observable
       // evidence of model activity (could be queued, prefilling, throttled,
@@ -222,6 +224,10 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'llm_requesting':
     case 'awaiting_continuation':
       return { type, attempt: (obj['attempt'] as number) ?? 1 };
+    case 'server_overload_retrying': {
+      const retry = isRecord(obj['retry']) ? obj['retry'] : obj;
+      return { type, attempt: typeof retry['attempt'] === 'number' ? retry['attempt'] : 1 };
+    }
     case 'seeded_llm_requesting': {
       const seed = obj['seed_message_id'];
       if (typeof seed !== 'string' || seed.trim() === '') {

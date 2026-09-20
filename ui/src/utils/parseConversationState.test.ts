@@ -3,6 +3,22 @@ import { canChangeModelInState } from '../api';
 import { parseConversationState, canCancelConversationState, isAgentWorking } from '../utils';
 
 describe('parseConversationState recovery', () => {
+  it('parses overload retry as busy and cancellable', () => {
+    const state = parseConversationState({
+      type: 'server_overload_retrying',
+      retry: {
+        target: { type: 'ordinary' },
+        phase: { type: 'waiting', retry_at: '2026-01-01T00:00:30Z' },
+        attempt: 3,
+      },
+    });
+
+    expect(state).toEqual({ type: 'server_overload_retrying', attempt: 3 });
+    expect(isAgentWorking(state)).toBe(true);
+    expect(canCancelConversationState(state)).toBe(true);
+    expect(canChangeModelInState(state)).toBe(false);
+  });
+
   it('allows manual recovery of a persisted invalid-request error', () => {
     const state = parseConversationState({
       type: 'error',

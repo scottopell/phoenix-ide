@@ -550,7 +550,7 @@ impl From<SseEvent> for SseWireEvent {
                 let error = state.error_kind().map(ErrorPresentation::from_kind);
                 SseWireEvent::StateChange {
                     sequence_id,
-                    state: serde_json::to_value(&state).unwrap_or(Value::Null),
+                    state: crate::runtime::public_conversation_state(&state),
                     presentation_mode,
                     state_updated_at,
                     error,

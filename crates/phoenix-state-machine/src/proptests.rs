@@ -2023,7 +2023,11 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 },
                 message: msg,
             },
-            8 => LlmOutcome::ServerOverloaded { message: msg },
+            8 => LlmOutcome::ServerOverloaded {
+                message: msg,
+                detected_at: chrono::Utc::now(),
+                guidance: None,
+            },
             9 => LlmOutcome::InvalidResponse { message: msg },
             10 => LlmOutcome::PromptRejected { message: msg },
             11 => LlmOutcome::ContentFiltered { message: msg },

@@ -11,4 +11,4 @@
  * emitted by `serde` via the `rename_all` attribute so the JSON values
  * match the retry-visibility spec's closed reason set.
  */
-export type LlmAttemptReason = "rate_limit" | "server_error" | "network" | "timed_out";
+export type LlmAttemptReason = "rate_limit" | "server_error" | "server_overloaded" | "network" | "timed_out";

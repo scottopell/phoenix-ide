@@ -11,6 +11,7 @@ use crate::state::{SubAgentOutcome, ToolCall};
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 use phoenix_core::domain::quota_details::QuotaDetails;
+use phoenix_core::domain::sm_state::OverloadRetryGuidance;
 use std::time::Duration;
 
 // ============================================================================
@@ -59,9 +60,12 @@ pub enum LlmOutcome {
     /// Provider returned bytes we could not parse or understand (malformed SSE
     /// event, unparseable body, unexpected content-block shape) — retryable.
     InvalidResponse { message: String },
-    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) — terminal,
-    /// suggest a different model.
-    ServerOverloaded { message: String },
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`).
+    ServerOverloaded {
+        message: String,
+        detected_at: chrono::DateTime<chrono::Utc>,
+        guidance: Option<OverloadRetryGuidance>,
+    },
     /// Network/connection error — retryable
     NetworkError { message: String },
     /// Phoenix's absolute provider-attempt deadline elapsed — retryable.

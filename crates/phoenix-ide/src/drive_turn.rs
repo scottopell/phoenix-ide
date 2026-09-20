@@ -511,6 +511,7 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         ConvState::HandedOff { .. } => Some(StableOutcome::HandedOff),
         ConvState::Terminal | ConvState::CreationCancelled { .. } => Some(StableOutcome::Terminal),
         ConvState::LlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::Provisioning { .. }
         | ConvState::ToolExecuting { .. }
