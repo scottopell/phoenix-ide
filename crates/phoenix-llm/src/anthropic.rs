@@ -2,11 +2,13 @@
 
 use super::headers::apply_source_header;
 use super::models::ModelSpec;
+use super::retry_guidance::retry_after_from_headers;
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
 };
 use super::LlmError;
+use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -363,6 +365,27 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
     }
 }
 
+fn anthropic_http_error(status: u16, headers: &HeaderMap, body: &str) -> LlmError {
+    let overloaded = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|error_type| error_type == "overloaded_error");
+
+    if overloaded {
+        LlmError::server_overloaded_with_retry_after(
+            "Anthropic is overloaded for this model. Try a different model or retry later.",
+            retry_after_from_headers(headers),
+        )
+    } else {
+        LlmError::from_http_status(status, body)
+    }
+}
+
 fn resolve_anthropic_url(base_url_override: Option<&str>) -> String {
     if let Some(url) = base_url_override {
         url.to_string()
@@ -435,11 +458,12 @@ pub async fn complete_streaming(
 
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(anthropic_http_error(status.as_u16(), &headers, &body));
     }
 
     let mut acc = StreamAccumulator::new(dispatch_at, request);
@@ -535,13 +559,14 @@ pub async fn complete(
     })?;
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(anthropic_http_error(status.as_u16(), &headers, &body));
     }
 
     let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
@@ -1379,6 +1404,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_overload_preserves_retry_guidance_without_conflating_rate_limits() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        let overload = anthropic_http_error(
+            529,
+            &headers,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+        assert_eq!(
+            overload.retry_after(),
+            Some(crate::RetryAfter::WithinLimit(Duration::from_secs(7)))
+        );
+
+        let quota = anthropic_http_error(
+            429,
+            &headers,
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Limited"}}"#,
+        );
+        assert_eq!(quota.kind, crate::LlmErrorKind::RateLimit);
+        assert_eq!(quota.retry_after(), None);
+    }
+
     #[tokio::test]
     async fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
@@ -1394,9 +1443,10 @@ mod tests {
 
         assert_eq!(err.kind, crate::LlmErrorKind::ServerOverloaded);
         assert!(
-            !err.kind.is_auto_retryable(),
-            "overloaded Anthropic SSE errors should not be retried as empty responses"
+            err.kind.is_auto_retryable(),
+            "overloaded Anthropic SSE errors use the bounded overload policy"
         );
+        assert_eq!(err.retry_after(), None);
         assert!(err.message.contains("overloaded"));
     }
 

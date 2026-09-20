@@ -4,6 +4,7 @@ use crate::domain::bash_types::{BashInvocation, BashToolInput};
 use crate::domain::db_schema::{ConversationCreationPhase, ErrorKind, ToolResult, UsageData};
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::patch_types::PatchInput;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -896,6 +897,7 @@ mod tests {
                 | ConvState::Error { .. }
                 | ConvState::RecoverableContinuationFailure { .. } => true,
                 ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::Provisioning { .. }
                 | ConvState::ToolExecuting { .. }
@@ -1092,6 +1094,77 @@ pub enum RecoveryResumeTarget {
     ConversationTurn,
     ContinuationSummary { request: ContinuationSummaryRequest },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverloadRetryGuidance {
+    WithinLimit(Duration),
+    ExceedsLimit(Duration),
+}
+
+impl OverloadRetryGuidance {
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::WithinLimit(duration) | Self::ExceedsLimit(duration) => duration,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerOverloadTarget {
+    Ordinary,
+    Continuation {
+        operation_id: String,
+        rejected_tool_calls: Vec<ToolCall>,
+    },
+}
+
+impl ServerOverloadTarget {
+    #[must_use]
+    pub fn continuation_request(&self, attempt: u32) -> Option<ContinuationSummaryRequest> {
+        match self {
+            Self::Ordinary => None,
+            Self::Continuation {
+                operation_id,
+                rejected_tool_calls,
+            } => Some(Self::continuation_request_from_parts(
+                operation_id,
+                rejected_tool_calls,
+                attempt,
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn continuation_request_from_parts(
+        operation_id: &str,
+        rejected_tool_calls: &[ToolCall],
+        attempt: u32,
+    ) -> ContinuationSummaryRequest {
+        ContinuationSummaryRequest {
+            operation_id: operation_id.to_owned(),
+            rejected_tool_calls: rejected_tool_calls.to_vec(),
+            attempt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerOverloadPhase {
+    Waiting { retry_at: DateTime<Utc> },
+    InFlight,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerOverloadRetry {
+    pub target: ServerOverloadTarget,
+    pub phase: ServerOverloadPhase,
+    pub attempt: u32,
+    pub started_at: DateTime<Utc>,
+    pub deadline_at: DateTime<Utc>,
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1102,7 +1175,13 @@ pub enum ConvState {
     Idle,
 
     /// LLM request in flight, with retry tracking
-    LlmRequesting { attempt: u32 },
+    LlmRequesting {
+        attempt: u32,
+    },
+
+    ServerOverloadRetrying {
+        retry: ServerOverloadRetry,
+    },
 
     /// Fresh handoff successor whose approved-plan seed is already durable.
     /// Runtime resume treats this as `LlmRequesting` so the first request can
@@ -1119,7 +1198,9 @@ pub enum ConvState {
     },
 
     /// Creation was cancelled; original intent remains available for restart.
-    CreationCancelled { job_id: String },
+    CreationCancelled {
+        job_id: String,
+    },
 
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
@@ -1192,7 +1273,9 @@ pub enum ConvState {
     },
 
     /// Sub-agent completed successfully (terminal state, sub-agent only)
-    Completed { result: String },
+    Completed {
+        result: String,
+    },
 
     /// Sub-agent failed (terminal state, sub-agent only)
     Failed {
@@ -1277,7 +1360,9 @@ pub enum ConvState {
     },
 
     /// This conversation handed live work to a successor conversation.
-    HandedOff { successor_conv_id: String },
+    HandedOff {
+        successor_conv_id: String,
+    },
 
     /// Task lifecycle completed or abandoned — conversation is permanently read-only.
     /// Rejects all events. Preserved on server restart (not reset to Idle).
@@ -1304,6 +1389,9 @@ pub enum CoreState {
     Idle,
     LlmRequesting {
         attempt: u32,
+    },
+    ServerOverloadRetrying {
+        retry: ServerOverloadRetry,
     },
     ToolExecuting {
         current_tool: ToolCall,
@@ -1456,6 +1544,9 @@ impl From<CoreState> for ConvState {
         match cs {
             CoreState::Idle => ConvState::Idle,
             CoreState::LlmRequesting { attempt } => ConvState::LlmRequesting { attempt },
+            CoreState::ServerOverloadRetrying { retry } => {
+                ConvState::ServerOverloadRetrying { retry }
+            }
             CoreState::ToolExecuting {
                 current_tool,
                 remaining_tools,
@@ -1551,6 +1642,11 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::LlmRequesting { attempt }
             | ConvState::SeededLlmRequesting { attempt, .. } => {
                 Ok(ParentState::Core(CoreState::LlmRequesting { attempt }))
+            }
+            ConvState::ServerOverloadRetrying { retry } => {
+                Ok(ParentState::Core(CoreState::ServerOverloadRetrying {
+                    retry,
+                }))
             }
             ConvState::ToolExecuting {
                 current_tool,
@@ -1676,6 +1772,11 @@ impl TryFrom<ConvState> for SubAgentState {
             | ConvState::SeededLlmRequesting { attempt, .. } => {
                 Ok(SubAgentState::Core(CoreState::LlmRequesting { attempt }))
             }
+            ConvState::ServerOverloadRetrying { retry } => {
+                Ok(SubAgentState::Core(CoreState::ServerOverloadRetrying {
+                    retry,
+                }))
+            }
             ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
@@ -1768,6 +1869,7 @@ impl CoreState {
         match self {
             CoreState::Idle => "Idle",
             CoreState::LlmRequesting { .. } => "LlmRequesting",
+            CoreState::ServerOverloadRetrying { .. } => "ServerOverloadRetrying",
             CoreState::ToolExecuting { .. } => "ToolExecuting",
             CoreState::CancellingTool { .. } => "CancellingTool",
             CoreState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -1948,6 +2050,7 @@ impl ConvState {
         matches!(
             self,
             ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
@@ -1991,6 +2094,7 @@ impl ConvState {
             Self::RecoverableContinuationFailure { failure } => Some(&failure.error_kind),
             Self::Idle
             | Self::LlmRequesting { .. }
+            | Self::ServerOverloadRetrying { .. }
             | Self::SeededLlmRequesting { .. }
             | Self::Provisioning { .. }
             | Self::CreationCancelled { .. }
@@ -2019,6 +2123,7 @@ impl ConvState {
         match self {
             ConvState::Idle => "Idle",
             ConvState::LlmRequesting { .. } => "LlmRequesting",
+            ConvState::ServerOverloadRetrying { .. } => "ServerOverloadRetrying",
             ConvState::SeededLlmRequesting { .. } => "SeededLlmRequesting",
             ConvState::Provisioning { .. } => "Provisioning",
             ConvState::CreationFailed { .. } => "CreationFailed",
@@ -2067,6 +2172,7 @@ impl ConvState {
             }
             ConvState::Idle
             | ConvState::LlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::SeededLlmRequesting { .. }
             | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
@@ -2104,6 +2210,7 @@ impl ConvState {
             | ConvState::Completed { .. }
             | ConvState::Failed { .. } => "done",
             ConvState::LlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::SeededLlmRequesting { .. }
             | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
@@ -2134,6 +2241,7 @@ impl ConvState {
             | ConvState::Failed { .. }
             | ConvState::Terminal => DisplayState::Terminal,
             ConvState::LlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. }
             | ConvState::SeededLlmRequesting { .. }
             | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }

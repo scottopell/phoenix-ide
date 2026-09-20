@@ -396,7 +396,8 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
 
 use crate::domain::llm_types::{ContentBlock, Usage};
 use crate::domain::sm_state::{
-    PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
+    OverloadRetryGuidance, PendingSubAgent, QuestionAnnotation, SubAgentOutcome,
+    TaskApprovalOutcome, ToolCall,
 };
 use std::collections::HashMap;
 
@@ -472,6 +473,11 @@ pub enum Event {
         /// network/server-error retries and for rate-limit errors whose
         /// upstream response didn't include the reset timestamp.
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    ServerOverloaded {
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
     },
     RetryTimeout {
         attempt: u32,
@@ -653,6 +659,7 @@ impl Event {
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
+            Event::ServerOverloaded { .. } => "ServerOverloaded",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
@@ -731,6 +738,11 @@ pub enum CoreEvent {
         recovery_in_progress: bool,
         /// Quota reset timestamp; see `Event::LlmError::resets_at`.
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    ServerOverloaded {
+        message: String,
+        detected_at: DateTime<Utc>,
+        guidance: Option<OverloadRetryGuidance>,
     },
     RetryTimeout {
         attempt: u32,
@@ -920,6 +932,15 @@ impl TryFrom<Event> for ParentEvent {
                 recovery_in_progress,
                 resets_at,
             })),
+            Event::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+            } => Ok(ParentEvent::Core(CoreEvent::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+            })),
             Event::RetryTimeout { attempt } => {
                 Ok(ParentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1103,6 +1124,15 @@ impl TryFrom<Event> for SubAgentEvent {
                 recovery_in_progress,
                 resets_at,
             })),
+            Event::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ServerOverloaded {
+                message,
+                detected_at,
+                guidance,
+            })),
             Event::RetryTimeout { attempt } => {
                 Ok(SubAgentEvent::Core(CoreEvent::RetryTimeout { attempt }))
             }
@@ -1205,6 +1235,7 @@ impl CoreEvent {
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",
             CoreEvent::RetryTimeout { .. } => "RetryTimeout",
+            CoreEvent::ServerOverloaded { .. } => "ServerOverloaded",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",

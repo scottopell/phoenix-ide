@@ -2,18 +2,12 @@
 
 ## User Story
 
-As a user watching a Phoenix conversation, I need to see *why* a turn is
-taking a long time — specifically, whether the agent is being throttled,
-hitting a 5xx server, or losing network — and how many retries remain
-before the turn gives up. The current behaviour hides retries entirely
-inside the executor's `Effect::ScheduleRetry` handler, so a 45-second
-silence could be one slow LLM call or three back-to-back rate-limit
-backoffs and I have no way to tell.
+As a user watching a Phoenix conversation, I need to see why a turn is taking a long time, which retry policy applies, how many attempts remain, and when the next attempt is due.
 
 ## Background
 
 When the LLM client returns a retryable `LlmError`
-(`Network | RateLimit | ServerError | TimedOut`), the executor maps it to an `LlmOutcome` and feeds an
+(`Network | RateLimit | ServerError | TimedOut`) or receives the dedicated `ServerOverloaded` capacity outcome, the executor maps it to an `LlmOutcome` and feeds an
 `Event::LlmError` to the state machine. The state machine
 (`handle_core_error_retry` in `transition.rs`, and `handle_core_continuation`
 for the post-tool-round path) bumps the `attempt` counter, schedules a
@@ -27,7 +21,7 @@ The state's `attempt` field is already surfaced on the wire as part of
 the `StateChange.state` payload (clients can read `state.attempt`).
 The retry-attempt projection carries the following context between the executor and the client:
 
-- **The reason** (`RateLimit | ServerError | Network | TimedOut`), classified by
+- **The reason** (`RateLimit | ServerError | Network | TimedOut | ServerOverloaded`), classified by
   `llm_error_to_outcome` and surfaced as `LlmAttempt.reason`.
 - **The backoff delay**, surfaced as `LlmAttempt.backing_off_ms`.
 - **The quota reset timestamp**, surfaced as `LlmAttempt.resets_at` when known.
@@ -55,8 +49,8 @@ context, immediately before the spawned backoff sleep begins
 LlmAttempt {
     sequence_id: i64,
     attempt: u32,           // 1-indexed, matches state.attempt
-    max_attempts: u32,      // MAX_RETRY_ATTEMPTS = 3
-    reason: LlmAttemptReason,   // RateLimit | ServerError | Network | TimedOut
+    max_attempts: u32,      // 3 generic; 5 selected-model overload
+    reason: LlmAttemptReason,   // RateLimit | ServerError | Network | TimedOut | ServerOverloaded
     backing_off_ms: u64,    // the delay value in Effect::ScheduleRetry
     resets_at: Option<DateTime<Utc>>,  // RFC3339 string, when known
 }
@@ -73,22 +67,24 @@ data, not by string parsing.
 ### REQ-LRV-002: Retry Reason Classification
 
 WHEN classifying an `LlmError` into an `LlmAttemptReason`
-THE SYSTEM SHALL map exactly the four retryable `LlmErrorKind`
-variants:
+THE SYSTEM SHALL map the generic retryable `LlmErrorKind` variants and the dedicated overload classification:
 
 - `LlmErrorKind::RateLimit` -> `LlmAttemptReason::RateLimit`
 - `LlmErrorKind::ServerError` -> `LlmAttemptReason::ServerError`
 - `LlmErrorKind::Network` -> `LlmAttemptReason::Network`
 - `LlmErrorKind::TimedOut` -> `LlmAttemptReason::TimedOut`
+- `LlmErrorKind::ServerOverloaded` -> `LlmAttemptReason::ServerOverloaded`
 
-WHEN an `LlmError` with a non-retryable kind arrives
-THE SYSTEM SHALL NOT emit `LlmAttempt` (the state machine terminates
-the turn instead — see `transition.rs:1255`)
+WHEN an `LlmError` outside the generic retryable set and `ServerOverloaded` arrives
+THE SYSTEM SHALL NOT emit `LlmAttempt`
 
-**Rationale:** `is_retryable()` (`llm/error.rs:111`) is the single
-source of truth for which errors enter the retry loop. The wire enum
-mirrors that classification exactly so the compiler enforces
-exhaustiveness on both sides.
+WHEN the generic policy schedules a retry
+THE SYSTEM SHALL emit `max_attempts = 3` and use nominal waits of 2 and 4 seconds
+
+WHEN selected-model overload schedules a retry
+THE SYSTEM SHALL emit reason `ServerOverloaded`, `max_attempts = 5`, and the persisted remaining backoff
+
+**Rationale:** The reason and maximum are carried per event because generic transient failures and selected-model capacity use different bounded policies.
 
 ---
 
@@ -107,11 +103,7 @@ THE SYSTEM SHALL source `K` from `LlmAttempt.attempt`, `N` from
 formatted by a shared helper owned here (`reason_text(reason) ->
 String`)
 
-**Rationale:** The placeholder `RetryContext` value type currently
-inlined in `working-phase-visibility.allium` (with PLACEHOLDER
-comment) is owned by this spec from now on. The import direction is
-working-phase-visibility -> llm-retry-visibility (the consumer
-imports the producer); there is no circular dependency.
+**Rationale:** This producer spec owns the canonical `RetryContext`; `working-phase-visibility.allium` imports it as a consumer, preventing a circular dependency or parallel representation.
 
 ---
 
@@ -126,10 +118,7 @@ retrying
 THE SYSTEM SHALL display the parent's own retry context (which may be
 absent), NOT a roll-up of the sub-agent's retries
 
-**Rationale:** Phoenix sub-agents run as independent conversations
-with their own SSE streams and their own state machines
-(`SubAgentState::Core` in `state.rs:1302`). Cross-conversation retry
-rollups (e.g. "this parent's sub-agent is retrying") are a separate
+**Rationale:** Phoenix sub-agents run as independent conversations with their own SSE streams and state machines. Cross-conversation retry rollups (e.g. "this parent's sub-agent is retrying") are a separate
 aggregate-dashboard concern (see the
 `AggregateActivityDashboard` deferred entry in
 `working-phase-visibility.allium`). Keeping each conversation's
@@ -138,7 +127,7 @@ parent view that wasn't asked for them.
 
 ---
 
-### REQ-LRV-005: Cancellation During Backoff Routes Through Cancelling
+### REQ-LRV-005: Cancellation and Close Retire Retry Visibility
 
 WHEN the user cancels during a retry backoff window (the executor's
 spawned `RetryTimeout` task is sleeping)
@@ -146,6 +135,11 @@ THE SYSTEM SHALL transition the conversation to a `Cancelling`
 variant via the existing state-machine cancel path, and the
 ScheduledRetry task's eventual `RetryTimeout` event SHALL be filtered
 by the state machine as stale
+AND the retry countdown SHALL be cleared
+
+WHEN Close settles a conversation during overload wait or dispatch
+THE SYSTEM SHALL clear the retry countdown and retire the timer and provider admission
+AND a stale retry event SHALL NOT recreate retry visibility
 
 WHEN the conversation is in any `Cancelling*` variant with a
 `TurnRetryContext` populated
@@ -153,14 +147,7 @@ THE SYSTEM SHALL continue to display the retry suffix until either
 (a) the turn reaches a terminal state (`AgentDone` clears it per the
 working-phase-visibility spec) or (b) a fresh `LlmAttempt` arrives
 
-**Rationale:** The state machine already correctly handles
-cancellation during backoff: `handle_core_cancel*` paths transition
-out of `LlmRequesting`/`AwaitingContinuation`, and stale
-`RetryTimeout` events are absorbed by the catch-all idle path. The
-spec exists to make explicit that no new "abort retry" event is
-needed — the existing cancellation flow is the abort signal, and the
-display naturally tracks it via the same `TurnRetryContext` lifecycle
-working-phase-visibility already specifies.
+**Rationale:** Cancellation and Close are authority-retirement operations, not additional retry outcomes. Clearing their visibility with the same generation prevents a stale timer or provider completion from presenting work that can no longer commit.
 
 ---
 
@@ -185,10 +172,7 @@ clears (per
 `TurnRetryContextClearedOnAgentDone` in working-phase-visibility)
 and the audit trail of "this answer took 2 retries" would
 otherwise vanish. The typed field on the persisted message is
-the long-lived record. Keying it on `display_data` mirrors the
-existing `duration_ms`-on-tool-result convention (`schema.rs:649`)
-and the `tool_starts`-on-assistant-message convention from the
-sibling spec — same side-channel, same shape, one mental model.
+the long-lived record. Keying it on `display_data` mirrors the typed `duration_ms` and `tool_starts` presentation metadata conventions — the same side-channel and shape.
 
 ---
 
@@ -226,18 +210,26 @@ preserves both contracts.
 
 ---
 
+### REQ-LRV-008: Selected-Model Overload Countdown
+
+WHEN a selected-model overload retry is waiting
+THE SYSTEM SHALL display reason `server overloaded`, target attempt, maximum attempts, and a live countdown derived from the persisted retry time
+
+WHEN the overload retry is restored after reconnect or process restart
+THE SYSTEM SHALL reconstruct the same target attempt, maximum attempts, and remaining countdown from persisted state
+
+WHEN an over-30-second `Retry-After` hint, attempt exhaustion, or the absolute overload deadline stops automatic retry
+THE SYSTEM SHALL replace the countdown with a visible terminal error or recoverable continuation failure
+AND SHALL NOT imply that another retry remains scheduled
+
+**Rationale:** Capacity retry can wait materially longer than the generic path. A countdown distinguishes deliberate backoff from a stalled request, while terminal visibility prevents a rejected long provider hint from becoming silent waiting.
+
+---
+
 ## Out of Scope
 
-- Per-provider retry policies (different `max_attempts` for Anthropic
-  vs OpenAI vs Fireworks). `MAX_RETRY_ATTEMPTS = 3` is global; if a
-  provider-specific policy emerges, the wire field `max_attempts` is
-  already per-event so no schema change is needed — only the runtime
-  policy.
-- Showing a live "backing off Ns" countdown derived from
-  `LlmAttempt.backing_off_ms`. V1 displays the static modifier
-  `(retry K/N <reason>)`; if a countdown is added, it derives from the
-  `LlmAttempt` event's own arrival timestamp client-side, not from a
-  server-pushed clock.
+- Provider-specific retry budgets beyond the semantic distinction between generic transient failures and selected-model overload.
+- A server-pushed countdown clock; clients derive remaining time from persisted retry timing and elapsed time.
 - A retry-events query API ("show me all retries for conversation X").
   The `display_data.retry_count` badge (REQ-LRV-006) plus
   server-side logs cover diagnostics needs at v1.

@@ -190,7 +190,7 @@ WITH RECURSIVE roots(id) AS (
 SELECT c.id AS current_conversation_id,
        leaves.root_id AS root_conversation_id,
        c.slug, c.title, c.project_id, c.work_scope_id, c.cm_kind AS mode,
-       json_extract(c.state, '$.type') AS state,
+       c.state_kind AS state,
        c.state_updated_at, c.updated_at, c.continued_in_conv_id,
        c.archived, c.user_initiated, c.parent_conversation_id,
        c.cm_task_id, c.cm_task_title,
@@ -204,8 +204,8 @@ LEFT JOIN work_scopes environment
 WHERE leaves.root_id NOT IN (
   SELECT id FROM conversations WHERE coordinator_head = 1
 )
-ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
-  ('llm_requesting','tool_executing','awaiting_sub_agents')
+ORDER BY CASE WHEN c.state_kind IN
+  ('llm_requesting','server_overload_retrying','tool_executing','awaiting_sub_agents')
   THEN 0 ELSE 1 END,
   c.updated_at DESC
 LIMIT 41
@@ -1285,6 +1285,44 @@ mod tests {
         assert!(
             active < snapshot.find("done task").unwrap(),
             "active state must remain attached to its current continuation metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_orders_overload_retry_as_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overload-snapshot.db");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        for id in ["idle", "overload"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = '{\"type\":\"server_overload_retrying\",\"retry\":{\"target\":{\"type\":\"ordinary\"},\"phase\":{\"type\":\"in_flight\"},\"attempt\":2,\"started_at\":\"2025-01-01T00:00:00Z\",\"deadline_at\":\"2025-01-01T00:10:00Z\"}}',
+                 state_kind = 'server_overload_retrying', updated_at = '2025-01-01'
+             WHERE id = 'overload'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET updated_at = '2026-01-01' WHERE id = 'idle'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let retriever = Arc::new(db.fts_retriever());
+        let snapshot = GlobalReadService::new(db, retriever)
+            .coordinator_snapshot()
+            .await
+            .unwrap();
+        assert!(
+            snapshot.find("server_overload_retrying").unwrap()
+                < snapshot.find("\"state\": \"idle\"").unwrap()
         );
     }
 

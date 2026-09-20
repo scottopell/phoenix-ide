@@ -79,14 +79,14 @@
 ------------------------------------------------------------
 
 -- Why a retry attempt is being scheduled. Mirrors the retryable subset
--- of LlmErrorKind exactly (`llm/error.rs:111` — Network, RateLimit,
--- ServerError, TimedOut). Non-retryable LlmErrorKind variants terminate the turn
+-- of the generic retryable LlmErrorKind subset plus dedicated ServerOverloaded. Non-retryable LlmErrorKind variants terminate the turn
 -- without scheduling a retry, so they never reach this enum.
 enum LlmAttemptReason {
     rate_limit
     | server_error
     | network
     | timed_out
+    | server_overloaded
 }
 
 ------------------------------------------------------------
@@ -104,9 +104,8 @@ enum LlmAttemptReason {
 --   attempt:        The attempt number this retry is scheduled FOR.
 --                   1-indexed; matches the state's `attempt` after
 --                   the bump.
---   max_attempts:   The retry-budget ceiling
---                   (MAX_RETRY_ATTEMPTS = 3 in
---                   `state_machine/transition.rs:183`). Carried
+--   max_attempts:   The retry-budget ceiling selected by the applicable
+--                   retry policy. Carried
 --                   per-event so a future per-provider policy is
 --                   wire-compatible.
 --   reason:         One of the LlmAttemptReason enum variants, set by
@@ -198,8 +197,8 @@ entity PersistedAssistantMessage {
 --           TimedOut    -> timed_out
 --           RateLimit   -> rate_limit
 --           ServerError -> server_error
---       Undefined on non-retryable variants (which never reach
---       Effect::ScheduleRetry per is_retryable() in llm/error.rs:111).
+--           ServerOverloaded -> server_overloaded
+--       Undefined on variants outside the generic and overload retry policies.
 --
 --   reason_to_text(reason: LlmAttemptReason) -> String
 --       Maps the enum variant to its human-rendered form:
@@ -207,6 +206,7 @@ entity PersistedAssistantMessage {
 --           server_error -> "server error"
 --           network      -> "network error"
 --           timed_out    -> "request timeout"
+--           server_overloaded -> "server overloaded"
 --       The strings are not normative wire syntax; they are the
 --       implementation's single source of truth and are referenced by
 --       working-phase-visibility's render_retry_modifier_for helper
@@ -221,11 +221,9 @@ entity PersistedAssistantMessage {
 --       handle_core_error_retry / handle_core_continuation in
 --       transition.rs).
 --
---   max_retry_attempts() -> Integer
---       The global retry-budget ceiling. Sourced from
---       `state_machine/transition.rs::MAX_RETRY_ATTEMPTS`. Returned
---       as a value so any future per-provider policy can switch the
---       implementation without changing the wire shape.
+--   max_attempts_for(reason: LlmAttemptReason) -> Integer
+--       Returns 5 for server_overloaded and 3 for every generic retry reason.
+--       The value is carried by Effect::ScheduleRetry and LlmAttempt.
 --
 ------------------------------------------------------------
 
@@ -241,22 +239,18 @@ entity PersistedAssistantMessage {
 -- RetryTimeout outcome lands) before the LlmAttempt event has been
 -- queued for broadcast.
 --
--- The `reason` argument is one of the four LlmAttemptReason enum
--- variants. The runtime maps the inbound LlmErrorKind to this enum
--- via classify_retry_reason() (declared in the Helpers block), which
--- mirrors the retryable subset of LlmErrorKind (`llm/error.rs:111` —
--- is_retryable() returns true for exactly Network/TimedOut/RateLimit/ServerError).
--- Non-retryable LlmErrorKind variants terminate the turn without
--- scheduling a retry, so they never reach this rule.
+-- Generic transient failures and selected-model overload share the wire event
+-- while carrying distinct reason and maximum-attempt values.
 --
--- Event shape: EffectScheduleRetryEmitted(conv_id, attempt, delay_ms,
---                                          reason, resets_at).
+-- Event shape: EffectScheduleRetryEmitted(conv_id, attempt, max_attempts,
+--                                          delay_ms, reason, resets_at).
 rule RuntimeEmitsLlmAttemptOnScheduleRetry {
-    when: EffectScheduleRetryEmitted(conv_id, attempt, delay_ms, reason, resets_at)
+    when: EffectScheduleRetryEmitted(conv_id, attempt, max_attempts, delay_ms, reason, resets_at)
 
     requires: attempt >= 1
-    requires: attempt <= max_retry_attempts()
-    requires: reason in { rate_limit, server_error, network, timed_out }
+    requires: attempt <= max_attempts
+    requires: max_attempts = max_attempts_for(reason)
+    requires: reason in { rate_limit, server_error, network, timed_out, server_overloaded }
     requires: delay_ms >= 0
 
     -- The LlmAttempt event is constructed here. The actual SSE
@@ -264,7 +258,7 @@ rule RuntimeEmitsLlmAttemptOnScheduleRetry {
     -- responsibility; this rule constructs the payload value.
     let payload = RetryContext{
         attempt:        attempt,
-        max_attempts:   max_retry_attempts(),
+        max_attempts:   max_attempts,
         reason:         reason,
         reason_text:    reason_to_text(reason),
         backing_off_ms: delay_ms,
@@ -328,6 +322,31 @@ rule TurnRetryContextUpdatedOnLlmAttempt {
     }
 
     ensures: TurnRetryContext{conversation_id: conv_id}.retry = payload
+}
+
+rule ServerOverloadCountdownRendered {
+    when: RetryContextRendered(conv_id, elapsed_ms)
+    requires: TurnRetryContext{conversation_id: conv_id}.retry.reason = server_overloaded
+    let retry = TurnRetryContext{conversation_id: conv_id}.retry
+    ensures: VisibleRetryStatus(
+        conv_id,
+        retry.reason_text,
+        retry.attempt,
+        retry.max_attempts,
+        remaining_backoff(retry.backing_off_ms, elapsed_ms))
+}
+
+rule RestoredServerOverloadRetryRebroadcastsRemainingWait {
+    when: PersistedServerOverloadRetryRestored(conv_id, attempt, remaining_ms)
+    requires: remaining_ms > 0
+    ensures: EffectScheduleRetryEmitted(conv_id, attempt, 5, remaining_ms, server_overloaded, null)
+}
+
+rule ServerOverloadRetryStopsVisibly {
+    when: ServerOverloadRetryStopped(conv_id, target_kind, reason)
+    requires: reason in { attempts_exhausted, retry_after_over_30_seconds, deadline_exhausted }
+    ensures: not exists TurnRetryContext{conversation_id: conv_id}
+    ensures: VisibleTargetFailure(conv_id, target_kind, server_overloaded, reason)
 }
 
 -- REQ-LRV-003 (cross-spec) / REQ-WPV-003 (per the consumer): the
@@ -444,14 +463,13 @@ invariant TurnRetryContextPresentBetweenAttemptAndTurnBoundary {
 }
 
 -- REQ-LRV-002: the wire emission only carries reason values from the
--- retryable subset. Structurally enforced by the
--- RuntimeEmitsLlmAttemptOnScheduleRetry rule's `reason` precondition
--- (`reason in { rate_limit, server_error, network, timed_out }`) and the
--- LlmAttemptReason enum's closed set of variants.
+-- generic retryable subset plus the dedicated selected-model overload reason.
+-- Structurally enforced by RuntimeEmitsLlmAttemptOnScheduleRetry and the closed
+-- LlmAttemptReason enum.
 invariant LlmAttemptReasonInRetryableSet {
     for conv_id in LlmAttemptBroadcast:
         LlmAttemptBroadcast{conversation_id: conv_id}.payload.reason
-            in { rate_limit, server_error, network, timed_out }
+            in { rate_limit, server_error, network, timed_out, server_overloaded }
 }
 
 -- REQ-LRV-004: LlmAttempt is emitted on the conversation whose
@@ -551,29 +569,19 @@ surface RetryCountPersistedSurface {
         -- LlmRequesting/AwaitingContinuation.
 }
 
+invariant RetryMaximumMatchesReason {
+    for conv_id in TurnRetryContext:
+        TurnRetryContext{conversation_id: conv_id}.retry.max_attempts
+            = max_attempts_for(TurnRetryContext{conversation_id: conv_id}.retry.reason)
+}
+
+-- Helpers:
+--   remaining_backoff(total_ms: Integer, elapsed_ms: Integer) -> Integer
+--       Returns total_ms minus elapsed_ms, clamped at zero.
+
 ------------------------------------------------------------
 -- Deferred
 ------------------------------------------------------------
-
-deferred PerProviderRetryPolicies    -- see: crates/phoenix-ide/src/state_machine/transition.rs
-    -- All retryable LlmErrorKind variants share the global
-    -- MAX_RETRY_ATTEMPTS = 3 ceiling (`state_machine/transition.rs:183`)
-    -- and the exponential backoff 1s/2s/4s. Per-provider customisation
-    -- (e.g. longer backoff for Anthropic 429, faster for OpenAI 5xx)
-    -- is wire-compatible — the LlmAttempt event carries max_attempts
-    -- per-event, so the runtime can switch policies without a spec
-    -- change. Defer until a use case materialises.
-    -- Location: crates/phoenix-ide/src/state_machine/transition.rs
-
-deferred LiveBackoffCountdown    -- see: ui/src/components/StateBar.tsx
-    -- A live "backing off Ns" sub-display would compose
-    -- (now() - llm_attempt.event_arrived_at) against
-    -- llm_attempt.backing_off_ms to show the remaining backoff.
-    -- The wire field is already present; the consumer-side rule
-    -- would live in specs/working-phase-visibility/ as a new
-    -- DisplayWhen* rule gated on "currently backing off." V1 omits
-    -- this; the static "(retry K/N <reason>)" suffix is sufficient.
-    -- Location: ui/src/components/StateBar.tsx
 
 deferred CrossConversationRetryRollup    -- see: ui/src/pages/
     -- A parent-view aggregation ("this parent's sub-agents are
@@ -631,9 +639,8 @@ deferred ReplayRingMembershipStructural    -- see: specs/sse_wire/
 --     LlmAttempt IS replay-eligible; RateLimitSnapshot is NOT.
 --     Different lifecycles, different staleness properties.
 --
---   - max_attempts source: global MAX_RETRY_ATTEMPTS = 3
---     (`transition.rs:183`). Per-event field on the wire keeps the
---     contract per-provider-compatible for the future.
+--   - max_attempts source: policy-specific, 3 for generic transient failures
+--     and 5 for selected-model overload.
 --
 --   - resets_at threading: widen Event::LlmError to carry
 --     resets_at: Option<DateTime<Utc>> (sourced from

@@ -520,7 +520,85 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_svg_artifacts",
         sql: MIGRATION_101,
     },
+    Migration {
+        version: 102,
+        name: "admit_server_overload_retrying_state",
+        sql: MIGRATION_102,
+    },
 ];
+
+const MIGRATION_102: &str = r"
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    '''idle'', ''llm_requesting'', ''tool_executing''',
+    '''idle'', ''llm_requesting'', ''server_overload_retrying'', ''tool_executing'''
+)
+WHERE type = 'table'
+  AND name = 'conversations'
+  AND instr(sql, '''idle'', ''llm_requesting'', ''tool_executing''') > 0
+  AND instr(sql, '''server_overload_retrying''') = 0
+";
+
+#[cfg(test)]
+mod migration_102_tests {
+    use super::{run_pending_migrations, MIGRATIONS};
+    use sqlx::{sqlite::SqlitePoolOptions, Row};
+
+    #[tokio::test]
+    async fn migrates_101_schema_and_records_rollback_boundary() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                state_kind TEXT NOT NULL CHECK (state_kind IN ('idle', 'llm_requesting', 'tool_executing'))
+             );
+             CREATE TABLE _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 101)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let schema: String =
+            sqlx::query("SELECT sql FROM sqlite_schema WHERE name = 'conversations'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("sql");
+        assert!(schema.contains("'server_overload_retrying'"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 102")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("INSERT INTO conversations (id, state_kind) VALUES ('retry', 'server_overload_retrying')")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
 
 const MIGRATION_101: &str = r"
 CREATE TABLE conversation_svg_artifacts (
@@ -9573,6 +9651,46 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+async fn run_migration_102(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        let schema: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'conversations'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !schema.contains("'server_overload_retrying'") {
+            let changed = sqlx::query(migration.sql).execute(&mut *tx).await?;
+            if changed.rows_affected() != 1 {
+                return Err(DbError::Serialization(
+                    "migration 102 expected the migration-59 conversations schema".to_string(),
+                ));
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA schema_version = {}",
+                schema_version + 1
+            )))
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -9580,6 +9698,7 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
 /// # Errors
 ///
 /// Returns a [`DbError`] if the underlying database operation fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(
@@ -9632,6 +9751,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 96 {
             run_migration_096(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 102 {
+            run_migration_102(pool, migration).await?;
             applied += 1;
             continue;
         }

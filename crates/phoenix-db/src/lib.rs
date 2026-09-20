@@ -10059,7 +10059,7 @@ impl Database {
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'server_overload_retrying', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
                    FROM durable_turns AS obligated_turn
@@ -10708,6 +10708,7 @@ impl Database {
                 )),
                 ConvState::Idle
                 | ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::Provisioning { .. }
                 | ConvState::CreationCancelled { .. }
@@ -13940,6 +13941,7 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
     match state {
         ConvState::Idle => "idle",
         ConvState::LlmRequesting { .. } => "llm_requesting",
+        ConvState::ServerOverloadRetrying { .. } => "server_overload_retrying",
         ConvState::ToolExecuting { .. } => "tool_executing",
         ConvState::CancellingTool { .. } => "cancelling_tool",
         ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
@@ -22234,6 +22236,70 @@ mod tests {
                 assert!(content.text.to_ascii_lowercase().contains("interrupted"));
             }
         }
+    }
+
+    fn overload_retry_state(
+        phase: phoenix_core::domain::sm_state::ServerOverloadPhase,
+    ) -> ConvState {
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                phase,
+                attempt: 2,
+                started_at,
+                deadline_at: started_at + chrono::Duration::minutes(10),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_retry_waiting_and_inflight_persist_and_reload() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (id, phase) in [
+            (
+                "waiting",
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: Utc::now() + chrono::Duration::seconds(30),
+                },
+            ),
+            (
+                "inflight",
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+            ),
+        ] {
+            db.create_conversation(id, id, "/tmp", false, None, None)
+                .await
+                .unwrap();
+            let expected = overload_retry_state(phase);
+            db.update_conversation_state(id, &expected).await.unwrap();
+            assert_eq!(db.get_conversation(id).await.unwrap().state, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_all_to_idle_preserves_overload_retry_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("overload", "overload", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        let expected = overload_retry_state(
+            phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                retry_at: Utc::now() + chrono::Duration::seconds(30),
+            },
+        );
+        db.update_conversation_state("overload", &expected)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert_eq!(
+            db.get_conversation("overload").await.unwrap().state,
+            expected
+        );
     }
 
     #[tokio::test]

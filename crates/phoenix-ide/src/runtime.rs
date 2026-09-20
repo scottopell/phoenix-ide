@@ -1632,6 +1632,16 @@ pub struct CachedPrSummary {
 /// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
 /// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
 /// the extra display fields.
+pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value {
+    match state {
+        ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
+            "type": "server_overload_retrying",
+            "attempt": retry.attempt,
+        }),
+        _ => serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PresentationConversation(pub crate::db::Conversation);
 
@@ -1645,6 +1655,10 @@ impl serde::Serialize for PresentationConversation {
             .as_object_mut()
             .ok_or_else(|| serde::ser::Error::custom("Conversation must serialize as an object"))?;
         object.remove("product_conversation_id");
+        object.insert(
+            "state".to_string(),
+            public_conversation_state(&self.0.state),
+        );
         value.serialize(serializer)
     }
 }
@@ -6064,7 +6078,8 @@ impl RuntimeManager {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::SeededLlmRequesting { .. } => {
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ServerOverloadRetrying { .. } => {
                 tracing::debug!(
                     conv_id = %conversation_id,
                     state = ?std::mem::discriminant(&conv.state),
@@ -11084,6 +11099,40 @@ mod scope_liveness_tests {
             .await
             .expect("reconstruct committed skill steer");
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_overload_retry() {
+        use phoenix_core::domain::sm_state::{
+            ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+        };
+
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("overload", "overload", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let started_at = Utc::now();
+        let expected = ConvState::ServerOverloadRetrying {
+            retry: ServerOverloadRetry {
+                target: ServerOverloadTarget::Ordinary,
+                phase: ServerOverloadPhase::InFlight,
+                attempt: 3,
+                started_at,
+                deadline_at: started_at + chrono::Duration::minutes(5),
+            },
+        };
+        mgr.db()
+            .update_conversation_state("overload", &expected)
+            .await
+            .expect("persist overload retry");
+
+        let (state, _ts, needs_auto_continue) = mgr
+            .determine_resume_state("overload")
+            .await
+            .expect("resume overload retry");
+        assert_eq!(state, expected);
         assert!(!needs_auto_continue);
     }
 

@@ -610,6 +610,21 @@ mod random_walk {
                 },
             },
 
+            ConvState::ServerOverloadRetrying { retry } => match retry.phase {
+                phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting { .. } => {
+                    Event::RetryTimeout {
+                        attempt: retry.attempt,
+                    }
+                }
+                phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight => {
+                    Event::ServerOverloaded {
+                        message: "still overloaded".to_string(),
+                        detected_at: chrono::Utc::now(),
+                        guidance: None,
+                    }
+                }
+            },
+
             ConvState::LlmRequesting { attempt }
             | ConvState::SeededLlmRequesting { attempt, .. } => {
                 match rng.random_range(0..4) {

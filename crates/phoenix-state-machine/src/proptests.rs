@@ -443,11 +443,22 @@ pub(crate) fn effects_are_valid(effects: &[Effect], new_state: &ConvState) -> bo
         }
     }
 
-    // RequestLlm should only appear when transitioning to LlmRequesting
-    if has_request_llm {
-        if !matches!(new_state, ConvState::LlmRequesting { .. }) {
-            return false;
-        }
+    // RequestLlm appears in ordinary request state or in the typed overload
+    // lifecycle after a persisted backoff becomes in-flight.
+    if has_request_llm
+        && !matches!(
+            new_state,
+            ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying {
+                    retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                        target: phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary,
+                        phase: phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight,
+                        ..
+                    }
+                }
+        )
+    {
+        return false;
     }
 
     true
@@ -2023,7 +2034,11 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 },
                 message: msg,
             },
-            8 => LlmOutcome::ServerOverloaded { message: msg },
+            8 => LlmOutcome::ServerOverloaded {
+                message: msg,
+                detected_at: chrono::Utc::now(),
+                guidance: None,
+            },
             9 => LlmOutcome::InvalidResponse { message: msg },
             10 => LlmOutcome::PromptRejected { message: msg },
             11 => LlmOutcome::ContentFiltered { message: msg },

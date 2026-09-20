@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     state TEXT NOT NULL DEFAULT '{"type":"idle"}',
     state_kind TEXT NOT NULL DEFAULT 'idle'
         CHECK (state_kind IN (
-            'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+            'idle', 'llm_requesting', 'server_overload_retrying', 'tool_executing', 'cancelling_tool',
             'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
             'awaiting_continuation', 'recoverable_continuation_failure',
             'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',

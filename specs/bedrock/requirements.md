@@ -298,14 +298,23 @@ THE SYSTEM SHALL NOT transition to error state — a cancellation the user reque
 
 ### REQ-BED-006: Error Recovery
 
-WHEN an in-flight conversation-turn LLM request fails with retryable error (network, rate limit, 5xx)
-THE SYSTEM SHALL retry automatically up to 3 times with exponential backoff
+WHEN an in-flight conversation-turn LLM request fails under the generic retry policy (network, rate limit, 5xx)
+THE SYSTEM SHALL use 3 total attempts with nominal waits of 2 seconds and 4 seconds
 AND remain in LLM requesting state during retries
 AND display retry status to user
 
-WHEN an in-flight conversation-turn LLM request fails after all retries are exhausted
+WHEN an in-flight conversation-turn or continuation-summary request fails with selected-model overload
+THE SYSTEM SHALL apply the single bounded overload loop defined by REQ-LLM-006b
+AND SHALL preserve the selected model and logical operation identity
+AND SHALL NOT open another overload loop when continuation begins
+
+WHEN an in-flight conversation-turn LLM request exhausts its applicable automatic retry policy
 THE SYSTEM SHALL transition to error state
 AND display actionable error message indicating retry failure
+
+WHEN continuation-summary generation exhausts its applicable automatic retry policy
+THE SYSTEM SHALL transition to `RecoverableContinuationFailure`
+AND preserve the continuation operation identity and inputs
 
 WHEN a recoverable LLM-backed operation fails with an auth error while credential recovery is in progress
 THE SYSTEM SHALL transition to awaiting recovery
@@ -369,6 +378,14 @@ AND SHALL NOT introduce a second steering lifecycle or queue authority
 WHEN server restarts with a conversation in `awaiting_continuation`, `recoverable_continuation_failure`, or continuation-summary `awaiting_recovery`
 THE SYSTEM SHALL preserve the durable continuation operation identity and recovery state
 AND materialize the pending continuation operation at startup
+
+WHEN server restarts with a persisted overload retry before its original deadline
+THE SYSTEM SHALL preserve its target attempt and deadline
+AND SHALL rearm a future wait once, dispatch a due retry once, or redispatch an in-flight target once
+
+WHEN server restarts with a persisted overload retry at or after its original deadline
+THE SYSTEM SHALL expire it without provider dispatch
+AND SHALL settle it as ordinary error or recoverable continuation failure according to its persisted target
 
 **Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
 

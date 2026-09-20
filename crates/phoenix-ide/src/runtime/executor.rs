@@ -85,6 +85,7 @@ enum AuthoritativeEffect {
     ScheduleRetry {
         delay: Duration,
         attempt: u32,
+        max_attempts: u32,
         reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason,
         resets_at: Option<DateTime<Utc>>,
     },
@@ -240,11 +241,13 @@ impl ClassifiedEffect {
             Effect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             })),
@@ -1943,6 +1946,37 @@ enum FollowUpApprovalError {
     AuthorityLost(String),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+enum OverloadStartupAction {
+    Schedule {
+        delay: std::time::Duration,
+        attempt: u32,
+    },
+    Dispatch,
+    Expire,
+}
+
+fn overload_startup_action(
+    retry: &phoenix_core::domain::sm_state::ServerOverloadRetry,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OverloadStartupAction {
+    use phoenix_core::domain::sm_state::ServerOverloadPhase;
+    if now >= retry.deadline_at {
+        return OverloadStartupAction::Expire;
+    }
+    match retry.phase {
+        ServerOverloadPhase::Waiting { retry_at } if retry_at <= now => {
+            OverloadStartupAction::Dispatch
+        }
+        ServerOverloadPhase::Waiting { retry_at } => OverloadStartupAction::Schedule {
+            delay: (retry_at - now).to_std().unwrap_or_default(),
+            attempt: retry.attempt,
+        },
+        ServerOverloadPhase::InFlight => OverloadStartupAction::Dispatch,
+    }
+}
+
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -2328,6 +2362,78 @@ where
                 return RuntimeExitDisposition::Interrupted;
             }
         };
+
+        if let ConvState::ServerOverloadRetrying { retry } = self.state.clone() {
+            use phoenix_core::domain::sm_state::{
+                OverloadRetryGuidance, ServerOverloadPhase, ServerOverloadTarget,
+            };
+            let now = Utc::now();
+            if matches!(
+                overload_startup_action(&retry, now),
+                OverloadStartupAction::Expire
+            ) {
+                if let Err(error) = self
+                    .process_event(Event::ServerOverloaded {
+                        message: "Server overload retry deadline elapsed".to_string(),
+                        detected_at: now,
+                        guidance: Some(OverloadRetryGuidance::ExceedsLimit(
+                            std::time::Duration::from_secs(31),
+                        )),
+                    })
+                    .await
+                {
+                    tracing::error!(%error, "Failed to expire recovered overload retry");
+                    return RuntimeExitDisposition::Interrupted;
+                }
+            } else {
+                match overload_startup_action(&retry, now) {
+                    OverloadStartupAction::Dispatch
+                        if matches!(retry.phase, ServerOverloadPhase::Waiting { .. }) => {
+                        if let Err(error) = self
+                            .process_event(Event::RetryTimeout {
+                                attempt: retry.attempt,
+                            })
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to dispatch due recovered overload retry");
+                            return RuntimeExitDisposition::Interrupted;
+                        }
+                    }
+                    OverloadStartupAction::Schedule { delay, attempt } => {
+                        if let Err(error) = self
+                            .execute_effect(Effect::ScheduleRetry {
+                                delay,
+                                attempt,
+                                max_attempts: 5,
+                                reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason::ServerOverloaded,
+                                resets_at: None,
+                            })
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to schedule recovered overload retry");
+                            return RuntimeExitDisposition::Interrupted;
+                        }
+                    }
+                    OverloadStartupAction::Expire => unreachable!("handled before startup action match"),
+                    OverloadStartupAction::Dispatch => {
+                        let effect = match retry.target {
+                            ServerOverloadTarget::Ordinary => Effect::RequestLlm,
+                            target @ ServerOverloadTarget::Continuation { .. } => {
+                                Effect::RequestContinuation {
+                                    request: target
+                                        .continuation_request(retry.attempt)
+                                        .expect("continuation target reconstructs its request"),
+                                }
+                            }
+                        };
+                        if let Err(error) = self.execute_effect(effect).await {
+                            tracing::error!(%error, "Failed to resume in-flight overload retry");
+                            return RuntimeExitDisposition::Interrupted;
+                        }
+                    }
+                }
+            }
+        }
 
         // Check if we need to resume an interrupted operation
         // This handles crash recovery for in-flight LLM requests
@@ -3371,7 +3477,9 @@ where
         // early; correctness does not depend on it.
         if !matches!(
             self.state,
-            ConvState::LlmRequesting { .. } | ConvState::AwaitingContinuation { .. }
+            ConvState::LlmRequesting { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::ServerOverloadRetrying { .. }
         ) {
             if let Some(handle) = self.retry_timer_handle.take() {
                 handle.abort();
@@ -5247,6 +5355,11 @@ where
 
     fn abort_external_effects_in_memory(&mut self) {
         self.abort_active_llm_task();
+        self.retry_generation = self.retry_generation.wrapping_add(1);
+        if let Some(handle) = self.retry_timer_handle.take() {
+            handle.abort();
+        }
+        self.handoff_completion_authority = None;
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             let _ = attempt_capture.finalize_cancelled();
         }
@@ -5261,6 +5374,11 @@ where
 
     async fn abort_external_effects(&mut self) {
         self.abort_active_llm_task();
+        self.retry_generation = self.retry_generation.wrapping_add(1);
+        if let Some(handle) = self.retry_timer_handle.take() {
+            handle.abort();
+        }
+        self.handoff_completion_authority = None;
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             if let Some(metrics) = attempt_capture.finalize_cancelled() {
                 if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await {
@@ -6151,6 +6269,7 @@ where
             AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => {
@@ -6168,7 +6287,7 @@ where
                     .event(|seq| SseEvent::LlmAttempt {
                         sequence_id: seq,
                         attempt,
-                        max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                        max_attempts,
                         reason,
                         backing_off_ms,
                         resets_at,
@@ -6305,6 +6424,17 @@ where
                     &self.state,
                     ConvState::AwaitingContinuation { request: active }
                         if active.operation_id == request.operation_id
+                ) || matches!(
+                    &self.state,
+                    ConvState::ServerOverloadRetrying { retry }
+                        if matches!(
+                            &retry.target,
+                            phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation { operation_id, .. }
+                                if operation_id == &request.operation_id
+                        ) && matches!(
+                            retry.phase,
+                            phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                        )
                 ) {
                     self.request_continuation(request, admitted).await
                 } else {
@@ -6771,12 +6901,45 @@ where
             }
         }
 
-        let retry_attempt = match self.state {
+        let retry_attempt = match &self.state {
             ConvState::LlmRequesting { attempt }
-            | ConvState::SeededLlmRequesting { attempt, .. } => attempt,
+            | ConvState::SeededLlmRequesting { attempt, .. } => *attempt,
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.target,
+                    phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                ) && matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                retry.attempt
+            }
             _ => 1,
         };
+        let overload_deadline = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.target,
+                    phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                ) && matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                Some(retry.deadline_at)
+            }
+            _ => None,
+        };
         let mut tool_surface = LlmToolSurface::Full;
+
+        if overload_deadline.is_some_and(|deadline| deadline <= Utc::now()) {
+            return Ok(Some(Event::ServerOverloaded {
+                detected_at: Utc::now(),
+                message: "Server overload retry deadline elapsed".to_string(),
+                guidance: None,
+            }));
+        }
 
         // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
         // finite turn budget. Grace turn mechanism gives the model one extra LLM
@@ -6883,6 +7046,13 @@ where
         // Persistence effects have settled before RequestLlm reaches this method.
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
+        if overload_deadline.is_some_and(|deadline| deadline <= Utc::now()) {
+            return Ok(Some(Event::ServerOverloaded {
+                detected_at: Utc::now(),
+                message: "Server overload retry deadline elapsed".to_string(),
+                guidance: None,
+            }));
+        }
         self.refresh_active_prompt_projection().await?;
         let trusted_results = self.pending_trusted_tool_results.clone();
         let trusted_token_reserve = trusted_results
@@ -7153,7 +7323,19 @@ where
             let attempt_capture = task_attempt_capture;
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
-            let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
+            let provider = llm_client.complete_streaming(&request, &chunk_tx);
+            let result = if let Some(deadline) = overload_deadline {
+                let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
+                match tokio::time::timeout(remaining, provider).await {
+                    Ok(result) => result,
+                    Err(_) => Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    )),
+                }
+            } else {
+                provider.await
+            };
+            let llm_outcome = match result {
                 Ok(response) => {
                     // Extract tool calls from content and convert to typed ToolCall
                     let tool_calls: Vec<ToolCall> = response
@@ -8151,6 +8333,17 @@ where
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
         let retry_attempt = request.attempt;
+        let overload_deadline = match &self.state {
+            ConvState::ServerOverloadRetrying { retry }
+                if matches!(
+                    retry.phase,
+                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+                ) =>
+            {
+                Some(retry.deadline_at)
+            }
+            _ => None,
+        };
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
@@ -8342,7 +8535,18 @@ where
         let continuation_admission = admitted.reborrow();
         let continuation_task = async move {
             let _continuation_admission = continuation_admission;
-            let result = llm_client.complete(&request).await;
+            let provider = llm_client.complete(&request);
+            let result = if let Some(deadline) = overload_deadline {
+                let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
+                match tokio::time::timeout(remaining, provider).await {
+                    Ok(result) => result,
+                    Err(_) => Err(phoenix_llm::LlmError::server_overloaded(
+                        "Server overload retry deadline elapsed",
+                    )),
+                }
+            } else {
+                provider.await
+            };
             let finalized_metrics = attempt_capture.finalized();
 
             match result {
@@ -8392,7 +8596,25 @@ where
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
-                    let event = if e.recovery_in_progress {
+                    let event = if e.kind == phoenix_llm::LlmErrorKind::ServerOverloaded {
+                        let guidance = e.retry_after().map(|retry_after| match retry_after {
+                            phoenix_llm::RetryAfter::WithinLimit(duration) => {
+                                phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(
+                                    duration,
+                                )
+                            }
+                            phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
+                                phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(
+                                    duration,
+                                )
+                            }
+                        });
+                        Event::ServerOverloaded {
+                            message: e.message.clone(),
+                            detected_at: Utc::now(),
+                            guidance,
+                        }
+                    } else if e.recovery_in_progress {
                         Event::LlmError {
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
@@ -11594,9 +11816,21 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
         LlmErrorKind::InvalidResponse => LlmOutcome::InvalidResponse {
             message: error.message,
         },
-        LlmErrorKind::ServerOverloaded => LlmOutcome::ServerOverloaded {
-            message: error.message,
-        },
+        LlmErrorKind::ServerOverloaded => {
+            let guidance = error.retry_after().map(|retry_after| match retry_after {
+                phoenix_llm::RetryAfter::WithinLimit(duration) => {
+                    phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(duration)
+                }
+                phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
+                    phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(duration)
+                }
+            });
+            LlmOutcome::ServerOverloaded {
+                message: error.message,
+                detected_at: Utc::now(),
+                guidance,
+            }
+        }
         LlmErrorKind::Network => LlmOutcome::NetworkError {
             message: error.message,
         },
@@ -11840,8 +12074,8 @@ mod error_mapping_tests {
         );
         let db_kind = llm_error_to_db_error(LlmErrorKind::ServerOverloaded);
         assert!(
-            !db_kind.is_auto_retryable(),
-            "ServerOverloaded must NOT be retryable after mapping"
+            db_kind.is_auto_retryable(),
+            "ServerOverloaded must retain its bounded overload retry policy after mapping"
         );
     }
 
@@ -20667,6 +20901,14 @@ mod retry_timer_epoch_tests {
         }
     }
 
+    fn server_overload() -> Event {
+        Event::ServerOverloaded {
+            message: "capacity".to_string(),
+            detected_at: Utc::now(),
+            guidance: None,
+        }
+    }
+
     /// Mirror of the executor select-loop's retry-outcome arm: apply the
     /// generation guard, then route a current-generation `RetryTimeout` to
     /// `process_outcome`. Returns `true` if the timeout was applied, `false` if
@@ -20727,6 +20969,113 @@ mod retry_timer_epoch_tests {
         assert!(
             rt.retry_timeout_is_stale(scheduled_gen),
             "the cancelled timer's fire must now be stale"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_backoff_cleanup_retires_timer_generation_and_admission() {
+        let mut cancelled = runtime_requesting();
+        let cancel_fence = Arc::clone(&cancelled.fatal_local_authority_fence);
+        cancelled
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules backoff");
+        let cancel_generation = cancelled.retry_generation;
+        assert!(matches!(
+            cancelled.state,
+            ConvState::ServerOverloadRetrying { .. }
+        ));
+        assert!(cancelled.retry_timer_handle.is_some());
+        assert_eq!(cancel_fence.owner_count(), 1);
+
+        cancelled
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await
+            .expect("cancel transitions");
+        tokio::task::yield_now().await;
+        assert!(matches!(cancelled.state, ConvState::Idle));
+        assert!(cancelled.retry_timer_handle.is_none());
+        assert!(cancelled.retry_generation > cancel_generation);
+        assert!(!route_retry_timeout(&mut cancelled, cancel_generation, 2).await);
+        assert_eq!(cancel_fence.owner_count(), 0);
+
+        let mut torn_down = runtime_requesting();
+        let teardown_fence = Arc::clone(&torn_down.fatal_local_authority_fence);
+        torn_down
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules backoff");
+        let teardown_generation = torn_down.retry_generation;
+        assert_eq!(teardown_fence.owner_count(), 1);
+        torn_down.abort_external_effects().await;
+        tokio::task::yield_now().await;
+        assert!(torn_down.retry_timer_handle.is_none());
+        assert!(torn_down.retry_generation > teardown_generation);
+        assert!(!route_retry_timeout(&mut torn_down, teardown_generation, 2).await);
+        assert_eq!(teardown_fence.owner_count(), 0);
+
+        let mut fatally_aborted = runtime_requesting();
+        let fatal_fence = Arc::clone(&fatally_aborted.fatal_local_authority_fence);
+        fatally_aborted
+            .process_event(server_overload())
+            .await
+            .expect("overload schedules fatal-cleanup backoff");
+        let fatal_generation = fatally_aborted.retry_generation;
+        assert_eq!(fatal_fence.owner_count(), 1);
+        fatally_aborted.abort_external_effects_in_memory();
+        tokio::task::yield_now().await;
+        assert!(fatally_aborted.retry_timer_handle.is_none());
+        assert!(fatally_aborted.retry_generation > fatal_generation);
+        assert!(!route_retry_timeout(&mut fatally_aborted, fatal_generation, 2).await);
+        assert_eq!(fatal_fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_expired_continuation_overload_persists_recoverable_terminal() {
+        let mut rt = runtime_requesting();
+        let storage = Arc::clone(&rt.storage);
+        let now = Utc::now();
+        rt.state = ConvState::ServerOverloadRetrying {
+            retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
+                target: phoenix_core::domain::sm_state::ServerOverloadTarget::Continuation {
+                    operation_id: "startup-expired-continuation".to_string(),
+                    rejected_tool_calls: vec![],
+                },
+                phase: phoenix_core::domain::sm_state::ServerOverloadPhase::Waiting {
+                    retry_at: now - chrono::Duration::seconds(1),
+                },
+                attempt: 4,
+                started_at: now - chrono::Duration::seconds(121),
+                deadline_at: now - chrono::Duration::seconds(1),
+            },
+        };
+        let runtime = tokio::spawn(rt.run());
+
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(state @ ConvState::RecoverableContinuationFailure { .. }) =
+                    storage.get_current_state("conv-retry")
+                {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup expiry reaches durable recovery state");
+        let ConvState::RecoverableContinuationFailure { failure } = persisted else {
+            unreachable!()
+        };
+        assert_eq!(failure.request.operation_id, "startup-expired-continuation");
+        assert_eq!(failure.request.attempt, 4);
+
+        runtime.abort();
+        assert!(
+            matches!(runtime.await, Err(error) if error.is_cancelled()),
+            "the test runtime remains available for an explicit user retry after publishing recovery"
         );
     }
 
@@ -21783,6 +22132,67 @@ mod llm_generation_guard_tests {
         assert!(
             !rt.llm_outcome_is_stale(5),
             "an outcome stamped with the current generation must be processed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod overload_startup_tests {
+    use super::*;
+    use phoenix_core::domain::sm_state::{
+        ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
+    };
+
+    fn retry(phase: ServerOverloadPhase, now: chrono::DateTime<Utc>) -> ServerOverloadRetry {
+        ServerOverloadRetry {
+            target: ServerOverloadTarget::Ordinary,
+            phase,
+            attempt: 2,
+            started_at: now,
+            deadline_at: now + chrono::Duration::seconds(120),
+        }
+    }
+
+    #[test]
+    fn recovered_waiting_retry_schedules_once_or_dispatches_when_due() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = retry(
+            ServerOverloadPhase::Waiting {
+                retry_at: now + chrono::Duration::seconds(7),
+            },
+            now,
+        );
+        assert_eq!(
+            overload_startup_action(&future, now),
+            OverloadStartupAction::Schedule {
+                delay: std::time::Duration::from_secs(7),
+                attempt: 2,
+            }
+        );
+        let due = retry(ServerOverloadPhase::Waiting { retry_at: now }, now);
+        assert_eq!(
+            overload_startup_action(&due, now),
+            OverloadStartupAction::Dispatch
+        );
+    }
+
+    #[test]
+    fn recovered_retry_expires_or_redispatches_in_flight() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut expired = retry(ServerOverloadPhase::Waiting { retry_at: now }, now);
+        expired.deadline_at = now;
+        assert_eq!(
+            overload_startup_action(&expired, now),
+            OverloadStartupAction::Expire
+        );
+        let in_flight = retry(ServerOverloadPhase::InFlight, now);
+        assert_eq!(
+            overload_startup_action(&in_flight, now),
+            OverloadStartupAction::Dispatch
         );
     }
 }

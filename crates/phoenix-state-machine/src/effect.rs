@@ -188,6 +188,7 @@ pub enum Effect {
     ScheduleRetry {
         delay: Duration,
         attempt: u32,
+        max_attempts: u32,
         reason: LlmAttemptReason,
         resets_at: Option<DateTime<Utc>>,
     },

@@ -102,6 +102,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
     case 'idle':
     case 'error':
     case 'llm_requesting':
+    case 'server_overload_retrying':
     case 'seeded_llm_requesting':
     case 'tool_executing':
     case 'awaiting_sub_agents':

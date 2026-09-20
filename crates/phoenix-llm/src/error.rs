@@ -1,6 +1,7 @@
 //! LLM error types
 
 use super::rate_limit::QuotaDetails;
+use super::retry_guidance::RetryAfter;
 use chrono::{DateTime, Datelike, Local, Utc};
 use thiserror::Error;
 
@@ -21,6 +22,7 @@ pub struct LlmError {
     /// small enough that `Result<_, LlmError>` stays under clippy's
     /// `result_large_err` threshold across the LLM hot path.
     pub quota: Option<Box<QuotaDetails>>,
+    retry_after: Option<RetryAfter>,
 }
 
 impl LlmError {
@@ -30,6 +32,7 @@ impl LlmError {
             message: message.into(),
             recovery_in_progress: false,
             quota: None,
+            retry_after: None,
         }
     }
 
@@ -50,7 +53,25 @@ impl LlmError {
     }
 
     pub fn server_overloaded(message: impl Into<String>) -> Self {
-        Self::new(LlmErrorKind::ServerOverloaded, message)
+        Self::server_overloaded_with_retry_after(message, None)
+    }
+
+    pub(crate) fn server_overloaded_with_retry_after(
+        message: impl Into<String>,
+        retry_after: Option<RetryAfter>,
+    ) -> Self {
+        Self {
+            kind: LlmErrorKind::ServerOverloaded,
+            message: message.into(),
+            recovery_in_progress: false,
+            quota: None,
+            retry_after,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_after(&self) -> Option<RetryAfter> {
+        self.retry_after
     }
 
     #[must_use]
@@ -61,6 +82,7 @@ impl LlmError {
             message,
             recovery_in_progress: false,
             quota: Some(Box::new(quota)),
+            retry_after: None,
         }
     }
 
@@ -479,21 +501,29 @@ mod tests {
 
     #[test]
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
-        use phoenix_core::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
-        use AutoRetryPolicy::{AutoRetryable, NoAutoRetry};
+        use phoenix_core::domain::retry_policy::{
+            AutoRetryPolicy, UserResumePolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
+        };
+        use AutoRetryPolicy::NoAutoRetry;
         use LlmErrorKind::{
             Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
             RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
         };
         use UserResumePolicy::{NotResumable, Resumable};
+        const GENERIC: AutoRetryPolicy = AutoRetryPolicy::Generic {
+            max_attempts: GENERIC_MAX_ATTEMPTS,
+        };
+        const OVERLOAD: AutoRetryPolicy = AutoRetryPolicy::ServerOverloaded {
+            max_attempts: OVERLOAD_MAX_ATTEMPTS,
+        };
 
         let cases = [
-            (Network, AutoRetryable, Resumable),
-            (RateLimit, AutoRetryable, Resumable),
+            (Network, GENERIC, Resumable),
+            (RateLimit, GENERIC, Resumable),
             (UsageLimitReached, NoAutoRetry, Resumable),
-            (ServerError, AutoRetryable, Resumable),
-            (InvalidResponse, AutoRetryable, Resumable),
-            (ServerOverloaded, NoAutoRetry, Resumable),
+            (ServerError, GENERIC, Resumable),
+            (InvalidResponse, GENERIC, Resumable),
+            (ServerOverloaded, OVERLOAD, Resumable),
             (Auth, NoAutoRetry, Resumable),
             (InvalidRequest, NoAutoRetry, Resumable),
             (ContentFilter, NoAutoRetry, NotResumable),

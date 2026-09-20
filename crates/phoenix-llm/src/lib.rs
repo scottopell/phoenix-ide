@@ -50,6 +50,7 @@ mod openai;
 mod proptests;
 pub mod rate_limit;
 mod registry;
+mod retry_guidance;
 mod service;
 pub(crate) mod sse;
 
@@ -59,6 +60,7 @@ pub use codex_credential::{
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_codex_models, discover_models, DiscoveredModels, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
+pub use retry_guidance::RetryAfter;
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
 // imports them via a `phoenix_llm::` path. Their only consumer is the persisted

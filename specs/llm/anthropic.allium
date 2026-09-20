@@ -433,9 +433,8 @@ rule AnthropicStreamCompleted {
 ------------------------------------------------------------
 
 -- Map an Anthropic SSE `error` event's error_type to the taxonomy
--- (parse_anthropic_sse_error). overloaded_error is terminal and distinct
--- from a generic server error so the executor does not retry a model
--- that is at capacity.
+-- (parse_anthropic_sse_error). overloaded_error is distinct from a generic
+-- server error and enters the bounded same-model capacity policy in llm.allium.
 rule AnthropicSseErrorClassified {
     when: AnthropicSseErrorRaised(error_type, message)
 

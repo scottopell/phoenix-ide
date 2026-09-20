@@ -456,6 +456,7 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
         crate::state_machine::ConvState::Terminal => Some("terminal".to_string()),
         crate::state_machine::ConvState::Idle
         | crate::state_machine::ConvState::LlmRequesting { .. }
+        | crate::state_machine::ConvState::ServerOverloadRetrying { .. }
         | crate::state_machine::ConvState::SeededLlmRequesting { .. }
         | crate::state_machine::ConvState::Provisioning { .. }
         | crate::state_machine::ConvState::ToolExecuting { .. }
