@@ -707,7 +707,16 @@ export function buildConversationSearchProjection(
       case 'continuation': {
         const summary = (unit.message.content as { summary?: string }).summary;
         if (summary) {
-          addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', summary);
+          addConversationSource(
+            sources,
+            unitIndex,
+            unit.kind,
+            unit.key,
+            'system-message',
+            summary,
+            undefined,
+            { kind: 'message-text', fragmentId: unit.message.message_id },
+          );
         }
         break;
       }

@@ -374,7 +374,11 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
                     .reconcile_or_record_automatic_continuation_no_progress(&admission, error)
                     .await
                 {
-                    warn!(%record_error, "failed to persist automatic continuation failure");
+                    warn!(%record_error, "automatic continuation no-progress outcome is unclassified");
+                    runtime.signal_fatal_local_authority(
+                        "automatic_continuation_no_progress_classification",
+                    );
+                    return false;
                 }
             }
             Err(error) => {
@@ -397,7 +401,11 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
                             )
                             .await
                         {
-                            warn!(%record_error, "failed to persist automatic continuation failure");
+                            warn!(%record_error, "automatic continuation no-progress outcome is unclassified");
+                            runtime.signal_fatal_local_authority(
+                                "automatic_continuation_no_progress_classification",
+                            );
+                            return false;
                         }
                     }
                     Err(record_error) => {

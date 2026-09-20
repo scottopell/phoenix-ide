@@ -96,7 +96,6 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
       if (requestGeneration.current === generation && viewRevision.current === revision) {
         setView(next);
         setFeedback('Saved');
-        window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated'));
       }
     } catch (error) {
       if (requestGeneration.current === generation && viewRevision.current === revision) {
@@ -130,6 +129,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         },
       );
       if (response.status === 'dispatch_failed') {
+        window.dispatchEvent(new CustomEvent('phoenix:automatic-continuation-updated'));
         throw new Error(response.error ?? `Failed to retry ${authorityLabel} handoff`);
       }
       if (requestGeneration.current === generation) {

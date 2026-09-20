@@ -1318,7 +1318,7 @@ fn accepted_continuation_message_matches(
 }
 
 impl AutomaticContinuationAdmission {
-    pub const MAX_NO_PROGRESS_ATTEMPTS: u32 = 5;
+    pub const MAX_NO_PROGRESS_ATTEMPTS: u32 = 3;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

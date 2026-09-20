@@ -23,6 +23,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
+  const [topologyRevision, setTopologyRevision] = useState(0);
+
+  useEffect(() => {
+    const refresh = () => setTopologyRevision((value) => value + 1);
+    window.addEventListener('phoenix:automatic-continuation-updated', refresh);
+    return () => window.removeEventListener('phoenix:automatic-continuation-updated', refresh);
+  }, []);
 
   useEffect(() => {
     if (fixtureData) return;
@@ -61,7 +68,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug]);
+  }, [fixtureData, navigate, slug, topologyRevision]);
 
   return (
     <main className="coordinator-page">

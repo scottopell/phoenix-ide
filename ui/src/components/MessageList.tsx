@@ -375,7 +375,18 @@ function renderHistoricalUnit(
     case 'continuation': {
       const summary = (unit.message.content as { summary?: string })?.summary;
       if (!summary) return null;
-      return <CompletedContinuationBoundary summary={summary} />;
+      const revealedSummary = activeHighlight?.owner === 'message-text'
+        ? renderHighlightedText(summary, activeHighlight.start, activeHighlight.end)
+        : undefined;
+      return (
+        <div id={`message-${unit.message.message_id}`}>
+          <CompletedContinuationBoundary
+            summary={summary}
+            revealedSummary={revealedSummary}
+            revealSummary={revealedSummary !== undefined}
+          />
+        </div>
+      );
     }
     case 'system': {
       const displayData = unit.message.display_data as ProductHistoricalHandoffDisplayData | null;
