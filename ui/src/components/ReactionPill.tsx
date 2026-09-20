@@ -57,7 +57,13 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     if (!el || !scroller) return;
     let frame = 0;
     let observedComposer: Element | null = null;
+    let observedObstructions = new Set<Element>();
     const layoutOwner = scroller.closest('.conversation-column') ?? document.body;
+    const layoutChild = (element: Element | null) => {
+      let child = element;
+      while (child?.parentElement && child.parentElement !== layoutOwner) child = child.parentElement;
+      return child?.parentElement === layoutOwner ? child : null;
+    };
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
@@ -99,12 +105,23 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
         let obstructionTop = composer?.getBoundingClientRect().top ?? bottom;
-        if (composer?.parentElement === layoutOwner) {
-          for (let sibling = composer.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
-            const siblingRect = sibling.getBoundingClientRect();
-            if (siblingRect.height > 0) obstructionTop = Math.min(obstructionTop, siblingRect.top);
+        const transcriptChild = layoutChild(scroller);
+        const composerChild = layoutChild(composer);
+        const nextObstructions = new Set<Element>();
+        for (let sibling = transcriptChild?.nextElementSibling; sibling && sibling !== composerChild; sibling = sibling.nextElementSibling) {
+          const siblingRect = sibling.getBoundingClientRect();
+          if (siblingRect.height > 0) {
+            obstructionTop = Math.min(obstructionTop, siblingRect.top);
+            nextObstructions.add(sibling);
           }
         }
+        for (const obstruction of observedObstructions) {
+          if (!nextObstructions.has(obstruction)) resize.unobserve(obstruction);
+        }
+        for (const obstruction of nextObstructions) {
+          if (!observedObstructions.has(obstruction)) resize.observe(obstruction);
+        }
+        observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
       } else if (visible && rect) {
         x = rect.left;

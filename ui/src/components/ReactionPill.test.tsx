@@ -231,18 +231,18 @@ describe('reaction pill', () => {
     expect(input).not.toHaveFocus();
   });
 
-  it('stays above visible bars that follow the composer', async () => {
+  it('stays above visible controls between the transcript and composer', async () => {
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       if (this.id === 'input-area') return new DOMRect(0, 500, 390, 80);
-      if (this.id === 'state-bar') return new DOMRect(0, 470, 390, 30);
+      if (this.id === 'work-controls') return new DOMRect(0, 470, 390, 30);
       if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
       return new DOMRect(0, 0, 390, 700);
     });
     render(<FocusScopeProvider>
       <div className="conversation-column">
         <div id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+        <div id="work-controls" />
         <footer id="input-area" />
-        <div id="state-bar" />
       </div>
       <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
     </FocusScopeProvider>);
