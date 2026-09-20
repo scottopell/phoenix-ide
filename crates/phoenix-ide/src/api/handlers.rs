@@ -6308,7 +6308,19 @@ async fn delete_conversation(
 /// on success. Loss of fatal-authority admission or DB row deletion fails the
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
-pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+pub(super) enum PreparedHardDelete {
+    AlreadyDeleted,
+    Ready {
+        conversation: Box<crate::db::Conversation>,
+        cleanup: ResourceCleanupReceipt,
+        _authority: crate::runtime::AdmittedOperation,
+    },
+}
+
+pub(super) async fn prepare_hard_delete_cascade(
+    state: &AppState,
+    id: &str,
+) -> Result<PreparedHardDelete, AppError> {
     let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
@@ -6356,7 +6368,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         delete_conversation_attachments(id).await;
         broadcast_conversation_hard_deleted(state, id).await;
         state.runtime.kick_creation_worker();
-        return Ok(());
+        return Ok(PreparedHardDelete::AlreadyDeleted);
     }
 
     if conv.state.is_busy() {
@@ -6401,7 +6413,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    let _owner = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
+    let authority = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; a
@@ -6411,28 +6423,46 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // identical.
     let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
-    // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
-    // rows. This is the only step whose failure is fatal to the request
-    // — partial cleanup above is non-fatal but a missing row deletion
-    // means the user's "delete this conversation" never actually
-    // happened.
+    Ok(PreparedHardDelete::Ready {
+        conversation: Box::new(conv),
+        cleanup,
+        _authority: authority,
+    })
+}
+
+pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &PreparedHardDelete) {
+    if let PreparedHardDelete::Ready {
+        conversation,
+        cleanup,
+        ..
+    } = prepared
+    {
+        reopen_bash_after_failed_lifecycle_mutation(state, conversation, cleanup).await;
+    }
+}
+
+pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: PreparedHardDelete) {
+    let PreparedHardDelete::Ready { conversation, .. } = prepared else {
+        return;
+    };
+    let id = conversation.id.clone();
+    retire_work_scope_after_hard_delete(state, &conversation).await;
+    delete_conversation_attachments(&id).await;
+    broadcast_conversation_hard_deleted(state, &id).await;
+}
+
+pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let prepared = prepare_hard_delete_cascade(state, id).await?;
+    if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
+        return Ok(());
+    }
     if let Err(error) = state.runtime.db().delete_conversation(id).await {
-        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
+        reopen_prepared_hard_delete(state, &prepared).await;
         return Err(AppError::Internal(format!(
             "Failed to delete conversation row: {error}"
         )));
     }
-
-    // Scope retirement belongs to explicit scope cleanup, not to a terminal
-    // transcript transition. The row deletion above removes this conversation's
-    // ownership claim; runtime inventory and the database CAS independently
-    // recheck the remaining in-memory and durable obligations.
-    retire_work_scope_after_hard_delete(state, &conv).await;
-
-    delete_conversation_attachments(id).await;
-
-    broadcast_conversation_hard_deleted(state, id).await;
-
+    finish_prepared_hard_delete(state, prepared).await;
     Ok(())
 }
 

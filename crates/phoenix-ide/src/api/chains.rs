@@ -37,7 +37,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{require_hard_delete_admission, run_hard_delete_cascade, AppError};
+use super::handlers::{
+    finish_prepared_hard_delete, prepare_hard_delete_cascade, reopen_prepared_hard_delete,
+    require_hard_delete_admission, AppError, PreparedHardDelete,
+};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
@@ -435,12 +438,9 @@ async fn lock_chain_admissions(
 /// once through its root. Only History chains proceed to preflight and cleanup.
 /// Pre-checks every member's busy state up front and refuses the whole
 /// operation if any member is busy (atomic refuse — no partial wipe).
-/// Iterates root-first so the existing FK on `continued_in_conv_id`
-/// (`NO ACTION`) does not reject the row delete: the root has no
-/// incoming reference, and removing it frees its successor to be
-/// deleted next. Reuses [`run_hard_delete_cascade`] per-member so
-/// bash / tmux / worktree cleanup runs identically to the per-
-/// conversation path.
+/// External cleanup runs for every member before any conversation row is
+/// removed. The rows are then deleted root-first in one immediate transaction
+/// so any member failure rolls the whole aggregate back.
 pub async fn delete_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -484,8 +484,42 @@ pub async fn delete_chain_handler(
         }
     }
 
+    let mut prepared = Vec::with_capacity(member_ids.len());
     for id in &member_ids {
-        run_hard_delete_cascade(&state, id).await?;
+        match prepare_hard_delete_cascade(&state, id).await {
+            Ok(member) => prepared.push(member),
+            Err(error) => {
+                for member in &prepared {
+                    reopen_prepared_hard_delete(&state, member).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    if prepared
+        .iter()
+        .any(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        for member in &prepared {
+            reopen_prepared_hard_delete(&state, member).await;
+        }
+        return Err(AppError::Internal(
+            "chain member entered creation cleanup during aggregate deletion".to_string(),
+        ));
+    }
+
+    if let Err(error) = state.db.delete_conversations_atomically(&member_ids).await {
+        for member in &prepared {
+            reopen_prepared_hard_delete(&state, member).await;
+        }
+        return Err(AppError::Internal(format!(
+            "Failed to delete chain conversation rows: {error}"
+        )));
+    }
+
+    for member in prepared {
+        finish_prepared_hard_delete(&state, member).await;
     }
 
     Ok(Json(SuccessResponse { success: true }))

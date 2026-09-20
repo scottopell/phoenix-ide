@@ -9850,13 +9850,7 @@ impl Database {
         Ok(true)
     }
 
-    /// Delete a conversation and all its messages
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    #[allow(clippy::too_many_lines)]
-    pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
+    async fn delete_conversations_in_transaction(&self, ids: &[String]) -> DbResult<()> {
         let telemetry = self.sqlite_telemetry(
             SqliteOperation::ConversationDelete,
             SqliteWorkloadCategory::MessagePersistence,
@@ -9874,17 +9868,27 @@ impl Database {
                     .map_err(DbError::from)
             })
             .await?;
-        let body = Self::hard_delete_conversation_tx(
-            &mut connection,
-            id,
-            telemetry.parent_observer(),
-            None,
-        )
+
+        let body = async {
+            for id in ids {
+                if !Self::hard_delete_conversation_tx(
+                    &mut connection,
+                    id,
+                    telemetry.parent_observer(),
+                    None,
+                )
+                .await?
+                {
+                    return Err(DbError::ConversationNotFound(id.clone()));
+                }
+            }
+            Ok(())
+        }
         .await;
 
         match body {
-            Ok(true) => {
-                telemetry
+            Ok(()) => {
+                let commit = telemetry
                     .observe_commit_db(timing, async {
                         sqlx::query("COMMIT")
                             .execute(&mut *connection)
@@ -9892,19 +9896,11 @@ impl Database {
                             .map(|_| ())
                             .map_err(DbError::from)
                     })
-                    .await
-            }
-            Ok(false) => {
-                telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
-                    .await?;
-                Err(DbError::ConversationNotFound(id.to_string()))
+                    .await;
+                if commit.is_err() {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                }
+                commit
             }
             Err(error) => {
                 telemetry
@@ -9919,6 +9915,29 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    /// Delete conversations and all their dependent rows in one transaction.
+    ///
+    /// The caller supplies deletion order. Any missing row or database failure
+    /// rolls back every member deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if any conversation is missing or the underlying
+    /// database operation fails.
+    pub async fn delete_conversations_atomically(&self, ids: &[String]) -> DbResult<()> {
+        self.delete_conversations_in_transaction(ids).await
+    }
+
+    /// Delete a conversation and all its messages
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
+        self.delete_conversations_in_transaction(&[id.to_string()])
+            .await
     }
 
     /// Rename conversation (update slug)
@@ -24953,6 +24972,38 @@ mod tests {
         assert_eq!(binding_exists, 0);
         assert_eq!(receipt_exists, 0);
         assert_eq!(link_exists, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_conversations_atomically_rolls_back_all_rows_on_member_failure() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("atomic-root", "atomic-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("atomic-member", "atomic-member", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_atomic_member_delete
+             BEFORE DELETE ON conversations
+             WHEN OLD.id = 'atomic-member'
+             BEGIN SELECT RAISE(ABORT, 'induced member delete failure'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let error = db
+            .delete_conversations_atomically(&[
+                "atomic-root".to_string(),
+                "atomic-member".to_string(),
+            ])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("induced member delete failure"));
+        assert!(db.get_conversation("atomic-root").await.is_ok());
+        assert!(db.get_conversation("atomic-member").await.is_ok());
     }
 
     #[tokio::test]
