@@ -886,6 +886,10 @@ final class ConversationSession {
         }
     }
 
+    func markHardDeleted() {
+        handleHardDeletion()
+    }
+
     private func handleHardDeletion() {
         guard !isHardDeleted else { return }
         streamTask?.cancel()
