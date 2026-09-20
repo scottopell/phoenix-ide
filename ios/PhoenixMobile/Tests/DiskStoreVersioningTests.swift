@@ -163,6 +163,36 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testWriterConditionalReplaceAndRetireRequireExactCurrentContent() async {
+        freshDiskStore()
+        let context = DiskStore.versionedContext()
+        let writer = context.writer(name: "records", version: 1)
+        let first = Record(name: "first", count: 1)
+        let widened = Record(name: "widened", count: 2)
+
+        let created = await writer.replace(
+            expected: Optional<Record>.none, replacement: first, revision: writer.reserveRevision())
+        guard case .replaced = created else { return XCTFail("expected create") }
+
+        let staleCreate = await writer.replace(
+            expected: Optional<Record>.none, replacement: widened, revision: writer.reserveRevision())
+        guard case .expectationMismatch = staleCreate else { return XCTFail("expected stale create mismatch") }
+
+        let replaced = await writer.replace(
+            expected: first, replacement: widened, revision: writer.reserveRevision())
+        guard case .replaced = replaced else { return XCTFail("expected exact replacement") }
+
+        let staleRetire = await writer.replace(
+            expected: first, replacement: Optional<Record>.none, revision: writer.reserveRevision())
+        guard case .expectationMismatch = staleRetire else { return XCTFail("expected stale retire mismatch") }
+
+        let retired = await writer.replace(
+            expected: widened, replacement: Optional<Record>.none, revision: writer.reserveRevision())
+        guard case .replaced = retired else { return XCTFail("expected exact retirement") }
+        XCTAssertNil(DiskStore.loadVersioned(Record.self, name: "records", version: 1))
+    }
+
+    @MainActor
     func testWriterHandlesShareOneDestinationRevisionFence() async {
         freshDiskStore()
         let context = DiskStore.versionedContext()

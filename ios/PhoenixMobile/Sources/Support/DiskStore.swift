@@ -2,6 +2,12 @@ import Foundation
 
 /// Serial background sink for one destination. Every writer handle for the
 /// destination shares this revision fence.
+enum DiskConditionalMutationOutcome: Sendable {
+    case replaced
+    case expectationMismatch
+    case persistenceFailed
+}
+
 private actor VersionedDiskSink {
     private let destination: URL
     private var latestAttemptedRevision = 0
@@ -23,6 +29,30 @@ private actor VersionedDiskSink {
             latestCommittedRevision = max(latestCommittedRevision, revision)
         }
         return committed
+    }
+
+    func replace<T: Codable & Equatable & Sendable>(
+        expected: T?, replacement: T?, version: Int, revision: Int
+    ) -> DiskConditionalMutationOutcome {
+        let current: T?
+        switch DiskStore.loadVersionedResult(T.self, source: destination, version: version) {
+        case .missing: current = nil
+        case .value(let value): current = value
+        case .incompatible, .unreadable: return .persistenceFailed
+        }
+        guard current == expected else { return .expectationMismatch }
+        latestAttemptedRevision = max(latestAttemptedRevision, revision)
+        if let replacement {
+            guard DiskStore.writeVersioned(replacement, to: destination, version: version) else {
+                return .persistenceFailed
+            }
+        } else {
+            do { try FileManager.default.removeItem(at: destination) }
+            catch where (error as NSError).code == NSFileNoSuchFileError {}
+            catch { return .persistenceFailed }
+        }
+        latestCommittedRevision = max(latestCommittedRevision, revision)
+        return .replaced
     }
 
     func fence(revision: Int) {
@@ -80,6 +110,13 @@ final class VersionedDiskWriter {
 
     func save<T: Encodable & Sendable>(_ value: T, revision: Int) async -> Bool {
         await destination.sink.save(value, version: version, revision: revision)
+    }
+
+    func replace<T: Codable & Equatable & Sendable>(
+        expected: T?, replacement: T?, revision: Int
+    ) async -> DiskConditionalMutationOutcome {
+        await destination.sink.replace(
+            expected: expected, replacement: replacement, version: version, revision: revision)
     }
 
     func fence(revision: Int) async {
