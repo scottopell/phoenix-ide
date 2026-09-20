@@ -29,13 +29,13 @@ Current profiled critical path was 1,073.8 s; lane records sum to 1,072.7 s (99.
 | `tsc` | `pnpm run typecheck` (`tsc -b --noEmit`); project-reference and `exactOptionalPropertyTypes` errors. | 0.5 s warm; profile 15.1 s, **1.4%**. Cold: unknown. | 27/50 (54%) | No emitted build tree from `--noEmit`; shares installed UI dependencies. | CI `check (ui/specs)`; ESLint/Vitest do not prove TS project-reference correctness. | **Conditional (retain).** Warm cost is sub-second and protection is unique. |
 | `ui-lint` | ESLint then Stylelint; TS/React hook/static rules and CSS validity/conventions. | 8.4 s (6.7 + 1.7); profile 12.8 s, **1.2%**. Cold: unknown. | 27/50 (54%) | No material lane artifact; shares `ui/node_modules`. | CI `check (ui/specs)`; partially overlaps tsc syntax, but lint/CSS rule classes are distinct. | **Conditional (retain).** ~8 s for two unique static surfaces. Keep consolidated as one lane. |
 | `vitest` | UI component/state/hook tests. | 39.5 s; profile 47.7 s, **4.4%**. Cold: unknown. | 27/50 (54%) | Transient workers only; shares `ui/node_modules`. | CI `check (ui/specs)`; overlaps code touched by tsc/lint, not asserted behavior. | **Conditional (retain).** CI-only saves ~40 s per UI change but loses the only broad UI behavioral feedback locally. |
-| `ast-grep` | One structural-rule scan over Rust/UI, then changed-test timing lint (`check_ast_grep`). Protects repository-specific forbidden shapes and newly introduced slow Rust tests. | 4.0 s (0.9 + 3.1); profile lane 5.2 s, **0.5%**. Cold: near cache-independent, not separately measured. | 42/50 (84%) | Negligible persistent output. | CI `check (ui/specs)` even for Rust changes; overlaps lint scanning but rules and timing-diff contract are unique. | **Conditional (retain).** High frequency but only ~4 s. Keep the two steps consolidated to avoid another job/lane. |
-| `allium` | Parse/analyse every Allium spec and reject new findings beyond the checked baseline. | 0.1 s; profile 0.2 s, **<0.1%**. Cold: tool install excluded. | 28/50 (56%) | None in worktree. | CI `check (ui/specs)`; no other lane validates Allium grammar/finding baseline. | **Conditional (retain).** Unique protection at ~0.1 s. |
+| `ast-grep` | One structural-rule scan over Rust/UI, then a static changed-test synchronization-smell lint (`check_ast_grep`). The latter rejects newly introduced sleeps and unbounded event waits; it does not execute or time tests and therefore does not detect arbitrary slow tests. | 4.0 s (0.9 + 3.1); profile lane 5.2 s, **0.5%**. Cold: near cache-independent, not separately measured. | 42/50 (84%) | Negligible persistent output. | Local protection is conditional on the optional `ast-grep` CLI: when absent, `check_ast_grep` records a successful skip before both the structural scan and timing-smell lint. CI `check (ui/specs)` installs the CLI. | **Conditional (retain).** With the optional CLI installed, repository-specific structural and synchronization-smell protection costs ~4 s. Keep the two steps consolidated. |
+| `allium` | Parse/analyse every Allium spec and reject new findings beyond the checked baseline. | 0.1 s; profile 0.2 s, **<0.1%**. Cold: tool install excluded. | 28/50 (56%) | None in worktree. | Local protection is conditional on the optional `allium` CLI; absence is a successful skipped lane. CI `check (ui/specs)` installs pinned `allium-cli` 3.5.0, where no other lane validates this grammar/finding baseline. | **Conditional (retain).** With the optional CLI installed, unique protection costs ~0.1 s. |
 | `spec-shape` | Validate spEARS v2 artifact shape, then run all `tests/devpy` orchestration/deployment/check tests. | 34.7 s ordinary; profile 149.5 s, **13.9%**. Cold: unknown. | 28/50 (56%) | Python/uv caches are shared host state and not attributable; no material worktree output. | CI `check (ui/specs)`; shape validation is unique, while dev.py tests protect the check/deploy/task machinery itself. | **Conditional (retain).** The 35 s cost is dominated by distinct dev.py regression tests. A future split could improve attribution, but consolidation/removal has no proven protection-preserving saving. |
 | `spec-anchors` | Cross-check code `REQ-*` references against declarations. | 0.6 s; profile 0.6 s, **0.1%**. Cold: cache-independent. | 46/50 (92%) | None. | CI `check (ui/specs)`; intentionally spans specs, Rust, and UI; shape validation cannot catch orphan code anchors. | **Conditional (retain).** Very frequent but sub-second and unique. |
 | `e2e` | Build/run a real Phoenix binary and drive HTTP/SSE scenarios with isolated DB/mock model. | 48.8 s; profile 53.4 s, **5.0%**. Cold: unknown. | 32/50 (64%) | Reuses normal `target/debug` dependencies but must link non-test binary; incremental bytes cannot be separated safely from Rust lane in the shared tree. | Dedicated CI `check (e2e)`; overlaps user journeys but uniquely crosses binary/API/SSE/process boundaries. | **Conditional (retain).** CI-only saves ~49 s on Rust/E2E changes but removes the only local real-binary boundary gate. |
 | `task` | Validate task filename grammar and global ID uniqueness. Always on. | 0.0 s (12 ms profile); **<0.1%**. | 50/50 (100%) | None. | CI `check (task validation)` plus roadmap reducer test. No substitute. | **Retain local always-on.** Negligible cost; it caught the intentionally plain approval brief until that proposal artifact was removed after approval. |
-| `pkglock` | Fail when `ui/pnpm-lock.yaml` has uncommitted drift that a frozen deploy install would reject. | <0.1 s; profile 0.1 s, **<0.1%**. Cold: cache-independent. | 27/50 (54%) | None. | CI `check (ui/specs)`; CI frozen install also fails lock drift, but local tripwire gives immediate deploy-relevant feedback. | **Conditional (retain).** Near-zero cost. |
+| `pkglock` | Run `git status --porcelain -- ui/pnpm-lock.yaml` and fail if that one file is dirty. This is only an uncommitted-lockfile tripwire: it does not validate package/lock consistency or predict whether a clean frozen install succeeds. | <0.1 s; profile 0.1 s, **<0.1%**. Cold: cache-independent. | 27/50 (54%) | None. | CI `check (ui/specs)` runs this same dirty-file predicate after checkout; its separate `pnpm install --frozen-lockfile` step provides package/lock consistency protection. | **Conditional (retain).** Near-zero cost for the exact dirty-file predicate. |
 
 ### Shared UI dependency footprint
 
@@ -74,18 +74,180 @@ Exact workflow mapping at `bed747b5`:
 
 All jobs are merge-time PR checks subject to the current path plan; all groups run on pushes to `main`. The current local design already captures the measurable ROI: an unchanged/docs-only branch paid 0.47 s instead of roughly 491 s, while relevant edits select their distinct gates. Recommended changes to gates: **none**. Potential follow-up investigations—not changes commissioned here—are load-sensitive tmux cleanup tests and whether `spec-shape` should be renamed/split solely for clearer ownership; neither has evidence supporting removal or CI-only conversion.
 
-## Reproduction commands
+## Reproduction procedure
 
-Every instrumented command began with assertions for `hostname -s == devmbp` and a worktree root under `/Users/sopell/git/phoenix-ide/.phoenix/worktrees/`.
+The raw files cited above are intentionally ignored, so the exact scripts used to produce their durable aggregate claims follow. Every instrumented command was preceded by:
 
 ```bash
-./dev.py check-plan --all --format json
-./dev.py check-plan --format json
-./dev.py check --all --profile-work --profile-work-dir target/check-profile/roi-current-warm-1
-./dev.py check --profile-work --profile-work-dir target/check-profile/roi-current-default
-./dev.py check --all
-CARGO_INCREMENTAL=0 cargo check --target x86_64-unknown-linux-musl \
-  --features phoenix_ide/datadog-tracing
+[ "$(hostname -s)" = devmbp ]
+case "$(git rev-parse --show-toplevel)" in
+  /Users/sopell/git/phoenix-ide/.phoenix/worktrees/*) ;;
+  *) exit 2 ;;
+esac
+mkdir -p target/check-roi-audit
 ```
 
-Disk snapshots used `du -sk` (allocated blocks on this APFS host) and `du -skA` (apparent bytes) immediately before/after owned runs. Shared trees are reported once; APFS/apparent values are not summed as unique physical cost.
+### Plans, timed checks, and logs
+
+`/usr/bin/time -lp` writes process wall/resource data into each named log through `tee`; `--profile-work` writes command/lane/step JSON under the named profile directory.
+
+```bash
+./dev.py check-plan --all --format json \
+  > target/check-roi-audit/current-full-plan.json
+./dev.py check-plan --format json \
+  > target/check-roi-audit/current-default-plan.json
+/usr/bin/time -lp ./dev.py check --all --profile-work \
+  --profile-work-dir target/check-profile/roi-current-warm-1 2>&1 \
+  | tee target/check-roi-audit/current-warm-1.log
+/usr/bin/time -lp ./dev.py check --profile-work \
+  --profile-work-dir target/check-profile/roi-current-default 2>&1 \
+  | tee target/check-roi-audit/current-default.log
+/usr/bin/time -lp ./dev.py check --all 2>&1 \
+  | tee target/check-roi-audit/current-warm-normal.log
+/usr/bin/time -lp env CARGO_INCREMENTAL=0 cargo check \
+  --target x86_64-unknown-linux-musl \
+  --features phoenix_ide/datadog-tracing 2>&1 \
+  | tee target/check-roi-audit/musl-check.log
+```
+
+### Before/after disk snapshots
+
+This exact function was called with distinct output files immediately before and after each owned run (for example, `disk-before-musl.tsv` and `disk-after-musl.tsv`). `du -sk` reports allocated KiB on this APFS host and `du -skA` reports apparent KiB. Deltas are compared by path; shared trees are reported once, not summed across lanes.
+
+```bash
+snapshot_disk() {
+  out=$1
+  {
+    printf 'captured_utc=%s\n' "$(date -u +%FT%TZ)"
+    printf 'source=%s\n' "$(git rev-parse HEAD)"
+    for p in target target/debug target/clippy \
+      target/x86_64-unknown-linux-musl ui/node_modules \
+      "$HOME/.rustup/toolchains"; do
+      if [ -e "$p" ]; then
+        printf '%s\t' "$p"
+        du -sk "$p" | awk '{printf "allocated_KiB=%s\\t",$1}'
+        du -skA "$p" | awk '{printf "apparent_KiB=%s\\n",$1}'
+      else
+        printf '%s\tabsent\n' "$p"
+      fi
+    done
+  } > "$out"
+}
+```
+
+### Current-classifier simulation over 50 first-parent commits
+
+This is the exact standalone simulation used for the table. It transcribes `_categorize_changed_paths`, `_LANE_INPUTS`, the `SELF` rule, and always-on `task` from audited `dev.py`; it evaluates each commit diff rather than PR aggregates.
+
+```bash
+python3 - <<'PY' > target/check-roi-audit/commit-frequency.json
+import json, subprocess
+lanes = {
+  'rust': {'RUST'}, 'cargo-fmt': {'RUST'}, 'clippy': {'RUST'},
+  'tsc': {'UI'}, 'ui-lint': {'UI'}, 'vitest': {'UI'},
+  'ast-grep': {'UI', 'RUST', 'ASTGREP'}, 'allium': {'SPECS'},
+  'spec-shape': {'SPECS'}, 'spec-anchors': {'SPECS', 'RUST', 'UI'},
+  'e2e': {'RUST', 'E2E'}, 'task': None, 'pkglock': {'UI'},
+}
+def categories(paths):
+  found = set()
+  for p in paths:
+    if p == 'dev.py' or p.startswith('.github/workflows/'): found.add('SELF')
+    if (p.startswith('crates/') or p in ('Cargo.toml', 'Cargo.lock') or
+        p.startswith('.cargo/') or p.startswith('rust-toolchain')): found.add('RUST')
+    if p.startswith('ui/src/generated/'): found.add('RUST')
+    if p.startswith('ui/') and not p.startswith('ui/dist/'): found.add('UI')
+    if p.startswith('tasks/'): found.add('TASKS')
+    if p.startswith('specs/') or p.startswith('tests/devpy/'): found.add('SPECS')
+    if p == 'scripts/check_rust_test_timing.py': found.update(('ASTGREP', 'SPECS'))
+    if p in {'scripts/check_profile_command.py', 'scripts/check_profile_report.py',
+             'scripts/python_unittest_profile.py'}: found.add('SPECS')
+    if p.startswith('ast-grep-rules/'): found.add('ASTGREP')
+    if p.startswith('tests/e2e/') or p == 'phoenix-client.py': found.add('E2E')
+  return found
+shas = subprocess.check_output(
+  ['git', 'rev-list', '--first-parent', '--max-count=50', 'origin/main'], text=True
+).split()
+counts = {lane: 0 for lane in lanes}; rows = []
+for sha in shas:
+  paths = subprocess.check_output(
+    ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha], text=True
+  ).splitlines()
+  cats = categories(paths)
+  active = (set(lanes) if 'SELF' in cats else
+            {'task'} | {lane for lane, inputs in lanes.items() if inputs and inputs & cats})
+  for lane in active: counts[lane] += 1
+  rows.append({'sha': sha, 'paths': len(paths), 'categories': sorted(cats),
+               'active_lanes': sorted(active)})
+print(json.dumps({'method': 'current classifier per first-parent commit',
+                  'sample_size': len(shas), 'tip': shas[0], 'oldest': shas[-1],
+                  'counts': counts, 'rows': rows}, indent=2))
+PY
+```
+
+### Latest 30 completed PR Actions runs
+
+The exact query requested 100 jobs for each of 30 runs; every sampled run had fewer than 100 jobs, so no job page was omitted. The first script persisted each run's job names/outcomes. The second extracted the two named Rust steps. A `skipped` job is not counted as scheduled lane execution.
+
+```bash
+gh run list --repo scottopell/phoenix-ide --workflow CI \
+  --event pull_request --limit 30 --status completed \
+  --json databaseId,headSha,createdAt,conclusion,url \
+  > target/check-roi-audit/gh-pr-runs.json
+python3 - <<'PY'
+import json, subprocess
+runs = json.load(open('target/check-roi-audit/gh-pr-runs.json'))
+out = []
+for run in runs:
+  response = subprocess.run([
+    'gh', 'api',
+    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/jobs?per_page=100"
+  ], capture_output=True, text=True)
+  if response.returncode:
+    run['jobs_error'] = response.stderr.strip()
+  else:
+    run['jobs'] = [{'name': job['name'], 'conclusion': job['conclusion']}
+                   for job in json.loads(response.stdout)['jobs']]
+  out.append(run)
+open('target/check-roi-audit/gh-pr-jobs.json', 'w').write(
+  json.dumps(out, indent=2) + '\n')
+PY
+python3 - <<'PY'
+import json, subprocess
+runs = json.load(open('target/check-roi-audit/gh-pr-runs.json'))
+rows = []
+for run in runs:
+  raw = subprocess.check_output([
+    'gh', 'api',
+    f"repos/scottopell/phoenix-ide/actions/runs/{run['databaseId']}/jobs?per_page=100"
+  ], text=True)
+  for job in json.loads(raw)['jobs']:
+    if job['name'] == 'check (rust)':
+      rows.append({
+        'run': run['databaseId'], 'createdAt': run['createdAt'],
+        'job_conclusion': job['conclusion'], 'url': job['html_url'],
+        'steps': [{'name': step['name'], 'status': step['status'],
+                   'conclusion': step['conclusion']} for step in job['steps']
+                  if step['name'] in ('./dev.py check (rust,cargo-fmt)',
+                                      'Check production feature on musl')]
+      })
+open('target/check-roi-audit/gh-rust-musl-steps.json', 'w').write(
+  json.dumps(rows, indent=2) + '\n')
+PY
+python3 - <<'PY'
+import collections, json
+runs = json.load(open('target/check-roi-audit/gh-pr-jobs.json'))
+counts = collections.Counter(); outcomes = collections.Counter()
+for run in runs:
+  for job in run.get('jobs', []):
+    if job['name'].startswith('check ('):
+      counts[job['name']] += 1
+      outcomes[(job['name'], job['conclusion'])] += 1
+print(dict(counts)); print(dict(outcomes))
+rows = json.load(open('target/check-roi-audit/gh-rust-musl-steps.json'))
+print(collections.Counter(row['job_conclusion'] for row in rows))
+print(collections.Counter(
+  (step['status'], step['conclusion']) for row in rows for step in row['steps']
+  if step['name'] == 'Check production feature on musl'))
+PY
+```
