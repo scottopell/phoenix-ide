@@ -188,7 +188,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
   const composerHasContentRef = useRef(false);
   const composerContentRef = useRef({ draft, images, files });
-  const deferredExpansionErrorRef = useRef<{ scopeKey: string; error: string } | null>(null);
+  const deferredExpansionErrorsRef = useRef(new Map<string, string>());
   useEffect(() => {
     composerContentRef.current = { draft, images, files };
     composerHasContentRef.current = draft.length > 0
@@ -228,10 +228,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const setExpansionErrorRef = useRef(setExpansionError);
   setExpansionErrorRef.current = setExpansionError;
   useEffect(() => {
-    const deferred = deferredExpansionErrorRef.current;
-    if (deferred?.scopeKey === scopeKey) {
-      setExpansionErrorRef.current(deferred.error);
-      deferredExpansionErrorRef.current = null;
+    const deferred = deferredExpansionErrorsRef.current.get(scopeKey);
+    if (deferred) {
+      setExpansionErrorRef.current(deferred);
+      deferredExpansionErrorsRef.current.delete(scopeKey);
     }
   }, [scopeKey]);
 
@@ -481,10 +481,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setFiles([...files, ...current.files]);
         } else {
           // This render's callbacks remain bound to the submitted conversation's stores.
-          deferredExpansionErrorRef.current = {
-            scopeKey: submittedScopeKey,
-            error: err.detail.error ?? 'Reference expansion failed',
-          };
+          deferredExpansionErrorsRef.current.set(
+            submittedScopeKey,
+            err.detail.error ?? 'Reference expansion failed',
+          );
           setDraft(text);
           setImages(images);
           setFiles(files);
