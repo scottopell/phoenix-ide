@@ -3548,7 +3548,6 @@ where
         ));
     }
     if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
-        let _ = std::fs::remove_dir(&tombstone_root);
         return Err(format!(
             "cannot move {description} into private final tombstone: {error}"
         ));
@@ -5654,7 +5653,13 @@ fn macos_process_working_directory(pid: i32) -> Result<Option<PathBuf>, String> 
         )
     };
     if bytes == 0 {
-        return Ok(None);
+        let error = std::io::Error::last_os_error();
+        if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "cannot re-read process {pid} working directory: {error}"
+        ));
     }
     if bytes
         != i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>())
@@ -5784,7 +5789,10 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     capacity_bytes_i32,
                 )
             };
-            if descriptor_bytes <= 0 {
+            if descriptor_bytes == 0 {
+                break Vec::new();
+            }
+            if descriptor_bytes < 0 {
                 let error = std::io::Error::last_os_error();
                 if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
                     continue 'processes;

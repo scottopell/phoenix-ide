@@ -551,6 +551,15 @@ export function WorkControlBar({
       : err instanceof Error && 'code' in err && typeof err.code === 'string'
         ? err.code
         : undefined;
+    if (code === 'inactive_close_transcript') {
+      const activeTranscript = err instanceof ConflictError
+        ? err.detail.active_transcript_id
+        : undefined;
+      if (activeTranscript && activeTranscript !== conversationId) {
+        window.location.assign(`/conversation/${activeTranscript}`);
+      }
+      return false;
+    }
     if (
       code === 'close_loss_confirmation_required'
       || code === 'close_inspection_failed'
