@@ -22,6 +22,7 @@ jobs:
       rust: ${{ steps.plan.outputs.rust }}
       clippy: ${{ steps.plan.outputs.clippy }}
       e2e: ${{ steps.plan.outputs.e2e }}
+      devpy: ${{ steps.plan.outputs.devpy }}
       ui: ${{ steps.plan.outputs.ui }}
       fast: ${{ steps.plan.outputs.fast }}
       active_lanes: ${{ steps.plan.outputs.active_lanes }}
@@ -170,6 +171,61 @@ jobs:
       - name: ./dev.py check (e2e)
         run: ./dev.py check --lanes e2e
 
+  check-devpy:
+    name: check (dev.py tests)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.devpy == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: check-devpy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Upgrade corepack
+        run: |
+          npm i -g corepack@latest
+          corepack enable
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: Install UI dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: ./dev.py check (dev.py tests)
+        run: ./dev.py check --lanes devpy
+
   check-ui:
     name: check (ui/specs)
     needs: plan_check
@@ -260,7 +316,7 @@ jobs:
 
   notify-main-failure:
     name: Open issue on main CI failure
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(join(needs.*.result, ','), 'failure') }}
     runs-on: ubuntu-latest
     permissions:
@@ -286,7 +342,7 @@ jobs:
 
   close-main-failure:
     name: Close CI-failure issue on green
-    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-devpy, check-ui, check-fast]
     if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
