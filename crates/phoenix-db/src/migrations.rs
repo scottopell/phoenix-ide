@@ -520,13 +520,41 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
-    Migration { version: 101, name: "create_conversation_svg_artifacts", sql: MIGRATION_101 },
-    Migration { version: 102, name: "persist_typed_close_repair_cause", sql: MIGRATION_102 },
-    Migration { version: 103, name: "settled_close_participant_allows_legacy_member_delete", sql: MIGRATION_103 },
-    Migration { version: 104, name: "enforce_close_ambient_writer_authority_pairs", sql: MIGRATION_104 },
-    Migration { version: 105, name: "persist_close_ambient_writer_indeterminate_cause", sql: MIGRATION_105 },
-    Migration { version: 106, name: "guard_close_participant_deleted_settlement", sql: MIGRATION_106 },
-    Migration { version: 107, name: "exclude_conflicting_close_repair_causes", sql: MIGRATION_107 },
+    Migration {
+        version: 101,
+        name: "create_conversation_svg_artifacts",
+        sql: MIGRATION_101,
+    },
+    Migration {
+        version: 102,
+        name: "persist_typed_close_repair_cause",
+        sql: MIGRATION_102,
+    },
+    Migration {
+        version: 103,
+        name: "settled_close_participant_allows_legacy_member_delete",
+        sql: MIGRATION_103,
+    },
+    Migration {
+        version: 104,
+        name: "enforce_close_ambient_writer_authority_pairs",
+        sql: MIGRATION_104,
+    },
+    Migration {
+        version: 105,
+        name: "persist_close_ambient_writer_indeterminate_cause",
+        sql: MIGRATION_105,
+    },
+    Migration {
+        version: 106,
+        name: "guard_close_participant_deleted_settlement",
+        sql: MIGRATION_106,
+    },
+    Migration {
+        version: 107,
+        name: "exclude_conflicting_close_repair_causes",
+        sql: MIGRATION_107,
+    },
 ];
 
 const MIGRATION_101: &str = r"
@@ -15858,8 +15886,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard'),
-                    (106, 'temporarily_skip_conflicting_close_repair_causes')",
+                    (106, 'temporarily_skip_close_participant_deleted_settlement_guard'),
+                    (107, 'temporarily_skip_conflicting_close_repair_causes')",
         )
         .execute(&pool)
         .await
@@ -16753,8 +16781,8 @@ mod tests {
                     (93, 'temporarily_skip_product_creation_ownership'),
                     (95, 'temporarily_skip_product_lifecycle_reconciliation'),
                     (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (105, 'temporarily_skip_close_participant_deleted_settlement_guard'),
-                    (106, 'temporarily_skip_conflicting_close_repair_causes')",
+                    (106, 'temporarily_skip_close_participant_deleted_settlement_guard'),
+                    (107, 'temporarily_skip_conflicting_close_repair_causes')",
         )
         .execute(pool)
         .await
