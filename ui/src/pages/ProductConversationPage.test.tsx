@@ -472,6 +472,27 @@ describe('ProductConversationPage', () => {
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it('rearms canonical snapshot invalidation after each refresh', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'First Rename', presentation_mode: 'idle' },
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        presentation: { kind: 'state', display_name: 'Second Rename', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/root-alias');
+    expect(await screen.findByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+    expect(await screen.findByRole('heading', { name: 'First Rename' })).toBeInTheDocument();
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    expect(await screen.findByRole('heading', { name: 'Second Rename' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3);
+  });
+
   it('starts a new measured open when revisiting a previously loaded product route', async () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-1', true);

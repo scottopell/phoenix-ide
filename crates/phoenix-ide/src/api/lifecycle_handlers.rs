@@ -982,11 +982,11 @@ pub(crate) async fn close_legacy_compat(
     run_legacy_close_compat(state, id, action, false).await
 }
 
-pub(crate) async fn close_product_conversation_direct(
+pub(crate) async fn close_product_conversation_with_active_work(
     state: &AppState,
     id: &str,
 ) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, "archive", true).await
+    run_legacy_close_compat(state, id, "archive", false).await
 }
 
 pub(crate) async fn abandon_task(

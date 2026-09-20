@@ -883,7 +883,7 @@ function ProductConversationPageInner() {
       refresh();
     }
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
-  }, [productConversationId, snapshot?.product_conversation_id]);
+  }, [productConversationId, snapshot?.product_conversation_id, snapshotRetry]);
 
   useEffect(() => {
     const notificationIds = new Set([

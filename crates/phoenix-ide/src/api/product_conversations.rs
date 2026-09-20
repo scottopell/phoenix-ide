@@ -61,7 +61,7 @@ pub async fn close_product_conversation(
             .await
             .map_err(db_to_app)?
             .aggregate;
-        match crate::api::lifecycle_handlers::close_product_conversation_direct(
+        match crate::api::lifecycle_handlers::close_product_conversation_with_active_work(
             &state,
             &product_conversation.latest_transcript_row_id,
         )

@@ -110,6 +110,25 @@ enum ProductHistorySnapshotStore {
     }
 }
 
+enum ProductCloseConfirmationKind: Equatable {
+    case stopWork
+    case losses
+}
+
+struct PendingProductCloseConfirmation: Equatable {
+    var productConversationId: String
+    var transcriptRowId: String
+    var close: ProductConversationClose
+
+    var kind: ProductCloseConfirmationKind? {
+        switch close.phase {
+        case .awaiting_stop_work_confirmation: .stopWork
+        case .awaiting_loss_confirmation: .losses
+        default: nil
+        }
+    }
+}
+
 enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
     case emptyResponse
     case aggregateIdentityChanged
@@ -204,7 +223,9 @@ final class AppModel {
     private var drainSessions: [String: ConversationSession] = [:]
     private var closingProductConversationIds: Set<String> = []
     private var closeActionGenerations = ProductActionGenerationTracker()
+    private var productHistoryGenerations = ProductActionGenerationTracker()
     private(set) var deletedProductHistoryIds: Set<String> = []
+    private(set) var pendingProductCloseConfirmation: PendingProductCloseConfirmation?
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -403,6 +424,9 @@ final class AppModel {
         }
         let startedGeneration = apiGeneration
         let writer = ProductHistorySnapshotStore.writer(productConversationId: productConversationId)
+        let startedHistoryGeneration = productHistoryGenerations.begin(
+            productConversationId: productConversationId)
+        let revision = writer.reserveRevision()
         var snapshot: ProductConversationSnapshot?
         var before: String?
         var seenCursors: Set<String> = []
@@ -411,7 +435,12 @@ final class AppModel {
                 let page = try await api.getProductConversation(
                     reference: productConversationId,
                     before: before)
-                guard !Task.isCancelled, apiGeneration == startedGeneration else {
+                guard !Task.isCancelled,
+                      apiGeneration == startedGeneration,
+                      productHistoryGenerations.isCurrent(
+                          startedHistoryGeneration,
+                          productConversationId: productConversationId)
+                else {
                     throw ProductHistoryLoadError.staleServerGeneration
                 }
                 guard page.product_conversation_id == productConversationId else {
@@ -433,8 +462,11 @@ final class AppModel {
             guard apiGeneration == startedGeneration else {
                 throw ProductHistoryLoadError.staleServerGeneration
             }
-            let transcriptIds = Set(listStore.transcriptRowIds(
-                forAggregateId: productConversationId))
+            let cachedTranscriptIds = cachedProductHistory(productConversationId: productConversationId)?
+                .snapshot.segments.map(\.transcript_row_id) ?? []
+            let transcriptIds = Set(
+                listStore.transcriptRowIds(forAggregateId: productConversationId)
+                    + cachedTranscriptIds)
             guard await removeProductHistoryLocally(
                 productConversationId: productConversationId,
                 transcriptIds: transcriptIds,
@@ -445,16 +477,22 @@ final class AppModel {
             throw ProductHistoryLoadError.notFound
         }
 
-        guard !Task.isCancelled, apiGeneration == startedGeneration,
+        guard !Task.isCancelled,
+              apiGeneration == startedGeneration,
+              productHistoryGenerations.isCurrent(
+                  startedHistoryGeneration,
+                  productConversationId: productConversationId),
               let snapshot
         else {
             throw ProductHistoryLoadError.staleServerGeneration
         }
         let cached = CachedProductHistory(snapshot: snapshot, fetchedAt: Date())
-        let revision = writer.reserveRevision()
         guard await writer.save(cached, revision: revision),
               !Task.isCancelled,
-              apiGeneration == startedGeneration
+              apiGeneration == startedGeneration,
+              productHistoryGenerations.isCurrent(
+                  startedHistoryGeneration,
+                  productConversationId: productConversationId)
         else {
             throw ProductHistoryLoadError.staleServerGeneration
         }
@@ -672,8 +710,75 @@ final class AppModel {
                       startedCloseActionGeneration,
                       productConversationId: conversation.aggregateIdentity)
             else { return false }
+            if let apiError = error as? APIError,
+               ["close_stop_work_confirmation_required", "close_loss_confirmation_required"]
+                .contains(apiError.serverErrorType),
+               let snapshot = try? await api.getProductConversation(
+                   reference: conversation.aggregateIdentity),
+               apiGeneration == startedGeneration,
+               let close = snapshot.close
+            {
+                pendingProductCloseConfirmation = PendingProductCloseConfirmation(
+                    productConversationId: conversation.aggregateIdentity,
+                    transcriptRowId: snapshot.latest_transcript_row_id,
+                    close: close)
+                await listStore.refresh(api: api)
+                return false
+            }
             lastActionError = error.localizedDescription
             return false
+        }
+    }
+
+    func resolvePendingProductCloseConfirmation(confirm: Bool) async {
+        guard let pending = pendingProductCloseConfirmation,
+              let kind = pending.kind,
+              let api,
+              connectivity.isOnline
+        else { return }
+        let startedGeneration = apiGeneration
+        do {
+            if confirm {
+                switch kind {
+                case .stopWork:
+                    try await api.confirmCloseStopWork(
+                        conversationId: pending.transcriptRowId,
+                        attemptId: pending.close.attempt_id)
+                case .losses:
+                    guard let inspection = pending.close.confirmation_snapshot else {
+                        lastActionError = "Close confirmation is missing its retirement inspection."
+                        return
+                    }
+                    try await api.confirmCloseLossRetirement(
+                        conversationId: pending.transcriptRowId,
+                        attemptId: pending.close.attempt_id,
+                        inspection: inspection)
+                }
+            } else {
+                try await api.cancelClose(
+                    conversationId: pending.transcriptRowId,
+                    attemptId: pending.close.attempt_id)
+            }
+            guard apiGeneration == startedGeneration else { return }
+            pendingProductCloseConfirmation = nil
+            await listStore.refresh(api: api)
+        } catch {
+            guard apiGeneration == startedGeneration else { return }
+            if let snapshot = try? await api.getProductConversation(
+                reference: pending.productConversationId),
+               apiGeneration == startedGeneration,
+               let close = snapshot.close,
+               close.phase != .completed
+            {
+                pendingProductCloseConfirmation = PendingProductCloseConfirmation(
+                    productConversationId: pending.productConversationId,
+                    transcriptRowId: snapshot.latest_transcript_row_id,
+                    close: close)
+                await listStore.refresh(api: api)
+            } else {
+                pendingProductCloseConfirmation = nil
+            }
+            lastActionError = error.localizedDescription
         }
     }
 
@@ -711,6 +816,7 @@ final class AppModel {
     ) async -> Bool {
         guard apiGeneration == startedGeneration else { return false }
 
+        _ = productHistoryGenerations.begin(productConversationId: productConversationId)
         let historyWriter = ProductHistorySnapshotStore.writer(
             productConversationId: productConversationId)
         let revision = historyWriter.reserveRevision()

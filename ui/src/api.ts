@@ -2106,7 +2106,10 @@ export const api = {
     const resp = await fetch(`/api/conversations/${convId}/delete`, {
       method: 'POST',
     });
-    if (!resp.ok) throw new Error('Failed to delete');
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to delete', resp.status, err.error_type);
+    }
     return resp.json();
   },
 
@@ -2725,7 +2728,7 @@ export const api = {
       if (resp.status === 409) {
         throw new ConflictError(err as ConflictErrorDetail);
       }
-      throw new Error(err.error || 'Failed to delete chain');
+      throw new ApiResponseError(err.error || 'Failed to delete chain', resp.status, err.error_type);
     }
   },
 

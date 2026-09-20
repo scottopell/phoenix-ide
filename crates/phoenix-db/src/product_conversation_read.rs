@@ -255,7 +255,7 @@ fn list_projection_from_row(
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation,
         )
-    } else if latest_state.is_busy() || row.try_get::<bool, _>("has_active_close_attempt")? {
+    } else if row.try_get::<bool, _>("has_active_close_attempt")? {
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
         )
@@ -1662,6 +1662,25 @@ mod tests {
             .await
             .unwrap();
 
+        let projection = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            ProductConversationListLifecycle::Open {
+                close_availability: ProductConversationCloseAvailability::Available,
+            }
+        );
+
+        db.update_conversation_state(&conversation.id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
         let projection = db
             .list_ordinary_product_conversation_projections()
             .await

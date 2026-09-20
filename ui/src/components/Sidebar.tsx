@@ -1,6 +1,6 @@
 import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { api, getConvDisplayState } from '../api';
+import { ApiResponseError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
@@ -112,6 +112,7 @@ export function Sidebar({
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
   const refreshScheduledRef = useRef<number | null>(null);
   const productConversationRefreshSeqRef = useRef(0);
+  const [activeProductSnapshot, setActiveProductSnapshot] = useState<Awaited<ReturnType<typeof api.getProductConversationSnapshot>> | null>(null);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
     getProductConversationListRevision,
@@ -201,8 +202,21 @@ export function Sidebar({
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
   const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
+  useEffect(() => {
+    if (!activeSlug || !location.pathname.startsWith('/product-conversations/')) {
+      setActiveProductSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    api.getProductConversationSnapshot(activeSlug, { message_limit: 1 })
+      .then((snapshot) => { if (!cancelled) setActiveProductSnapshot(snapshot); })
+      .catch(() => { if (!cancelled) setActiveProductSnapshot(null); });
+    return () => { cancelled = true; };
+  }, [activeSlug, location.pathname, productConversationListRevision]);
+
   const scopedActiveCount = openProductConversations.length;
   const scopedArchivedCount = archivedProductConversations.length;
+  const activeProductRouteIdentity = activeProductSnapshot?.product_conversation_id ?? activeSlug;
 
   useEffect(() => {
     if (!activeSlug) {
@@ -212,9 +226,9 @@ export function Sidebar({
     if (lastArchiveRevealSlugRef.current === activeSlug) return;
 
     const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || openProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+      || openProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
     const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
     if (!inActiveList && !inArchivedList) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
@@ -223,7 +237,7 @@ export function Sidebar({
       setShowArchived(false);
     }
     lastArchiveRevealSlugRef.current = activeSlug;
-  }, [activeSlug, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
+  }, [activeSlug, activeProductRouteIdentity, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
     beginNewProductConversationIntent();
@@ -385,13 +399,24 @@ export function Sidebar({
       setProductDeleteTarget((current) =>
         current?.product_conversation_id === productId ? null : current);
       notifyProductConversationListMayHaveChanged();
-      if (activeSlug === productId
-        || activeSlug === productDeleteTarget.canonical_root.slug
-        || activeSlug === rootId
-        || activeSlug === productDeleteTarget.latest_transcript_row_id) {
+      const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
+        && activeProductSnapshot.segments.some((segment) => (
+          segment.transcript_row_id === activeSlug || segment.slug === activeSlug
+        ));
+      if (productRowMatchesRoute(productDeleteTarget, activeSlug) || activeSnapshotMatches) {
         navigate('/');
       }
     } catch (error) {
+      if (error instanceof ApiResponseError && error.status === 404) {
+        setProductDeleteTarget((current) =>
+          current?.product_conversation_id === productId ? null : current);
+        notifyProductConversationListMayHaveChanged();
+        if (productRowMatchesRoute(productDeleteTarget, activeSlug)
+          || activeProductSnapshot?.product_conversation_id === productId) {
+          navigate('/');
+        }
+        return;
+      }
       setProductDeleteError({
         productId,
         message: error instanceof Error ? error.message : 'Failed to delete product conversation',
@@ -400,7 +425,7 @@ export function Sidebar({
     } finally {
       setProductDeleteSubmittingId((current) => current === productId ? null : current);
     }
-  }, [productDeleteTarget, productDeleteSubmittingId, activeSlug, navigate]);
+  }, [productDeleteTarget, productDeleteSubmittingId, activeSlug, activeProductSnapshot, navigate]);
 
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
@@ -409,7 +434,7 @@ export function Sidebar({
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
   const isOnGlobalPage = location.pathname === '/global';
-  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeSlug);
+  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeProductRouteIdentity);
   const collapsedConversations = productConversationsError && productConversations.length === 0
     ? collapsedDotConversations(conversations, activeSlug)
     : [];
@@ -463,7 +488,7 @@ export function Sidebar({
             return (
               <button
                 key={row.product_conversation_id}
-                className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
+                className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeProductRouteIdentity) ? 'active' : ''}`}
                 onClick={() => navigate(row.canonical_route)}
                 title={row.presentation.display_name}
                 aria-label={`Open ${row.presentation.display_name}`}

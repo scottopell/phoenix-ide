@@ -47,6 +47,18 @@ enum APIError: Error, LocalizedError {
         return false
     }
 
+    var serverErrorType: String? {
+        guard case .http(_, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(ServerErrorPayload.self, from: data)
+        else { return nil }
+        return payload.error_type
+    }
+
+    private struct ServerErrorPayload: Decodable {
+        var error_type: String?
+    }
+
     var isPermanentStreamAuthenticationFailure: Bool {
         if case .http(let status, _) = self {
             return status == 401 || status == 403
@@ -398,6 +410,38 @@ struct PhoenixAPI: Sendable {
         struct SuccessResponse: Codable { var success: Bool? }
         _ = try await post(
             "api/product-conversations/\(reference)/close", body: [:], as: SuccessResponse.self)
+    }
+
+    func confirmCloseStopWork(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/confirm-stop-work",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
+    }
+
+    func confirmCloseLossRetirement(
+        conversationId: String,
+        attemptId: String,
+        inspection: ProductConversationCloseInspection
+    ) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/confirm-loss-retirement",
+            body: [
+                "attempt_id": attemptId,
+                "inspection_generation": inspection.generation,
+                "inspection_fingerprint": inspection.fingerprint,
+            ],
+            as: SuccessResponse.self)
+    }
+
+    func cancelClose(conversationId: String, attemptId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/close/cancel-before-retirement",
+            body: ["attempt_id": attemptId],
+            as: SuccessResponse.self)
     }
 
     func deleteConversation(reference: String, chainRootId: String?) async throws {

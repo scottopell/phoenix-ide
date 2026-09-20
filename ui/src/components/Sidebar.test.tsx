@@ -7,7 +7,7 @@ import {
 } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { ConflictError } from '../api';
+import { ApiResponseError, ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
@@ -25,6 +25,7 @@ const { apiMock } = vi.hoisted(() => ({
     deleteConversation: vi.fn(),
     renameConversation: vi.fn(),
     renameProductConversation: vi.fn(),
+    getProductConversationSnapshot: vi.fn(),
   },
 }));
 
@@ -91,6 +92,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     });
     apiMock.deploymentInfo.mockResolvedValue({ local_access: true });
     apiMock.getLocalServices.mockResolvedValue({ services: [] });
+    apiMock.getProductConversationSnapshot.mockRejectedValue(new Error('not a product route'));
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [
         makeProductConversation('pc-open', { canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' } }),
@@ -337,6 +339,53 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(await findByText('server refused deletion')).toBeInTheDocument();
     expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).not.toBeNull();
     expect(getByRole('button', { name: 'Delete' })).not.toBeDisabled();
+  });
+
+  it('treats an authoritative History Delete 404 as idempotent success', async () => {
+    apiMock.deleteChain.mockRejectedValueOnce(new ApiResponseError('not found', 404));
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-history', {
+        lifecycle: { state: 'history' },
+        canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
+        latest_transcript_row_id: 'history-latest',
+      })],
+    });
+
+    const { getByRole, queryByText, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).toBeNull());
+    expect(queryByText('not found')).toBeNull();
+  });
+
+  it('leaves an intermediate aggregate member route after History Delete', async () => {
+    const row = makeProductConversation('pc-history', {
+      lifecycle: { state: 'history' },
+      canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
+      latest_transcript_row_id: 'history-latest',
+    });
+    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+    apiMock.getProductConversationSnapshot.mockResolvedValue({
+      product_conversation_id: 'pc-history',
+      segments: [{ transcript_row_id: 'history-root', slug: 'history-root' }, { transcript_row_id: 'middle-id', slug: 'middle-slug' }, { transcript_row_id: 'history-latest', slug: 'latest-slug' }],
+    });
+
+    const { getByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/middle-slug']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="middle-slug" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(apiMock.getProductConversationSnapshot).toHaveBeenCalledWith('middle-slug', { message_limit: 1 }));
+    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).toBeNull());
   });
 
   it('publishes the successful authoritative title to the active aggregate snapshot', async () => {
