@@ -13,6 +13,11 @@
   overflow-anchor: none;
 }
 
+.virtual-transcript.reaction-dock-reserved {
+  padding-bottom: var(--reaction-dock-height, 0);
+  scroll-padding-bottom: var(--reaction-dock-height, 0);
+}
+
 .virtual-transcript__spacer {
   flex: none;
   overflow-anchor: none;
