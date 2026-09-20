@@ -306,7 +306,12 @@ mod tests {
                     .await
             });
             if matches!(repository.outcome, Outcome::Pending) {
-                repository.started.notified().await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    repository.started.notified(),
+                )
+                .await
+                .expect("publication entered the repository");
                 task.abort();
             }
             assert!(task.await.is_err());
@@ -342,7 +347,12 @@ mod tests {
                 )
                 .await
         });
-        repository.started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            repository.started.notified(),
+        )
+        .await
+        .expect("publication entered the repository");
         lifetime.coordinated_shutdown();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
