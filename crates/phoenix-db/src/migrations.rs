@@ -10719,8 +10719,8 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(2).copied().collect::<Vec<_>>(),
             vec![
-                (103, "persist_approval_request_obligation"),
-                (102, "enforce_authority_timestamp_storage_class"),
+                (104, "persist_approval_request_obligation"),
+                (103, "enforce_authority_timestamp_storage_class"),
             ]
         );
     }
