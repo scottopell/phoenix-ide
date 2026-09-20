@@ -289,19 +289,35 @@ mod tests {
 
         let mut command = Command::new(&binary);
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        let result = command_output(
+        let output = tokio::spawn(command_output(
             command,
-            Some(Instant::now() + std::time::Duration::from_millis(500)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, None);
-
-        let pid = std::fs::read_to_string(&pid_path)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+            Some(Instant::now() + std::time::Duration::from_secs(5)),
+        ));
+        let pid_deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let pid = loop {
+            match std::fs::read_to_string(&pid_path) {
+                Ok(pid) => match pid.trim().parse::<u32>() {
+                    Ok(pid) => break pid,
+                    Err(_error) if pid.trim().is_empty() => {
+                        assert!(
+                            Instant::now() < pid_deadline,
+                            "probe helper never published pid"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("parse probe helper pid: {error}"),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        Instant::now() < pid_deadline,
+                        "probe helper never published pid"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("read probe helper pid: {error}"),
+            }
+        };
+        assert_eq!(output.await.unwrap().unwrap(), None);
         let status = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stderr(Stdio::null())

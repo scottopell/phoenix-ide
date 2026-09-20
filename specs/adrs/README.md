@@ -60,7 +60,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [046](046_productconversation-owns-aggregate-presentation.md) | ProductConversation owns aggregate presentation without duplicating transcript authority | Accepted | REQ-BED-030A; `ProductConversation`, transcript members |
 | [047](047_global-coordinator-unsandboxed-bash.md) | Global Coordinator uses explicitly targeted unsandboxed Bash | Accepted | REQ-BASH-012/013, REQ-GR-007; singleton Coordinator, explicit active WorkScope target |
 | [048](048_absolute-llm-provider-attempt-deadline.md) | LLM provider attempts use one absolute service deadline | Accepted | REQ-LLM-011–013; request liveness, timeout metrics, durable retry/terminalization |
-| [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
+| [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Partially superseded by ADR-059 | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
@@ -70,6 +70,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_project-coordinator-is-an-ordinary-productconversation-profile.md) | Project Coordinator is an ordinary ProductConversation profile | Accepted | REQ-PCO-001 through REQ-PCO-007; `ProductConversation`, continuation compaction, provider prompt composition |
 
 ## For agents: which decisions bind your task
 
@@ -96,6 +97,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying an ordinary ProductConversation's Project Coordinator profile, charter authority, human mutation boundary, or coordination compaction | 059, then 049, 045, 031, and 026 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -163,6 +165,7 @@ ADR-000 (adopt spEARS v2 for new work)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
+              ├── ADR-059 (Project Coordinator is an ordinary ProductConversation profile)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
