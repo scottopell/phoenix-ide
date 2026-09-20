@@ -5546,13 +5546,26 @@ impl RuntimeManager {
                 }
             }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                manager_for_cleanup.kick_direct_turn_worker();
+                manager_for_cleanup.schedule_runtime_recreation(conv_id);
             }
         });
 
         drop(steering_projection_guard);
 
         Ok(handle)
+    }
+
+    fn schedule_runtime_recreation(self: &Arc<Self>, conversation_id: String) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = manager.get_or_create(&conversation_id).await {
+                tracing::error!(
+                    %error,
+                    conversation_id,
+                    "failed to rematerialize runtime after database-recreation exit"
+                );
+            }
+        });
     }
 
     /// Inject a fake live handle carrying a specific `ConvState` into the

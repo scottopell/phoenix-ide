@@ -1200,6 +1200,7 @@ impl ToolRegistry {
     #[must_use]
     pub fn for_attached_subagent_work() -> Self {
         let mut tools = read_only_tools();
+        tools.push(Arc::new(PresentSvgTool));
         tools.push(Arc::new(WorktreeSandboxedBashTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
@@ -1489,6 +1490,13 @@ mod tests {
     /// `read_only_tools()` in tools.rs will automatically propagate it to
     /// every mode and keep this test passing; forgetting to add it to a
     /// specific constructor will fail this test.
+    #[test]
+    fn attached_work_registry_keeps_present_svg_without_patch() {
+        let registry = ToolRegistry::for_attached_subagent_work();
+        assert!(registry.find_tool("present_svg").is_some());
+        assert!(registry.find_tool("patch").is_none());
+    }
+
     #[test]
     fn registry_mode_matrix_read_only_tools_everywhere() {
         let read_only_expected: BTreeSet<&str> = [

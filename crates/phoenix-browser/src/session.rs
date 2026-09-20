@@ -1594,11 +1594,13 @@ impl BrowserSessionManager {
     ) -> bool {
         let restricted =
             EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let work = EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Work);
         let old_key = session_key(work_scope, &restricted);
         let new_key = work_scope.stable_key();
         let mut state = self.state.write().await;
         if Self::scope_is_fenced(&state, work_scope).is_some()
             || Self::actor_is_fenced(&state, work_scope, &restricted).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &work).is_some()
         {
             return false;
         }

@@ -505,9 +505,10 @@ rule BashIsolationMatchesWorkScopeAuthority {
     ensures: BashIsolationDerivedFromWorkScopeAuthority(conversation)
 
     @guidance
-        -- Restricted WorkScope authority selects the Explore OS sandbox;
-        -- Work authority selects unsandboxed Bash. Conversation mode is
-        -- provenance and does not override this selection.
+        -- Restricted WorkScope authority selects the Explore OS sandbox.
+        -- AttachedWorkChild with Work authority selects the inherited-worktree
+        -- confined OS sandbox. Other Work authority selects unsandboxed Bash.
+        -- Conversation mode otherwise remains provenance, not authority.
 }
 
 rule RunRejectedByCap {
