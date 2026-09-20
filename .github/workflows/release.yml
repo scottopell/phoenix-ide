@@ -286,7 +286,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     concurrency:
-      group: publish-release-assets-${{ needs.gate.outputs.tag }}
+      group: publish-release-assets
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

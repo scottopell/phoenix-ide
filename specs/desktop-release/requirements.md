@@ -98,6 +98,9 @@ Stable promotion SHALL use a new stable version and the normal version-bump rele
 WHEN creating a new release tag,
 THE SYSTEM SHALL serialize tag-gate operations and require its supported version to follow every existing supported release tag.
 
+WHEN publishing a release draft,
+THE SYSTEM SHALL serialize publication across release tags.
+
 WHEN publishing a stable draft,
 THE SYSTEM SHALL refuse to make it latest if a newer stable release is already latest.
 
