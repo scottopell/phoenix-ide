@@ -4,6 +4,7 @@ import type { Message } from '../api';
 import { InlineReactionContext, InlineReactionStore, formatInlineReaction, type ReactionSource } from '../conversation/InlineReactionStore';
 import { useFocusScope } from '../hooks/useFocusScope';
 import { readReactionSelection } from './inlineReactionSelection';
+import { restoreReactionRange } from './reactionRange';
 import { ReactionPill } from './ReactionPill';
 import './InlineMessageReaction.css';
 
@@ -58,8 +59,9 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput = null;
         setNotice('');
-      } else if (current?.presentation === 'floating'
-        || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)) {
+      } else if (current && (current.presentation === 'floating'
+        || Boolean(nativeSelection && nativeSelection.rangeCount > 0 && !nativeSelection.isCollapsed)
+        || Boolean(restoreReactionRange(current.source)))) {
         store.dispatch(scopeKey, { type: 'clear' });
       }
     };

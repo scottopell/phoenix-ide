@@ -210,6 +210,20 @@ describe('inline message reactions', () => {
     expect(store.getSnapshot('conversation-a')?.presentation).toBe('touch-docked');
   });
 
+  it('clears an empty touch reaction when its mounted selection collapses', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    render(<Harness store={store} append={vi.fn()} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    window.getSelection()?.removeAllRanges();
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')).toBeNull();
+  });
+
   it('clears an empty touch reaction when a live excluded selection replaces it', async () => {
     setCoarsePointer(true);
     const store = new InlineReactionStore();

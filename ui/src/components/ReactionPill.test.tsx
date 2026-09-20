@@ -271,6 +271,41 @@ describe('reaction pill', () => {
     await waitFor(() => expect(screen.getByRole('region', { name: 'Docked reaction' })).toHaveStyle({ top: '394px' }));
   });
 
+  it('rebinds dock reservation when the transcript remounts', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 620, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    const view = render(<Fixture touchDocked body="Retained" />);
+    const original = document.getElementById('messages')!;
+    expect(original).toHaveClass('reaction-dock-reserved');
+    view.rerender(<FocusScopeProvider>
+      <div className="conversation-column">
+        <div key="replacement" id="messages"><div data-inline-reaction-message="answer" data-message-occurrence="earlier:answer"><div className="agent-text-block" data-fragment-id="text-0">first <strong>second</strong> third</div></div></div>
+        <footer id="input-area" />
+      </div>
+      <ReactionPill source={source} touchDocked bubbleRef={createRef<HTMLDivElement>()} scopeId="test" body="Retained" available onChange={() => {}} onAdd={add} onClose={close} returnToSource={navigate} />
+    </FocusScopeProvider>);
+    const replacement = document.getElementById('messages')!;
+    expect(replacement).not.toBe(original);
+    await waitFor(() => expect(replacement).toHaveClass('reaction-dock-reserved'));
+    expect(original).not.toHaveClass('reaction-dock-reserved');
+  });
+
+  it('scrolls an unpinned bottom selection above the touch dock once', async () => {
+    vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 550, 200, 50));
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'input-area') return new DOMRect(0, 580, 390, 80);
+      if (this.classList.contains('reaction-pill')) return new DOMRect(0, 0, 366, 54);
+      return new DOMRect(0, 0, 390, 700);
+    });
+    render(<Fixture touchDocked body="" />);
+    const scroller = document.getElementById('messages')!;
+    await waitFor(() => expect(scroller.scrollTop).toBe(98));
+    expect(screen.getByRole('textbox')).not.toHaveFocus();
+  });
+
   it('clamps the touch dock inside visual-viewport safe-area insets', () => {
     Object.defineProperty(window, 'visualViewport', { configurable: true, value: {
       offsetLeft: 0, offsetTop: 0, width: 390, height: 700,

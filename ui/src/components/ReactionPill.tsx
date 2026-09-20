@@ -53,10 +53,12 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
 
   useLayoutEffect(() => {
     const el = bubbleRef.current;
-    const scroller = document.getElementById('messages');
+    let scroller = document.getElementById('messages');
     if (!el || !scroller) return;
     let frame = 0;
     let observedComposer: Element | null = null;
+    let observedScroller: HTMLElement = scroller;
+    let selectionClearanceApplied = false;
     let observedObstructions = new Set<Element>();
     const initialComposer = document.getElementById('input-area');
     const scrollerAncestors = new Set<Element>();
@@ -72,6 +74,17 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     const position = () => {
       frame = 0;
       const viewport = window.visualViewport;
+      const liveScroller = document.getElementById('messages');
+      if (liveScroller && liveScroller !== observedScroller) {
+        observedScroller.classList.remove('reaction-dock-reserved');
+        observedScroller.style.removeProperty('--reaction-dock-height');
+        resize.unobserve(observedScroller);
+        observedScroller = liveScroller;
+        scroller = liveScroller;
+        selectionClearanceApplied = false;
+        resize.observe(observedScroller);
+        if (touchDocked) observedScroller.classList.add('reaction-dock-reserved');
+      }
       const composer = document.getElementById('input-area');
       if (composer !== observedComposer) {
         if (observedComposer) resize.unobserve(observedComposer);
@@ -89,7 +102,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const top = viewportTop + safeTop;
       const width = (viewport?.width ?? window.innerWidth) - safeLeft - safeRight;
       const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
-      const transcript = scroller.getBoundingClientRect();
+      const transcript = observedScroller.getBoundingClientRect();
       const restoredRange = restoreReactionRange(source);
       const range = restoredRange ?? (sourceRange?.commonAncestorContainer.isConnected ? sourceRange : null);
       const rect = range?.getBoundingClientRect();
@@ -105,7 +118,7 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const pillWidth = Math.min(420, width - 24);
       el.style.width = `${pillWidth}px`;
       const height = el.getBoundingClientRect().height || 46;
-      if (touchDocked) scroller.style.setProperty('--reaction-dock-height', `${height + 12}px`);
+      if (touchDocked) observedScroller.style.setProperty('--reaction-dock-height', `${height + 12}px`);
       let y = Math.min(visibleBottom, bottom) - height - 12;
       let x = transcript.right - pillWidth - 12;
       if (touchDocked) {
@@ -131,6 +144,10 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
         }
         observedObstructions = nextObstructions;
         y = Math.min(bottom, obstructionTop) - height - 12;
+        if (!selectionClearanceApplied && visible && rect && rect.bottom > y - 12) {
+          observedScroller.scrollTop += rect.bottom - (y - 12);
+          selectionClearanceApplied = true;
+        }
       } else if (visible && rect) {
         x = rect.left;
         y = rect.bottom + 16;
@@ -155,8 +172,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
     window.visualViewport?.addEventListener('scroll', schedule);
     return () => {
       cancelAnimationFrame(frame);
-      scroller.classList.remove('reaction-dock-reserved');
-      scroller.style.removeProperty('--reaction-dock-height');
+      observedScroller.classList.remove('reaction-dock-reserved');
+      observedScroller.style.removeProperty('--reaction-dock-height');
       mutations.disconnect();
       resize.disconnect();
       window.removeEventListener('scroll', schedule, true);
