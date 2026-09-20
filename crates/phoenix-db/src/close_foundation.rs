@@ -972,10 +972,10 @@ fn validate_begin_preconditions(
         ));
     }
     if addressed_id != latest.id {
-        return Err(close_precondition(format!(
-            "addressed conversation {} is not latest {}",
-            addressed_id, latest.id
-        )));
+        return Err(DbError::CloseFoundationStaleLatest {
+            expected: addressed_id.to_string(),
+            actual: latest.id.clone(),
+        });
     }
     if matches!(latest.state, ConvState::HandedOff { .. }) {
         return Err(close_precondition(
@@ -7110,8 +7110,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             stale,
-            DbError::CloseFoundationPrecondition(message)
-                if message.contains("addressed conversation root is not latest latest")
+            DbError::CloseFoundationStaleLatest { expected, actual }
+                if expected == "root" && actual == "latest"
         ));
 
         let obligation = db

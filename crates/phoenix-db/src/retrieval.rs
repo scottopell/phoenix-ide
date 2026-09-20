@@ -763,6 +763,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::ProductConversationUnavailable(_)
         | crate::DbError::SteeringQueueFull
         | crate::DbError::CloseFoundationPrecondition(_)
+        | crate::DbError::CloseFoundationStaleLatest { .. }
         | crate::DbError::CloseFoundationRepairRequired(_)
         | crate::DbError::CloseFoundationNotFound(_)
         | crate::DbError::DirectTurnConflict(_)

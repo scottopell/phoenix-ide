@@ -50,6 +50,14 @@ pub struct RenameProductConversationRequest {
     pub title: String,
 }
 
+fn should_retry_aggregate_close(attempt: usize, error_type: &str) -> bool {
+    attempt == 0
+        && matches!(
+            error_type,
+            "inactive_close_transcript" | "stale_latest_close_transcript"
+        )
+}
+
 pub async fn close_product_conversation(
     State(state): State<AppState>,
     Path(reference): Path<String>,
@@ -69,7 +77,7 @@ pub async fn close_product_conversation(
         {
             Ok(()) => break,
             Err(AppError::Conflict(conflict))
-                if attempt == 0 && conflict.error_type == "inactive_close_transcript" => {}
+                if should_retry_aggregate_close(attempt, &conflict.error_type) => {}
             Err(error) => return Err(error),
         }
     }
@@ -1259,6 +1267,20 @@ mod tests {
         .unwrap();
         assert_eq!(legacy_body["chain_name"], serde_json::Value::Null);
         assert_eq!(legacy_body["display_name"], "Renamed Product Conversation");
+    }
+
+    #[test]
+    fn aggregate_close_retries_only_once_for_stale_latest_conflicts() {
+        assert!(should_retry_aggregate_close(0, "inactive_close_transcript"));
+        assert!(should_retry_aggregate_close(
+            0,
+            "stale_latest_close_transcript"
+        ));
+        assert!(!should_retry_aggregate_close(
+            1,
+            "stale_latest_close_transcript"
+        ));
+        assert!(!should_retry_aggregate_close(0, "close_start_failed"));
     }
 
     #[tokio::test]

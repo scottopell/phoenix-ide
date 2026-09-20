@@ -316,6 +316,30 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(settling.kind)
     }
 
+    func testPendingCloseConfirmationRehydratesOnlyFromAuthoritativeConfirmationPhase() {
+        var snapshot = historySnapshot(segments: [])
+        snapshot.close = closeSnapshot(phase: .awaiting_stop_work_confirmation)
+        let pending = PendingProductCloseConfirmation(snapshot: snapshot)
+
+        XCTAssertEqual(pending?.productConversationId, "pc-history")
+        XCTAssertEqual(pending?.transcriptRowId, "latest")
+        XCTAssertEqual(pending?.kind, .stopWork)
+
+        snapshot.close = closeSnapshot(phase: .settling_active_work)
+        XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
+    }
+
+    func testOfflineCloseConfirmationFailsImmediatelyWithExplanation() async {
+        let model = AppModel()
+        model.connectivity.setOnlineForTesting(false)
+
+        await model.resolvePendingProductCloseConfirmation(confirm: true)
+
+        XCTAssertEqual(
+            model.lastActionError,
+            "Resolving a Close confirmation needs a connection — reconnect and try again.")
+    }
+
     func testHistoryGenerationInvalidatesOnlyMatchingProduct() {
         var tracker = ProductActionGenerationTracker()
         let productA = tracker.begin(productConversationId: "product-a")

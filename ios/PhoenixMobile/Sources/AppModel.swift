@@ -120,6 +120,22 @@ struct PendingProductCloseConfirmation: Equatable {
     var transcriptRowId: String
     var close: ProductConversationClose
 
+    init?(snapshot: ProductConversationSnapshot) {
+        guard let close = snapshot.close,
+              close.phase == .awaiting_stop_work_confirmation
+                || close.phase == .awaiting_loss_confirmation
+        else { return nil }
+        productConversationId = snapshot.product_conversation_id
+        transcriptRowId = snapshot.latest_transcript_row_id
+        self.close = close
+    }
+
+    init(productConversationId: String, transcriptRowId: String, close: ProductConversationClose) {
+        self.productConversationId = productConversationId
+        self.transcriptRowId = transcriptRowId
+        self.close = close
+    }
+
     var kind: ProductCloseConfirmationKind? {
         switch close.phase {
         case .awaiting_stop_work_confirmation: .stopWork
@@ -362,11 +378,29 @@ final class AppModel {
         attentionEvidenceGeneration &+= 1
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
+            await rehydratePendingProductCloseConfirmation(api: api)
             // The user is looking at fresh data — nothing here should nudge
             // them later.
             attention.seed(
                 with: listStore.conversations,
                 transcriptToAggregate: listStore.transcriptToAggregate)
+        }
+    }
+
+    private func rehydratePendingProductCloseConfirmation(api: PhoenixAPI) async {
+        guard pendingProductCloseConfirmation == nil else { return }
+        let startedGeneration = apiGeneration
+        let activeCloseRows = listStore.conversations.filter {
+            $0.product_close_action == .unavailable(reason: .active_close_attempt)
+        }
+        for row in activeCloseRows {
+            guard let snapshot = try? await api.getProductConversation(reference: row.aggregateIdentity),
+                  apiGeneration == startedGeneration
+            else { continue }
+            if let pending = PendingProductCloseConfirmation(snapshot: snapshot) {
+                pendingProductCloseConfirmation = pending
+                return
+            }
         }
     }
 
@@ -682,34 +716,27 @@ final class AppModel {
             try await api.closeProductConversation(reference: conversation.aggregateIdentity)
             guard apiGeneration == startedGeneration else { return false }
             closed = true
-            listStore.projectHistory(aggregateId: conversation.aggregateIdentity)
-            for (transcriptId, session) in aggregateSessions {
-                session.stop()
-                if sessions[transcriptId] === session {
-                    sessions[transcriptId] = nil
-                }
-            }
-            do {
-                _ = try await loadProductHistory(
-                    productConversationId: conversation.aggregateIdentity)
-            } catch ProductHistoryLoadError.notFound {
-                guard apiGeneration == startedGeneration else { return false }
-                removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
-                return true
-            } catch {
-                guard apiGeneration == startedGeneration else { return false }
-            }
-            await listStore.refresh(api: api)
-            guard apiGeneration == startedGeneration else { return false }
-            listStore.projectHistory(aggregateId: conversation.aggregateIdentity)
-            removeAttentionNotifications(productConversationId: conversation.aggregateIdentity)
-            return true
+            return await finalizeProductCloseLocally(
+                productConversationId: conversation.aggregateIdentity,
+                transcriptIds: transcriptIds,
+                startedGeneration: startedGeneration,
+                api: api)
         } catch {
             guard apiGeneration == startedGeneration,
                   closeActionGenerations.isCurrent(
                       startedCloseActionGeneration,
                       productConversationId: conversation.aggregateIdentity)
             else { return false }
+            if let apiError = error as? APIError,
+               apiError.isCloseAlreadyHistory
+            {
+                closed = true
+                return await finalizeProductCloseLocally(
+                    productConversationId: conversation.aggregateIdentity,
+                    transcriptIds: transcriptIds,
+                    startedGeneration: startedGeneration,
+                    api: api)
+            }
             if let apiError = error as? APIError,
                ["close_stop_work_confirmation_required", "close_loss_confirmation_required"]
                 .contains(apiError.serverErrorType),
@@ -730,11 +757,42 @@ final class AppModel {
         }
     }
 
+    private func finalizeProductCloseLocally(
+        productConversationId: String,
+        transcriptIds: Set<String>,
+        startedGeneration: Int,
+        api: PhoenixAPI
+    ) async -> Bool {
+        guard apiGeneration == startedGeneration else { return false }
+        listStore.projectHistory(aggregateId: productConversationId)
+        for transcriptId in transcriptIds {
+            sessions.removeValue(forKey: transcriptId)?.stop()
+            drainSessions.removeValue(forKey: transcriptId)?.stop()
+        }
+        do {
+            _ = try await loadProductHistory(productConversationId: productConversationId)
+        } catch ProductHistoryLoadError.notFound {
+            guard apiGeneration == startedGeneration else { return false }
+            removeAttentionNotifications(productConversationId: productConversationId)
+            return true
+        } catch {
+            guard apiGeneration == startedGeneration else { return false }
+        }
+        await listStore.refresh(api: api)
+        guard apiGeneration == startedGeneration else { return false }
+        listStore.projectHistory(aggregateId: productConversationId)
+        removeAttentionNotifications(productConversationId: productConversationId)
+        return true
+    }
+
     func resolvePendingProductCloseConfirmation(confirm: Bool) async {
+        guard connectivity.isOnline else {
+            lastActionError = "Resolving a Close confirmation needs a connection — reconnect and try again."
+            return
+        }
         guard let pending = pendingProductCloseConfirmation,
               let kind = pending.kind,
-              let api,
-              connectivity.isOnline
+              let api
         else { return }
         let startedGeneration = apiGeneration
         do {
@@ -761,7 +819,18 @@ final class AppModel {
             }
             guard apiGeneration == startedGeneration else { return }
             pendingProductCloseConfirmation = nil
-            await listStore.refresh(api: api)
+            if confirm {
+                let transcriptIds = Set(
+                    listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
+                        + [pending.transcriptRowId])
+                _ = await finalizeProductCloseLocally(
+                    productConversationId: pending.productConversationId,
+                    transcriptIds: transcriptIds,
+                    startedGeneration: startedGeneration,
+                    api: api)
+            } else {
+                await listStore.refresh(api: api)
+            }
         } catch {
             guard apiGeneration == startedGeneration else { return }
             if let snapshot = try? await api.getProductConversation(
@@ -790,14 +859,19 @@ final class AppModel {
             lastActionError = "Deleting needs a connection — it can't be queued."
             return false
         }
+        let transcriptIds = Set(
+            listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
+                + [conversation.transcriptRowIdentity])
         do {
             try await api.deleteConversation(
                 reference: conversation.transcriptRowIdentity,
                 chainRootId: conversation.chain_root_id)
             guard apiGeneration == startedGeneration else { return false }
-            let transcriptIds = Set(
-                listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
-                    + [conversation.transcriptRowIdentity])
+            return await removeProductHistoryLocally(
+                productConversationId: conversation.aggregateIdentity,
+                transcriptIds: transcriptIds,
+                startedGeneration: startedGeneration)
+        } catch let error as APIError where error.isNotFound {
             return await removeProductHistoryLocally(
                 productConversationId: conversation.aggregateIdentity,
                 transcriptIds: transcriptIds,

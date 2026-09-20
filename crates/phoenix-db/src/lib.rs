@@ -225,6 +225,8 @@ pub enum DbError {
     SteeringQueueFull,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
+    #[error("Close foundation latest transcript changed: expected {expected}, found {actual}")]
+    CloseFoundationStaleLatest { expected: String, actual: String },
     #[error("Close foundation repair required: {0:?}")]
     CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]

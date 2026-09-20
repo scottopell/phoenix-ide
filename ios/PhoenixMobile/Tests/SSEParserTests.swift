@@ -202,6 +202,10 @@ final class SSEParserTests: XCTestCase {
         XCTAssertFalse(
             APIError.http(status: 400, body: "rejected").isRetryableChatDeliveryFailure)
         XCTAssertTrue(APIError.http(status: 404, body: "gone").isNotFound)
+        XCTAssertTrue(APIError.http(
+            status: 409,
+            body: #"{"error_type":"close_already_history"}"#).isCloseAlreadyHistory)
+        XCTAssertFalse(APIError.http(status: 409, body: "{}").isCloseAlreadyHistory)
         XCTAssertFalse(APIError.http(status: 500, body: "retry").isNotFound)
         XCTAssertTrue(
             APIError.http(status: 401, body: "unauthorized")

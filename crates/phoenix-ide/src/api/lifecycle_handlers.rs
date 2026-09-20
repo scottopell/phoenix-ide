@@ -824,9 +824,15 @@ async fn run_legacy_close_compat(
                     .await
             };
             begin.map_err(|error| {
+                let error_type =
+                    if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                        "stale_latest_close_transcript"
+                    } else {
+                        "close_start_failed"
+                    };
                 AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     error.to_string(),
-                    "close_start_failed",
+                    error_type,
                 )))
             })?
         }

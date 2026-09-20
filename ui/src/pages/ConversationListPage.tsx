@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../api';
+import { ApiResponseError, api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
 import type { Conversation, CodexLoginPreflight, ProductConversationListRow } from '../api';
 import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
@@ -144,6 +144,12 @@ export function ConversationListPage() {
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
+  const finishProductDelete = () => {
+    setProductDeleteTarget(null);
+    setProductDeleteError(undefined);
+    notifyProductConversationListMayHaveChanged();
+  };
+
   const handleProductDelete = async () => {
     if (!productDeleteTarget || productDeleteSubmitting) return;
     setProductDeleteSubmitting(true);
@@ -151,11 +157,13 @@ export function ConversationListPage() {
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
       if (rootId === productDeleteTarget.latest_transcript_row_id) await api.deleteConversation(rootId);
       else await api.deleteChain(rootId);
-      setProductDeleteTarget(null);
-      setProductDeleteError(undefined);
-      notifyProductConversationListMayHaveChanged();
+      finishProductDelete();
     } catch (error) {
-      setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
+      if (error instanceof ApiResponseError && error.status === 404) {
+        finishProductDelete();
+      } else {
+        setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
+      }
     } finally {
       setProductDeleteSubmitting(false);
     }
