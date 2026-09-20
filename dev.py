@@ -4970,6 +4970,8 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     assert wrapper is not None
     os.environ["RUSTC_WRAPPER"] = wrapper
     if backend == "kache":
+        if sys.platform == "darwin":
+            os.environ.setdefault("KACHE_CACHE_EXECUTABLES", "0")
         generated_socket = "KACHE_SOCKET_PATH" not in os.environ
         daemon_error = _ensure_kache_daemon(wrapper)
         if daemon_error:
