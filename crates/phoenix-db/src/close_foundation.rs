@@ -3306,7 +3306,8 @@ impl Database {
                      SELECT 1 FROM close_attempt_scopes
                      WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL
                  )
-             AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id=?1) =
+             AND (SELECT COUNT(*) FROM close_attempt_scopes
+                  WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL) =
                  (SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id=?1)
              AND (SELECT COUNT(*) FROM close_attempt_scopes
                   WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL) =
@@ -3316,7 +3317,8 @@ impl Database {
                     AND resource_kind='worktree' AND proof_kind='residual'
                     AND residual_reason='manual_repair_required'
                     AND detail LIKE '%(code: 787) FOREIGN KEY constraint failed%')
-             AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id=?1) =
+             AND (SELECT COUNT(*) FROM close_attempt_scopes
+                  WHERE attempt_id=?1 AND captured_worktree_identity IS NOT NULL) =
                  (SELECT COUNT(*) FROM close_retirement_inventories
                   WHERE attempt_id=?1 AND inspection_generation=?2
                     AND inspection_fingerprint=?3 AND sealed=1)

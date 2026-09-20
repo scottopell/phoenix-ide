@@ -4589,7 +4589,16 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 )
             };
             if bytes == 0 {
-                break;
+                let error = std::io::Error::last_os_error();
+                if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
+                    break;
+                }
+                return Err(AmbientWriterIndeterminateDiagnostic {
+                    detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
+                    operation: AmbientWriterDiagnosticOperation::ReadMappings,
+                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                }
+                .marker());
             }
             if bytes
                 != i32::try_from(size_of::<ProcRegionWithPathInfo>())
@@ -5862,12 +5871,12 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
             let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
             let candidate_path = Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
-            if info.vnode.vip_vi.vi_stat.vst_nlink == 0 {
+            let target_is_directory =
+                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
+            if info.vnode.vip_vi.vi_stat.vst_nlink == 0 && !target_is_directory {
                 continue;
             }
             let candidate_is_within = path_is_within(candidate_path, &canonical);
-            let target_is_directory =
-                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
             let Some(access_mode) = classify_descriptor_access_mode(
                 macos_descriptor_access_mode(info.file.open_flags),
                 candidate_is_within && target_is_directory,
