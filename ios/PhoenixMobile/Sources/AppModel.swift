@@ -134,6 +134,10 @@ struct ProductCloseLossInventory {
 }
 
 struct PendingProductCloseConfirmation: Equatable {
+    static func isCompleted(snapshot: ProductConversationSnapshot) -> Bool {
+        snapshot.close?.phase == .completed || snapshot.ordinary_lifecycle == .history
+    }
+
     var productConversationId: String
     var transcriptRowId: String
     var close: ProductConversationClose
@@ -709,6 +713,29 @@ final class AppModel {
     /// Online-only archive. Returns false with `lastActionError` on failure.
     var lastActionError: String?
 
+    private func requireEmptyAggregateOutboxes(transcriptIds: Set<String>) async -> Bool {
+        let hasVisibleMessages = transcriptIds.contains {
+            sessions[$0]?.outbox.visibleEntries.isEmpty == false
+        }
+        guard !hasVisibleMessages else {
+            lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
+            return false
+        }
+        for transcriptId in transcriptIds {
+            if let session = sessions[transcriptId] {
+                _ = await session.outbox.flushPersistence()
+            }
+        }
+        guard transcriptIds.allSatisfy({
+            if case .empty = Outbox.storedContents(conversationId: $0) { return true }
+            return false
+        }) else {
+            lastActionError = "This conversation has queued or unreadable messages. Resolve them before closing."
+            return false
+        }
+        return true
+    }
+
     @discardableResult
     func closeProductConversation(_ conversation: Conversation) async -> Bool {
         guard ClientOperation.close.policy == .onlineOnly else { return false }
@@ -732,23 +759,7 @@ final class AppModel {
                 startedCloseActionGeneration,
                 productConversationId: conversation.aggregateIdentity)
         }
-        let hasInMemoryMessages = transcriptIds.contains {
-            sessions[$0]?.outbox.visibleEntries.isEmpty == false
-        }
-        guard !hasInMemoryMessages else {
-            lastActionError = "This conversation has queued or unconfirmed messages. Retry or discard them before closing."
-            return false
-        }
-        for transcriptId in transcriptIds {
-            if let session = sessions[transcriptId] {
-                _ = await session.outbox.flushPersistence()
-            }
-        }
-        guard transcriptIds.allSatisfy({
-            if case .empty = Outbox.storedContents(conversationId: $0) { return true }
-            return false
-        }) else {
-            lastActionError = "This conversation has queued or unreadable messages. Resolve them before closing."
+        guard await requireEmptyAggregateOutboxes(transcriptIds: transcriptIds) else {
             return false
         }
         guard apiGeneration == startedGeneration else { return false }
@@ -858,6 +869,15 @@ final class AppModel {
             return
         }
         let startedGeneration = apiGeneration
+        let transcriptIds = Set(
+            listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
+                + [pending.transcriptRowId])
+        if confirm {
+            guard await requireEmptyAggregateOutboxes(transcriptIds: transcriptIds) else {
+                return
+            }
+        }
+        guard apiGeneration == startedGeneration else { return }
         guard let actionGeneration = pendingProductCloseResolution.begin(
             productConversationId: pending.productConversationId)
         else { return }
@@ -907,9 +927,7 @@ final class AppModel {
                 if let refreshed = PendingProductCloseConfirmation(snapshot: snapshot) {
                     pendingProductCloseConfirmation = refreshed
                     await listStore.refresh(api: api)
-                } else if snapshot.close?.phase == .completed
-                            || snapshot.ordinary_lifecycle == .history
-                {
+                } else if PendingProductCloseConfirmation.isCompleted(snapshot: snapshot) {
                     let transcriptIds = Set(
                         listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
                             + [snapshot.latest_transcript_row_id])
@@ -924,9 +942,6 @@ final class AppModel {
                 }
             } else if confirm {
                 pendingProductCloseConfirmation = nil
-                let transcriptIds = Set(
-                    listStore.transcriptRowIds(forAggregateId: pending.productConversationId)
-                        + [pending.transcriptRowId])
                 _ = await finalizeProductCloseLocally(
                     productConversationId: pending.productConversationId,
                     transcriptIds: transcriptIds,
@@ -949,8 +964,20 @@ final class AppModel {
                    productConversationId: pending.productConversationId,
                    apiGeneration: startedGeneration)
             {
-                pendingProductCloseConfirmation = PendingProductCloseConfirmation(snapshot: snapshot)
-                await listStore.refresh(api: api)
+                if PendingProductCloseConfirmation.isCompleted(snapshot: snapshot) {
+                    pendingProductCloseConfirmation = nil
+                    let reconciledTranscriptIds = Set(
+                        transcriptIds + [snapshot.latest_transcript_row_id])
+                    _ = await finalizeProductCloseLocally(
+                        productConversationId: pending.productConversationId,
+                        transcriptIds: reconciledTranscriptIds,
+                        startedGeneration: startedGeneration,
+                        api: api)
+                    return
+                } else {
+                    pendingProductCloseConfirmation = PendingProductCloseConfirmation(snapshot: snapshot)
+                    await listStore.refresh(api: api)
+                }
             }
             guard isCurrentPendingCloseAction(
                 actionGeneration,

@@ -357,6 +357,22 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
     }
 
+    func testPendingCloseReconciliationRecognizesHistoryAsCompleted() {
+        let snapshot = historySnapshot(segments: [])
+
+        XCTAssertTrue(PendingProductCloseConfirmation.isCompleted(snapshot: snapshot))
+        XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
+    }
+
+    func testPendingCloseReconciliationRecognizesCompletedCloseAsCompleted() {
+        var snapshot = historySnapshot(segments: [])
+        snapshot.ordinary_lifecycle = .open
+        snapshot.close = closeSnapshot(phase: .completed)
+
+        XCTAssertTrue(PendingProductCloseConfirmation.isCompleted(snapshot: snapshot))
+        XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
+    }
+
     func testCloseLossInventoryRendersExactCategorizedItemsDeterministically() {
         let losses = [
             ProductConversationCloseLoss(
@@ -392,6 +408,27 @@ final class AppModelProductConversationTests: XCTestCase {
         await model.clearCache()
 
         XCTAssertNil(model.pendingProductCloseConfirmation)
+        XCTAssertFalse(model.isResolvingPendingProductClose)
+    }
+
+    func testPendingCloseConfirmationBlocksPersistedAggregateOutboxWithoutRequest() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-outbox-tests-\(UUID().uuidString)")
+        DiskStore.save(["queued"], name: "outbox-latest")
+        let model = AppModel()
+        model.serverURLString = "http://127.0.0.1:1"
+        model.connectivity.setOnlineForTesting(true)
+        model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
+            productConversationId: "product",
+            transcriptRowId: "latest",
+            close: closeSnapshot(phase: .awaiting_stop_work_confirmation)))
+
+        await model.resolvePendingProductCloseConfirmation(confirm: true)
+
+        XCTAssertEqual(
+            model.lastActionError,
+            "This conversation has queued or unreadable messages. Resolve them before closing.")
+        XCTAssertNotNil(model.pendingProductCloseConfirmation)
         XCTAssertFalse(model.isResolvingPendingProductClose)
     }
 
