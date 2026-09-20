@@ -329,17 +329,19 @@ impl SendChatApplicationService {
                     "reserved continuation opening intent disappeared".to_string(),
                 ));
             };
-            let submitted_authority = match req.expansion_policy {
-                MessageExpansionPolicy::GeneratedPredecessorContext => {
-                    phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+            let policy_matches = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+                    req.expansion_policy == MessageExpansionPolicy::GeneratedPredecessorContext
                 }
-                MessageExpansionPolicy::ExpandReferences | MessageExpansionPolicy::LiteralText => {
-                    phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+                    req.expansion_policy == MessageExpansionPolicy::LiteralText
                 }
             };
             if intent.handoff != req.text
-                || intent.opening_authority != submitted_authority
+                || !policy_matches
                 || intent.user_agent != req.user_agent
+                || !req.images.is_empty()
+                || !req.files.is_empty()
             {
                 return Ok(SendChatOutcome::Rejected {
                     message: "reserved continuation opening payload does not match".to_string(),
@@ -359,9 +361,7 @@ impl SendChatApplicationService {
                 code: "continuation_opening_pending",
             });
         }
-        let generated_opening =
-            req.expansion_policy == MessageExpansionPolicy::GeneratedPredecessorContext;
-        if !generated_opening
+        if !reserved_opening
             && (should_enqueue_steering(&acceptability)
                 || should_enqueue_steering(&acceptance_acceptability)
                 || pending_queue_fences_direct_acceptance(

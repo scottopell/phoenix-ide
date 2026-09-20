@@ -1176,7 +1176,7 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM automatic_continuation_admissions
                  WHERE product_conversation_id = ?1
-                   AND phase NOT IN ('message_settled', 'superseded')
+                   AND phase NOT IN ('message_settled', 'superseded', 'failed')
              )",
         )
         .bind(product_conversation_id.as_str())

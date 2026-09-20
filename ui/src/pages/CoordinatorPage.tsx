@@ -24,6 +24,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [topologyRevision, setTopologyRevision] = useState(0);
+  const consumedTopologyRevision = useRef(0);
 
   useEffect(() => {
     const refresh = () => setTopologyRevision((value) => value + 1);
@@ -42,7 +43,9 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        if (topologyRevision > 0 && slug !== coordinator.conversation.id) {
+        const topologyChanged = topologyRevision > consumedTopologyRevision.current;
+        consumedTopologyRevision.current = topologyRevision;
+        if (topologyChanged && slug !== coordinator.conversation.id) {
           navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else if (!slug || slug === coordinator.conversation.id) {
           setResolvedCoordinatorId(coordinator.conversation.id);

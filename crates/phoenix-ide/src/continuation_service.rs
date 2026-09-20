@@ -99,16 +99,30 @@ impl ContinuationApplicationService {
                 .await
                 .map_err(|error| error.to_string())?
             {
-                crate::runtime::wake::transfer_active_for_continuation(
-                    &self.runtime,
-                    &admission.predecessor_conversation_id,
-                    &successor_id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                let predecessor = self
+                    .runtime
+                    .db()
+                    .get_conversation(&admission.predecessor_conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let successor = self
+                    .runtime
+                    .db()
+                    .get_conversation(&successor_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if predecessor.attached_work_scope_id == successor.attached_work_scope_id {
+                    crate::runtime::wake::transfer_active_for_continuation(
+                        &self.runtime,
+                        &admission.predecessor_conversation_id,
+                        &successor_id,
+                        phoenix_workflow::Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
             }
             if self
                 .runtime
