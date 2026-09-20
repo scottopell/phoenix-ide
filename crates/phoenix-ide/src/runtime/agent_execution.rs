@@ -222,7 +222,7 @@ impl SpawnCatalog {
         })
     }
 
-    pub fn schema(&self) -> serde_json::Value {
+    pub fn schema(&self, resolved_parent_model_id: &str) -> serde_json::Value {
         use phoenix_tools::Tool;
         use phoenix_tools::{SpawnAgentsTool, SpawnModelChoice};
         let choices = self
@@ -242,6 +242,7 @@ impl SpawnCatalog {
             self.tiers.keys().cloned().collect(),
             choices,
         )
+        .with_parallel_work_capability(resolved_parent_model_id)
         .input_schema()
     }
 }
@@ -303,7 +304,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(catalog
             .select(Some("unavailable"), None, "sol", None)
             .is_err());
-        let schema = catalog.schema();
+        let schema = catalog.schema("gpt-5.6-luna");
         let agents = &schema["properties"]["tasks"]["items"]["properties"]["agent_type"]["enum"];
         assert_eq!(agents, &serde_json::json!(["reviewer"]));
         assert!(!schema.to_string().contains("opus"));
