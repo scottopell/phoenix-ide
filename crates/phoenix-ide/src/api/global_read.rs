@@ -1413,6 +1413,9 @@ async fn render_message_page_bounded_as(
                 }
                 continue;
             }
+            let message = db
+                .get_message_by_id_in_conversation(&conv.id, &message.message_id)
+                .await?;
             let line = match render_kind {
                 ReadRenderKind::Global => render_global_message_line(conv, &message),
                 ReadRenderKind::StrictPredecessor => render_previous_message_line(conv, &message),
@@ -1906,7 +1909,9 @@ async fn resolve_reference_impl(
             .await
             .map_err(map_db_not_found)?;
         if let Some(message_id) = message_id {
-            return resolve_message(service, conv, message_id, false).await;
+            let message_id =
+                percent_decode_url_component(message_id).map_err(AppError::BadRequest)?;
+            return resolve_message(service, conv, &message_id, false).await;
         }
         return Ok(resolve_conversation(conv, false));
     }
@@ -2723,6 +2728,39 @@ mod tests {
         assert_eq!(chain.matches(&message_id).count(), 1);
         assert!(global.contains(&encoded));
         assert!(chain.contains(&encoded));
+    }
+
+    #[tokio::test]
+    async fn emitted_conv_handle_round_trips_through_reference_resolver() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "resolve-encoded",
+            "resolve-encoded",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let message_id = "id with%20 and#fragment";
+        db.add_message_with_seq(
+            message_id,
+            "resolve-encoded",
+            1,
+            &crate::db::MessageContent::user("evidence"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let handle = "@conv:resolve-encoded#message-id%20with%2520%20and%23fragment";
+
+        let resolved = service.resolve_reference(handle).await.unwrap();
+
+        assert_eq!(resolved.kind, "message");
+        assert_eq!(resolved.id, message_id);
     }
 
     #[tokio::test]
