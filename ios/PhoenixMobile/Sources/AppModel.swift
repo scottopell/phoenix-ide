@@ -700,16 +700,26 @@ final class AppModel {
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
         guard let fresh = try? await api.listConversations() else { return false }
-        guard !Task.isCancelled,
-              backgroundNudgesEnabled,
-              apiGeneration == startedGeneration
-        else { return false }
+        let coordinator: Conversation?
+        do {
+            coordinator = try await Self.coordinatorForAttention(
+                rememberedId: coordinatorConversationId,
+                fetch: { try await api.getConversation(id: $0).conversation },
+                cached: { ConversationSession.cachedConversation(conversationId: $0) })
+        } catch {
+            return false
+        }
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration,
+              nudgePreferenceGeneration == startedNudgeGeneration,
+              attentionEvidenceGeneration == startedEvidenceGeneration,
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
+        let attentionConversations = Self.attentionConversations(
+            ordinary: fresh,
+            coordinator: coordinator)
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
@@ -718,10 +728,32 @@ final class AppModel {
                 && self.attentionEvidenceGeneration == startedEvidenceGeneration
         }
         await attention.refreshAndNotifyIfNeeded(
-            from: fresh,
+            from: attentionConversations,
             transcriptToAggregate: listStore.transcriptToAggregate,
             isCurrent: isCurrent)
         return await isCurrent()
+    }
+
+    static func coordinatorForAttention(
+        rememberedId: String?,
+        fetch: (String) async throws -> Conversation,
+        cached: (String) -> Conversation?
+    ) async throws -> Conversation? {
+        guard let rememberedId else { return nil }
+        do {
+            return try await fetch(rememberedId)
+        } catch let error as APIError where error.isTransport {
+            guard let cached = cached(rememberedId) else { throw error }
+            return cached
+        }
+    }
+
+    nonisolated static func attentionConversations(
+        ordinary: [Conversation],
+        coordinator: Conversation?
+    ) -> [Conversation] {
+        guard let coordinator else { return ordinary }
+        return ordinary.filter { $0.aggregateIdentity != coordinator.aggregateIdentity } + [coordinator]
     }
 
     // MARK: - Coordinator

@@ -23,6 +23,10 @@ import {
 } from '../storage/lastViewerStorage';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import type { Conversation } from '../api';
+import {
+  subscribeProductConversationListRevision,
+  subscribeProductConversationSnapshotChanged,
+} from '../notifications';
 
 // The polling refresh tries to call api.listConversations on mount.
 // No-op so the test isolates the hard-delete listener.
@@ -308,6 +312,35 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
       expect(draftStore!.getSnapshot('old-slug').draft).toBe('');
       expect(draftStore!.getSnapshot('new-slug').draft).toBe('');
     });
+  });
+
+  it('notifies mounted product list and exact aggregate snapshot projections', async () => {
+    const listChanged = vi.fn();
+    const snapshotChanged = vi.fn();
+    const unsubscribeList = subscribeProductConversationListRevision(listChanged);
+    const unsubscribeSnapshot = subscribeProductConversationSnapshotChanged('product-id', snapshotChanged);
+
+    render(
+      <ConversationProvider>
+        <CaptureStore onStore={() => {}} />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: {
+            conversationId: 'product-id',
+            deletedConversationIds: ['root-id', 'leaf-id'],
+          },
+        }),
+      );
+    });
+
+    expect(snapshotChanged).toHaveBeenCalledOnce();
+    await waitFor(() => expect(listChanged).toHaveBeenCalledOnce());
+    unsubscribeList();
+    unsubscribeSnapshot();
   });
 
   it('clears every transcript store and draft named by one aggregate delete event', async () => {
