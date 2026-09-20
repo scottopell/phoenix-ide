@@ -18652,7 +18652,9 @@ mod tests {
         db.add_message(
             second_admission.first_message_id.as_str(),
             &exact_successor.id,
-            &MessageContent::user("exact summary for auto-on-second  \n"),
+            &MessageContent::Continuation(schema::ContinuationContent {
+                summary: "exact summary for auto-on-second  \n".to_string(),
+            }),
             None,
             None,
         )
