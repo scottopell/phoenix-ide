@@ -13,7 +13,8 @@ final class AppModelProductConversationTests: XCTestCase {
         archived: Bool? = nil,
         mode: String? = nil,
         updatedAt: String? = nil,
-        runtimeRole: String? = nil
+        runtimeRole: String? = nil,
+        closeAction: ProductConversationCloseAction? = nil
     ) -> Conversation {
         Conversation(
             id: id,
@@ -30,6 +31,7 @@ final class AppModelProductConversationTests: XCTestCase {
             branch_name: nil,
             task_title: taskTitle,
             archived: archived,
+            product_close_action: closeAction,
             project_name: nil,
             conv_mode_label: nil,
             presentation_mode: mode,
@@ -194,6 +196,64 @@ final class AppModelProductConversationTests: XCTestCase {
         model.rebuildAPIForTesting()
 
         XCTAssertNotNil(model.aggregateReconciliationId)
+    }
+
+    func testInstallAPIForTestingInvalidatesInheritedAPIWorkBeforeReplacement() {
+        let originalURL = UserDefaults.standard.string(forKey: "phoenix.serverURL")
+        UserDefaults.standard.set("http://127.0.0.1:2", forKey: "phoenix.serverURL")
+        defer {
+            if let originalURL {
+                UserDefaults.standard.set(originalURL, forKey: "phoenix.serverURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "phoenix.serverURL")
+            }
+        }
+        let model = AppModel()
+        let inheritedGeneration = model.apiGenerationForTesting
+        XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
+        XCTAssertNotNil(model.aggregateReconciliationId)
+
+        model.installAPIForTesting()
+
+        XCTAssertGreaterThan(model.apiGenerationForTesting, inheritedGeneration)
+        XCTAssertFalse(model.aggregateEventStreamOwnedForTesting)
+        XCTAssertNil(model.aggregateReconciliationId)
+    }
+
+    func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() {
+        let model = AppModel()
+        model.installAPIForTesting()
+        let staleId = model.prepareAggregateReconciliationForTesting()
+        let currentId = model.prepareAggregateReconciliationForTesting()
+        let current = [conversation(id: "new", aggregateId: "pc-new")]
+        let stale = [conversation(id: "old", aggregateId: "pc-old")]
+
+        XCTAssertTrue(model.applyAggregateListForReconciliationForTesting(
+            current,
+            reconciliationId: currentId))
+        XCTAssertFalse(model.applyAggregateListForReconciliationForTesting(
+            stale,
+            reconciliationId: staleId))
+        XCTAssertEqual(model.listStore.conversations, current)
+    }
+
+    func testCancelledAggregateReconciliationCannotApplyFetchedList() async {
+        let model = AppModel()
+        model.installAPIForTesting()
+        let reconciliationId = model.prepareAggregateReconciliationForTesting()
+        let stale = [conversation(id: "old", aggregateId: "pc-old")]
+        let task = Task { @MainActor in
+            while !Task.isCancelled { await Task.yield() }
+            return model.applyAggregateListForReconciliationForTesting(
+                stale,
+                reconciliationId: reconciliationId)
+        }
+
+        task.cancel()
+
+        let applied = await task.value
+        XCTAssertFalse(applied)
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
     }
 
     func testAggregateReconciliationRetriesTransientFailureAndApplyLoss() async {
@@ -580,6 +640,57 @@ final class AppModelProductConversationTests: XCTestCase {
 
         snapshot.close = closeSnapshot(phase: .settling_active_work)
         XCTAssertNil(PendingProductCloseConfirmation(snapshot: snapshot))
+    }
+
+    func testCloseRehydrationFencesEveryListedActiveAggregateBeforeSelectingPrompt() async throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-close-rehydration-fence-tests-\(UUID().uuidString)")
+        let model = AppModel()
+        model.installAPIForTesting()
+        let first = conversation(
+            id: "row-a",
+            aggregateId: "product-a",
+            closeAction: .unavailable(reason: .active_close_attempt))
+        let second = conversation(
+            id: "row-b",
+            aggregateId: "product-b",
+            closeAction: .unavailable(reason: .active_close_attempt))
+        model.listStore.upsert(first)
+        model.listStore.upsert(second)
+        let firstSession = try XCTUnwrap(model.session(for: first.id))
+        let secondSession = try XCTUnwrap(model.session(for: second.id))
+        var fetched: [String] = []
+
+        await model.rehydratePendingProductCloseConfirmationForTesting { aggregateId in
+            XCTAssertTrue(firstSession.isArchiving)
+            XCTAssertTrue(secondSession.isArchiving)
+            fetched.append(aggregateId)
+            var snapshot = self.historySnapshot(aggregateId: aggregateId, segments: [])
+            snapshot.ordinary_lifecycle = .open
+            snapshot.close = self.closeSnapshot(phase: .awaiting_stop_work_confirmation)
+            return snapshot
+        }
+
+        XCTAssertEqual(fetched, ["product-a", "product-b"])
+        XCTAssertEqual(model.pendingProductCloseConfirmation?.productConversationId, "product-a")
+        XCTAssertFalse(firstSession.acceptsConversationActions)
+        XCTAssertFalse(secondSession.acceptsConversationActions)
+    }
+
+    func testForegroundAttentionSeedInvalidatesBackgroundEvidenceGeneration() {
+        let model = AppModel()
+        let backgroundGeneration = model.attentionEvidenceGenerationForTesting
+        model.listStore.upsert(conversation(
+            id: "visible",
+            aggregateId: "pc-visible",
+            mode: "needs_action"))
+
+        model.seedForegroundAttentionForTesting()
+
+        XCTAssertGreaterThan(model.attentionEvidenceGenerationForTesting, backgroundGeneration)
+        XCTAssertEqual(
+            model.attention.snapshot["pc-visible"],
+            AttentionMonitor.Entry(mode: "needs_action", title: "visible"))
     }
 
     func testPendingCloseReconciliationRecognizesHistoryAsCompleted() {
