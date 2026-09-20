@@ -13968,7 +13968,10 @@ pub(crate) mod hard_delete_cascade_tests {
                 "{id} must be gone after chain delete"
             );
         }
-        let event = events.recv().await.expect("aggregate hard-delete event");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("aggregate hard-delete event timeout")
+            .expect("aggregate hard-delete event");
         assert!(matches!(
             event,
             SseEvent::ConversationHardDeleted { conversation_id, .. }
