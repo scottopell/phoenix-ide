@@ -4318,7 +4318,10 @@ async fn stream_conversation(
         let stored_model = stale_model
             .clone()
             .unwrap_or_else(|| state.llm_registry.default_model_id());
-        let model_id = state.llm_registry.resolve_model_id(&stored_model);
+        let model_id = state
+            .llm_registry
+            .resolve_model_id(&stored_model)
+            .map_err(AppError::BadRequest)?;
         if !state.llm_registry.supports_service_tier(
             &model_id,
             phoenix_core::domain::llm_types::ServiceTier::Fast,

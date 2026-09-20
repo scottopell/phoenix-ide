@@ -557,6 +557,15 @@ pub struct ModelRegistry {
     config: Arc<LlmConfig>,
 }
 
+#[must_use]
+pub fn legacy_model_replacement(model_id: &str) -> Option<&'static str> {
+    match model_id {
+        "gpt-5.4-mini" => Some("gpt-5.6-luna"),
+        "gpt-5.3-codex" | "gpt-5.4" | "gpt-5.5" => Some("gpt-5.6-sol"),
+        _ => None,
+    }
+}
+
 impl ModelRegistry {
     /// Create an empty registry for testing purposes
     #[cfg(any(test, feature = "test-support"))]
@@ -622,9 +631,6 @@ impl ModelRegistry {
             "gpt-5.6-sol",
             "gpt-5.6-luna",
             "gpt-5.6-terra",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
             "mock",
         ];
         // Honor `DEFAULT_MODEL` only if it actually got registered. A
@@ -1157,15 +1163,22 @@ impl ModelRegistry {
         }
     }
 
-    /// Resolve a persisted model id to an exact registered route, or to the
-    /// retired built-in replacement when no exact route exists.
-    pub fn resolve_model_id(&self, model_id: &str) -> String {
+    /// Resolve a model id to an exact registered route, or to its explicit
+    /// retired built-in replacement. A missing replacement never falls through
+    /// to the deployment default.
+    pub fn resolve_model_id(&self, model_id: &str) -> Result<String, String> {
         if self.get(model_id).is_some() {
-            model_id.to_string()
-        } else if model_id == "gpt-5.3-codex" {
-            "gpt-5.4".to_string()
+            return Ok(model_id.to_string());
+        }
+        let Some(replacement) = legacy_model_replacement(model_id) else {
+            return Ok(model_id.to_string());
+        };
+        if self.get(replacement).is_some() {
+            Ok(replacement.to_string())
         } else {
-            model_id.to_string()
+            Err(format!(
+                "Model '{model_id}' has been retired; select '{replacement}', which is not available in this deployment"
+            ))
         }
     }
 
@@ -1381,7 +1394,7 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-6-sol → gpt-5.6-sol → gpt-5.5 → registry default.
+    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-6-sol → gpt-5.6-sol → registry default.
     /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
         const PREFERRED: &[&str] = &[
@@ -1389,7 +1402,6 @@ impl ModelRegistry {
             "claude-sonnet-4-6",
             "gpt-6-sol",
             "gpt-5.6-sol",
-            "gpt-5.5",
         ];
         for id in PREFERRED {
             if let Some(service) = self.get(id) {
@@ -1400,9 +1412,9 @@ impl ModelRegistry {
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
-    /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
+    /// Prefers: claude-haiku-4-5 > gpt-5.6-luna > any available model
     pub fn get_cheap_model_with_id(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.4-mini"];
+        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.6-luna"];
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
                 return Some(((*model_id).to_string(), service));
@@ -1437,7 +1449,7 @@ impl ModelRegistry {
 
         let candidates: &[&str] = match parent_backend {
             ModelBackend::Anthropic => &["claude-haiku-4-5"],
-            ModelBackend::OpenAIResponses => &["gpt-5.4-mini"],
+            ModelBackend::OpenAIResponses => &["gpt-5.6-luna"],
             ModelBackend::OpenAIChatCompletions => return parent_model_id.to_string(),
             ModelBackend::Mock => return "mock".to_string(),
         };
@@ -1824,6 +1836,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_model_replacements_are_explicit_and_exhaustive() {
+        assert_eq!(
+            legacy_model_replacement("gpt-5.3-codex"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            legacy_model_replacement("gpt-5.4-mini"),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(legacy_model_replacement("gpt-5.4"), Some("gpt-5.6-sol"));
+        assert_eq!(legacy_model_replacement("gpt-5.5"), Some("gpt-5.6-sol"));
+        assert_eq!(legacy_model_replacement("gpt-5.6-sol"), None);
+        assert_eq!(legacy_model_replacement("custom/gpt-5.5"), None);
+    }
+
+    #[test]
+    fn unavailable_legacy_replacement_does_not_fall_back_to_default() {
+        let registry = ModelRegistry::new(&LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        });
+        let default_model = registry.default_model_id();
+        assert!(registry.get(&default_model).is_some());
+
+        let error = registry
+            .resolve_model_id("gpt-5.5")
+            .expect_err("missing explicit replacement must fail");
+        assert!(error.contains("gpt-5.6-sol"));
+        assert!(error.contains("not available"));
+        assert!(!error.contains(&format!("select '{default_model}'")));
+    }
+
+    #[test]
+    fn custom_exact_route_precedes_legacy_model_mapping() {
+        let custom = parse_external_models(
+            r#"[{"id":"gpt-5.5","api_name":"operator/gpt-5.5","backend":"openai_responses","description":"Operator-defined exact legacy ID","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let registry = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            external_models: vec![custom],
+            ..Default::default()
+        });
+
+        assert_eq!(registry.resolve_model_id("gpt-5.5").unwrap(), "gpt-5.5");
+        assert_eq!(
+            registry.connection_for_model("gpt-5.5").as_deref(),
+            Some("openai_responses")
+        );
+    }
+
+    #[test]
     fn astra_registration_is_independent_across_direct_and_codex_routes() {
         let direct = ModelRegistry::new(&LlmConfig {
             openai_api_key: Some("test-key".to_string()),
@@ -2093,6 +2160,34 @@ mod tests {
             &model,
             &discovered
         ));
+    }
+
+    #[test]
+    fn pruned_builtins_cannot_be_reintroduced_by_discovery() {
+        let configured = ModelRegistry::model_specs(&LlmConfig::default());
+        let discovered = DiscoveredModels {
+            anthropic_listed: false,
+            anthropic: HashSet::new(),
+            openai_responses_listed: true,
+            openai_responses: HashSet::from([
+                "gpt-5.4-mini".to_string(),
+                "gpt-5.4".to_string(),
+                "gpt-5.5".to_string(),
+            ]),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
+        };
+
+        assert!(configured
+            .iter()
+            .all(|spec| !discovered.ids_for_backend(spec.backend).contains(&spec.id)));
+        assert!(
+            ModelRegistry::discovery_fallback_backends(&configured, &discovered)
+                .contains(&ModelBackend::OpenAIResponses)
+        );
+        for retired in ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"] {
+            assert!(configured.iter().all(|spec| spec.id != retired));
+        }
     }
 
     #[test]
@@ -2379,7 +2474,9 @@ mod tests {
         assert!(registry.get("gpt-5.6-sol").is_some());
         assert!(registry.get("gpt-5.6-luna").is_some());
         assert!(registry.get("gpt-5.6-terra").is_some());
-        assert!(registry.get("gpt-5.5").is_some());
+        for retired in ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"] {
+            assert!(registry.get(retired).is_none());
+        }
     }
 
     /// Helper: build a `CodexCredential` pointing at a freshly-written valid
@@ -2427,13 +2524,13 @@ mod tests {
             external_models: vec![external],
             ..Default::default()
         });
-        assert_eq!(registry.provider_display_name("gpt-5.5"), "OpenAI");
+        assert_eq!(registry.provider_display_name("gpt-5.6-sol"), "OpenAI");
         assert_eq!(
             registry.provider_display_name("openai-compatible/custom"),
             "OpenAI"
         );
         assert_eq!(
-            registry.connection_for_model("gpt-5.5").as_deref(),
+            registry.connection_for_model("gpt-5.6-sol").as_deref(),
             Some("codex")
         );
         assert_eq!(
@@ -2443,17 +2540,17 @@ mod tests {
             Some("openai_responses")
         );
         assert!(registry
-            .validate_execution_route("gpt-5.5", "openai_responses", None)
+            .validate_execution_route("gpt-5.6-sol", "openai_responses", None)
             .is_err());
         assert!(registry
-            .validate_execution_route("gpt-5.5", "codex", None)
+            .validate_execution_route("gpt-5.6-sol", "codex", None)
             .is_ok());
         assert!(registry
-            .get_execution_service("gpt-5.5", "codex")
+            .get_execution_service("gpt-5.6-sol", "codex")
             .unwrap()
             .uses_codex_bridge());
         assert!(registry
-            .get_execution_service("gpt-5.5", "openai_responses")
+            .get_execution_service("gpt-5.6-sol", "openai_responses")
             .is_none());
         assert!(!registry
             .get_execution_service("openai-compatible/custom", "openai_responses")
@@ -2475,10 +2572,10 @@ mod tests {
         assert!(routes.iter().all(|route| route.connection != "anthropic"));
         assert_eq!(registry.connection_for_model("claude-sonnet-4-6"), None);
         assert!(registry
-            .validate_execution_route("gpt-5.5", "codex", Some(ModelEffort::High))
+            .validate_execution_route("gpt-5.6-sol", "codex", Some(ModelEffort::High))
             .is_ok());
         assert!(registry
-            .validate_execution_route("gpt-5.5", "codex", Some(ModelEffort::Minimal))
+            .validate_execution_route("gpt-5.6-sol", "codex", Some(ModelEffort::Minimal))
             .is_err());
         assert!(registry
             .validate_execution_route("opus", "anthropic", None)
@@ -2500,7 +2597,7 @@ mod tests {
 
         assert!(
             registry
-                .get("gpt-5.5")
+                .get("gpt-5.6-sol")
                 .expect("built-in OpenAI model should still use Codex")
                 .uses_codex_bridge(),
             "built-in OpenAI models keep existing Codex routing"
@@ -2543,7 +2640,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
         assert!(
-            registry.get("gpt-5.5").is_some(),
+            registry.get("gpt-5.6-sol").is_some(),
             "OpenAI model should register via codex auth without OPENAI_API_KEY"
         );
         assert!(
@@ -2564,7 +2661,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
         assert!(
-            registry.get("gpt-5.5").is_none(),
+            registry.get("gpt-5.6-sol").is_none(),
             "OpenAI must not fall through to OPENAI_API_KEY when codex auth is enabled but credentials are absent"
         );
     }
@@ -2584,7 +2681,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
         assert!(
-            registry.get("gpt-5.5").is_some(),
+            registry.get("gpt-5.6-sol").is_some(),
             "OpenAI should register via OPENAI_API_KEY when bridge intent is off"
         );
     }
@@ -2602,7 +2699,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
         assert!(
-            registry.get("gpt-5.5").is_none(),
+            registry.get("gpt-5.6-sol").is_none(),
             "no OpenAI bridge before reload"
         );
         assert_eq!(registry.current_codex_loaded_path(), None);
@@ -2631,7 +2728,7 @@ mod tests {
             Some("acc-1")
         );
         assert!(
-            registry.get("gpt-5.5").is_some(),
+            registry.get("gpt-5.6-sol").is_some(),
             "reload must register the OpenAI bridge"
         );
         assert!(
@@ -2684,7 +2781,7 @@ mod tests {
             registry.current_codex_loaded_path().as_deref(),
             Some(path2.as_path())
         );
-        assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gpt-5.6-sol").is_some());
         assert_eq!(
             registry
                 .current_codex_credential()
@@ -2738,13 +2835,13 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gpt-5.6-sol").is_some());
 
         let outcome = registry.reload_codex_credential_with(None);
         assert!(!outcome.credential_loaded);
         assert!(registry.current_codex_credential().is_none());
         assert!(
-            registry.get("gpt-5.5").is_none(),
+            registry.get("gpt-5.6-sol").is_none(),
             "OpenAI bridge must be removed when reload resolves to None"
         );
     }
@@ -2764,7 +2861,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gpt-5.6-sol").is_some());
         assert_eq!(
             registry.current_codex_loaded_path().as_deref(),
             Some(initial_path.as_path())
@@ -2782,7 +2879,7 @@ mod tests {
         // report restart_required iff initial_path doesn't equal the
         // login-write path — independent of this failed attempt.
         assert!(
-            registry.get("gpt-5.5").is_some(),
+            registry.get("gpt-5.6-sol").is_some(),
             "load failure must not deregister the working bridge"
         );
         assert_eq!(
@@ -2805,19 +2902,19 @@ mod tests {
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that
-    /// isn't actually registered (e.g. DEFAULT_MODEL=gpt-5.5 with codex
+    /// isn't actually registered (e.g. DEFAULT_MODEL=gpt-5.6-sol with codex
     /// auth disabled and only an Anthropic key set).
     #[test]
     fn test_default_model_falls_back_when_configured_one_unavailable() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
-            default_model: Some("gpt-5.5".to_string()),
+            default_model: Some("gpt-5.6-sol".to_string()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        // gpt-5.5 isn't registered (no OpenAI auth), so default must fall
+        // gpt-5.6-sol isn't registered (no OpenAI auth), so default must fall
         // back to a model that actually exists.
-        assert_ne!(registry.default_model_id(), "gpt-5.5");
+        assert_ne!(registry.default_model_id(), "gpt-5.6-sol");
         assert!(registry.get(&registry.default_model_id()).is_some());
     }
 
@@ -2934,7 +3031,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.get("gpt-5.5").is_none());
+        assert!(registry.get("gpt-5.6-sol").is_none());
         assert!(registry
             .get("gateway-provider/example-org/Code-Model")
             .is_some());
@@ -2951,7 +3048,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.get("gpt-5.5").is_none());
+        assert!(registry.get("gpt-5.6-sol").is_none());
         assert!(registry
             .get("gateway-provider/example-org/Code-Model")
             .is_some());
@@ -3000,7 +3097,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry.get("gpt-5.6-sol").is_some());
         assert!(registry
             .get("gateway-provider/example-org/Code-Model")
             .is_some());

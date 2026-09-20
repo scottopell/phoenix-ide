@@ -75,7 +75,8 @@ pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{
-    AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
+    legacy_model_replacement, AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig,
+    ModelRegistry, ResolvedAuth,
 };
 pub use service::{LlmAttemptDeadline, LlmServiceImpl};
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias

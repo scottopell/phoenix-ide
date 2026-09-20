@@ -10,8 +10,11 @@ whole execution choice. Worker definitions do not carry mode or tools.
 
 The callable catalog excludes unusable defaults and diagnoses configuration
 mistakes. Connection availability reflects configured backend routes, not model
-family names. Exact selections do not silently fall back. Filesystem-agent
-catalogs are retired; Skills remain the home for reusable expertise.
+family names. Exact selections do not silently fall back. Retired built-in pins
+use explicit compatibility replacements on the same connection, fail when that
+replacement route is unavailable, and defer to an exact operator-configured
+route. Filesystem-agent catalogs are retired; Skills remain the home for reusable
+expertise.
 
 ## Technical Summary
 
@@ -42,7 +45,7 @@ validation, authority, and child lifecycle seams.
 | **REQ-AG-009:** Capability from Spawn Authority, Not Definition | Implemented | `rejects_invalid_and_legacy_fields`; `mode_guidance_separates_permissions_from_execution` |
 | **REQ-AG-010:** Single User Configuration | Implemented | `config_location_uses_only_xdg_or_home`; `missing_config_does_not_load_legacy_files` |
 | **REQ-AG-011:** Ordered Atomic Execution Candidates | Implemented | `parses_ordered_atomic_candidates_and_inline_instructions`; `invalid_reached_effort_does_not_fall_through` |
-| **REQ-AG-012:** Usable Model Routes | Implemented | `execution_routes_follow_connections_not_display_families`; `pinned_route_mismatch_is_not_a_retryable_network_failure` |
+| **REQ-AG-012:** Usable Model Routes | Implemented | `execution_routes_follow_connections_not_display_families`; `retired_pin_requires_replacement_on_the_same_connection_without_fallback`; `configured_exact_route_precedes_legacy_pin_replacement` |
 
 **Progress:** 9 active requirements implemented; 3 filesystem requirements retired.
 
