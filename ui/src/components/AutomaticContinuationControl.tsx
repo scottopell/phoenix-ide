@@ -59,6 +59,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         .then((next) => {
           if (requestGeneration.current === generation && viewRevision.current === revision) {
             setView(next);
+            setFeedback(null);
           }
         })
         .catch((error: unknown) => {

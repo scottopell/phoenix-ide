@@ -141,6 +141,9 @@ impl SendChatApplicationService {
         {
             return Ok(AutomaticRetryTurnState::AlreadyAccepted);
         }
+        let _authority = self.runtime.acquire_local_authority_pass().map_err(|()| {
+            SendChatServiceError::Internal("local authority is closed".to_string())
+        })?;
         let input = crate::db::workflow::RearmAuthoritativeTurnInput {
             turn_id: turn.id,
             expected_generation: turn.generation,
@@ -327,6 +330,13 @@ impl SendChatApplicationService {
                 crate::db::ProductConversationAdmission::History(_) => {
                     return Ok(history_unavailable_outcome());
                 }
+            }
+
+            if req.expansion_policy == MessageExpansionPolicy::GeneratedPredecessorContext {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "generated continuation opening requires direct admission".to_string(),
+                    code: "generated_continuation_busy",
+                });
             }
 
             let event = Event::SteerMessage {
