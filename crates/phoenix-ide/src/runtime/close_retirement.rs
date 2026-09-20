@@ -150,7 +150,21 @@ impl RuntimeManager {
     ) -> Result<CloseRetirementSnapshot, CloseRetirementError> {
         self.inspect_close_retirement_with_continuation(attempt_id, false)
             .await
-            .map_err(|error| CloseRetirementError::Message(error.clone()))
+            .map_err(|error| {
+                let prefix = "Close evidence invariant ";
+                if let Some((invariant, relation)) = error
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.split_once(" failed in "))
+                {
+                    CloseRetirementError::EvidenceInvariant {
+                        scope: None,
+                        invariant: invariant.to_string(),
+                        relation: relation.to_string(),
+                    }
+                } else {
+                    CloseRetirementError::Message(error)
+                }
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4113,7 +4127,6 @@ fn inspect_ambient_writer_until_quiescent(
         match observe()? {
             ExternalWriterEvidence::NoPositiveEvidence => {
                 consecutive_clean += 1;
-                final_writer = None;
                 if consecutive_clean == policy.required_clean.get() {
                     return Ok(None);
                 }

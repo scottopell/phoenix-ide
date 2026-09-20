@@ -3281,24 +3281,6 @@ impl RuntimeManager {
                         .inspect_close_retirement(obligation.attempt_id().clone())
                         .await
                     {
-                        let scopes = manager
-                            .db
-                            .list_close_attempt_scopes(obligation.attempt_id().as_str())
-                            .await
-                            .map_err(|db_error| db_error.to_string())?;
-                        let Some(scope) = scopes.first().map(|captured| captured.scope.clone())
-                        else {
-                            return Err(
-                                "Close needs-repair attempt has no captured scope".to_string()
-                            );
-                        };
-                        manager
-                            .persist_close_error_repair(
-                                obligation.attempt_id(),
-                                &scope,
-                                &close_retirement::CloseRetirementError::Message(error.clone()),
-                            )
-                            .await?;
                         tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
                             "Close needs-repair attempt could not rebuild inspection");
                         return Ok(false);

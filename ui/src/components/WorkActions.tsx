@@ -557,6 +557,7 @@ export function WorkControlBar({
         : undefined;
       if (activeTranscript && activeTranscript !== conversationId) {
         window.location.assign(`/c/${activeTranscript}`);
+        return true;
       }
       return false;
     }
