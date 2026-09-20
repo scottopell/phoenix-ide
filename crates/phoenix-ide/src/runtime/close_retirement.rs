@@ -4641,6 +4641,10 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                     != i32::try_from(size_of::<ProcRegionWithPathInfo>())
                         .expect("region path info size fits i32")
                 {
+                    let error = std::io::Error::last_os_error();
+                    if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
+                        continue;
+                    }
                     return Err(AmbientWriterIndeterminateDiagnostic {
                         detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
                         operation: AmbientWriterDiagnosticOperation::ReadMappings,
@@ -5325,9 +5329,6 @@ fn linux_namespace_cwd_writer_evidence_if_stable(
     else {
         return Ok(None);
     };
-    if linux_namespace_path_is_deleted(&cwd) {
-        return Ok(None);
-    }
     if !path_is_within(&cwd, canonical) {
         return Ok(None);
     }
@@ -5565,7 +5566,7 @@ fn quarantine_has_open_descriptors_in(
             else {
                 continue;
             };
-            if linux_descriptor_is_deleted(&target_metadata) {
+            if linux_descriptor_is_deleted(&target_metadata) && !target_metadata.is_dir() {
                 continue;
             }
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
