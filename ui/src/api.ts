@@ -2377,7 +2377,8 @@ export const api = {
       body: JSON.stringify(request),
     });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      const err = await resp.json().catch(() => ({})) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(err);
       throw new ApiResponseError(err.error ?? 'Failed to confirm Close losses', resp.status, err.error_type);
     }
     return resp.json();

@@ -14202,11 +14202,8 @@ pub(crate) mod hard_delete_cascade_tests {
             else {
                 panic!("archive must return a structured conflict");
             };
-            assert_eq!(conflict.attempt_id.as_deref(), Some(attempt_id.as_str()));
-            assert_eq!(
-                conflict.active_transcript_id.as_deref(),
-                Some(root.id.as_str())
-            );
+            assert_eq!(conflict.close_recovery_parts().0, Some(attempt_id.as_str()));
+            assert_eq!(conflict.close_recovery_parts().1, Some(root.id.as_str()));
             let failed_evidence = conflict
                 .failed_evidence
                 .as_ref()

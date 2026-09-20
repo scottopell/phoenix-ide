@@ -772,7 +772,11 @@ pub(crate) async fn retry_close_retirement(
             .get_close_obligation(retried.attempt_id().as_str())
             .await
             .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
-        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
+        if matches!(
+            authoritative.phase(),
+            phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                | phoenix_core::domain::close::ClosePhase::RetirementRequested
+        ) {
             let scope = match &error {
                 CloseRetirementError::EvidenceInvariant {
                     scope: Some(scope), ..
@@ -853,7 +857,7 @@ fn inactive_close_transcript_conflict(
     active_transcript: &str,
     obligation: Option<&phoenix_core::domain::close::CloseObligation>,
 ) -> ConflictErrorResponse {
-    let mut conflict = ConflictErrorResponse::new(
+    let conflict = ConflictErrorResponse::new(
         "Close is accepted only from the active aggregate transcript",
         "inactive_close_transcript",
     );
@@ -863,8 +867,7 @@ fn inactive_close_transcript_conflict(
                 .with_close_recovery(obligation.attempt_id().as_str(), active_transcript);
         }
     }
-    conflict.active_transcript_id = Some(active_transcript.to_string());
-    conflict
+    conflict.with_active_close_transcript(active_transcript)
 }
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
@@ -1280,11 +1283,8 @@ mod tests {
             assert!(!close_phase_allows_retry_guidance(phase));
         }
         let without_obligation = inactive_close_transcript_conflict("active", None);
-        assert!(without_obligation.recovery_action.is_none());
-        assert_eq!(
-            without_obligation.active_transcript_id.as_deref(),
-            Some("active")
-        );
+        assert!(without_obligation.close_recovery_parts().2.is_none());
+        assert_eq!(without_obligation.close_recovery_parts().1, Some("active"));
 
         let timestamp = Utc.with_ymd_and_hms(2026, 9, 18, 0, 0, 0).unwrap();
         let needs_repair = CloseObligation::parse(
@@ -1299,15 +1299,12 @@ mod tests {
         )
         .unwrap();
         let with_obligation = inactive_close_transcript_conflict("active", Some(&needs_repair));
-        assert_eq!(with_obligation.attempt_id.as_deref(), Some("attempt-1"));
-        assert_eq!(
-            with_obligation.active_transcript_id.as_deref(),
-            Some("active")
-        );
+        assert_eq!(with_obligation.close_recovery_parts().0, Some("attempt-1"));
+        assert_eq!(with_obligation.close_recovery_parts().1, Some("active"));
         assert_eq!(
             with_obligation
-                .recovery_action
-                .as_ref()
+                .close_recovery_parts()
+                .2
                 .map(|action| action.path.as_str()),
             Some("/api/conversations/active/close/retry-retirement")
         );

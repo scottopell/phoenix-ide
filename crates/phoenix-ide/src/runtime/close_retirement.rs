@@ -5888,6 +5888,11 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     != i32::try_from(size_of::<VnodeFdInfoWithPath>())
                         .expect("vnode info size fits i32")
                 {
+                    let error = std::io::Error::last_os_error();
+                    if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error())
+                    {
+                        continue;
+                    }
                     return Err(AmbientWriterIndeterminateDiagnostic {
                         detector: AmbientWriterDiagnosticDetector::MacosProcPidinfo,
                         operation: AmbientWriterDiagnosticOperation::EnumerateDescriptor,

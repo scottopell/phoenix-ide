@@ -8908,6 +8908,23 @@ CREATE TABLE close_worktree_cleanup_adoptions (
 
 DROP TRIGGER close_retirement_inspections_reject_sealed_delete;
 
+CREATE TRIGGER close_worktree_cleanup_plan_reject_adopted_update
+BEFORE UPDATE ON close_worktree_cleanup_plans
+WHEN EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_adoptions adoption
+    WHERE adoption.attempt_id = OLD.attempt_id
+      AND adoption.scope = OLD.scope
+      AND adoption.source_inspection_generation = OLD.inspection_generation
+      AND adoption.source_inspection_fingerprint = OLD.inspection_fingerprint
+      AND adoption.resource_kind = OLD.resource_kind
+      AND adoption.identity_kind = OLD.identity_kind
+      AND adoption.identity_codec = OLD.identity_codec
+      AND adoption.identity_value = OLD.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted cleanup-plan payload is immutable');
+END;
+
 CREATE TRIGGER close_worktree_cleanup_adoption_requires_identical_payload
 BEFORE INSERT ON close_worktree_cleanup_adoptions
 WHEN NOT EXISTS (
