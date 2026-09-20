@@ -106,6 +106,69 @@ fn deposit_turn_trigger(handle: &ConversationHandle) {
     }
 }
 
+#[async_trait::async_trait]
+pub(crate) trait ConversationEventDispatcher: Send + Sync + 'static {
+    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub(crate) struct AddressedConversationEventDispatcher {
+    manager: Arc<RuntimeManager>,
+}
+
+impl AddressedConversationEventDispatcher {
+    fn new(manager: Arc<RuntimeManager>) -> Self {
+        Self { manager }
+    }
+
+    async fn resolve(&self, conversation_id: &str) -> Result<ConversationHandle, String> {
+        self.manager.get_or_create(conversation_id).await
+    }
+
+    async fn dispatch_resolved(
+        &self,
+        handle: &ConversationHandle,
+        event: Event,
+    ) -> Result<(), String> {
+        handle
+            .event_tx
+            .send(event)
+            .await
+            .map_err(|error| format!("Failed to send addressed conversation event: {error}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationEventDispatcher for AddressedConversationEventDispatcher {
+    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        let handle = self.resolve(conversation_id).await?;
+        self.dispatch_resolved(&handle, event).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestConversationEventDispatcher {
+    sender: mpsc::Sender<Event>,
+}
+
+#[cfg(test)]
+impl TestConversationEventDispatcher {
+    pub(crate) fn new(sender: mpsc::Sender<Event>) -> Self {
+        Self { sender }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ConversationEventDispatcher for TestConversationEventDispatcher {
+    async fn dispatch(&self, _conversation_id: &str, event: Event) -> Result<(), String> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Request to spawn a sub-agent
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
@@ -4034,7 +4097,10 @@ impl RuntimeManager {
             broadcaster.clone(),
         )
         .with_wake_registrar(self.wake_registrar())
-        .with_parent(parent_event_tx.clone())
+        .with_parent_dispatch(
+            parent_conversation_id.clone(),
+            Arc::new(AddressedConversationEventDispatcher::new(Arc::clone(self))),
+        )
         .with_acknowledged_event_receiver(acknowledged_event_rx)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
@@ -5265,6 +5331,14 @@ impl RuntimeManager {
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
+        let runtime = if let Some(parent_conversation_id) = conv.parent_conversation_id.clone() {
+            runtime.with_parent_dispatch(
+                parent_conversation_id,
+                Arc::new(AddressedConversationEventDispatcher::new(Arc::clone(self))),
+            )
+        } else {
+            runtime
+        };
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer

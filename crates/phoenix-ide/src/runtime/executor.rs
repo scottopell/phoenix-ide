@@ -1877,8 +1877,8 @@ where
     /// `EffectOutcome` type.
     retry_outcome_tx: mpsc::Sender<(u64, u32)>,
     retry_outcome_rx: mpsc::Receiver<(u64, u32)>,
-    /// Channel to notify parent of sub-agent completion (sub-agent only)
-    parent_event_tx: Option<mpsc::Sender<Event>>,
+    /// Durable parent address and in-process dispatcher (sub-agent only).
+    parent_dispatch: Option<(String, Arc<dyn crate::runtime::ConversationEventDispatcher>)>,
     /// Channel to request sub-agent spawning (parent only)
     spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
     /// Channel to request sub-agent cancellation (parent only)
@@ -2086,7 +2086,7 @@ where
             tool_outcome_rx,
             retry_outcome_tx,
             retry_outcome_rx,
-            parent_event_tx: None,
+            parent_dispatch: None,
             spawn_tx: None,
             cancel_tx: None,
             handoff_tx: None,
@@ -2284,8 +2284,12 @@ where
         self
     }
 
-    pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
-        self.parent_event_tx = Some(parent_tx);
+    pub fn with_parent_dispatch(
+        mut self,
+        parent_conversation_id: String,
+        dispatcher: Arc<dyn crate::runtime::ConversationEventDispatcher>,
+    ) -> Self {
+        self.parent_dispatch = Some((parent_conversation_id, dispatcher));
         self
     }
 
@@ -5045,7 +5049,12 @@ where
             }
         }
 
-        if work_count_in_batch > 1 {
+        let parallel_work_qualified =
+            phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                &self.context.model_id,
+            );
+
+        if !parallel_work_qualified && work_count_in_batch > 1 {
             let result = ToolResult::error(
                 tool_use_id.clone(),
                 "Only one Work sub-agent can be spawned per call. \
@@ -5058,7 +5067,7 @@ where
             }));
         }
 
-        if work_count_in_batch > 0 && self.active_work_subagents > 0 {
+        if !parallel_work_qualified && work_count_in_batch > 0 && self.active_work_subagents > 0 {
             let result = ToolResult::error(
                 tool_use_id.clone(),
                 "A Work sub-agent is already active. Only one Work sub-agent \
@@ -6581,16 +6590,16 @@ where
             }
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
-                if let Some(parent_tx) = &self.parent_event_tx {
+                if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
                         agent_id: self.context.conversation_id.clone(),
                         outcome,
                     };
-                    if let Err(error) = parent_tx.send(event).await {
-                        tracing::warn!(%error, "Failed to notify parent (may have terminated)");
+                    if let Err(error) = dispatcher.dispatch(parent_conversation_id, event).await {
+                        tracing::warn!(%error, %parent_conversation_id, "Failed to notify addressed parent conversation");
                     }
                 } else {
-                    tracing::warn!("No parent channel configured for sub-agent");
+                    tracing::warn!("No parent address configured for sub-agent");
                 }
                 Ok(None)
             }
@@ -7149,7 +7158,7 @@ where
                 &self.agent_config,
                 self.llm_registry.available_execution_routes(),
             );
-            tool.input_schema = catalog.schema();
+            tool.input_schema = catalog.schema(&self.context.model_id);
             self.spawn_catalog = Some(catalog);
         }
         let explore_bash_capability =
@@ -17699,7 +17708,12 @@ mod steer_drain_detector_tests {
         rt.context.is_sub_agent = true;
         storage.set_fail_state_update(true);
         let (parent_tx, mut parent_rx) = mpsc::channel(1);
-        rt.parent_event_tx = Some(parent_tx);
+        rt.parent_dispatch = Some((
+            "parent-conversation".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        ));
         let outcome = LlmOutcome::Response {
             provider_replay: None,
             content: vec![ContentBlock::text("done")],
@@ -17712,7 +17726,7 @@ mod steer_drain_detector_tests {
         rt.process_generation_tagged_llm_outcome(0, outcome).await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
-        assert!(rt.parent_event_tx.is_some());
+        assert!(rt.parent_dispatch.is_some());
 
         storage.set_fail_state_update(false);
         tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
@@ -20215,6 +20229,100 @@ mod work_subagent_cwd_guard_tests {
             rt.active_work_subagents, 0,
             "rejected spawn must not increment active_work_subagents"
         );
+    }
+
+    fn luna_work_task(task: &str) -> SubAgentTask {
+        SubAgentTask {
+            task: task.to_string(),
+            cwd: None,
+            mode: Some(SubAgentMode::Work),
+            execution: Some(phoenix_core::domain::sm_state::ExecutionSelection::Model {
+                model: "gpt-5.6-luna".to_string(),
+                connection: "openai_responses".to_string(),
+                reasoning_effort: Some(phoenix_core::domain::llm_types::ModelEffort::High),
+            }),
+            max_turns: None,
+            agent_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_parent_models_admit_multiple_luna_work_children() {
+        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+            let worktree = TempDir::new().expect("worktree tempdir");
+            let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.context.model_id = parent_model.to_string();
+
+            let result = rt
+                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![
+                        luna_work_task("first partition"),
+                        luna_work_task("second partition"),
+                    ],
+                }))
+                .await
+                .expect("qualified spawn validation");
+
+            assert!(
+                matches!(
+                    result,
+                    Some(Event::SpawnAgentsComplete { ref spawned, .. }) if spawned.len() == 2
+                ),
+                "{parent_model}: {result:?}"
+            );
+            for _ in 0..2 {
+                let request = spawn_rx.try_recv().expect("Luna child request");
+                assert_eq!(request.spec.model_id, "gpt-5.6-luna");
+                assert_eq!(request.spec.mode, SubAgentMode::Work);
+            }
+            assert_eq!(rt.active_work_subagents, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn luna_parent_still_rejects_multiple_work_children() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_work_mode(worktree.path());
+        rt.context.model_id = "gpt-5.6-luna".to_string();
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![luna_work_task("first"), luna_work_task("second")],
+            }))
+            .await
+            .expect("unqualified spawn validation");
+
+        assert!(
+            matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
+        );
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn qualified_explore_parent_still_cannot_spawn_work_children() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_mode(
+            worktree.path(),
+            ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            },
+        );
+        rt.context.model_id = "gpt-6-astra".to_string();
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![luna_work_task("write")],
+            }))
+            .await
+            .expect("Explore authority validation");
+
+        assert!(
+            matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
+        );
+        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]
