@@ -90,8 +90,14 @@ impl ContinuationHistory {
         let accepted = accepted_message_id
             .and_then(|id| messages.iter().find(|message| message.message_id == id));
         let handoff = if let Some(message) = accepted {
-            if !matches!(message.content, MessageContent::User(_)) {
-                return Err("Accepted continuation handoff is not a user message".to_string());
+            if !matches!(
+                message.content,
+                MessageContent::User(_) | MessageContent::Continuation(_)
+            ) {
+                return Err(
+                    "Accepted continuation handoff lacks user or generated-context authority"
+                        .to_string(),
+                );
             }
             let mut rendered =
                 render_messages(std::iter::once(message), &std::collections::HashSet::new());
@@ -230,6 +236,22 @@ mod tests {
         let handoff = history.handoff.unwrap();
         assert_eq!(handoff.message.content, user("edited").content);
         assert_eq!(handoff.message_id, "accepted");
+    }
+
+    #[test]
+    fn typed_generated_handoff_remains_protected_for_later_compaction() {
+        let mut generated = persisted("generated", "ignored");
+        generated.message_type = MessageType::Continuation;
+        generated.content = MessageContent::Continuation(crate::db::ContinuationContent {
+            summary: "authority-wrapped generated context".to_string(),
+        });
+        let history =
+            ContinuationHistory::from_projection(&[generated], Some("generated")).unwrap();
+        let handoff = history.handoff.unwrap();
+        assert_eq!(
+            handoff.message.content,
+            user("authority-wrapped generated context").content
+        );
     }
 
     #[test]
