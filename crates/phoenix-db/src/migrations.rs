@@ -774,7 +774,6 @@ SET resume_phase = CASE
 END;
 ";
 
-
 const MIGRATION_102: &str = r"
 ALTER TABLE automatic_continuation_admissions
 RENAME TO automatic_continuation_admissions_migration_101_old;
@@ -10819,7 +10818,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
 
         let phase: String = sqlx::query_scalar(
             "UPDATE automatic_continuation_admissions
@@ -10930,7 +10929,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_102).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_103).execute(&pool).await.unwrap();
 
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT predecessor_conversation_id, resume_phase
