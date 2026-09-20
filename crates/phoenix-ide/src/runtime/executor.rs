@@ -85,6 +85,7 @@ enum AuthoritativeEffect {
     ScheduleRetry {
         delay: Duration,
         attempt: u32,
+        max_attempts: u32,
         reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason,
         resets_at: Option<DateTime<Utc>>,
     },
@@ -240,11 +241,13 @@ impl ClassifiedEffect {
             Effect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             })),
@@ -6151,6 +6154,7 @@ where
             AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
+                max_attempts,
                 reason,
                 resets_at,
             } => {
@@ -6168,7 +6172,7 @@ where
                     .event(|seq| SseEvent::LlmAttempt {
                         sequence_id: seq,
                         attempt,
-                        max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                        max_attempts,
                         reason,
                         backing_off_ms,
                         resets_at,

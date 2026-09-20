@@ -26,6 +26,9 @@ use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
+use phoenix_core::domain::retry_policy::{
+    AutoRetryPolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
+};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -200,7 +203,8 @@ fn resolve_task_file(
 /// so the client can render `(retry K/N <reason>)` (specs/llm-retry-visibility/
 /// REQ-LRV-001). `pub` exposure is for the executor's
 /// `Effect::ScheduleRetry` handler, which sends the value on the wire.
-pub const MAX_RETRY_ATTEMPTS: u32 = 3;
+pub const MAX_RETRY_ATTEMPTS: u32 = GENERIC_MAX_ATTEMPTS;
+pub const MAX_OVERLOAD_ATTEMPTS: u32 = OVERLOAD_MAX_ATTEMPTS;
 
 /// Stamp `retry_count = saturating_sub(1)` onto an assistant message's
 /// `display_data` (the JSON-blob form `Option<serde_json::Value>`) iff
@@ -238,6 +242,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         // the `server_error` reason rather than widening the spec'd
         // `server_error` wire reason rather than adding another class.
         ErrorKind::ServerError | ErrorKind::InvalidResponse => LlmAttemptReason::ServerError,
+        ErrorKind::ServerOverloaded => LlmAttemptReason::ServerOverloaded,
         ErrorKind::Network => LlmAttemptReason::Network,
         ErrorKind::TimedOut => LlmAttemptReason::TimedOut,
         // Non-retryable kinds. `db::ErrorKind::is_auto_retryable` admits
@@ -248,7 +253,6 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         // value rather than panicking the conversation).
         ErrorKind::Auth
         | ErrorKind::UsageLimitReached
-        | ErrorKind::ServerOverloaded
         | ErrorKind::InvalidRequest
         | ErrorKind::PromptRejected
         | ErrorKind::Cancelled
@@ -729,7 +733,7 @@ pub fn transition_core(
         // Error Handling and Retry (REQ-BED-006)
         (CoreState::LlmRequesting { .. }, CoreEvent::LlmError { .. })
         | (CoreState::LlmRequesting { .. }, CoreEvent::RetryTimeout { .. }) => {
-            handle_core_error_retry(state, event)
+            handle_core_error_retry(state, context, event)
         }
 
         // Tool Execution (REQ-BED-004)
@@ -762,7 +766,7 @@ pub fn transition_core(
             CoreEvent::UserTriggerContinuation { .. },
         )
         | (CoreState::Idle, CoreEvent::UserTriggerContinuation { .. }) => {
-            handle_core_continuation(state, event)
+            handle_core_continuation(state, context, event)
         }
 
         // Stale LlmResponse after cancel
@@ -1513,6 +1517,7 @@ fn handle_core_sub_agents(
 /// Handles `LlmError` and `RetryTimeout` events during `LlmRequesting` state.
 fn handle_core_error_retry(
     state: &CoreState,
+    context: &ConvContext,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
@@ -1524,9 +1529,10 @@ fn handle_core_error_retry(
                 resets_at,
                 ..
             },
-        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
+        ) if retry_policy(error_kind).is_some_and(|policy| *attempt < policy.max_attempts()) => {
             let new_attempt = attempt + 1;
-            let delay = retry_delay(new_attempt);
+            let policy = retry_policy(error_kind).expect("retry guard established policy");
+            let delay = retry_delay(policy, new_attempt, &context.conversation_id);
             let reason = error_kind_to_attempt_reason(error_kind);
 
             Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
@@ -1536,6 +1542,7 @@ fn handle_core_error_retry(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                max_attempts: policy.max_attempts(),
                 reason,
                 resets_at,
             })
@@ -1594,6 +1601,7 @@ fn handle_core_error_retry(
 /// `AwaitingContinuation`, and `UserTriggerContinuation` from Idle.
 fn handle_core_continuation(
     state: &CoreState,
+    context: &ConvContext,
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
@@ -1604,9 +1612,12 @@ fn handle_core_continuation(
                 resets_at,
                 ..
             },
-        ) if error_kind.is_auto_retryable() && request.attempt < MAX_RETRY_ATTEMPTS => {
+        ) if retry_policy(error_kind)
+            .is_some_and(|policy| request.attempt < policy.max_attempts()) =>
+        {
             let new_attempt = request.attempt + 1;
-            let delay = retry_delay(new_attempt);
+            let policy = retry_policy(error_kind).expect("retry guard established policy");
+            let delay = retry_delay(policy, new_attempt, &context.conversation_id);
             let reason = error_kind_to_attempt_reason(error_kind);
             let mut next_request = request.clone();
             next_request.attempt = new_attempt;
@@ -1618,6 +1629,7 @@ fn handle_core_continuation(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                max_attempts: policy.max_attempts(),
                 reason,
                 resets_at,
             })
@@ -2693,9 +2705,10 @@ pub fn transition_parent(
                 ..
             }),
         ) if request.operation_id == operation_id
-            && error_kind.is_auto_retryable()
-            && request.attempt < MAX_RETRY_ATTEMPTS =>
+            && retry_policy(&error_kind)
+                .is_some_and(|policy| request.attempt < policy.max_attempts()) =>
         {
+            let policy = retry_policy(&error_kind).expect("retry guard established policy");
             let mut next_request = request.clone();
             next_request.attempt += 1;
             let attempt = next_request.attempt;
@@ -2705,8 +2718,9 @@ pub fn transition_parent(
                 }))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::ScheduleRetry {
-                    delay: retry_delay(attempt),
+                    delay: retry_delay(policy, attempt, &context.conversation_id),
                     attempt,
+                    max_attempts: policy.max_attempts(),
                     reason: error_kind_to_attempt_reason(&error_kind),
                     resets_at,
                 })
@@ -2749,7 +2763,9 @@ pub fn transition_parent(
                 ref error_kind,
                 ..
             }),
-        ) if !error_kind.is_auto_retryable() || request.attempt >= MAX_RETRY_ATTEMPTS => {
+        ) if retry_policy(error_kind)
+            .is_none_or(|policy| request.attempt >= policy.max_attempts()) =>
+        {
             Ok(ParentTransitionResult::new(ParentState::Core(
                 CoreState::RecoverableContinuationFailure {
                     failure: crate::state::RecoverableContinuationFailure {
@@ -2967,7 +2983,7 @@ pub fn transition_sub_agent(
                 error_kind,
                 ..
             }),
-        ) if !error_kind.is_auto_retryable() || *attempt >= MAX_RETRY_ATTEMPTS => {
+        ) if retry_policy(&error_kind).is_none_or(|policy| *attempt >= policy.max_attempts()) => {
             let error_message = if error_kind.is_auto_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
@@ -3559,9 +3575,54 @@ fn extract_text_from_content(blocks: &[phoenix_core::domain::llm_types::ContentB
         .join("\n")
 }
 
-fn retry_delay(attempt: u32) -> Duration {
-    // Exponential backoff: 1s, 2s, 4s
-    Duration::from_secs(1 << (attempt - 1))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryPolicy {
+    kind: AutoRetryPolicy,
+}
+
+impl RetryPolicy {
+    fn max_attempts(self) -> u32 {
+        self.kind
+            .max_attempts()
+            .expect("retry policy always has an attempt bound")
+    }
+}
+
+fn retry_policy(kind: &ErrorKind) -> Option<RetryPolicy> {
+    let policy = kind.auto_retry_policy();
+    policy
+        .allows_auto_retry()
+        .then_some(RetryPolicy { kind: policy })
+}
+
+fn retry_delay(policy: RetryPolicy, attempt: u32, conversation_id: &str) -> Duration {
+    match policy.kind {
+        AutoRetryPolicy::Generic { .. } => Duration::from_secs(1 << (attempt - 1)),
+        AutoRetryPolicy::ServerOverloaded { .. } => {
+            let base_ms = 4_000_u64 << (attempt - 2);
+            let hash = conversation_id
+                .bytes()
+                .fold(u64::from(attempt), |acc, byte| {
+                    acc.wrapping_mul(1_099_511_628_211)
+                        .wrapping_add(u64::from(byte))
+                });
+            let jitter_percent = 75 + hash % 51;
+            Duration::from_millis(base_ms * jitter_percent / 100)
+        }
+        AutoRetryPolicy::NoAutoRetry => unreachable!("excluded policy cannot schedule a retry"),
+    }
+}
+
+#[cfg(test)]
+fn overload_retry_delays(conversation_id: &str) -> Vec<Duration> {
+    let policy = RetryPolicy {
+        kind: AutoRetryPolicy::ServerOverloaded {
+            max_attempts: MAX_OVERLOAD_ATTEMPTS,
+        },
+    };
+    (2..=MAX_OVERLOAD_ATTEMPTS)
+        .map(|attempt| retry_delay(policy, attempt, conversation_id))
+        .collect()
 }
 
 #[allow(dead_code)] // Conversion utility
@@ -4010,11 +4071,146 @@ mod tests {
     }
 
     #[test]
-    fn continuation_capacity_failure_is_recoverable_and_retry_reuses_operation() {
+    fn overload_backoff_is_deterministic_jittered_exponential_and_bounded() {
+        let first = overload_retry_delays("conversation-a");
+        assert_eq!(first, overload_retry_delays("conversation-a"));
+        assert_ne!(first, overload_retry_delays("conversation-b"));
+        for (delay, base_secs) in first.iter().zip([4_u64, 8, 16, 32]) {
+            let millis = u64::try_from(delay.as_millis()).unwrap();
+            assert!((base_secs * 750..=base_secs * 1_250).contains(&millis));
+        }
+        assert!(first.iter().sum::<Duration>() <= Duration::from_secs(75));
+    }
+
+    #[test]
+    fn generic_retry_delays_remain_two_then_four_seconds() {
+        let context = test_context();
+        for (attempt, expected) in [(1, Duration::from_secs(2)), (2, Duration::from_secs(4))] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt },
+                &context,
+                Event::LlmError {
+                    message: "network".to_string(),
+                    error_kind: ErrorKind::Network,
+                    attempt,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            assert!(result.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ScheduleRetry {
+                    delay,
+                    attempt: scheduled,
+                    max_attempts: MAX_RETRY_ATTEMPTS,
+                    reason: LlmAttemptReason::Network,
+                    ..
+                } if *scheduled == attempt + 1 && *delay == expected
+            )));
+        }
+    }
+
+    #[test]
+    fn exhausted_ordinary_overload_becomes_visible_error() {
+        let result = transition(
+            &ConvState::LlmRequesting {
+                attempt: MAX_OVERLOAD_ATTEMPTS,
+            },
+            &test_context(),
+            Event::LlmError {
+                message: "selected model is at capacity".to_string(),
+                error_kind: ErrorKind::ServerOverloaded,
+                attempt: MAX_OVERLOAD_ATTEMPTS,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::ServerOverloaded,
+                ref message,
+                ..
+            } if message.contains("Failed after 5 attempts")
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::ScheduleRetry { .. })));
+    }
+
+    #[test]
+    fn overload_policy_schedules_ordinary_and_continuation_retries() {
+        let context = test_context();
+        let ordinary = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmError {
+                message: "selected model is at capacity".to_string(),
+                error_kind: ErrorKind::ServerOverloaded,
+                attempt: 1,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+        let ordinary_delay = ordinary.effects.iter().find_map(|effect| match effect {
+            Effect::ScheduleRetry {
+                delay,
+                attempt: 2,
+                max_attempts: MAX_OVERLOAD_ATTEMPTS,
+                reason: LlmAttemptReason::ServerOverloaded,
+                ..
+            } => Some(*delay),
+            _ => None,
+        });
+        assert!(ordinary_delay.is_some_and(|delay| {
+            (Duration::from_secs(3)..=Duration::from_secs(5)).contains(&delay)
+        }));
+
         let request = ContinuationSummaryRequest {
             operation_id: "capacity-op".to_string(),
             rejected_tool_calls: vec![test_tool_call("tool-1")],
-            attempt: MAX_RETRY_ATTEMPTS,
+            attempt: 1,
+        };
+        let continuation = transition(
+            &ConvState::AwaitingContinuation {
+                request: request.clone(),
+            },
+            &context,
+            Event::ContinuationError {
+                operation_id: request.operation_id.clone(),
+                message: "selected model is at capacity".to_string(),
+                error_kind: ErrorKind::ServerOverloaded,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            continuation.new_state,
+            ConvState::AwaitingContinuation { ref request }
+                if request.operation_id == "capacity-op" && request.attempt == 2
+        ));
+        assert!(continuation.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleRetry {
+                delay,
+                attempt: 2,
+                max_attempts: MAX_OVERLOAD_ATTEMPTS,
+                reason: LlmAttemptReason::ServerOverloaded,
+                ..
+            } if Some(*delay) == ordinary_delay
+        )));
+    }
+
+    #[test]
+    fn exhausted_continuation_overload_is_recoverable_and_reuses_operation() {
+        let request = ContinuationSummaryRequest {
+            operation_id: "capacity-op".to_string(),
+            rejected_tool_calls: vec![test_tool_call("tool-1")],
+            attempt: MAX_OVERLOAD_ATTEMPTS,
         };
         let failed = transition(
             &ConvState::AwaitingContinuation {
@@ -4048,7 +4244,7 @@ mod tests {
             retried.new_state,
             ConvState::AwaitingContinuation { ref request }
                 if request.operation_id == "capacity-op"
-                    && request.attempt == MAX_RETRY_ATTEMPTS + 1
+                    && request.attempt == MAX_OVERLOAD_ATTEMPTS + 1
         ));
         assert!(retried.effects.iter().any(|effect| matches!(
             effect,

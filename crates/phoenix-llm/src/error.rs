@@ -479,21 +479,29 @@ mod tests {
 
     #[test]
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
-        use phoenix_core::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
-        use AutoRetryPolicy::{AutoRetryable, NoAutoRetry};
+        use phoenix_core::domain::retry_policy::{
+            AutoRetryPolicy, UserResumePolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
+        };
+        use AutoRetryPolicy::NoAutoRetry;
         use LlmErrorKind::{
             Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
             RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
         };
         use UserResumePolicy::{NotResumable, Resumable};
+        const GENERIC: AutoRetryPolicy = AutoRetryPolicy::Generic {
+            max_attempts: GENERIC_MAX_ATTEMPTS,
+        };
+        const OVERLOAD: AutoRetryPolicy = AutoRetryPolicy::ServerOverloaded {
+            max_attempts: OVERLOAD_MAX_ATTEMPTS,
+        };
 
         let cases = [
-            (Network, AutoRetryable, Resumable),
-            (RateLimit, AutoRetryable, Resumable),
+            (Network, GENERIC, Resumable),
+            (RateLimit, GENERIC, Resumable),
             (UsageLimitReached, NoAutoRetry, Resumable),
-            (ServerError, AutoRetryable, Resumable),
-            (InvalidResponse, AutoRetryable, Resumable),
-            (ServerOverloaded, NoAutoRetry, Resumable),
+            (ServerError, GENERIC, Resumable),
+            (InvalidResponse, GENERIC, Resumable),
+            (ServerOverloaded, OVERLOAD, Resumable),
             (Auth, NoAutoRetry, Resumable),
             (InvalidRequest, NoAutoRetry, Resumable),
             (ContentFilter, NoAutoRetry, NotResumable),
