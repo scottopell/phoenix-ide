@@ -10,6 +10,18 @@ const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
 const WORKTREE_WRITE_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_WRITE";
 const WORKTREE_ROOT_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_ROOT";
+const NETWORK_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
 
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
@@ -99,6 +111,13 @@ impl ExploreReadOnlyPolicy {
         if let Some(worktree_root) = &self.worktree_write_root {
             command.env(WORKTREE_WRITE_ENV, "1");
             command.env(WORKTREE_ROOT_ENV, worktree_root);
+        }
+        if self.worktree_write_root.is_some() {
+            for name in NETWORK_ENV_ALLOWLIST {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
         }
         self.apply_child_env(command);
     }

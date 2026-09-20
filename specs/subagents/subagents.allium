@@ -324,7 +324,7 @@ rule SubAgentSpecsResolved {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
-    requires: parent.mode in { work, branch, direct }
+    requires: parent.work_scope_authority = write_capable
         or not any_task_mode_is_work(tasks)
     requires: work_task_count(tasks) <= 1
     requires: work_task_count(tasks) = 0
