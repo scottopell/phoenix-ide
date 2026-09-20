@@ -198,11 +198,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       || voiceInterim.length > 0;
   }, [draft, images, files, voiceBase, voiceInterim]);
   useEffect(() => {
-    if (deferredExpansionErrorRef.current?.scopeKey === scopeKey) {
-      setExpansionError(deferredExpansionErrorRef.current.error);
+    const deferred = deferredExpansionErrorRef.current;
+    if (deferred?.scopeKey === scopeKey) {
+      setExpansionError(deferred.error);
       deferredExpansionErrorRef.current = null;
     }
-  }, [scopeKey]);
+  }, [scopeKey, setExpansionError]);
 
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -481,7 +482,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           // This render's callbacks remain bound to the submitted conversation's stores.
           deferredExpansionErrorRef.current = {
             scopeKey: submittedScopeKey,
-            error: err.detail.error,
+            error: err.detail.error ?? 'Reference expansion failed',
           };
           setDraft(text);
           setImages(images);
