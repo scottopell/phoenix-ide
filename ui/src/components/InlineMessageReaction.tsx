@@ -52,7 +52,7 @@ function ReactionSession({ scopeKey, messages, destination, returnToSource, stor
         store.dispatch(scopeKey, { type: 'select', source: selected.source, presentation: touchDocked ? 'touch-docked' : 'floating' });
         selectionInput = null;
         setNotice('');
-      } else if (current) {
+      } else if (current?.presentation === 'floating') {
         store.dispatch(scopeKey, { type: 'clear' });
       }
     };

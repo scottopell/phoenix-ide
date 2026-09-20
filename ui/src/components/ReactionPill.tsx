@@ -78,7 +78,8 @@ export function ReactionPill({ source, sourceRange, touchDocked = false, capture
       const width = (viewport?.width ?? window.innerWidth) - safeLeft - safeRight;
       const bottom = viewportTop + (viewport?.height ?? window.innerHeight) - safeBottom;
       const transcript = scroller.getBoundingClientRect();
-      const range = restoreReactionRange(source) ?? sourceRange;
+      const restoredRange = restoreReactionRange(source);
+      const range = restoredRange ?? (sourceRange?.commonAncestorContainer.isConnected ? sourceRange : null);
       const rect = range?.getBoundingClientRect();
       if (returning.current && rect && rect.height > 0) {
         returning.current = false;

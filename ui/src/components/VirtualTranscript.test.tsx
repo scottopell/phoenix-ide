@@ -250,6 +250,30 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('keeps dock padding out of the virtual viewport extent after scrolling and tailing', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        ref={ref}
+        items={makeItems(20, 10)}
+        getKey={(item) => item.id}
+        estimatedExtent={10}
+        overscan={0}
+        initialTail={false}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+    scroller!.style.paddingBottom = '40px';
+    act(() => resizeObservers[0]!.triggerEntries([[scroller!, 60]]));
+    fireEvent.scroll(scroller!, { target: { scrollTop: 1 } });
+    act(() => ref.current?.scrollToTail());
+    expect(scrollTopOf(scroller)).toBe(140);
+    expect(rowIndexes()).toEqual([14, 15, 16, 17, 18, 19]);
+  });
+
   it('positions an intra-row target through the transcript executor', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;

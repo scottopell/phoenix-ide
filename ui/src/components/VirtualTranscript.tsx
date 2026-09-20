@@ -187,6 +187,12 @@ function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+function viewportExtentForScroller(scroller: HTMLElement, measuredExtent = scroller.clientHeight): number {
+  const styles = getComputedStyle(scroller);
+  const reserved = (Number.parseFloat(styles.paddingTop) || 0) + (Number.parseFloat(styles.paddingBottom) || 0);
+  return clampNonNegative(measuredExtent - reserved);
+}
+
 function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange | null {
   return range ? { startIndex: range.startIndex, endIndex: range.endIndex } : null;
 }
@@ -243,7 +249,7 @@ function synchronizedPhysicalSnapshot<T>(
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
   store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
-  store.viewportExtent = store.scroller?.clientHeight ?? store.viewportExtent;
+  store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
   recompute(store);
   return buildPhysicalSnapshot(store, targetIndex, targetSelector);
 }
@@ -443,7 +449,7 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
     const target = entry.target;
     const entryHeight = clampNonNegative(entry.contentRect.height);
     if (target === store.scroller) {
-      const nextExtent = entryHeight || store.scroller?.clientHeight || 0;
+      const nextExtent = entryHeight || (store.scroller ? viewportExtentForScroller(store.scroller) : 0);
       if (store.viewportExtent !== nextExtent) {
         store.viewportExtent = clampNonNegative(nextExtent);
         viewportChanged = true;
@@ -683,7 +689,7 @@ function VirtualTranscriptInner<T>(
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
-      current.viewportExtent = element.clientHeight;
+      current.viewportExtent = viewportExtentForScroller(element);
       observeElement(current, publish, element);
       if (current.initialTailPending && current.layout.count > 0) {
         current.initialTailPending = false;
@@ -897,7 +903,7 @@ function VirtualTranscriptInner<T>(
     current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
-    current.viewportExtent = current.scroller.clientHeight;
+    current.viewportExtent = viewportExtentForScroller(current.scroller);
     current.activeAnchor = captureTopAnchor(current);
     recompute(current);
     publish();

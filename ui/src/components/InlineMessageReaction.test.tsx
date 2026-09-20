@@ -34,12 +34,12 @@ function setCoarsePointer(matches: boolean) {
   }));
 }
 
-function Harness({ store, scope = 'conversation-a', append }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined }) {
+function Harness({ store, scope = 'conversation-a', append, sourceMounted = true }: { store: InlineReactionStore; scope?: string; append?: ((text: string) => void) | undefined; sourceMounted?: boolean }) {
   return (
     <FocusScopeProvider>
       <InlineReactionContext.Provider value={store}>
         <div id="messages">
-          {messages.map((message) => (
+          {messages.filter((message) => sourceMounted || message.message_id !== 'old').map((message) => (
             <div key={message.message_id} className="message agent" data-inline-reaction-message={message.message_id} data-message-occurrence={`${message.conversation_id}:${message.message_id}`} data-message-id={message.message_id} data-sequence-id="2">
               <div className="agent-text-block" data-fragment-id="text-0"><p data-testid={message.message_id}>Deterministic state patterns <code>replay(events)</code></p></div>
             </div>
@@ -168,6 +168,26 @@ describe('inline message reactions', () => {
     view.rerender(<Harness store={store} append={append} />);
     expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
     expect(screen.getByRole('textbox')).toHaveValue('Retain presentation');
+  });
+
+  it('retains an empty touch reaction when scrolling virtualizes its selected source', async () => {
+    setCoarsePointer(true);
+    const store = new InlineReactionStore();
+    const append = vi.fn();
+    const view = render(<Harness store={store} append={append} />);
+    const text = screen.getByTestId('old').firstChild!;
+    fireEvent.pointerDown(text, { pointerType: 'touch' });
+    select(text);
+    expect(await screen.findByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    const owned = store.getSnapshot('conversation-a');
+    expect(owned?.body).toBe('');
+    view.rerender(<Harness store={store} append={append} sourceMounted={false} />);
+    window.getSelection()?.removeAllRanges();
+    fireEvent(document, new Event('selectionchange'));
+    await act(async () => { await new Promise(requestAnimationFrame); });
+    expect(store.getSnapshot('conversation-a')).toEqual(owned);
+    expect(screen.getByRole('region', { name: 'Docked reaction' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Return to passage/ })).toBeInTheDocument();
   });
 
   it('dismisses an empty reaction without reopening it on pointerup', async () => {
