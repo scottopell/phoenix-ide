@@ -80,7 +80,7 @@ impl ContinuationApplicationService {
     pub(crate) async fn drive_admission(
         &self,
         admission: &AutomaticContinuationAdmission,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if admission.opening_authority != ContinuationOpeningAuthority::GeneratedPredecessorContext
         {
             return Err("automatic admission lacks generated-context authority".to_string());
@@ -93,7 +93,7 @@ impl ContinuationApplicationService {
             .map_err(|error| error.to_string())?
             .is_some()
         {
-            return Ok(());
+            return Ok(true);
         }
 
         let current = self.current_admission(admission).await?;
@@ -202,7 +202,7 @@ impl ContinuationApplicationService {
             match outcome {
                 SendChatOutcome::Delivered
                 | SendChatOutcome::AlreadyPersisted
-                | SendChatOutcome::QueuedAsSteering => return Ok(()),
+                | SendChatOutcome::QueuedAsSteering => return Ok(true),
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
         }
@@ -241,7 +241,7 @@ impl ContinuationApplicationService {
                 SendChatOutcome::Rejected { message, .. } => return Err(message),
             }
         }
-        Ok(())
+        Ok(current.phase != AutomaticContinuationPhase::DispatchAccepted)
     }
 
     async fn current_admission(
@@ -254,6 +254,56 @@ impl ContinuationApplicationService {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "automatic continuation admission is missing".to_string())
+    }
+
+    async fn reconcile_durable_phase(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+    ) -> Result<AutomaticContinuationPhase, String> {
+        if self
+            .runtime
+            .db()
+            .reconcile_completed_automatic_continuation(admission)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(self.current_admission(admission).await?.phase);
+        }
+        let intent = self
+            .runtime
+            .db()
+            .continuation_dispatch_intent(&admission.predecessor_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if intent.is_some() {
+            let current = self.current_admission(admission).await?;
+            if current.phase == AutomaticContinuationPhase::Admitted {
+                self.advance_current(
+                    &admission.predecessor_conversation_id,
+                    AutomaticContinuationPhase::SuccessorReserved,
+                )
+                .await?;
+                return Ok(AutomaticContinuationPhase::SuccessorReserved);
+            }
+            if current.phase == AutomaticContinuationPhase::SuccessorReserved
+                && crate::runtime::wake::continuation_transfer_is_settled(
+                    &self.runtime,
+                    &admission.predecessor_conversation_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                self.advance_current(
+                    &admission.predecessor_conversation_id,
+                    AutomaticContinuationPhase::OwnershipTransferred,
+                )
+                .await?;
+                return Ok(AutomaticContinuationPhase::OwnershipTransferred);
+            }
+            return Ok(current.phase);
+        }
+        Ok(self.current_admission(admission).await?.phase)
     }
 
     async fn advance_current(
@@ -269,7 +319,10 @@ impl ContinuationApplicationService {
     }
 }
 
-pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) {
+pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) -> bool {
+    let Ok(_authority) = runtime.acquire_local_authority_pass() else {
+        return false;
+    };
     let admissions = match runtime
         .db()
         .pending_automatic_continuation_admissions()
@@ -278,30 +331,38 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
         Ok(admissions) => admissions,
         Err(error) => {
             warn!(%error, "failed to discover automatic continuation admissions");
-            return;
+            return true;
         }
     };
     let service = ContinuationApplicationService::new(runtime.clone());
     for admission in admissions {
         match service.drive_admission(&admission).await {
-            Ok(()) => {
+            Ok(true) => {
                 debug!(predecessor = %admission.predecessor_conversation_id, "automatic continuation progressed");
             }
-            Err(error) => {
-                let current = runtime
+            Ok(false) => {
+                let error = "automatic continuation replay made no durable progress";
+                warn!(predecessor = %admission.predecessor_conversation_id, %error);
+                if let Err(record_error) = runtime
                     .db()
-                    .automatic_continuation_admission(&admission.predecessor_conversation_id)
-                    .await;
+                    .reconcile_or_record_automatic_continuation_no_progress(&admission, error)
+                    .await
+                {
+                    warn!(%record_error, "failed to persist automatic continuation failure");
+                }
+            }
+            Err(error) => {
+                let current = service.reconcile_durable_phase(&admission).await;
                 match current {
-                    Ok(Some(current)) if current.phase != admission.phase => {
+                    Ok(phase) if phase != admission.phase => {
                         warn!(
                             predecessor = %admission.predecessor_conversation_id,
-                            phase = current.phase.as_str(),
+                            phase = phase.as_str(),
                             %error,
                             "automatic continuation advanced before a later step failed"
                         );
                     }
-                    Ok(Some(_)) => {
+                    Ok(_) => {
                         warn!(predecessor = %admission.predecessor_conversation_id, %error, "automatic continuation made no durable progress");
                         if let Err(record_error) = runtime
                             .db()
@@ -313,11 +374,6 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
                             warn!(%record_error, "failed to persist automatic continuation failure");
                         }
                     }
-                    Ok(None) => warn!(
-                        predecessor = %admission.predecessor_conversation_id,
-                        %error,
-                        "automatic continuation admission disappeared after failure"
-                    ),
                     Err(record_error) => {
                         warn!(%record_error, "failed to inspect automatic continuation progress");
                     }
@@ -325,6 +381,7 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
             }
         }
     }
+    true
 }
 
 #[cfg(test)]

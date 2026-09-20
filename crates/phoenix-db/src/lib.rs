@@ -8415,7 +8415,19 @@ impl Database {
             .continue_conversation_inner(parent_id, Some(&intent))
             .await?;
         let stored = self.continuation_dispatch_intent(parent_id).await?;
-        Ok((outcome, stored))
+        let accepted = match (&outcome, stored) {
+            (_, Some(stored)) => Some(stored),
+            (ContinueOutcome::Created(successor), None) => Some(ContinuationDispatchIntent {
+                parent_conversation_id: parent_id.to_string(),
+                successor_conversation_id: successor.id.clone(),
+                message_id: intent.message_id,
+                handoff: intent.handoff,
+                user_agent: intent.user_agent,
+                opening_authority: intent.opening_authority,
+            }),
+            _ => None,
+        };
+        Ok((outcome, accepted))
     }
 
     #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent

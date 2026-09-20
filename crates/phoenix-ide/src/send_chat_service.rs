@@ -141,27 +141,33 @@ impl SendChatApplicationService {
         {
             return Ok(AutomaticRetryTurnState::AlreadyAccepted);
         }
-        match repo
-            .rearm_terminal_runtime_direct_turn_for_automatic_continuation(
-                &crate::db::workflow::RearmAuthoritativeTurnInput {
-                    turn_id: turn.id,
-                    expected_generation: turn.generation,
-                    rearmed_at: now_timestamp(),
-                },
-                predecessor_conversation_id,
-            )
+        let input = crate::db::workflow::RearmAuthoritativeTurnInput {
+            turn_id: turn.id,
+            expected_generation: turn.generation,
+            rearmed_at: now_timestamp(),
+        };
+        let predecessor_conversation_id = predecessor_conversation_id.to_string();
+        let runtime = self.runtime.clone();
+        let rearm = tokio::spawn(async move {
+            let result = repo
+                .rearm_terminal_runtime_direct_turn_for_automatic_continuation(
+                    &input,
+                    &predecessor_conversation_id,
+                )
+                .await;
+            if matches!(
+                result,
+                Err(crate::db::workflow::RearmAuthoritativeTurnError::DurableFactUnclassified(_))
+            ) {
+                runtime.signal_fatal_local_authority("automatic_continuation_rearm_classification");
+            }
+            result
+        });
+        match rearm
             .await
-            .map_err(|error| {
-                if matches!(
-                    error,
-                    crate::db::workflow::RearmAuthoritativeTurnError::DurableFactUnclassified(_)
-                ) {
-                    self.runtime.signal_fatal_local_authority(
-                        "automatic_continuation_rearm_classification",
-                    );
-                }
-                SendChatServiceError::Internal(error.to_string())
-            })? {
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+        {
             crate::db::workflow::RearmAuthoritativeTurnOutcome::Rearmed { .. }
             | crate::db::workflow::RearmAuthoritativeTurnOutcome::ExactReplay { .. } => {
                 Ok(AutomaticRetryTurnState::RearmedWithAdmission)

@@ -972,18 +972,24 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let automatic_continuation_runtime = state.runtime.clone();
     tokio::spawn(async move {
-        crate::continuation_service::drain_automatic_continuations(
+        if !crate::continuation_service::drain_automatic_continuations(
             automatic_continuation_runtime.clone(),
         )
-        .await;
+        .await
+        {
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            crate::continuation_service::drain_automatic_continuations(
+            if !crate::continuation_service::drain_automatic_continuations(
                 automatic_continuation_runtime.clone(),
             )
-            .await;
+            .await
+            {
+                return;
+            }
         }
     });
 

@@ -842,11 +842,9 @@ impl WorkflowRepository {
         } else {
             true
         };
-        classification.rollback().await.map_err(|error| {
-            RearmAuthoritativeTurnError::DurableFactUnclassified(format!(
-                "rearm commit failed ({commit_error}); classification close failed: {error}"
-            ))
-        })?;
+        if let Err(error) = classification.rollback().await {
+            tracing::warn!(%error, "rearm classification rollback failed after authority was read");
+        }
         match exact {
             Some(turn) if admission_rearmed => Ok(RearmAuthoritativeTurnOutcome::Rearmed { turn }),
             _ => Err(RearmAuthoritativeTurnError::Database(commit_error)),
@@ -2616,13 +2614,17 @@ async fn load_exact_rearmed_turn_tx(
              JOIN workflow_transitions tr ON tr.workflow_id = w.workflow_id
              JOIN workflow_effects e ON e.workflow_id = w.workflow_id
              JOIN durable_turns t ON t.workflow_id = w.workflow_id
-             WHERE w.workflow_id = ?1 AND w.status = 'Active' AND w.generation = ?2
+             WHERE w.workflow_id = ?1 AND w.generation = ?2
                AND tr.generation = ?2 AND tr.event_codec_family = 'direct_turn.event'
                AND e.generation = ?2 AND e.kind = 'deliver_runtime_turn'
-               AND e.status IN ('Eligible', 'Executing')
                AND t.turn_id = ?3 AND t.generation = ?2
-               AND t.disposition = 'Runtime' AND t.terminal_kind IS NULL
-               AND t.canonical_message_id IS NULL AND t.owns_conversation = 1
+               AND t.disposition = 'Runtime'
+               AND (
+                   (w.status = 'Active' AND t.terminal_kind IS NULL
+                    AND e.status IN ('Eligible', 'Executing'))
+                   OR t.canonical_message_id IS NOT NULL
+                   OR e.status = 'Completed'
+               )
          )",
     )
     .bind(to_i64(workflow_id.0, "workflow_id")?)
