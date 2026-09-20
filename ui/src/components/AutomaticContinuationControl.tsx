@@ -34,6 +34,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
   const requestGeneration = useRef(0);
   const viewRevision = useRef(0);
   const savePending = useRef(false);
+  const retryPending = useRef(false);
   const scopeKind = scope.kind;
   const reference = scope.kind === 'ordinary' ? scope.reference : null;
 
@@ -49,7 +50,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     setFailedValue(null);
     setRetrying(false);
     const refresh = (initial: boolean) => {
-      if (refreshPending || savePending.current) return;
+      if (refreshPending || savePending.current || retryPending.current) return;
       refreshPending = true;
       const revision = ++viewRevision.current;
       const request = scopeKind === 'ordinary'
@@ -114,6 +115,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
     const generation = requestGeneration.current;
     const authorityLabel = admission.actionable_failure.opening_authority === 'generated_predecessor_context' ? 'generated' : 'manual';
     setRetrying(true);
+    retryPending.current = true;
     viewRevision.current += 1;
     setFeedback(null);
     try {
@@ -136,6 +138,7 @@ export function AutomaticContinuationControl({ scope }: AutomaticContinuationCon
         setFeedback(errorMessage(error, `Failed to retry ${authorityLabel} handoff`));
       }
     } finally {
+      retryPending.current = false;
       if (requestGeneration.current === generation) setRetrying(false);
     }
   }, [view]);

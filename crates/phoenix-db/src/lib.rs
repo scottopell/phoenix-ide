@@ -6714,6 +6714,27 @@ impl Database {
         Ok(exists != 0)
     }
 
+    /// Returns whether a successor is still waiting for its reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM continuation_dispatch_intents AS intent
+                 WHERE intent.successor_conversation_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM completed_continuation_handoffs AS completed
+                       WHERE completed.predecessor_conversation_id = intent.parent_conversation_id
+                   )
+             )",
+        )
+        .bind(successor_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
     /// Returns the durable successor that accepted a completed handoff.
     ///
     /// # Errors
@@ -8712,6 +8733,19 @@ impl Database {
             "UPDATE steering_messages
              SET conversation_id = ?2
              WHERE conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .bind(&new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE steering_acceptance_receipts
+             SET conversation_id = ?2
+             WHERE conversation_id = ?1
+               AND message_id IN (
+                   SELECT message_id FROM steering_messages
+                   WHERE conversation_id = ?2
+               )",
         )
         .bind(parent_id)
         .bind(&new_id)

@@ -160,7 +160,7 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     expect(screen.getByText('/global/old-coordinator?view=history#message-source')).toBeInTheDocument();
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('old-coordinator');
-    expect(screen.queryByTestId('automatic-continuation-control')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
   });
 
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {

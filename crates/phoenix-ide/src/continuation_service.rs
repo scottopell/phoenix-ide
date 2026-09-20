@@ -401,7 +401,11 @@ pub(crate) async fn drain_automatic_continuations(runtime: Arc<RuntimeManager>) 
                         }
                     }
                     Err(record_error) => {
-                        warn!(%record_error, "failed to inspect automatic continuation progress");
+                        warn!(%record_error, "automatic continuation reservation outcome is unclassified");
+                        runtime.signal_fatal_local_authority(
+                            "automatic_continuation_reservation_classification",
+                        );
+                        return false;
                     }
                 }
             }

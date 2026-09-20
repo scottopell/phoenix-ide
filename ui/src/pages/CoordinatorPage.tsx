@@ -23,7 +23,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!fixtureData);
   const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
-  const [currentCoordinatorId, setCurrentCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
 
   useEffect(() => {
     if (fixtureData) return;
@@ -33,7 +32,6 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     api.ensureGlobalCoordinator()
       .then((coordinator) => {
         if (cancelled) return;
-        setCurrentCoordinatorId(coordinator.conversation.id);
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
@@ -70,7 +68,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
       {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
       {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
-      {!loading && !error && resolvedCoordinatorId === slug && slug === currentCoordinatorId && (
+      {!loading && !error && resolvedCoordinatorId === slug && (
         <div className="coordinator-page__automatic-continuation">
           <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
         </div>

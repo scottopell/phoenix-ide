@@ -2314,6 +2314,18 @@ where
             }
         }
 
+        let continuation_opening_pending = self
+            .storage
+            .has_pending_continuation_opening(&self.context.conversation_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to classify pending continuation opening");
+                true
+            });
+        if continuation_opening_pending {
+            return RuntimeExitDisposition::Interrupted;
+        }
+
         let startup_drain = match self.commit_startup_steering_queue().await {
             Ok(outcome) => outcome,
             Err(error) => {
