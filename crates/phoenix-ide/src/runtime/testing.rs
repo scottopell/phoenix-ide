@@ -2135,12 +2135,14 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_turn_usage(
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         _usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {

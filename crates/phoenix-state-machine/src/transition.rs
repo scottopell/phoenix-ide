@@ -3541,6 +3541,8 @@ fn extract_text_from_content(blocks: &[phoenix_core::domain::llm_types::ContentB
             phoenix_core::domain::llm_types::ContentBlock::Image { .. }
             | phoenix_core::domain::llm_types::ContentBlock::ToolUse { .. }
             | phoenix_core::domain::llm_types::ContentBlock::ToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::Thinking { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::RedactedThinking { .. }
             | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse { .. }
             | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult { .. }
             | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult { .. }

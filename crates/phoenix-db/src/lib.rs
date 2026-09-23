@@ -12743,12 +12743,14 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the persistence boundary together
     pub async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: EffectiveEffort,
+        service_tier: ServiceTier,
         usage: &phoenix_core::domain::llm_types::Usage,
         first_byte_at: Option<DateTime<Utc>>,
     ) -> DbResult<()> {
@@ -12756,15 +12758,16 @@ impl Database {
         let first_byte_str = first_byte_at.map(|t| t.to_rfc3339());
         sqlx::query(
             "INSERT INTO turn_usage \
-             (conversation_id, root_conversation_id, model, effort_source, effort_level, \
+             (conversation_id, root_conversation_id, model, effort_source, effort_level, service_tier, \
               input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(conversation_id)
         .bind(root_conversation_id)
         .bind(model)
         .bind(effective_effort.source().as_str())
         .bind(effective_effort.level().map(ModelEffort::as_wire_name))
+        .bind(service_tier.as_wire_name())
         .bind(usage.input_tokens.cast_signed())
         .bind(usage.output_tokens.cast_signed())
         .bind(usage.reasoning_tokens.map(u64::cast_signed))
@@ -12886,13 +12889,13 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_daily_by_model(&self) -> DbResult<Vec<UsageDailyModelRow>> {
         let rows = sqlx::query(
-            "SELECT date(created_at) AS day, model, \
+            "SELECT date(created_at) AS day, model, service_tier, \
              COALESCE(SUM(input_tokens), 0) AS input_tokens, \
              COALESCE(SUM(output_tokens), 0) AS output_tokens, \
              COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, \
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
              COUNT(*) AS turns \
-             FROM turn_usage GROUP BY day, model ORDER BY day ASC",
+             FROM turn_usage GROUP BY day, model, service_tier ORDER BY day ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -12903,6 +12906,8 @@ impl Database {
                     day: r.try_get("day")?,
                     model: r.try_get("model")?,
                     input_tokens: r.try_get("input_tokens")?,
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     output_tokens: r.try_get("output_tokens")?,
                     cache_creation_tokens: r.try_get("cache_creation_tokens")?,
                     cache_read_tokens: r.try_get("cache_read_tokens")?,
@@ -12922,7 +12927,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_by_conversation(&self) -> DbResult<Vec<UsageConversationModelRow>> {
         let rows = sqlx::query(
-            "SELECT tu.root_conversation_id AS rid, tu.model AS model, \
+            "SELECT tu.root_conversation_id AS rid, tu.model AS model, tu.service_tier AS service_tier, \
              c.slug AS slug, c.title AS title, c.project_id AS project_id, \
              e.worktree_path AS worktree_path, MIN(tu.created_at) AS started_at, \
              COALESCE(SUM(tu.input_tokens), 0) AS input_tokens, \
@@ -12933,7 +12938,7 @@ impl Database {
              FROM turn_usage tu \
              LEFT JOIN conversations c ON c.id = tu.root_conversation_id \
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id \
-             GROUP BY tu.root_conversation_id, tu.model",
+             GROUP BY tu.root_conversation_id, tu.model, tu.service_tier",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -12944,6 +12949,8 @@ impl Database {
                     root_conversation_id: r.try_get("rid")?,
                     model: r.try_get("model")?,
                     slug: r.try_get("slug").ok().flatten(),
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     title: r.try_get("title").ok().flatten(),
                     project_id: r.try_get("project_id").ok().flatten(),
                     worktree_path: r.try_get("worktree_path").ok().flatten(),
@@ -12985,7 +12992,7 @@ impl Database {
     pub async fn usage_conversation_turns(&self, root_id: &str) -> DbResult<Vec<UsageTurnRow>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, root_conversation_id, model, created_at, first_byte_at, \
-             input_tokens, output_tokens, reasoning_tokens, effort_source, effort_level, cache_creation_tokens, cache_read_tokens \
+             input_tokens, output_tokens, reasoning_tokens, effort_source, effort_level, service_tier, cache_creation_tokens, cache_read_tokens \
              FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY created_at ASC",
         )
         .bind(root_id)
@@ -13014,6 +13021,8 @@ impl Database {
                                 .map_err(|error| sqlx::Error::Decode(error.into()))
                         })
                         .transpose()?,
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     cache_read_tokens: r.try_get("cache_read_tokens")?,
                 })
             })
@@ -13900,6 +13909,8 @@ fn synthesize_spawn_fan_ins(
             ContentBlock::Text { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
             | ContentBlock::WebSearchToolResult { .. }
@@ -17858,6 +17869,7 @@ mod tests {
             "conv-fb",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Standard,
             &usage,
             None,
         )
@@ -17869,6 +17881,7 @@ mod tests {
             "conv-fb",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Fast,
             &usage,
             Some(observed),
         )
@@ -17878,6 +17891,8 @@ mod tests {
         let rows = db.usage_conversation_turns("conv-fb").await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].first_byte_at, None);
+        assert_eq!(rows[0].service_tier, ServiceTier::Standard);
+        assert_eq!(rows[1].service_tier, ServiceTier::Fast);
         assert_eq!(
             rows[1].first_byte_at.as_deref(),
             Some(observed.to_rfc3339().as_str())
@@ -18042,6 +18057,7 @@ mod tests {
             "root-anchor",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Standard,
             &usage,
             None,
         )

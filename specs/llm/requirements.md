@@ -169,30 +169,36 @@ THE child conversation SHALL resolve its own model-native default from its selec
 
 ---
 
-### REQ-LLM-004g: Fast Service Tier
+### REQ-LLM-004g: Fast Request Speed
 
-WHEN a conversation uses a model and provider route that advertise the Fast service tier
+WHEN a conversation uses a model and provider route that advertise Fast request speed
 THE SYSTEM SHALL allow the user to select Standard or Fast independently of model reasoning effort
-AND SHALL disclose that Fast provides approximately 1.5x speed with increased usage
+AND SHALL disclose that Fast increases request speed and usage cost
 
-WHEN Fast is selected for a supported Responses request
-THE SYSTEM SHALL send the provider-native `priority` service tier
+WHEN Fast is selected
+THE SYSTEM SHALL translate it to the supported route's native request-speed control
+AND SHALL send every required feature header for that control
+AND SHALL NOT silently retry the request at Standard speed after a provider failure
 
 WHEN Standard is selected
-THE SYSTEM SHALL omit the service-tier field from the provider request
+THE SYSTEM SHALL omit provider-native Fast controls from the request
 
 WHEN the selected model or provider route does not support Fast mode
 THE SYSTEM SHALL NOT advertise Fast capability
 AND SHALL reject an explicit attempt to enable Fast
 AND SHALL reset an inherited conversation selection to Standard when switching to that route
 
+WHEN Phoenix records usage for a turn
+THE SYSTEM SHALL persist the effective Standard or Fast selection with that turn
+AND SHALL use that immutable value for speed-dependent historical cost calculations
+
 WHEN Phoenix spawns a subagent conversation
-THE child conversation SHALL start with Standard service tier independently of the parent's selection
+THE child conversation SHALL start with Standard request speed independently of the parent's selection
 
 WHEN a conversation continues into a successor conversation
-THE successor SHALL preserve the parent's service-tier selection
+THE successor SHALL preserve the parent's request-speed selection
 
-**Rationale:** Fast is a paid routing choice, not a model or reasoning-effort alias. Capability gating prevents Phoenix from claiming support on routes whose model contract omits it, while independent subagent defaults avoid multiplying usage without an explicit child choice.
+**Rationale:** Fast is a paid request-routing choice, not a model or reasoning-effort alias. Provider routes encode it differently. Route-aware capability gating prevents Phoenix from claiming support where the native control is unavailable, while per-turn persistence keeps historical pricing independent from mutable conversation settings.
 
 ---
 
@@ -257,6 +263,15 @@ THE SYSTEM SHALL parse into common format containing:
 WHEN response indicates tool use
 THE SYSTEM SHALL extract tool name, ID, and JSON input for each tool
 
+WHEN a provider returns signed or encrypted reasoning blocks that are required to continue a tool-use exchange
+THE SYSTEM SHALL preserve those blocks losslessly and in provider order
+AND SHALL replay them unchanged to the provider with subsequent tool results
+AND SHALL NOT expose their readable or opaque contents through normalized user-visible text or search
+
+WHEN a target provider cannot represent preserved reasoning blocks from another provider
+THE SYSTEM SHALL omit them through an explicit typed translation path
+AND SHALL log that capability gap at debug level or above
+
 WHEN a Chat Completions response contains private reasoning content alongside final content
 THE SYSTEM SHALL omit private reasoning from user-visible normalized content
 AND SHALL preserve final text and tool calls
@@ -293,6 +308,11 @@ WHEN the provider rejects the assembled prompt under its prompt policy (for exam
 THE SYSTEM SHALL classify it as a prompt-rejection category distinct from a malformed request
 AND SHALL NOT automatically replay the identical rejected request
 AND SHALL classify the persisted error as user-resumable so a revised message or explicit continuation can recover within the same conversation
+
+WHEN a provider returns a successful transport response whose terminal reason is refusal
+THE SYSTEM SHALL discard any partial generated content from that response
+AND SHALL classify the outcome as prompt rejection
+AND SHALL NOT treat it as a tool-use continuation or an automatically retryable server failure
 
 WHEN a request fails with an invalid-request classification
 THE SYSTEM SHALL stop automatic retries of that request

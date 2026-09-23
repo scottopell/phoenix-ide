@@ -744,6 +744,21 @@ pub enum ContentBlock {
         is_error: bool,
     },
 
+    // ---- Preserved adaptive-thinking blocks (Anthropic) ----
+    // Provider-owned reasoning blocks. Phoenix does not render or index them as
+    // readable text; the signature/encrypted data is opaque. They MUST be
+    // replayed unchanged with tool-use results or a later request can fail --
+    // the signature-bearing block matters even when `thinking` text is empty.
+    /// Adaptive-thinking block with its opaque signature.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Redacted (encrypted) thinking block -- fully opaque round-trip.
+    RedactedThinking {
+        data: String,
+    },
+
     // ---- Server-handled blocks (Anthropic) ----
     // These blocks are executed by the API, not by Phoenix. They MUST be
     // preserved in conversation history for multi-turn correctness (e.g.
@@ -848,6 +863,7 @@ impl ContentBlock {
             // Results live in the following user message, not the assistant
             // block — but if one ever appears here, render its text.
             Self::ToolResult { content, .. } => content.clone(),
+            Self::Thinking { .. } | Self::RedactedThinking { .. } => String::new(),
         }
     }
 }
@@ -885,6 +901,8 @@ impl ContentBlock {
             ContentBlock::Image { .. } => "image",
             ContentBlock::ToolUse { .. } => "tool_use",
             ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::Thinking { .. } => "thinking",
+            ContentBlock::RedactedThinking { .. } => "redacted_thinking",
             ContentBlock::ServerToolUse { .. } => "server_tool_use",
             ContentBlock::ToolSearchToolResult { .. } => "tool_search_tool_result",
             ContentBlock::WebSearchToolResult { .. } => "web_search_tool_result",
@@ -969,6 +987,8 @@ impl LlmResponse {
                 ContentBlock::Image { .. }
                 | ContentBlock::Text { .. }
                 | ContentBlock::ToolResult { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
                 | ContentBlock::WebSearchToolResult { .. }
@@ -992,6 +1012,8 @@ impl LlmResponse {
                 ContentBlock::Image { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::ToolResult { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
                 | ContentBlock::WebSearchToolResult { .. }

@@ -491,12 +491,14 @@ pub trait StateStore: Send + Sync {
 
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
@@ -1067,12 +1069,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -1082,6 +1086,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )
@@ -2071,12 +2076,14 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2086,6 +2093,7 @@ impl StateStore for DatabaseStorage {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )

@@ -12,6 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentBlockKind {
+    None,
+    Text,
+    Thinking,
+    Tool,
+    ServerTool,
+}
+
 /// Accumulates state across Anthropic SSE stream events to assemble the final response.
 struct StreamAccumulator {
     input_tokens: u64,
@@ -19,16 +28,17 @@ struct StreamAccumulator {
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
     stop_reason: Option<String>,
+    stop_details: Option<AnthropicStopDetails>,
     content_blocks: Vec<(usize, AnthropicContentBlock)>,
     // Current block being parsed
     current_index: Option<usize>,
-    current_is_text: bool,
+    current_block_kind: CurrentBlockKind,
     current_text: String,
+    current_thinking: String,
+    current_signature: String,
     current_tool_id: String,
     current_tool_name: String,
     current_tool_json: String,
-    /// True when the current tool block is a `server_tool_use` (not a regular `tool_use`).
-    current_is_server_tool: bool,
     /// Raw JSON for server-handled blocks that arrive complete in `content_block_start`.
     current_server_block: Option<serde_json::Value>,
     /// Set true when `message_stop` is received -- signals outer loop to stop
@@ -44,14 +54,16 @@ impl StreamAccumulator {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             stop_reason: None,
+            stop_details: None,
             content_blocks: Vec::new(),
             current_index: None,
-            current_is_text: false,
+            current_block_kind: CurrentBlockKind::None,
             current_text: String::new(),
+            current_thinking: String::new(),
+            current_signature: String::new(),
             current_tool_id: String::new(),
             current_tool_name: String::new(),
             current_tool_json: String::new(),
-            current_is_server_tool: false,
             current_server_block: None,
             done: false,
             telemetry: StreamTelemetryRecorder::new(
@@ -101,6 +113,9 @@ impl StreamAccumulator {
                 {
                     self.stop_reason = Some(sr.to_string());
                 }
+                if let Some(details) = v.pointer("/delta/stop_details") {
+                    self.stop_details = serde_json::from_value(details.clone()).ok();
+                }
                 self.output_tokens = v
                     .pointer("/usage/output_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -113,6 +128,7 @@ impl StreamAccumulator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // single-pass dispatch over Anthropic block variants
     fn on_block_start(&mut self, v: &serde_json::Value, now: Instant) {
         let idx = usize::try_from(
             v.get("index")
@@ -128,15 +144,31 @@ impl StreamAccumulator {
         match block_type {
             "text" => {
                 self.current_index = Some(idx);
-                self.current_is_text = true;
+                self.current_block_kind = CurrentBlockKind::Text;
                 self.current_text.clear();
+            }
+            "thinking" => {
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Reasoning);
+                self.current_index = Some(idx);
+                self.current_block_kind = CurrentBlockKind::Thinking;
+                self.current_thinking.clear();
+                self.current_signature.clear();
+            }
+            "redacted_thinking" => {
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Reasoning);
+                if let Some(block) = v.get("content_block") {
+                    self.current_index = Some(idx);
+                    self.current_block_kind = CurrentBlockKind::None;
+                    self.current_server_block = Some(block.clone());
+                }
             }
             "tool_use" => {
                 self.telemetry
                     .record_generation_event_at(now, GenerationKind::Tool);
                 self.current_index = Some(idx);
-                self.current_is_text = false;
-                self.current_is_server_tool = false;
+                self.current_block_kind = CurrentBlockKind::Tool;
                 self.current_tool_id = v
                     .pointer("/content_block/id")
                     .and_then(serde_json::Value::as_str)
@@ -154,8 +186,7 @@ impl StreamAccumulator {
                     .record_generation_event_at(now, GenerationKind::Structured);
                 // Server-side execution -- accumulate like tool_use for history.
                 self.current_index = Some(idx);
-                self.current_is_text = false;
-                self.current_is_server_tool = true;
+                self.current_block_kind = CurrentBlockKind::ServerTool;
                 self.current_tool_id = v
                     .pointer("/content_block/id")
                     .and_then(serde_json::Value::as_str)
@@ -243,12 +274,23 @@ impl StreamAccumulator {
                 }
             }
             "thinking_delta" => {
-                if v.pointer("/delta/thinking")
+                if let Some(delta) = v
+                    .pointer("/delta/thinking")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|delta| !delta.is_empty())
                 {
-                    self.telemetry
-                        .record_generation_event_at(now, GenerationKind::Reasoning);
+                    if !delta.is_empty() {
+                        self.telemetry
+                            .record_generation_event_at(now, GenerationKind::Reasoning);
+                    }
+                    self.current_thinking.push_str(delta);
+                }
+            }
+            "signature_delta" => {
+                if let Some(signature) = v
+                    .pointer("/delta/signature")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.current_signature.push_str(signature);
                 }
             }
             _ => {}
@@ -277,7 +319,18 @@ impl StreamAccumulator {
             }
             return;
         }
-        if self.current_is_text {
+        if self.current_block_kind == CurrentBlockKind::Thinking {
+            if !self.current_thinking.is_empty() || !self.current_signature.is_empty() {
+                self.content_blocks.push((
+                    idx,
+                    AnthropicContentBlock::Thinking {
+                        thinking: std::mem::take(&mut self.current_thinking),
+                        signature: std::mem::take(&mut self.current_signature),
+                    },
+                ));
+            }
+            self.current_block_kind = CurrentBlockKind::None;
+        } else if self.current_block_kind == CurrentBlockKind::Text {
             if !self.current_text.is_empty() {
                 self.content_blocks.push((
                     idx,
@@ -291,7 +344,7 @@ impl StreamAccumulator {
         } else if !self.current_tool_name.is_empty() {
             let input: serde_json::Value = serde_json::from_str(&self.current_tool_json)
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            let block = if self.current_is_server_tool {
+            let block = if self.current_block_kind == CurrentBlockKind::ServerTool {
                 AnthropicContentBlock::ServerToolUse {
                     id: self.current_tool_id.clone(),
                     name: self.current_tool_name.clone(),
@@ -308,7 +361,7 @@ impl StreamAccumulator {
             self.current_tool_json.clear();
             self.current_tool_name.clear();
             self.current_tool_id.clear();
-            self.current_is_server_tool = false;
+            self.current_block_kind = CurrentBlockKind::None;
         }
     }
 
@@ -327,6 +380,7 @@ impl StreamAccumulator {
             AnthropicResponse {
                 content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
                 stop_reason: self.stop_reason,
+                stop_details: self.stop_details,
                 usage: AnthropicUsage {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
@@ -363,12 +417,49 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
     }
 }
 
+const OFFICIAL_ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Beta token enabling Anthropic Fast mode (research preview, direct Claude API).
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+/// Beta token enabling advanced tool use (tool search).
+const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
+
 fn resolve_anthropic_url(base_url_override: Option<&str>) -> String {
     if let Some(url) = base_url_override {
         url.to_string()
     } else {
-        "https://api.anthropic.com/v1/messages".to_string()
+        OFFICIAL_ANTHROPIC_URL.to_string()
     }
+}
+
+/// True when the request targets the official direct Claude API — either no
+/// base-URL override, or an override that is exactly the official endpoint. A
+/// compatible/proxy base URL is not official, so route-gated capabilities
+/// (Fast mode) must not be advertised or sent there.
+pub(crate) fn is_official_anthropic_route(base_url_override: Option<&str>) -> bool {
+    base_url_override.is_none_or(|url| url == OFFICIAL_ANTHROPIC_URL)
+}
+
+/// True when this request should send Anthropic Fast mode: the resolved
+/// effective service tier is Fast and the route is the official Claude API.
+/// Effort and speed are independent — this reads only the tier.
+fn is_fast_mode(base_url_override: Option<&str>, request: &LlmRequest) -> bool {
+    request.service_tier == super::types::EffectiveServiceTier::Fast
+        && is_official_anthropic_route(base_url_override)
+}
+
+/// Compose the ordered `anthropic-beta` token list for a request. Tool search
+/// and Fast mode are independent betas that can both apply; they are joined
+/// into one comma-separated header value.
+fn anthropic_beta_tokens(has_deferred: bool, fast_mode: bool) -> Vec<&'static str> {
+    let mut tokens = Vec::new();
+    if has_deferred {
+        tokens.push(ADVANCED_TOOL_USE_BETA);
+    }
+    if fast_mode {
+        tokens.push(FAST_MODE_BETA);
+    }
+    tokens
 }
 
 /// Complete using Anthropic Messages API with streaming.
@@ -393,7 +484,8 @@ pub async fn complete_streaming(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let mut anthropic_request = translate_request(spec, request);
+    let fast_mode = is_fast_mode(base_url_override, request);
+    let mut anthropic_request = translate_request(spec, request, fast_mode);
     anthropic_request.stream = Some(true);
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
@@ -414,9 +506,11 @@ pub async fn complete_streaming(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    // Tool search requires the advanced-tool-use beta header.
-    if has_deferred {
-        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    // Tool search and Fast mode are independent betas; compose them into one
+    // comma-separated header value so both can apply on the same request.
+    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode);
+    if !beta_tokens.is_empty() {
+        builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
     builder = builder
         .header("anthropic-version", "2023-06-01")
@@ -503,7 +597,8 @@ pub async fn complete(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let mut anthropic_request = translate_request(spec, request);
+    let fast_mode = is_fast_mode(base_url_override, request);
+    let mut anthropic_request = translate_request(spec, request, fast_mode);
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
     }
@@ -517,8 +612,9 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    if has_deferred {
-        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
+    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode);
+    if !beta_tokens.is_empty() {
+        builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
     builder = builder
         .header("anthropic-version", "2023-06-01")
@@ -551,7 +647,11 @@ pub async fn complete(
     normalize_response(anthropic_response)
 }
 
-fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> AnthropicRequest {
+fn translate_request(
+    spec: &super::ModelSpec,
+    request: &LlmRequest,
+    fast_mode: bool,
+) -> AnthropicRequest {
     let system: Vec<AnthropicSystemBlock> = request
         .system
         .iter()
@@ -635,6 +735,13 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
             .effective_effort
             .explicit_level()
             .map(explicit_anthropic_effort),
+        // Fast mode: top-level `speed: "fast"`; Standard omits the field.
+        // Independent of effort and of the beta-header composition.
+        speed: if fast_mode {
+            Some("fast".to_string())
+        } else {
+            None
+        },
         stream: None,
         tags: None,
     }
@@ -671,6 +778,16 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                 name: name.clone(),
                 input: input.clone(),
             },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => AnthropicContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::RedactedThinking { data } => {
+                AnthropicContentBlock::RedactedThinking { data: data.clone() }
+            }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -802,6 +919,16 @@ fn normalize_response_with_diagnostics(
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
+            AnthropicContentBlock::Thinking {
+                thinking,
+                signature,
+            } => content.push(ContentBlock::Thinking {
+                thinking,
+                signature,
+            }),
+            AnthropicContentBlock::RedactedThinking { data } => {
+                content.push(ContentBlock::RedactedThinking { data });
+            }
             AnthropicContentBlock::Image { .. } => {
                 return Err(LlmError::invalid_response(
                     "Unexpected image block in Anthropic response",
@@ -915,6 +1042,20 @@ fn normalize_response_with_diagnostics(
         }
     }
 
+    if resp.stop_reason.as_deref() == Some("refusal") {
+        let category = resp
+            .stop_details
+            .as_ref()
+            .and_then(|details| details.category.as_deref());
+        let message = category.map_or_else(
+            || "Anthropic refused the request under its safety policy.".to_string(),
+            |category| {
+                format!("Anthropic refused the request under its safety policy ({category}).")
+            },
+        );
+        return Err(LlmError::prompt_rejected(message));
+    }
+
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
     // Check if content has any client-actionable blocks. Server blocks
@@ -1001,6 +1142,11 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicToolEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<AnthropicOutputConfig>,
+    /// Anthropic Fast mode selector. `Some("fast")` on a Fast request; omitted
+    /// for Standard. Direct provider APIs reject unknown fields, so this is set
+    /// only on the official route (gated upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// Free-form metadata forwarded to the gateway/proxy in front of the
@@ -1063,6 +1209,13 @@ pub(crate) enum AnthropicContentBlock {
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
     /// Server-side tool invocation (tool search, web search, code execution).
     /// Handled by Anthropic -- Phoenix preserves these for multi-turn history.
@@ -1151,7 +1304,15 @@ struct AnthropicToolSearchTool {
 pub(crate) struct AnthropicResponse {
     pub(crate) content: Vec<AnthropicContentBlock>,
     pub(crate) stop_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) stop_details: Option<AnthropicStopDetails>,
     pub(crate) usage: AnthropicUsage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AnthropicStopDetails {
+    #[serde(default)]
+    pub(crate) category: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1246,21 +1407,47 @@ mod tests {
         let spec = test_spec(false);
         let mut request = test_request_with_tools();
 
-        let native = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        let native = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
         assert!(native.get("output_config").is_none());
         assert_eq!(native["max_tokens"], 16_384);
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::High);
-        let native_known = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        let native_known = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
         assert!(native_known.get("output_config").is_none());
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);
         request.max_tokens = Some(16_384);
-        let explicit = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        let explicit = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
         assert_eq!(explicit["max_tokens"], 16_384);
+    }
+
+    #[test]
+    fn fast_mode_request_shape_and_beta_tokens_are_independent() {
+        let spec = test_spec(true);
+        let standard =
+            serde_json::to_value(translate_request(&spec, &test_request_with_tools(), false))
+                .unwrap();
+        assert!(standard.get("speed").is_none());
+        assert_eq!(
+            anthropic_beta_tokens(true, false),
+            vec![ADVANCED_TOOL_USE_BETA]
+        );
+
+        let fast = serde_json::to_value(translate_request(&spec, &test_request_with_tools(), true))
+            .unwrap();
+        assert_eq!(fast["speed"], "fast");
+        assert_eq!(
+            anthropic_beta_tokens(true, true).join(", "),
+            "advanced-tool-use-2025-11-20, fast-mode-2026-02-01"
+        );
+        assert!(is_official_anthropic_route(None));
+        assert!(is_official_anthropic_route(Some(OFFICIAL_ANTHROPIC_URL)));
+        assert!(!is_official_anthropic_route(Some(
+            "https://gateway.example/v1/messages"
+        )));
     }
 
     #[tokio::test]
@@ -1283,7 +1470,7 @@ mod tests {
     async fn test_tool_search_enabled_serialization() {
         let spec = test_spec(true);
         let request = test_request_with_tools();
-        let anthropic_req = translate_request(&spec, &request);
+        let anthropic_req = translate_request(&spec, &request, false);
 
         assert_eq!(anthropic_req.model, "test-model-api");
 
@@ -1319,7 +1506,7 @@ mod tests {
     async fn test_tool_search_disabled_serialization() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let anthropic_req = translate_request(&spec, &request);
+        let anthropic_req = translate_request(&spec, &request, false);
 
         let json = serde_json::to_value(&anthropic_req).unwrap();
         let tools = json["tools"].as_array().unwrap();
@@ -1369,7 +1556,7 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
-        let req = translate_request(&spec, &request);
+        let req = translate_request(&spec, &request, false);
         let json = serde_json::to_value(&req).unwrap();
         let block = &json["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
@@ -1454,6 +1641,110 @@ mod tests {
         assert!(resp.end_turn);
         assert_eq!(resp.usage.input_tokens, 7);
         assert_eq!(resp.usage.output_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn streaming_preserves_empty_thinking_signature_and_redacted_thinking() {
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .await
+            .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":1,"content_block":{"type":"redacted_thinking","data":"encrypted"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":1}"#, &tx)
+            .await
+            .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":2,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":2}"#, &tx)
+            .await
+            .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        let response = acc.into_response_with_diagnostics(None).unwrap();
+        assert!(
+            matches!(&response.content[0], ContentBlock::Thinking { thinking, signature } if thinking.is_empty() && signature == "opaque-signature")
+        );
+        assert!(
+            matches!(&response.content[1], ContentBlock::RedactedThinking { data } if data == "encrypted")
+        );
+        let replay = translate_message(&LlmMessage {
+            role: MessageRole::Assistant,
+            content: response.content,
+        });
+        let replay_json = serde_json::to_value(replay).unwrap();
+        assert_eq!(replay_json["content"][0]["signature"], "opaque-signature");
+        assert_eq!(replay_json["content"][1]["data"], "encrypted");
+    }
+
+    #[test]
+    fn refusal_is_non_retryable_prompt_rejection_even_with_partial_content() {
+        let error = normalize_response(AnthropicResponse {
+            content: vec![AnthropicContentBlock::Text {
+                text: "partial".into(),
+                cache_control: None,
+            }],
+            stop_reason: Some("refusal".into()),
+            stop_details: Some(AnthropicStopDetails {
+                category: Some("bio".into()),
+            }),
+            usage: AnthropicUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
+        assert!(!error.kind.is_auto_retryable());
+        assert!(error.kind.is_user_resumable());
+        assert!(error.message.contains("bio"));
     }
 
     #[tokio::test]
@@ -1624,7 +1915,7 @@ mod tests {
     async fn test_request_tags_omitted_when_none() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let req = translate_request(&spec, &request);
+        let req = translate_request(&spec, &request, false);
         let json = serde_json::to_value(&req).unwrap();
         assert!(
             json.get("tags").is_none(),
@@ -1636,7 +1927,7 @@ mod tests {
     async fn test_request_tags_serialized_when_set() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let mut req = translate_request(&spec, &request);
+        let mut req = translate_request(&spec, &request, false);
         let mut tags = std::collections::BTreeMap::new();
         tags.insert("disable_data_logging".to_string(), "true".to_string());
         tags.insert("foo".to_string(), "bar".to_string());
@@ -1666,6 +1957,7 @@ mod tests {
                 },
             ],
             stop_reason: Some("tool_use".to_string()),
+            stop_details: None,
             usage: AnthropicUsage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -1721,6 +2013,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: Some("end_turn".to_string()),
+            stop_details: None,
             usage: AnthropicUsage {
                 input_tokens: 100,
                 output_tokens: 10,
@@ -1752,6 +2045,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: Some("tool_use".to_string()),
+            stop_details: None,
             usage: AnthropicUsage {
                 input_tokens: 100,
                 output_tokens: 10,

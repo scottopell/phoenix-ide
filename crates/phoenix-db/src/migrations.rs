@@ -530,6 +530,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "preserve_automatic_continuation_resume_phase",
         sql: MIGRATION_103,
     },
+    Migration {
+        version: 104,
+        name: "persist_turn_usage_service_tier",
+        sql: MIGRATION_104,
+    },
 ];
 
 const MIGRATION_101: &str = r"
@@ -10518,6 +10523,11 @@ WHERE type = 'table'
   AND name = 'llm_request_metrics'
   AND instr(sql, '''network_error'', ''token_budget_exceeded''') > 0
   AND instr(sql, '''timed_out''') = 0
+";
+
+const MIGRATION_104: &str = r"
+ALTER TABLE turn_usage ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'
+    CHECK (service_tier IN ('standard', 'fast'));
 ";
 
 #[cfg(test)]

@@ -1497,6 +1497,13 @@ fn translate_to_responses_request(
                 ContentBlock::Image { source } => image_blocks.push(source),
                 ContentBlock::ToolUse { .. } => tool_calls.push(block),
                 ContentBlock::ToolResult { .. } => tool_results.push(block),
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                    tracing::debug!(
+                        block_type = block.type_tag(),
+                        role,
+                        "dropping Anthropic preserved-thinking block in OpenAI message translation — no OpenAI wire equivalent"
+                    );
+                }
                 // Anthropic-specific server blocks: executed by the Anthropic API,
                 // with no representable equivalent in the OpenAI Responses wire
                 // format — dropped from the OpenAI request. Logged per-block with
@@ -2611,6 +2618,14 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
                     });
                 }
                 super::types::ContentBlock::ToolResult { .. } => tool_results.push(block),
+                super::types::ContentBlock::Thinking { .. }
+                | super::types::ContentBlock::RedactedThinking { .. } => {
+                    tracing::debug!(
+                        block_type = block.type_tag(),
+                        role,
+                        "dropping Anthropic preserved-thinking block in chat completions translation — no Chat Completions wire equivalent"
+                    );
+                }
                 super::types::ContentBlock::ServerToolUse { id, .. }
                 | super::types::ContentBlock::McpToolUse { id, .. } => {
                     tracing::debug!(

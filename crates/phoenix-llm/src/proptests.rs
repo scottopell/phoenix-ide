@@ -147,6 +147,7 @@ fn make_anthropic_response(
     AnthropicResponse {
         content,
         stop_reason: stop_reason.map(String::from),
+        stop_details: None,
         usage: AnthropicUsage {
             input_tokens: 10,
             output_tokens: 5,
@@ -170,6 +171,7 @@ proptest! {
         let resp = AnthropicResponse {
             content: vec![],
             stop_reason,
+            stop_details: None,
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -221,6 +223,8 @@ proptest! {
                 | (ContentBlock::Image { .. }, AnthropicContentBlock::Image { .. })
                 | (ContentBlock::ToolUse { .. }, AnthropicContentBlock::ToolUse { .. })
                 | (ContentBlock::ToolResult { .. }, AnthropicContentBlock::ToolResult { .. })
+                | (ContentBlock::Thinking { .. }, AnthropicContentBlock::Thinking { .. })
+                | (ContentBlock::RedactedThinking { .. }, AnthropicContentBlock::RedactedThinking { .. })
                 | (ContentBlock::ServerToolUse { .. }, AnthropicContentBlock::ServerToolUse { .. })
                 | (ContentBlock::ToolSearchToolResult { .. }, AnthropicContentBlock::ToolSearchToolResult { .. })
                 | (ContentBlock::WebSearchToolResult { .. }, AnthropicContentBlock::WebSearchToolResult { .. })

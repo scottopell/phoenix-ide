@@ -768,6 +768,7 @@ where
                     &root_conv_id,
                     &llm_usage.model,
                     llm_usage.effective_effort,
+                    phoenix_core::domain::llm_types::ServiceTier::Standard,
                     &llm_usage.usage,
                     None,
                 )
@@ -859,7 +860,9 @@ fn content_contains_only_terminal_tool_call(
     let mut saw_terminal_tool = false;
     for block in content {
         match block {
-            ContentBlock::Text { .. } => {}
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. } => {}
             ContentBlock::ToolUse { id, name, .. }
                 if id == &tool_call.id && name == tool_call.name() && !saw_terminal_tool =>
             {
@@ -7257,6 +7260,7 @@ where
                 let root_id_for_usage = root_conv_id.clone();
                 let model_for_usage = model_id.clone();
                 let effort_for_usage = effective_effort;
+                let service_tier_for_usage = effective_service_tier;
                 let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
                 let usage_admission = request_admission.reborrow();
@@ -7268,6 +7272,7 @@ where
                             &root_id_for_usage,
                             &model_for_usage,
                             effort_for_usage,
+                            service_tier_for_usage.into(),
                             &usage_for_insert,
                             first_byte_for_insert,
                         )

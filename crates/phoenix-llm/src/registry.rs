@@ -1772,6 +1772,8 @@ pub struct CodexReloadOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{EffortCapabilities, NativeDefault, ServiceTierCapabilities};
+    use crate::ModelEffort;
     use std::collections::HashSet;
 
     #[test]
@@ -2734,6 +2736,21 @@ mod tests {
             assert!(info.context_window > 0);
         }
 
+        let opus_55 = model_infos
+            .iter()
+            .find(|model| model.id == "claude-opus-5-5")
+            .expect("Opus 5.5 must be available on direct Anthropic auth");
+        assert_eq!(opus_55.context_window, 1_000_000);
+        assert_eq!(
+            opus_55.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
+        );
+        assert!(matches!(
+            &opus_55.effort_capabilities,
+            EffortCapabilities::Supported(capabilities)
+                if capabilities.native_default() == NativeDefault::Known(ModelEffort::Medium)
+        ));
+
         // Check specific model
         let opus = model_infos
             .iter()
@@ -2757,6 +2774,21 @@ mod tests {
             .unwrap();
         assert!(!sonnet_4_6.recommended);
         assert!(sonnet_4_6.description.contains("legacy"));
+
+        let proxied = ModelRegistry::new(&LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            anthropic_base_url: Some("https://gateway.example/v1/messages".to_string()),
+            ..Default::default()
+        });
+        let proxied_opus_55 = proxied
+            .available_model_info()
+            .into_iter()
+            .find(|model| model.id == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(
+            proxied_opus_55.service_tier_capabilities,
+            ServiceTierCapabilities::Unsupported
+        );
     }
 
     #[test]

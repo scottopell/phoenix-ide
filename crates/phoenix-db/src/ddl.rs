@@ -184,7 +184,9 @@ CREATE TABLE IF NOT EXISTS turn_usage (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    service_tier TEXT NOT NULL DEFAULT 'standard'
+        CHECK (service_tier IN ('standard', 'fast'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_turn_usage_conversation ON turn_usage(conversation_id);
