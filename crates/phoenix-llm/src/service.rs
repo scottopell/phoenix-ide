@@ -241,6 +241,11 @@ impl LlmService for LlmServiceImpl {
             && openai::is_official_responses_route(self.openai_responses_base_url.as_deref())
     }
 
+    fn uses_official_anthropic(&self) -> bool {
+        self.spec.backend == crate::ModelBackend::Anthropic
+            && anthropic::is_official_anthropic_route(self.anthropic_base_url.as_deref())
+    }
+
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
         if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
             super::ContinuationRequestLimits::codex_responses_lite()
@@ -476,6 +481,7 @@ mod tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),

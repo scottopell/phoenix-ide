@@ -530,6 +530,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "preserve_automatic_continuation_resume_phase",
         sql: MIGRATION_103,
     },
+    Migration {
+        version: 104,
+        name: "persist_turn_usage_service_tier",
+        sql: MIGRATION_104,
+    },
+    Migration {
+        version: 105,
+        name: "create_active_provider_replay_state",
+        sql: MIGRATION_105,
+    },
 ];
 
 const MIGRATION_101: &str = r"
@@ -10519,6 +10529,29 @@ WHERE type = 'table'
   AND instr(sql, '''network_error'', ''token_budget_exceeded''') > 0
   AND instr(sql, '''timed_out''') = 0
 ";
+
+const MIGRATION_104: &str = r"
+ALTER TABLE turn_usage ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'
+    CHECK (service_tier IN ('standard', 'fast'));
+";
+
+const MIGRATION_105: &str = r"
+CREATE TABLE IF NOT EXISTS active_provider_replay_state (
+    conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL
+        CHECK (provider IN ('anthropic')),
+    model TEXT NOT NULL
+        CHECK (length(trim(model)) > 0),
+    response_id TEXT NOT NULL
+        CHECK (length(trim(response_id)) > 0),
+    payload TEXT NOT NULL
+);
+";
+
+/// Exposed for isolated migration tests in `provider_replay`.
+#[cfg(test)]
+pub(crate) const MIGRATION_105_FOR_TEST: &str = MIGRATION_105;
 
 #[cfg(test)]
 mod tests {

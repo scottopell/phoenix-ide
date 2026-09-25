@@ -3234,6 +3234,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             end_turn,
             usage,
             request_id,
+            provider_replay: _,
         } => Event::LlmResponse {
             content,
             tool_calls,

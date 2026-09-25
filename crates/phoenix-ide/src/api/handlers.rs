@@ -9480,6 +9480,7 @@ pub(crate) mod hard_delete_cascade_tests {
             _request: &phoenix_llm::LlmRequest,
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
                 content: vec![],
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
@@ -15510,6 +15511,7 @@ mod regenerate_conversation_name_tests {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
             match self {
                 StubLlm::Ok(text) => Ok(LlmResponse {
+                    provider_replay: None,
                     content: vec![ContentBlock::text(*text)],
                     end_turn: true,
                     usage: Usage::default(),
@@ -15748,6 +15750,7 @@ mod upgrade_model_state_guard_tests {
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
             Ok(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::text("stub")],
                 end_turn: true,
                 usage: Usage::default(),

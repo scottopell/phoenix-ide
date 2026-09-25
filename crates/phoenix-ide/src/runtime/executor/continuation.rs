@@ -177,6 +177,7 @@ mod tests {
 
     fn user(text: &str) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(text)],
         }
@@ -292,6 +293,7 @@ mod tests {
     #[test]
     fn assistant_work_after_opening_handoff_is_not_discarded() {
         let assistant = LlmMessage {
+            source_message_id: None,
             role: MessageRole::Assistant,
             content: vec![ContentBlock::text(
                 "Implemented the fix; tests passed; review is pending.",

@@ -117,6 +117,12 @@ fn unknown_turn_cost() -> TurnCost {
 
 fn model_pricing(model: &str) -> Option<ModelPricing> {
     match model {
+        "claude-opus-5-5" => Some(ModelPricing {
+            input: 4.00,
+            output: 20.00,
+            cache_write: 5.00,
+            cache_read: 0.20,
+        }),
         "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelPricing {
             input: 15.00,
             output: 75.00,
@@ -187,6 +193,7 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn calculate_turn_cost(
     model: &str,
     input: i64,
@@ -196,6 +203,27 @@ pub(crate) fn calculate_turn_cost(
 ) -> TurnCost {
     model_pricing(model).map_or_else(unknown_turn_cost, |p| {
         p.cost(input, output, cache_write, cache_read)
+    })
+}
+
+pub(crate) fn calculate_turn_cost_for_tier(
+    model: &str,
+    service_tier: phoenix_core::domain::llm_types::ServiceTier,
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+) -> TurnCost {
+    model_pricing(model).map_or_else(unknown_turn_cost, |mut pricing| {
+        if model == "claude-opus-5-5"
+            && service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast
+        {
+            pricing.input *= 2.0;
+            pricing.output *= 2.0;
+            pricing.cache_write *= 2.0;
+            pricing.cache_read *= 2.0;
+        }
+        pricing.cost(input, output, cache_write, cache_read)
     })
 }
 
@@ -402,6 +430,7 @@ pub struct TurnPoint {
     pub reasoning_tokens: Option<f64>,
     pub effort_source: phoenix_core::domain::llm_types::EffortSource,
     pub effort_level: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub service_tier: phoenix_core::domain::llm_types::ServiceTier,
     pub cache_write_tokens: f64,
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
@@ -743,7 +772,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
             row.cache_read_tokens,
             row.turns,
         );
-        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
+        let cost = calculate_turn_cost_for_tier(&row.model, row.service_tier, i, o, cw, cr);
         daily_map
             .entry(row.day.clone())
             .or_default()
@@ -831,7 +860,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
                 started_at: row.started_at.clone(),
                 totals: Totals::default(),
             });
-        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
+        let cost = calculate_turn_cost_for_tier(&row.model, row.service_tier, i, o, cw, cr);
         acc.totals.add(i, o, cw, cr, t, cost);
         if row.started_at < acc.started_at {
             acc.started_at.clone_from(&row.started_at);
@@ -923,6 +952,7 @@ pub async fn usage_conversation_detail(
                 reasoning_tokens: r.tokens.reasoning_tokens.map(|tokens| tokens as f64),
                 effort_source: r.effort_source,
                 effort_level: r.effort_level,
+                service_tier: r.service_tier,
                 cache_write_tokens: r.tokens.cache_creation_tokens as f64,
                 cache_read_tokens: r.tokens.cache_read_tokens as f64,
                 total_tokens: (r.tokens.input_tokens
@@ -996,6 +1026,30 @@ mod tests {
         assert_eq!(cost.cache_write_usd, Some(11.25));
         assert_eq!(cost.cache_read_usd, Some(1.2));
         assert_eq!(cost.total_usd, Some(45.45));
+    }
+
+    #[test]
+    fn opus_55_fast_mode_uses_double_standard_rates() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+
+        let standard = calculate_turn_cost_for_tier(
+            "claude-opus-5-5",
+            ServiceTier::Standard,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        let fast = calculate_turn_cost_for_tier(
+            "claude-opus-5-5",
+            ServiceTier::Fast,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert_eq!(standard.total_usd, Some(29.20));
+        assert_eq!(fast.total_usd, Some(58.40));
     }
 
     #[test]

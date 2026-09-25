@@ -330,6 +330,7 @@ impl ChainQa {
     /// "I'll search…" narration never reaches the user. When the model stops
     /// calling tools (or the turn cap is hit), a dedicated final turn with no
     /// tools streams the answer token-by-token over the chain broadcaster.
+    #[allow(clippy::too_many_lines)] // bounded agent loop keeps replay/tool sequencing visible
     async fn run_answer_invocation(
         &self,
         prep: &PreparedInvocation,
@@ -352,7 +353,11 @@ impl ChainQa {
              with read_conversation to answer."
         };
 
+        let mut provider_replay: Option<
+            phoenix_core::domain::provider_replay::AnthropicReplayPayload,
+        > = None;
         let mut messages = vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
                 "Chain skeleton (members in order):\n{}\n---\nQuestion: {}{}",
@@ -376,6 +381,8 @@ impl ChainQa {
                 prep.effective_effort,
                 prep.max_output_tokens,
             );
+            let mut request = request;
+            request.provider_replay = provider_replay.clone();
             let resp = prep
                 .service
                 .complete(&request)
@@ -384,6 +391,28 @@ impl ChainQa {
                     error: ChainQaError::from(e),
                     partial_answer: None,
                 })?;
+
+            if let Some(update) = resp.provider_replay.clone() {
+                use phoenix_core::domain::provider_replay::{
+                    AnthropicReplayPayload, AnthropicReplayUpdate,
+                };
+                match update {
+                    AnthropicReplayUpdate::Append(response) => {
+                        let mut sets = provider_replay
+                            .take()
+                            .map_or_else(Vec::new, |p| p.response_sets);
+                        sets.push(response.with_owner_message_id(format!("chain-qa-{turn}")));
+                        provider_replay =
+                            Some(AnthropicReplayPayload::new(sets).map_err(|error| {
+                                RunInvocationError {
+                                    error: ChainQaError::Llm(error.to_string()),
+                                    partial_answer: None,
+                                }
+                            })?);
+                    }
+                    AnthropicReplayUpdate::Clear => provider_replay = None,
+                }
+            }
 
             let tool_calls: Vec<(String, String, serde_json::Value)> = resp
                 .tool_uses()
@@ -411,6 +440,7 @@ impl ChainQa {
                     partial_answer: None,
                 })?;
             messages.push(LlmMessage {
+                source_message_id: Some(format!("chain-qa-{turn}")),
                 role: MessageRole::Assistant,
                 content: resp.content.clone(),
             });
@@ -438,6 +468,7 @@ impl ChainQa {
                 });
             }
             messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: results,
             });
@@ -455,7 +486,13 @@ impl ChainQa {
             .live_snapshot(&prep.root_id)
             .await
             .unwrap_or(prep.snapshot);
-        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
+        // The forced-answer request changes the tool surface. Settle private
+        // Anthropic replay before that boundary rather than carrying signed
+        // planning blocks into a different prefix.
+        provider_replay = None;
+        let answer = self
+            .stream_final_answer(&messages, provider_replay, prep, runtime)
+            .await?;
         Ok(AnswerOutcome { answer, snapshot })
     }
 
@@ -478,6 +515,7 @@ impl ChainQa {
     async fn stream_final_answer(
         &self,
         messages: &[LlmMessage],
+        provider_replay: Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
@@ -491,6 +529,8 @@ impl ChainQa {
             prep.effective_effort,
             prep.max_output_tokens,
         );
+        let mut request = request;
+        request.provider_replay = provider_replay;
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
@@ -778,6 +818,7 @@ fn build_agent_request(
             crate::llm_language::chain_qa_agent_system_prompt(language),
         )],
         messages: messages.to_vec(),
+        provider_replay: None,
         tools,
         max_tokens: Some(
             max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),

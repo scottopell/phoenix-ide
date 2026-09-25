@@ -1688,6 +1688,7 @@ pub struct ConversationUsage {
 pub struct UsageDailyModelRow {
     pub day: String,
     pub model: String,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_tokens: i64,
@@ -1703,6 +1704,7 @@ pub struct UsageDailyModelRow {
 pub struct UsageConversationModelRow {
     pub root_conversation_id: String,
     pub model: String,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub slug: Option<String>,
     pub title: Option<String>,
     pub project_id: Option<String>,
@@ -1732,6 +1734,7 @@ pub struct UsageTurnRow {
     pub reasoning_tokens: Option<i64>,
     pub effort_source: crate::domain::llm_types::EffortSource,
     pub effort_level: Option<crate::domain::llm_types::ModelEffort>,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
 }

@@ -489,14 +489,50 @@ pub trait StateStore: Send + Sync {
     /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
     async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String>;
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String>;
+
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
@@ -1067,12 +1103,78 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        (**self).load_provider_replay_state(conversation_id).await
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_tool_round_state_and_provider_replay(
+                conversation_id,
+                assistant,
+                tool_results,
+                state,
+                state_updated_at,
+                update,
+            )
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_and_clear_provider_replay(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                state,
+                state_updated_at,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -1082,6 +1184,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )
@@ -1622,6 +1725,10 @@ impl MessageStore for DatabaseStorage {
                     state: settlement.state.clone(),
                     state_updated_at: settlement.state_updated_at,
                 }),
+                provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                    &settlement.conversation_id,
+                    &settlement.state,
+                ),
             },
         )
         .await
@@ -2071,12 +2178,84 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        self.db
+            .load_provider_replay_state(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.db
+            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.db
+            .persist_tool_round_state_and_provider_replay(
+                conversation_id,
+                assistant,
+                tool_results,
+                state,
+                state_updated_at,
+                update,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_and_clear_provider_replay(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2086,6 +2265,7 @@ impl StateStore for DatabaseStorage {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )

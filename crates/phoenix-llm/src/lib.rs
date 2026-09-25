@@ -197,6 +197,15 @@ pub trait LlmService: Send + Sync {
         false
     }
 
+    /// True when this service reaches Anthropic through the official direct
+    /// Claude API (no compatible/proxy base-URL override). Consumed by
+    /// [`crate::ModelSpec::service_tier_capabilities_for`] so Anthropic Fast
+    /// mode is advertised only on the route where it exists. Default `false`
+    /// covers non-Anthropic and proxied routes.
+    fn uses_official_anthropic(&self) -> bool {
+        false
+    }
+
     /// Request-shape limits for tool-less continuation-summary requests.
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {
         ContinuationRequestLimits::TokenWindowOnly
@@ -516,6 +525,10 @@ impl LlmService for LoggingService {
 
     fn uses_official_openai_responses(&self) -> bool {
         self.inner.uses_official_openai_responses()
+    }
+
+    fn uses_official_anthropic(&self) -> bool {
+        self.inner.uses_official_anthropic()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

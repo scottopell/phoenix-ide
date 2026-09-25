@@ -178,6 +178,14 @@ fn effort_anthropic_xhigh() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_XHIGH, ModelEffort::High)
 }
 
+/// Opus 5.5 shares the xhigh-capable Anthropic effort set but its native
+/// default is `medium`, not `high`. It must not reuse [`effort_anthropic_xhigh`]:
+/// omitting `output_config` on a no-override request has to represent the true
+/// native default the model applies.
+fn effort_anthropic_opus_55() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_XHIGH, ModelEffort::Medium)
+}
+
 fn effort_gpt_55_plus() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
 }
@@ -406,9 +414,15 @@ impl ModelSpec {
         &self,
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
-        if service.uses_codex_bridge()
-            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses())
-        {
+        let openai_fast = service.uses_codex_bridge()
+            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses());
+        // Anthropic Fast mode is a research-preview capability of the official
+        // direct Claude API only. A compatible/proxy base URL or a cloud route
+        // must not advertise it, so gate on the official-Anthropic route.
+        let anthropic_fast = self.backend == ModelBackend::Anthropic
+            && self.api_name == "claude-opus-5-5"
+            && service.uses_official_anthropic();
+        if openai_fast || anthropic_fast {
             self.service_tier_capabilities
         } else {
             ServiceTierCapabilities::Unsupported
@@ -613,6 +627,24 @@ pub fn all_models() -> Vec<ModelSpec> {
         // their 2026-03-13 GA. The `context-1m-2025-08-07` beta header was
         // retired April 30, 2026 and is no longer required (or accepted on
         // older models). See migration 009 for legacy `-1m` id rewrite.
+        ModelSpec {
+            id: "claude-opus-5-5".into(),
+            api_name: "claude-opus-5-5".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Opus 5.5 (most capable, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
+            effort_capabilities: effort_anthropic_opus_55(),
+            // Fast mode is available only on the official direct Claude API
+            // route; `service_tier_capabilities_for` gates this per route so a
+            // compatible/proxy base URL is not falsely advertised as Fast.
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
         ModelSpec {
             id: "claude-opus-4-8".into(),
             api_name: "claude-opus-4-8".into(),
@@ -874,6 +906,17 @@ mod tests {
                 .find(|model| model.id == id)
                 .unwrap_or_else(|| panic!("missing built-in model {id}"))
         };
+
+        let opus_55 = by_id("claude-opus-5-5");
+        assert_eq!(opus_55.api_name, "claude-opus-5-5");
+        assert_eq!(opus_55.context_window, 1_000_000);
+        assert_eq!(opus_55.output_token_limit(), Some(128_000));
+        assert_eq!(opus_55.effort_capabilities, effort_anthropic_opus_55());
+        assert!(opus_55.recommended);
+        assert_eq!(
+            opus_55.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
+        );
 
         assert_eq!(
             by_id("claude-sonnet-5").effort_capabilities,

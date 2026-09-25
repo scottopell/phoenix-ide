@@ -226,6 +226,7 @@ pub struct PersistedConversationProjection {
 pub struct TerminalizeAuthoritativeTurnInput {
     pub command: TurnCommand,
     pub projection: Option<PersistedConversationProjection>,
+    pub provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1780,6 +1781,8 @@ impl WorkflowRepository {
         self.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
             command,
             projection: None,
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
     }
@@ -1827,6 +1830,10 @@ impl WorkflowRepository {
                                 state: input.completed_state.clone(),
                                 state_updated_at: input.state_updated_at,
                             }),
+                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                &input.conversation_id,
+                                &input.completed_state,
+                            ),
                         },
                     )
                     .await?;
@@ -1892,6 +1899,9 @@ impl WorkflowRepository {
                                     .to_string(),
                             },
                             projection: None,
+                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+                                conversation_id: conversation_id.to_string(),
+                            },
                         },
                     )
                     .await?;
@@ -1961,6 +1971,10 @@ impl WorkflowRepository {
                     &TerminalizeAuthoritativeTurnInput {
                         command: input.command.clone(),
                         projection,
+                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                            &input.conversation_id,
+                            &input.completed_state,
+                        ),
                     },
                 )
                 .await?;
@@ -1996,6 +2010,8 @@ impl WorkflowRepository {
             &TerminalizeAuthoritativeTurnInput {
                 command,
                 projection: None,
+                provider_replay_settlement:
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
             },
             cut,
         )
@@ -2360,6 +2376,22 @@ impl WorkflowRepository {
         Ok(step)
     }
 
+    async fn clear_provider_replay_for_settlement(
+        tx: &mut sqlx::SqliteConnection,
+        settlement: &phoenix_core::domain::provider_replay::ProviderReplaySettlement,
+    ) -> DbResult<()> {
+        if let phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+            conversation_id,
+        } = settlement
+        {
+            sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(tx)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn terminalize_authoritative_turn_in_tx(
         &self,
         tx: &mut super::WorkflowTx<'_>,
@@ -2382,6 +2414,11 @@ impl WorkflowRepository {
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
+            Self::clear_provider_replay_for_settlement(
+                &mut tx.tx,
+                &input.provider_replay_settlement,
+            )
+            .await?;
             return Ok(step);
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
@@ -2493,6 +2530,8 @@ impl WorkflowRepository {
         }
         mark_active_attempts_authority_lost_tx(tx, workflow_id).await?;
         delete_reclaimable_leases_tx(tx, workflow_id).await?;
+        Self::clear_provider_replay_for_settlement(&mut tx.tx, &input.provider_replay_settlement)
+            .await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
         Ok(step)
     }
@@ -4180,6 +4219,8 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(expected.projection.clone()),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
         .unwrap();
@@ -5056,6 +5097,12 @@ mod tests {
             .execute(&repo.pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a','anthropic','claude-opus-5-5','resp','{\"response_sets\":[]}')",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
         let projection = PersistedConversationProjection {
             state: ConvState::Idle,
             state_updated_at: Utc::now(),
@@ -5066,6 +5113,10 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(projection.clone()),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+                    conversation_id: "conv-a".to_string(),
+                },
         };
 
         assert!(repo
@@ -5088,6 +5139,13 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_after_cut).unwrap(),
             ConvState::LlmRequesting { .. }
         ));
+        let replay_after_cut: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_after_cut, 1);
 
         repo.terminalize_authoritative_turn(&input).await.unwrap();
         let committed = repo
@@ -5106,6 +5164,58 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
             projection.state
         );
+        let replay_after_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_after_commit, 0);
+    }
+
+    #[tokio::test]
+    async fn resumable_error_terminalization_preserves_provider_replay() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "resumable-error", 8))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        sqlx::query(
+            "INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a','anthropic','claude-opus-5-5','resp-error','{\"response_sets\":[]}')",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        let error_state = ConvState::Error {
+            message: "retryable".into(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+            resets_at: None,
+        };
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Fail {
+                turn_id,
+                expected_generation: 0,
+                reason: "retryable".into(),
+            },
+            projection: Some(PersistedConversationProjection {
+                state: error_state,
+                state_updated_at: Utc::now(),
+            }),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+        let replay_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_count, 1);
     }
 
     #[tokio::test]
@@ -5172,6 +5282,8 @@ mod tests {
                 state: ConvState::Idle,
                 state_updated_at: Utc::now(),
             }),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
         .unwrap();
@@ -5205,6 +5317,8 @@ mod tests {
                 state: ConvState::Idle,
                 state_updated_at: Utc::now(),
             }),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
         .unwrap();
@@ -5249,6 +5363,8 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(projection.clone()),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
         .unwrap();

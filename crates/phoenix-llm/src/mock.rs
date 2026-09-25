@@ -831,6 +831,7 @@ impl LlmService for MockLlmService {
         }
 
         Ok(LlmResponse {
+            provider_replay: None,
             content,
             end_turn: true,
             usage: Usage {
@@ -903,6 +904,7 @@ impl LlmService for MockLlmService {
         }
 
         Ok(LlmResponse {
+            provider_replay: None,
             content,
             end_turn: true,
             usage: Usage {
@@ -931,11 +933,13 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::Text {
                     text: text.to_string(),
                 }],
             }],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),

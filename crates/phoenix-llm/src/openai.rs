@@ -3614,10 +3614,12 @@ mod tests {
             messages: messages
                 .iter()
                 .map(|(text, role)| LlmMessage {
+                    source_message_id: None,
                     role: *role,
                     content: vec![ContentBlock::text(*text)],
                 })
                 .collect(),
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4434,6 +4436,7 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4649,6 +4652,7 @@ mod tests {
 
         let mut req = empty_request();
         req.messages = vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -4684,14 +4688,17 @@ mod tests {
         let mut req = empty_request();
         req.messages = vec![
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("first question")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text("prior answer")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("follow-up question")],
             },
@@ -4758,11 +4765,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -4786,11 +4795,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -5413,11 +5424,13 @@ mod tests {
         let mut request = empty_request();
         for i in 0..5 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call-1".into(),
@@ -5468,6 +5481,7 @@ mod tests {
         let mut request = empty_request();
         for i in 0..55 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
@@ -5505,15 +5519,18 @@ mod tests {
         // the 50 limit), each preceded/followed by a skipped assistant turn.
         for i in 0..60 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("q-{i}"))],
             });
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text(format!("a-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("latest")],
         });

@@ -171,6 +171,7 @@ impl LlmClient for StreamingMockLlmClient {
                 .await;
         }
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
@@ -2135,12 +2136,72 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        Ok(None)
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.update_state(conversation_id, state, state_updated_at)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.persist_tool_round_and_state(
+            conversation_id,
+            assistant,
+            tool_results,
+            state,
+            state_updated_at,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &crate::db::MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&crate::db::UsageData>,
+        _state: &phoenix_core::domain::sm_state::ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::Message, String> {
+        self.add_message_with_seq(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_turn_usage(
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         _usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2487,6 +2548,7 @@ mod tests {
     async fn test_mock_llm_client() {
         let mock = MockLlmClient::new("test-model");
         mock.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
@@ -2494,6 +2556,7 @@ mod tests {
         });
 
         let request = LlmRequest {
+            provider_replay: None,
             system: vec![],
             messages: vec![],
             tools: vec![],
@@ -2570,6 +2633,7 @@ mod tests {
     async fn test_simple_text_response() {
         let llm = MockLlmClient::new("test-model");
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2595,6 +2659,7 @@ mod tests {
         let llm = MockLlmClient::new("test-model");
         // First response: tool call
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2606,6 +2671,7 @@ mod tests {
         });
         // Second response: text after tool
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2658,6 +2724,7 @@ mod tests {
             Duration::from_secs(5),
         ));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
@@ -2768,6 +2835,7 @@ mod tests {
         // Fast LLM, long tool delay that we'll cancel
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2779,6 +2847,7 @@ mod tests {
         });
         // This response won't be used since tool is cancelled
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -2881,6 +2950,7 @@ mod tests {
         // 5 second tool delay - we should NOT wait for this
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2998,6 +3068,7 @@ mod tests {
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3702,6 +3773,7 @@ mod tests {
         // LLM returns a single tool call
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3713,6 +3785,7 @@ mod tests {
         });
         // After tool completes, LLM returns text
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -3818,6 +3891,7 @@ mod tests {
         // 4th RequestLlm should trip it. Queue 10 for headroom.
         for _ in 0..10 {
             llm.queue_response(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::tool_use(
                     "tool-x",
                     "bash",
@@ -4387,6 +4461,7 @@ mod tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         // Turn 1: a tool call (will wedge).
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -4398,6 +4473,7 @@ mod tests {
         });
         // Turn 2: a tool call (cooperative now), then...
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-2",
                 "bash",
@@ -4409,6 +4485,7 @@ mod tests {
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
