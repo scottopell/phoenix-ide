@@ -4565,7 +4565,10 @@ impl RuntimeManager {
                                                 state_updated_at: projection.state_updated_at,
                                             },
                                         ),
-                                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                            &conversation_id,
+                                            &projection.state,
+                                        ),
                                     },
                                 )
                                 .await
@@ -4649,11 +4652,14 @@ impl RuntimeManager {
                                     },
                                     projection: Some(
                                         phoenix_db::workflow::PersistedConversationProjection {
-                                            state: conversation.state,
+                                            state: conversation.state.clone(),
                                             state_updated_at: conversation.state_updated_at,
                                         },
                                     ),
-                                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                        &conversation_id,
+                                        &conversation.state,
+                                    ),
                                 },
                             )
                             .await
