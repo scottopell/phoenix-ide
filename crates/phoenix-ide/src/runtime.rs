@@ -4565,7 +4565,7 @@ impl RuntimeManager {
                                                 state_updated_at: projection.state_updated_at,
                                             },
                                         ),
-                                        clear_provider_replay_for: None,
+                                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
                                     },
                                 )
                                 .await
@@ -4653,7 +4653,7 @@ impl RuntimeManager {
                                             state_updated_at: conversation.state_updated_at,
                                         },
                                     ),
-                                    clear_provider_replay_for: None,
+                                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
                                 },
                             )
                             .await
@@ -4733,7 +4733,10 @@ impl RuntimeManager {
                 &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                     command,
                     projection: Some(obligation.projection.clone()),
-                    clear_provider_replay_for: None,
+                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                        conversation_id,
+                        &obligation.projection.state,
+                    ),
                 },
             )
             .await
@@ -10847,6 +10850,39 @@ mod scope_liveness_tests {
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
 
+        let replay_response =
+            phoenix_core::domain::provider_replay::AnthropicResponseSet::with_public_content(
+                phoenix_core::domain::provider_replay::AnthropicResponseIdentity {
+                    response_id: "recovery-private-response".into(),
+                    model: "claude-opus-5-5".into(),
+                },
+                vec![phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-recovery".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![
+                    phoenix_core::domain::provider_replay::AnthropicPrivateBlock::Thinking {
+                        index: phoenix_core::domain::provider_replay::ContentIndex(0),
+                        thinking: String::new(),
+                        signature: "private-signature".into(),
+                    },
+                ],
+            )
+            .expect("valid replay response")
+            .with_owner_message_id("direct-final-response".into());
+        mgr.db()
+            .update_state_and_provider_replay(
+                conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+                &phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                    replay_response,
+                ),
+            )
+            .await
+            .expect("seed private replay before database recovery");
+
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,
@@ -10897,6 +10933,13 @@ mod scope_liveness_tests {
             })
         ));
         assert!(terminal_events.try_recv().is_err());
+
+        assert!(mgr
+            .db()
+            .load_provider_replay_state(conversation_id)
+            .await
+            .expect("load replay after recovery")
+            .is_none());
 
         let durable_turn = repo
             .load_authoritative_turn(turn_id)

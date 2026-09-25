@@ -310,6 +310,34 @@ impl AnthropicReplayPayload {
     }
 }
 
+/// Replay disposition applied by an authoritative turn-settlement transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderReplaySettlement {
+    Preserve,
+    Clear { conversation_id: String },
+}
+
+impl ProviderReplaySettlement {
+    #[must_use]
+    pub fn for_conversation_state(
+        conversation_id: &str,
+        state: &super::sm_state::ConvState,
+    ) -> Self {
+        if matches!(
+            state,
+            super::sm_state::ConvState::Error { .. }
+                | super::sm_state::ConvState::RecoverableContinuationFailure { .. }
+                | super::sm_state::ConvState::AwaitingRecovery { .. }
+        ) {
+            Self::Preserve
+        } else {
+            Self::Clear {
+                conversation_id: conversation_id.to_string(),
+            }
+        }
+    }
+}
+
 /// Private replay update returned beside public provider content. Runtime
 /// admission decides whether this may mutate durable replay state.
 #[derive(Debug, Clone, PartialEq)]
