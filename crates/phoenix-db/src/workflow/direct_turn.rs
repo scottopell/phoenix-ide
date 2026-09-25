@@ -226,6 +226,8 @@ pub struct PersistedConversationProjection {
 pub struct TerminalizeAuthoritativeTurnInput {
     pub command: TurnCommand,
     pub projection: Option<PersistedConversationProjection>,
+    /// Conversation whose active provider replay clears with terminalization.
+    pub clear_provider_replay_for: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1780,6 +1782,7 @@ impl WorkflowRepository {
         self.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
             command,
             projection: None,
+            clear_provider_replay_for: None,
         })
         .await
     }
@@ -1827,6 +1830,7 @@ impl WorkflowRepository {
                                 state: input.completed_state.clone(),
                                 state_updated_at: input.state_updated_at,
                             }),
+                            clear_provider_replay_for: None,
                         },
                     )
                     .await?;
@@ -1892,6 +1896,7 @@ impl WorkflowRepository {
                                     .to_string(),
                             },
                             projection: None,
+                            clear_provider_replay_for: None,
                         },
                     )
                     .await?;
@@ -1961,6 +1966,7 @@ impl WorkflowRepository {
                     &TerminalizeAuthoritativeTurnInput {
                         command: input.command.clone(),
                         projection,
+                        clear_provider_replay_for: None,
                     },
                 )
                 .await?;
@@ -1996,6 +2002,7 @@ impl WorkflowRepository {
             &TerminalizeAuthoritativeTurnInput {
                 command,
                 projection: None,
+                clear_provider_replay_for: None,
             },
             cut,
         )
@@ -2382,6 +2389,12 @@ impl WorkflowRepository {
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
+            if let Some(conversation_id) = &input.clear_provider_replay_for {
+                sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+                    .bind(conversation_id)
+                    .execute(&mut *tx.tx)
+                    .await?;
+            }
             return Ok(step);
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
@@ -2493,6 +2506,12 @@ impl WorkflowRepository {
         }
         mark_active_attempts_authority_lost_tx(tx, workflow_id).await?;
         delete_reclaimable_leases_tx(tx, workflow_id).await?;
+        if let Some(conversation_id) = &input.clear_provider_replay_for {
+            sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut *tx.tx)
+                .await?;
+        }
         tx.invalidate_nonterminal_effects(workflow_id).await?;
         Ok(step)
     }
@@ -4180,6 +4199,7 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(expected.projection.clone()),
+            clear_provider_replay_for: None,
         })
         .await
         .unwrap();
@@ -5056,6 +5076,12 @@ mod tests {
             .execute(&repo.pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a','anthropic','claude-opus-5-5','resp','{\"response_sets\":[]}')",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
         let projection = PersistedConversationProjection {
             state: ConvState::Idle,
             state_updated_at: Utc::now(),
@@ -5066,6 +5092,7 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(projection.clone()),
+            clear_provider_replay_for: Some("conv-a".to_string()),
         };
 
         assert!(repo
@@ -5088,6 +5115,13 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_after_cut).unwrap(),
             ConvState::LlmRequesting { .. }
         ));
+        let replay_after_cut: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_after_cut, 1);
 
         repo.terminalize_authoritative_turn(&input).await.unwrap();
         let committed = repo
@@ -5106,6 +5140,13 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
             projection.state
         );
+        let replay_after_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id='conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_after_commit, 0);
     }
 
     #[tokio::test]
@@ -5172,6 +5213,7 @@ mod tests {
                 state: ConvState::Idle,
                 state_updated_at: Utc::now(),
             }),
+            clear_provider_replay_for: None,
         })
         .await
         .unwrap();
@@ -5205,6 +5247,7 @@ mod tests {
                 state: ConvState::Idle,
                 state_updated_at: Utc::now(),
             }),
+            clear_provider_replay_for: None,
         })
         .await
         .unwrap();
@@ -5249,6 +5292,7 @@ mod tests {
                 expected_generation: 0,
             },
             projection: Some(projection.clone()),
+            clear_provider_replay_for: None,
         })
         .await
         .unwrap();

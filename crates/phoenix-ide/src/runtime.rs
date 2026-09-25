@@ -4565,6 +4565,7 @@ impl RuntimeManager {
                                                 state_updated_at: projection.state_updated_at,
                                             },
                                         ),
+                                        clear_provider_replay_for: None,
                                     },
                                 )
                                 .await
@@ -4652,6 +4653,7 @@ impl RuntimeManager {
                                             state_updated_at: conversation.state_updated_at,
                                         },
                                     ),
+                                    clear_provider_replay_for: None,
                                 },
                             )
                             .await
@@ -4731,6 +4733,7 @@ impl RuntimeManager {
                 &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                     command,
                     projection: Some(obligation.projection.clone()),
+                    clear_provider_replay_for: None,
                 },
             )
             .await

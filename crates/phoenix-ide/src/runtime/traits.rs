@@ -1725,6 +1725,7 @@ impl MessageStore for DatabaseStorage {
                     state: settlement.state.clone(),
                     state_updated_at: settlement.state_updated_at,
                 }),
+                clear_provider_replay_for: Some(settlement.conversation_id.clone()),
             },
         )
         .await

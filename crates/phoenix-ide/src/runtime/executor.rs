@@ -4298,6 +4298,7 @@ where
                 span.record("commit_probe", "not_needed");
                 self.active_direct_turn = None;
                 self.pending_direct_turn_terminal = None;
+                self.pending_provider_replay_update = None;
                 self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
                 self.direct_turn_cancellation_initiated = false;
                 Ok(())
@@ -10073,7 +10074,7 @@ fn strip_unavailable_tool_blocks(
         }
         if !filtered.is_empty() {
             normalized.push(LlmMessage {
-                source_message_id: None,
+                source_message_id: msg.source_message_id,
                 role: msg.role,
                 content: filtered,
             });
@@ -10644,6 +10645,21 @@ mod strip_tool_blocks_tests {
     }
 
     // ----- strip_unavailable_tool_blocks -----
+
+    #[test]
+    fn strip_unavailable_preserves_replay_owner_identity() {
+        let messages = vec![LlmMessage {
+            source_message_id: Some("accepted-request".into()),
+            role: MessageRole::Assistant,
+            content: vec![tool_use("tool-1", "bash")],
+        }];
+        let available = std::collections::HashSet::from(["bash"]);
+        let projected = strip_unavailable_tool_blocks(messages, &available, false);
+        assert_eq!(
+            projected[0].source_message_id.as_deref(),
+            Some("accepted-request")
+        );
+    }
 
     #[test]
     fn strip_unavailable_noop_when_all_tools_available() {
@@ -13031,6 +13047,7 @@ mod authoritative_user_message_effect_tests {
         assert!(matches!(settlements[0].state, ConvState::Idle));
         assert_eq!(rt.active_direct_turn, None);
         assert_eq!(rt.pending_direct_turn_terminal, None);
+        assert_eq!(rt.pending_provider_replay_update, None);
     }
 
     #[tokio::test]
