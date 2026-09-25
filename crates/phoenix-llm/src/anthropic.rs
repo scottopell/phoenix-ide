@@ -58,7 +58,7 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
+    fn new(dispatch_at: Instant, request: &LlmRequest, requested_fast: bool) -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
@@ -66,7 +66,7 @@ impl StreamAccumulator {
             cache_read_tokens: 0,
             response_id: None,
             response_model: None,
-            requested_fast: request.service_tier == super::types::EffectiveServiceTier::Fast,
+            requested_fast,
             dropped_thinking_blocks: 0,
             speed: None,
             stop_reason: None,
@@ -616,7 +616,7 @@ pub async fn complete_streaming(
         return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let mut acc = StreamAccumulator::new(dispatch_at, request);
+    let mut acc = StreamAccumulator::new(dispatch_at, request, fast_mode);
     let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
@@ -868,7 +868,7 @@ fn apply_provider_replay(
         for block in &set.private_blocks {
             let ordinal = block.index().0;
             if ordinal > wire.len() {
-                return Err(LlmError::invalid_response(format!(
+                return Err(LlmError::invalid_request(format!(
                     "Anthropic replay block ordinal {ordinal} exceeds owner content length {}",
                     wire.len()
                 )));
@@ -1267,11 +1267,10 @@ fn normalize_response_with_diagnostics(
         );
     }
 
-    let provider_replay = if content
+    let has_tool_use = content
         .iter()
-        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-        && !private_blocks.is_empty()
-    {
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let provider_replay = if has_tool_use && !private_blocks.is_empty() {
         Some(AnthropicReplayUpdate::Append(
             AnthropicResponseSet::with_public_content(
                 response_identity,
@@ -1280,6 +1279,8 @@ fn normalize_response_with_diagnostics(
             )
             .map_err(|error| LlmError::invalid_response(error.to_string()))?,
         ))
+    } else if has_tool_use {
+        None
     } else {
         Some(AnthropicReplayUpdate::Clear)
     };
@@ -1733,7 +1734,7 @@ mod tests {
 
     #[test]
     fn malformed_sse_error_withholds_private_event_data() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let error = tokio::runtime::Runtime::new()
             .unwrap()
@@ -1867,7 +1868,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event(
@@ -1891,7 +1892,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_assembles_text_and_usage_from_event_sequence() {
         // first generation must come from non-empty model output, not message_start/usage.
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -1994,10 +1995,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_standard_route_does_not_expect_fast_echo_from_raw_tier() {
+        let mut request = test_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        let mut acc = StreamAccumulator::new(Instant::now(), &request, false);
+        acc.response_id = Some("msg_stream".into());
+        acc.response_model = Some("claude-opus-5-5".into());
+        acc.stop_reason = Some("end_turn".into());
+        acc.speed = None;
+        acc.content_blocks.push((
+            0,
+            AnthropicContentBlock::Text {
+                text: "ok".into(),
+                cache_control: None,
+            },
+        ));
+        assert!(acc.into_response_with_diagnostics(None).is_ok());
+    }
+
+    #[tokio::test]
     async fn streaming_parses_and_validates_usage_speed() {
         let mut request = test_request();
         request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
-        let mut acc = StreamAccumulator::new(Instant::now(), &request);
+        let mut acc = StreamAccumulator::new(Instant::now(), &request, true);
         let (tx, mut _rx) = tokio::sync::mpsc::channel(8);
         acc.process_event(
             "message_start",
@@ -2038,7 +2058,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_rejects_unknown_usage_speed_at_finalize() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         acc.process_event(
             "message_start",
@@ -2080,7 +2100,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_preserves_empty_thinking_signature_and_redacted_thinking() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         acc.response_id = Some("msg_stream".to_string());
         acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -2160,6 +2180,30 @@ mod tests {
     }
 
     #[test]
+    fn tool_use_without_new_private_blocks_retains_existing_replay() {
+        let response = normalize_response(AnthropicResponse {
+            id: "msg_no_thinking".into(),
+            model: "claude-opus-5-5".into(),
+            content: vec![AnthropicContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("tool_use".into()),
+            stop_details: None,
+            usage: AnthropicUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                speed: None,
+            },
+        })
+        .unwrap();
+        assert!(response.provider_replay.is_none());
+    }
+
+    #[test]
     fn refusal_is_non_retryable_prompt_rejection_even_with_partial_content() {
         let error = normalize_response(AnthropicResponse {
             id: "msg_test".to_string(),
@@ -2190,7 +2234,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_telemetry_ignores_control_usage_and_terminal_events_for_first_generation() {
         let start = Instant::now();
-        let mut acc = StreamAccumulator::new(start, &test_request());
+        let mut acc = StreamAccumulator::new(start, &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -2236,7 +2280,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_assembles_tool_use_from_split_input_json() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         acc.response_id = Some("msg_stream".to_string());
         acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -2286,7 +2330,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_malformed_sse_data_is_invalid_response_not_panic() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event("content_block_delta", "{ not json", &tx)
@@ -2303,7 +2347,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_ping_and_unknown_events_are_ignored() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Keep-alive pings and forward-compatible unknown events must be no-ops,
         // not errors — the stream keeps flowing.
@@ -2315,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_text_delta_before_block_start_is_not_committed() {
-        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
         acc.response_id = Some("msg_stream".to_string());
         acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);

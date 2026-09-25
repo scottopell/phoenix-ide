@@ -103,6 +103,11 @@ impl Database {
                     .map_err(|error| {
                         DbError::Serialization(format!("provider replay decode: {error}"))
                     })?
+                    .map(|decoded| AnthropicReplayPayload::new(decoded.response_sets))
+                    .transpose()
+                    .map_err(|error| {
+                        DbError::Serialization(format!("provider replay validation: {error}"))
+                    })?
                     .map_or_else(Vec::new, |payload| payload.response_sets);
                 if !sets
                     .iter()
@@ -178,6 +183,11 @@ impl Database {
                     .transpose()
                     .map_err(|error| {
                         DbError::Serialization(format!("provider replay decode: {error}"))
+                    })?
+                    .map(|decoded| AnthropicReplayPayload::new(decoded.response_sets))
+                    .transpose()
+                    .map_err(|error| {
+                        DbError::Serialization(format!("provider replay validation: {error}"))
                     })?
                     .map_or_else(Vec::new, |payload| payload.response_sets);
                 if !sets
@@ -314,8 +324,12 @@ impl Database {
             None => Ok(None),
             Some(row) => {
                 let blob: String = row.try_get("payload")?;
-                let payload: AnthropicReplayPayload = serde_json::from_str(&blob)
+                let decoded: AnthropicReplayPayload = serde_json::from_str(&blob)
                     .map_err(|e| DbError::Serialization(format!("provider replay decode: {e}")))?;
+                let payload =
+                    AnthropicReplayPayload::new(decoded.response_sets).map_err(|error| {
+                        DbError::Serialization(format!("provider replay validation: {error}"))
+                    })?;
                 Ok(Some(payload))
             }
         }
@@ -777,6 +791,38 @@ mod tests {
             matches!(err, DbError::Serialization(_)),
             "expected Serialization error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_semantically_invalid_ordinal() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "conv-invalid-ordinal",
+            "conv-invalid-ordinal",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let payload = serde_json::json!({
+            "response_sets": [{
+                "identity": {"response_id": "resp", "model": "claude-opus-5-5"},
+                "owner_message_id": "owner",
+                "public_content": [{"type": "text", "text": "public"}],
+                "private_blocks": [{"type": "thinking", "index": 2, "thinking": "", "signature": "sig"}]
+            }]
+        });
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES (?1,'anthropic','claude-opus-5-5','resp',?2)")
+            .bind("conv-invalid-ordinal")
+            .bind(payload.to_string())
+            .execute(db.pool()).await.unwrap();
+        let error = db
+            .load_provider_replay_state("conv-invalid-ordinal")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("validation"));
     }
 
     #[tokio::test]

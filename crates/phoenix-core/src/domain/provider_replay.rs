@@ -229,6 +229,20 @@ impl AnthropicResponseSet {
         self.owner_message_id = owner_message_id;
         self
     }
+
+    /// Re-run semantic invariants after decoding persisted replay state.
+    ///
+    /// # Errors
+    /// Returns [`AnthropicResponseSetError`] when persisted identity, signature,
+    /// ordinal, or ordering data is invalid.
+    pub fn validate(&self) -> Result<(), AnthropicResponseSetError> {
+        Self::with_public_content(
+            self.identity.clone(),
+            self.public_content.clone(),
+            self.private_blocks.clone(),
+        )?;
+        Ok(())
+    }
 }
 
 /// Replay payload for all active Anthropic response sets in a conversation.
@@ -251,6 +265,8 @@ pub struct AnthropicReplayPayload {
 /// Error returned by [`AnthropicReplayPayload::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnthropicReplayPayloadError {
+    /// A decoded response set violates semantic replay invariants.
+    InvalidResponseSet(String),
     /// Two or more response sets share the same `response_id`.
     DuplicateResponseId(String),
 }
@@ -258,6 +274,7 @@ pub enum AnthropicReplayPayloadError {
 impl std::fmt::Display for AnthropicReplayPayloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidResponseSet(message) => f.write_str(message),
             Self::DuplicateResponseId(id) => {
                 write!(f, "duplicate response_id in payload: {id}")
             }
@@ -283,6 +300,11 @@ impl AnthropicReplayPayload {
             if !seen.insert(id.as_str()) {
                 return Err(AnthropicReplayPayloadError::DuplicateResponseId(id.clone()));
             }
+        }
+        for set in &response_sets {
+            set.validate().map_err(|error| {
+                AnthropicReplayPayloadError::InvalidResponseSet(error.to_string())
+            })?;
         }
         Ok(Self { response_sets })
     }
