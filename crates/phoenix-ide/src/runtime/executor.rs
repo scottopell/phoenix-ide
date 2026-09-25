@@ -19418,6 +19418,51 @@ mod steer_drain_detector_tests {
         assert_eq!(fence.owner_count(), 0);
     }
 
+    #[tokio::test]
+    async fn accepted_request_id_survives_checkpoint_and_next_projection() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-replay-owner",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            content: vec![ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }],
+            provider_replay: None,
+            tool_calls: vec![ToolCall::new(
+                "tool-1",
+                crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                    "echo ok",
+                )),
+            )],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "accepted-request".into(),
+        }))
+        .await
+        .expect("accepted tool response");
+        rt.process_event(Event::ToolComplete {
+            tool_use_id: "tool-1".into(),
+            result: ToolResult::success("tool-1".into(), "ok".into()),
+        })
+        .await
+        .expect("checkpoint tool round");
+        let messages = storage.get_all_messages("conv-replay-owner");
+        let rendered = render_messages(&messages, &std::collections::HashSet::new());
+        let available = std::collections::HashSet::from(["bash"]);
+        let projected = strip_unavailable_tool_blocks(rendered, &available, false);
+        assert_eq!(
+            projected
+                .iter()
+                .find(|message| message.role == MessageRole::Assistant)
+                .and_then(|message| message.source_message_id.as_deref()),
+            Some("accepted-request")
+        );
+    }
+
     /// Regression: a tool result carrying typed images must survive the
     /// normal `PersistCheckpoint` round into `ToolContent.images`. Before
     /// this was threaded, `MessageContent::tool(...)` dropped the field, so

@@ -1830,7 +1830,10 @@ impl WorkflowRepository {
                                 state: input.completed_state.clone(),
                                 state_updated_at: input.state_updated_at,
                             }),
-                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                &input.conversation_id,
+                                &input.completed_state,
+                            ),
                         },
                     )
                     .await?;
@@ -1896,7 +1899,9 @@ impl WorkflowRepository {
                                     .to_string(),
                             },
                             projection: None,
-                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                            provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+                                conversation_id: conversation_id.to_string(),
+                            },
                         },
                     )
                     .await?;
@@ -1966,7 +1971,10 @@ impl WorkflowRepository {
                     &TerminalizeAuthoritativeTurnInput {
                         command: input.command.clone(),
                         projection,
-                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                            &input.conversation_id,
+                            &input.completed_state,
+                        ),
                     },
                 )
                 .await?;
