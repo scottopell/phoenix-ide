@@ -133,6 +133,7 @@ impl LlmService for CountingLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text(self.response_text.clone())],
             end_turn: true,
             usage: Usage::default(),
@@ -291,6 +292,7 @@ impl StreamingLlm {
 impl LlmService for StreamingLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text(self.assembled())],
             end_turn: true,
             usage: Usage::default(),
@@ -311,6 +313,7 @@ impl LlmService for StreamingLlm {
             tokio::task::yield_now().await;
         }
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text(self.assembled())],
             end_turn: true,
             usage: Usage::default(),
@@ -335,6 +338,7 @@ impl LlmService for FailingStreamingLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         // Planning turn: no tool call → the loop moves to the final answer.
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("")],
             end_turn: true,
             usage: Usage::default(),
@@ -570,6 +574,7 @@ impl LlmService for ScriptedToolLlm {
         if n == 0 {
             // Planning turn 1: ask to search.
             Ok(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::ToolUse {
                     id: "t1".to_string(),
                     name: "search_conversations".to_string(),
@@ -582,6 +587,7 @@ impl LlmService for ScriptedToolLlm {
         } else {
             // Planning turn 2: no tool call → ready to answer.
             Ok(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::text("")],
                 end_turn: true,
                 usage: Usage::default(),
@@ -601,6 +607,7 @@ impl LlmService for ScriptedToolLlm {
             .await;
         tokio::task::yield_now().await;
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("final answer after search")],
             end_turn: true,
             usage: Usage::default(),
@@ -790,6 +797,7 @@ impl LlmService for AlwaysSearchLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.complete_calls.fetch_add(1, Ordering::SeqCst);
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::ToolUse {
                 id: "loop".to_string(),
                 name: "search_conversations".to_string(),
@@ -811,6 +819,7 @@ impl LlmService for AlwaysSearchLlm {
             .await;
         tokio::task::yield_now().await;
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("forced final answer")],
             end_turn: true,
             usage: Usage::default(),

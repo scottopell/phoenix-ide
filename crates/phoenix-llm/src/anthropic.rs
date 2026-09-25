@@ -7,6 +7,10 @@ use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
 };
 use super::LlmError;
+use phoenix_core::domain::provider_replay::{
+    AnthropicPrivateBlock, AnthropicReplayUpdate, AnthropicResponseIdentity, AnthropicResponseSet,
+    ContentIndex,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,6 +31,13 @@ struct StreamAccumulator {
     output_tokens: u64,
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
+    response_id: Option<String>,
+    response_model: Option<String>,
+    requested_fast: bool,
+    dropped_thinking_blocks: u64,
+    /// Effective request speed echoed by Anthropic in `message_start` /
+    /// `message_delta` usage. Observational only; validated at finalize.
+    speed: Option<String>,
     stop_reason: Option<String>,
     stop_details: Option<AnthropicStopDetails>,
     content_blocks: Vec<(usize, AnthropicContentBlock)>,
@@ -53,6 +64,11 @@ impl StreamAccumulator {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            response_id: None,
+            response_model: None,
+            requested_fast: request.service_tier == super::types::EffectiveServiceTier::Fast,
+            dropped_thinking_blocks: 0,
+            speed: None,
             stop_reason: None,
             stop_details: None,
             content_blocks: Vec::new(),
@@ -86,10 +102,20 @@ impl StreamAccumulator {
         let now = Instant::now();
         self.telemetry.record_provider_event_at(now);
         let v: serde_json::Value = serde_json::from_str(data).map_err(|e| {
-            LlmError::invalid_response(format!("Failed to parse SSE data: {e} - data: {data}"))
+            LlmError::invalid_response(format!(
+                "Failed to parse Anthropic SSE JSON ({e}); event data withheld"
+            ))
         })?;
         match event_type {
             "message_start" => {
+                self.response_id = v
+                    .pointer("/message/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                self.response_model = v
+                    .pointer("/message/model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
                 self.input_tokens = v
                     .pointer("/message/usage/input_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -102,6 +128,13 @@ impl StreamAccumulator {
                     .pointer("/message/usage/cache_read_input_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
+                if let Some(speed) = v
+                    .pointer("/message/usage/speed")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.speed = Some(speed.to_string());
+                }
+                self.dropped_thinking_blocks += count_dropped_thinking_blocks(&v);
             }
             "content_block_start" => self.on_block_start(&v, now),
             "content_block_delta" => self.on_block_delta(&v, chunk_tx, now).await,
@@ -120,6 +153,13 @@ impl StreamAccumulator {
                     .pointer("/usage/output_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(self.output_tokens);
+                if let Some(speed) = v
+                    .pointer("/usage/speed")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.speed = Some(speed.to_string());
+                }
+                self.dropped_thinking_blocks += count_dropped_thinking_blocks(&v);
             }
             "error" => return Err(parse_anthropic_sse_error(&v)),
             "message_stop" => self.done = true,
@@ -378,6 +418,12 @@ impl StreamAccumulator {
         let telemetry = self.telemetry;
         let mut response = normalize_response_with_diagnostics(
             AnthropicResponse {
+                id: self.response_id.ok_or_else(|| {
+                    LlmError::invalid_response("Anthropic stream omitted message id")
+                })?,
+                model: self
+                    .response_model
+                    .ok_or_else(|| LlmError::invalid_response("Anthropic stream omitted model"))?,
                 content: self.content_blocks.into_iter().map(|(_, b)| b).collect(),
                 stop_reason: self.stop_reason,
                 stop_details: self.stop_details,
@@ -386,10 +432,18 @@ impl StreamAccumulator {
                     output_tokens: self.output_tokens,
                     cache_creation_input_tokens: Some(self.cache_creation_tokens),
                     cache_read_input_tokens: Some(self.cache_read_tokens),
+                    speed: self.speed,
                 },
             },
             diagnostics,
+            self.requested_fast,
         )?;
+        if self.dropped_thinking_blocks > 0 {
+            tracing::debug!(
+                dropped_thinking_blocks = self.dropped_thinking_blocks,
+                "Anthropic dropped preserved-thinking blocks after prefix mismatch"
+            );
+        }
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -421,8 +475,25 @@ const OFFICIAL_ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Beta token enabling Anthropic Fast mode (research preview, direct Claude API).
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 /// Beta token enabling advanced tool use (tool search).
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
+
+fn count_dropped_thinking_blocks(value: &serde_json::Value) -> u64 {
+    value
+        .pointer("/message/input_transformations")
+        .or_else(|| value.pointer("/delta/input_transformations"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str)
+                        == Some("thinking_block_dropped")
+                })
+                .count() as u64
+        })
+}
 
 fn resolve_anthropic_url(base_url_override: Option<&str>) -> String {
     if let Some(url) = base_url_override {
@@ -451,13 +522,20 @@ fn is_fast_mode(base_url_override: Option<&str>, request: &LlmRequest) -> bool {
 /// Compose the ordered `anthropic-beta` token list for a request. Tool search
 /// and Fast mode are independent betas that can both apply; they are joined
 /// into one comma-separated header value.
-fn anthropic_beta_tokens(has_deferred: bool, fast_mode: bool) -> Vec<&'static str> {
+fn anthropic_beta_tokens(
+    has_deferred: bool,
+    fast_mode: bool,
+    thinking_binding: bool,
+) -> Vec<&'static str> {
     let mut tokens = Vec::new();
     if has_deferred {
         tokens.push(ADVANCED_TOOL_USE_BETA);
     }
     if fast_mode {
         tokens.push(FAST_MODE_BETA);
+    }
+    if thinking_binding {
+        tokens.push(THINKING_BINDING_BETA);
     }
     tokens
 }
@@ -485,7 +563,9 @@ pub async fn complete_streaming(
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let fast_mode = is_fast_mode(base_url_override, request);
-    let mut anthropic_request = translate_request(spec, request, fast_mode);
+    let thinking_binding =
+        spec.api_name == "claude-opus-5-5" && is_official_anthropic_route(base_url_override);
+    let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
     anthropic_request.stream = Some(true);
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
@@ -508,7 +588,7 @@ pub async fn complete_streaming(
     };
     // Tool search and Fast mode are independent betas; compose them into one
     // comma-separated header value so both can apply on the same request.
-    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode);
+    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
     if !beta_tokens.is_empty() {
         builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
@@ -598,7 +678,9 @@ pub async fn complete(
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
     let fast_mode = is_fast_mode(base_url_override, request);
-    let mut anthropic_request = translate_request(spec, request, fast_mode);
+    let thinking_binding =
+        spec.api_name == "claude-opus-5-5" && is_official_anthropic_route(base_url_override);
+    let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
     }
@@ -612,7 +694,7 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode);
+    let beta_tokens = anthropic_beta_tokens(has_deferred, fast_mode, thinking_binding);
     if !beta_tokens.is_empty() {
         builder = builder.header("anthropic-beta", beta_tokens.join(", "));
     }
@@ -641,17 +723,20 @@ pub async fn complete(
     }
 
     let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
-        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+        LlmError::invalid_response(format!(
+            "Failed to parse Anthropic response JSON ({e}); response body withheld"
+        ))
     })?;
 
-    normalize_response(anthropic_response)
+    normalize_response_with_diagnostics(anthropic_response, None, fast_mode)
 }
 
 fn translate_request(
     spec: &super::ModelSpec,
     request: &LlmRequest,
     fast_mode: bool,
-) -> AnthropicRequest {
+    thinking_binding: bool,
+) -> Result<AnthropicRequest, LlmError> {
     let system: Vec<AnthropicSystemBlock> = request
         .system
         .iter()
@@ -668,7 +753,11 @@ fn translate_request(
         })
         .collect();
 
-    let messages: Vec<AnthropicMessage> = request.messages.iter().map(translate_message).collect();
+    let mut messages: Vec<AnthropicMessage> =
+        request.messages.iter().map(translate_message).collect();
+    if let Some(payload) = &request.provider_replay {
+        apply_provider_replay(&request.messages, &mut messages, payload)?;
+    }
 
     let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
@@ -709,7 +798,6 @@ fn translate_request(
     // Set explicit cache breakpoint on last content block of last user message.
     // Combined with system-prompt and last-tool breakpoints, this gives Anthropic
     // three deterministic cache anchor points per request.
-    let mut messages = messages;
     if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
         if let Some(
             AnthropicContentBlock::Text { cache_control, .. }
@@ -723,8 +811,14 @@ fn translate_request(
         }
     }
 
-    AnthropicRequest {
+    Ok(AnthropicRequest {
         model: spec.api_name.clone(),
+        thinking: thinking_binding.then_some(AnthropicThinkingConfig {
+            r#type: "adaptive",
+            block_binding: AnthropicBlockBinding {
+                prefix_mismatch_behavior: "drop_block",
+            },
+        }),
         max_tokens: request
             .raised_output_token_ceiling()
             .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
@@ -744,7 +838,58 @@ fn translate_request(
         },
         stream: None,
         tags: None,
+    })
+}
+
+fn apply_provider_replay(
+    source_messages: &[LlmMessage],
+    wire_messages: &mut [AnthropicMessage],
+    payload: &phoenix_core::domain::provider_replay::AnthropicReplayPayload,
+) -> Result<(), LlmError> {
+    use phoenix_core::domain::provider_replay::AnthropicPrivateBlock;
+    for set in &payload.response_sets {
+        let index = source_messages
+            .iter()
+            .position(|message| message.source_message_id.as_deref() == Some(&set.owner_message_id))
+            .ok_or_else(|| {
+                LlmError::invalid_request(format!(
+                    "active Anthropic replay owner '{}' is absent from projected history",
+                    set.owner_message_id
+                ))
+            })?;
+        let source = &source_messages[index];
+        if source.role != MessageRole::Assistant || source.content != set.public_content {
+            return Err(LlmError::invalid_request(format!(
+                "active Anthropic replay owner '{}' was removed or rewritten",
+                set.owner_message_id
+            )));
+        }
+        let wire = &mut wire_messages[index].content;
+        for block in &set.private_blocks {
+            let ordinal = block.index().0;
+            if ordinal > wire.len() {
+                return Err(LlmError::invalid_response(format!(
+                    "Anthropic replay block ordinal {ordinal} exceeds owner content length {}",
+                    wire.len()
+                )));
+            }
+            let private = match block {
+                AnthropicPrivateBlock::Thinking {
+                    thinking,
+                    signature,
+                    ..
+                } => AnthropicContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                },
+                AnthropicPrivateBlock::RedactedThinking { data, .. } => {
+                    AnthropicContentBlock::RedactedThinking { data: data.clone() }
+                }
+            };
+            wire.insert(ordinal, private);
+        }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
@@ -778,16 +923,6 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                 name: name.clone(),
                 input: input.clone(),
             },
-            ContentBlock::Thinking {
-                thinking,
-                signature,
-            } => AnthropicContentBlock::Thinking {
-                thinking: thinking.clone(),
-                signature: signature.clone(),
-            },
-            ContentBlock::RedactedThinking { data } => {
-                AnthropicContentBlock::RedactedThinking { data: data.clone() }
-            }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -898,18 +1033,29 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
 }
 
 #[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
+#[cfg(test)]
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
-    normalize_response_with_diagnostics(resp, None)
+    normalize_response_with_diagnostics(resp, None, false)
 }
 
 #[allow(clippy::too_many_lines)]
 fn normalize_response_with_diagnostics(
     resp: AnthropicResponse,
     sse_diagnostics: Option<super::sse::SseDiagnostics>,
+    expected_fast: bool,
 ) -> Result<LlmResponse, LlmError> {
-    let mut content = Vec::new();
+    // Validate the echoed effective speed for both streaming and non-streaming
+    // success. A present-but-unknown value is a contract violation, not success.
+    validate_usage_speed(resp.usage.speed.as_deref(), expected_fast)?;
 
-    for block in resp.content {
+    let mut content = Vec::new();
+    let mut private_blocks = Vec::new();
+    let response_identity = AnthropicResponseIdentity {
+        response_id: resp.id,
+        model: resp.model,
+    };
+
+    for (index, block) in resp.content.into_iter().enumerate() {
         match block {
             AnthropicContentBlock::Text { text, .. } => {
                 if !text.is_empty() {
@@ -922,12 +1068,28 @@ fn normalize_response_with_diagnostics(
             AnthropicContentBlock::Thinking {
                 thinking,
                 signature,
-            } => content.push(ContentBlock::Thinking {
-                thinking,
-                signature,
-            }),
+            } => {
+                if signature.is_empty() {
+                    return Err(LlmError::invalid_response(
+                        "Anthropic thinking block omitted its signature",
+                    ));
+                }
+                private_blocks.push(AnthropicPrivateBlock::Thinking {
+                    index: ContentIndex(index),
+                    thinking,
+                    signature,
+                });
+            }
             AnthropicContentBlock::RedactedThinking { data } => {
-                content.push(ContentBlock::RedactedThinking { data });
+                if data.is_empty() {
+                    return Err(LlmError::invalid_response(
+                        "Anthropic redacted thinking block omitted its data",
+                    ));
+                }
+                private_blocks.push(AnthropicPrivateBlock::RedactedThinking {
+                    index: ContentIndex(index),
+                    data,
+                });
             }
             AnthropicContentBlock::Image { .. } => {
                 return Err(LlmError::invalid_response(
@@ -1105,7 +1267,24 @@ fn normalize_response_with_diagnostics(
         );
     }
 
-    Ok(LlmResponse::non_streaming(
+    let provider_replay = if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        && !private_blocks.is_empty()
+    {
+        Some(AnthropicReplayUpdate::Append(
+            AnthropicResponseSet::with_public_content(
+                response_identity,
+                content.clone(),
+                private_blocks,
+            )
+            .map_err(|error| LlmError::invalid_response(error.to_string()))?,
+        ))
+    } else {
+        Some(AnthropicReplayUpdate::Clear)
+    };
+
+    let mut response = LlmResponse::non_streaming(
         content,
         end_turn,
         Usage {
@@ -1115,7 +1294,9 @@ fn normalize_response_with_diagnostics(
             cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
             cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
         },
-    ))
+    );
+    response.provider_replay = provider_replay;
+    Ok(response)
 }
 
 fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
@@ -1134,6 +1315,8 @@ fn explicit_anthropic_effort(effort: ModelEffort) -> AnthropicOutputConfig {
 
 #[derive(Debug, Serialize)]
 struct AnthropicRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingConfig>,
     model: String,
     max_tokens: u32,
     system: Vec<AnthropicSystemBlock>,
@@ -1157,6 +1340,17 @@ struct AnthropicRequest {
     /// configured; the field is omitted from the wire when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicThinkingConfig {
+    r#type: &'static str,
+    block_binding: AnthropicBlockBinding,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicBlockBinding {
+    prefix_mismatch_behavior: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1302,6 +1496,8 @@ struct AnthropicToolSearchTool {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnthropicResponse {
+    pub(crate) id: String,
+    pub(crate) model: String,
     pub(crate) content: Vec<AnthropicContentBlock>,
     pub(crate) stop_reason: Option<String>,
     #[serde(default)]
@@ -1322,6 +1518,29 @@ pub(crate) struct AnthropicUsage {
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_input_tokens: Option<u64>,
     pub(crate) cache_read_input_tokens: Option<u64>,
+    /// Effective request speed echoed by Anthropic (`"standard"` | `"fast"`).
+    /// Observational only: the pricing authority is Phoenix's persisted
+    /// per-turn effective request speed, not this field. Absent on models and
+    /// routes that do not report it.
+    #[serde(default)]
+    pub(crate) speed: Option<String>,
+}
+
+/// Validate an Anthropic `usage.speed` value. `None` is allowed (field absent).
+/// A present value must be one of the documented tokens; anything else is a
+/// contract violation and rejected so a malformed response cannot be silently
+/// treated as success.
+fn validate_usage_speed(speed: Option<&str>, expected_fast: bool) -> Result<(), LlmError> {
+    match (expected_fast, speed) {
+        (true, Some("fast")) | (false, None | Some("standard")) => Ok(()),
+        (_, Some("standard" | "fast")) | (true, None) => Err(LlmError::invalid_response(format!(
+            "Anthropic response usage.speed {speed:?} disagrees with requested {} speed",
+            if expected_fast { "fast" } else { "standard" }
+        ))),
+        (_, Some(other)) => Err(LlmError::invalid_response(format!(
+            "Anthropic response reported unknown usage.speed {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1367,6 +1586,7 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![
                 ToolDefinition {
                     name: "bash".into(),
@@ -1393,6 +1613,7 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -1407,19 +1628,22 @@ mod tests {
         let spec = test_spec(false);
         let mut request = test_request_with_tools();
 
-        let native = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
+        let native =
+            serde_json::to_value(translate_request(&spec, &request, false, true).unwrap()).unwrap();
         assert!(native.get("output_config").is_none());
         assert_eq!(native["max_tokens"], 16_384);
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::High);
-        let native_known = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
+        let native_known =
+            serde_json::to_value(translate_request(&spec, &request, false, true).unwrap()).unwrap();
         assert!(native_known.get("output_config").is_none());
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);
         request.max_tokens = Some(16_384);
-        let explicit = serde_json::to_value(translate_request(&spec, &request, false)).unwrap();
+        let explicit =
+            serde_json::to_value(translate_request(&spec, &request, false, true).unwrap()).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
         assert_eq!(explicit["max_tokens"], 16_384);
     }
@@ -1427,27 +1651,100 @@ mod tests {
     #[test]
     fn fast_mode_request_shape_and_beta_tokens_are_independent() {
         let spec = test_spec(true);
-        let standard =
-            serde_json::to_value(translate_request(&spec, &test_request_with_tools(), false))
-                .unwrap();
+        let standard = serde_json::to_value(
+            translate_request(&spec, &test_request_with_tools(), false, true).unwrap(),
+        )
+        .unwrap();
         assert!(standard.get("speed").is_none());
         assert_eq!(
-            anthropic_beta_tokens(true, false),
+            anthropic_beta_tokens(true, false, false),
             vec![ADVANCED_TOOL_USE_BETA]
         );
 
-        let fast = serde_json::to_value(translate_request(&spec, &test_request_with_tools(), true))
-            .unwrap();
+        let fast = serde_json::to_value(
+            translate_request(&spec, &test_request_with_tools(), true, true).unwrap(),
+        )
+        .unwrap();
         assert_eq!(fast["speed"], "fast");
         assert_eq!(
-            anthropic_beta_tokens(true, true).join(", "),
-            "advanced-tool-use-2025-11-20, fast-mode-2026-02-01"
+            anthropic_beta_tokens(true, true, true).join(", "),
+            "advanced-tool-use-2025-11-20, fast-mode-2026-02-01, thinking-binding-controls-2026-08-01"
         );
         assert!(is_official_anthropic_route(None));
         assert!(is_official_anthropic_route(Some(OFFICIAL_ANTHROPIC_URL)));
         assert!(!is_official_anthropic_route(Some(
             "https://gateway.example/v1/messages"
         )));
+    }
+
+    #[test]
+    fn private_replay_reconstructs_three_rounds_and_rejects_rewritten_owner() {
+        use phoenix_core::domain::provider_replay::{
+            AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
+            AnthropicResponseSet, ContentIndex,
+        };
+        let mut source = Vec::new();
+        let mut sets = Vec::new();
+        for round in 0..3 {
+            let id = format!("round-{round}");
+            let public = vec![ContentBlock::ToolUse {
+                id: format!("tool-{round}"),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }];
+            source.push(LlmMessage {
+                source_message_id: Some(id.clone()),
+                role: MessageRole::Assistant,
+                content: public.clone(),
+            });
+            sets.push(
+                AnthropicResponseSet::with_public_content(
+                    AnthropicResponseIdentity {
+                        response_id: format!("provider-{round}"),
+                        model: "claude-opus-5-5".into(),
+                    },
+                    public,
+                    vec![AnthropicPrivateBlock::Thinking {
+                        index: ContentIndex(0),
+                        thinking: String::new(),
+                        signature: format!("sig-{round}"),
+                    }],
+                )
+                .unwrap()
+                .with_owner_message_id(id),
+            );
+        }
+        let payload = AnthropicReplayPayload::new(sets).unwrap();
+        let mut wire: Vec<_> = source.iter().map(translate_message).collect();
+        apply_provider_replay(&source, &mut wire, &payload).unwrap();
+        for (round, message) in wire.iter().enumerate() {
+            assert!(matches!(
+                &message.content[..],
+                [AnthropicContentBlock::Thinking { signature, .. }, AnthropicContentBlock::ToolUse { .. }]
+                    if signature == &format!("sig-{round}")
+            ));
+        }
+
+        source[1].content = vec![ContentBlock::text("rewritten")];
+        let mut wire: Vec<_> = source.iter().map(translate_message).collect();
+        let error = apply_provider_replay(&source, &mut wire, &payload).unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn malformed_sse_error_withholds_private_event_data() {
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(acc.process_event(
+                "content_block_delta",
+                r#"{"signature":"PRIVATE-SENTINEL"#,
+                &tx,
+            ))
+            .unwrap_err();
+        assert!(!error.message.contains("PRIVATE-SENTINEL"));
+        assert!(error.message.contains("withheld"));
     }
 
     #[tokio::test]
@@ -1470,7 +1767,7 @@ mod tests {
     async fn test_tool_search_enabled_serialization() {
         let spec = test_spec(true);
         let request = test_request_with_tools();
-        let anthropic_req = translate_request(&spec, &request, false);
+        let anthropic_req = translate_request(&spec, &request, false, true).unwrap();
 
         assert_eq!(anthropic_req.model, "test-model-api");
 
@@ -1506,7 +1803,7 @@ mod tests {
     async fn test_tool_search_disabled_serialization() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let anthropic_req = translate_request(&spec, &request, false);
+        let anthropic_req = translate_request(&spec, &request, false, true).unwrap();
 
         let json = serde_json::to_value(&anthropic_req).unwrap();
         let tools = json["tools"].as_array().unwrap();
@@ -1541,6 +1838,7 @@ mod tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "toolu_abc".into(),
@@ -1549,6 +1847,7 @@ mod tests {
                     is_error: false,
                 }],
             }],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -1556,7 +1855,7 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
-        let req = translate_request(&spec, &request, false);
+        let req = translate_request(&spec, &request, false, true).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         let block = &json["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
@@ -1597,7 +1896,7 @@ mod tests {
 
         acc.process_event(
             "message_start",
-            r#"{"message":{"usage":{"input_tokens":7}}}"#,
+            r#"{"message":{"id":"msg_stream","model":"claude-opus-5-5","usage":{"input_tokens":7}}}"#,
             &tx,
         )
         .await
@@ -1642,10 +1941,148 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 7);
         assert_eq!(resp.usage.output_tokens, 11);
     }
+    #[test]
+    fn counts_only_content_free_dropped_thinking_transformations() {
+        let event = serde_json::json!({
+            "message": {
+                "input_transformations": [
+                    { "type": "thinking_block_dropped", "private": "NOT-LOGGED" },
+                    { "type": "other" },
+                    { "type": "thinking_block_dropped" }
+                ]
+            }
+        });
+        assert_eq!(count_dropped_thinking_blocks(&event), 2);
+    }
+
+    #[test]
+    fn usage_speed_validation_accepts_known_and_rejects_unknown() {
+        assert!(validate_usage_speed(None, false).is_ok());
+        assert!(validate_usage_speed(Some("standard"), false).is_ok());
+        assert!(validate_usage_speed(Some("fast"), true).is_ok());
+
+        let err = validate_usage_speed(Some("turbo"), false).unwrap_err();
+        assert!(
+            matches!(err.kind, crate::LlmErrorKind::InvalidResponse),
+            "unknown speed must be an invalid-response contract error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nonstreaming_rejects_unknown_usage_speed() {
+        let resp = AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
+            content: vec![AnthropicContentBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            stop_details: None,
+            usage: AnthropicUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                speed: Some("turbo".to_string()),
+            },
+        };
+        assert!(matches!(
+            normalize_response(resp).unwrap_err().kind,
+            crate::LlmErrorKind::InvalidResponse
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_parses_and_validates_usage_speed() {
+        let mut request = test_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        let mut acc = StreamAccumulator::new(Instant::now(), &request);
+        let (tx, mut _rx) = tokio::sync::mpsc::channel(8);
+        acc.process_event(
+            "message_start",
+            r#"{"message":{"id":"msg_stream","model":"claude-opus-5-5","usage":{"input_tokens":3,"speed":"fast"}}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .await
+            .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
+        assert_eq!(acc.speed.as_deref(), Some("fast"));
+        // Known speed finalizes successfully.
+        assert!(acc.into_response_with_diagnostics(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_unknown_usage_speed_at_finalize() {
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        acc.process_event(
+            "message_start",
+            r#"{"message":{"id":"msg_stream","model":"claude-opus-5-5","usage":{"input_tokens":1,"speed":"warp"}}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .await
+            .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
+        assert!(matches!(
+            acc.into_response_with_diagnostics(None).unwrap_err().kind,
+            crate::LlmErrorKind::InvalidResponse
+        ));
+    }
 
     #[tokio::test]
     async fn streaming_preserves_empty_thinking_signature_and_redacted_thinking() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        acc.response_id = Some("msg_stream".to_string());
+        acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         acc.process_event(
             "content_block_start",
@@ -1707,24 +2144,26 @@ mod tests {
         .unwrap();
 
         let response = acc.into_response_with_diagnostics(None).unwrap();
-        assert!(
-            matches!(&response.content[0], ContentBlock::Thinking { thinking, signature } if thinking.is_empty() && signature == "opaque-signature")
+        assert_eq!(
+            response.content.len(),
+            1,
+            "public response contains only tool use"
         );
-        assert!(
-            matches!(&response.content[1], ContentBlock::RedactedThinking { data } if data == "encrypted")
-        );
-        let replay = translate_message(&LlmMessage {
-            role: MessageRole::Assistant,
-            content: response.content,
-        });
-        let replay_json = serde_json::to_value(replay).unwrap();
-        assert_eq!(replay_json["content"][0]["signature"], "opaque-signature");
-        assert_eq!(replay_json["content"][1]["data"], "encrypted");
+        let update = response.provider_replay.expect("private replay update");
+        let phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(set) = update
+        else {
+            panic!("tool response must append private replay");
+        };
+        assert_eq!(set.private_blocks.len(), 2);
+        assert_eq!(set.private_blocks[0].index().0, 0);
+        assert_eq!(set.private_blocks[1].index().0, 1);
     }
 
     #[test]
     fn refusal_is_non_retryable_prompt_rejection_even_with_partial_content() {
         let error = normalize_response(AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
             content: vec![AnthropicContentBlock::Text {
                 text: "partial".into(),
                 cache_control: None,
@@ -1738,6 +2177,7 @@ mod tests {
                 output_tokens: 1,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                speed: None,
             },
         })
         .unwrap_err();
@@ -1755,7 +2195,7 @@ mod tests {
 
         acc.process_event(
             "message_start",
-            r#"{"message":{"usage":{"input_tokens":7}}}"#,
+            r#"{"message":{"id":"msg_stream","model":"claude-opus-5-5","usage":{"input_tokens":7}}}"#,
             &tx,
         )
         .await
@@ -1797,6 +2237,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_assembles_tool_use_from_split_input_json() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        acc.response_id = Some("msg_stream".to_string());
+        acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -1851,7 +2293,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.message.contains("Failed to parse SSE data"),
+            err.message.contains("Failed to parse Anthropic SSE JSON")
+                && err.message.contains("withheld")
+                && !err.message.contains("{ not json"),
             "got: {}",
             err.message
         );
@@ -1872,6 +2316,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_text_delta_before_block_start_is_not_committed() {
         let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
+        acc.response_id = Some("msg_stream".to_string());
+        acc.response_model = Some("claude-opus-5-5".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         // A delta with no preceding content_block_start has no committed block to
         // attach to; it must be dropped rather than fabricated into output.
@@ -1915,7 +2361,7 @@ mod tests {
     async fn test_request_tags_omitted_when_none() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let req = translate_request(&spec, &request, false);
+        let req = translate_request(&spec, &request, false, true).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert!(
             json.get("tags").is_none(),
@@ -1927,7 +2373,7 @@ mod tests {
     async fn test_request_tags_serialized_when_set() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
-        let mut req = translate_request(&spec, &request, false);
+        let mut req = translate_request(&spec, &request, false, true).unwrap();
         let mut tags = std::collections::BTreeMap::new();
         tags.insert("disable_data_logging".to_string(), "true".to_string());
         tags.insert("foo".to_string(), "bar".to_string());
@@ -1940,6 +2386,8 @@ mod tests {
     #[tokio::test]
     async fn test_normalize_response_with_server_tool_use() {
         let resp = AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
             content: vec![
                 AnthropicContentBlock::Text {
                     text: "Here is my analysis.".to_string(),
@@ -1963,6 +2411,7 @@ mod tests {
                 output_tokens: 50,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                speed: None,
             },
         };
 
@@ -2007,6 +2456,8 @@ mod tests {
     #[tokio::test]
     async fn test_normalize_response_only_server_blocks_with_end_turn() {
         let resp = AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
             content: vec![AnthropicContentBlock::ServerToolUse {
                 id: "srvtoolu_abc".to_string(),
                 name: "tool_search".to_string(),
@@ -2019,6 +2470,7 @@ mod tests {
                 output_tokens: 10,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                speed: None,
             },
         };
 
@@ -2039,6 +2491,8 @@ mod tests {
         // with stop_reason="tool_use". This should be rejected -- there's nothing
         // for the client to execute, so the state machine would be stuck.
         let resp = AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
             content: vec![AnthropicContentBlock::ServerToolUse {
                 id: "srvtoolu_abc".to_string(),
                 name: "tool_search".to_string(),
@@ -2051,6 +2505,7 @@ mod tests {
                 output_tokens: 10,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                speed: None,
             },
         };
 

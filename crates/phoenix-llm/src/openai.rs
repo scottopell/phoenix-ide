@@ -1497,13 +1497,6 @@ fn translate_to_responses_request(
                 ContentBlock::Image { source } => image_blocks.push(source),
                 ContentBlock::ToolUse { .. } => tool_calls.push(block),
                 ContentBlock::ToolResult { .. } => tool_results.push(block),
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                    tracing::debug!(
-                        block_type = block.type_tag(),
-                        role,
-                        "dropping Anthropic preserved-thinking block in OpenAI message translation — no OpenAI wire equivalent"
-                    );
-                }
                 // Anthropic-specific server blocks: executed by the Anthropic API,
                 // with no representable equivalent in the OpenAI Responses wire
                 // format — dropped from the OpenAI request. Logged per-block with
@@ -2618,14 +2611,6 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
                     });
                 }
                 super::types::ContentBlock::ToolResult { .. } => tool_results.push(block),
-                super::types::ContentBlock::Thinking { .. }
-                | super::types::ContentBlock::RedactedThinking { .. } => {
-                    tracing::debug!(
-                        block_type = block.type_tag(),
-                        role,
-                        "dropping Anthropic preserved-thinking block in chat completions translation — no Chat Completions wire equivalent"
-                    );
-                }
                 super::types::ContentBlock::ServerToolUse { id, .. }
                 | super::types::ContentBlock::McpToolUse { id, .. } => {
                     tracing::debug!(
@@ -3629,10 +3614,12 @@ mod tests {
             messages: messages
                 .iter()
                 .map(|(text, role)| LlmMessage {
+                    source_message_id: None,
                     role: *role,
                     content: vec![ContentBlock::text(*text)],
                 })
                 .collect(),
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4449,6 +4436,7 @@ mod tests {
         LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -4664,6 +4652,7 @@ mod tests {
 
         let mut req = empty_request();
         req.messages = vec![LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -4699,14 +4688,17 @@ mod tests {
         let mut req = empty_request();
         req.messages = vec![
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("first question")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text("prior answer")],
             },
             LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text("follow-up question")],
             },
@@ -4773,11 +4765,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -4801,11 +4795,13 @@ mod tests {
         let mut req = empty_request();
         req.messages = (0..history_cap)
             .map(|i| LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("history {i}"))],
             })
             .collect();
         req.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
@@ -5428,11 +5424,13 @@ mod tests {
         let mut request = empty_request();
         for i in 0..5 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call-1".into(),
@@ -5483,6 +5481,7 @@ mod tests {
         let mut request = empty_request();
         for i in 0..55 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("stable-{i}"))],
             });
@@ -5520,15 +5519,18 @@ mod tests {
         // the 50 limit), each preceded/followed by a skipped assistant turn.
         for i in 0..60 {
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(format!("q-{i}"))],
             });
             request.messages.push(LlmMessage {
+                source_message_id: None,
                 role: MessageRole::Assistant,
                 content: vec![ContentBlock::text(format!("a-{i}"))],
             });
         }
         request.messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text("latest")],
         });

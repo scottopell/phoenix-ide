@@ -645,6 +645,8 @@ impl ProviderStreamTelemetry {
 pub struct LlmRequest {
     pub system: Vec<SystemContent>,
     pub messages: Vec<LlmMessage>,
+    /// Durable provider-private replay data for the active exchange, if any.
+    pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub effective_effort: EffectiveEffort,
@@ -709,6 +711,10 @@ impl SystemContent {
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
     pub role: MessageRole,
+    /// Durable source identity for transcript-backed messages. Stateless
+    /// requests use None. Provider-private replay uses this to locate the exact
+    /// owning assistant response after filtering/projection.
+    pub source_message_id: Option<String>,
     pub content: Vec<ContentBlock>,
 }
 
@@ -742,21 +748,6 @@ pub enum ContentBlock {
         images: Vec<ImageSource>,
         #[serde(default)]
         is_error: bool,
-    },
-
-    // ---- Preserved adaptive-thinking blocks (Anthropic) ----
-    // Provider-owned reasoning blocks. Phoenix does not render or index them as
-    // readable text; the signature/encrypted data is opaque. They MUST be
-    // replayed unchanged with tool-use results or a later request can fail --
-    // the signature-bearing block matters even when `thinking` text is empty.
-    /// Adaptive-thinking block with its opaque signature.
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
-    /// Redacted (encrypted) thinking block -- fully opaque round-trip.
-    RedactedThinking {
-        data: String,
     },
 
     // ---- Server-handled blocks (Anthropic) ----
@@ -863,7 +854,6 @@ impl ContentBlock {
             // Results live in the following user message, not the assistant
             // block — but if one ever appears here, render its text.
             Self::ToolResult { content, .. } => content.clone(),
-            Self::Thinking { .. } | Self::RedactedThinking { .. } => String::new(),
         }
     }
 }
@@ -901,8 +891,6 @@ impl ContentBlock {
             ContentBlock::Image { .. } => "image",
             ContentBlock::ToolUse { .. } => "tool_use",
             ContentBlock::ToolResult { .. } => "tool_result",
-            ContentBlock::Thinking { .. } => "thinking",
-            ContentBlock::RedactedThinking { .. } => "redacted_thinking",
             ContentBlock::ServerToolUse { .. } => "server_tool_use",
             ContentBlock::ToolSearchToolResult { .. } => "tool_search_tool_result",
             ContentBlock::WebSearchToolResult { .. } => "web_search_tool_result",
@@ -953,6 +941,9 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
+    /// Private replay update returned beside public content. Never persisted as
+    /// ordinary message content or serialized to clients.
+    pub provider_replay: Option<super::provider_replay::AnthropicReplayUpdate>,
     pub end_turn: bool,
     pub usage: Usage,
     pub stream_telemetry: ProviderStreamTelemetry,
@@ -963,6 +954,7 @@ impl LlmResponse {
     pub fn non_streaming(content: Vec<ContentBlock>, end_turn: bool, usage: Usage) -> Self {
         Self {
             content,
+            provider_replay: None,
             end_turn,
             usage,
             stream_telemetry: ProviderStreamTelemetry::non_streaming(),
@@ -987,8 +979,6 @@ impl LlmResponse {
                 ContentBlock::Image { .. }
                 | ContentBlock::Text { .. }
                 | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
                 | ContentBlock::WebSearchToolResult { .. }
@@ -1012,8 +1002,6 @@ impl LlmResponse {
                 ContentBlock::Image { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
                 | ContentBlock::WebSearchToolResult { .. }
@@ -1077,6 +1065,7 @@ mod attempt_capture_tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: Some(50),
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),

@@ -481,6 +481,7 @@ mod tests {
         let request = LlmRequest {
             system: vec![],
             messages: vec![],
+            provider_replay: None,
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),

@@ -902,6 +902,7 @@ mod tests {
         impl LlmService for StubLlm {
             async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
                 Ok(LlmResponse {
+                    provider_replay: None,
                     content: vec![ContentBlock::text("stub")],
                     end_turn: true,
                     usage: Usage::default(),

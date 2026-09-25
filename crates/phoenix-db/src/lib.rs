@@ -15,6 +15,7 @@ mod svg_artifacts;
 pub use svg_artifacts::SvgArtifact;
 mod migrations;
 mod product_creation;
+mod provider_replay;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
@@ -9847,6 +9848,10 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -13909,8 +13914,6 @@ fn synthesize_spawn_fan_ins(
             ContentBlock::Text { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::ToolResult { .. }
-            | ContentBlock::Thinking { .. }
-            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
             | ContentBlock::WebSearchToolResult { .. }

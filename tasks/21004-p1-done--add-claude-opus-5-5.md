@@ -113,3 +113,20 @@ flowchart LR
 - Do not add forced tool use, strict-tool policy, native Anthropic computer-use toolsets, Priority Tier, server-side fallback, or non-Anthropic cloud model IDs.
 - Do not replace/remove older Opus models or change Phoenix's default model.
 - The turn-usage migration is limited to immutable effective request speed for truthful historical pricing. Do not migrate persisted polymorphic message content unless implementation proves the existing aggregate cannot losslessly store the new typed thinking variants.
+
+## Approved replay-state revision
+
+PR #800 must keep Anthropic provider-private thinking out of public transcript/SSE types. Store active private replay material in one conversation-owned, typed opaque SQLite aggregate only when an unsettled Anthropic tool exchange has private blocks. Rebuild Phoenix's normal prefix and request Anthropic `prefix_mismatch_behavior: "drop_block"` with the binding-controls beta; record only bounded transformation diagnostics.
+
+Implementation constraints:
+
+- Preserve response identity and validated original ordinals. Do not index blindly into filtered public content.
+- Store private replay with the accepted execution-state transition before tools execute, without inserting the public assistant message early. Existing assistant/tool-result checkpoint atomicity remains authoritative.
+- Row existence means replay is owed, not that recovery may dispatch immediately.
+- Retain through same-exchange retries, tool/sub-agent work, question/task approval waits and valid answers; clear with terminal response, authoritative cancellation/abandonment, dismissal/rejection, incompatible approve-here/model changes, fresh-conversation handoff, and Phoenix Continuation.
+- Adapt Chain Q&A's in-memory Anthropic loop to the private response representation without adding durability.
+- Reuse existing request admission and response identity. Decode/load failures are explicit errors; never continue as if replay were absent.
+- Test crash cuts, stale outcomes, three-round replay, ordinal reconstruction, malformed response/error privacy, and every public SSE/transcript projection with private sentinels.
+- Parse and validate Anthropic response `usage.speed` for streaming and non-streaming success. Persisted effective request speed remains pricing authority.
+- Scope UI failed-stream cleanup to the affected request/attempt so stale errors cannot erase a newer stream.
+- Add a narrow ADR authorizing the short-lived provider-owned opaque aggregate as a deliberate schema exception.

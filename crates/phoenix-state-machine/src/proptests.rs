@@ -1986,6 +1986,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 }
                 LlmOutcome::Response {
                     content,
+                    provider_replay: None,
                     tool_calls,
                     end_turn: true,
                     usage: Usage::default(),

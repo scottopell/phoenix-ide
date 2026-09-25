@@ -230,6 +230,24 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- One row per conversation; stores the active Anthropic replay payload so the
+-- next turn can replay private blocks (extended thinking, redacted thinking)
+-- verbatim. The payload column is a serialized AnthropicReplayPayload JSON
+-- blob, always read and written whole. The provider column is a checked
+-- discriminator; no message FK (the payload is linked to the transcript as an
+-- aggregate, not to any individual message).
+CREATE TABLE IF NOT EXISTS active_provider_replay_state (
+    conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL
+        CHECK (provider IN ('anthropic')),
+    model TEXT NOT NULL
+        CHECK (length(trim(model)) > 0),
+    response_id TEXT NOT NULL
+        CHECK (length(trim(response_id)) > 0),
+    payload TEXT NOT NULL
+);
 "#;
 
 /// Migration SQL to convert old state format to typed JSON

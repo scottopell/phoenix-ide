@@ -8960,6 +8960,7 @@ mod scope_liveness_tests {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
                 content: Vec::new(),
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),

@@ -192,6 +192,11 @@ WHEN Phoenix records usage for a turn
 THE SYSTEM SHALL persist the effective Standard or Fast selection with that turn
 AND SHALL use that immutable value for speed-dependent historical cost calculations
 
+WHEN a successful provider response reports effective request speed
+THE SYSTEM SHALL parse it as a closed provider-native value
+AND SHALL reject a missing, unknown, or contradictory Fast response before usage persistence
+AND SHALL retain requested effective speed as the sole historical pricing authority
+
 WHEN Phoenix spawns a subagent conversation
 THE child conversation SHALL start with Standard request speed independently of the parent's selection
 
@@ -263,14 +268,27 @@ THE SYSTEM SHALL parse into common format containing:
 WHEN response indicates tool use
 THE SYSTEM SHALL extract tool name, ID, and JSON input for each tool
 
-WHEN a provider returns signed or encrypted reasoning blocks that are required to continue a tool-use exchange
-THE SYSTEM SHALL preserve those blocks losslessly and in provider order
-AND SHALL replay them unchanged to the provider with subsequent tool results
-AND SHALL NOT expose their readable or opaque contents through normalized user-visible text or search
+WHEN a provider returns signed or encrypted private blocks that are required to continue an unsettled tool exchange
+THE SYSTEM SHALL store those blocks in provider-private replay state outside public transcript content
+AND SHALL bind every private response set to its durable public assistant-message identity
+AND SHALL replay each block unchanged at its validated original ordinal
+AND SHALL retain all required private response sets until the exchange settles or is authoritatively abandoned
+AND SHALL reject missing, rewritten, malformed, unknown, unsigned, or incorrectly positioned replay state before provider I/O
 
-WHEN a target provider cannot represent preserved reasoning blocks from another provider
-THE SYSTEM SHALL omit them through an explicit typed translation path
-AND SHALL log that capability gap at debug level or above
+WHEN the accepted response starts or extends private replay
+THE SYSTEM SHALL persist replay mutation with the active execution-state transition before tool execution
+AND SHALL apply replay mutation only after stale-generation and reducer admission checks
+
+WHEN the exchange settles or is authoritatively abandoned
+THE SYSTEM SHALL clear private replay with the terminal message, state, settings, or handoff transaction that establishes settlement
+AND SHALL NOT recreate a cleared response identity from a stale outcome
+
+WHEN Phoenix serializes public messages, reconnect state, transcript APIs, search data, exports, errors, diagnostics, or logs
+THE SYSTEM SHALL NOT include readable thinking, signatures, encrypted redacted data, or malformed raw provider payloads
+
+WHEN Phoenix rebuilds a supported Anthropic request prefix that no longer matches preserved-thinking binding
+THE SYSTEM SHALL request provider-side block dropping instead of freezing Phoenix's prompt prefix
+AND SHALL record only bounded content-free transformation diagnostics
 
 WHEN a Chat Completions response contains private reasoning content alongside final content
 THE SYSTEM SHALL omit private reasoning from user-visible normalized content
@@ -313,6 +331,10 @@ WHEN a provider returns a successful transport response whose terminal reason is
 THE SYSTEM SHALL discard any partial generated content from that response
 AND SHALL classify the outcome as prompt rejection
 AND SHALL NOT treat it as a tool-use continuation or an automatically retryable server failure
+
+WHEN a streaming attempt fails, is refused, retries, or is cancelled after visible token deltas
+THE SYSTEM SHALL clear only that attempt's ephemeral client buffer
+AND SHALL NOT let a stale error or retry event clear a newer request's buffer
 
 WHEN a request fails with an invalid-request classification
 THE SYSTEM SHALL stop automatic retries of that request

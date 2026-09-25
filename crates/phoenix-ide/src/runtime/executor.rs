@@ -843,6 +843,53 @@ fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
         })
 }
 
+fn provider_replay_should_clear(old: &ConvState, new: &ConvState) -> bool {
+    if old == new {
+        return false;
+    }
+    matches!(new, ConvState::Idle)
+        || matches!(new, ConvState::ContextExhausted { .. })
+        || matches!(new, ConvState::AwaitingContinuation { .. })
+        || new.is_terminal()
+}
+
+#[cfg(test)]
+mod provider_replay_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn retains_replay_across_active_exchange_states() {
+        let active = ConvState::LlmRequesting { attempt: 1 };
+        assert!(!provider_replay_should_clear(&active, &active));
+        assert!(!provider_replay_should_clear(
+            &active,
+            &ConvState::Error {
+                message: "retryable".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+                resets_at: None,
+            },
+        ));
+    }
+
+    #[test]
+    fn clears_replay_at_settlement_and_handoff_boundaries() {
+        let active = ConvState::LlmRequesting { attempt: 1 };
+        assert!(provider_replay_should_clear(&active, &ConvState::Idle));
+        assert!(provider_replay_should_clear(
+            &active,
+            &ConvState::ContextExhausted {
+                summary: "summary".into(),
+            },
+        ));
+        assert!(provider_replay_should_clear(
+            &active,
+            &ConvState::HandedOff {
+                successor_conv_id: "next".into(),
+            },
+        ));
+    }
+}
+
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -860,9 +907,7 @@ fn content_contains_only_terminal_tool_call(
     let mut saw_terminal_tool = false;
     for block in content {
         match block {
-            ContentBlock::Text { .. }
-            | ContentBlock::Thinking { .. }
-            | ContentBlock::RedactedThinking { .. } => {}
+            ContentBlock::Text { .. } => {}
             ContentBlock::ToolUse { id, name, .. }
                 if id == &tool_call.id && name == tool_call.name() && !saw_terminal_tool =>
             {
@@ -1329,6 +1374,7 @@ async fn assemble_cleared_messages<S: StateStore>(
 /// intact, so a cleared result is never a silent gap. Every other tool result is
 /// sent verbatim with its images. The persisted messages are never mutated — the
 /// cleared form exists only in the returned list for this one request.
+#[allow(clippy::too_many_lines)] // one exhaustive DB-message to provider-message fold
 fn render_messages<'a>(
     db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
     cleared_sequence_ids: &std::collections::HashSet<i64>,
@@ -1375,6 +1421,7 @@ fn render_messages<'a>(
                 }
 
                 messages.push(LlmMessage {
+                    source_message_id: Some(msg.message_id.clone()),
                     role: MessageRole::User,
                     content,
                 });
@@ -1382,6 +1429,7 @@ fn render_messages<'a>(
 
             MessageContent::Agent(blocks) => {
                 messages.push(LlmMessage {
+                    source_message_id: Some(msg.message_id.clone()),
                     role: MessageRole::Assistant,
                     content: blocks.clone(),
                 });
@@ -1412,6 +1460,7 @@ fn render_messages<'a>(
 
                 // Tool results go in user message
                 messages.push(LlmMessage {
+                    source_message_id: Some(msg.message_id.clone()),
                     role: MessageRole::User,
                     content: vec![ContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
@@ -1430,6 +1479,7 @@ fn render_messages<'a>(
                     body.push_str(&file.llm_context_tag());
                 }
                 messages.push(LlmMessage {
+                    source_message_id: Some(msg.message_id.clone()),
                     role: MessageRole::User,
                     content: vec![ContentBlock::text(body)],
                 });
@@ -1437,6 +1487,7 @@ fn render_messages<'a>(
 
             MessageContent::Continuation(continuation) => {
                 messages.push(LlmMessage {
+                    source_message_id: Some(msg.message_id.clone()),
                     role: MessageRole::User,
                     content: vec![ContentBlock::text(
                         crate::send_chat_service::generated_predecessor_context_projection(
@@ -1708,6 +1759,10 @@ where
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
     pending_trusted_tool_results: Vec<(String, String)>,
+    /// Accepted provider-private replay mutation waiting for the reducer's
+    /// authoritative persistence effect. Consumed by `PersistState`.
+    pending_provider_replay_update:
+        Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2003,6 +2058,7 @@ where
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
+            pending_provider_replay_update: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -2861,6 +2917,17 @@ where
 
         let is_llm_outcome = matches!(&outcome, EffectOutcome::Llm(_));
 
+        let replay_update = match &outcome {
+            EffectOutcome::Llm(LlmOutcome::Response {
+                provider_replay,
+                request_id,
+                ..
+            }) => provider_replay
+                .clone()
+                .map(|update| (update, request_id.clone())),
+            _ => None,
+        };
+
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
             tool_calls,
@@ -2884,7 +2951,18 @@ where
         }
 
         let result = match handle_outcome(&self.state, &self.context, outcome) {
-            Ok(r) => r,
+            Ok(r) => {
+                self.pending_provider_replay_update =
+                    replay_update.map(|(update, owner_message_id)| match update {
+                        phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                            response,
+                        ) => phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                            response.with_owner_message_id(owner_message_id),
+                        ),
+                        clear @ phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear => clear,
+                    });
+                r
+            }
             Err(invalid) => {
                 tracing::warn!(
                     reason = %invalid.reason,
@@ -3335,6 +3413,12 @@ where
             });
         } else {
             let state_changed = result.new_state != old_state;
+            if self.pending_provider_replay_update.is_none()
+                && provider_replay_should_clear(&old_state, &result.new_state)
+            {
+                self.pending_provider_replay_update =
+                    Some(phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear);
+            }
             let retry_has_durable_fact = matches!(
                 self.terminal_settlement_attempt,
                 TerminalSettlementAttempt::Retry {
@@ -4017,6 +4101,15 @@ where
             self.pending_direct_turn_terminal.as_deref().cloned(),
         ) {
             self.settle_pending_direct_turn(turn, Box::new(terminal))
+                .await?;
+        } else if let Some(update) = self.pending_provider_replay_update.take() {
+            self.storage
+                .update_state_and_provider_replay(
+                    &self.context.conversation_id,
+                    &self.state,
+                    self.state_updated_at,
+                    &update,
+                )
                 .await?;
         } else {
             self.storage
@@ -5497,17 +5590,37 @@ where
                 }
 
                 let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &message_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        display_data.as_ref(),
-                        usage_data.as_ref(),
-                    )
-                    .await?;
+                let msg = if matches!(
+                    self.pending_provider_replay_update,
+                    Some(phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Clear)
+                ) {
+                    let message = self
+                        .storage
+                        .add_message_and_clear_provider_replay(
+                            &message_id,
+                            &self.context.conversation_id,
+                            seq,
+                            &content,
+                            display_data.as_ref(),
+                            usage_data.as_ref(),
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await?;
+                    self.pending_provider_replay_update = None;
+                    message
+                } else {
+                    self.storage
+                        .add_message_with_seq(
+                            &message_id,
+                            &self.context.conversation_id,
+                            seq,
+                            &content,
+                            display_data.as_ref(),
+                            usage_data.as_ref(),
+                        )
+                        .await?
+                };
                 if idempotent {
                     tracing::info!(
                         conversation_id = %self.context.conversation_id,
@@ -7087,9 +7200,11 @@ where
             system.push(SystemContent::new(capsule));
         }
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+        let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let request = LlmRequest {
             system,
             messages,
+            provider_replay,
             tools,
             max_tokens: Some(request_output_tokens),
             effective_effort,
@@ -7208,6 +7323,7 @@ where
 
                     LlmOutcome::Response {
                         content: response.content,
+                        provider_replay: response.provider_replay,
                         tool_calls,
                         end_turn: response.end_turn,
                         usage: response.usage,
@@ -7791,7 +7907,18 @@ where
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+                if let Some(update) = self.pending_provider_replay_update.take() {
+                    self.storage
+                        .persist_tool_round_state_and_provider_replay(
+                            &conv_id,
+                            &agent_msg,
+                            &tool_msgs,
+                            &self.state,
+                            self.state_updated_at,
+                            &update,
+                        )
+                        .await?;
+                } else if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
                     self.storage
                         .persist_tool_round_and_state(
                             &conv_id,
@@ -8339,6 +8466,7 @@ where
         );
         let mut messages = budget.messages;
         messages.push(LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(&continuation_prompt)],
         });
@@ -8346,6 +8474,7 @@ where
         let request = LlmRequest {
             messages,
             system: vec![SystemContent::new(system_prompt)],
+            provider_replay: None,
             tools: vec![], // No tools for continuation
             // Handoff quality favors completeness; cap high enough that a
             // thorough summary is not truncated mid-thought.
@@ -9460,6 +9589,7 @@ fn flatten_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
                 }
             }
             LlmMessage {
+                source_message_id: None,
                 role: msg.role,
                 content: flattened,
             }
@@ -9851,6 +9981,7 @@ fn normalize_task_file_repo_relative(
 /// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
 ///
 /// The DB history is not modified -- this operates on the in-memory message Vec only.
+#[allow(clippy::too_many_lines)] // one exhaustive provider-history capability projection
 fn strip_unavailable_tool_blocks(
     messages: Vec<LlmMessage>,
     available_tools: &std::collections::HashSet<&str>,
@@ -9942,6 +10073,7 @@ fn strip_unavailable_tool_blocks(
         }
         if !filtered.is_empty() {
             normalized.push(LlmMessage {
+                source_message_id: None,
                 role: msg.role,
                 content: filtered,
             });
@@ -9971,6 +10103,7 @@ mod strip_tool_blocks_tests {
 
     fn user_text(s: &str) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(s)],
         }
@@ -9978,6 +10111,7 @@ mod strip_tool_blocks_tests {
 
     fn assistant(blocks: Vec<ContentBlock>) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::Assistant,
             content: blocks,
         }
@@ -9985,6 +10119,7 @@ mod strip_tool_blocks_tests {
 
     fn user(blocks: Vec<ContentBlock>) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: blocks,
         }
@@ -12084,6 +12219,7 @@ mod dispatch_context_budget_tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         for text in ["first", "second", "third"] {
             llm.queue_response(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::text(text)],
                 end_turn: true,
                 usage: Usage::default(),
@@ -12215,6 +12351,7 @@ mod dispatch_context_budget_tests {
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("accepted by provider")],
             end_turn: true,
             usage: Usage::default(),
@@ -12935,6 +13072,7 @@ mod authoritative_user_message_effect_tests {
         rt.state = ConvState::LlmRequesting { attempt: 1 };
 
         rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            provider_replay: None,
             content: vec![ContentBlock::text("done")],
             tool_calls: Vec::new(),
             end_turn: true,
@@ -13302,6 +13440,7 @@ mod authoritative_user_message_effect_tests {
             request: request.clone(),
         };
         rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::Text {
                 text: "   ".to_string(),
             }],
@@ -14404,6 +14543,7 @@ mod authoritative_user_message_effect_tests {
         rt.active_direct_turn = Some(Box::new(turn));
         rt.state = ConvState::LlmRequesting { attempt: 1 };
         let outcome = LlmOutcome::Response {
+            provider_replay: None,
             content: vec![ContentBlock::text("final answer")],
             tool_calls: vec![],
             end_turn: true,
@@ -14541,6 +14681,7 @@ mod authoritative_user_message_effect_tests {
         rt.active_direct_turn = Some(Box::new(turn));
         rt.state = ConvState::LlmRequesting { attempt: 1 };
         let outcome = LlmOutcome::Response {
+            provider_replay: None,
             content: vec![ContentBlock::text("exact response retained")],
             tool_calls: vec![],
             end_turn: true,
@@ -17303,6 +17444,7 @@ mod explore_prompt_cache_shape_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::ToolUse {
                 id: "tool-patch-1".to_string(),
                 name: "patch".to_string(),
@@ -17316,6 +17458,7 @@ mod explore_prompt_cache_shape_tests {
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("ready to propose")],
             end_turn: true,
             usage: Usage::default(),
@@ -17541,6 +17684,7 @@ mod steer_drain_detector_tests {
         let (parent_tx, mut parent_rx) = mpsc::channel(1);
         rt.parent_event_tx = Some(parent_tx);
         let outcome = LlmOutcome::Response {
+            provider_replay: None,
             content: vec![ContentBlock::text("done")],
             tool_calls: vec![],
             end_turn: true,
@@ -18035,6 +18179,7 @@ mod steer_drain_detector_tests {
         // We don't assert on the response — just that the pipeline doesn't panic
         // and the persists landed before RequestLlm was dispatched.
         rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
             content: vec![],
             end_turn: true,
             usage: phoenix_llm::Usage {
@@ -19325,6 +19470,7 @@ mod steer_drain_detector_tests {
 
         let mut messages = vec![
             LlmMessage {
+                source_message_id: None,
                 role: phoenix_llm::MessageRole::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "reused".to_string(),
@@ -19334,6 +19480,7 @@ mod steer_drain_detector_tests {
                 }],
             },
             LlmMessage {
+                source_message_id: None,
                 role: phoenix_llm::MessageRole::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "reused".to_string(),
@@ -19592,6 +19739,7 @@ mod subagent_grace_tool_surface_tests {
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("findings")],
             end_turn: true,
             usage: Usage::default(),
@@ -19658,6 +19806,7 @@ mod subagent_grace_tool_surface_tests {
         context.max_turns = 1;
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("continuing")],
             end_turn: true,
             usage: Usage::default(),
@@ -19728,6 +19877,7 @@ mod subagent_grace_tool_surface_tests {
         context.max_turns = 1;
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("findings")],
             end_turn: true,
             usage: Usage::default(),
@@ -21746,6 +21896,7 @@ mod llm_generation_guard_tests {
         let storage = rt.storage.clone();
         let tools = rt.tool_executor.clone();
         let late_response = LlmOutcome::Response {
+            provider_replay: None,
             content: vec![ContentBlock::Text {
                 text: "late response".to_string(),
             }],

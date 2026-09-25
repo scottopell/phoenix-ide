@@ -24,6 +24,7 @@ const PROBE: &str = "Resume the user's work from this handoff. In at most 250 wo
 
 fn user(text: &str) -> LlmMessage {
     LlmMessage {
+        source_message_id: None,
         role: MessageRole::User,
         content: vec![ContentBlock::text(text)],
     }
@@ -52,6 +53,7 @@ fn request(
     LlmRequest {
         system: vec![SystemContent::new(system)],
         messages,
+        provider_replay: None,
         tools: vec![],
         max_tokens: Some(OUTPUT),
         effective_effort: registry.effective_effort(model, None),
