@@ -2144,12 +2144,13 @@ impl StateStore for InMemoryStorage {
     }
     async fn update_state_and_provider_replay(
         &self,
-        _conversation_id: &str,
-        _state: &phoenix_core::domain::sm_state::ConvState,
-        _state_updated_at: chrono::DateTime<chrono::Utc>,
+        conversation_id: &str,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
         _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
     ) -> Result<(), String> {
-        Ok(())
+        self.update_state(conversation_id, state, state_updated_at)
+            .await
     }
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_round_state_and_provider_replay(
