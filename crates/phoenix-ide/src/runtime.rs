@@ -3898,18 +3898,29 @@ impl RuntimeManager {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        self.db
-            .admit_sub_agent_batch_atomically(&phoenix_db::AtomicSubAgentBatchAdmission {
-                batch_id,
-                parent_conversation_id: parent_conversation_id.clone(),
-                parent_scope,
-                parallel_work_qualified,
-                children,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+        let admission = phoenix_db::AtomicSubAgentBatchAdmission {
+            batch_id: batch_id.clone(),
+            parent_conversation_id: parent_conversation_id.clone(),
+            parent_scope,
+            parallel_work_qualified,
+            children,
+        };
+        match self.db.admit_sub_agent_batch_atomically(&admission).await {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| error.to_string())?;
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
+            }
+        }
 
         if activation_rx.await.is_err() {
+            self.db
+                .abandon_unactivated_sub_agent_batch(&batch_id, Utc::now())
+                .await
+                .map_err(|error| {
+                    format!("failed to terminalize unactivated sub-agent batch: {error}")
+                })?;
             return Ok(());
         }
 

@@ -1736,6 +1736,11 @@ fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTe
     }
 }
 
+struct PendingSubAgentActivation {
+    child_ids: Vec<String>,
+    sender: oneshot::Sender<()>,
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1783,7 +1788,7 @@ where
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
-    pending_sub_agent_activation: Option<oneshot::Sender<()>>,
+    pending_sub_agent_activation: Option<PendingSubAgentActivation>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -3666,6 +3671,8 @@ where
                     continue;
                 }
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
+                let is_sub_agent_result_persist =
+                    matches!(effect, Effect::PersistSubAgentResults { .. });
                 let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
                 let continuation_request = match &effect {
                     Effect::RequestContinuation { request } => Some(request.clone()),
@@ -3910,6 +3917,7 @@ where
                     Err(error)
                         if is_state_persist
                             || is_steering_drain
+                            || is_sub_agent_result_persist
                             || ((terminal_subagent_transition
                                 || terminal_direct_turn_transition)
                                 && !state_committed) =>
@@ -4137,6 +4145,32 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let activation = self.pending_sub_agent_activation.take();
+        if let Some(activation) = &activation {
+            let pending = match &self.state {
+                ConvState::ToolExecuting {
+                    pending_sub_agents, ..
+                } => pending_sub_agents,
+                ConvState::AwaitingSubAgents { pending, .. }
+                | ConvState::CancellingSubAgents { pending, .. } => pending,
+                _ => {
+                    return Err(
+                        "sub-agent activation persist omitted admitted parent membership"
+                            .to_string(),
+                    )
+                }
+            };
+            if !activation.child_ids.iter().all(|child_id| {
+                pending
+                    .iter()
+                    .any(|pending_child| pending_child.agent_id == *child_id)
+            }) {
+                return Err(
+                    "sub-agent activation persist did not contain its exact admitted membership"
+                        .to_string(),
+                );
+            }
+        }
         if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
             self.storage
                 .update_state_and_accept_sub_agent(
@@ -4171,8 +4205,8 @@ where
                 )
                 .await?;
         }
-        if let Some(activation) = self.pending_sub_agent_activation.take() {
-            let _ = activation.send(());
+        if let Some(activation) = activation {
+            let _ = activation.sender.send(());
         }
 
         if broadcast {
@@ -5366,7 +5400,10 @@ where
             }
         }
 
-        self.pending_sub_agent_activation = Some(activation_tx);
+        self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
+            child_ids: spawned.iter().map(|child| child.agent_id.clone()).collect(),
+            sender: activation_tx,
+        });
 
         self.active_work_subagents += work_count_in_batch;
 
@@ -8254,13 +8291,10 @@ where
                 .await
             {
                 Ok(generation) => generation,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        message_id = %message_id,
-                        "Failed to update spawn_agents message content with sub-agent results"
-                    );
-                    return Ok(None);
+                Err(error) => {
+                    return Err(format!(
+                        "failed to update spawn_agents message content with sub-agent results: {error}"
+                    ));
                 }
             };
 
@@ -8270,13 +8304,10 @@ where
                 .await
             {
                 Ok(generation) => generation,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        message_id = %message_id,
-                        "Failed to update spawn_agents message display_data"
-                    );
-                    return Ok(None);
+                Err(error) => {
+                    return Err(format!(
+                        "failed to update spawn_agents message display data: {error}"
+                    ));
                 }
             };
 
@@ -18531,6 +18562,82 @@ mod steer_drain_detector_tests {
             text.contains("Timed out") && text.contains("investigate"),
             "the summary must carry the per-result outcome, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_generic_fan_in_evidence_prevents_parent_advance() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-missing-fan-in",
+            ConvState::AwaitingSubAgents {
+                pending: vec![PendingSubAgent {
+                    agent_id: "child".to_string(),
+                    task: "work".to_string(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: vec![],
+                spawn_tool_id: Some("missing-tool".to_string()),
+            },
+            vec![],
+        );
+        storage.set_fail_state_update(false);
+
+        let result = rt
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
+        assert!(storage.get_all_messages("conv-missing-fan-in").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_membership_persist_drops_activation_before_later_persist() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-activation-rollback",
+            ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "tool",
+                    ToolInput::from(crate::tools::BashToolInput::run("true")),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![PendingSubAgent {
+                    agent_id: "child".to_string(),
+                    task: "work".to_string(),
+                    mode: SubAgentMode::Work,
+                }],
+                assistant_message: AssistantMessage::new(
+                    "assistant".to_string(),
+                    vec![],
+                    None,
+                    None,
+                ),
+            },
+            vec![],
+        );
+        let (activation_tx, mut activation_rx) = oneshot::channel();
+        rt.pending_sub_agent_activation = Some(PendingSubAgentActivation {
+            child_ids: vec!["child".to_string()],
+            sender: activation_tx,
+        });
+        storage.set_fail_state_update(true);
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        assert!(rt.persist_state_effect(false, &mut admitted).await.is_err());
+        assert!(matches!(
+            activation_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+
+        storage.set_fail_state_update(false);
+        rt.state = ConvState::Idle;
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
+        assert!(matches!(
+            activation_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]

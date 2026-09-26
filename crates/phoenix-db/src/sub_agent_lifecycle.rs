@@ -121,6 +121,39 @@ pub enum SubAgentBatchAdmissionOutcome {
     Replayed,
 }
 
+#[derive(Clone, Copy)]
+enum SubAgentAdmissionCommit {
+    Normal,
+    #[cfg(test)]
+    CommittedError,
+    #[cfg(test)]
+    RolledBackError,
+    #[cfg(test)]
+    CommittedLookupUnavailable,
+}
+
+impl SubAgentAdmissionCommit {
+    async fn execute(self, transaction: Transaction<'_, Sqlite>) -> DbResult<()> {
+        match self {
+            Self::Normal => transaction.commit().await.map_err(Into::into),
+            #[cfg(test)]
+            Self::CommittedError | Self::CommittedLookupUnavailable => {
+                transaction.commit().await?;
+                Err(DbError::Serialization(
+                    "injected sub-agent admission commit acknowledgement failure".into(),
+                ))
+            }
+            #[cfg(test)]
+            Self::RolledBackError => {
+                transaction.rollback().await?;
+                Err(DbError::Serialization(
+                    "injected sub-agent admission commit failure".into(),
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentInitialDispatchOutcome {
     Claimed,
@@ -303,7 +336,72 @@ impl Database {
     pub async fn admit_sub_agent_batch_atomically(
         &self,
         batch: &AtomicSubAgentBatchAdmission,
-    ) -> DbResult<SubAgentBatchAdmissionOutcome> {
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<SubAgentBatchAdmissionOutcome>> {
+        self.admit_sub_agent_batch_atomically_with_commit(batch, SubAgentAdmissionCommit::Normal)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn admit_sub_agent_batch_atomically_with_commit(
+        &self,
+        batch: &AtomicSubAgentBatchAdmission,
+        commit: SubAgentAdmissionCommit,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<SubAgentBatchAdmissionOutcome>> {
+        use crate::workflow::LocalAuthorityResult;
+        let prepared = self.prepare_atomic_sub_agent_batch(batch).await;
+        let (tx, outcome) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        match commit.execute(tx).await {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(outcome)),
+            Err(error) => match self.classify_atomic_sub_agent_batch(batch, commit).await {
+                Ok(Some(true)) => LocalAuthorityResult::DurableFactEstablished(Ok(outcome)),
+                Ok(None) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Ok(Some(false)) => {
+                    LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(format!(
+                        "batch id {} committed with different membership",
+                        batch.batch_id
+                    ))))
+                }
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    async fn classify_atomic_sub_agent_batch(
+        &self,
+        batch: &AtomicSubAgentBatchAdmission,
+        commit: SubAgentAdmissionCommit,
+    ) -> DbResult<Option<bool>> {
+        let _ = commit;
+        #[cfg(test)]
+        if matches!(commit, SubAgentAdmissionCommit::CommittedLookupUnavailable) {
+            return Err(DbError::Serialization(
+                "injected sub-agent admission classification failure".into(),
+            ));
+        }
+        let lifecycle = SubAgentBatchAdmission {
+            batch_id: batch.batch_id.clone(),
+            parent_conversation_id: batch.parent_conversation_id.clone(),
+            parallel_work_qualified: batch.parallel_work_qualified,
+            runs: batch
+                .children
+                .iter()
+                .map(|child| child.run.clone())
+                .collect(),
+        };
+        let mut tx = self.pool.begin_with("BEGIN").await?;
+        let classification = existing_batch_matches(&mut tx, &lifecycle).await?;
+        tx.rollback().await?;
+        Ok(classification)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_atomic_sub_agent_batch<'a>(
+        &'a self,
+        batch: &AtomicSubAgentBatchAdmission,
+    ) -> DbResult<(Transaction<'a, Sqlite>, SubAgentBatchAdmissionOutcome)> {
         let lifecycle = SubAgentBatchAdmission {
             batch_id: batch.batch_id.clone(),
             parent_conversation_id: batch.parent_conversation_id.clone(),
@@ -331,9 +429,8 @@ impl Database {
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(matches) = existing_batch_matches(&mut tx, &lifecycle).await? {
-            tx.commit().await?;
             return if matches {
-                Ok(SubAgentBatchAdmissionOutcome::Replayed)
+                Ok((tx, SubAgentBatchAdmissionOutcome::Replayed))
             } else {
                 Err(lifecycle_conflict(format!(
                     "batch id {} was already admitted with different membership",
@@ -497,8 +594,63 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        Ok((tx, SubAgentBatchAdmissionOutcome::Admitted))
+    }
+
+    pub async fn abandon_unactivated_sub_agent_batch(
+        &self,
+        batch_id: &str,
+        abandoned_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let at = abandoned_at.timestamp_micros();
+        let children = sqlx::query_scalar::<_, String>(
+            "SELECT child_conversation_id FROM sub_agent_runs
+             WHERE batch_id = ?1 AND initial_dispatch_claimed_at_unix_micros IS NULL
+             ORDER BY ordinal",
+        )
+        .bind(batch_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let changed = sqlx::query(
+            "UPDATE sub_agent_runs
+             SET cancellation_requested_at_unix_micros = ?2,
+                 terminal_cause = 'cancelled', terminal_at_unix_micros = ?2,
+                 parent_accepted_at_unix_micros = ?2
+             WHERE batch_id = ?1
+               AND initial_dispatch_claimed_at_unix_micros IS NULL
+               AND terminal_at_unix_micros IS NULL",
+        )
+        .bind(batch_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != u64::try_from(children.len()).unwrap_or(u64::MAX) {
+            return Err(lifecycle_conflict(format!(
+                "unactivated batch {batch_id} no longer has exact unclaimed membership"
+            )));
+        }
+        let failed = serde_json::to_string(&ConvState::Failed {
+            error: "Sub-agent activation cancelled because parent membership was not committed"
+                .to_string(),
+            error_kind: ErrorKind::Cancelled,
+        })
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        for child in children {
+            sqlx::query(
+                "UPDATE conversations
+                 SET state = ?2, state_kind = 'failed', state_updated_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+            )
+            .bind(child)
+            .bind(&failed)
+            .bind(abandoned_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
-        Ok(SubAgentBatchAdmissionOutcome::Admitted)
+        Ok(())
     }
 
     pub async fn sub_agent_dispatch_config(
@@ -923,6 +1075,100 @@ mod tests {
             .await
             .unwrap();
         (dir, first, second)
+    }
+
+    fn atomic_batch(
+        batch_id: &str,
+        parent_scope: Option<WorkScopeId>,
+    ) -> AtomicSubAgentBatchAdmission {
+        AtomicSubAgentBatchAdmission {
+            batch_id: batch_id.to_string(),
+            parent_conversation_id: "parent".to_string(),
+            parent_scope,
+            parallel_work_qualified: false,
+            children: vec![SubAgentChildAdmission {
+                run: SubAgentRunAdmission {
+                    child_conversation_id: "child".to_string(),
+                    execution_authority: SubAgentExecutionAuthority::WriteCapable,
+                },
+                slug: "child".to_string(),
+                cwd: "/tmp".to_string(),
+                model: "gpt-5.6-luna".to_string(),
+                conv_mode: ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                llm_language: phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+                connection: "codex".to_string(),
+                effort: None,
+                persona: None,
+                initial_message_id: "initial".to_string(),
+                initial_task: "work".to_string(),
+                max_turns: 10,
+                timeout_millis: 1_000,
+            }],
+        }
+    }
+
+    async fn atomic_parent(db: &Database) -> Option<WorkScopeId> {
+        db.create_conversation("parent", "parent", "/tmp", true, None, Some("gpt-5.6-sol"))
+            .await
+            .unwrap()
+            .attached_work_scope_id
+    }
+
+    #[tokio::test]
+    async fn atomic_admission_classifies_commit_acknowledgement_failure() {
+        for commit in [
+            SubAgentAdmissionCommit::CommittedError,
+            SubAgentAdmissionCommit::RolledBackError,
+            SubAgentAdmissionCommit::CommittedLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let parent_scope = atomic_parent(&db).await;
+            let admission = atomic_batch("batch", parent_scope);
+            let result = db
+                .admit_sub_agent_batch_atomically_with_commit(&admission, commit)
+                .await;
+            match commit {
+                SubAgentAdmissionCommit::CommittedError => assert_eq!(
+                    result.established().unwrap().unwrap(),
+                    SubAgentBatchAdmissionOutcome::Admitted
+                ),
+                SubAgentAdmissionCommit::RolledBackError => {
+                    assert!(result.established().unwrap().is_err());
+                    assert!(!db.sub_agent_lifecycle_exists("child").await.unwrap());
+                }
+                SubAgentAdmissionCommit::CommittedLookupUnavailable => {
+                    assert!(matches!(
+                        result,
+                        crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                    ));
+                    assert!(db.sub_agent_lifecycle_exists("child").await.unwrap());
+                }
+                SubAgentAdmissionCommit::Normal => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoning_unactivated_batch_terminalizes_and_releases_write_reservation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_scope = atomic_parent(&db).await;
+        let admission = atomic_batch("batch", parent_scope);
+        db.admit_sub_agent_batch_atomically(&admission)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+
+        db.abandon_unactivated_sub_agent_batch("batch", Utc::now())
+            .await
+            .unwrap();
+
+        assert!(db.sub_agent_terminal_is_accepted("child").await.unwrap());
+        let child = db.get_conversation("child").await.unwrap();
+        assert!(matches!(child.state, ConvState::Failed { .. }));
     }
 
     #[tokio::test]

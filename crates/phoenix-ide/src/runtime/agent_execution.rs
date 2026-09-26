@@ -68,7 +68,7 @@ impl SpawnCatalog {
         candidates: &[ExecutionCandidate],
     ) -> Result<ExecutionCandidate, String> {
         for (index, candidate) in candidates.iter().enumerate() {
-            let Some(candidate) = self.resolve_candidate(candidate) else {
+            let Some(candidate) = self.resolve_candidate(candidate)? else {
                 continue;
             };
             self.validate(&candidate)?;
@@ -86,22 +86,28 @@ impl SpawnCatalog {
             .find(|route| route.model == model && route.connection == connection)
     }
 
-    fn resolve_candidate(&self, candidate: &ExecutionCandidate) -> Option<ExecutionCandidate> {
+    fn resolve_candidate(
+        &self,
+        candidate: &ExecutionCandidate,
+    ) -> Result<Option<ExecutionCandidate>, String> {
         if self
             .route(&candidate.model, &candidate.connection)
             .is_some()
         {
-            return Some(candidate.clone());
+            return Ok(Some(candidate.clone()));
         }
         let Some(replacement) = legacy_model_replacement(&candidate.model) else {
-            return None;
+            return Ok(None);
         };
         if self.route(replacement, &candidate.connection).is_none() {
-            return None;
+            return Err(self.execution_error(&format!(
+                "Retired model '{}' requires replacement '{}' through '{}', but that route is unavailable",
+                candidate.model, replacement, candidate.connection
+            )));
         }
         let mut resolved = candidate.clone();
         resolved.model = replacement.to_string();
-        Some(resolved)
+        Ok(Some(resolved))
     }
 
     fn validate(&self, candidate: &ExecutionCandidate) -> Result<(), String> {
@@ -181,7 +187,7 @@ impl SpawnCatalog {
                     connection: connection.clone(),
                     reasoning_effort: *reasoning_effort,
                 };
-                self.resolve_candidate(&requested).ok_or_else(|| {
+                self.resolve_candidate(&requested)?.ok_or_else(|| {
                     self.execution_error(&format!(
                         "Model '{model}' through '{connection}' was not advertised"
                     ))
@@ -512,7 +518,7 @@ execution = [{model = "gpt-5.4-mini", connection = "codex", reasoning_effort = "
     }
 
     #[test]
-    fn retired_unavailable_replacement_skips_to_next_configured_candidate() {
+    fn retired_unavailable_replacement_stops_before_later_candidate() {
         let config = phoenix_agents::parse_config(
             r#"
 version = 1
@@ -533,11 +539,10 @@ execution = [
                 route("gpt-5.6-sol", "openai_responses"),
             ],
         );
-        let selected = catalog
-            .select(Some("legacy"), None, "gpt-5.6-luna", None)
-            .expect("later configured candidate remains usable");
-        assert_eq!(selected.execution.model, "gpt-5.6-luna");
-        assert_eq!(selected.execution.connection, "codex");
+        let Err(error) = catalog.select(Some("legacy"), None, "gpt-5.6-luna", None) else {
+            panic!("unavailable required replacement must stop fallback");
+        };
+        assert!(error.contains("requires replacement 'gpt-5.6-sol' through 'codex'"));
     }
 
     #[test]
