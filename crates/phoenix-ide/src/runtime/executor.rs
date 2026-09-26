@@ -1763,6 +1763,7 @@ where
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
+    pending_sub_agent_acceptance: Option<String>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2059,6 +2060,7 @@ where
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
+            pending_sub_agent_acceptance: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -3241,6 +3243,10 @@ where
 
         while let Some(current_event) = events_to_process.pop() {
             let settles_handoff = matches!(current_event, Event::TaskHandoffComplete { .. });
+            let accepted_sub_agent = match &current_event {
+                Event::SubAgentResult { agent_id, .. } => Some(agent_id.clone()),
+                _ => None,
+            };
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if self
                     .storage
@@ -3292,12 +3298,8 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
+            self.pending_sub_agent_acceptance = accepted_sub_agent;
             let generated = self.apply_transition_result(result).await?;
-            if let Event::SubAgentResult { ref agent_id, .. } = terminal_event {
-                self.storage
-                    .accept_sub_agent_terminal(agent_id, Utc::now())
-                    .await?;
-            }
             if settles_handoff {
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
@@ -4114,7 +4116,17 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        if let (Some(turn), Some(terminal)) = (
+        if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+            self.storage
+                .update_state_and_accept_sub_agent(
+                    &self.context.conversation_id,
+                    &self.state,
+                    self.state_updated_at,
+                    &child_id,
+                    Utc::now(),
+                )
+                .await?;
+        } else if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
         ) {
