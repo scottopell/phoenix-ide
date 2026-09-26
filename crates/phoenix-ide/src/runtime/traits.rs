@@ -2719,7 +2719,7 @@ mod registry_llm_client_tests {
     #[test]
     fn pinned_route_mismatch_is_not_a_retryable_network_failure() {
         let (_dir, registry) = codex_registry();
-        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
             .with_connection(Some("openai_responses".to_string()));
         let Err(error) = client.service() else {
             panic!("must not substitute Codex for the selected direct connection");
@@ -2728,7 +2728,7 @@ mod registry_llm_client_tests {
         assert!(!error.kind.is_auto_retryable());
         assert!(error.message.contains("openai_responses"));
         assert!(
-            RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+            RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
                 .with_connection(Some("codex".to_string()))
                 .service()
                 .is_ok()
@@ -2740,13 +2740,13 @@ mod registry_llm_client_tests {
     #[test]
     fn continuation_limits_use_the_selected_connection() {
         let (_dir, registry) = codex_registry();
-        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
             .with_connection(Some("codex".to_string()));
         assert!(matches!(
             client.continuation_request_limits(),
             phoenix_llm::ContinuationRequestLimits::MaxInputItems { .. }
         ));
-        let mismatch = RegistryLlmClient::new(registry, "gpt-5.5".to_string())
+        let mismatch = RegistryLlmClient::new(registry, "gpt-5.6-sol".to_string())
             .with_connection(Some("openai_responses".to_string()));
         assert_eq!(
             mismatch.continuation_request_limits(),
