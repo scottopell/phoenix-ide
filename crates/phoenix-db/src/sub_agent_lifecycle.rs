@@ -586,6 +586,27 @@ impl Database {
         .await?
         .rows_affected()
             == 1;
+        if cancelled_before_dispatch {
+            let failed = ConvState::Failed {
+                error: "Sub-agent cancelled before initial dispatch".to_string(),
+                error_kind: ErrorKind::Cancelled,
+            };
+            let serialized = serde_json::to_string(&failed)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let updated_at = requested_at.to_rfc3339();
+            sqlx::query(
+                "UPDATE conversations
+                 SET state = ?2, state_kind = 'failed',
+                     state_updated_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+            )
+            .bind(child_conversation_id)
+            .bind(serialized)
+            .bind(updated_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let outcome = if cancelled_before_dispatch {
             SubAgentCancellationOutcome::CancelledBeforeDispatch
         } else {
