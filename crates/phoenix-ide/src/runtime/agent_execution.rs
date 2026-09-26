@@ -187,11 +187,12 @@ impl SpawnCatalog {
                     connection: connection.clone(),
                     reasoning_effort: *reasoning_effort,
                 };
-                self.resolve_candidate(&requested)?.ok_or_else(|| {
-                    self.execution_error(&format!(
+                if self.route(model, connection).is_none() {
+                    return Err(self.execution_error(&format!(
                         "Model '{model}' through '{connection}' was not advertised"
-                    ))
-                })?
+                    )));
+                }
+                requested
             }
             None => {
                 if let Some(execution) = agent.and_then(|agent| agent.execution.clone()) {
@@ -486,7 +487,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
     }
 
     #[test]
-    fn retired_named_and_explicit_pins_use_exact_replacements() {
+    fn retired_named_pin_uses_exact_replacement() {
         let config = phoenix_agents::parse_config(
             r#"
 version = 1
@@ -502,19 +503,22 @@ execution = [{model = "gpt-5.4-mini", connection = "codex", reasoning_effort = "
             .select(Some("legacy"), None, "gpt-5.6-luna", None)
             .unwrap();
         assert_eq!(named.execution.model, "gpt-5.6-luna");
+    }
 
-        let explicit = ExecutionSelection::Model {
-            model: "gpt-5.5".into(),
-            connection: "codex".into(),
-            reasoning_effort: Some(ModelEffort::High),
-        };
+    #[test]
+    fn explicit_retired_model_does_not_remap_to_available_replacement() {
         let catalog =
             SpawnCatalog::resolve(&AgentConfig::default(), vec![route("gpt-5.6-sol", "codex")]);
-        let selected = catalog
-            .select(None, Some(&explicit), "gpt-5.6-sol", None)
-            .unwrap();
-        assert_eq!(selected.execution.model, "gpt-5.6-sol");
-        assert_eq!(selected.execution.reasoning_effort, Some(ModelEffort::High));
+        let selection = ExecutionSelection::Model {
+            model: "gpt-5.4".to_string(),
+            connection: "codex".to_string(),
+            reasoning_effort: None,
+        };
+
+        let Err(error) = catalog.select(None, Some(&selection), "gpt-5.6-sol", None) else {
+            panic!("explicit unavailable model must not be remapped");
+        };
+        assert!(error.contains("Model 'gpt-5.4' through 'codex' was not advertised"));
     }
 
     #[test]
