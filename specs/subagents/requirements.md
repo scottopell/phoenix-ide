@@ -200,9 +200,9 @@ AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than in
 
 WHEN deciding whether multiple Work children may be pending for one parent
 THE SYSTEM SHALL qualify only the parent's actual resolved model identifier
-AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-6-astra`
+AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, and `gpt-6-sol`
 AND SHALL NOT infer qualification from provider, model family, version ordering, reasoning effort, service tier, configuration tier, named worker, child model, or child persona
-AND SHALL treat every unknown, newly introduced, custom, and otherwise unlisted parent model as unqualified
+AND SHALL treat `gpt-5.6-luna`, `gpt-6-luna`, every unknown or newly introduced identifier, every custom route, and every otherwise unlisted parent model as unqualified
 
 WHEN a qualified parent requests a valid bounded batch
 THE SYSTEM SHALL allow multiple Work tasks in that batch and multiple pending Work children across calls

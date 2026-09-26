@@ -570,13 +570,18 @@ mod tests {
 
     #[test]
     fn schema_guidance_uses_exact_parent_qualification() {
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
             let tool = SpawnAgentsTool::new().with_parallel_work_capability(model);
             assert!(tool.description().contains("may run in parallel"));
             assert!(tool.description().contains("preserve unrelated edits"));
         }
 
-        for model in ["gpt-5.6-luna", "gpt-6-astra-preview", "claude-opus-5"] {
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "gpt-6-astra-preview",
+            "claude-opus-5",
+        ] {
             let tool = SpawnAgentsTool::new().with_parallel_work_capability(model);
             assert!(tool.description().contains("one at a time per parent"));
         }

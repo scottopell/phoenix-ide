@@ -558,7 +558,7 @@ invariant QualificationIsExplicitAndFailClosed {
     for p in bedrock.Conversation:
         parallel_work_qualified(p.resolved_model_id)
             = (p.resolved_model_id in {
-                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra" })
+                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol" })
 }
 
 invariant AdmittedChildStartsAtMostOnce {
@@ -609,8 +609,8 @@ invariant ToolRegistryMatchesMode {
 -- Helpers
 ------------------------------------------------------------
 -- parallel_work_qualified(model_id: String) -> Boolean
---   True exactly for gpt-5.6-sol, gpt-5.6-terra, and gpt-6-astra. False for
---   gpt-5.6-luna, every Anthropic identifier in the supported catalog, custom
+--   True exactly for gpt-5.6-sol, gpt-5.6-terra, gpt-6-astra, and gpt-6-sol.
+--   False for gpt-5.6-luna, gpt-6-luna, every Anthropic identifier in the supported catalog, custom
 --   routes, unknown identifiers, and newly introduced identifiers.
 -- pending_work_admissions(parent: Conversation) -> Integer
 --   Counts durable write-capable admissions whose parent_accepted_terminal is false.

@@ -20314,7 +20314,7 @@ mod work_subagent_cwd_guard_tests {
 
     #[tokio::test]
     async fn qualified_parent_models_admit_multiple_luna_work_children() {
-        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
+        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
             let worktree = TempDir::new().expect("worktree tempdir");
             let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
             let (cancel_tx, _cancel_rx) = mpsc::channel(1);
@@ -20367,6 +20367,32 @@ mod work_subagent_cwd_guard_tests {
             matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
         );
         assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn gpt_6_luna_parent_remains_sequential() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context.model_id = "gpt-6-luna".to_string();
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![
+                    luna_work_task("first partition"),
+                    luna_work_task("second partition"),
+                ],
+            }))
+            .await
+            .expect("Luna rejection is a tool result");
+
+        let Some(Event::ToolComplete { result, .. }) = result else {
+            panic!("expected ToolComplete rejection");
+        };
+        let text = tool_result_text(&result);
+        assert!(text.contains("Only one Work sub-agent"), "{text}");
+        assert!(spawn_rx.try_recv().is_err());
     }
 
     #[tokio::test]

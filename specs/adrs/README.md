@@ -72,6 +72,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
 | [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
+| [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
 
 ## For agents: which decisions bind your task
 

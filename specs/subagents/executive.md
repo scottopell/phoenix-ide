@@ -13,7 +13,7 @@ process-wide sandbox support gates only whether Explore parents and spawned
 Explore sub-agents receive sandboxed bash. Without sandbox support, delegation
 still works with read/browser/submit tools and no bash. Work, Branch, and Direct
 parents can spawn either. The normative target qualifies the parent's resolved
-model by exact identifier: Sol, Terra, and Astra may admit parallel Work children;
+model by exact identifier: GPT-5.6 Sol/Terra, Astra, and GPT-6 Sol may admit parallel Work children;
 Luna and every unlisted model remain sequential. Child execution choices do not
 change that decision. Admitted Work children intentionally share the parent's
 exact `WorkScope` as trusted collaborators. When the parent owns a worktree (Work
