@@ -218,6 +218,10 @@ THE SYSTEM SHALL withhold that account-scoped model without suppressing establis
 WHEN direct OpenAI API authentication is configured
 THE SYSTEM SHALL determine direct model availability independently of the ChatGPT account catalog
 
+WHEN a model supports different native reasoning-effort values across direct OpenAI and Codex account routes
+THE SYSTEM SHALL publish and validate the reasoning-effort capability of the selected route
+AND SHALL NOT send direct-only values through the Codex route
+
 WHEN the active Codex credential changes while model discovery is in flight
 THE SYSTEM SHALL NOT publish the discovered catalog with a different account's credential
 
@@ -382,6 +386,10 @@ THE SYSTEM SHALL record input tokens, output tokens, and cache statistics
 
 WHEN tracking context window usage
 THE SYSTEM SHALL compute total as input + output + cache tokens
+
+WHEN a model's token price depends on per-request context thresholds or route details that historical usage does not preserve
+THE SYSTEM SHALL report its historical cost as unknown
+AND SHALL NOT estimate cost from an incomplete aggregate pricing model
 
 **Rationale:** Users need visibility into token consumption for context window management.
 

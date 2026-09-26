@@ -617,6 +617,8 @@ impl ModelRegistry {
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-luna",
             "gpt-5.6-terra",
@@ -1379,12 +1381,13 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-5.6-sol → gpt-5.5 → registry default.
+    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-6-sol → gpt-5.6-sol → gpt-5.5 → registry default.
     /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
         const PREFERRED: &[&str] = &[
             "claude-sonnet-5",
             "claude-sonnet-4-6",
+            "gpt-6-sol",
             "gpt-5.6-sol",
             "gpt-5.5",
         ];
@@ -1796,6 +1799,21 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_sol_luna_codex_registration_requires_account_catalog_membership() {
+        let specs: Vec<_> = all_models()
+            .into_iter()
+            .filter(|spec| matches!(spec.id.as_str(), "gpt-6-sol" | "gpt-6-luna"))
+            .collect();
+        let absent = HashSet::from(["gpt-6-astra".to_string()]);
+        let present = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
+        for spec in specs {
+            assert!(!ModelRegistry::codex_catalog_allows(&spec, None));
+            assert!(!ModelRegistry::codex_catalog_allows(&spec, Some(&absent)));
+            assert!(ModelRegistry::codex_catalog_allows(&spec, Some(&present)));
+        }
+    }
+
+    #[test]
     fn established_codex_models_remain_available_without_catalog_discovery() {
         let spec = all_models()
             .into_iter()
@@ -1828,6 +1846,92 @@ mod tests {
         let present = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&catalog));
         assert!(present.get("gpt-6-astra").is_some());
         assert_eq!(present.context_window("gpt-6-astra"), 272_000);
+    }
+
+    #[test]
+    fn gpt6_sol_luna_route_capabilities_are_truthful() {
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        });
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let info = direct
+                .available_model_info()
+                .into_iter()
+                .find(|model| model.id == id)
+                .unwrap();
+            assert!(matches!(
+                info.effort_capabilities,
+                EffortCapabilities::Supported(ref caps)
+                    if caps.levels().contains(&ModelEffort::None)
+                        && caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+            ));
+            assert_eq!(
+                info.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let codex_config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let catalog = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
+        let codex = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&catalog));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let info = codex
+                .available_model_info()
+                .into_iter()
+                .find(|model| model.id == id)
+                .unwrap();
+            assert!(matches!(
+                info.effort_capabilities,
+                EffortCapabilities::Supported(ref caps)
+                    if !caps.levels().contains(&ModelEffort::None)
+                        && caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+            ));
+            assert_eq!(info.context_window, 272_000);
+            assert_eq!(
+                info.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+        }
+    }
+
+    #[test]
+    fn gpt6_sol_luna_default_order_follows_catalog_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let only_luna = HashSet::from(["gpt-6-luna".to_string()]);
+        let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
+        assert_eq!(
+            ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
+            "gpt-6-luna"
+        );
+        assert_eq!(
+            ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
+            "gpt-6-sol"
+        );
+    }
+
+    #[test]
+    fn gpt6_sol_precedes_older_openai_models_for_mid_tier_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let catalog = HashSet::from(["gpt-6-sol".to_string()]);
+        let registry = ModelRegistry::new_with_codex_catalog(&config, Some(&catalog));
+        let (model, _) = registry.get_mid_tier_model().unwrap();
+        assert_eq!(model, "gpt-6-sol");
     }
 
     #[test]

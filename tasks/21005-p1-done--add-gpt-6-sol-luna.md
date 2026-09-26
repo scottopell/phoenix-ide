@@ -1,0 +1,1 @@
+Add GPT-6 Sol and GPT-6 Luna as built-in OpenAI Responses models. Use exact official model metadata, account-catalog Codex gating, route-aware effort/Fast capabilities, Responses Lite/WebSocket transport, truthful unknown pricing while long-context/request-route data is unavailable, registry preferences, specs, and focused tests.
