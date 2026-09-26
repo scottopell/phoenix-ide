@@ -1783,6 +1783,7 @@ where
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
+    pending_sub_agent_activation: Option<oneshot::Sender<()>>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -2080,6 +2081,7 @@ where
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
             pending_sub_agent_acceptance: None,
+            pending_sub_agent_activation: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -4169,6 +4171,10 @@ where
                 )
                 .await?;
         }
+        if let Some(activation) = self.pending_sub_agent_activation.take() {
+            let _ = activation.send(());
+        }
+
         if broadcast {
             let _ = self
                 .broadcast_tx
@@ -5110,8 +5116,8 @@ where
             }
         }
 
-        let parallel_work_qualified =
-            phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+        let parallel_work_qualified = self.llm_registry.is_builtin_model(&self.context.model_id)
+            && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
                 &self.context.model_id,
             );
 
@@ -5321,6 +5327,7 @@ where
             })
             .collect::<Vec<_>>();
         let (response_tx, response_rx) = oneshot::channel();
+        let (activation_tx, activation_rx) = oneshot::channel();
         let request = SubAgentSpawnRequest {
             batch_id: uuid::Uuid::new_v4().to_string(),
             specs,
@@ -5329,6 +5336,7 @@ where
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
+            activation_rx,
         };
         if let Err(error) = spawn_tx.send(request).await {
             return Ok(Some(Event::ToolComplete {
@@ -5357,6 +5365,8 @@ where
                 }));
             }
         }
+
+        self.pending_sub_agent_activation = Some(activation_tx);
 
         self.active_work_subagents += work_count_in_batch;
 
@@ -7242,7 +7252,10 @@ where
                 &self.agent_config,
                 self.llm_registry.available_execution_routes(),
             );
-            tool.input_schema = catalog.schema(&self.context.model_id);
+            tool.input_schema = catalog.schema(
+                &self.context.model_id,
+                self.llm_registry.is_builtin_model(&self.context.model_id),
+            );
             self.spawn_catalog = Some(catalog);
         }
         let explore_bash_capability =
