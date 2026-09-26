@@ -28,8 +28,10 @@ constraints:
   FUNCTION:
     regex: '(^|::)(query|query_scalar|query_as|raw_sql|execute|execute_batch|exec)(::\s*<.*>)?$'
   SQL:
-    all:
-      - any:
+    any:
+      - all:
           - kind: string_literal
+          - regex: '(?is)^"(?:\s|\\[nrt]|/\*.*?\*/|--(?:[^\\\n]|\\[^n])*?(?:\n|\\n))*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b'
+      - all:
           - kind: raw_string_literal
-      - regex: '(?is)^(?:r\#*)?"(?:\s|\\[nrt]|/\*.*?\*/|--[^\n]*\n)*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b'
+          - regex: '(?is)^r\#*"(?:\s|/\*.*?\*/|--[^\n]*\n)*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b'

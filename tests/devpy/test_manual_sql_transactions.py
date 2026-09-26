@@ -59,6 +59,23 @@ class ManualSqlTransactionTests(unittest.TestCase):
         }'''
         self.assertEqual([], self.findings(source))
 
+    def test_escaped_newlines_terminate_normal_string_sql_comments(self):
+        for sql in (r'-- reservation\nBEGIN IMMEDIATE',
+                    r'-- reservation\r\nROLLBACK',
+                    r'-- first\n-- second\nCOMMIT',
+                    r'-- backslash \\\nSAVEPOINT partial'):
+            with self.subTest(sql=sql):
+                source = 'async fn production() { connection.execute("' + sql + '"); }'
+                self.assertEqual(1, len(self.findings(source)))
+
+    def test_literal_backslashes_do_not_terminate_sql_comments(self):
+        source = r'''async fn production() {
+            connection.execute("-- reservation\\nBEGIN IMMEDIATE");
+            connection.execute(r#"-- reservation\nBEGIN IMMEDIATE"#);
+            connection.execute(r#"\nBEGIN IMMEDIATE"#);
+        }'''
+        self.assertEqual([], self.findings(source))
+
     def test_cfg_test_module_and_helpers_are_exempt(self):
         source = '''
         #[cfg(test)]
