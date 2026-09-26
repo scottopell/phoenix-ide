@@ -1717,6 +1717,25 @@ impl ActivePromptProjection {
     }
 }
 
+fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTerminalCause {
+    match outcome {
+        SubAgentOutcome::Success { .. } => phoenix_db::SubAgentTerminalCause::SubmitResult,
+        SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
+        SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+            crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,
+            crate::db::ErrorKind::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
+            crate::db::ErrorKind::TurnLimitExhausted => {
+                phoenix_db::SubAgentTerminalCause::TurnLimit
+            }
+            crate::db::ErrorKind::ContextExhausted => {
+                phoenix_db::SubAgentTerminalCause::ContextExhausted
+            }
+            crate::db::ErrorKind::SubAgentError => phoenix_db::SubAgentTerminalCause::SubmitError,
+            _ => phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+        },
+    }
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -6619,23 +6638,6 @@ where
         }
     }
 
-    fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTerminalCause {
-        match outcome {
-            SubAgentOutcome::Success { .. } => phoenix_db::SubAgentTerminalCause::SubmitResult,
-            SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
-            SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
-                crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,
-                crate::db::ErrorKind::TurnLimitExhausted => {
-                    phoenix_db::SubAgentTerminalCause::TurnLimit
-                }
-                crate::db::ErrorKind::ContextExhausted => {
-                    phoenix_db::SubAgentTerminalCause::ContextExhausted
-                }
-                _ => phoenix_db::SubAgentTerminalCause::SubmitError,
-            },
-        }
-    }
-
     #[allow(clippy::too_many_lines)]
     async fn execute_control_effect(
         &mut self,
@@ -6667,7 +6669,7 @@ where
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
                 let child_conversation_id = self.context.conversation_id.clone();
-                let cause = Self::sub_agent_terminal_cause(&outcome);
+                let cause = sub_agent_terminal_cause(&outcome);
                 self.storage
                     .record_sub_agent_terminal(&child_conversation_id, cause, Utc::now())
                     .await?;
@@ -12052,6 +12054,59 @@ mod continuation_prompt_tests {
             !prompt.to_lowercase().contains("brief") && !prompt.to_lowercase().contains("concise"),
             "brevity framing should be gone: {prompt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_terminal_cause_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_distinct_terminal_causes() {
+        let cases = [
+            (
+                SubAgentOutcome::TimedOut,
+                phoenix_db::SubAgentTerminalCause::TimedOut,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "cancelled".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+                phoenix_db::SubAgentTerminalCause::Cancelled,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "turn limit".into(),
+                    error_kind: crate::db::ErrorKind::TurnLimitExhausted,
+                },
+                phoenix_db::SubAgentTerminalCause::TurnLimit,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "context".into(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
+                },
+                phoenix_db::SubAgentTerminalCause::ContextExhausted,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "runtime".into(),
+                    error_kind: crate::db::ErrorKind::Network,
+                },
+                phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "submit error".into(),
+                    error_kind: crate::db::ErrorKind::SubAgentError,
+                },
+                phoenix_db::SubAgentTerminalCause::SubmitError,
+            ),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(sub_agent_terminal_cause(&outcome), expected);
+        }
     }
 }
 
