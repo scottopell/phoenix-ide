@@ -110,6 +110,7 @@ pub struct SpawnAgentsTool {
     agents: Vec<AgentDefinition>,
     tiers: Vec<String>,
     models: Vec<SpawnModelChoice>,
+    parallel_work_subagents: bool,
 }
 
 impl SpawnAgentsTool {
@@ -137,6 +138,24 @@ impl SpawnAgentsTool {
             agents,
             tiers,
             models,
+            parallel_work_subagents: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_parallel_work_capability(mut self, resolved_parent_model_id: &str) -> Self {
+        self.parallel_work_subagents =
+            phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                resolved_parent_model_id,
+            );
+        self
+    }
+
+    fn work_guidance(&self) -> &'static str {
+        if self.parallel_work_subagents {
+            "Work sub-agents may run in parallel for this qualified parent model. The parent should partition assignments and owns integration. Other trusted collaborators may edit the shared worktree concurrently, so preserve unrelated edits and report conflicts, overlap, or uncertainty."
+        } else {
+            "Work sub-agents run one at a time per parent: include at most one Work task per call and wait for the active Work child to finish before spawning another."
         }
     }
 }
@@ -148,10 +167,17 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the available named personas. Omit execution to use the named worker's preferences, or otherwise inherit the parent's model, connection, and effort. Choose a configured tier or an explicit model connection to override execution. Execution selection is independent of permissions. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        format!(
+            "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. {} Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the available named personas. Omit execution to use the named worker's preferences, or otherwise inherit the parent's model, connection, and effort. Choose a configured tier or an explicit model connection to override execution. Execution selection is independent of permissions. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.",
+            self.work_guidance()
+        )
     }
 
     fn input_schema(&self) -> Value {
+        let mode_description = format!(
+            "Sub-agent mode. Explore (default): read-only tools; Explore sub-agents may run in parallel. Work: full tool suite. Mode does not choose the model, connection, or effort. {} Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct).",
+            self.work_guidance()
+        );
         let mut task_props = json!({
             "task": {
                 "type": "string",
@@ -164,7 +190,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools; Explore sub-agents may run in parallel. Work: full tool suite and runs one at a time per parent. Mode does not choose the model, connection, or effort. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
+                "description": mode_description
             },
             "max_turns": {
                 "type": "integer",
@@ -539,6 +565,25 @@ mod tests {
         ] {
             assert!(!description.contains(unsupported_claim));
             assert!(!mode_guidance.contains(unsupported_claim));
+        }
+    }
+
+    #[test]
+    fn schema_guidance_uses_exact_parent_qualification() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
+            let tool = SpawnAgentsTool::new().with_parallel_work_capability(model);
+            assert!(tool.description().contains("may run in parallel"));
+            assert!(tool.description().contains("preserve unrelated edits"));
+        }
+
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "gpt-6-astra-preview",
+            "claude-opus-5",
+        ] {
+            let tool = SpawnAgentsTool::new().with_parallel_work_capability(model);
+            assert!(tool.description().contains("one at a time per parent"));
         }
     }
 

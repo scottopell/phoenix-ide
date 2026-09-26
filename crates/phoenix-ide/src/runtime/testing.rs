@@ -4682,7 +4682,12 @@ mod tests {
             event_tx,
             broadcast_tx,
         )
-        .with_parent(parent_tx);
+        .with_parent_dispatch(
+            "parent-conv".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        );
 
         tokio::spawn(async move { runtime.run().await });
 

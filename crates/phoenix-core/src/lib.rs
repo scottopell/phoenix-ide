@@ -14,6 +14,7 @@ pub mod llm_service;
 pub mod platform;
 pub mod process_identity;
 pub mod runtime_env;
+pub mod subagent_qualification;
 pub mod task_handoff;
 pub mod task_source;
 pub mod work_scope;

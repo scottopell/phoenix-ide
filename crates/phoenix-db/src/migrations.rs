@@ -540,7 +540,153 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_active_provider_replay_state",
         sql: MIGRATION_105,
     },
+    Migration {
+        version: 106,
+        name: "create_sub_agent_lifecycle_tables",
+        sql: MIGRATION_106,
+    },
 ];
+
+const MIGRATION_106: &str = r"
+CREATE TABLE sub_agent_batches (
+    batch_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(batch_id)) > 0),
+    parent_conversation_id TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    parallel_work_qualified INTEGER NOT NULL
+        CHECK(typeof(parallel_work_qualified) = 'integer' AND parallel_work_qualified IN (0, 1)),
+    admitted_at_unix_micros INTEGER NOT NULL
+        CHECK(typeof(admitted_at_unix_micros) = 'integer' AND admitted_at_unix_micros >= 0)
+);
+
+CREATE TABLE sub_agent_runs (
+    child_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    batch_id TEXT NOT NULL REFERENCES sub_agent_batches(batch_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL
+        CHECK(typeof(ordinal) = 'integer' AND ordinal >= 0),
+    execution_authority TEXT NOT NULL
+        CHECK(execution_authority IN ('read_only', 'write_capable')),
+    max_turns INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(max_turns) = 'integer' AND max_turns > 0),
+    timeout_millis INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(timeout_millis) = 'integer' AND timeout_millis > 0),
+    cancellation_requested_at_unix_micros INTEGER
+        CHECK(cancellation_requested_at_unix_micros IS NULL OR (
+            typeof(cancellation_requested_at_unix_micros) = 'integer'
+            AND cancellation_requested_at_unix_micros >= 0
+        )),
+    initial_dispatch_claimed_at_unix_micros INTEGER
+        CHECK(initial_dispatch_claimed_at_unix_micros IS NULL OR (
+            typeof(initial_dispatch_claimed_at_unix_micros) = 'integer'
+            AND initial_dispatch_claimed_at_unix_micros >= 0
+        )),
+    terminal_cause TEXT CHECK(terminal_cause IS NULL OR terminal_cause IN (
+        'submit_result', 'submit_error', 'timed_out', 'cancelled',
+        'turn_limit', 'implicit_completion', 'runtime_failure', 'context_exhausted'
+    )),
+    terminal_at_unix_micros INTEGER
+        CHECK(terminal_at_unix_micros IS NULL OR (
+            typeof(terminal_at_unix_micros) = 'integer' AND terminal_at_unix_micros >= 0
+        )),
+    parent_accepted_at_unix_micros INTEGER
+        CHECK(parent_accepted_at_unix_micros IS NULL OR (
+            typeof(parent_accepted_at_unix_micros) = 'integer'
+            AND parent_accepted_at_unix_micros >= 0
+        )),
+    UNIQUE(batch_id, ordinal),
+    CHECK((terminal_cause IS NULL) = (terminal_at_unix_micros IS NULL)),
+    CHECK(parent_accepted_at_unix_micros IS NULL OR terminal_at_unix_micros IS NOT NULL)
+);
+
+CREATE INDEX sub_agent_runs_parent_delivery_owed
+    ON sub_agent_runs(terminal_at_unix_micros, parent_accepted_at_unix_micros, child_conversation_id);
+CREATE INDEX sub_agent_runs_batch ON sub_agent_runs(batch_id, ordinal);
+
+CREATE TRIGGER sub_agent_batches_validate_insert
+BEFORE INSERT ON sub_agent_batches
+FOR EACH ROW WHEN
+    NOT EXISTS (
+        SELECT 1 FROM conversations parent
+        JOIN product_conversations product ON product.id = parent.product_conversation_id
+        WHERE parent.id = NEW.parent_conversation_id
+          AND parent.runtime_role IN ('user', 'coordinator')
+          AND (product.kind = 'coordinator'
+               OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'))
+    )
+    OR EXISTS (
+        SELECT 1 FROM conversations parent
+        JOIN close_obligations obligation
+          ON obligation.product_conversation_id = parent.product_conversation_id
+        WHERE parent.id = NEW.parent_conversation_id
+          AND obligation.phase <> 'completed'
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent batch parent is not open for admission');
+END;
+
+CREATE TRIGGER sub_agent_batches_immutable
+BEFORE UPDATE ON sub_agent_batches
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent batch identity is immutable');
+END;
+
+CREATE TRIGGER sub_agent_runs_validate_insert
+BEFORE INSERT ON sub_agent_runs
+FOR EACH ROW WHEN
+    NOT EXISTS (
+        SELECT 1 FROM conversations child
+        JOIN sub_agent_batches batch ON batch.batch_id = NEW.batch_id
+        WHERE child.id = NEW.child_conversation_id
+          AND child.runtime_role = 'sub_agent'
+          AND child.parent_conversation_id = batch.parent_conversation_id
+    )
+    OR (
+        NEW.execution_authority = 'write_capable'
+        AND EXISTS (
+            SELECT 1
+            FROM sub_agent_batches incoming
+            JOIN sub_agent_batches existing_batch
+              ON existing_batch.parent_conversation_id = incoming.parent_conversation_id
+            JOIN sub_agent_runs existing_run ON existing_run.batch_id = existing_batch.batch_id
+            WHERE incoming.batch_id = NEW.batch_id
+              AND incoming.parallel_work_qualified = 0
+              AND existing_run.execution_authority = 'write_capable'
+              AND existing_run.parent_accepted_at_unix_micros IS NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent run is not admissible');
+END;
+
+CREATE TRIGGER sub_agent_runs_immutable_identity
+BEFORE UPDATE OF child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis
+ON sub_agent_runs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent run identity is immutable');
+END;
+
+CREATE TRIGGER sub_agent_runs_monotonic_lifecycle
+BEFORE UPDATE ON sub_agent_runs
+FOR EACH ROW WHEN
+    (OLD.cancellation_requested_at_unix_micros IS NOT NULL AND
+     NEW.cancellation_requested_at_unix_micros IS NOT OLD.cancellation_requested_at_unix_micros)
+    OR (OLD.initial_dispatch_claimed_at_unix_micros IS NOT NULL AND
+        NEW.initial_dispatch_claimed_at_unix_micros IS NOT OLD.initial_dispatch_claimed_at_unix_micros)
+    OR (OLD.terminal_cause IS NOT NULL AND (
+        NEW.terminal_cause IS NOT OLD.terminal_cause
+        OR NEW.terminal_at_unix_micros IS NOT OLD.terminal_at_unix_micros
+    ))
+    OR (OLD.parent_accepted_at_unix_micros IS NOT NULL AND
+        NEW.parent_accepted_at_unix_micros IS NOT OLD.parent_accepted_at_unix_micros)
+    OR (NEW.initial_dispatch_claimed_at_unix_micros IS NOT NULL
+        AND OLD.initial_dispatch_claimed_at_unix_micros IS NULL
+        AND OLD.cancellation_requested_at_unix_micros IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent lifecycle facts are monotonic');
+END;
+";
 
 const MIGRATION_101: &str = r"
 CREATE TABLE conversation_svg_artifacts (

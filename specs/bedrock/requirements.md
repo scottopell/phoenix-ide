@@ -427,9 +427,15 @@ WHEN sub-agent completes its task
 THE SYSTEM SHALL require it to call a dedicated result submission tool
 AND capture the submitted result
 
-WHEN all sub-agents have submitted results
+WHEN an admitted sub-agent terminal outcome is delivered
+THE SYSTEM SHALL accept it only for the exact pending child identity
+AND atomically move that child from pending to completed
+AND treat duplicate delivery for an already accepted child as idempotent success
+
+WHEN all admitted sub-agents have parent-accepted terminal outcomes
 THE SYSTEM SHALL aggregate results
 AND return them to parent conversation
+AND SHALL NOT settle or resume the parent while any admitted child remains pending
 
 WHEN any sub-agent fails or times out without submitting
 THE SYSTEM SHALL include failure information in aggregated results
@@ -625,16 +631,17 @@ AND configure its working directory as the parent's worktree path
 WHEN sub-agent is spawned by a write-capable parent conversation with write capability requested
 THE SYSTEM SHALL create the sub-agent with write capability against the parent's attached `WorkScope`
 AND configure its working directory as the parent's worktree path
-AND enforce that only one Work sub-agent exists per parent at a time
+AND enforce the fail-closed parent-model Work admission policy defined by REQ-PROJ-008 in [`../subagents/requirements.md`](../subagents/requirements.md)
 
 WHEN sub-agent is running
 THE SYSTEM SHALL NOT provide `propose_task` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
-tool set. Explore sub-agents are safe to run in parallel — they cannot write.
-Work sub-agents inherit the parent's worktree so they operate on the same codebase
-state; the one-at-a-time constraint maintains a single writer per worktree.
+tool set. Explore sub-agents are safe to run in parallel because they cannot write.
+Work sub-agents inherit the parent's exact environment; parallel Work is admitted
+only for explicitly qualified parent models, while every unqualified parent remains
+sequential and unknown models fail closed.
 
 ---
 

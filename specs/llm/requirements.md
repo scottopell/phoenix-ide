@@ -48,7 +48,22 @@ AND fall back per backend to the configured model list if model listing is unava
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-**Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
+THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol`
+AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
+AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
+
+WHEN an exact operator-configured route uses an identifier that is also a legacy built-in identifier
+THE SYSTEM SHALL preserve the exact operator-configured route rather than replace its identifier
+
+WHEN resolving a persisted live model pin or named-worker pin whose exact route is unavailable
+THE SYSTEM SHALL map `gpt-5.3-codex`, `gpt-5.4`, and `gpt-5.5` to `gpt-5.6-sol`
+AND SHALL map `gpt-5.4-mini` to `gpt-5.6-luna`
+AND SHALL require the mapped replacement to be available instead of falling back to the deployment default
+
+THE SYSTEM SHALL preserve the original model identity on historical turns and requests or runtimes whose model was already resolved
+AND SHALL NOT use catalog family or version ordering to infer orchestration qualification for an unlisted model
+
+**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative.
 
 ---
 

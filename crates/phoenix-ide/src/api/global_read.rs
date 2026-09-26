@@ -1103,6 +1103,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
+        | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseAdmissionFenced(_)

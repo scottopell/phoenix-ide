@@ -1717,6 +1717,30 @@ impl ActivePromptProjection {
     }
 }
 
+fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTerminalCause {
+    match outcome {
+        SubAgentOutcome::Success { .. } => phoenix_db::SubAgentTerminalCause::SubmitResult,
+        SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
+        SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+            crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,
+            crate::db::ErrorKind::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
+            crate::db::ErrorKind::TurnLimitExhausted => {
+                phoenix_db::SubAgentTerminalCause::TurnLimit
+            }
+            crate::db::ErrorKind::ContextExhausted => {
+                phoenix_db::SubAgentTerminalCause::ContextExhausted
+            }
+            crate::db::ErrorKind::SubAgentError => phoenix_db::SubAgentTerminalCause::SubmitError,
+            _ => phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+        },
+    }
+}
+
+struct PendingSubAgentActivation {
+    child_ids: Vec<String>,
+    sender: oneshot::Sender<()>,
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1763,6 +1787,8 @@ where
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
+    pending_sub_agent_acceptance: Option<String>,
+    pending_sub_agent_activation: Option<PendingSubAgentActivation>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -1877,8 +1903,8 @@ where
     /// `EffectOutcome` type.
     retry_outcome_tx: mpsc::Sender<(u64, u32)>,
     retry_outcome_rx: mpsc::Receiver<(u64, u32)>,
-    /// Channel to notify parent of sub-agent completion (sub-agent only)
-    parent_event_tx: Option<mpsc::Sender<Event>>,
+    /// Durable parent address and in-process dispatcher (sub-agent only).
+    parent_dispatch: Option<(String, Arc<dyn crate::runtime::ConversationEventDispatcher>)>,
     /// Channel to request sub-agent spawning (parent only)
     spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
     /// Channel to request sub-agent cancellation (parent only)
@@ -2059,6 +2085,8 @@ where
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
+            pending_sub_agent_acceptance: None,
+            pending_sub_agent_activation: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -2086,7 +2114,7 @@ where
             tool_outcome_rx,
             retry_outcome_tx,
             retry_outcome_rx,
-            parent_event_tx: None,
+            parent_dispatch: None,
             spawn_tx: None,
             cancel_tx: None,
             handoff_tx: None,
@@ -2284,8 +2312,12 @@ where
         self
     }
 
-    pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
-        self.parent_event_tx = Some(parent_tx);
+    pub fn with_parent_dispatch(
+        mut self,
+        parent_conversation_id: String,
+        dispatcher: Arc<dyn crate::runtime::ConversationEventDispatcher>,
+    ) -> Self {
+        self.parent_dispatch = Some((parent_conversation_id, dispatcher));
         self
     }
 
@@ -3237,6 +3269,19 @@ where
 
         while let Some(current_event) = events_to_process.pop() {
             let settles_handoff = matches!(current_event, Event::TaskHandoffComplete { .. });
+            let accepted_sub_agent = match &current_event {
+                Event::SubAgentResult { agent_id, .. } => Some(agent_id.clone()),
+                _ => None,
+            };
+            if let Event::SubAgentResult { ref agent_id, .. } = current_event {
+                if self
+                    .storage
+                    .sub_agent_terminal_is_accepted(agent_id)
+                    .await?
+                {
+                    continue;
+                }
+            }
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -3279,6 +3324,7 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
+            self.pending_sub_agent_acceptance = accepted_sub_agent;
             let generated = self.apply_transition_result(result).await?;
             if settles_handoff {
                 self.handoff_completion_authority = None;
@@ -3625,6 +3671,8 @@ where
                     continue;
                 }
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
+                let is_sub_agent_result_persist =
+                    matches!(effect, Effect::PersistSubAgentResults { .. });
                 let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
                 let continuation_request = match &effect {
                     Effect::RequestContinuation { request } => Some(request.clone()),
@@ -3869,6 +3917,7 @@ where
                     Err(error)
                         if is_state_persist
                             || is_steering_drain
+                            || is_sub_agent_result_persist
                             || ((terminal_subagent_transition
                                 || terminal_direct_turn_transition)
                                 && !state_committed) =>
@@ -4096,7 +4145,43 @@ where
         broadcast: bool,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        if let (Some(turn), Some(terminal)) = (
+        let activation = self.pending_sub_agent_activation.take();
+        if let Some(activation) = &activation {
+            let pending = match &self.state {
+                ConvState::ToolExecuting {
+                    pending_sub_agents, ..
+                } => pending_sub_agents,
+                ConvState::AwaitingSubAgents { pending, .. }
+                | ConvState::CancellingSubAgents { pending, .. } => pending,
+                _ => {
+                    return Err(
+                        "sub-agent activation persist omitted admitted parent membership"
+                            .to_string(),
+                    )
+                }
+            };
+            if !activation.child_ids.iter().all(|child_id| {
+                pending
+                    .iter()
+                    .any(|pending_child| pending_child.agent_id == *child_id)
+            }) {
+                return Err(
+                    "sub-agent activation persist did not contain its exact admitted membership"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+            self.storage
+                .update_state_and_accept_sub_agent(
+                    &self.context.conversation_id,
+                    &self.state,
+                    self.state_updated_at,
+                    &child_id,
+                    Utc::now(),
+                )
+                .await?;
+        } else if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
         ) {
@@ -4120,6 +4205,10 @@ where
                 )
                 .await?;
         }
+        if let Some(activation) = activation {
+            let _ = activation.sender.send(());
+        }
+
         if broadcast {
             let _ = self
                 .broadcast_tx
@@ -4697,6 +4786,22 @@ where
         // and the last one resolves by cause: Timeout resumes to LlmRequesting,
         // UserRequested settles to Idle.
         for agent_id in pending_ids {
+            let terminal_cause = match cause {
+                crate::state_machine::event::CancelCause::Timeout => {
+                    phoenix_db::SubAgentTerminalCause::TimedOut
+                }
+                crate::state_machine::event::CancelCause::UserRequested => {
+                    phoenix_db::SubAgentTerminalCause::Cancelled
+                }
+            };
+            if let Err(error) = self
+                .storage
+                .record_sub_agent_terminal(&agent_id, terminal_cause, Utc::now())
+                .await
+            {
+                tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");
+                continue;
+            }
             let event = Event::SubAgentResult {
                 agent_id,
                 outcome: SubAgentOutcome::Failure {
@@ -5045,7 +5150,12 @@ where
             }
         }
 
-        if work_count_in_batch > 1 {
+        let parallel_work_qualified = self.llm_registry.is_builtin_model(&self.context.model_id)
+            && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                &self.context.model_id,
+            );
+
+        if !parallel_work_qualified && work_count_in_batch > 1 {
             let result = ToolResult::error(
                 tool_use_id.clone(),
                 "Only one Work sub-agent can be spawned per call. \
@@ -5058,7 +5168,7 @@ where
             }));
         }
 
-        if work_count_in_batch > 0 && self.active_work_subagents > 0 {
+        if !parallel_work_qualified && work_count_in_batch > 0 && self.active_work_subagents > 0 {
             let result = ToolResult::error(
                 tool_use_id.clone(),
                 "A Work sub-agent is already active. Only one Work sub-agent \
@@ -5242,34 +5352,59 @@ where
                 result,
             }));
         }
-        let mut spawned = Vec::with_capacity(specs.len());
-        for spec in specs {
-            spawned.push(PendingSubAgent {
+        let spawned = specs
+            .iter()
+            .map(|spec| PendingSubAgent {
                 agent_id: spec.agent_id.clone(),
                 task: spec.task.clone(),
                 mode: spec.mode,
-            });
-            let request = SubAgentSpawnRequest {
-                spec,
-                parent_conversation_id: self.context.conversation_id.clone(),
-                parent_scope: self.context.resource_scope.work_scope_id().cloned(),
-                parent_event_tx: self.event_tx.clone(),
-                parent_turn_link: parent_turn_link.clone(),
-            };
-            if let Err(e) = spawn_tx.send(request).await {
-                tracing::error!(error = %e, "Failed to send spawn request");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    format!("Failed to spawn sub-agents: {e}"),
-                );
-                return Ok(Some(Event::ToolComplete {
+            })
+            .collect::<Vec<_>>();
+        let (response_tx, response_rx) = oneshot::channel();
+        let (activation_tx, activation_rx) = oneshot::channel();
+        let request = SubAgentSpawnRequest {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            specs,
+            parent_conversation_id: self.context.conversation_id.clone(),
+            parent_scope: self.context.resource_scope.work_scope_id().cloned(),
+            parallel_work_qualified,
+            parent_turn_link,
+            response_tx,
+            activation_rx,
+        };
+        if let Err(error) = spawn_tx.send(request).await {
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool_use_id.clone(),
+                result: ToolResult::error(
                     tool_use_id,
-                    result,
+                    format!("Failed to submit sub-agent batch: {error}"),
+                ),
+            }));
+        }
+        match response_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(tool_use_id, error),
+                }));
+            }
+            Err(error) => {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(
+                        tool_use_id,
+                        format!("Sub-agent admission stopped: {error}"),
+                    ),
                 }));
             }
         }
 
-        // Track active Work sub-agents for one-writer constraint (REQ-PROJ-008)
+        self.pending_sub_agent_activation = Some(PendingSubAgentActivation {
+            child_ids: spawned.iter().map(|child| child.agent_id.clone()).collect(),
+            sender: activation_tx,
+        });
+
         self.active_work_subagents += work_count_in_batch;
 
         // Build success result
@@ -6569,7 +6704,6 @@ where
                     let request = SubAgentCancelRequest {
                         ids,
                         parent_conversation_id: self.context.conversation_id.clone(),
-                        parent_event_tx: self.event_tx.clone(),
                     };
                     if let Err(error) = cancel_tx.send(request).await {
                         tracing::error!(%error, "Failed to send cancel request");
@@ -6581,16 +6715,22 @@ where
             }
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
-                if let Some(parent_tx) = &self.parent_event_tx {
+                let child_conversation_id = self.context.conversation_id.clone();
+                let cause = sub_agent_terminal_cause(&outcome);
+                self.storage
+                    .record_sub_agent_terminal(&child_conversation_id, cause, Utc::now())
+                    .await?;
+                if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
-                        agent_id: self.context.conversation_id.clone(),
+                        agent_id: child_conversation_id.clone(),
                         outcome,
                     };
-                    if let Err(error) = parent_tx.send(event).await {
-                        tracing::warn!(%error, "Failed to notify parent (may have terminated)");
+                    if let Err(error) = dispatcher.dispatch(parent_conversation_id, event).await {
+                        tracing::warn!(%error, %parent_conversation_id, "Failed to notify addressed parent conversation");
+                        dispatcher.reconcile(parent_conversation_id).await?;
                     }
                 } else {
-                    tracing::warn!("No parent channel configured for sub-agent");
+                    tracing::warn!("No parent address configured for sub-agent");
                 }
                 Ok(None)
             }
@@ -7149,7 +7289,10 @@ where
                 &self.agent_config,
                 self.llm_registry.available_execution_routes(),
             );
-            tool.input_schema = catalog.schema();
+            tool.input_schema = catalog.schema(
+                &self.context.model_id,
+                self.llm_registry.is_builtin_model(&self.context.model_id),
+            );
             self.spawn_catalog = Some(catalog);
         }
         let explore_bash_capability =
@@ -7176,6 +7319,16 @@ where
                 explore_bash_capability,
             )
         };
+        if is_sub_agent
+            && matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            )
+        {
+            system_prompt.push_str(
+                "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
+            );
+        }
         if has_approved_task_write_authority {
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
@@ -8138,13 +8291,10 @@ where
                 .await
             {
                 Ok(generation) => generation,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        message_id = %message_id,
-                        "Failed to update spawn_agents message content with sub-agent results"
-                    );
-                    return Ok(None);
+                Err(error) => {
+                    return Err(format!(
+                        "failed to update spawn_agents message content with sub-agent results: {error}"
+                    ));
                 }
             };
 
@@ -8154,13 +8304,10 @@ where
                 .await
             {
                 Ok(generation) => generation,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        message_id = %message_id,
-                        "Failed to update spawn_agents message display_data"
-                    );
-                    return Ok(None);
+                Err(error) => {
+                    return Err(format!(
+                        "failed to update spawn_agents message display data: {error}"
+                    ));
                 }
             };
 
@@ -11951,6 +12098,59 @@ mod continuation_prompt_tests {
             !prompt.to_lowercase().contains("brief") && !prompt.to_lowercase().contains("concise"),
             "brevity framing should be gone: {prompt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_terminal_cause_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_distinct_terminal_causes() {
+        let cases = [
+            (
+                SubAgentOutcome::TimedOut,
+                phoenix_db::SubAgentTerminalCause::TimedOut,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "cancelled".into(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+                phoenix_db::SubAgentTerminalCause::Cancelled,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "turn limit".into(),
+                    error_kind: crate::db::ErrorKind::TurnLimitExhausted,
+                },
+                phoenix_db::SubAgentTerminalCause::TurnLimit,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "context".into(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
+                },
+                phoenix_db::SubAgentTerminalCause::ContextExhausted,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "runtime".into(),
+                    error_kind: crate::db::ErrorKind::Network,
+                },
+                phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+            ),
+            (
+                SubAgentOutcome::Failure {
+                    error: "submit error".into(),
+                    error_kind: crate::db::ErrorKind::SubAgentError,
+                },
+                phoenix_db::SubAgentTerminalCause::SubmitError,
+            ),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(sub_agent_terminal_cause(&outcome), expected);
+        }
     }
 }
 
@@ -17699,7 +17899,12 @@ mod steer_drain_detector_tests {
         rt.context.is_sub_agent = true;
         storage.set_fail_state_update(true);
         let (parent_tx, mut parent_rx) = mpsc::channel(1);
-        rt.parent_event_tx = Some(parent_tx);
+        rt.parent_dispatch = Some((
+            "parent-conversation".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        ));
         let outcome = LlmOutcome::Response {
             provider_replay: None,
             content: vec![ContentBlock::text("done")],
@@ -17712,7 +17917,7 @@ mod steer_drain_detector_tests {
         rt.process_generation_tagged_llm_outcome(0, outcome).await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
-        assert!(rt.parent_event_tx.is_some());
+        assert!(rt.parent_dispatch.is_some());
 
         storage.set_fail_state_update(false);
         tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
@@ -18357,6 +18562,82 @@ mod steer_drain_detector_tests {
             text.contains("Timed out") && text.contains("investigate"),
             "the summary must carry the per-result outcome, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_generic_fan_in_evidence_prevents_parent_advance() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-missing-fan-in",
+            ConvState::AwaitingSubAgents {
+                pending: vec![PendingSubAgent {
+                    agent_id: "child".to_string(),
+                    task: "work".to_string(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: vec![],
+                spawn_tool_id: Some("missing-tool".to_string()),
+            },
+            vec![],
+        );
+        storage.set_fail_state_update(false);
+
+        let result = rt
+            .process_event(Event::SubAgentResult {
+                agent_id: "child".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
+        assert!(storage.get_all_messages("conv-missing-fan-in").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_membership_persist_drops_activation_before_later_persist() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-activation-rollback",
+            ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "tool",
+                    ToolInput::from(crate::tools::BashToolInput::run("true")),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![PendingSubAgent {
+                    agent_id: "child".to_string(),
+                    task: "work".to_string(),
+                    mode: SubAgentMode::Work,
+                }],
+                assistant_message: AssistantMessage::new(
+                    "assistant".to_string(),
+                    vec![],
+                    None,
+                    None,
+                ),
+            },
+            vec![],
+        );
+        let (activation_tx, mut activation_rx) = oneshot::channel();
+        rt.pending_sub_agent_activation = Some(PendingSubAgentActivation {
+            child_ids: vec!["child".to_string()],
+            sender: activation_tx,
+        });
+        storage.set_fail_state_update(true);
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        assert!(rt.persist_state_effect(false, &mut admitted).await.is_err());
+        assert!(matches!(
+            activation_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+
+        storage.set_fail_state_update(false);
+        rt.state = ConvState::Idle;
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
+        assert!(matches!(
+            activation_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]
@@ -20071,6 +20352,21 @@ mod work_subagent_cwd_guard_tests {
         ToolCall::new("tool-spawn-1", ToolInput::SpawnAgents(input))
     }
 
+    async fn accept_spawn_batch(
+        mut spawn_rx: mpsc::Receiver<SubAgentSpawnRequest>,
+    ) -> Vec<crate::runtime::SubAgentSpec> {
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
+            .await
+            .expect("spawn batch request remained live")
+            .expect("spawn batch request");
+        let specs = request.specs;
+        request
+            .response_tx
+            .send(Ok(()))
+            .expect("spawn requester receives admission result");
+        specs
+    }
+
     fn tool_result_text(result: &ToolResult) -> String {
         match &result.outcome {
             ToolOutcome::Success { output, .. }
@@ -20217,13 +20513,136 @@ mod work_subagent_cwd_guard_tests {
         );
     }
 
+    fn luna_work_task(task: &str) -> SubAgentTask {
+        SubAgentTask {
+            task: task.to_string(),
+            cwd: None,
+            mode: Some(SubAgentMode::Work),
+            execution: Some(phoenix_core::domain::sm_state::ExecutionSelection::Model {
+                model: "gpt-5.6-luna".to_string(),
+                connection: "openai_responses".to_string(),
+                reasoning_effort: Some(phoenix_core::domain::llm_types::ModelEffort::High),
+            }),
+            max_turns: None,
+            agent_type: None,
+        }
+    }
+
     #[tokio::test]
-    async fn accepts_unnamed_generic_work_subagent() {
+    async fn qualified_parent_models_admit_multiple_luna_work_children() {
+        for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"] {
+            let worktree = TempDir::new().expect("worktree tempdir");
+            let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            let mut rt =
+                runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+            rt.context.model_id = parent_model.to_string();
+
+            let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
+            let result = rt
+                .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                    tasks: vec![
+                        luna_work_task("first partition"),
+                        luna_work_task("second partition"),
+                    ],
+                }))
+                .await
+                .expect("qualified spawn validation");
+            let specs = responder.await.expect("spawn batch responder");
+
+            assert!(
+                matches!(
+                    result,
+                    Some(Event::SpawnAgentsComplete { ref spawned, .. }) if spawned.len() == 2
+                ),
+                "{parent_model}: {result:?}"
+            );
+            assert_eq!(specs.len(), 2);
+            for spec in &specs {
+                assert_eq!(spec.model_id, "gpt-5.6-luna");
+                assert_eq!(spec.mode, SubAgentMode::Work);
+            }
+            assert_eq!(rt.active_work_subagents, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn luna_parent_still_rejects_multiple_work_children() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_work_mode(worktree.path());
+        rt.context.model_id = "gpt-5.6-luna".to_string();
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![luna_work_task("first"), luna_work_task("second")],
+            }))
+            .await
+            .expect("unqualified spawn validation");
+
+        assert!(
+            matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
+        );
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn gpt_6_luna_parent_remains_sequential() {
         let worktree = TempDir::new().expect("worktree tempdir");
         let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
         let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context.model_id = "gpt-6-luna".to_string();
 
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![
+                    luna_work_task("first partition"),
+                    luna_work_task("second partition"),
+                ],
+            }))
+            .await
+            .expect("Luna rejection is a tool result");
+
+        let Some(Event::ToolComplete { result, .. }) = result else {
+            panic!("expected ToolComplete rejection");
+        };
+        let text = tool_result_text(&result);
+        assert!(text.contains("Only one Work sub-agent"), "{text}");
+        assert!(spawn_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn qualified_explore_parent_still_cannot_spawn_work_children() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_mode(
+            worktree.path(),
+            ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            },
+        );
+        rt.context.model_id = "gpt-6-astra".to_string();
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![luna_work_task("write")],
+            }))
+            .await
+            .expect("Explore authority validation");
+
+        assert!(
+            matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
+        );
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_unnamed_generic_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -20249,15 +20668,13 @@ mod work_subagent_cwd_guard_tests {
             other => panic!("expected SpawnAgentsComplete, got {other:?}"),
         }
 
-        let request = spawn_rx
-            .try_recv()
-            .expect("generic Work sub-agent request should be sent");
-        assert_eq!(request.spec.mode, SubAgentMode::Work);
-        assert_eq!(request.spec.agent_name, None);
-        assert_eq!(request.spec.persona, None);
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, None);
+        let specs = responder.await.expect("generic Work batch responder");
+        assert_eq!(specs[0].mode, SubAgentMode::Work);
+        assert_eq!(specs[0].agent_name, None);
+        assert_eq!(specs[0].persona, None);
+        assert_eq!(specs[0].model_id, "gpt-5.6-sol");
+        assert_eq!(specs[0].connection, "openai_responses");
+        assert_eq!(specs[0].effort, None);
         assert_eq!(rt.active_work_subagents, 1);
     }
 
@@ -20401,11 +20818,12 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn omitted_execution_and_blank_cwd_use_defaults() {
         let parent = TempDir::new().expect("parent tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
         let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
         rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
 
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -20421,13 +20839,13 @@ mod work_subagent_cwd_guard_tests {
             .expect("handle_spawn_agents_tool returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
-        let request = spawn_rx.try_recv().expect("spawn request sent");
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, rt.context.effort);
-        assert_eq!(request.spec.mode, SubAgentMode::Explore);
+        let specs = responder.await.expect("default batch responder");
+        assert_eq!(specs[0].model_id, "gpt-5.6-sol");
+        assert_eq!(specs[0].connection, "openai_responses");
+        assert_eq!(specs[0].effort, rt.context.effort);
+        assert_eq!(specs[0].mode, SubAgentMode::Explore);
         assert_eq!(
-            std::fs::canonicalize(request.spec.cwd).unwrap(),
+            std::fs::canonicalize(&specs[0].cwd).unwrap(),
             std::fs::canonicalize(parent.path()).unwrap()
         );
     }
