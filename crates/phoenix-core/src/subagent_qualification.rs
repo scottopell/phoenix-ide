@@ -7,7 +7,7 @@
 pub fn supports_parallel_work_subagents(resolved_parent_model_id: &str) -> bool {
     matches!(
         resolved_parent_model_id,
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra" | "gpt-6-sol"
     )
 }
 
@@ -26,10 +26,12 @@ mod tests {
                     "{model} at {effort}"
                 );
             }
-            assert!(
-                !supports_parallel_work_subagents("gpt-5.6-luna"),
-                "Luna at {effort}"
-            );
+            for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+                assert!(
+                    !supports_parallel_work_subagents(model),
+                    "{model} at {effort}"
+                );
+            }
         }
     }
 
@@ -40,6 +42,7 @@ mod tests {
         }
         for unqualified in [
             "gpt-5.6-luna",
+            "gpt-6-luna",
             "gpt-6-astra-preview",
             "GPT-6-ASTRA",
             "claude-opus-5",
