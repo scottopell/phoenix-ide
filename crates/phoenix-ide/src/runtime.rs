@@ -8478,6 +8478,102 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn cancellation_during_materialization_prevents_subagent_bootstrap() {
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create parent");
+        let agent_id = "cancel-during-materialization";
+        let spec = SubAgentSpec {
+            agent_id: agent_id.to_string(),
+            task: "must never begin".to_string(),
+            cwd: "/tmp".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Explore,
+            model_id: "gpt-5.6-sol".to_string(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        manager
+            .handle_spawn_request(SubAgentSpawnRequest {
+                batch_id: "cancel-during-materialization-batch".to_string(),
+                specs: vec![spec.clone()],
+                parent_conversation_id: parent.id.clone(),
+                parent_scope: None,
+                parallel_work_qualified: false,
+                parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                response_tx,
+            })
+            .await;
+        assert_eq!(response_rx.await.expect("admission response"), Ok(()));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(agent_id.to_string(), Arc::clone(&barrier));
+        let kick = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .kick_admitted_sub_agent(spec, opentelemetry::trace::SpanContext::NONE)
+                    .await
+            }
+        });
+        barrier.wait().await;
+        let disposition = manager
+            .db()
+            .request_sub_agent_cancellation(agent_id, Utc::now())
+            .await
+            .expect("durable cancellation");
+        assert_eq!(
+            disposition,
+            phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch
+        );
+        barrier.wait().await;
+        assert_eq!(kick.await.expect("kick task joins"), Ok(()));
+        let lifecycle = manager
+            .db()
+            .sub_agent_lifecycle_exists(agent_id)
+            .await
+            .expect("lifecycle row");
+        assert!(lifecycle);
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(agent_id)
+                .await
+                .expect("cancelled child")
+                .state,
+            ConvState::Failed {
+                error_kind: crate::db::ErrorKind::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(agent_id)
+                .await
+                .expect("initial task remains singular")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn admitted_task_handoff_persists_creation_job_before_authority_closes() {
         let manager = Arc::new(test_manager().await);
         create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
