@@ -26,11 +26,14 @@ rule:
     - pattern: $SQL
     - inside:
         kind: arguments
+        stopBy:
+          not:
+            kind: parenthesized_expression
         inside:
           kind: call_expression
           has:
             field: function
-            regex: '(^|::|\.)(query|query_scalar|query_as|query_with|query_scalar_with|query_as_with|raw_sql|execute|execute_batch|execute_many|exec|fetch|fetch_all|fetch_one|fetch_optional|fetch_many)(::\s*<.*>)?$'
+            regex: '(?s)(^|::|\.)\s*(?:r#)?(query|query_scalar|query_as|query_with|query_scalar_with|query_as_with|raw_sql|execute|execute_batch|execute_many|exec|fetch|fetch_all|fetch_one|fetch_optional|fetch_many)\s*(::\s*<.*>)?$'
     - not:
         inside:
           all:
@@ -50,7 +53,7 @@ rule:
 ESCAPE = re.compile(r'''\\(?:[nrt0\\'"]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|\n[ \t\n\r]*)''')
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0",
                   "\\": "\\", "'": "'", '"': '"'}
-LEADING_COMMENTS = re.compile(r"(?:\s|--[^\n]*(?:\n|$)|/\*.*?(?:\*/|$))*", re.DOTALL)
+LEADING_COMMENTS = re.compile(r"(?:\s|\ufeff|--[^\n]*(?:\n|$)|/\*.*?(?:\*/|$))*", re.DOTALL)
 CONTROL = re.compile(r"(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b", re.IGNORECASE)
 
 

@@ -141,6 +141,30 @@ class ManualSqlTransactionTests(unittest.TestCase):
         }'''
         self.assertEqual(3, len(self.findings(source)))
 
+    def test_function_spelling_does_not_hide_literal_calls(self):
+        for function in ("sqlx :: query", "connection . execute", "sqlx::r#query",
+                         "connection.r#execute", "sqlx::query :: <sqlx::Sqlite>",
+                         "sqlx::query::<\nsqlx::Sqlite\n>"):
+            with self.subTest(function=function):
+                source = 'async fn production() { ' + function + '("BEGIN"); }'
+                self.assertEqual(1, len(self.findings(source)))
+
+    def test_parentheses_preserve_literal_argument_identity(self):
+        source = '''async fn production() {
+            connection.execute((("BEGIN")));
+            sqlx::query_with("SELECT ?1", ("COMMIT",));
+            sqlx::query_with("SELECT ?1", ["ROLLBACK"]);
+            sqlx::query("SELECT ?1").bind("SAVEPOINT partial");
+        }'''
+        self.assertEqual(1, len(self.findings(source)))
+
+    def test_sqlite_bom_is_whitespace(self):
+        source = r'''async fn production() {
+            connection.execute("\u{feff}BEGIN");
+            sqlx::raw_sql("SELECT 1; /* boundary */\u{feff}COMMIT;");
+        }'''
+        self.assertEqual(2, len(self.findings(source)))
+
 
 if __name__ == "__main__":
     unittest.main()
