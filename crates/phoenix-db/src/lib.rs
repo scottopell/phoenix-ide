@@ -11094,6 +11094,17 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
+        for result in results {
+            sqlx::query(
+                "UPDATE sub_agent_runs
+                 SET parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?2)
+                 WHERE child_conversation_id = ?1 AND terminal_at_unix_micros IS NOT NULL",
+            )
+            .bind(&result.agent_id)
+            .bind(now.timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT OR REPLACE INTO startup_parent_actions
                  (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)

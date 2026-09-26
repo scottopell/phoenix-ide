@@ -463,6 +463,22 @@ impl Database {
             .bind(&now_text)
             .execute(&mut *tx)
             .await?;
+            let admitted_message = Message {
+                message_id: child.initial_message_id.clone(),
+                conversation_id: child.run.child_conversation_id.clone(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            };
+            crate::retrieval::fts_index_message_tx(
+                &mut tx,
+                &admitted_message,
+                crate::sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+            )
+            .await?;
             sqlx::query(
                 "INSERT INTO sub_agent_runs (
                      child_conversation_id, batch_id, ordinal, execution_authority,
