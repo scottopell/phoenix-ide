@@ -1677,7 +1677,7 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend || (official_openai_route && api_name == "gpt-6-astra"),
+            use_codex_backend || (official_openai_route && is_known_gpt_6(api_name)),
         )
         .responses_request_value()
         .map(str::to_string),
@@ -1741,16 +1741,20 @@ fn translate_to_backend_request(
     }
 }
 
-fn is_gpt_56_or_astra(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || api_name == "gpt-6-astra"
+fn is_known_gpt_6(api_name: &str) -> bool {
+    matches!(api_name, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+}
+
+fn supports_modern_responses(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || is_known_gpt_6(api_name)
 }
 
 pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
-    is_gpt_56_or_astra(api_name)
+    supports_modern_responses(api_name)
 }
 
 fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    is_gpt_56_or_astra(api_name)
+    supports_modern_responses(api_name)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -4510,6 +4514,52 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_sol_luna_fast_tier_serializes_on_direct_and_codex_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let direct =
+                serde_json::to_value(translate_to_responses_request(model, &request, false, true))
+                    .unwrap();
+            let codex =
+                serde_json::to_value(translate_to_responses_request(model, &request, true, false))
+                    .unwrap();
+            assert_eq!(direct["service_tier"], "priority");
+            assert_eq!(codex["service_tier"], "priority");
+        }
+    }
+
+    #[test]
+    fn future_gpt6_model_does_not_inherit_known_model_capabilities() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        let direct = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-future",
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert!(direct.get("service_tier").is_none());
+        assert!(!supports_responses_lite("gpt-6-future"));
+        assert!(!supports_explicit_prompt_cache("gpt-6-future"));
+    }
+
+    #[test]
+    fn gpt6_sol_luna_omit_fast_and_explicit_cache_on_custom_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let custom = serde_json::to_value(translate_to_responses_request(
+                model, &request, false, false,
+            ))
+            .unwrap();
+            assert!(custom.get("service_tier").is_none());
+            assert!(custom.get("prompt_cache_options").is_none());
+        }
+    }
+
+    #[test]
     fn astra_explicit_cache_controls_are_omitted_on_custom_routes() {
         let request = empty_request();
 
@@ -4556,6 +4606,21 @@ mod tests {
 
         assert!(matches!(codex, ResponsesBackendRequest::CodexLite(_)));
         assert!(matches!(platform, ResponsesBackendRequest::Platform(_)));
+    }
+
+    #[test]
+    fn gpt6_sol_luna_use_responses_lite_only_on_codex_route() {
+        let request = empty_request();
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            assert!(matches!(
+                translate_to_backend_request(model, &request, true, false),
+                ResponsesBackendRequest::CodexLite(_)
+            ));
+            assert!(matches!(
+                translate_to_backend_request(model, &request, false, true),
+                ResponsesBackendRequest::Platform(_)
+            ));
+        }
     }
 
     #[test]

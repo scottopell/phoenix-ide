@@ -854,6 +854,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gpt6_sol_luna_codex_use_websocket_and_responses_lite_limits() {
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let spec = all_models()
+                .into_iter()
+                .find(|spec| spec.id == model)
+                .unwrap();
+            let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+            let service = LlmServiceImpl {
+                spec,
+                auth,
+                anthropic_base_url: None,
+                openai_responses_base_url: Some(crate::CODEX_BACKEND_URL.to_string()),
+                openai_chat_completions_base_url: None,
+                custom_headers: Vec::new(),
+                request_tags: BTreeMap::new(),
+                use_codex_backend: true,
+                codex_credential: None,
+                codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+                attempt_deadline: LlmAttemptDeadline::default(),
+            };
+            assert_eq!(
+                service.attempt_transport(true),
+                crate::LlmTransport::Websocket
+            );
+            assert_eq!(
+                service.continuation_request_limits(),
+                crate::ContinuationRequestLimits::codex_responses_lite()
+            );
+        }
+    }
+
     fn chat_gateway_service_with_api_name(api_name: &str) -> LlmServiceImpl {
         let mut spec = all_models()
             .into_iter()

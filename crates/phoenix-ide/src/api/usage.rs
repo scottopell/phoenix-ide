@@ -1081,6 +1081,19 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_sol_luna_pricing_is_unknown_without_per_request_long_context_data() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let standard =
+                calculate_turn_cost_for_tier(model, ServiceTier::Standard, 100_000, 10_000, 0, 0);
+            let fast =
+                calculate_turn_cost_for_tier(model, ServiceTier::Fast, 100_000, 10_000, 0, 0);
+            assert!(!standard.pricing_known);
+            assert!(!fast.pricing_known);
+        }
+    }
+
+    #[test]
     fn gpt_6_astra_pricing_is_unknown_without_route_tier_and_long_context_data() {
         let cost = calculate_turn_cost("gpt-6-astra", 1_000_000, 1_000_000, 100_000, 100_000);
         assert!(!cost.pricing_known);

@@ -198,6 +198,14 @@ fn effort_gpt_6_astra() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Low)
 }
 
+fn effort_gpt_6_sol_luna_direct() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
+}
+
+fn effort_gpt_6_sol_luna_codex() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Medium)
+}
+
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
 /// the model picker). Built by [`super::ModelRegistry::available_model_info`]
 /// from a [`ModelSpec`] plus the live service's effective context window.
@@ -405,8 +413,16 @@ impl ModelSpec {
     }
 
     #[must_use]
-    pub fn effort_capabilities_for(&self, _service: &dyn crate::LlmService) -> EffortCapabilities {
-        self.effort_capabilities.clone()
+    pub fn effort_capabilities_for(&self, service: &dyn crate::LlmService) -> EffortCapabilities {
+        if matches!(self.api_name.as_str(), "gpt-6-sol" | "gpt-6-luna") {
+            if service.uses_codex_bridge() {
+                effort_gpt_6_sol_luna_codex()
+            } else {
+                effort_gpt_6_sol_luna_direct()
+            }
+        } else {
+            self.effort_capabilities.clone()
+        }
     }
 
     #[must_use]
@@ -415,7 +431,10 @@ impl ModelSpec {
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
         let openai_fast = service.uses_codex_bridge()
-            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses());
+            || (matches!(
+                self.api_name.as_str(),
+                "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+            ) && service.uses_official_openai_responses());
         // Anthropic Fast mode is a research-preview capability of the official
         // direct Claude API only. A compatible/proxy base URL or a cloud route
         // must not advertise it, so gate on the official-Anthropic route.
@@ -757,6 +776,36 @@ pub fn all_models() -> Vec<ModelSpec> {
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
+            id: "gpt-6-sol".into(),
+            api_name: "gpt-6-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Sol (workhorse, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::AccountCatalog,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6-luna".into(),
+            api_name: "gpt-6-luna".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Luna (fast, affordable, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::AccountCatalog,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
             id: "gpt-5.6-sol".into(),
             api_name: "gpt-5.6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
@@ -942,6 +991,18 @@ mod tests {
         assert!(!by_id("gpt-6-astra")
             .effort_capabilities
             .supports(ModelEffort::None));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = by_id(id);
+            assert_eq!(model.context_window, 1_050_000);
+            assert_eq!(model.output_token_limit(), Some(128_000));
+            assert_eq!(model.effort_capabilities, effort_gpt_6_sol_luna_direct());
+            assert!(model.effort_capabilities.supports(ModelEffort::None));
+            assert_eq!(model.codex_availability, CodexAvailability::AccountCatalog);
+            assert_eq!(
+                model.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+        }
         assert_eq!(
             by_id("gpt-5.6-sol").effort_capabilities,
             effort_gpt_55_plus()
