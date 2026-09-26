@@ -155,10 +155,6 @@ impl ConversationEventDispatcher for AddressedConversationEventDispatcher {
             .db
             .establish_parent_reconcile_action(conversation_id)
             .await
-            .map_err(|error| error.to_string())?;
-        self.manager
-            .reconcile_startup_obligated_parents()
-            .await
             .map_err(|error| error.to_string())
     }
 }
@@ -196,6 +192,7 @@ pub struct SubAgentSpawnRequest {
     pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
     pub response_tx: oneshot::Sender<Result<(), String>>,
+    pub activation_rx: oneshot::Receiver<()>,
 }
 
 /// Request to cancel sub-agents
@@ -3828,6 +3825,7 @@ impl RuntimeManager {
             parallel_work_qualified,
             parent_turn_link,
             response_tx,
+            activation_rx,
         } = req;
         let result = self
             .admit_and_kick_sub_agent_batch(
@@ -3837,6 +3835,7 @@ impl RuntimeManager {
                 parent_scope,
                 parallel_work_qualified,
                 parent_turn_link,
+                activation_rx,
             )
             .await;
         let _ = response_tx.send(result);
@@ -3851,6 +3850,7 @@ impl RuntimeManager {
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
         parent_turn_link: opentelemetry::trace::SpanContext,
+        activation_rx: oneshot::Receiver<()>,
     ) -> Result<(), String> {
         let parent = self
             .db
@@ -3909,6 +3909,10 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
 
+        if activation_rx.await.is_err() {
+            return Ok(());
+        }
+
         for (spec, turn_link) in specs.into_iter().zip(std::iter::repeat(parent_turn_link)) {
             let manager = Arc::clone(self);
             tokio::spawn(async move {
@@ -3944,11 +3948,21 @@ impl RuntimeManager {
         if dispatch.outcome != phoenix_db::SubAgentInitialDispatchOutcome::Claimed {
             return Ok(());
         }
-        handle
+        if let Err(error) = handle
             .event_tx
             .send(Event::PersistedSubAgentBootstrap)
             .await
-            .map_err(|error| (agent_id.clone(), error.to_string()))?;
+        {
+            self.db
+                .record_sub_agent_terminal(
+                    &agent_id,
+                    phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+            return Err((agent_id, error.to_string()));
+        }
         drop(gate);
 
         let manager = Arc::clone(self);
@@ -3982,12 +3996,16 @@ impl RuntimeManager {
     /// Handle a sub-agent cancel request
     async fn handle_cancel_request(self: &Arc<Self>, req: SubAgentCancelRequest) {
         let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
+        let mut dispositions = Vec::with_capacity(req.ids.len());
         for agent_id in req.ids {
-            match self
+            let outcome = self
                 .db
                 .request_sub_agent_cancellation(&agent_id, Utc::now())
-                .await
-            {
+                .await;
+            dispositions.push((agent_id, outcome));
+        }
+        for (agent_id, outcome) in dispositions {
+            match outcome {
                 Ok(phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch) => {
                     let _ = dispatcher
                         .dispatch(
@@ -8443,6 +8461,11 @@ mod scope_liveness_tests {
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
+                activation_rx: {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(());
+                    rx
+                },
             })
             .await;
         assert_eq!(response_rx.await.expect("admission response"), Ok(()));
@@ -8514,6 +8537,11 @@ mod scope_liveness_tests {
                 parallel_work_qualified: false,
                 parent_turn_link: opentelemetry::trace::SpanContext::NONE,
                 response_tx,
+                activation_rx: {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(());
+                    rx
+                },
             })
             .await;
         assert_eq!(response_rx.await.expect("admission response"), Ok(()));

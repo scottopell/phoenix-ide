@@ -68,7 +68,7 @@ impl SpawnCatalog {
         candidates: &[ExecutionCandidate],
     ) -> Result<ExecutionCandidate, String> {
         for (index, candidate) in candidates.iter().enumerate() {
-            let Some(candidate) = self.resolve_candidate(candidate)? else {
+            let Some(candidate) = self.resolve_candidate(candidate) else {
                 continue;
             };
             self.validate(&candidate)?;
@@ -86,28 +86,22 @@ impl SpawnCatalog {
             .find(|route| route.model == model && route.connection == connection)
     }
 
-    fn resolve_candidate(
-        &self,
-        candidate: &ExecutionCandidate,
-    ) -> Result<Option<ExecutionCandidate>, String> {
+    fn resolve_candidate(&self, candidate: &ExecutionCandidate) -> Option<ExecutionCandidate> {
         if self
             .route(&candidate.model, &candidate.connection)
             .is_some()
         {
-            return Ok(Some(candidate.clone()));
+            return Some(candidate.clone());
         }
         let Some(replacement) = legacy_model_replacement(&candidate.model) else {
-            return Ok(None);
+            return None;
         };
         if self.route(replacement, &candidate.connection).is_none() {
-            return Err(self.execution_error(&format!(
-                "Model '{}' has been retired; select '{replacement}', which is not available through '{}'",
-                candidate.model, candidate.connection
-            )));
+            return None;
         }
         let mut resolved = candidate.clone();
         resolved.model = replacement.to_string();
-        Ok(Some(resolved))
+        Some(resolved)
     }
 
     fn validate(&self, candidate: &ExecutionCandidate) -> Result<(), String> {
@@ -187,7 +181,7 @@ impl SpawnCatalog {
                     connection: connection.clone(),
                     reasoning_effort: *reasoning_effort,
                 };
-                self.resolve_candidate(&requested)?.ok_or_else(|| {
+                self.resolve_candidate(&requested).ok_or_else(|| {
                     self.execution_error(&format!(
                         "Model '{model}' through '{connection}' was not advertised"
                     ))
@@ -222,7 +216,11 @@ impl SpawnCatalog {
         })
     }
 
-    pub fn schema(&self, resolved_parent_model_id: &str) -> serde_json::Value {
+    pub fn schema(
+        &self,
+        resolved_parent_model_id: &str,
+        parent_is_builtin: bool,
+    ) -> serde_json::Value {
         use phoenix_tools::Tool;
         use phoenix_tools::{SpawnAgentsTool, SpawnModelChoice};
         let choices = self
@@ -242,7 +240,11 @@ impl SpawnCatalog {
             self.tiers.keys().cloned().collect(),
             choices,
         )
-        .with_parallel_work_capability(resolved_parent_model_id)
+        .with_parallel_work_capability(if parent_is_builtin {
+            resolved_parent_model_id
+        } else {
+            ""
+        })
         .input_schema()
     }
 }
@@ -304,7 +306,7 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert!(catalog
             .select(Some("unavailable"), None, "sol", None)
             .is_err());
-        let schema = catalog.schema("gpt-5.6-luna");
+        let schema = catalog.schema("gpt-5.6-luna", true);
         let agents = &schema["properties"]["tasks"]["items"]["properties"]["agent_type"]["enum"];
         assert_eq!(agents, &serde_json::json!(["reviewer"]));
         assert!(!schema.to_string().contains("opus"));
@@ -510,7 +512,7 @@ execution = [{model = "gpt-5.4-mini", connection = "codex", reasoning_effort = "
     }
 
     #[test]
-    fn retired_pin_requires_replacement_on_the_same_connection_without_fallback() {
+    fn retired_unavailable_replacement_skips_to_next_configured_candidate() {
         let config = phoenix_agents::parse_config(
             r#"
 version = 1
@@ -531,12 +533,11 @@ execution = [
                 route("gpt-5.6-sol", "openai_responses"),
             ],
         );
-        let error = catalog
+        let selected = catalog
             .select(Some("legacy"), None, "gpt-5.6-luna", None)
-            .err()
-            .expect("retired pin must be unavailable");
-        assert!(error.contains("gpt-5.6-sol"));
-        assert!(error.contains("not available"));
+            .expect("later configured candidate remains usable");
+        assert_eq!(selected.execution.model, "gpt-5.6-luna");
+        assert_eq!(selected.execution.connection, "codex");
     }
 
     #[test]

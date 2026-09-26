@@ -1234,6 +1234,19 @@ impl ModelRegistry {
     }
 
     #[must_use]
+    pub fn is_builtin_model(&self, model: &str) -> bool {
+        self.specs
+            .read()
+            .ok()
+            .and_then(|specs| {
+                specs
+                    .get(model)
+                    .map(|spec| spec.source == ModelSource::BuiltIn)
+            })
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn connection_for_model(&self, model: &str) -> Option<String> {
         let services = self.services.read().ok()?;
         let specs = self.specs.read().ok()?;
