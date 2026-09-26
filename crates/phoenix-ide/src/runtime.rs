@@ -3972,7 +3972,7 @@ impl RuntimeManager {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(%error, %agent_id, "failed to persist sub-agent timeout")
+                    tracing::warn!(%error, %agent_id, "failed to persist sub-agent timeout");
                 }
             }
         });
@@ -4016,7 +4016,7 @@ impl RuntimeManager {
                 }
                 Ok(phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal) => {}
                 Err(error) => {
-                    tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation")
+                    tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
                 }
             }
         }

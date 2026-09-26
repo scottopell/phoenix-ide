@@ -299,6 +299,7 @@ impl Database {
         Ok(SubAgentBatchAdmissionOutcome::Admitted)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn admit_sub_agent_batch_atomically(
         &self,
         batch: &AtomicSubAgentBatchAdmission,
@@ -972,10 +973,8 @@ mod tests {
                 SubAgentInitialDispatchOutcome::Claimed,
                 SubAgentCancellationOutcome::DeliverToRuntime
             ) | (
-                SubAgentInitialDispatchOutcome::AlreadyTerminal,
-                SubAgentCancellationOutcome::CancelledBeforeDispatch
-            ) | (
-                SubAgentInitialDispatchOutcome::CancelledBeforeDispatch,
+                SubAgentInitialDispatchOutcome::AlreadyTerminal
+                    | SubAgentInitialDispatchOutcome::CancelledBeforeDispatch,
                 SubAgentCancellationOutcome::CancelledBeforeDispatch
             )
         ));

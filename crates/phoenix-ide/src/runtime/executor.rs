@@ -20142,7 +20142,10 @@ mod work_subagent_cwd_guard_tests {
     async fn accept_spawn_batch(
         mut spawn_rx: mpsc::Receiver<SubAgentSpawnRequest>,
     ) -> Vec<crate::runtime::SubAgentSpec> {
-        let request = spawn_rx.recv().await.expect("spawn batch request");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
+            .await
+            .expect("spawn batch request remained live")
+            .expect("spawn batch request");
         let specs = request.specs;
         request
             .response_tx
