@@ -4396,7 +4396,10 @@ mod model_resolution_tests {
 
     #[test]
     fn retired_creation_job_model_resolves_to_current_route() {
-        let registry = registry();
+        let registry = ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        });
         assert_eq!(
             resolve_creation_model(&registry, Some("gpt-5.3-codex"), "direct", false).unwrap(),
             "gpt-5.6-sol"
@@ -4407,8 +4410,8 @@ mod model_resolution_tests {
     fn explicit_model_wins_over_mode_defaults() {
         let registry = registry();
         assert_eq!(
-            resolve_creation_model(&registry, Some("gpt-5.4"), "managed", true).unwrap(),
-            "gpt-5.6-sol"
+            resolve_creation_model(&registry, Some("mock"), "managed", true).unwrap(),
+            "mock"
         );
     }
 }
