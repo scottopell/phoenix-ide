@@ -5,7 +5,7 @@ use phoenix_core::domain::product_conversation::{
 };
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
-use sqlx::{Executor, Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 use tracing::Instrument;
 
 use crate::{Database, DbError, DbResult, MessageContent, MessageType};
@@ -557,27 +557,26 @@ impl Database {
             .acquire()
             .instrument(tracing::info_span!("product_conversation.pool_wait"))
             .await?;
-        connection
-            .execute("BEGIN")
+        let mut tx = connection
+            .begin()
             .instrument(tracing::info_span!("product_conversation.begin_read"))
             .await?;
         let result = async {
-            let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut connection, reference)
-                    .instrument(tracing::info_span!("product_conversation.resolve"))
-                    .await?;
+            let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, reference)
+                .instrument(tracing::info_span!("product_conversation.resolve"))
+                .await?;
             tracing::Span::current().record(
                 "product.reference",
                 resolved.product_conversation_id.as_str(),
             );
             let aggregate = Self::get_ordinary_product_conversation_on(
-                &mut connection,
+                &mut tx,
                 &resolved.product_conversation_id,
             )
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
             let messages = Self::get_product_conversation_messages_page_on(
-                &mut connection,
+                &mut tx,
                 aggregate.product_conversation.id(),
                 before,
                 segment_ceilings,
@@ -596,8 +595,7 @@ impl Database {
             "product.reference" = tracing::field::Empty,
         ))
         .await;
-        connection
-            .execute("ROLLBACK")
+        tx.rollback()
             .instrument(tracing::info_span!("product_conversation.rollback_read"))
             .await?;
         result
@@ -1066,6 +1064,82 @@ mod tests {
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
 
+    #[tokio::test]
+    async fn cancelled_snapshot_returns_a_clean_connection() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            assert_cancelled_snapshot_returns_a_clean_connection(),
+        )
+        .await
+        .expect("cancelled snapshot cleanup did not complete");
+    }
+
+    async fn assert_cancelled_snapshot_returns_a_clean_connection() {
+        for pause_after in [1, 20] {
+            let db = Database::open_in_memory().await.unwrap();
+            let root = db
+                .create_conversation("cancel-root", "cancel-root", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut connection = db.pool.acquire().await.unwrap();
+            {
+                let mut handle = connection.lock_handle().await.unwrap();
+                let raw = handle.as_raw_handle().as_ptr() as usize;
+                let mut entered_tx = Some(entered_tx);
+                let mut active_steps = 0;
+                handle.set_progress_handler(1, move || {
+                    // SAFETY: SQLite invokes this callback on the owning connection's
+                    // worker; the handle remains live and this call only reads its flag.
+                    let active =
+                        unsafe { libsqlite3_sys::sqlite3_get_autocommit(raw as *mut _) == 0 };
+                    if active {
+                        active_steps += 1;
+                        if active_steps == pause_after {
+                            entered_tx.take().unwrap().send(()).unwrap();
+                            let _ = release_rx.recv();
+                        }
+                    }
+                    true
+                });
+            }
+            drop(connection);
+            let mut read =
+                Box::pin(db.read_ordinary_product_conversation_snapshot(&root.id, None, None, 10));
+            tokio::select! {
+                result = &mut read => panic!("snapshot completed before cancellation: {result:?}"),
+                entered = entered_rx => entered.unwrap(),
+            }
+            drop(read);
+            release_tx.send(()).unwrap();
+
+            let mut connection = db.pool.acquire().await.unwrap();
+            {
+                let mut handle = connection.lock_handle().await.unwrap();
+                handle.remove_progress_handler();
+                // SAFETY: the locked handle excludes concurrent SQLite access.
+                assert_ne!(
+                    unsafe {
+                        libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr())
+                    },
+                    0,
+                    "cancelled snapshot left a transaction open"
+                );
+            }
+            drop(connection);
+            let tx = db
+                .pool
+                .begin()
+                .await
+                .expect("cancelled snapshot must not poison the pool");
+            tx.rollback().await.unwrap();
+            db.read_ordinary_product_conversation_snapshot(&root.id, None, None, 10)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn performance_fixture(
         segment_count: usize,
         messages_per_segment: usize,
@@ -1138,8 +1212,7 @@ mod tests {
     }
 
     async fn measure_snapshot_stages(db: &Database, reference: &str) -> (u128, u128, u128, u128) {
-        let mut connection = db.pool.acquire().await.unwrap();
-        connection.execute("BEGIN").await.unwrap();
+        let mut connection = db.pool.begin().await.unwrap();
         let started = Instant::now();
         let resolved =
             Database::resolve_ordinary_product_conversation_on(&mut connection, reference)
@@ -1167,7 +1240,7 @@ mod tests {
         assert_eq!(messages.len(), 51);
         let page_micros = started.elapsed().as_micros();
         let started = Instant::now();
-        connection.execute("ROLLBACK").await.unwrap();
+        connection.rollback().await.unwrap();
         let rollback_micros = started.elapsed().as_micros();
         (
             resolve_micros,

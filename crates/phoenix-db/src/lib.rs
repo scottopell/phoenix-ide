@@ -4346,13 +4346,12 @@ impl Database {
         model: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: DbResult<String> = async {
             if let Some(id) = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut *tx)
             .await?
             {
                 return Ok(id);
@@ -4367,7 +4366,7 @@ impl Database {
                  VALUES (?1, 'coordinator', NULL)",
             )
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             let now = Utc::now().to_rfc3339();
             let idle = serde_json::to_string(&ConvState::Idle)
@@ -4384,7 +4383,7 @@ impl Database {
             .bind(model)
             .bind(llm_language.as_str())
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             Ok(id)
         }
@@ -4392,12 +4391,11 @@ impl Database {
 
         match result {
             Ok(conversation_id) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                drop(conn);
+                tx.commit().await?;
                 self.get_conversation(&conversation_id).await
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let _ = tx.rollback().await;
                 Err(error)
             }
         }
@@ -9861,56 +9859,29 @@ impl Database {
         let (mut connection, acquisition) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let ((), timing) = telemetry
+        let (mut tx, timing) = telemetry
             .observe_transaction_admission_db(acquisition, async {
-                sqlx::query("BEGIN IMMEDIATE")
-                    .execute(&mut *connection)
-                    .await
-                    .map(|_| ())
-                    .map_err(DbError::from)
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
             })
             .await?;
-        let body = Self::hard_delete_conversation_tx(
-            &mut connection,
-            id,
-            telemetry.parent_observer(),
-            None,
-        )
-        .await;
+        let body =
+            Self::hard_delete_conversation_tx(&mut tx, id, telemetry.parent_observer(), None).await;
 
         match body {
             Ok(true) => {
                 telemetry
-                    .observe_commit_db(timing, async {
-                        sqlx::query("COMMIT")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
                     .await
             }
             Ok(false) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(DbError::ConversationNotFound(id.to_string()))
             }
             Err(error) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(error)
             }

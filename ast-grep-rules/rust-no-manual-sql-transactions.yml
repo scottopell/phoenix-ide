@@ -1,0 +1,35 @@
+id: no-manual-sql-transactions
+language: Rust
+severity: error
+message: |
+  Manual SQL transaction control has no cancellation-safe owner and can return
+  an open transaction to the connection pool. Use sqlx Transaction via begin()
+  or begin_with(), then commit()/rollback(); dropping the owner rolls back.
+rule:
+  all:
+    - any:
+        - pattern: $CONNECTION.$FUNCTION($SQL)
+        - pattern: $FUNCTION($SQL)
+    - not:
+        inside:
+          all:
+            - any:
+                - kind: mod_item
+                - kind: function_item
+                - kind: impl_item
+            - follows:
+                kind: attribute_item
+                regex: '^#\[\s*(cfg\(\s*test\s*\)|(?:tokio::)?test)\s*\]$'
+                stopBy:
+                  not:
+                    kind: attribute_item
+          stopBy: end
+constraints:
+  FUNCTION:
+    regex: '(^|::)(query|query_scalar|query_as|raw_sql|execute|execute_batch|exec)(::\s*<.*>)?$'
+  SQL:
+    all:
+      - any:
+          - kind: string_literal
+          - kind: raw_string_literal
+      - regex: '(?is)^(?:r\#*)?"(?:\s|\\[nrt]|/\*.*?\*/|--[^\n]*\n)*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b'
