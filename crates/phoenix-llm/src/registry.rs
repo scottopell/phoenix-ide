@@ -1166,6 +1166,11 @@ impl ModelRegistry {
     /// Resolve a model id to an exact registered route, or to its explicit
     /// retired built-in replacement. A missing replacement never falls through
     /// to the deployment default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actionable reselection error when a retired identifier's
+    /// explicit replacement is unavailable in this registry.
     pub fn resolve_model_id(&self, model_id: &str) -> Result<String, String> {
         if self.get(model_id).is_some() {
             return Ok(model_id.to_string());
