@@ -10657,6 +10657,10 @@ def _bootstrap_rich() -> None:
 
 
 def main():
+    # Pipes and redirected log files otherwise block-buffer progress messages.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     # Verbatim passthrough commands are intercepted before argparse so their
     # flags (especially --help) reach the underlying CLI unchanged.
     if len(sys.argv) >= 2 and sys.argv[1] == "taskmd":
