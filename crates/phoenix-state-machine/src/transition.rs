@@ -2815,6 +2815,27 @@ pub fn transition_sub_agent(
         // ============================================================
         // Terminal state absorption (Completed / Failed)
         // ============================================================
+        (
+            SubAgentState::Core(CoreState::Idle),
+            SubAgentEvent::SubAgent(SubAgentOnlyEvent::PersistedBootstrap),
+        ) => Ok(
+            SubAgentTransitionResult::new(SubAgentState::Core(CoreState::LlmRequesting {
+                attempt: 1,
+            }))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+            .with_effect(Effect::RequestLlm),
+        ),
+        (_, SubAgentEvent::SubAgent(SubAgentOnlyEvent::PersistedBootstrap)) => {
+            Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "PersistedSubAgentBootstrap",
+            })
+        }
+
+        // ============================================================
+        // Terminal state absorption (Completed / Failed)
+        // ============================================================
         (SubAgentState::Completed { .. } | SubAgentState::Failed { .. }, _event) => {
             Ok(SubAgentTransitionResult::new(state.clone()))
         }

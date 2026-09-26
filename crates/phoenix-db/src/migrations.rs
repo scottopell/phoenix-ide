@@ -566,6 +566,10 @@ CREATE TABLE sub_agent_runs (
         CHECK(typeof(ordinal) = 'integer' AND ordinal >= 0),
     execution_authority TEXT NOT NULL
         CHECK(execution_authority IN ('read_only', 'write_capable')),
+    max_turns INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(max_turns) = 'integer' AND max_turns > 0),
+    timeout_millis INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(timeout_millis) = 'integer' AND timeout_millis > 0),
     cancellation_requested_at_unix_micros INTEGER
         CHECK(cancellation_requested_at_unix_micros IS NULL OR (
             typeof(cancellation_requested_at_unix_micros) = 'integer'
@@ -656,7 +660,7 @@ BEGIN
 END;
 
 CREATE TRIGGER sub_agent_runs_immutable_identity
-BEFORE UPDATE OF child_conversation_id, batch_id, ordinal, execution_authority
+BEFORE UPDATE OF child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis
 ON sub_agent_runs
 FOR EACH ROW
 BEGIN

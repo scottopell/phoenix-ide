@@ -3241,6 +3241,15 @@ where
 
         while let Some(current_event) = events_to_process.pop() {
             let settles_handoff = matches!(current_event, Event::TaskHandoffComplete { .. });
+            if let Event::SubAgentResult { ref agent_id, .. } = current_event {
+                if self
+                    .storage
+                    .sub_agent_terminal_is_accepted(agent_id)
+                    .await?
+                {
+                    continue;
+                }
+            }
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -3284,6 +3293,11 @@ where
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             let generated = self.apply_transition_result(result).await?;
+            if let Event::SubAgentResult { ref agent_id, .. } = terminal_event {
+                self.storage
+                    .accept_sub_agent_terminal(agent_id, Utc::now())
+                    .await?;
+            }
             if settles_handoff {
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
@@ -5251,34 +5265,52 @@ where
                 result,
             }));
         }
-        let mut spawned = Vec::with_capacity(specs.len());
-        for spec in specs {
-            spawned.push(PendingSubAgent {
+        let spawned = specs
+            .iter()
+            .map(|spec| PendingSubAgent {
                 agent_id: spec.agent_id.clone(),
                 task: spec.task.clone(),
                 mode: spec.mode,
-            });
-            let request = SubAgentSpawnRequest {
-                spec,
-                parent_conversation_id: self.context.conversation_id.clone(),
-                parent_scope: self.context.resource_scope.work_scope_id().cloned(),
-                parent_event_tx: self.event_tx.clone(),
-                parent_turn_link: parent_turn_link.clone(),
-            };
-            if let Err(e) = spawn_tx.send(request).await {
-                tracing::error!(error = %e, "Failed to send spawn request");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    format!("Failed to spawn sub-agents: {e}"),
-                );
-                return Ok(Some(Event::ToolComplete {
+            })
+            .collect::<Vec<_>>();
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = SubAgentSpawnRequest {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            specs,
+            parent_conversation_id: self.context.conversation_id.clone(),
+            parent_scope: self.context.resource_scope.work_scope_id().cloned(),
+            parallel_work_qualified,
+            parent_turn_link,
+            response_tx,
+        };
+        if let Err(error) = spawn_tx.send(request).await {
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool_use_id.clone(),
+                result: ToolResult::error(
                     tool_use_id,
-                    result,
+                    format!("Failed to submit sub-agent batch: {error}"),
+                ),
+            }));
+        }
+        match response_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(tool_use_id, error),
+                }));
+            }
+            Err(error) => {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(
+                        tool_use_id,
+                        format!("Sub-agent admission stopped: {error}"),
+                    ),
                 }));
             }
         }
 
-        // Track active Work sub-agents for one-writer constraint (REQ-PROJ-008)
         self.active_work_subagents += work_count_in_batch;
 
         // Build success result
@@ -6559,6 +6591,23 @@ where
         }
     }
 
+    fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTerminalCause {
+        match outcome {
+            SubAgentOutcome::Success { .. } => phoenix_db::SubAgentTerminalCause::SubmitResult,
+            SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
+            SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,
+                crate::db::ErrorKind::TurnLimitExhausted => {
+                    phoenix_db::SubAgentTerminalCause::TurnLimit
+                }
+                crate::db::ErrorKind::ContextExhausted => {
+                    phoenix_db::SubAgentTerminalCause::ContextExhausted
+                }
+                _ => phoenix_db::SubAgentTerminalCause::SubmitError,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_control_effect(
         &mut self,
@@ -6578,7 +6627,6 @@ where
                     let request = SubAgentCancelRequest {
                         ids,
                         parent_conversation_id: self.context.conversation_id.clone(),
-                        parent_event_tx: self.event_tx.clone(),
                     };
                     if let Err(error) = cancel_tx.send(request).await {
                         tracing::error!(%error, "Failed to send cancel request");
@@ -6590,13 +6638,19 @@ where
             }
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
+                let child_conversation_id = self.context.conversation_id.clone();
+                let cause = Self::sub_agent_terminal_cause(&outcome);
+                self.storage
+                    .record_sub_agent_terminal(&child_conversation_id, cause, Utc::now())
+                    .await?;
                 if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
-                        agent_id: self.context.conversation_id.clone(),
+                        agent_id: child_conversation_id.clone(),
                         outcome,
                     };
                     if let Err(error) = dispatcher.dispatch(parent_conversation_id, event).await {
                         tracing::warn!(%error, %parent_conversation_id, "Failed to notify addressed parent conversation");
+                        dispatcher.reconcile(parent_conversation_id).await?;
                     }
                 } else {
                     tracing::warn!("No parent address configured for sub-agent");
@@ -20085,6 +20139,18 @@ mod work_subagent_cwd_guard_tests {
         ToolCall::new("tool-spawn-1", ToolInput::SpawnAgents(input))
     }
 
+    async fn accept_spawn_batch(
+        mut spawn_rx: mpsc::Receiver<SubAgentSpawnRequest>,
+    ) -> Vec<crate::runtime::SubAgentSpec> {
+        let request = spawn_rx.recv().await.expect("spawn batch request");
+        let specs = request.specs;
+        request
+            .response_tx
+            .send(Ok(()))
+            .expect("spawn requester receives admission result");
+        specs
+    }
+
     fn tool_result_text(result: &ToolResult) -> String {
         match &result.outcome {
             ToolOutcome::Success { output, .. }
@@ -20250,12 +20316,13 @@ mod work_subagent_cwd_guard_tests {
     async fn qualified_parent_models_admit_multiple_luna_work_children() {
         for parent_model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
             let worktree = TempDir::new().expect("worktree tempdir");
-            let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
+            let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
             let (cancel_tx, _cancel_rx) = mpsc::channel(1);
             let mut rt =
                 runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
             rt.context.model_id = parent_model.to_string();
 
+            let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
             let result = rt
                 .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                     tasks: vec![
@@ -20265,6 +20332,7 @@ mod work_subagent_cwd_guard_tests {
                 }))
                 .await
                 .expect("qualified spawn validation");
+            let specs = responder.await.expect("spawn batch responder");
 
             assert!(
                 matches!(
@@ -20273,10 +20341,10 @@ mod work_subagent_cwd_guard_tests {
                 ),
                 "{parent_model}: {result:?}"
             );
-            for _ in 0..2 {
-                let request = spawn_rx.try_recv().expect("Luna child request");
-                assert_eq!(request.spec.model_id, "gpt-5.6-luna");
-                assert_eq!(request.spec.mode, SubAgentMode::Work);
+            assert_eq!(specs.len(), 2);
+            for spec in &specs {
+                assert_eq!(spec.model_id, "gpt-5.6-luna");
+                assert_eq!(spec.mode, SubAgentMode::Work);
             }
             assert_eq!(rt.active_work_subagents, 2);
         }
@@ -20328,10 +20396,11 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn accepts_unnamed_generic_work_subagent() {
         let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
         let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
 
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -20357,15 +20426,13 @@ mod work_subagent_cwd_guard_tests {
             other => panic!("expected SpawnAgentsComplete, got {other:?}"),
         }
 
-        let request = spawn_rx
-            .try_recv()
-            .expect("generic Work sub-agent request should be sent");
-        assert_eq!(request.spec.mode, SubAgentMode::Work);
-        assert_eq!(request.spec.agent_name, None);
-        assert_eq!(request.spec.persona, None);
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, None);
+        let specs = responder.await.expect("generic Work batch responder");
+        assert_eq!(specs[0].mode, SubAgentMode::Work);
+        assert_eq!(specs[0].agent_name, None);
+        assert_eq!(specs[0].persona, None);
+        assert_eq!(specs[0].model_id, "gpt-5.6-sol");
+        assert_eq!(specs[0].connection, "openai_responses");
+        assert_eq!(specs[0].effort, None);
         assert_eq!(rt.active_work_subagents, 1);
     }
 
@@ -20509,11 +20576,12 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn omitted_execution_and_blank_cwd_use_defaults() {
         let parent = TempDir::new().expect("parent tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
         let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
         rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
 
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -20529,13 +20597,13 @@ mod work_subagent_cwd_guard_tests {
             .expect("handle_spawn_agents_tool returned error");
 
         assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
-        let request = spawn_rx.try_recv().expect("spawn request sent");
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, rt.context.effort);
-        assert_eq!(request.spec.mode, SubAgentMode::Explore);
+        let specs = responder.await.expect("default batch responder");
+        assert_eq!(specs[0].model_id, "gpt-5.6-sol");
+        assert_eq!(specs[0].connection, "openai_responses");
+        assert_eq!(specs[0].effort, rt.context.effort);
+        assert_eq!(specs[0].mode, SubAgentMode::Explore);
         assert_eq!(
-            std::fs::canonicalize(request.spec.cwd).unwrap(),
+            std::fs::canonicalize(&specs[0].cwd).unwrap(),
             std::fs::canonicalize(parent.path()).unwrap()
         );
     }

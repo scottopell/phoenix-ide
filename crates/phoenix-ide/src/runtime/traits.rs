@@ -196,6 +196,32 @@ pub trait MessageStore: Send + Sync {
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Message, String>;
 
+    /// Persist a child terminal fact before its outcome enters the parent fan-in.
+    async fn record_sub_agent_terminal(
+        &self,
+        _child_conversation_id: &str,
+        _cause: phoenix_db::SubAgentTerminalCause,
+        _terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn sub_agent_terminal_is_accepted(
+        &self,
+        _child_conversation_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Mark a terminal outcome accepted only after it was admitted to the parent.
+    async fn accept_sub_agent_terminal(
+        &self,
+        _child_conversation_id: &str,
+        _accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -1475,6 +1501,41 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn record_sub_agent_terminal(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn sub_agent_terminal_is_accepted(
+        &self,
+        child_conversation_id: &str,
+    ) -> Result<bool, String> {
+        self.db
+            .sub_agent_terminal_is_accepted(child_conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_sub_agent_terminal(
+        &self,
+        child_conversation_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .accept_sub_agent_terminal(child_conversation_id, accepted_at)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
