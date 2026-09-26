@@ -969,6 +969,8 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
             ])
         );
     }
