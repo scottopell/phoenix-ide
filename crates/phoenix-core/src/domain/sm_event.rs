@@ -433,6 +433,8 @@ pub enum Event {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
     },
+    /// Starts an admitted sub-agent whose initial user message is already durable.
+    PersistedSubAgentBootstrap,
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
@@ -657,6 +659,7 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -818,6 +821,7 @@ pub enum ParentOnlyEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum SubAgentOnlyEvent {
+    PersistedBootstrap,
     GraceTurnExhausted { result: Option<String> },
 }
 
@@ -892,6 +896,10 @@ impl TryFrom<Event> for ParentEvent {
                     authority,
                 }))
             }
+            Event::PersistedSubAgentBootstrap => Err(EventConversionError {
+                event_variant: "PersistedSubAgentBootstrap",
+                target_type: "ParentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -1173,6 +1181,9 @@ impl TryFrom<Event> for SubAgentEvent {
                 }))
             }
             // Sub-agent-only events
+            Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
+                SubAgentOnlyEvent::PersistedBootstrap,
+            )),
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
@@ -1255,6 +1266,7 @@ impl SubAgentEvent {
         match self {
             SubAgentEvent::Core(e) => e.variant_name(),
             SubAgentEvent::SubAgent(e) => match e {
+                SubAgentOnlyEvent::PersistedBootstrap => "PersistedSubAgentBootstrap",
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }

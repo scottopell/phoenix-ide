@@ -74,6 +74,39 @@ pub struct SubAgentRunAdmission {
     pub execution_authority: SubAgentExecutionAuthority,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubAgentChildAdmission {
+    pub run: SubAgentRunAdmission,
+    pub slug: String,
+    pub cwd: String,
+    pub model: String,
+    pub conv_mode: ConvMode,
+    pub llm_language: phoenix_core::llm_language::LlmLanguage,
+    pub connection: String,
+    pub effort: Option<ModelEffort>,
+    pub persona: Option<String>,
+    pub initial_message_id: String,
+    pub initial_task: String,
+    pub max_turns: u32,
+    pub timeout_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtomicSubAgentBatchAdmission {
+    pub batch_id: String,
+    pub parent_conversation_id: String,
+    pub parent_scope: Option<WorkScopeId>,
+    pub parallel_work_qualified: bool,
+    pub children: Vec<SubAgentChildAdmission>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubAgentInitialDispatch {
+    pub outcome: SubAgentInitialDispatchOutcome,
+    pub max_turns: u32,
+    pub timeout_millis: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAgentBatchAdmission {
     pub batch_id: String,
@@ -251,8 +284,9 @@ impl Database {
                 .map_err(|_| lifecycle_conflict("sub-agent ordinal exceeds i64"))?;
             sqlx::query(
                 "INSERT INTO sub_agent_runs (
-                     child_conversation_id, batch_id, ordinal, execution_authority
-                 ) VALUES (?1, ?2, ?3, ?4)",
+                     child_conversation_id, batch_id, ordinal, execution_authority,
+                     max_turns, timeout_millis
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 1)",
             )
             .bind(&run.child_conversation_id)
             .bind(&batch.batch_id)
@@ -265,11 +299,214 @@ impl Database {
         Ok(SubAgentBatchAdmissionOutcome::Admitted)
     }
 
+    pub async fn admit_sub_agent_batch_atomically(
+        &self,
+        batch: &AtomicSubAgentBatchAdmission,
+    ) -> DbResult<SubAgentBatchAdmissionOutcome> {
+        let lifecycle = SubAgentBatchAdmission {
+            batch_id: batch.batch_id.clone(),
+            parent_conversation_id: batch.parent_conversation_id.clone(),
+            parallel_work_qualified: batch.parallel_work_qualified,
+            runs: batch
+                .children
+                .iter()
+                .map(|child| child.run.clone())
+                .collect(),
+        };
+        validate_batch_input(&lifecycle)?;
+        if batch.children.iter().any(|child| {
+            child.slug.trim().is_empty()
+                || child.cwd.trim().is_empty()
+                || child.model.trim().is_empty()
+                || child.connection.trim().is_empty()
+                || child.initial_message_id.trim().is_empty()
+                || child.max_turns == 0
+                || child.timeout_millis == 0
+        }) {
+            return Err(lifecycle_conflict(
+                "sub-agent admission fields must be non-empty",
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(matches) = existing_batch_matches(&mut tx, &lifecycle).await? {
+            tx.commit().await?;
+            return if matches {
+                Ok(SubAgentBatchAdmissionOutcome::Replayed)
+            } else {
+                Err(lifecycle_conflict(format!(
+                    "batch id {} was already admitted with different membership",
+                    batch.batch_id
+                )))
+            };
+        }
+
+        let parent = sqlx::query(
+            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?1",
+        )
+        .bind(&batch.parent_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| lifecycle_conflict("sub-agent parent does not exist"))?;
+        let inherited_scope = parent
+            .try_get::<Option<String>, _>("work_scope_id")?
+            .map(WorkScopeId::parse)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if inherited_scope.as_ref() != batch.parent_scope.as_ref() {
+            return Err(lifecycle_conflict(
+                "parent WorkScope changed before batch admission",
+            ));
+        }
+        let product_conversation_id: String = parent.try_get("product_conversation_id")?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let idle = serde_json::to_string(&ConvState::Idle)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation,
+                  turn_id, turn_generation, created_at)
+             SELECT c.id, 'Reconcile', c.transcript_generation,
+                    t.turn_id, t.generation, ?2
+             FROM conversations AS c
+             LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE c.id = ?1
+             ON CONFLICT(conversation_id) DO NOTHING",
+        )
+        .bind(&batch.parent_conversation_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO sub_agent_batches (
+                 batch_id, parent_conversation_id, parallel_work_qualified,
+                 admitted_at_unix_micros
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&batch.batch_id)
+        .bind(&batch.parent_conversation_id)
+        .bind(batch.parallel_work_qualified)
+        .bind(now.timestamp_micros())
+        .execute(&mut *tx)
+        .await?;
+
+        for (ordinal, child) in batch.children.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal)
+                .map_err(|_| lifecycle_conflict("sub-agent ordinal exceeds i64"))?;
+            let cm = conv_mode_columns(&child.conv_mode);
+            let title = schema::title_from_slug(&child.slug);
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, title, parent_conversation_id,
+                     user_initiated, state, state_kind, state_updated_at, created_at, updated_at,
+                     archived, transcript_generation, model, effort, llm_language, cm_kind,
+                     cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role,
+                     work_scope_id, sub_agent_cwd_override, service_tier
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15, 'sub_agent', ?16, ?17, ?18
+                 )",
+            )
+            .bind(&child.run.child_conversation_id)
+            .bind(&product_conversation_id)
+            .bind(&child.slug)
+            .bind(title)
+            .bind(&batch.parent_conversation_id)
+            .bind(&idle)
+            .bind(conv_state_kind(&ConvState::Idle))
+            .bind(&now_text)
+            .bind(&child.model)
+            .bind(child.effort.map(ModelEffort::as_wire_name))
+            .bind(child.llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
+            .bind(batch.parent_scope.as_ref().map(WorkScopeId::as_str))
+            .bind(&child.cwd)
+            .bind(ServiceTier::Standard.as_wire_name())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO sub_agent_execution_routes (conversation_id, connection) VALUES (?1, ?2)",
+            )
+            .bind(&child.run.child_conversation_id)
+            .bind(&child.connection)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(persona) = &child.persona {
+                sqlx::query(
+                    "INSERT INTO sub_agent_personas (conversation_id, persona) VALUES (?1, ?2)",
+                )
+                .bind(&child.run.child_conversation_id)
+                .bind(persona)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let content = MessageContent::user(&child.initial_task);
+            let content_json = serde_json::to_string(&content.to_stored_json())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+            )
+            .bind(&child.initial_message_id)
+            .bind(&child.run.child_conversation_id)
+            .bind(content.message_type().to_string())
+            .bind(content_json)
+            .bind(&now_text)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO sub_agent_runs (
+                     child_conversation_id, batch_id, ordinal, execution_authority,
+                     max_turns, timeout_millis
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(&child.run.child_conversation_id)
+            .bind(&batch.batch_id)
+            .bind(ordinal)
+            .bind(child.run.execution_authority.as_db_str())
+            .bind(i64::from(child.max_turns))
+            .bind(
+                i64::try_from(child.timeout_millis)
+                    .map_err(|_| lifecycle_conflict("sub-agent timeout exceeds i64"))?,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(SubAgentBatchAdmissionOutcome::Admitted)
+    }
+
+    pub async fn sub_agent_dispatch_config(
+        &self,
+        child_conversation_id: &str,
+    ) -> DbResult<(u32, u64)> {
+        let (max_turns, timeout_millis): (i64, i64) = sqlx::query_as(
+            "SELECT max_turns, timeout_millis FROM sub_agent_runs WHERE child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            u32::try_from(max_turns)
+                .map_err(|_| lifecycle_conflict("invalid persisted max turns"))?,
+            u64::try_from(timeout_millis)
+                .map_err(|_| lifecycle_conflict("invalid persisted timeout"))?,
+        ))
+    }
+
     pub async fn claim_sub_agent_initial_dispatch(
         &self,
         child_conversation_id: &str,
         claimed_at: DateTime<Utc>,
-    ) -> DbResult<SubAgentInitialDispatchOutcome> {
+    ) -> DbResult<SubAgentInitialDispatch> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE sub_agent_runs
@@ -289,7 +526,8 @@ impl Database {
         } else {
             let row = sqlx::query(
                 "SELECT cancellation_requested_at_unix_micros,
-                        initial_dispatch_claimed_at_unix_micros, terminal_at_unix_micros
+                        initial_dispatch_claimed_at_unix_micros, terminal_at_unix_micros,
+                        max_turns, timeout_millis
                  FROM sub_agent_runs WHERE child_conversation_id = ?1",
             )
             .bind(child_conversation_id)
@@ -310,8 +548,20 @@ impl Database {
                 SubAgentInitialDispatchOutcome::CancelledBeforeDispatch
             }
         };
+        let config: (i64, i64) = sqlx::query_as(
+            "SELECT max_turns, timeout_millis FROM sub_agent_runs WHERE child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(outcome)
+        Ok(SubAgentInitialDispatch {
+            outcome,
+            max_turns: u32::try_from(config.0)
+                .map_err(|_| lifecycle_conflict("invalid persisted max turns"))?,
+            timeout_millis: u64::try_from(config.1)
+                .map_err(|_| lifecycle_conflict("invalid persisted timeout"))?,
+        })
     }
 
     pub async fn request_sub_agent_cancellation(
@@ -411,6 +661,31 @@ impl Database {
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    pub async fn sub_agent_lifecycle_exists(&self, child_conversation_id: &str) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sub_agent_runs WHERE child_conversation_id = ?1)",
+        )
+        .bind(child_conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    pub async fn sub_agent_terminal_is_accepted(
+        &self,
+        child_conversation_id: &str,
+    ) -> DbResult<bool> {
+        let accepted: Option<i64> = sqlx::query_scalar(
+            "SELECT parent_accepted_at_unix_micros
+             FROM sub_agent_runs WHERE child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(accepted.is_some())
     }
 
     pub async fn accept_sub_agent_terminal(
@@ -671,7 +946,7 @@ mod tests {
         let claim = claim.await.unwrap().unwrap();
         let cancel = cancel.await.unwrap().unwrap();
         assert!(matches!(
-            (claim, cancel),
+            (claim.outcome, cancel),
             (
                 SubAgentInitialDispatchOutcome::Claimed,
                 SubAgentCancellationOutcome::DeliverToRuntime
