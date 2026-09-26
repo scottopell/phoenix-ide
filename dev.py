@@ -4151,7 +4151,7 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p.startswith("tests/devpy/"):
             cats.add("SPECS")
-        if p == "scripts/check_rust_test_timing.py":
+        if p in {"scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"}:
             cats.update({"ASTGREP", "SPECS"})
         if p in {
             "scripts/check_profile_command.py",
@@ -5468,6 +5468,9 @@ def cmd_check(
         run_step("ast-grep", [
             "ast-grep", "scan", "--inline-rules", inline_rules,
             "crates/", "ui/src/",
+        ])
+        run_step("manual-sql-transactions", [
+            "uv", "run", "scripts/check_manual_sql_transactions.py", "crates/",
         ])
         comparison_commit = "HEAD^" if _on_integration_base() else _resolve_check_merge_base()
         if comparison_commit is None:

@@ -1,18 +1,19 @@
 import json
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-RULE = ROOT / "ast-grep-rules" / "rust-no-manual-sql-transactions.yml"
+CHECKER = ROOT / "scripts" / "check_manual_sql_transactions.py"
 
 
 @unittest.skipUnless(shutil.which("ast-grep"), "ast-grep is not installed")
 class ManualSqlTransactionTests(unittest.TestCase):
     def findings(self, source):
         result = subprocess.run(
-            ["ast-grep", "scan", "--rule", str(RULE), "--stdin", "--json=compact"],
+            [sys.executable, str(CHECKER), "--stdin", "--json"],
             input=source, text=True, capture_output=True, check=False,
         )
         self.assertIn(result.returncode, (0, 1), result.stderr)
@@ -101,6 +102,43 @@ class ManualSqlTransactionTests(unittest.TestCase):
         #[cfg(any(test, feature = "production"))]
         async fn shared() { sqlx::raw_sql("ROLLBACK"); }
         '''
+        self.assertEqual(3, len(self.findings(source)))
+
+    def test_every_statement_is_checked(self):
+        source = r'''async fn production() {
+            sqlx::raw_sql("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+            connection.execute_batch("SELECT 1; -- comment\nSAVEPOINT partial; RELEASE partial;");
+            connection.execute("; ; COMMIT;");
+            sqlx::raw_sql("CREATE TRIGGER guard BEFORE INSERT ON rows
+                BEGIN SELECT 1; SELECT 2; END; BEGIN IMMEDIATE;");
+        }'''
+        self.assertEqual(4, len(self.findings(source)))
+
+    def test_quoted_and_commented_semicolons_are_not_boundaries(self):
+        source = r'''async fn production() {
+            sqlx::raw_sql("SELECT '; BEGIN', 'it''s; ROLLBACK', \"; END\", [; RELEASE], `; SAVEPOINT`;");
+            connection.execute_batch("SELECT 1 /* ; BEGIN */; -- ; COMMIT\nSELECT 2;");
+            sqlx::raw_sql("CREATE TRIGGER guard BEFORE INSERT ON rows BEGIN
+                SELECT CASE WHEN 1 THEN 'a; BEGIN' ELSE 'b' END; SELECT 2; END;");
+        }'''
+        self.assertEqual([], self.findings(source))
+
+    def test_rust_escapes_are_decoded_before_sql_inspection(self):
+        source = r'''async fn production() {
+            connection.execute("-- comment\x0aBEGIN IMMEDIATE");
+            connection.execute("-- comment\u{0_00a}COMMIT");
+            connection.execute("\x42EGIN IMMEDIATE");
+            connection.execute("\
+                ROLLBACK");
+        }'''
+        self.assertEqual(4, len(self.findings(source)))
+
+    def test_executor_and_bound_argument_calls_are_checked(self):
+        source = '''async fn production() {
+            sqlx::Executor::execute(&mut connection, "BEGIN");
+            sqlx::query_with("COMMIT", arguments);
+            connection.fetch_all("ROLLBACK");
+        }'''
         self.assertEqual(3, len(self.findings(source)))
 
 
