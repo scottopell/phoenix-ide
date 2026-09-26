@@ -206,6 +206,18 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        _conv_id: &str,
+        _state: &ConvState,
+        _state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.accept_sub_agent_terminal(child_conversation_id, accepted_at)
+            .await
+    }
+
     async fn sub_agent_terminal_is_accepted(
         &self,
         _child_conversation_id: &str,
@@ -1511,6 +1523,27 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .update_parent_state_and_accept_sub_agent(
+                conv_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

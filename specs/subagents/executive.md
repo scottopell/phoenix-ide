@@ -78,11 +78,11 @@ only the architectural seams.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-SA-001:** Parallel Task Execution | 🚧 Partial | Existing Explore parallelism and bounds are live; atomic qualified Work batch admission is normative but not implemented |
+| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Explore parallelism and bounds remain live; qualified Work batches are admitted atomically before child startup |
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
-| **REQ-SA-003:** Result Submission | 🚧 Partial | Terminal tools are live; durable parent-identity delivery and idempotent acceptance remain to be implemented |
-| **REQ-SA-004:** Parent Fan-In | 🚧 Partial | Existing fan-in is live; exact durable pending removal, idempotent duplicate acceptance, and settlement fencing remain to be implemented |
-| **REQ-SA-005:** Cancellation Propagation | 🚧 Partial | Installed-child cancellation is live; durable cancel-before-start and joined materialization remain to be implemented |
+| **REQ-SA-003:** Result Submission | ✅ Complete | Terminal evidence precedes addressed parent delivery; acceptance is idempotent and atomic with parent state persistence |
+| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Durable lifecycle rows fence admission; parent transitions remove exact children and accepted duplicate delivery converges |
+| **REQ-SA-005:** Cancellation Propagation | ✅ Complete | Durable cancellation covers admitted, materializing, and installed children; materialization joins the existing single-flight |
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Selection | ✅ Complete | `generic_omission_inherits_parent_execution`, `override_replaces_execution_and_keeps_persona`, and `explicit_connection_is_exact_and_never_falls_back`; persisted selection verified by `unattached_sub_agent_persists_selection_without_parent_effort_leak` |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
@@ -90,7 +90,7 @@ only the architectural seams.
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
 | **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | `omitted_execution_and_blank_cwd_use_defaults`, `relative_cwd_resolves_from_parent_working_directory`, and `advertised_model_removed_from_live_registry_is_rejected` |
 
-**Progress:** 5 complete; 4 partial; 1 deferred; 1 proposed for wake runtime.
+**Progress:** 9 complete; 1 deferred; 1 proposed for wake runtime.
 
 ## Execution-selection verification
 

@@ -3965,7 +3965,7 @@ impl RuntimeManager {
                             &agent_id,
                             Event::UserCancel {
                                 reason: Some("Sub-agent timed out".to_string()),
-                                cause: crate::state_machine::event::CancelCause::UserRequested,
+                                cause: crate::state_machine::event::CancelCause::Timeout,
                             },
                         )
                         .await;

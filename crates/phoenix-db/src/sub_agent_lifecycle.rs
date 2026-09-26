@@ -685,6 +685,69 @@ impl Database {
         Ok(outcome)
     }
 
+    pub async fn update_parent_state_and_accept_sub_agent(
+        &self,
+        parent_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> DbResult<SubAgentParentAcceptanceOutcome> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE conversations
+             SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?5
+             WHERE id = ?1",
+        )
+        .bind(parent_conversation_id)
+        .bind(state_json)
+        .bind(crate::conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(DbError::ConversationNotFound(
+                parent_conversation_id.to_string(),
+            ));
+        }
+        let accepted = sqlx::query(
+            "UPDATE sub_agent_runs SET parent_accepted_at_unix_micros = ?2
+             WHERE child_conversation_id = ?1
+               AND terminal_at_unix_micros IS NOT NULL
+               AND parent_accepted_at_unix_micros IS NULL",
+        )
+        .bind(child_conversation_id)
+        .bind(accepted_at.timestamp_micros())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let outcome = if accepted == 1 {
+            SubAgentParentAcceptanceOutcome::Accepted
+        } else {
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs
+                 WHERE child_conversation_id = ?1",
+            )
+            .bind(child_conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            if existing.is_some() {
+                SubAgentParentAcceptanceOutcome::Replayed
+            } else {
+                return Err(lifecycle_conflict(format!(
+                    "child {child_conversation_id} has no terminal evidence to accept"
+                )));
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
     pub async fn sub_agent_lifecycle_exists(&self, child_conversation_id: &str) -> DbResult<bool> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sub_agent_runs WHERE child_conversation_id = ?1)",
