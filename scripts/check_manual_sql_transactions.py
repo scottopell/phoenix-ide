@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.13"
+# requires-python = ">=3.12"
 # dependencies = []
 # ///
 """Reject unowned SQL transactions in production Rust SQL literals."""

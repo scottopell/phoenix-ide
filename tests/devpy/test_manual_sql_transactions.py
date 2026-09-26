@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -126,12 +127,20 @@ class ManualSqlTransactionTests(unittest.TestCase):
     def test_rust_escapes_are_decoded_before_sql_inspection(self):
         source = r'''async fn production() {
             connection.execute("-- comment\x0aBEGIN IMMEDIATE");
-            connection.execute("-- comment\u{0_00a}COMMIT");
+            connection.execute("-- comment\u{000a}COMMIT");
             connection.execute("\x42EGIN IMMEDIATE");
             connection.execute("\
                 ROLLBACK");
         }'''
         self.assertEqual(4, len(self.findings(source)))
+
+    def test_decoder_accepts_underscores_in_unicode_escapes(self):
+        # tree-sitter-rust rejects this valid escape before AST extraction.
+        spec = importlib.util.spec_from_file_location("manual_sql_checker", CHECKER)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        self.assertEqual("-- comment\nCOMMIT",
+                         checker.decode_rust_string(r'"-- comment\u{0_00a}COMMIT"'))
 
     def test_executor_and_bound_argument_calls_are_checked(self):
         source = '''async fn production() {
