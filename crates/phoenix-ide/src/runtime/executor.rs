@@ -4727,6 +4727,22 @@ where
         // and the last one resolves by cause: Timeout resumes to LlmRequesting,
         // UserRequested settles to Idle.
         for agent_id in pending_ids {
+            let terminal_cause = match cause {
+                crate::state_machine::event::CancelCause::Timeout => {
+                    phoenix_db::SubAgentTerminalCause::TimedOut
+                }
+                crate::state_machine::event::CancelCause::UserRequested => {
+                    phoenix_db::SubAgentTerminalCause::Cancelled
+                }
+            };
+            if let Err(error) = self
+                .storage
+                .record_sub_agent_terminal(&agent_id, terminal_cause, Utc::now())
+                .await
+            {
+                tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");
+                continue;
+            }
             let event = Event::SubAgentResult {
                 agent_id,
                 outcome: SubAgentOutcome::Failure {
@@ -7251,6 +7267,16 @@ where
                 explore_bash_capability,
             )
         };
+        if is_sub_agent
+            && matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            )
+        {
+            system_prompt.push_str(
+                "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
+            );
+        }
         if has_approved_task_write_authority {
             system_prompt.push_str(
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
