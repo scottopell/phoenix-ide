@@ -155,7 +155,7 @@ impl SpawnAgentsTool {
         if self.parallel_work_subagents {
             "Work sub-agents may run in parallel for this qualified parent model. The parent should partition assignments and owns integration. Other trusted collaborators may edit the shared worktree concurrently, so preserve unrelated edits and report conflicts, overlap, or uncertainty."
         } else {
-            "Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another."
+            "Work sub-agents run one at a time per parent: include at most one Work task per call and wait for the active Work child to finish before spawning another."
         }
     }
 }
