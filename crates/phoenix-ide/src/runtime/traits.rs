@@ -206,32 +206,11 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
-    async fn update_state_and_accept_sub_agent(
-        &self,
-        _conv_id: &str,
-        _state: &ConvState,
-        _state_updated_at: DateTime<Utc>,
-        child_conversation_id: &str,
-        accepted_at: DateTime<Utc>,
-    ) -> Result<(), String> {
-        self.accept_sub_agent_terminal(child_conversation_id, accepted_at)
-            .await
-    }
-
     async fn sub_agent_terminal_is_accepted(
         &self,
         _child_conversation_id: &str,
     ) -> Result<bool, String> {
         Ok(false)
-    }
-
-    /// Mark a terminal outcome accepted only after it was admitted to the parent.
-    async fn accept_sub_agent_terminal(
-        &self,
-        _child_conversation_id: &str,
-        _accepted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        Ok(())
     }
 
     /// Get all messages for a conversation
@@ -452,6 +431,17 @@ pub trait StateStore: Send + Sync {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        _child_conversation_id: &str,
+        _accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await
+    }
 
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
@@ -1528,27 +1518,6 @@ impl MessageStore for DatabaseStorage {
             .map_err(|error| error.to_string())
     }
 
-    async fn update_state_and_accept_sub_agent(
-        &self,
-        conv_id: &str,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-        child_conversation_id: &str,
-        accepted_at: DateTime<Utc>,
-    ) -> Result<(), String> {
-        self.db
-            .update_parent_state_and_accept_sub_agent(
-                conv_id,
-                state,
-                state_updated_at,
-                child_conversation_id,
-                accepted_at,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
     async fn sub_agent_terminal_is_accepted(
         &self,
         child_conversation_id: &str,
@@ -1556,18 +1525,6 @@ impl MessageStore for DatabaseStorage {
         self.db
             .sub_agent_terminal_is_accepted(child_conversation_id)
             .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn accept_sub_agent_terminal(
-        &self,
-        child_conversation_id: &str,
-        accepted_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.db
-            .accept_sub_agent_terminal(child_conversation_id, accepted_at)
-            .await
-            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
@@ -2105,6 +2062,27 @@ impl StateStore for DatabaseStorage {
             .update_conversation_state_at(conv_id, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .update_parent_state_and_accept_sub_agent(
+                conv_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
