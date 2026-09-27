@@ -3904,6 +3904,21 @@ impl RuntimeManager {
         }
     }
 
+    fn sub_agent_child_mode(spec: &SubAgentSpec) -> Result<ConvMode, String> {
+        match spec.mode {
+            SubAgentMode::Explore => Ok(ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            }),
+            SubAgentMode::Work => Ok(ConvMode::AttachedWorkChild {
+                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
+                    spec.cwd.clone(),
+                )
+                .map_err(|error| format!("Invalid attached Work-child worktree path: {error}"))?,
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn admit_sub_agent_batch(
         self: &Arc<Self>,
@@ -3924,13 +3939,7 @@ impl RuntimeManager {
         let children = specs
             .iter()
             .map(|spec| {
-                let conv_mode = match spec.mode {
-                    SubAgentMode::Explore => ConvMode::Explore {
-                        worktree_path: None,
-                        next_taskmd_id_hint: None,
-                    },
-                    SubAgentMode::Work => parent.conv_mode.clone(),
-                };
+                let conv_mode = Self::sub_agent_child_mode(spec)?;
                 Ok(phoenix_db::SubAgentChildAdmission {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
@@ -8897,6 +8906,33 @@ mod scope_liveness_tests {
         assert!(!drain.is_finished());
         tokio::time::advance(crate::tls::SHUTDOWN_GRACE).await;
         assert!(drain.await.expect("bounded drain task joins").is_none());
+    }
+
+    #[test]
+    fn work_subagent_persists_attached_work_child_mode() {
+        let spec = SubAgentSpec {
+            agent_id: "attached-work-child".to_string(),
+            task: "inherit the parent scope".to_string(),
+            cwd: "/tmp/owned-worktree".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Work,
+            model_id: "gpt-5.6-sol".to_string(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+
+        assert_eq!(
+            RuntimeManager::sub_agent_child_mode(&spec).unwrap(),
+            ConvMode::AttachedWorkChild {
+                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
+                    "/tmp/owned-worktree",
+                )
+                .unwrap(),
+            }
+        );
     }
 
     #[tokio::test]

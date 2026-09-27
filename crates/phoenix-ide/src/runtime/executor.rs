@@ -9262,12 +9262,25 @@ where
                 }
                 self.install_live_state(approved_state, state_updated_at, true)?;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-                self.browser_sessions
+                let browser_promoted = self
+                    .browser_sessions
                     .promote_actor_to_work_scope(
                         &self.context.resource_scope,
                         &self.context.conversation_id,
                     )
                     .await;
+                if !browser_promoted {
+                    let restricted_actor = phoenix_core::work_scope::EffectiveResourceAccess::new(
+                        &self.context.conversation_id,
+                        crate::work_scope::ResourceAuthority::Restricted,
+                    );
+                    self.browser_sessions
+                        .request_kill_session_for_actor(
+                            &self.context.resource_scope,
+                            &restricted_actor,
+                        )
+                        .await;
+                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
