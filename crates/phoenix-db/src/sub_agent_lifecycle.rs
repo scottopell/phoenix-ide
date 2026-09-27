@@ -641,9 +641,11 @@ impl Database {
         &self,
         abandoned_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let batch_ids = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT r.batch_id
+        let candidates = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT DISTINCT r.batch_id, r.child_conversation_id, parent.state
              FROM sub_agent_runs r
+             JOIN sub_agent_batches batch ON batch.batch_id = r.batch_id
+             JOIN conversations parent ON parent.id = batch.parent_conversation_id
              WHERE r.initial_dispatch_claimed_at_unix_micros IS NULL
                AND r.terminal_at_unix_micros IS NULL
                AND NOT EXISTS (
@@ -654,6 +656,41 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
+        let mut batch_ids = std::collections::BTreeSet::new();
+        for (batch_id, child_id, parent_state) in candidates {
+            let state: ConvState = serde_json::from_str(&parent_state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let adopted = match state {
+                ConvState::ToolExecuting {
+                    pending_sub_agents, ..
+                } => pending_sub_agents,
+                ConvState::AwaitingSubAgents { pending, .. }
+                | ConvState::CancellingSubAgents { pending, .. } => pending,
+                ConvState::Idle
+                | ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::Provisioning { .. }
+                | ConvState::CreationCancelled { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+                | ConvState::CreationFailed { .. }
+                | ConvState::Error { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+                | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingUserResponse { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::HandedOff { .. }
+                | ConvState::Terminal => Vec::new(),
+            }
+            .iter()
+            .any(|pending| pending.agent_id == child_id);
+            if !adopted {
+                batch_ids.insert(batch_id);
+            }
+        }
         for batch_id in batch_ids {
             self.abandon_unactivated_sub_agent_batch(&batch_id, abandoned_at)
                 .await?;

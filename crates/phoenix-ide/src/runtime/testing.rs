@@ -562,6 +562,16 @@ pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    sub_agent_terminals: Mutex<
+        HashMap<
+            String,
+            (
+                phoenix_db::SubAgentTerminalCause,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >,
+    >,
+    sub_agent_acceptances: Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
@@ -633,6 +643,8 @@ impl InMemoryStorage {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
+            sub_agent_terminals: Mutex::new(HashMap::new()),
+            sub_agent_acceptances: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
@@ -1898,6 +1910,38 @@ impl StateStore for InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), state.clone());
+        Ok(())
+    }
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_terminals
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), (cause, terminal_at));
+        Ok(())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_conversation_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_acceptances.lock().unwrap().insert(
+            child_conversation_id.to_string(),
+            (conv_id.to_string(), accepted_at),
+        );
         Ok(())
     }
 

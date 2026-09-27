@@ -2013,6 +2013,7 @@ where
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     agent_config: phoenix_agents::AgentConfig,
     spawn_catalog: Option<super::agent_execution::SpawnCatalog>,
+    spawn_parent_parallel_work_qualified: Option<bool>,
     /// Sender to the single serialized fork-resolution consumer, used solely to
     /// retire this conversation's still-pending fork proposals when it reaches a
     /// terminal state (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set
@@ -2169,6 +2170,7 @@ where
             credential_helper: None,
             agent_config: phoenix_agents::AgentConfig::default(),
             spawn_catalog: None,
+            spawn_parent_parallel_work_qualified: None,
             fork_cmd_tx: None,
             state_watcher: None,
         }
@@ -2337,6 +2339,7 @@ where
     pub fn with_agent_config(mut self, config: phoenix_agents::AgentConfig) -> Self {
         self.agent_config = config;
         self.spawn_catalog = None;
+        self.spawn_parent_parallel_work_qualified = None;
         self
     }
 
@@ -5168,10 +5171,14 @@ where
             }
         }
 
-        let parallel_work_qualified = self.llm_registry.is_builtin_model(&self.context.model_id)
-            && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
-                &self.context.model_id,
-            );
+        let parallel_work_qualified =
+            self.spawn_parent_parallel_work_qualified
+                .unwrap_or_else(|| {
+                    self.llm_registry.is_builtin_model(&self.context.model_id)
+                        && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                            &self.context.model_id,
+                        )
+                });
 
         if !parallel_work_qualified && work_count_in_batch > 1 {
             let result = ToolResult::error(
@@ -7296,6 +7303,12 @@ where
                 self.llm_registry.is_builtin_model(&self.context.model_id),
             );
             self.spawn_catalog = Some(catalog);
+            self.spawn_parent_parallel_work_qualified = Some(
+                self.llm_registry.is_builtin_model(&self.context.model_id)
+                    && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                        &self.context.model_id,
+                    ),
+            );
         }
         let explore_bash_capability =
             if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {

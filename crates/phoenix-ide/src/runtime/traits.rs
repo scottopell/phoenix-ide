@@ -450,21 +450,16 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
         cause: SubAgentTerminalCause,
         terminal_at: DateTime<Utc>,
-    ) -> Result<(), String> {
-        let _ = (cause, terminal_at);
-        self.update_state(conv_id, state, state_updated_at).await
-    }
+    ) -> Result<(), String>;
 
     async fn update_state_and_accept_sub_agent(
         &self,
         conv_id: &str,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-        _child_conversation_id: &str,
-        _accepted_at: DateTime<Utc>,
-    ) -> Result<(), String> {
-        self.update_state(conv_id, state, state_updated_at).await
-    }
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String>;
 
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
@@ -1043,6 +1038,44 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .update_state(conv_id, state, state_updated_at)
+            .await
+    }
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_record_sub_agent_terminal(
+                conv_id,
+                state,
+                state_updated_at,
+                cause,
+                terminal_at,
+            )
+            .await
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_accept_sub_agent(
+                conv_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
             .await
     }
 
