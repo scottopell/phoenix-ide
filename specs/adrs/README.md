@@ -71,6 +71,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
+| [060](060_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 
 ## For agents: which decisions bind your task
 
