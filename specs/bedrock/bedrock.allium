@@ -137,7 +137,7 @@ enum ConversationErrorKind {
     | content_filter
 }
 enum ToolOutcome { success | error | cancelled }
-enum SubAgentOutcome { success | failure | timed_out }
+enum SubAgentOutcome { success | implicit_completion | failure | timed_out }
 enum RecoveryKind { credential }
 enum RecoveryResumeTarget { conversation_turn | continuation_summary }
 enum TaskApprovalDecision {

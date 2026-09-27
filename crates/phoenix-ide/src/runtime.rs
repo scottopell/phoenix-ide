@@ -4153,10 +4153,17 @@ impl RuntimeManager {
                             &req.parent_conversation_id,
                             Event::SubAgentResult {
                                 agent_id,
-                                outcome: SubAgentOutcome::Failure {
-                                    error: "Sub-agent cancelled before initial dispatch"
-                                        .to_string(),
-                                    error_kind: crate::db::ErrorKind::Cancelled,
+                                outcome: match req.cause {
+                                    crate::state_machine::event::CancelCause::Timeout => {
+                                        SubAgentOutcome::TimedOut
+                                    }
+                                    crate::state_machine::event::CancelCause::UserRequested => {
+                                        SubAgentOutcome::Failure {
+                                            error: "Sub-agent cancelled before initial dispatch"
+                                                .to_string(),
+                                            error_kind: crate::db::ErrorKind::Cancelled,
+                                        }
+                                    }
                                 },
                             },
                         )

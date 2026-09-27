@@ -2986,6 +2986,7 @@ pub fn transition_sub_agent(
                     error: "Sub-agent timed out".to_string(),
                     error_kind: ErrorKind::TimedOut,
                 })
+                .with_effect(Effect::AbortLlm)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::NotifyParent {
                     outcome: SubAgentOutcome::TimedOut,
@@ -2998,6 +2999,7 @@ pub fn transition_sub_agent(
                 error: error.clone(),
                 error_kind: ErrorKind::Cancelled,
             })
+            .with_effect(Effect::AbortLlm)
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
                 outcome: SubAgentOutcome::Failure {
