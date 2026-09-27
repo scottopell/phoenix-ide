@@ -184,6 +184,13 @@ impl ConversationEventDispatcher for TestConversationEventDispatcher {
 
 /// One atomic request to admit and start a complete sub-agent batch.
 #[derive(Debug)]
+pub enum SubAgentAdmissionResponse {
+    Admitted,
+    Rejected(String),
+    Unclassified,
+}
+
+#[derive(Debug)]
 pub struct SubAgentSpawnRequest {
     pub batch_id: String,
     pub specs: Vec<SubAgentSpec>,
@@ -191,7 +198,7 @@ pub struct SubAgentSpawnRequest {
     pub parent_scope: Option<WorkScopeId>,
     pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
-    pub response_tx: oneshot::Sender<Result<(), String>>,
+    pub response_tx: oneshot::Sender<SubAgentAdmissionResponse>,
     pub activation_rx: oneshot::Receiver<()>,
 }
 
@@ -3840,7 +3847,10 @@ impl RuntimeManager {
             .await
         {
             Ok(()) => {
-                if response_tx.send(Ok(())).is_err() {
+                if response_tx
+                    .send(SubAgentAdmissionResponse::Admitted)
+                    .is_err()
+                {
                     self.abandon_unactivated_sub_agent_batch(&batch_id).await;
                     return;
                 }
@@ -3850,8 +3860,12 @@ impl RuntimeManager {
                 }
                 self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
             }
+            Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
+                self.signal_fatal_local_authority("sub_agent_batch_admission");
+                let _ = response_tx.send(SubAgentAdmissionResponse::Unclassified);
+            }
             Err(error) => {
-                let _ = response_tx.send(Err(error));
+                let _ = response_tx.send(SubAgentAdmissionResponse::Rejected(error));
             }
         }
     }
@@ -8537,7 +8551,10 @@ mod scope_liveness_tests {
                     .await;
             }
         });
-        assert_eq!(response_rx.await.expect("admission response"), Ok(()));
+        assert!(matches!(
+            response_rx.await.expect("admission response"),
+            SubAgentAdmissionResponse::Admitted
+        ));
         assert!(
             !spawn.is_finished(),
             "launch waits for committed parent membership"
@@ -8575,6 +8592,7 @@ mod scope_liveness_tests {
             .expect("lifecycle lookup"));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn cancellation_during_materialization_prevents_subagent_bootstrap() {
         let mut manager = test_manager().await;
@@ -8619,7 +8637,10 @@ mod scope_liveness_tests {
                 },
             })
             .await;
-        assert_eq!(response_rx.await.expect("admission response"), Ok(()));
+        assert!(matches!(
+            response_rx.await.expect("admission response"),
+            SubAgentAdmissionResponse::Admitted
+        ));
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         manager

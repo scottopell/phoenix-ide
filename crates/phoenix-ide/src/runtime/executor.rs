@@ -1788,6 +1788,7 @@ where
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::AnthropicReplayUpdate>,
     pending_sub_agent_acceptance: Option<String>,
+    pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     pending_sub_agent_activation: Option<PendingSubAgentActivation>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
@@ -1960,7 +1961,6 @@ where
     #[cfg(test)]
     terminal_effect_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
-    active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
     /// Whether this sub-agent has been given its grace turn (one extra LLM turn to produce a terminal outcome)
@@ -2086,6 +2086,7 @@ where
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
             pending_sub_agent_acceptance: None,
+            pending_sub_agent_terminal: None,
             pending_sub_agent_activation: None,
             browser_sessions,
             bash_handles,
@@ -2134,7 +2135,6 @@ where
             semantic_publication_barrier: None,
             #[cfg(test)]
             terminal_effect_admission_barrier: None,
-            active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
             grace_turn_started_at: None,
@@ -3282,20 +3282,6 @@ where
                     continue;
                 }
             }
-            // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
-            if let Event::SubAgentResult { ref agent_id, .. } = current_event {
-                if let ConvState::AwaitingSubAgents { ref pending, .. }
-                | ConvState::CancellingSubAgents { ref pending, .. } = self.state
-                {
-                    if let Some(agent) = pending.iter().find(|p| p.agent_id == *agent_id) {
-                        if agent.mode == SubAgentMode::Work {
-                            self.active_work_subagents =
-                                self.active_work_subagents.saturating_sub(1);
-                        }
-                    }
-                }
-            }
-
             // Pure state transition
             let terminal_event = current_event.clone();
             let authoritative_event =
@@ -3423,6 +3409,14 @@ where
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
         let terminal_subagent_transition = self.context.is_sub_agent
             && matches!(result.new_state.step_result(), StepResult::Terminal(_));
+        if terminal_subagent_transition {
+            if let Some(outcome) = result.effects.iter().find_map(|effect| match effect {
+                Effect::NotifyParent { outcome } => Some(outcome),
+                _ => None,
+            }) {
+                self.pending_sub_agent_terminal = Some(sub_agent_terminal_cause(outcome));
+            }
+        }
         let terminal_direct_turn_transition = !self.context.is_sub_agent
             && self.active_direct_turn.is_some()
             && self.pending_direct_turn_terminal.is_some();
@@ -4171,7 +4165,17 @@ where
                 );
             }
         }
-        if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
+        if let Some(cause) = self.pending_sub_agent_terminal.take() {
+            self.storage
+                .update_state_and_record_sub_agent_terminal(
+                    &self.context.conversation_id,
+                    &self.state,
+                    self.state_updated_at,
+                    cause,
+                    Utc::now(),
+                )
+                .await?;
+        } else if let Some(child_id) = self.pending_sub_agent_acceptance.take() {
             self.storage
                 .update_state_and_accept_sub_agent(
                     &self.context.conversation_id,
@@ -5168,20 +5172,6 @@ where
             }));
         }
 
-        if !parallel_work_qualified && work_count_in_batch > 0 && self.active_work_subagents > 0 {
-            let result = ToolResult::error(
-                tool_use_id.clone(),
-                "A Work sub-agent is already active. Only one Work sub-agent \
-                 can run at a time per parent conversation. Wait for it to complete \
-                 before spawning another."
-                    .to_string(),
-            );
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id,
-                result,
-            }));
-        }
-
         // cwd-scoping guard (REQ-PROJ-008): a Work sub-agent's overridden
         // `cwd` must stay inside the parent's worktree. Without this guard
         // a Work sub-agent could write outside the worktree because its
@@ -5382,12 +5372,15 @@ where
             }));
         }
         match response_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+            Ok(crate::runtime::SubAgentAdmissionResponse::Admitted) => {}
+            Ok(crate::runtime::SubAgentAdmissionResponse::Rejected(error)) => {
                 return Ok(Some(Event::ToolComplete {
                     tool_use_id: tool_use_id.clone(),
                     result: ToolResult::error(tool_use_id, error),
                 }));
+            }
+            Ok(crate::runtime::SubAgentAdmissionResponse::Unclassified) => {
+                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
             }
             Err(error) => {
                 return Ok(Some(Event::ToolComplete {
@@ -5404,8 +5397,6 @@ where
             child_ids: spawned.iter().map(|child| child.agent_id.clone()).collect(),
             sender: activation_tx,
         });
-
-        self.active_work_subagents += work_count_in_batch;
 
         // Build success result
         let agent_ids: Vec<&str> = spawned.iter().map(|p| p.agent_id.as_str()).collect();
@@ -6716,10 +6707,6 @@ where
             ControlEffect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
                 let child_conversation_id = self.context.conversation_id.clone();
-                let cause = sub_agent_terminal_cause(&outcome);
-                self.storage
-                    .record_sub_agent_terminal(&child_conversation_id, cause, Utc::now())
-                    .await?;
                 if let Some((parent_conversation_id, dispatcher)) = &self.parent_dispatch {
                     let event = Event::SubAgentResult {
                         agent_id: child_conversation_id.clone(),
@@ -18871,9 +18858,7 @@ mod steer_drain_detector_tests {
         );
     }
 
-    /// Build a `CancellingSubAgents` state pending on the given agent ids (all
-    /// Work mode) with the given cause.
-    fn mk_cancelling_sub_agents(
+    fn cancelling_state(
         agent_ids: &[&str],
         cause: crate::state_machine::event::CancelCause,
     ) -> ConvState {
@@ -18888,14 +18873,12 @@ mod steer_drain_detector_tests {
                 .collect(),
             completed_results: vec![],
             cause,
-            // Default to a real spawn id so the last-one drain still persists
-            // results (exercising the common AwaitingSubAgents-origin path).
             spawn_tool_id: Some("spawn-1".to_string()),
         }
     }
 
     #[allow(clippy::type_complexity)]
-    async fn build_cancelling_runtime(
+    async fn cancelling_runtime(
         conv_id: &str,
         agent_ids: &[&str],
         cause: crate::state_machine::event::CancelCause,
@@ -18903,23 +18886,19 @@ mod steer_drain_detector_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         Arc<InMemoryStorage>,
     ) {
-        let (mut runtime, storage) = build_runtime_with_state_and_queue(
-            conv_id,
-            mk_cancelling_sub_agents(agent_ids, cause),
-            vec![],
-        );
-        let assistant = AssistantMessage::new(
-            format!("{conv_id}-spawn-assistant"),
-            vec![ContentBlock::tool_use(
-                "spawn-1",
-                "spawn_agents",
-                serde_json::json!({"tasks": agent_ids.iter().map(|id| serde_json::json!({"task": format!("task {id}"), "mode": "work"})).collect::<Vec<_>>()}),
-            )],
-            None,
-            None,
-        );
+        let (mut runtime, storage) =
+            build_runtime_with_state_and_queue(conv_id, cancelling_state(agent_ids, cause), vec![]);
         let checkpoint = CheckpointData::tool_round(
-            assistant,
+            AssistantMessage::new(
+                format!("{conv_id}-spawn-assistant"),
+                vec![ContentBlock::tool_use(
+                    "spawn-1",
+                    "spawn_agents",
+                    serde_json::json!({"tasks": []}),
+                )],
+                None,
+                None,
+            ),
             vec![ToolResult::success(
                 "spawn-1".into(),
                 "Spawning sub-agents".into(),
@@ -18933,15 +18912,12 @@ mod steer_drain_detector_tests {
         (runtime, storage)
     }
 
-    fn assert_cancellation_fan_in_persisted(storage: &InMemoryStorage, conv_id: &str) {
-        let messages = storage.get_all_messages(conv_id);
-        let message = messages
-            .iter()
-            .find(|message| {
-                matches!(&message.content,
-            MessageContent::Tool(content) if content.tool_use_id == "spawn-1")
-            })
-            .expect("spawn checkpoint must retain its tool result");
+    fn assert_cancellation_fan_in(storage: &InMemoryStorage, conv_id: &str) {
+        let message = storage
+            .get_all_messages(conv_id)
+            .into_iter()
+            .find(|message| matches!(&message.content, MessageContent::Tool(content) if content.tool_use_id == "spawn-1"))
+            .expect("spawn result persists");
         assert!(matches!(&message.content, MessageContent::Tool(content)
             if content.content.starts_with("Sub-agent results")));
         assert_eq!(
@@ -18954,27 +18930,14 @@ mod steer_drain_detector_tests {
         );
     }
 
-    /// Test 4 (part A): the one-writer reservation is released ONLY when a
-    /// `SubAgentResult` for the in-flight Work agent is actually processed — not
-    /// merely because the parent is in `CancellingSubAgents`. Seed the counter at
-    /// 1 (a Work agent is in flight), process its result, confirm the counter
-    /// drops to 0.
     #[tokio::test]
-    async fn one_writer_released_on_confirmed_stop() {
-        let (mut rt, storage) = build_cancelling_runtime(
-            "conv-onewriter-release",
+    async fn cancellation_result_persists_fan_in_and_late_duplicate_is_buffered() {
+        let (mut rt, storage) = cancelling_runtime(
+            "conv-cancel-result",
             &["w1"],
             crate::state_machine::event::CancelCause::UserRequested,
         )
         .await;
-        rt.active_work_subagents = 1;
-
-        // Before the result drains, the reservation is still held.
-        assert_eq!(
-            rt.active_work_subagents, 1,
-            "reservation held until the Work agent's result is processed"
-        );
-
         rt.process_event(Event::SubAgentResult {
             agent_id: "w1".to_string(),
             outcome: SubAgentOutcome::Failure {
@@ -18983,140 +18946,34 @@ mod steer_drain_detector_tests {
             },
         })
         .await
-        .expect("processing the Work agent's result must succeed");
-
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "reservation released exactly once when the Work result drained"
-        );
-        assert!(
-            matches!(rt.state, ConvState::Idle),
-            "the last drained result resolves CancellingSubAgents -> Idle, got {}",
-            rt.state.variant_name()
-        );
-        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-release");
-    }
-
-    /// Test 4 (part B): after the 6s last-resort presumes a silent Work agent
-    /// dead and injects a synthetic result, the one-writer counter returns to 0
-    /// — no leak. Drives the backstop directly (no real 6s wait).
-    #[tokio::test]
-    async fn one_writer_released_by_last_resort_backstop() {
-        let (mut rt, storage) = build_cancelling_runtime(
-            "conv-onewriter-backstop",
-            &["w1"],
-            crate::state_machine::event::CancelCause::Timeout,
-        )
-        .await;
-        rt.active_work_subagents = 1;
-
-        // Fire the last-resort backstop directly (the deadline arm would call
-        // this after 6s).
-        rt.handle_cancelling_sub_agents_timeout().await;
-
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "presumed-dead teardown must release the one-writer reservation — no leak"
-        );
-        assert!(
-            matches!(rt.state, ConvState::LlmRequesting { .. }),
-            "a Timeout teardown resumes the parent (LlmRequesting), got {}",
-            rt.state.variant_name()
-        );
-        assert_cancellation_fan_in_persisted(&storage, "conv-onewriter-backstop");
-    }
-
-    /// Test 5 (mixed drain): two pending Work agents — one reports a real result,
-    /// the other is presumed dead by the last-resort backstop. Exactly one
-    /// decrement each (no double-release, no leak); the parent reaches Idle.
-    #[tokio::test]
-    async fn mixed_drain_real_result_then_backstop_no_double_release() {
-        let (mut rt, storage) = build_cancelling_runtime(
-            "conv-mixed-drain",
-            &["real", "silent"],
-            crate::state_machine::event::CancelCause::Timeout,
-        )
-        .await;
-        rt.active_work_subagents = 2;
-
-        // "real" reports a genuine Success — fidelity preserved, counter -> 1.
-        rt.process_event(Event::SubAgentResult {
-            agent_id: "real".to_string(),
-            outcome: SubAgentOutcome::Success {
-                result: "did real work".to_string(),
-            },
-        })
-        .await
-        .expect("processing the real result must succeed");
-
-        assert_eq!(
-            rt.active_work_subagents, 1,
-            "exactly one decrement for the real result"
-        );
-        assert!(
-            matches!(rt.state, ConvState::CancellingSubAgents { .. }),
-            "still draining the silent agent, got {}",
-            rt.state.variant_name()
-        );
-        // "silent" never reports; the backstop presumes it dead and drains it.
-        rt.handle_cancelling_sub_agents_timeout().await;
-
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "exactly one decrement for the presumed-dead agent — no double-release, no leak"
-        );
-        assert!(
-            matches!(rt.state, ConvState::LlmRequesting { .. }),
-            "Timeout teardown resumes the parent after both agents drain, got {}",
-            rt.state.variant_name()
-        );
-        assert_cancellation_fan_in_persisted(&storage, "conv-mixed-drain");
-    }
-
-    /// Double-release / underflow probe: a real result drains a Work agent
-    /// (counter -> 0, agent removed from pending), then a LATE synthetic result
-    /// for the SAME agent arrives. The pending-membership guard means the second
-    /// is a harmless rejected transition that does NOT decrement again — the
-    /// `saturating_sub` floor is never even reached because the guard fires first.
-    #[tokio::test]
-    async fn late_duplicate_result_for_same_agent_does_not_double_release() {
-        let (mut rt, storage) = build_cancelling_runtime(
-            "conv-dup-nounder",
-            &["w1"],
-            crate::state_machine::event::CancelCause::UserRequested,
-        )
-        .await;
-        rt.active_work_subagents = 1;
-
-        rt.process_event(Event::SubAgentResult {
-            agent_id: "w1".to_string(),
-            outcome: SubAgentOutcome::Failure {
-                error: "cancelled".to_string(),
-                error_kind: crate::db::ErrorKind::Cancelled,
-            },
-        })
-        .await
-        .expect("first result must succeed");
-        assert_eq!(rt.active_work_subagents, 0);
+        .unwrap();
         assert!(matches!(rt.state, ConvState::Idle));
+        assert_cancellation_fan_in(&storage, "conv-cancel-result");
 
-        // A late duplicate for the same agent. The parent is now Idle, so this is
-        // buffered (Idle can't handle SubAgentResult) rather than re-decrementing.
         rt.process_event(Event::SubAgentResult {
             agent_id: "w1".to_string(),
             outcome: SubAgentOutcome::Failure {
-                error: "late dup".to_string(),
+                error: "late duplicate".to_string(),
                 error_kind: crate::db::ErrorKind::Cancelled,
             },
         })
         .await
-        .expect("a late duplicate must not error");
+        .unwrap();
+        assert_eq!(rt.sub_agent_result_buffer.len(), 1);
+        assert_cancellation_fan_in(&storage, "conv-cancel-result");
+    }
 
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "a late duplicate for an already-drained agent must not decrement again"
-        );
-        assert_cancellation_fan_in_persisted(&storage, "conv-dup-nounder");
+    #[tokio::test]
+    async fn cancellation_timeout_backstop_persists_fan_in() {
+        let (mut rt, storage) = cancelling_runtime(
+            "conv-cancel-backstop",
+            &["silent"],
+            crate::state_machine::event::CancelCause::Timeout,
+        )
+        .await;
+        rt.handle_cancelling_sub_agents_timeout().await;
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert_cancellation_fan_in(&storage, "conv-cancel-backstop");
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.
@@ -20362,7 +20219,7 @@ mod work_subagent_cwd_guard_tests {
         let specs = request.specs;
         request
             .response_tx
-            .send(Ok(()))
+            .send(crate::runtime::SubAgentAdmissionResponse::Admitted)
             .expect("spawn requester receives admission result");
         specs
     }
@@ -20406,7 +20263,6 @@ mod work_subagent_cwd_guard_tests {
             }
             other => panic!("expected ToolComplete with cwd error, got {other:?}"),
         }
-        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]
@@ -20435,7 +20291,6 @@ mod work_subagent_cwd_guard_tests {
             }
             other => panic!("expected ToolComplete with cwd error, got {other:?}"),
         }
-        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]
@@ -20507,10 +20362,6 @@ mod work_subagent_cwd_guard_tests {
             }
             other => panic!("expected ToolComplete with error, got {other:?}"),
         }
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "rejected spawn must not increment active_work_subagents"
-        );
     }
 
     fn luna_work_task(task: &str) -> SubAgentTask {
@@ -20562,7 +20413,6 @@ mod work_subagent_cwd_guard_tests {
                 assert_eq!(spec.model_id, "gpt-5.6-luna");
                 assert_eq!(spec.mode, SubAgentMode::Work);
             }
-            assert_eq!(rt.active_work_subagents, 2);
         }
     }
 
@@ -20582,7 +20432,6 @@ mod work_subagent_cwd_guard_tests {
         assert!(
             matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
         );
-        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]
@@ -20632,7 +20481,6 @@ mod work_subagent_cwd_guard_tests {
         assert!(
             matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
         );
-        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]
@@ -20675,7 +20523,6 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(specs[0].model_id, "gpt-5.6-sol");
         assert_eq!(specs[0].connection, "openai_responses");
         assert_eq!(specs[0].effort, None);
-        assert_eq!(rt.active_work_subagents, 1);
     }
 
     #[tokio::test]
@@ -20711,10 +20558,6 @@ mod work_subagent_cwd_guard_tests {
             }
             other => panic!("expected ToolComplete with error, got {other:?}"),
         }
-        assert_eq!(
-            rt.active_work_subagents, 0,
-            "rejected spawn must not increment active_work_subagents"
-        );
     }
 
     /// A later task with an unknown explicit model is rejected during the
@@ -20768,7 +20611,6 @@ mod work_subagent_cwd_guard_tests {
             }
             other => panic!("expected ToolComplete with model error, got {other:?}"),
         }
-        assert_eq!(rt.active_work_subagents, 0);
     }
 
     #[tokio::test]

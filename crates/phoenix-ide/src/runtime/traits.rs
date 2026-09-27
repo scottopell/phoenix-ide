@@ -7,6 +7,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use phoenix_db::SubAgentTerminalCause;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
@@ -431,6 +432,18 @@ pub trait StateStore: Send + Sync {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let _ = (cause, terminal_at);
+        self.update_state(conv_id, state, state_updated_at).await
+    }
 
     async fn update_state_and_accept_sub_agent(
         &self,
@@ -2062,6 +2075,34 @@ impl StateStore for DatabaseStorage {
             .update_conversation_state_at(conv_id, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        match self
+            .db
+            .update_child_state_and_record_sub_agent_terminal(
+                conv_id,
+                state,
+                state_updated_at,
+                cause,
+                terminal_at,
+            )
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: child terminal state and lifecycle fact commit could not be classified".to_string(),
+            ),
+        }
     }
 
     async fn update_state_and_accept_sub_agent(

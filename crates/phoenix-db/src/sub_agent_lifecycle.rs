@@ -902,6 +902,86 @@ impl Database {
         Ok(outcome)
     }
 
+    pub async fn update_child_state_and_record_sub_agent_terminal(
+        &self,
+        child_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        use crate::workflow::LocalAuthorityResult;
+        let state_json = match serde_json::to_string(state) {
+            Ok(state) => state,
+            Err(error) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(DbError::Serialization(
+                    error.to_string(),
+                )))
+            }
+        };
+        let state_kind = state.variant_name();
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let changed = sqlx::query(
+            "UPDATE sub_agent_runs
+             SET terminal_cause = COALESCE(terminal_cause, ?2),
+                 terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3)
+             WHERE child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .bind(cause.as_db_str())
+        .bind(terminal_at.timestamp_micros())
+        .execute(&mut *tx)
+        .await;
+        let changed = match changed {
+            Ok(result) => result.rows_affected(),
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        if changed != 1 {
+            return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(format!(
+                "child {child_conversation_id} has no lifecycle row"
+            ))));
+        }
+        if let Err(error) = sqlx::query(
+            "UPDATE conversations
+             SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+        )
+        .bind(child_conversation_id)
+        .bind(&state_json)
+        .bind(state_kind)
+        .bind(state_updated_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        {
+            return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
+        }
+        if let Err(error) = tx.commit().await {
+            let classified = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sub_agent_runs r
+                 JOIN conversations c ON c.id = r.child_conversation_id
+                 WHERE r.child_conversation_id = ?1
+                   AND r.terminal_cause = ?2
+                   AND r.terminal_at_unix_micros IS NOT NULL
+                   AND c.state = ?3 AND c.state_updated_at = ?4",
+            )
+            .bind(child_conversation_id)
+            .bind(cause.as_db_str())
+            .bind(&state_json)
+            .bind(state_updated_at.to_rfc3339())
+            .fetch_one(&self.pool)
+            .await;
+            return match classified {
+                Ok(1) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                Ok(_) => LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            };
+        }
+        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+    }
+
     pub async fn update_parent_state_and_accept_sub_agent(
         &self,
         parent_conversation_id: &str,
