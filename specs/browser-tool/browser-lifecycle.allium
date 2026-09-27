@@ -228,7 +228,9 @@ rule BrowserScopeRetirementBlocksAuthorityPromotion {
     @guidance
         -- Promotion and retirement admission share the manager-state write lock.
         -- A fenced scope or actor key rejects promotion before its session entry
-        -- can move to the shared WorkScope key.
+        -- can move to the shared WorkScope key. Reopening admission preserves the
+        -- destination retirement generation; a restricted session may promote only
+        -- when the destination generation still matches the one observed at creation.
 }
 
 rule CascadeTearsDownWhenNoInheritor {
