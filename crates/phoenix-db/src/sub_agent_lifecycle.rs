@@ -670,7 +670,9 @@ impl Database {
         let at = abandoned_at.timestamp_micros();
         let children = sqlx::query_scalar::<_, String>(
             "SELECT child_conversation_id FROM sub_agent_runs
-             WHERE batch_id = ?1 AND initial_dispatch_claimed_at_unix_micros IS NULL
+             WHERE batch_id = ?1
+               AND initial_dispatch_claimed_at_unix_micros IS NULL
+               AND terminal_at_unix_micros IS NULL
              ORDER BY ordinal",
         )
         .bind(batch_id)
@@ -1024,9 +1026,24 @@ impl Database {
         cause: SubAgentTerminalCause,
         terminal_at: DateTime<Utc>,
     ) -> DbResult<()> {
+        let error_kind = match cause {
+            SubAgentTerminalCause::TimedOut => ErrorKind::TimedOut,
+            SubAgentTerminalCause::Cancelled => ErrorKind::Cancelled,
+            SubAgentTerminalCause::SubmitResult
+            | SubAgentTerminalCause::ImplicitCompletion
+            | SubAgentTerminalCause::SubmitError
+            | SubAgentTerminalCause::TurnLimit
+            | SubAgentTerminalCause::ContextExhausted
+            | SubAgentTerminalCause::RuntimeFailure => {
+                return Err(lifecycle_conflict(format!(
+                    "cancellation backstop cannot establish terminal cause {}",
+                    cause.as_db_str()
+                )))
+            }
+        };
         let state = ConvState::Failed {
             error: "Sub-agent did not report within the cancellation deadline".to_string(),
-            error_kind: ErrorKind::Cancelled,
+            error_kind,
         };
         match self
             .update_child_state_and_record_sub_agent_terminal(
@@ -1526,6 +1543,56 @@ mod tests {
                 SubAgentAdmissionCommit::Normal => unreachable!(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn startup_abandonment_skips_terminal_sibling_and_is_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_scope = atomic_parent(&db).await;
+        let mut admission = atomic_batch("mixed-batch", parent_scope);
+        let mut second = admission.children[0].clone();
+        admission.children[0].run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
+        second.run.execution_authority = SubAgentExecutionAuthority::ReadOnly;
+        second.run.child_conversation_id = "child-live".to_string();
+        second.slug = "child-live".to_string();
+        second.initial_message_id = "initial-live".to_string();
+        admission.children.push(second);
+        db.admit_sub_agent_batch_atomically(&admission)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        db.record_sub_agent_terminal("child", SubAgentTerminalCause::SubmitResult, Utc::now())
+            .await
+            .unwrap();
+
+        db.abandon_all_unactivated_sub_agent_batches(Utc::now())
+            .await
+            .unwrap();
+        db.abandon_all_unactivated_sub_agent_batches(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.owed_sub_agent_terminals("parent")
+                .await
+                .unwrap()
+                .iter()
+                .map(|terminal| (&terminal.child_conversation_id, terminal.cause))
+                .collect::<Vec<_>>(),
+            vec![(&"child".to_string(), SubAgentTerminalCause::SubmitResult)]
+        );
+        assert!(db
+            .sub_agent_terminal_is_accepted("child-live")
+            .await
+            .unwrap());
+        let cause: String = sqlx::query_scalar(
+            "SELECT terminal_cause FROM sub_agent_runs WHERE child_conversation_id = 'child-live'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cause, "cancelled");
     }
 
     #[tokio::test]
