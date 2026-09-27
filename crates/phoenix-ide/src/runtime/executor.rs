@@ -1736,7 +1736,6 @@ fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTe
         SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
         SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
             crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,
-            crate::db::ErrorKind::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
             crate::db::ErrorKind::TurnLimitExhausted => {
                 phoenix_db::SubAgentTerminalCause::TurnLimit
             }
@@ -12145,6 +12144,13 @@ mod sub_agent_terminal_cause_tests {
             ),
             (
                 SubAgentOutcome::Failure {
+                    error: "provider attempt deadline elapsed".into(),
+                    error_kind: crate::db::ErrorKind::TimedOut,
+                },
+                phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+            ),
+            (
+                SubAgentOutcome::Failure {
                     error: "cancelled".into(),
                     error_kind: crate::db::ErrorKind::Cancelled,
                 },
@@ -18623,6 +18629,47 @@ mod steer_drain_detector_tests {
         assert!(result.is_err());
         assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
         assert!(storage.get_all_messages("conv-missing-fan-in").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_cancelling_state_persist_does_not_dispatch_child_cancel() {
+        let conversation_id = "conv-cancel-persist-first";
+        let awaiting = ConvState::AwaitingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "child".to_string(),
+                task: "work".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+            spawn_tool_id: Some("spawn".to_string()),
+        };
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, awaiting.clone(), vec![]);
+        let (spawn_tx, _spawn_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        rt = rt.with_spawn_channels(spawn_tx, cancel_tx);
+        storage.set_fail_state_update(true);
+
+        let result = rt
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "failed persistence must reject cancellation"
+        );
+        assert_eq!(
+            rt.state, awaiting,
+            "live state rolls back to durable authority"
+        );
+        assert!(matches!(
+            cancel_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(storage.get_current_state(conversation_id), None);
     }
 
     #[tokio::test]

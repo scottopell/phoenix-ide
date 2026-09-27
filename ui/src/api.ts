@@ -496,6 +496,7 @@ export interface PendingSubAgent {
 
 export type SubAgentOutcome =
   | { type: 'success'; result?: string }
+  | { type: 'implicit_completion'; result?: string }
   | { type: 'failure'; error?: string; error_kind?: string }
   | { type: 'timed_out' };
 

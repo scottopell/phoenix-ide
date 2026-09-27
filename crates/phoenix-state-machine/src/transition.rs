@@ -1134,8 +1134,8 @@ fn handle_core_cancellation(
                 cause,
                 spawn_tool_id: spawn_tool_id.clone(),
             })
-            .with_effect(Effect::CancelSubAgents { ids, cause })
-            .with_effect(Effect::PersistState))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::CancelSubAgents { ids, cause }))
         }
 
         // ToolExecuting + UserCancel -> CancellingTool
@@ -7603,17 +7603,13 @@ mod teardown_tests {
         );
         assert_eq!(pending.len(), 2, "all agents stay pending until they drain");
 
-        let cancel = result
-            .effects
-            .iter()
-            .find_map(|e| {
-                if let Effect::CancelSubAgents { ids, .. } = e {
-                    Some(ids.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("must emit Effect::CancelSubAgents");
+        assert!(matches!(
+            result.effects.as_slice(),
+            [Effect::PersistState, Effect::CancelSubAgents { .. }]
+        ));
+        let Effect::CancelSubAgents { ids: cancel, .. } = &result.effects[1] else {
+            unreachable!("effect order asserted above")
+        };
         assert_eq!(cancel.len(), 2, "cancel targets both pending agents");
 
         // The reroute must NOT directly fabricate per-agent results.

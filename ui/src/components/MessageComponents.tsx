@@ -3054,7 +3054,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
 
 // =====================================================================// Sub-Agent Summary (persistent view after completion)
 // =====================================================================
-type SubAgentStatusKind = 'running' | 'success' | 'failure' | 'timed_out';
+type SubAgentStatusKind = 'running' | 'success' | 'implicit_completion' | 'failure' | 'timed_out';
 
 function statusKindFromOutcome(outcome: SubAgentResult['outcome'] | null): SubAgentStatusKind {
   if (!outcome) return 'running';
@@ -3065,6 +3065,7 @@ function getStatusLabel(status: SubAgentStatusKind): string {
   switch (status) {
     case 'running': return 'running…';
     case 'success': return 'success';
+    case 'implicit_completion': return 'completed';
     case 'failure': return 'failed';
     case 'timed_out': return 'timed out';
     default: status satisfies never; return '';
@@ -3074,6 +3075,7 @@ function getStatusLabel(status: SubAgentStatusKind): string {
 function getOutcomeText(outcome: SubAgentResult['outcome']): string {
   switch (outcome.type) {
     case 'success': return outcome.result || 'Completed successfully';
+    case 'implicit_completion': return outcome.result || 'Completed';
     case 'failure': return outcome.error || 'Failed';
     case 'timed_out': return 'Timed out: sub-agent exceeded its time limit';
     default: outcome satisfies never; return '';
@@ -3105,7 +3107,7 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
   if (status === 'running') {
     return <span className="spinner"></span>;
   }
-  if (status === 'success') return <CheckIcon />;
+  if (status === 'success' || status === 'implicit_completion') return <CheckIcon />;
   return <XIcon />;
 }
 
@@ -3341,7 +3343,7 @@ function SubAgentSummaryRow({ result, revealRequest, activeHighlight }: { result
 
 /** Persistent summary of completed subagents (shown in spawn_agents tool result) */
 function SubAgentSummary({ results, revealRequest = null, activeHighlight = null }: { results: SubAgentResult[]; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
-  const successCount = results.filter(r => r.outcome.type === 'success').length;
+  const successCount = results.filter(r => r.outcome.type === 'success' || r.outcome.type === 'implicit_completion').length;
   const timeoutCount = results.filter(r => r.outcome.type === 'timed_out').length;
   const failCount = results.filter(r => r.outcome.type === 'failure').length;
 

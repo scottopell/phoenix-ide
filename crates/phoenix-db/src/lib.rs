@@ -22926,6 +22926,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_outcomes_preserve_wall_clock_and_provider_timeout_distinction() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "timeout-cause-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('timeout-cause-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut pending = Vec::new();
+        for (ordinal, (child_id, cause)) in [
+            ("wall-clock-timeout", "timed_out"),
+            ("provider-timeout", "runtime_failure"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            db.update_conversation_state(
+                child_id,
+                &ConvState::Failed {
+                    error: format!("{child_id} exact error"),
+                    error_kind: ErrorKind::TimedOut,
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                     timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'timeout-cause-batch', ?2, 'read_only', 10, 1000, ?3, 2)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .bind(cause)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            pending.push(PendingSubAgent {
+                agent_id: child_id.to_string(),
+                task: child_id.to_string(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+
+        let outcomes = db
+            .resolve_pending_sub_agent_outcomes(&pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes.get("wall-clock-timeout"),
+            Some(&SubAgentOutcome::TimedOut)
+        );
+        assert_eq!(
+            outcomes.get("provider-timeout"),
+            Some(&SubAgentOutcome::Failure {
+                error: "provider-timeout exact error".to_string(),
+                error_kind: ErrorKind::TimedOut,
+            })
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn startup_fan_in_preserves_terminal_child_and_interrupts_live_sibling() {
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
