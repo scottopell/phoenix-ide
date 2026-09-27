@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 export const PROJECTION_START = "<!-- phoenix-roadmap:projection:start -->";
 export const PROJECTION_END = "<!-- phoenix-roadmap:projection:end -->";
 export const RECORD_FENCE = "phoenix-roadmap";
+export const ACTIVATION_MARKER = "<!-- phoenix-roadmap:v2 -->";
 export const STAGES = ["implemented", "qualified", "merged", "released", "deployed", "accepted"];
 
 const VERSION = 2;
@@ -16,7 +17,7 @@ const MAX_LIVE_OUTCOMES = 40;
 const MAX_PULL_FETCHES = 60;
 const STALE_AFTER_HOURS = 72;
 const RECENTLY_RETIRED_DAYS = 14;
-const MAX_RENDERED_REJECTIONS = 20;
+const ACK_WINDOW_RECORDS = 50;
 const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const ROLES = new Set(["coordinator", "worker", "user"]);
 const CLEARERS = new Set(["user", "coordinator", "owner", "external"]);
@@ -97,6 +98,17 @@ function url(value, field, { httpsOnly }) {
   const allowed = httpsOnly ? ["https:"] : ["https:", "http:"];
   if (!allowed.includes(parsed.protocol)) reject(`${field} must use ${allowed.join(" or ")}`);
   return parsed.toString();
+}
+
+const RECEIPT_PATTERN = /^https:\/\/github\.com\/[^/]+\/[^/]+\/(?:(?:issues|pull)\/\d+#(?:issuecomment|pullrequestreview|discussion_r)-?\d+|actions\/runs\/\d+|releases\/tag\/[^/]+)$/;
+
+function githubUrl(value, field, { receipt = false } = {}) {
+  const text = url(value, field, { httpsOnly: true });
+  if (new URL(text).host !== "github.com") reject(`${field} must be a github.com URL`);
+  if (receipt && !RECEIPT_PATTERN.test(text)) {
+    reject(`${field} must link a GitHub receipt: an Issue/PR comment or review, an Actions run, or a release`);
+  }
+  return text;
 }
 
 function list(value, field, min, max, item) {
@@ -237,7 +249,7 @@ const VALIDATORS = {
     onlyKeys(value, ["kind", "version", "actor", "gate", "evidence", "note"], "gate-clear");
     return {
       gate: id(value.gate, "gate"),
-      evidence: url(value.evidence, "evidence", { httpsOnly: true }),
+      evidence: githubUrl(value.evidence, "evidence"),
       note: optionalLine(value.note, "note"),
     };
   },
@@ -268,7 +280,7 @@ const VALIDATORS = {
       stage: value.stage,
       result: value.result,
       subject,
-      url: url(value.url, "url", { httpsOnly: true }),
+      url: githubUrl(value.url, "url", { receipt: value.stage === "deployed" || value.stage === "accepted" }),
       note: optionalLine(value.note, "note"),
     };
   },
@@ -337,6 +349,7 @@ function newState() {
     mixedResults: new Set(),
     rejections: [],
     accepted: new Set(),
+    recordIds: [],
   };
 }
 
@@ -445,13 +458,16 @@ const APPLY = {
     for (const scopeId of record.scope) {
       if (!state.ids.has(scopeId)) reject(`scope ${scopeId} does not exist`);
     }
+    const scope = new Set(record.scope);
     const superseded = record.supersedes.map((decisionId) => {
       const decision = state.decisions.get(decisionId);
       if (!decision) reject(`supersedes ${decisionId} does not exist`);
+      if (!decision.scope.some((scopeId) => scope.has(scopeId))) reject(`decision ${decisionId} shares no scope with ${record.id}`);
       return decision;
     });
     const gates = record.clears.map((gateId) => {
       const gate = openGate(state, gateId);
+      if (!scope.has(gateId) && !scope.has(gate.blocks.id)) reject(`gate ${gateId} is outside the decision's scope`);
       if (gate.clearer === "user" && record.actor.role !== "user") reject(`gate ${gateId} is cleared only by a user decision`);
       return gate;
     });
@@ -504,6 +520,7 @@ export function reduceComments(comments, { coordinatorHarness } = {}) {
     const parsed = parseRecordComment(comment.body);
     if (!parsed) continue;
     const source = sourceOf(comment);
+    state.recordIds.push(comment.id);
     try {
       if (parsed.error) reject(parsed.error);
       if (comment.updated_at && comment.created_at && comment.updated_at !== comment.created_at) {
@@ -544,56 +561,81 @@ function latest(entries) {
   return entries.reduce((best, entry) => (best === undefined || entry.source.id > best.source.id ? entry : best), undefined);
 }
 
-export function surfaceDelivery(state, outcomeId, surface, pulls) {
-  const found = new Map();
+const WHOLE_SURFACE_STAGES = new Set(["released", "deployed", "accepted"]);
+
+function isComponentEvidence(entry) {
+  return entry.subject.pr !== undefined && !WHOLE_SURFACE_STAGES.has(entry.stage);
+}
+
+function componentDelivery(pr, entries, pull) {
+  const label = `#${pr}`;
+  if (pull?.state === "closed" && !pull.merged) return { live: false, note: `${label} closed without merge` };
+  if (pull?.merged) return { live: true, stageIndex: STAGES.indexOf("merged"), detail: `${label}→${short(pull.mergeCommit ?? pull.head)}`, notes: [] };
+  if (!pull) return { live: true, stageIndex: STAGES.indexOf("implemented"), detail: label, notes: [`${label} state unverified`] };
   const notes = [];
-  const prefix = `${outcomeId}|${surface}|`;
-  for (const [key, entries] of state.evidence) {
-    if (!key.startsWith(prefix)) continue;
-    const entry = latest(entries);
-    if (entry.result !== "pass") {
-      if (entry.stage === "qualified") {
-        const pull = pulls.get(entry.subject.pr);
-        if (!pull || pull.head === entry.subject.head) notes.push(`✗ qualification failed at ${short(entry.subject.head)}`);
-      }
-      continue;
-    }
-    let detail;
-    if (entry.stage === "qualified") {
-      const pull = pulls.get(entry.subject.pr);
-      if (pull && pull.head !== entry.subject.head) {
-        notes.push(`qualified at old head ${short(entry.subject.head)}; PR #${entry.subject.pr} is now ${short(pull.head)}`);
-        continue;
-      }
-      detail = `#${entry.subject.pr}@${short(entry.subject.head)}${pull ? "" : " (head unverified)"}`;
-    } else if (entry.stage === "deployed") {
-      detail = `${entry.subject.target}@${short(entry.subject.commit)}`;
-    } else if (entry.stage === "released") {
-      detail = entry.subject.release;
-    } else if (entry.stage === "merged") {
-      detail = short(entry.subject.commit);
-    } else if (entry.stage === "implemented") {
-      detail = entry.subject.pr !== undefined ? `#${entry.subject.pr}` : short(entry.subject.commit);
-    } else {
-      detail = "";
-    }
-    const current = found.get(entry.stage);
-    if (!current || current.id < entry.source.id) found.set(entry.stage, { detail, id: entry.source.id });
-    if (entry.subject.pr !== undefined) {
-      const pull = pulls.get(entry.subject.pr);
-      if (pull?.merged && pull.mergeCommit && !found.has("merged")) {
-        found.set("merged", { detail: `#${entry.subject.pr}→${short(pull.mergeCommit)}`, id: 0 });
-      }
+  const qualified = entries.filter((entry) => entry.stage === "qualified");
+  const current = latest(qualified.filter((entry) => entry.subject.head === pull.head));
+  for (const head of new Set(qualified.map((entry) => entry.subject.head))) {
+    if (head !== pull.head && latest(qualified.filter((entry) => entry.subject.head === head)).result === "pass") {
+      notes.push(`${label} qualified at old head ${short(head)}; now ${short(pull.head)}`);
     }
   }
-  let highest = -1;
-  for (const stage of found.keys()) highest = Math.max(highest, STAGES.indexOf(stage));
-  return {
-    stageIndex: highest,
-    stage: highest < 0 ? undefined : STAGES[highest],
-    detail: highest < 0 ? undefined : found.get(STAGES[highest]).detail,
-    notes,
-  };
+  if (current?.result === "pass") {
+    return { live: true, stageIndex: STAGES.indexOf("qualified"), detail: `${label}@${short(pull.head)}`, notes };
+  }
+  if (current?.result === "fail") notes.push(`✗ ${label} qualification failed at ${short(pull.head)}`);
+  return { live: true, stageIndex: STAGES.indexOf("implemented"), detail: label, notes };
+}
+
+export function surfaceDelivery(state, outcomeId, surface, pulls) {
+  const prefix = `${outcomeId}|${surface}|`;
+  const componentEntries = new Map();
+  let assertion;
+  const notes = [];
+  for (const [key, entries] of state.evidence) {
+    if (!key.startsWith(prefix)) continue;
+    for (const entry of entries.filter(isComponentEvidence)) {
+      componentEntries.set(entry.subject.pr, [...(componentEntries.get(entry.subject.pr) ?? []), entry]);
+    }
+    const entry = latest(entries);
+    if (isComponentEvidence(entry)) continue;
+    if (entry.result !== "pass") {
+      notes.push(`✗ ${entry.stage} failed${entry.subject.target ? ` on ${entry.subject.target}` : ""}`);
+      continue;
+    }
+    const detail =
+      entry.stage === "deployed" ? `${entry.subject.target}@${short(entry.subject.commit)}`
+      : entry.stage === "released" ? entry.subject.release
+      : entry.subject.commit ? short(entry.subject.commit)
+      : "";
+    const stageIndex = STAGES.indexOf(entry.stage);
+    if (!assertion || stageIndex > assertion.stageIndex || (stageIndex === assertion.stageIndex && entry.source.id > assertion.id)) {
+      assertion = { stageIndex, detail, id: entry.source.id };
+    }
+  }
+  const components = [...componentEntries].sort(([left], [right]) => left - right).map(([pr, entries]) => componentDelivery(pr, entries, pulls.get(pr)));
+  for (const component of components) {
+    if (!component.live) notes.push(component.note);
+    else notes.push(...component.notes);
+  }
+  const live = components.filter((component) => component.live);
+  const componentIndex = live.length ? Math.min(...live.map((component) => component.stageIndex)) : -1;
+  let stageIndex = -1;
+  let detail;
+  if (assertion && assertion.stageIndex >= componentIndex) {
+    stageIndex = assertion.stageIndex;
+    detail = assertion.detail;
+    for (const component of live) {
+      if (component.stageIndex < STAGES.indexOf("merged")) notes.push(`open follow-up ${component.detail} (${STAGES[component.stageIndex]})`);
+    }
+  } else if (componentIndex >= 0) {
+    stageIndex = componentIndex;
+    detail = live.filter((component) => component.stageIndex === componentIndex).map((component) => component.detail).join(", ");
+    for (const component of live) {
+      if (component.stageIndex > componentIndex) notes.push(`${component.detail} ${STAGES[component.stageIndex]}`);
+    }
+  }
+  return { stageIndex, stage: stageIndex < 0 ? undefined : STAGES[stageIndex], detail, notes };
 }
 
 function markdownText(value) {
@@ -691,6 +733,8 @@ export function renderRoadmap(state, { pulls = new Map(), pullsVerified = false,
   const lines = [
     "# Phoenix delivery roadmap",
     "",
+    ACTIVATION_MARKER,
+    "",
     "Generated from structured records in this Issue's comments; do not edit this body. Protocol: `specs/roadmap/requirements.md`.",
     "",
     PROJECTION_START,
@@ -734,8 +778,15 @@ export function renderRoadmap(state, { pulls = new Map(), pullsVerified = false,
     lines.push(retired.map((entry) => `- ${markdownText(entry.title)} — ${entry.reason}${entry.note ? `: ${markdownText(entry.note)}` : ""} (${link("source", entry.source.url)})`).join("\n"));
   }
 
-  const rejections = [...state.rejections].sort((left, right) => right.id - left.id).slice(0, MAX_RENDERED_REJECTIONS);
+  const window = state.recordIds.slice(-ACK_WINDOW_RECORDS);
+  const windowFrom = window.length ? window[0] : 0;
+  const rejections = state.rejections.filter((entry) => entry.id >= windowFrom).sort((left, right) => right.id - left.id);
   lines.push("", "## Recent rejections", "");
+  lines.push(`<!-- phoenix-roadmap:ack-window-from:${windowFrom} -->`);
+  lines.push(
+    `_Covers the last ${window.length} record comments (from comment ${windowFrom}). A record in that range is accepted unless listed here; this body does not say whether older records were accepted._`,
+    "",
+  );
   lines.push(rejections.length ? rejections.map((entry) => `- ${link(String(entry.id), entry.url)}: ${markdownText(entry.reason)}`).join("\n") : "_None._");
 
   lines.push("", PROJECTION_END);
@@ -771,6 +822,7 @@ export function githubApi({ owner, repo, issueNumber, token }) {
   }
   return {
     listComments: () => paginate(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`),
+    getIssueBody: async () => (await request(`/repos/${owner}/${repo}/issues/${issueNumber}`)).body ?? "",
     replaceBody: (body) => request(`/repos/${owner}/${repo}/issues/${issueNumber}`, { method: "PATCH", body: JSON.stringify({ body }) }),
     async getPull(number) {
       const pull = await request(`/repos/${owner}/${repo}/pulls/${number}`);
@@ -809,6 +861,14 @@ function commentSnapshot(comments) {
     .join("|");
 }
 
+async function bestEffortReaction(api, commentId, content) {
+  try {
+    await api.setReaction(commentId, content);
+  } catch (error) {
+    console.warn(`Could not set ${content} reaction on comment ${commentId}: ${error.message}`);
+  }
+}
+
 export async function run({ eventName, event, configuredIssueNumber, coordinatorHarness, api, now = () => new Date() }) {
   let acknowledge;
   if (eventName === "issue_comment") {
@@ -821,39 +881,59 @@ export async function run({ eventName, event, configuredIssueNumber, coordinator
   } else if (!["schedule", "workflow_dispatch"].includes(eventName)) {
     return { skipped: `unsupported event ${eventName}` };
   }
+  if (!coordinatorHarness) return { skipped: "roadmap v2 is not activated: no coordinator harness is configured" };
+  if (!String(await api.getIssueBody()).includes(ACTIVATION_MARKER)) {
+    return { skipped: "roadmap v2 is not activated: the configured Issue lacks the v2 activation marker" };
+  }
 
+  if (acknowledge !== undefined) await bestEffortReaction(api, acknowledge, "eyes");
+  let state;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const comments = await api.listComments();
+    state = reduceComments(comments, { coordinatorHarness });
+    const { pulls, verified } = await fetchPulls(api, pullNumbersIn(state));
+    const trustedIds = comments.filter(isTrusted).map((comment) => comment.id);
+    const snapshotThroughCommentId = trustedIds.length ? Math.max(...trustedIds) : 0;
+    await api.replaceBody(renderRoadmap(state, { pulls, pullsVerified: verified, now: now(), snapshotThroughCommentId }));
+    if (commentSnapshot(comments) === commentSnapshot(await api.listComments())) break;
+    console.warn(`Roadmap comments changed during projection attempt ${attempt}; rebuilding`);
+  }
+  for (const rejection of state.rejections) console.warn(`Rejected comment ${rejection.id}: ${rejection.reason}`);
+  const result = { outcomes: state.outcomes.size, rejections: state.rejections.length };
+  if (acknowledge === undefined) return result;
+  const accepted = state.accepted.has(acknowledge);
+  await bestEffortReaction(api, acknowledge, accepted ? "rocket" : "confused");
+  return { ...result, acknowledged: accepted ? "accepted" : "rejected" };
+}
+
+export function validateRecordText(text, options) {
+  const trimmed = String(text).trim();
+  const parsed = trimmed.startsWith("```") ? parseRecordComment(trimmed) : { payload: trimmed };
+  if (parsed === null) return { ok: false, error: "not a phoenix-roadmap record" };
+  if (parsed.error) return { ok: false, error: parsed.error };
   try {
-    if (acknowledge !== undefined) await api.setReaction(acknowledge, "eyes");
-    let state;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const comments = await api.listComments();
-      state = reduceComments(comments, { coordinatorHarness });
-      const { pulls, verified } = await fetchPulls(api, pullNumbersIn(state));
-      const trustedIds = comments.filter(isTrusted).map((comment) => comment.id);
-      const snapshotThroughCommentId = trustedIds.length ? Math.max(...trustedIds) : 0;
-      await api.replaceBody(renderRoadmap(state, { pulls, pullsVerified: verified, now: now(), snapshotThroughCommentId }));
-      if (commentSnapshot(comments) === commentSnapshot(await api.listComments())) break;
-      console.warn(`Roadmap comments changed during projection attempt ${attempt}; rebuilding`);
-    }
-    for (const rejection of state.rejections) console.warn(`Rejected comment ${rejection.id}: ${rejection.reason}`);
-    const result = { outcomes: state.outcomes.size, rejections: state.rejections.length };
-    if (acknowledge === undefined) return result;
-    const accepted = state.accepted.has(acknowledge);
-    await api.setReaction(acknowledge, accepted ? "rocket" : "confused");
-    return { ...result, acknowledged: accepted ? "accepted" : "rejected" };
+    return { ok: true, record: validateRecord(JSON.parse(parsed.payload), options) };
   } catch (error) {
-    if (acknowledge !== undefined) {
-      try {
-        await api.setReaction(acknowledge, "confused");
-      } catch (reactionError) {
-        console.error(`Could not mark comment ${acknowledge} rejected: ${reactionError.message}`);
-      }
-    }
-    throw error;
+    return { ok: false, error: error instanceof SyntaxError ? `invalid JSON: ${error.message}` : error.message };
+  }
+}
+
+async function validateMain(path) {
+  const text = path ? await fs.readFile(path, "utf8") : await new Promise((resolve) => {
+    let data = "";
+    process.stdin.on("data", (chunk) => { data += chunk; }).on("end", () => resolve(data));
+  });
+  const result = validateRecordText(text, { coordinatorHarness: process.env.PHOENIX_ROADMAP_COORDINATOR_HARNESS || undefined });
+  if (result.ok) {
+    console.log(`valid ${result.record.kind} record (structure and role only; references are checked against the Issue when reduced)`);
+  } else {
+    console.error(`invalid: ${result.error}`);
+    process.exitCode = 1;
   }
 }
 
 async function main() {
+  if (process.argv[2] === "--validate") return validateMain(process.argv[3]);
   const eventName = process.env.GITHUB_EVENT_NAME;
   const eventPath = process.env.GITHUB_EVENT_PATH;
   const issueNumber = Number(process.env.PHOENIX_ROADMAP_ISSUE_NUMBER);
@@ -870,6 +950,7 @@ async function main() {
     coordinatorHarness: process.env.PHOENIX_ROADMAP_COORDINATOR_HARNESS || undefined,
     api: githubApi({ owner, repo, issueNumber, token }),
   });
+  if (result.skipped?.startsWith("roadmap v2 is not activated")) console.log(`::warning::${result.skipped}`);
   console.log(JSON.stringify(result));
 }
 

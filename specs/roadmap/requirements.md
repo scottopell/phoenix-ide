@@ -38,8 +38,16 @@ body from the records in that Issue's comments.
 THE SYSTEM SHALL identify the roadmap Issue by repository configuration, not by
 a number embedded in the reducer.
 
+THE SYSTEM SHALL project only into an Issue whose body carries the v2
+activation marker, and only when a coordinator harness is configured. WHEN
+either is missing THE SYSTEM SHALL write nothing and report that the roadmap is
+not activated.
+
 **Rationale:** The Markdown is an output. A body anyone edits by hand is
-overwritten by the next projection and drifts from the records meanwhile.
+overwritten by the next projection and drifts from the records meanwhile. The
+activation guard makes the reducer and the Issue selection independent writes:
+deploying the reducer before the Issue selection changes, or failing to change
+it, leaves a non-v2 Issue untouched.
 
 ---
 
@@ -78,8 +86,8 @@ THE SYSTEM SHALL accept each record kind only from these roles:
 | `decision` | coordinator, user |
 | `evidence` | coordinator, worker; `accepted` stage: coordinator, user |
 
-WHEN the repository configures a coordinator harness
-THE SYSTEM SHALL reject coordinator records from any other harness.
+THE SYSTEM SHALL reject coordinator records from any harness other than the
+configured coordinator harness.
 
 **Rationale:** Every contributor posts under the same GitHub account, so the
 GitHub author cannot distinguish the coordinator, a worker, and the user. The
@@ -122,7 +130,8 @@ THE SYSTEM SHALL model a milestone as an ordered set of required
 an outcome cannot be both.
 
 THE SYSTEM SHALL count a milestone requirement as met only when that outcome's
-delivery on that surface has reached the required stage.
+delivery on that surface has reached the required stage as defined by
+REQ-ROADMAP-009.
 
 THE SYSTEM SHALL never count gates on optional outcomes toward a milestone.
 
@@ -144,9 +153,13 @@ or milestone, naming who can clear it: `user`, `coordinator`, `owner`, or
 THE SYSTEM SHALL permit only the coordinator to gate a milestone.
 
 THE SYSTEM SHALL clear a `user` gate only through a `user` decision, a
-`coordinator` gate only through a coordinator decision or coordinator
+`coordinator` gate only through a coordinator or user decision or a coordinator
 `gate-clear`, and an `owner` or `external` gate through any permitted
-`gate-clear` carrying an evidence URL or a decision.
+`gate-clear` carrying a GitHub evidence URL or a decision. The user outranks the
+coordinator.
+
+THE SYSTEM SHALL let a decision clear only a gate that it, or the gate's blocked
+outcome or milestone, names in the decision's scope.
 
 THE SYSTEM SHALL reject any record that would reopen a cleared gate, including a
 new gate reusing its identifier. A condition that recurs is a new gate.
@@ -167,8 +180,9 @@ words, so the decision is legible where the conversation it came from is not
 reachable.
 
 THE SYSTEM SHALL treat a decision as current until another decision supersedes
-it, and SHALL surface a decision superseded by two different decisions as
-needing the coordinator.
+it, SHALL accept a supersession only between decisions sharing at least one
+scope identifier, and SHALL surface a decision superseded by two different
+decisions as needing the coordinator.
 
 ---
 
@@ -176,19 +190,33 @@ needing the coordinator.
 
 THE SYSTEM SHALL record evidence for an outcome's surface at one of the stages
 `implemented`, `qualified`, `merged`, `released`, `deployed`, `accepted`, each
-with a result (`pass` or `fail`), an HTTPS evidence URL, and a stage-specific
-subject: a PR and head commit for `qualified`; a commit for `merged`; a release
-and commit for `released`; a target and commit for `deployed`.
+with a result (`pass` or `fail`), a github.com evidence URL, and a
+stage-specific subject: a PR and head commit for `qualified`; a commit for
+`merged`; a release and commit for `released`; a target and commit for
+`deployed`.
+
+THE SYSTEM SHALL require `deployed` and `accepted` evidence to link a GitHub
+receipt — an Issue or PR comment or review, an Actions run, or a release —
+because a commit link proves code identity, not that a deployment or acceptance
+happened.
 
 THE SYSTEM SHALL keep each surface's delivery independent, so one outcome can be
 deployed on one surface while unknown on another.
 
-THE SYSTEM SHALL count `qualified` evidence only for the PR's current head when
-the PR state is known, SHALL show qualification at an older head as such, and
-SHALL mark qualification whose PR state could not be read as unverified.
+THE SYSTEM SHALL treat evidence naming a PR (other than `released`, `deployed`,
+and `accepted`) as describing one component of the surface, and the other
+evidence as an assertion about the whole surface. A surface reaches a
+component stage only when every live component has reached it; one merged PR
+does not deliver a surface that still has an open one. A whole-surface
+assertion keeps its target and commit identity, and open components beneath it
+are shown as follow-ups.
 
-THE SYSTEM SHALL derive merge state for PRs named by evidence from GitHub at
-projection time rather than requiring it to be asserted.
+THE SYSTEM SHALL derive each component's state from GitHub at projection time:
+a merged PR is `merged` regardless of its qualification records; an open PR is
+`qualified` only when its latest qualification at the PR's current head passed;
+a PR closed without merge is shown as such and excluded from readiness; and a
+PR whose state could not be read counts only as `implemented` and is shown as
+unverified.
 
 WHEN both pass and fail are recorded for the same PR head
 THE SYSTEM SHALL show the latest result and surface the disagreement as needing
@@ -249,14 +277,21 @@ THE SYSTEM SHALL serialize projection runs.
 ### REQ-ROADMAP-014: The projection is the authoritative acknowledgement
 
 THE SYSTEM SHALL record in the projection the highest trusted comment it
-included.
+included and the first comment of a bounded acknowledgement window covering the
+most recent record comments, and SHALL list every rejected record in that
+window with its reason.
 
-A record is accepted when that marker is at or above its comment identifier and
-the record is absent from the rejection list.
+A record whose comment falls in the window is accepted exactly when it is not
+listed. For a record before the window the projection makes no claim.
 
 THE SYSTEM SHALL additionally mark a newly created record with bot reactions
-(processing, accepted, rejected) on a best-effort basis.
+(processing, accepted, rejected) on a best-effort basis: a reaction failure
+never prevents or alters the projection, and a projection failure fails the run
+without marking the record rejected.
+
+THE SYSTEM SHALL provide a local validator that checks a record's structure and
+role before it is posted.
 
 **Rationale:** Reaction authorship is not visible to every harness, and a
 superseded pending run can skip a reaction; the projection itself is readable by
-every contributor.
+every contributor, and a bounded window keeps it within the Issue size limit.

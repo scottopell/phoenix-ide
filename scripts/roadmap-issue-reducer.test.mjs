@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ACTIVATION_MARKER,
   PROJECTION_END,
   PROJECTION_START,
   parseRecordComment,
@@ -10,6 +11,7 @@ import {
   run,
   surfaceDelivery,
   validateRecord,
+  validateRecordText,
 } from "./roadmap-issue-reducer.mjs";
 
 const COORDINATOR = { role: "coordinator", harness: "phoenix@primary" };
@@ -182,20 +184,75 @@ test("qualification binds to the PR's current head", () => {
     qualified(5, HEAD_B, "fail"),
     qualified(5, HEAD_A, "fail"),
   ]);
-  const atB = surfaceDelivery(state, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false }]]));
-  assert.equal(atB.stage, undefined);
-  assert.deepEqual(atB.notes, ["✗ qualification failed at bbbbbbb"]);
+  const atB = surfaceDelivery(state, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false, state: "open" }]]));
+  assert.equal(atB.stage, "implemented");
+  assert.deepEqual(atB.notes, ["✗ #5 qualification failed at bbbbbbb"]);
 
   const withPass = reduce([outcome(), qualified(5, HEAD_B), qualified(5, HEAD_A)]);
-  const current = surfaceDelivery(withPass, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false }]]));
+  const current = surfaceDelivery(withPass, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false, state: "open" }]]));
   assert.equal(current.stage, "qualified");
   assert.equal(current.detail, "#5@bbbbbbb");
-  assert.deepEqual(current.notes, ["qualified at old head aaaaaaa; PR #5 is now bbbbbbb"]);
+  assert.deepEqual(current.notes, ["#5 qualified at old head aaaaaaa; now bbbbbbb"]);
 });
 
-test("unverified PR state is shown rather than assumed", () => {
+test("unverified PR state never counts as qualified", () => {
   const state = reduce([outcome(), qualified(5, HEAD_A)]);
-  assert.equal(surfaceDelivery(state, "ios-core-journeys", "ios", new Map()).detail, "#5@aaaaaaa (head unverified)");
+  const delivery = surfaceDelivery(state, "ios-core-journeys", "ios", new Map());
+  assert.equal(delivery.stage, "implemented");
+  assert.deepEqual(delivery.notes, ["#5 state unverified"]);
+});
+
+// Scenario: a PR closed without merge (like #794) must not read as ready.
+test("closed-without-merge PRs are history, not readiness", () => {
+  const milestone = { kind: "milestone", actor: COORDINATOR, id: "m-1", title: "M", required: [{ outcome: "ios-core-journeys", surface: "ios", stage: "qualified" }] };
+  const state = reduce([outcome(), milestone, qualified(794, HEAD_A)]);
+  const closed = new Map([[794, { head: HEAD_A, merged: false, state: "closed" }]]);
+  const delivery = surfaceDelivery(state, "ios-core-journeys", "ios", closed);
+  assert.equal(delivery.stage, undefined);
+  assert.deepEqual(delivery.notes, ["#794 closed without merge"]);
+  const rendered = renderRoadmap(state, { pulls: closed, now: NOW });
+  assert.match(rendered, /0\/1 required met/);
+  assert.doesNotMatch(rendered, /All requirements met/);
+  assert.match(renderRoadmap(state, { pulls: new Map(), now: NOW }), /0\/1 required met/);
+});
+
+test("merge is derived even when the latest qualification failed or is stale", () => {
+  const state = reduce([outcome(), qualified(5, HEAD_A), qualified(5, HEAD_A, "fail")]);
+  const merged = new Map([[5, { head: HEAD_B, merged: true, mergeCommit: MERGE, state: "closed" }]]);
+  const delivery = surfaceDelivery(state, "ios-core-journeys", "ios", merged);
+  assert.equal(delivery.stage, "merged");
+  assert.equal(delivery.detail, "#5→ccccccc");
+});
+
+test("one merged component PR does not deliver a multi-part surface", () => {
+  const implemented = (pr) => ({ kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "implemented", result: "pass", subject: { pr }, url: `https://github.com/o/r/pull/${pr}` });
+  const state = reduce([outcome(), implemented(796), implemented(798)]);
+  const pulls = new Map([
+    [796, { head: HEAD_A, merged: false, state: "open" }],
+    [798, { head: HEAD_B, merged: true, mergeCommit: MERGE, state: "closed" }],
+  ]);
+  const partial = surfaceDelivery(state, "ios-core-journeys", "ios", pulls);
+  assert.equal(partial.stage, "implemented");
+  assert.equal(partial.detail, "#796");
+  assert.deepEqual(partial.notes, ["#798→ccccccc merged"]);
+
+  pulls.set(796, { head: HEAD_A, merged: true, mergeCommit: MERGE, state: "closed" });
+  assert.equal(surfaceDelivery(state, "ios-core-journeys", "ios", pulls).stage, "merged");
+});
+
+test("whole-surface delivery keeps its identity and shows open follow-ups", () => {
+  const receipt = "https://github.com/o/r/issues/1#issuecomment-9";
+  const deployed = (commit) => ({ kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "deployed", result: "pass", subject: { target: "prod@primary", commit }, url: receipt });
+  const state = reduce([
+    outcome(),
+    deployed(HEAD_A),
+    deployed(HEAD_B),
+    { kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "implemented", result: "pass", subject: { pr: 9 }, url: "https://github.com/o/r/pull/9" },
+  ]);
+  const delivery = surfaceDelivery(state, "ios-core-journeys", "ios", new Map([[9, { head: HEAD_A, merged: false, state: "open" }]]));
+  assert.equal(delivery.stage, "deployed");
+  assert.equal(delivery.detail, "prod@primary@bbbbbbb");
+  assert.deepEqual(delivery.notes, ["open follow-up #9 (implemented)"]);
 });
 
 test("pass and fail for the same head needs the coordinator", () => {
@@ -230,7 +287,7 @@ test("status replaces execution pointers and flags non-owner harnesses", () => {
 test("each surface reports its own delivery stage", () => {
   const state = reduce([
     outcome({ id: "auto-continue", title: "Auto-continuation", surfaces: ["web", "ios"] }),
-    { kind: "evidence", actor: WORKER, outcome: "auto-continue", surface: "web", stage: "deployed", result: "pass", subject: { target: "prod@devmbp", commit: "87606f42404d8d169b85cea2f6de3e6732a3e58f" }, url: "https://github.com/o/r/commit/87606f4" },
+    { kind: "evidence", actor: WORKER, outcome: "auto-continue", surface: "web", stage: "deployed", result: "pass", subject: { target: "prod@devmbp", commit: "87606f42404d8d169b85cea2f6de3e6732a3e58f" }, url: "https://github.com/o/r/issues/1#issuecomment-2" },
   ]);
   assert.equal(surfaceDelivery(state, "auto-continue", "web", new Map()).detail, "prod@devmbp@87606f4");
   assert.equal(surfaceDelivery(state, "auto-continue", "ios", new Map()).stage, undefined);
@@ -313,36 +370,105 @@ test("forked supersession is a coordinator conflict", () => {
   assert.match(state.conflicts[0].message, /d-1 is superseded by both d-2 and d-3/);
 });
 
-test("rendering shows freshness, rejections, and escapes table text", () => {
+test("rendering shows freshness and escapes table text", () => {
   const state = reduceComments([
     comment(1, outcome({ title: "Pipes | and *stars*" })),
     comment(2, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "Next | step" }),
     comment(3, "```phoenix-roadmap\nnot json\n```"),
   ]);
   const rendered = renderRoadmap(state, { now: NOW, snapshotThroughCommentId: 3 });
-  assert.ok(rendered.includes(PROJECTION_START) && rendered.includes(PROJECTION_END));
+  assert.ok(rendered.includes(PROJECTION_START) && rendered.includes(PROJECTION_END) && rendered.includes(ACTIVATION_MARKER));
   assert.match(rendered, /snapshot-through:3/);
   assert.match(rendered, /Pipes \\\| and \\\*stars\\\*/);
   assert.match(rendered, /Next \\\| step/);
   assert.match(rendered, /\| 11h \|/);
-  assert.match(rendered, /## Recent rejections\n\n- \[3\]\(.*\): invalid JSON/);
+  assert.match(rendered, /- \[3\]\(.*\): invalid JSON/);
 
   const stale = renderRoadmap(state, { now: new Date("2026-10-05T00:00:00Z") });
   assert.match(stale, /\| 7d ⚠ \|/);
 });
 
-function fakeApi(comments, pulls = {}) {
+function acknowledgement(rendered, commentId) {
+  const snapshot = Number(rendered.match(/snapshot-through:(\d+)/)[1]);
+  const windowFrom = Number(rendered.match(/ack-window-from:(\d+)/)[1]);
+  if (commentId > snapshot) return "pending";
+  if (commentId < windowFrom) return "unknown";
+  return rendered.includes(`- [${commentId}](`) ? "rejected" : "accepted";
+}
+
+test("acknowledgement is unambiguous within a bounded window and unknown before it", () => {
+  const comments = [comment(1, outcome())];
+  for (let id = 2; id <= 22; id += 1) comments.push(comment(id, "```phoenix-roadmap\nnot json\n```"));
+  const rendered = renderRoadmap(reduceComments(comments), { now: NOW, snapshotThroughCommentId: 22 });
+  assert.equal(acknowledgement(rendered, 1), "accepted");
+  assert.equal(acknowledgement(rendered, 2), "rejected");
+  assert.equal(acknowledgement(rendered, 22), "rejected");
+  assert.equal(acknowledgement(rendered, 23), "pending");
+
+  for (let id = 23; id <= 80; id += 1) comments.push(comment(id, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: `check-in ${id}` }));
+  const later = renderRoadmap(reduceComments(comments), { now: NOW, snapshotThroughCommentId: 80 });
+  assert.equal(acknowledgement(later, 2), "unknown");
+  assert.equal(acknowledgement(later, 31), "accepted");
+  assert.match(later, /ack-window-from:31/);
+});
+
+test("a record edited after acceptance is reported as rejected on reprocessing", () => {
+  const edited = comment(2, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "x" }, { updated_at: "2026-09-28T00:00:00Z" });
+  const rendered = renderRoadmap(reduceComments([comment(1, outcome()), edited]), { now: NOW, snapshotThroughCommentId: 2 });
+  assert.equal(acknowledgement(rendered, 2), "rejected");
+  assert.match(rendered, /edited records are ignored/);
+});
+
+test("decisions clear and supersede only within their scope", () => {
+  const state = reduce([
+    outcome(),
+    outcome({ id: "other", title: "Other" }),
+    { kind: "gate", actor: COORDINATOR, id: "g-1", blocks: { outcome: "ios-core-journeys" }, clearer: "coordinator", condition: "x" },
+    { kind: "decision", actor: COORDINATOR, id: "d-other", statement: "x", scope: ["other"], clears: ["g-1"] },
+    { kind: "decision", actor: COORDINATOR, id: "d-a", statement: "x", scope: ["ios-core-journeys"] },
+    { kind: "decision", actor: COORDINATOR, id: "d-b", statement: "x", scope: ["other"], supersedes: ["d-a"] },
+    { kind: "decision", actor: USER, id: "d-user", statement: "x", scope: ["ios-core-journeys"], clears: ["g-1"], quote: "clear it" },
+  ]);
+  assert.deepEqual(reasons(state), ["gate g-1 is outside the decision's scope", "decision d-a shares no scope with d-b"]);
+  assert.equal(state.gates.get("g-1").cleared.decision, "d-user");
+});
+
+test("evidence must be GitHub-checkable and deployment claims need a receipt", () => {
+  const deployed = (url) => ({ version: 2, kind: "evidence", actor: WORKER, outcome: "x", surface: "server", stage: "deployed", result: "pass", subject: { target: "prod@primary", commit: HEAD_A }, url });
+  assert.throws(() => validateRecord(deployed("https://example.com/receipt")), /github.com URL/);
+  assert.throws(() => validateRecord(deployed("https://github.com/o/r/commit/abc")), /GitHub receipt/);
+  assert.equal(validateRecord(deployed("https://github.com/o/r/pull/807#issuecomment-5859803423")).stage, "deployed");
+  assert.equal(validateRecord(deployed("https://github.com/o/r/actions/runs/123")).stage, "deployed");
+});
+
+test("records can be validated standalone before posting", () => {
+  assert.equal(validateRecordText(body(outcome())).ok, true);
+  assert.equal(validateRecordText(JSON.stringify({ version: 2, ...outcome() })).ok, true);
+  assert.match(validateRecordText("{").error, /invalid JSON/);
+  assert.match(validateRecordText(JSON.stringify({ version: 2, ...outcome({ actor: WORKER }) })).error, /may not post outcome/);
+});
+
+const ACTIVE_BODY = `# Phoenix delivery roadmap\n\n${ACTIVATION_MARKER}\n`;
+
+function fakeApi(comments, { pulls = {}, body = ACTIVE_BODY, failReactions = [], failReplace = false } = {}) {
   const calls = { reactions: [], bodies: [], pulls: [] };
   return {
     calls,
+    getIssueBody: async () => body,
     listComments: async () => comments,
-    replaceBody: async (next) => calls.bodies.push(next),
+    replaceBody: async (next) => {
+      if (failReplace) throw new Error("PATCH failed");
+      calls.bodies.push(next);
+    },
     getPull: async (number) => {
       calls.pulls.push(number);
       if (!pulls[number]) throw new Error("404");
       return pulls[number];
     },
-    setReaction: async (id, content) => calls.reactions.push([id, content]),
+    setReaction: async (id, content) => {
+      if (failReactions.includes(content)) throw new Error(`${content} failed`);
+      calls.reactions.push([id, content]);
+    },
   };
 }
 
@@ -350,10 +476,12 @@ function commentEvent(created) {
   return { action: "created", issue: { number: 7 }, comment: created };
 }
 
+const RUN = { configuredIssueNumber: 7, coordinatorHarness: "phoenix@primary", now: () => NOW };
+
 test("run acknowledges an accepted record created on the roadmap Issue", async () => {
   const created = comment(2, qualified(5, HEAD_A));
-  const api = fakeApi([comment(1, outcome()), created], { 5: { head: HEAD_A, merged: false } });
-  const result = await run({ eventName: "issue_comment", event: commentEvent(created), configuredIssueNumber: 7, api, now: () => NOW });
+  const api = fakeApi([comment(1, outcome()), created], { pulls: { 5: { head: HEAD_A, merged: false, state: "open" } } });
+  const result = await run({ ...RUN, eventName: "issue_comment", event: commentEvent(created), api });
   assert.equal(result.acknowledged, "accepted");
   assert.deepEqual(api.calls.reactions, [[2, "eyes"], [2, "rocket"]]);
   assert.deepEqual(api.calls.pulls, [5]);
@@ -364,31 +492,62 @@ test("run acknowledges an accepted record created on the roadmap Issue", async (
 test("run marks a rejected record confused", async () => {
   const created = comment(1, qualified(5, HEAD_A));
   const api = fakeApi([created]);
-  const result = await run({ eventName: "issue_comment", event: commentEvent(created), configuredIssueNumber: 7, api, now: () => NOW });
+  const result = await run({ ...RUN, eventName: "issue_comment", event: commentEvent(created), api });
   assert.equal(result.acknowledged, "rejected");
   assert.deepEqual(api.calls.reactions.at(-1), [1, "confused"]);
+});
+
+test("reaction failures never block or contradict the projection", async () => {
+  const created = comment(2, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "x" });
+  const api = fakeApi([comment(1, outcome()), created], { failReactions: ["eyes", "rocket"] });
+  const result = await run({ ...RUN, eventName: "issue_comment", event: commentEvent(created), api });
+  assert.equal(result.acknowledged, "accepted");
+  assert.equal(api.calls.bodies.length, 1);
+  assert.deepEqual(api.calls.reactions, []);
+});
+
+test("a projection failure fails the run without marking the record rejected", async () => {
+  const created = comment(2, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "x" });
+  const api = fakeApi([comment(1, outcome()), created], { failReplace: true });
+  await assert.rejects(run({ ...RUN, eventName: "issue_comment", event: commentEvent(created), api }), /PATCH failed/);
+  assert.deepEqual(api.calls.reactions, [[2, "eyes"]]);
 });
 
 test("run skips other Issues and untrusted authors", async () => {
   const api = fakeApi([]);
   const created = comment(1, outcome());
   assert.deepEqual(
-    await run({ eventName: "issue_comment", event: { ...commentEvent(created), issue: { number: 8 } }, configuredIssueNumber: 7, api }),
+    await run({ ...RUN, eventName: "issue_comment", event: { ...commentEvent(created), issue: { number: 8 } }, api }),
     { skipped: "not the configured roadmap Issue" },
   );
   const untrusted = { ...created, author_association: "NONE" };
   assert.deepEqual(
-    await run({ eventName: "issue_comment", event: commentEvent(untrusted), configuredIssueNumber: 7, api }),
+    await run({ ...RUN, eventName: "issue_comment", event: commentEvent(untrusted), api }),
     { skipped: "triggering author is not trusted" },
   );
   assert.equal(api.calls.bodies.length, 0);
 });
 
+// Scenario: the reducer merges to main before the Issue variable is switched, or the switch is denied.
+test("an unactivated Issue or missing coordinator binding is never written", async () => {
+  const v1Body = "# Phoenix delivery roadmap\n\n<!-- phoenix-roadmap:projection:start -->\nv1 rows\n";
+  const v1Comment = comment(1, "```phoenix-roadmap-update\n{}\n```");
+  const onV1 = fakeApi([v1Comment], { body: v1Body });
+  assert.match((await run({ ...RUN, eventName: "schedule", event: {}, api: onV1 })).skipped, /lacks the v2 activation marker/);
+  assert.match((await run({ ...RUN, eventName: "issue_comment", event: commentEvent(v1Comment), api: onV1 })).skipped, /activation marker/);
+  assert.deepEqual(onV1.calls.bodies, []);
+  assert.deepEqual(onV1.calls.reactions, []);
+
+  const unbound = fakeApi([comment(1, outcome())]);
+  assert.match((await run({ ...RUN, coordinatorHarness: undefined, eventName: "workflow_dispatch", event: {}, api: unbound })).skipped, /no coordinator harness/);
+  assert.deepEqual(unbound.calls.bodies, []);
+});
+
 test("scheduled runs re-render without acknowledging and tolerate PR read failures", async () => {
   const api = fakeApi([comment(1, outcome()), comment(2, qualified(5, HEAD_A))]);
-  const result = await run({ eventName: "schedule", event: {}, configuredIssueNumber: 7, api, now: () => NOW });
+  const result = await run({ ...RUN, eventName: "schedule", event: {}, api });
   assert.deepEqual(result, { outcomes: 1, rejections: 0 });
   assert.deepEqual(api.calls.reactions, []);
   assert.match(api.calls.bodies[0], /PR state not verified/);
-  assert.match(api.calls.bodies[0], /head unverified/);
+  assert.match(api.calls.bodies[0], /#5 state unverified/);
 });
