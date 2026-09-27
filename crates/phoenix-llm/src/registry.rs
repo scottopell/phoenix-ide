@@ -3,8 +3,8 @@
 use super::codex_credential::AccountBoundCodexCredential;
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexAvailability, CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService,
-    LlmServiceImpl, LlmTransport, LoggingService, ModelBackend, ModelInfo, ModelSource,
+    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
+    LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -901,19 +901,17 @@ impl ModelRegistry {
             .and_then(|(models, _)| models)
     }
 
-    fn codex_catalog_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
-        match spec.codex_availability {
-            CodexAvailability::Established => true,
-            CodexAvailability::AccountCatalog => {
-                catalog.is_some_and(|models| models.contains(&spec.api_name))
-            }
-        }
+    fn is_codex_bridge_model(spec: &super::ModelSpec) -> bool {
+        spec.backend == ModelBackend::OpenAIResponses && spec.source == ModelSource::BuiltIn
     }
 
-    fn codex_bridge_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
-        spec.backend == ModelBackend::OpenAIResponses
-            && spec.source == ModelSource::BuiltIn
-            && Self::codex_catalog_allows(spec, catalog)
+    fn observe_codex_catalog(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) {
+        if catalog.is_some_and(|models| !models.contains(&spec.api_name)) {
+            tracing::debug!(
+                model = %spec.id,
+                "supported Codex model absent from advisory provider catalog"
+            );
+        }
     }
 
     /// Try to create a model service, validating prerequisites.
@@ -947,10 +945,7 @@ impl ModelRegistry {
             && spec.backend == ModelBackend::OpenAIResponses
             && spec.source == ModelSource::BuiltIn
         {
-            if !Self::codex_catalog_allows(spec, codex_catalog) {
-                tracing::debug!(model = %spec.id, "withholding account-scoped Codex model absent from the discovered catalog");
-                return None;
-            }
+            Self::observe_codex_catalog(spec, codex_catalog);
             let cred = config.codex_credential.as_ref()?;
             let bound_cred = Arc::new(AccountBoundCodexCredential::new(
                 Arc::clone(cred),
@@ -1646,9 +1641,10 @@ impl ModelRegistry {
                 account_id.clone(),
             ));
             for spec in Self::model_specs(&self.config) {
-                if !Self::codex_bridge_allows(&spec, codex_catalog) {
+                if !Self::is_codex_bridge_model(&spec) {
                     continue;
                 }
+                Self::observe_codex_catalog(&spec, codex_catalog);
                 let auth = LlmAuth::new(
                     Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                     AuthStyle::PlainBearer,
@@ -1815,42 +1811,27 @@ mod tests {
     }
 
     #[test]
-    fn astra_codex_registration_requires_account_catalog_membership() {
-        let spec = all_models()
-            .into_iter()
-            .find(|spec| spec.id == "gpt-6-astra")
-            .expect("Astra spec");
-        let absent = HashSet::from(["gpt-5.6-sol".to_string()]);
-        let present = HashSet::from(["gpt-6-astra".to_string()]);
+    fn supported_codex_builtins_register_when_advisory_catalog_is_absent_or_omits_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let unrelated = HashSet::from(["provider-model-unknown-to-phoenix".to_string()]);
 
-        assert!(!ModelRegistry::codex_catalog_allows(&spec, None));
-        assert!(!ModelRegistry::codex_catalog_allows(&spec, Some(&absent)));
-        assert!(ModelRegistry::codex_catalog_allows(&spec, Some(&present)));
-    }
-
-    #[test]
-    fn gpt6_sol_luna_codex_registration_requires_account_catalog_membership() {
-        let specs: Vec<_> = all_models()
-            .into_iter()
-            .filter(|spec| matches!(spec.id.as_str(), "gpt-6-sol" | "gpt-6-luna"))
-            .collect();
-        let absent = HashSet::from(["gpt-6-astra".to_string()]);
-        let present = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
-        for spec in specs {
-            assert!(!ModelRegistry::codex_catalog_allows(&spec, None));
-            assert!(!ModelRegistry::codex_catalog_allows(&spec, Some(&absent)));
-            assert!(ModelRegistry::codex_catalog_allows(&spec, Some(&present)));
+        for registry in [
+            ModelRegistry::new_with_codex_catalog(&config, None),
+            ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
+        ] {
+            for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+                assert!(
+                    registry.get(id).is_some(),
+                    "missing supported built-in {id}"
+                );
+            }
+            assert!(registry.get("provider-model-unknown-to-phoenix").is_none());
         }
-    }
-
-    #[test]
-    fn established_codex_models_remain_available_without_catalog_discovery() {
-        let spec = all_models()
-            .into_iter()
-            .find(|spec| spec.id == "gpt-5.6-sol")
-            .expect("GPT-5.6 Sol spec");
-
-        assert!(ModelRegistry::codex_catalog_allows(&spec, None));
     }
 
     #[test]
@@ -1923,14 +1904,15 @@ mod tests {
             codex_credential: Some(fake_codex_credential(&dir)),
             ..Default::default()
         };
-        let absent = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&HashSet::new()));
-        assert!(absent.get("gpt-6-astra").is_none());
-        assert!(absent.get("gpt-5.6-sol").is_some());
+        let omitted = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&HashSet::new()));
+        assert!(omitted.get("gpt-6-astra").is_some());
+        assert!(omitted.get("gpt-5.6-sol").is_some());
+        assert_eq!(omitted.context_window("gpt-6-astra"), 272_000);
 
         let catalog = HashSet::from(["gpt-6-astra".to_string()]);
-        let present = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&catalog));
-        assert!(present.get("gpt-6-astra").is_some());
-        assert_eq!(present.context_window("gpt-6-astra"), 272_000);
+        let listed = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&catalog));
+        assert!(listed.get("gpt-6-astra").is_some());
+        assert_eq!(listed.context_window("gpt-6-astra"), 272_000);
     }
 
     #[test]
@@ -1986,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt6_sol_luna_default_order_follows_catalog_availability() {
+    fn codex_default_order_is_independent_of_advisory_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
             use_codex_auth: true,
@@ -1997,11 +1979,11 @@ mod tests {
         let both = HashSet::from(["gpt-6-sol".to_string(), "gpt-6-luna".to_string()]);
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&only_luna)).default_model_id(),
-            "gpt-6-luna"
+            "gpt-6-astra"
         );
         assert_eq!(
             ModelRegistry::new_with_codex_catalog(&config, Some(&both)).default_model_id(),
-            "gpt-6-sol"
+            "gpt-6-astra"
         );
     }
 
@@ -2745,10 +2727,12 @@ mod tests {
                 .as_deref(),
             Some("acc-1")
         );
-        assert!(
-            registry.get("gpt-5.6-sol").is_some(),
-            "reload must register the OpenAI bridge"
-        );
+        for id in ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(
+                registry.get(id).is_some(),
+                "reload must register supported Codex built-in {id} without catalog discovery"
+            );
+        }
         assert!(
             registry.get("claude-sonnet-4-6").is_some(),
             "Anthropic models unaffected by reload"
@@ -2756,6 +2740,42 @@ mod tests {
         assert_eq!(
             registry.current_codex_loaded_path().as_deref(),
             Some(auth_path.as_path())
+        );
+    }
+
+    #[test]
+    fn reload_treats_omitting_catalog_as_advisory_and_does_not_register_unknown_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        let credential = fake_codex_credential(&dir);
+        let credential_with_account = (credential, Some("acc-1".to_string()));
+        let catalog = HashSet::from(["provider-model-unknown-to-phoenix".to_string()]);
+
+        let outcome = registry.reload_codex_credential_snapshot(
+            Some(dir.path().join("auth.json")),
+            Some(&credential_with_account),
+            Some(&catalog),
+        );
+
+        assert!(outcome.credential_loaded);
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(
+                registry.get(id).is_some(),
+                "missing supported built-in {id}"
+            );
+        }
+        assert!(registry.get("provider-model-unknown-to-phoenix").is_none());
+        assert_eq!(
+            registry
+                .current_codex_credential()
+                .expect("published credential")
+                .account_id()
+                .as_deref(),
+            Some("acc-1")
         );
     }
 
@@ -2916,7 +2936,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-5.6-sol");
+        assert_eq!(registry.default_model_id(), "gpt-6-astra");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that
