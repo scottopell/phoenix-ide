@@ -2055,12 +2055,6 @@ enum TaskApprovalExecution {
     DetachedApprovedTaskCheckpoint,
 }
 
-impl TaskApprovalExecution {
-    fn commits_state(self) -> bool {
-        matches!(self, Self::Initial | Self::FollowUp)
-    }
-}
-
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -3706,7 +3700,7 @@ where
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                 );
                 let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
-                    && task_approval_execution.is_some_and(TaskApprovalExecution::commits_state);
+                    && task_approval_execution.is_some();
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
                     && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
@@ -9129,24 +9123,51 @@ where
                 priority,
                 plan,
             );
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-            let seq = self.broadcast_tx.next_seq();
-            let msg = self
+            let approved_state = ConvState::LlmRequesting { attempt: 1 };
+            let state_updated_at = Utc::now();
+            let message = crate::db::Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: self.broadcast_tx.next_seq(),
+                message_type: crate::db::MessageType::User,
+                content: MessageContent::User(crate::db::UserContent::meta(&approval_msg)),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            };
+            let establishment = self
                 .storage
-                .add_message_with_seq(
-                    &msg_id,
+                .persist_approved_task_authority_and_state(
                     &self.context.conversation_id,
-                    seq,
-                    &content,
-                    None,
-                    None,
+                    &TaskApprovalHandoffData {
+                        task_id: reviewed.task_id,
+                        task_title: reviewed.task_title,
+                        title,
+                        priority,
+                        plan,
+                        task_file,
+                        artifact_body: reviewed.artifact_body,
+                    },
+                    &message,
+                    &approved_state,
+                    state_updated_at,
                 )
                 .await?;
+            if matches!(
+                establishment,
+                crate::db::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                admitted.close("detached_approval_authority_establishment");
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: detached task approval authority establishment is unclassified"
+                        .to_string(),
+                );
+            }
+            self.install_live_state(approved_state, state_updated_at, true)?;
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
-                .persisted_message(msg);
+                .persisted_message(message);
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -16254,6 +16275,58 @@ mod approved_explore_follow_up_tests {
             )
             .await
             .expect("existing approved objective");
+    }
+
+    #[tokio::test]
+    async fn detached_checkpoint_atomically_settles_approval() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "detached-approved-checkpoint",
+            "detached-approved-checkpoint-branch",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72005-p1-ready--detached-checkpoint.md";
+        let plan = "# Detached checkpoint\n\nContinue in this worktree.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let worktree_path = worktree.display().to_string();
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, plan, storage.clone(), broadcast_tx);
+        runtime.context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path,
+            task_id: "72005".to_string(),
+            task_title: "Detached checkpoint".to_string(),
+        });
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let execution = runtime.resolve_task_approval_execution().await.unwrap();
+        assert_eq!(
+            execution,
+            TaskApprovalExecution::DetachedApprovedTaskCheckpoint
+        );
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Detached checkpoint".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                execution,
+                &mut admitted,
+            )
+            .await
+            .expect("detached checkpoint approval");
+
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let objective = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("detached checkpoint objective");
+        assert_eq!(objective.task_id, "72005");
+        assert_eq!(objective.task_file, task_file);
     }
 
     #[test]
