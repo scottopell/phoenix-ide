@@ -21,7 +21,7 @@ expected_build_identity() {
   fi
   [ -n "$repository_root" ] || return 1
   version="$(/usr/bin/grep -m1 '^version' "$repository_root/crates/phoenix-ide/Cargo.toml" | /usr/bin/sed 's/version = "\(.*\)"/\1/')"
-  git_sha="$(git -C "$repository_root" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)"
+  git_sha="$(git -C "$repository_root" rev-parse HEAD 2>/dev/null || printf unknown)"
   if [ "$git_sha" != unknown ] && [ -n "$(git -C "$repository_root" status --porcelain 2>/dev/null)" ]; then
     git_sha="$git_sha-dirty"
   fi
@@ -38,7 +38,7 @@ validate_packaged_sidecar() {
     echo "error: packaged sidecar does not expose Phoenix build identity" >&2
     return 1
   }
-  printf '%s' "$build_identity" | /usr/bin/grep -Eq '^\{"version":"[^"]+","git_sha":"(unknown|[0-9a-f]{12,40}(-dirty)?)"\}$' || {
+  printf '%s' "$build_identity" | /usr/bin/grep -Eq '^\{"version":"[^"]+","git_sha":"(unknown|[0-9a-f]{40}(-dirty)?)"\}$' || {
     echo "error: packaged sidecar returned invalid Phoenix build identity" >&2
     return 1
   }

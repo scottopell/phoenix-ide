@@ -20,6 +20,10 @@ RESTART_HELPER = ROOT / "scripts/launchd_restart_helper.py"
 LIVE_LABEL = "com.phoenix-ide.server"
 LIVE_PORT = 8031
 LIVE_HOME = Path.home() / ".phoenix-ide"
+CANDIDATE_COMMIT = "b" * 40
+PREVIOUS_DEPLOYED_COMMIT = "a" * 40
+LEGACY_ROLLBACK_RUNTIME_SHA = "a" * 12
+RESTART_COMMIT = "c" * 40
 TERMINAL = {
     "committed",
     "activation_failed_rolled_back",
@@ -192,14 +196,34 @@ def launchd_pid(domain, label):
     raise RuntimeError(f"launchd job has no PID: {label}")
 
 
+def deployment_identity_fixture(*, healthy_candidate):
+    previous_runtime_sha = (
+        PREVIOUS_DEPLOYED_COMMIT if healthy_candidate else LEGACY_ROLLBACK_RUNTIME_SHA
+    )
+    return {
+        "source_commit": CANDIDATE_COMMIT,
+        "expected": {"version": "2.0.0", "git_sha": CANDIDATE_COMMIT},
+        "previous": {"version": "1.0.0", "git_sha": previous_runtime_sha},
+        "previous_deployed_sha": PREVIOUS_DEPLOYED_COMMIT,
+    }
+
+
+def restart_identity_fixture():
+    return {
+        "expected": {"version": "2.0.0", "git_sha": RESTART_COMMIT},
+        "deployed_sha": RESTART_COMMIT,
+    }
+
+
 def run_scenario(root, domain, *, healthy_candidate, expected_state):
     suffix = uuid.uuid4().hex
     target_label = f"test.phoenix-ide.server.{suffix}"
     helper_label = f"test.phoenix-ide.deploy.{suffix}"
     port = allocate_port()
     refuse_live(target_label, root, port)
-    old_identity = {"version": "1.0.0", "git_sha": "oldsha"}
-    new_identity = {"version": "2.0.0", "git_sha": "newsha"}
+    identity_fixture = deployment_identity_fixture(healthy_candidate=healthy_candidate)
+    old_identity = identity_fixture["previous"]
+    new_identity = identity_fixture["expected"]
     target_binary = root / f"phoenix-{suffix}"
     target_binary.write_text(server_script(old_identity)); target_binary.chmod(0o755)
     target_plist_path = root / f"target-{suffix}.plist"
@@ -220,9 +244,10 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
     url = f"http://127.0.0.1:{port}/api/version"
     manifest = {
         "manifest_version": 1,
-        "transaction_id": suffix, "source_kind": "local_head", "source_commit": "newsha",
+        "transaction_id": suffix, "source_kind": "local_head",
+        "source_commit": identity_fixture["source_commit"],
         "release_tag": None, "release_commit": None, "expected": new_identity, "previous": old_identity,
-        "previous_deployed_sha": "oldsha",
+        "previous_deployed_sha": identity_fixture["previous_deployed_sha"],
         "candidate_binary": str(candidate_binary), "candidate_binary_sha256": digest(candidate_binary),
         "candidate_plist": str(candidate_plist), "candidate_plist_sha256": digest(candidate_plist),
         "rollback_binary": str(rollback_binary), "rollback_binary_sha256": digest(rollback_binary),
@@ -271,13 +296,13 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
         wait_unloaded(domain, helper_label, time.monotonic() + 5)
         if expected_state == "committed":
             wait_identity(url, new_identity, time.monotonic() + 3)
-            if Path(manifest["deployed_sha_path"]).read_text().strip() != "newsha":
+            if Path(manifest["deployed_sha_path"]).read_text().strip() != CANDIDATE_COMMIT:
                 raise RuntimeError("committed SHA does not match candidate")
         else:
             wait_identity(url, old_identity, time.monotonic() + 3)
             if digest(target_binary) != old_binary_hash or digest(target_plist_path) != old_plist_hash:
                 raise RuntimeError("rollback did not restore exact binary and plist")
-            if Path(manifest["deployed_sha_path"]).read_text().strip() != "oldsha":
+            if Path(manifest["deployed_sha_path"]).read_text().strip() != PREVIOUS_DEPLOYED_COMMIT:
                 raise RuntimeError("failed candidate did not restore previous deployed.sha")
         print(f"PASS: {expected_state} after external SIGKILL of initiating process group")
     finally:
@@ -291,7 +316,8 @@ def run_restart_scenario(root, domain):
     helper_label = f"test.phoenix-ide.restart-helper.{suffix}"
     port = allocate_port()
     refuse_live(target_label, root, port)
-    identity = {"version": "2.0.0", "git_sha": "a" * 12}
+    identity_fixture = restart_identity_fixture()
+    identity = identity_fixture["expected"]
     runtime = {**identity, "socket_activated": True}
     target_binary = root / f"restart-phoenix-{suffix}"
     target_binary.write_text(socket_activated_server_script(identity))
@@ -304,7 +330,7 @@ def run_restart_scenario(root, domain):
         root / f"restart-target-{suffix}.log",
     ))
     deployed_sha = root / f"restart-deployed-{suffix}.sha"
-    deployed_sha.write_text("a" * 40 + "\n")
+    deployed_sha.write_text(identity_fixture["deployed_sha"] + "\n")
     original_hashes = {
         target_binary: digest(target_binary),
         target_plist_path: digest(target_plist_path),

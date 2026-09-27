@@ -2,12 +2,12 @@
 # Open a release bump PR. Merging it triggers the build + tag + publish.
 #
 # Usage:
-#   ./scripts/tag-release.sh          # auto-bump minor: 0.1.0 -> 0.2.0
-#   ./scripts/tag-release.sh v1.0.0   # explicit version (v-prefix optional)
+#   ./scripts/tag-release.sh                # stable -> next patch; RC -> next RC
+#   ./scripts/tag-release.sh v1.0.0-rc.1    # explicit version (v-prefix optional)
 #
 # This bumps crates/phoenix-ide/Cargo.toml, commits on a branch, and opens a
 # PR. It does NOT create or push a tag: the .github/workflows/release.yml
-# workflow fires when the bump lands on `main`, then creates the `vX.Y.Z` tag
+# workflow fires when the bump lands on `main`, then creates the release tag
 # at that main commit and builds the release. That keeps the tag always on
 # `main` and always `v`-prefixed by construction. Merge the PR to release.
 #
@@ -18,6 +18,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERSION_HELPER="$ROOT/scripts/release_version.py"
 
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
@@ -28,19 +29,20 @@ DIRTY=$(git -C "$ROOT" status --porcelain)
 
 git -C "$ROOT" fetch origin main --quiet
 
+remote_release_tags() {
+    git -C "$ROOT" ls-remote --refs --tags origin 'v*' \
+        | awk '{sub("refs/tags/", "", $2); print $2}'
+}
+
 # Resolve the target version (strip an optional leading v).
 if [[ -n "${1:-}" ]]; then
     VERSION="${1#v}"
-    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version must be X.Y.Z (got: $1)"
+    VERSION=$(remote_release_tags | python3 "$VERSION_HELPER" validate-new-from-tags "$VERSION") \
+        || die "Version must be newer than every supported release and use X.Y.Z or X.Y.Z-rc.N syntax (got: $1)"
 else
-    LATEST=$(git -C "$ROOT" tag --sort=-v:refname | grep -m1 '^v[0-9]' || echo "")
-    if [[ -z "$LATEST" ]]; then
-        VERSION="0.1.0"
-    else
-        IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
-        VERSION="${MAJOR}.$((MINOR + 1)).0"
-    fi
-    info "Latest tag: ${LATEST:-none} -> v$VERSION"
+    VERSION=$(remote_release_tags | python3 "$VERSION_HELPER" next-from-tags) \
+        || die "Release tags cannot be bumped automatically"
+    info "Next supported version: v$VERSION"
 fi
 
 TAG="v$VERSION"

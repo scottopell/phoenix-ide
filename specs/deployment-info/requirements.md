@@ -81,20 +81,33 @@ resolution path.
 THE SYSTEM SHALL display:
 
 - The application version (the crate version, e.g. `0.8.1`)
-- The build identifier (the git short SHA compiled into the binary)
+- The build identifier compiled into the binary: a full 40-character lowercase
+  git commit SHA when the commit is known, with an optional `-dirty` suffix for
+  a locally modified build
 - Process uptime
 - The wall-clock time the process started
 
+THE SYSTEM SHALL preserve the complete embedded build identifier in deployment
+and version APIs.
+
+WHEN a presentation surface abbreviates a known git SHA for visual display
+THE SYSTEM SHALL limit that abbreviation to presentation
+AND SHALL retain the complete embedded build identifier in the element title
+and accessible name.
+
 WHEN the build identifier is unavailable at compile time
 THE SYSTEM SHALL display the build identifier as `unknown` rather than omitting
-the field
+the field.
 
 **Rationale:** "Which build is this?" is the first question when a deployment
 misbehaves. Version alone is ambiguous across rebuilds of the same version; the
-git SHA pins the exact source. Uptime plus start time together answer "did it
-just restart?" without forcing the reader to do clock arithmetic. The `unknown`
-sentinel is preserved from the build's own contract so a missing SHA reads as a
-known-absent value, not a rendering bug.
+full git SHA pins the exact source without relying on prefix uniqueness. A
+12-character prefix remains useful for compact visual scanning, while API,
+title, and accessibility consumers retain the authoritative identity. Uptime
+plus start time together answer "did it just restart?" without forcing the
+reader to do clock arithmetic. The `unknown` sentinel is preserved from the
+build's own contract so a missing SHA reads as a known-absent value, not a
+rendering bug.
 
 ---
 

@@ -94,8 +94,22 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD after required checks and compilation,
---   or release source is one resolved tag and commit with a host-target asset,
---   matching checksum, package version, and embedded full git SHA.
+--   or release source is one resolved tag and commit with a host-target asset
+--   matching its checksum and package version. A latest selection resolves to
+--   stable tag and metadata; an exact RC selection has matching tag, prerelease
+--   metadata, full embedded version, and commit. In either case expected.git_sha
+--   is exactly source_commit, both are 40 lowercase hexadecimal characters,
+--   and no prefix match establishes candidate identity.
+-- previous_rollback_identity_is_valid(transaction) -> Boolean
+--   No previous runtime exists, or previous is the identity captured from the
+--   already-installed rollback artifact and its git_sha is exactly 12 or 40
+--   lowercase hexadecimal characters. The 12-character form is valid only for
+--   this predecessor rollback role, not for a candidate or controller.
+-- selected_supervisor_artifact_matches_running(transaction) -> Boolean
+--   No bare supervisor is running, or the startup-bound source digest reported
+--   by the running supervisor equals the supervisor artifact selected by this
+--   transaction. Protocol equality and on-disk file equality alone do not
+--   satisfy this predicate.
 -- preparation_complete(transaction) -> Boolean
 --   Candidate, backend configuration, one environment snapshot, rollback
 --   inputs, identities, endpoints, destination reservations, hashes,
@@ -118,13 +132,20 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   Fsynced destination-filesystem copies replaced all candidate targets by
 --   atomic rename without first unlinking a live path.
 -- exact_candidate_running(transaction) -> Boolean
---   A new backend-owned process serves the exact expected version and full
---   git SHA; bare Linux also matches the supervisor child PID and proc start.
+--   A new backend-owned process serves the exact expected version and complete
+--   40-character git SHA, expected.git_sha equals source_commit, and bare Linux
+--   also matches the supervisor child PID and proc start.
 -- exact_previous_restored(transaction) -> Boolean
---   Previous artifacts, environment, service state, deployed SHA, endpoint,
---   and exact runtime identity have been restored and verified.
+--   Previous runtime artifacts, environment, service state, deployed SHA,
+--   endpoint, and captured runtime identity have been restored and verified;
+--   the identity may use the rollback-only 12-character legacy form admitted by
+--   previous_rollback_identity_is_valid(transaction). No database is restored
+--   or verified by this predicate.
 -- durable_terminal_status_exists(transaction) -> Boolean
 --   Redacted status durably records transaction's terminal state.
+-- DeploymentRequestRejectedBeforeTransaction(transaction)
+--   The request returns an actionable refusal before a deployment claim or
+--   durable transaction exists.
 -- installed_environment_is_snapshot(transaction) -> Boolean
 --   The installed environment is the single snapshot used by preflight and
 --   endpoint selection, not a competing override layer.
@@ -134,6 +155,8 @@ rule PrepareCandidate {
     requires: transaction.state = preparing
     requires: claim_available(transaction)
     requires: selected_source_is_valid(transaction)
+    requires: previous_rollback_identity_is_valid(transaction)
+    requires: selected_supervisor_artifact_matches_running(transaction)
     ensures: DeploymentClaim.created(
         transaction: transaction,
         generation: transaction.claim_generation,
@@ -192,10 +215,22 @@ rule SystemdActivationHandedOff {
     ensures: transaction.state = handed_off
 }
 
+rule RejectChangedRunningBareSupervisor {
+    when: DeploymentRequested(transaction)
+    requires: transaction.state = preparing
+    requires: transaction.backend = bare_linux
+    requires: BareSupervisorRunning(transaction)
+    requires: not selected_supervisor_artifact_matches_running(transaction)
+    ensures: ProductionStateUnchanged(transaction)
+    ensures: BareSupervisorRemainsRunning(transaction)
+    ensures: DeploymentRequestRejectedBeforeTransaction(transaction)
+}
+
 rule BareLinuxActivationHandedOff {
     when: transaction: DeployTransaction.state transitions_to prepared
     requires: transaction.backend = bare_linux
     requires: preparation_complete(transaction)
+    requires: selected_supervisor_artifact_matches_running(transaction)
     requires: SupervisorPeerUidMatchesOwner(transaction)
     ensures: BareLinuxHandoff.created(
         transaction: transaction,
@@ -235,6 +270,8 @@ rule RollBackFailedActivation {
     ensures: transaction.state = activation_failed_rolled_back
     ensures: transaction.failure = failure
     ensures: DurableStatusWritten(transaction)
+    ensures: RuntimeArtifactRollbackRecorded(transaction)
+    ensures: not DatabaseRollbackClaimed(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
@@ -287,6 +324,32 @@ rule BareStopPreservesSupervisor {
     requires: transaction.backend = bare_linux
     ensures: ManagedPhoenixChildStopped(transaction)
     ensures: BareSupervisorRemainsRunning(transaction)
+}
+
+invariant CandidateIdentityIsFullAndExact {
+    for transaction in DeployTransactions:
+        transaction.state in { prepared, handed_off, activating, committed } implies
+            selected_source_is_valid(transaction)
+}
+
+invariant LegacyIdentityIsRollbackOnly {
+    for transaction in DeployTransactions:
+        transaction.previous != null implies
+            previous_rollback_identity_is_valid(transaction)
+}
+
+invariant AutomatedRollbackDoesNotClaimDatabaseRecovery {
+    for transaction in DeployTransactions:
+        transaction.state = activation_failed_rolled_back implies
+            RuntimeArtifactRollbackRecorded(transaction)
+            and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant BareSupervisorChangeFailsBeforeDisruption {
+    for transaction in DeployTransactions:
+        transaction.backend = bare_linux
+        and not selected_supervisor_artifact_matches_running(transaction) implies
+            not RuntimeDisruptionStarted(transaction)
 }
 
 invariant ActiveClaimMatchesTransactionGeneration {
