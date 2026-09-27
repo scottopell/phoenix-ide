@@ -156,13 +156,6 @@ const EFFORT_LEVELS_GPT_55_PLUS: &[ModelEffort] = &[
     ModelEffort::Xhigh,
     ModelEffort::Max,
 ];
-const EFFORT_LEVELS_GPT_54: &[ModelEffort] = &[
-    ModelEffort::None,
-    ModelEffort::Low,
-    ModelEffort::Medium,
-    ModelEffort::High,
-    ModelEffort::Xhigh,
-];
 const EFFORT_LEVELS_GPT_6_ASTRA: &[ModelEffort] = &[
     ModelEffort::Low,
     ModelEffort::Medium,
@@ -188,10 +181,6 @@ fn effort_anthropic_opus_55() -> EffortCapabilities {
 
 fn effort_gpt_55_plus() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
-}
-
-fn effort_gpt_54() -> EffortCapabilities {
-    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_54, ModelEffort::None)
 }
 
 fn effort_gpt_6_astra() -> EffortCapabilities {
@@ -850,51 +839,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
-        ModelSpec {
-            id: "gpt-5.5".into(),
-            api_name: "gpt-5.5".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.5 (frontier, 1M context)".into(),
-            context_window: 1_000_000,
-            max_output_tokens: None,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_55_plus(),
-            service_tier_capabilities: ServiceTierCapabilities::Supported,
-        },
-        ModelSpec {
-            id: "gpt-5.4".into(),
-            api_name: "gpt-5.4".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.4 (frontier, native computer use)".into(),
-            context_window: 400_000,
-            max_output_tokens: None,
-            recommended: false,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_54(),
-            service_tier_capabilities: ServiceTierCapabilities::Supported,
-        },
-        ModelSpec {
-            id: "gpt-5.4-mini".into(),
-            api_name: "gpt-5.4-mini".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.4 Mini (fast, efficient)".into(),
-            context_window: 400_000,
-            max_output_tokens: None,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_54(),
-            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
-        },
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
@@ -1007,14 +951,28 @@ mod tests {
             by_id("gpt-5.6-sol").effort_capabilities,
             effort_gpt_55_plus()
         );
-        assert_eq!(by_id("gpt-5.4-mini").effort_capabilities, effort_gpt_54());
         assert!(by_id("gpt-5.6-sol")
             .effort_capabilities
             .supports(ModelEffort::Max));
-        assert!(!by_id("gpt-5.4-mini")
-            .effort_capabilities
-            .supports(ModelEffort::Max));
-        assert!(models.iter().all(|model| model.id != "gpt-5.3-codex"));
+        let openai_builtins = models
+            .iter()
+            .filter(|model| {
+                model.backend == ModelBackend::OpenAIResponses
+                    && model.source == ModelSource::BuiltIn
+            })
+            .map(|model| model.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            openai_builtins,
+            std::collections::BTreeSet::from([
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+            ])
+        );
     }
 
     #[test]

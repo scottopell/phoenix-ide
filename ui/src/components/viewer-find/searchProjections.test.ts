@@ -398,12 +398,14 @@ describe('typed semantic display projections', () => {
         { agent_id: 'timeout', task: 'Slow task', outcome: { type: 'timed_out', partial_result: '' } },
         { agent_id: 'failed', task: 'Broken task', outcome: { type: 'failure', error: '' } },
         { agent_id: 'success', task: 'Done task', outcome: { type: 'success', result: '' } },
+        { agent_id: 'implicit', task: 'Grace task', outcome: { type: 'implicit_completion', result: '' } },
       ],
     }, 'spawn-1');
     expect(fragments.map((fragment) => fragment.semanticText)).toEqual([
       'Slow task\nTimed out: sub-agent exceeded its time limit',
       'Broken task\nFailed',
       'Done task\nCompleted successfully',
+      'Grace task\nCompleted',
     ]);
   });
 });

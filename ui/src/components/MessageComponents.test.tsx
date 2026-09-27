@@ -3,7 +3,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -3139,6 +3139,28 @@ describe('SubAgentStatus inline activity', () => {
     expect(screen.getByText(/Done without collapsing/)).toBeInTheDocument();
   });
 
+  it('renders implicit completion as successful with its exact result', () => {
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [],
+      completed_results: [{
+        agent_id: 'agent-1',
+        task: 'Finish during grace turn',
+        outcome: { type: 'implicit_completion', result: 'Exact grace-turn result.' },
+      }],
+    };
+
+    const { container } = render(
+      <MemoryRouter>
+        <SubAgentStatus stateData={state} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('completed')).toBeInTheDocument();
+    expect(screen.getByText('Exact grace-turn result.')).toBeInTheDocument();
+    expect(container.querySelector('.subagent-item.implicit-completion .subagent-icon svg')).not.toBeNull();
+  });
+
   it('renders timeout as a distinct state', async () => {
     const state: ConversationState = {
       type: 'awaiting_sub_agents',
@@ -3158,6 +3180,33 @@ describe('SubAgentStatus inline activity', () => {
 
     expect(screen.getByText('timed out')).toBeInTheDocument();
     expect(screen.getByText(/exceeded its time limit/)).toBeInTheDocument();
+  });
+});
+
+describe('sub-agent persistent summary', () => {
+  it('counts success and implicit completion together in a mixed summary', () => {
+    const block: ContentBlock = { type: 'tool_use', id: 'spawn-mixed', name: 'spawn_agents', input: { tasks: [] } };
+    const result = toolMessage('spawn-mixed', 'Sub-agent results', 2, {
+      type: 'subagent_summary',
+      results: [
+        { agent_id: 'success', task: 'Success task', outcome: { type: 'success', result: 'Success result' } },
+        { agent_id: 'implicit', task: 'Grace task', outcome: { type: 'implicit_completion', result: 'Grace result' } },
+        { agent_id: 'failed', task: 'Failure task', outcome: { type: 'failure', error: 'Failure result' } },
+        { agent_id: 'timeout', task: 'Timeout task', outcome: { type: 'timed_out' } },
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ToolUseBlock block={block} result={result} onOpenFile={undefined} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.subagent-summary-stats .success')).toHaveTextContent('2');
+    expect(container.querySelectorAll('.subagent-summary-stats .error')).toHaveLength(2);
+    expect(screen.getByText('Grace result')).toBeInTheDocument();
+    expect(within(container.querySelector('.subagent-item.implicit-completion') as HTMLElement).getByText('completed')).toBeInTheDocument();
+    expect(container.querySelector('.subagent-item.implicit-completion .subagent-icon svg')).not.toBeNull();
   });
 });
 

@@ -433,6 +433,10 @@ pub enum Event {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
     },
+    /// Starts an admitted sub-agent whose initial user message is already durable.
+    PersistedSubAgentBootstrap,
+    /// Retries exact buffered child outcomes after a transient acceptance read failure.
+    RetryBufferedSubAgentResults,
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
@@ -657,6 +661,8 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
+            Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -698,9 +704,10 @@ impl Event {
 /// forced teardown (task 61004). `UserRequested` is a human-initiated or
 /// parent-propagated cancel; `Timeout` is the parent's sub-agent completion
 /// timeout forcing teardown.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
+    #[default]
     UserRequested,
     Timeout,
 }
@@ -818,6 +825,7 @@ pub enum ParentOnlyEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum SubAgentOnlyEvent {
+    PersistedBootstrap,
     GraceTurnExhausted { result: Option<String> },
 }
 
@@ -892,6 +900,14 @@ impl TryFrom<Event> for ParentEvent {
                     authority,
                 }))
             }
+            Event::PersistedSubAgentBootstrap => Err(EventConversionError {
+                event_variant: "PersistedSubAgentBootstrap",
+                target_type: "ParentEvent",
+            }),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "ParentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -1173,6 +1189,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 }))
             }
             // Sub-agent-only events
+            Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
+                SubAgentOnlyEvent::PersistedBootstrap,
+            )),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "SubAgentEvent",
+            }),
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
@@ -1255,6 +1278,7 @@ impl SubAgentEvent {
         match self {
             SubAgentEvent::Core(e) => e.variant_name(),
             SubAgentEvent::SubAgent(e) => match e {
+                SubAgentOnlyEvent::PersistedBootstrap => "PersistedSubAgentBootstrap",
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }

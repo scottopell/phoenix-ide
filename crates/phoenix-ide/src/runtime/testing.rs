@@ -562,6 +562,16 @@ pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    sub_agent_terminals: Mutex<
+        HashMap<
+            String,
+            (
+                phoenix_db::SubAgentTerminalCause,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >,
+    >,
+    sub_agent_acceptances: Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
@@ -609,6 +619,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -633,6 +644,8 @@ impl InMemoryStorage {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
+            sub_agent_terminals: Mutex::new(HashMap::new()),
+            sub_agent_acceptances: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
@@ -674,6 +687,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -711,6 +725,14 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn fail_sub_agent_acceptance_once(&self) {
+        *self.fail_sub_agent_acceptance_once.lock().unwrap() = true;
+    }
+
+    pub fn sub_agent_acceptance_count(&self) -> usize {
+        self.sub_agent_acceptances.lock().unwrap().len()
     }
 
     pub fn set_fail_message_add(&self, fail: bool) {
@@ -1898,6 +1920,41 @@ impl StateStore for InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), state.clone());
+        Ok(())
+    }
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_terminals
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), (cause, terminal_at));
+        Ok(())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_conversation_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_sub_agent_acceptance_once.lock().unwrap()) {
+            return Err("injected sub-agent acceptance failure".to_string());
+        }
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_acceptances.lock().unwrap().insert(
+            child_conversation_id.to_string(),
+            (conv_id.to_string(), accepted_at),
+        );
         Ok(())
     }
 
@@ -4662,6 +4719,7 @@ mod tests {
         );
         let initial_state = ConvState::CancellingTool {
             tool_use_id: "wedged-tool".to_string(),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
             skipped_tools: vec![],
             completed_results: vec![],
             assistant_message,
@@ -4682,7 +4740,12 @@ mod tests {
             event_tx,
             broadcast_tx,
         )
-        .with_parent(parent_tx);
+        .with_parent_dispatch(
+            "parent-conv".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        );
 
         tokio::spawn(async move { runtime.run().await });
 
