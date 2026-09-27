@@ -1,5 +1,7 @@
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -75,7 +77,7 @@ class ProcBsdInfo(ctypes.Structure):
         ("start_tvsec", ctypes.c_uint64), ("start_tvusec", ctypes.c_uint64),
     ]
 
-def process(pid):
+def process(pid, timeout=0.5):
     try:
         if sys.platform.startswith("linux"):
             stat = Path(f"/proc/{pid}/stat").read_text()
@@ -94,7 +96,7 @@ def process(pid):
             capture_output=True,
             check=False,
             text=True,
-            timeout=0.5,
+            timeout=timeout,
         )
         birth = info.start_tvsec * 1_000_000 + info.start_tvusec
         return str(birth), info.status == 5, result.stdout.split()
@@ -108,6 +110,8 @@ def pid_exists(pid):
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    except OverflowError:
         return True
 
 def birth(pid):
@@ -137,10 +141,16 @@ def publish_response(path, value):
     pending.write_text(value)
     os.replace(pending, path)
 
+class DeadlineExpired(RuntimeError):
+    pass
+
+class IdentityOutputError(RuntimeError):
+    pass
+
 def remaining_timeout(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RuntimeError("tmux identity registration deadline expired")
+        raise DeadlineExpired("tmux identity registration deadline expired")
     return min(0.5, remaining)
 
 def query_control_processes(control, deadline):
@@ -159,8 +169,12 @@ def query_control_processes(control, deadline):
     if (server.returncode != 0 or panes.returncode != 0 or not pane_pids
             or not server_pid.isascii() or not server_pid.isdecimal()
             or any(not pid.isascii() or not pid.isdecimal() for pid in pane_pids)):
-        raise RuntimeError("tmux identity output was malformed")
-    return int(server_pid), tuple(dict.fromkeys(int(pid) for pid in pane_pids))
+        raise IdentityOutputError("tmux identity output was malformed")
+    server_pid = int(server_pid)
+    pane_pids = tuple(dict.fromkeys(int(pid) for pid in pane_pids))
+    if server_pid > 2_147_483_647 or any(pid > 2_147_483_647 for pid in pane_pids):
+        raise IdentityOutputError("tmux identity PID was out of range")
+    return server_pid, pane_pids
 
 def observe_control(control, expected_token, deadline):
     last_error = RuntimeError("tmux identity query did not run")
@@ -216,19 +230,41 @@ def record_cleanup_failure(reason, terminal):
     records = []
     bounded_owned, omitted_records = capped(owned, 16)
     omitted_processes = 0
+    probe_deadline = time.monotonic() + 0.25
     for socket, device, inode, control, processes in bounded_owned:
         bounded_processes, omitted = capped(processes, 32)
         omitted_processes += omitted
+        process_records = []
+        for identity in bounded_processes:
+            remaining = probe_deadline - time.monotonic()
+            if remaining <= 0:
+                state = "probe-budget-exhausted"
+            else:
+                observed = process(identity[0], min(0.05, remaining))
+                if observed is None:
+                    state = "unverifiable" if pid_exists(identity[0]) else "absent"
+                elif observed[0] != identity[1]:
+                    state = "mismatched"
+                elif observed[1]:
+                    state = "absent"
+                elif identity[2] is None:
+                    state = "owned"
+                else:
+                    token_bytes = f"PHOENIX_TMUX_SERVER_TOKEN={identity[2]}".encode()
+                    state = "owned" if any(
+                        value == token_bytes or value == token_bytes.decode()
+                        for value in observed[2]
+                    ) else "mismatched"
+            process_records.append({
+                "pid": identity[0], "birth": identity[1], "state": state
+            })
         records.append({
             "socket": socket.name,
             "control": control.name,
             "socket_identity": path_identity(socket),
             "control_identity": path_identity(control),
             "expected_identity": [device, inode],
-            "processes": [
-                {"pid": identity[0], "birth": identity[1], "state": identity_state(identity)}
-                for identity in bounded_processes
-            ],
+            "processes": process_records,
         })
     visible_paths, omitted_visible_paths = capped(
         sorted(path.name for path in preserved_visible_paths), 32
@@ -451,8 +487,14 @@ def retire_record(record, deadline):
     except subprocess.TimeoutExpired:
         set_cleanup_record_status(control, "subprocess", "timeout")
         return None
-    except RuntimeError:
+    except DeadlineExpired:
         set_cleanup_record_status(control, "subprocess", "deadline-expired")
+        return None
+    except IdentityOutputError as error:
+        set_cleanup_record_status(control, "query", str(error))
+        return None
+    except RuntimeError as error:
+        set_cleanup_record_status(control, "runtime", str(error))
         return None
     except OSError:
         set_cleanup_record_status(control, "subprocess", "os-error")
@@ -1268,6 +1310,7 @@ fail_cleanup("cleanup-deadline-expired", terminal)
 /// Owns real tmux servers created by tests, including after abrupt runner death.
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
+    root_anchor: Option<fs::File>,
     control_root: Option<TempDir>,
     watchdog: Option<Child>,
     heartbeat_stop: Arc<AtomicBool>,
@@ -1317,6 +1360,31 @@ fn configure_watchdog_env(
     set_path_env(command, "PHOENIX_TMUX_COMPLETION_HOOK", lifecycle_hooks.3);
 }
 
+fn read_cleanup_receipt(root_anchor: &fs::File) -> io::Result<String> {
+    let name = CString::new(".cleanup-failure.json").expect("static receipt name has no NUL");
+    let descriptor = unsafe {
+        libc::openat(
+            root_anchor.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("cleanup receipt is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(16_385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16_384 {
+        bytes.truncate(16_384);
+        bytes.extend_from_slice(b"...[truncated]");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl TestTmuxServerOwner {
     /// Creates an isolated short socket root and its detached cleanup watchdog.
     ///
@@ -1363,6 +1431,7 @@ impl TestTmuxServerOwner {
             .or_else(|_| tempfile::Builder::new().prefix("ptt-").tempdir_in("/tmp"))
             .expect("create short isolated tmux test root");
         let canonical_root = root.path().canonicalize().expect("canonicalize test root");
+        let root_anchor = fs::File::open(&canonical_root).expect("open anchored tmux test root");
         let control_root = tempfile::Builder::new()
             .prefix("ptw-")
             .tempdir_in(canonical_root.parent().expect("test root has parent"))
@@ -1435,6 +1504,7 @@ impl TestTmuxServerOwner {
 
         Self {
             root: Some(root),
+            root_anchor: Some(root_anchor),
             control_root: Some(control_root),
             watchdog: Some(watchdog),
             heartbeat_stop,
@@ -1487,6 +1557,7 @@ impl TestTmuxServerOwner {
 
     fn finish(&mut self, graceful: bool) -> io::Result<()> {
         let root = self.root.take().expect("owner root is live");
+        let root_anchor = self.root_anchor.take().expect("owner root anchor is live");
         let control_root = self
             .control_root
             .take()
@@ -1501,16 +1572,7 @@ impl TestTmuxServerOwner {
 
         let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
             if !status.success() {
-                let receipt = fs::File::open(root_path.join(".cleanup-failure.json"))
-                    .and_then(|file| {
-                        let mut bytes = Vec::new();
-                        file.take(16_385).read_to_end(&mut bytes)?;
-                        if bytes.len() > 16_384 {
-                            bytes.truncate(16_384);
-                            bytes.extend_from_slice(b"...[truncated]");
-                        }
-                        Ok(String::from_utf8_lossy(&bytes).into_owned())
-                    })
+                let receipt = read_cleanup_receipt(&root_anchor)
                     .unwrap_or_else(|error| format!("unavailable ({error})"));
                 return Err(io::Error::other(format!(
                     "tmux test watchdog reported cleanup failure: {status}; receipt: {receipt}"
@@ -2064,6 +2126,40 @@ mod tests {
     use std::process::ExitStatus;
 
     use super::*;
+
+    #[test]
+    fn watchdog_identity_protocol_rejects_out_of_range_pids_and_classifies_query_errors() {
+        assert!(WATCHDOG_PROGRAM.contains("server_pid > 2_147_483_647"));
+        assert!(WATCHDOG_PROGRAM.contains("pid > 2_147_483_647 for pid in pane_pids"));
+        assert!(WATCHDOG_PROGRAM.contains("except IdentityOutputError as error:"));
+        assert!(
+            WATCHDOG_PROGRAM.contains("set_cleanup_record_status(control, \"query\", str(error))")
+        );
+        assert!(WATCHDOG_PROGRAM.contains("except DeadlineExpired:"));
+    }
+
+    #[test]
+    fn cleanup_receipt_reader_is_anchored_and_bounded() {
+        let root = TempDir::new().unwrap();
+        let anchor = fs::File::open(root.path()).unwrap();
+        fs::write(
+            root.path().join(".cleanup-failure.json"),
+            vec![b'x'; 20_000],
+        )
+        .unwrap();
+        let replacement = root.path().with_extension("replacement");
+        fs::rename(root.path(), &replacement).unwrap();
+        fs::create_dir(root.path()).unwrap();
+        fs::write(root.path().join(".cleanup-failure.json"), b"forged").unwrap();
+
+        let receipt = read_cleanup_receipt(&anchor).unwrap();
+
+        assert!(!receipt.contains("forged"));
+        assert!(receipt.ends_with("...[truncated]"));
+        fs::remove_dir_all(root.path()).unwrap();
+        fs::remove_dir_all(replacement).unwrap();
+        std::mem::forget(root);
+    }
 
     #[test]
     fn process_identity_parser_accepts_exact_tmux_form_and_rejects_malformed_output() {
@@ -4630,7 +4726,8 @@ mod tests {
         assert!(WATCHDOG_PROGRAM.contains("bounded_owned, omitted_records = capped(owned, 16)"));
         assert!(WATCHDOG_PROGRAM.contains("bounded_processes, omitted = capped(processes, 32)"));
         assert!(WATCHDOG_PROGRAM.contains("len(serialized.encode()) > 16384"));
-        assert!(WATCHDOG_PROGRAM.contains("\"state\": identity_state(identity)"));
+        assert!(WATCHDOG_PROGRAM.contains("probe_deadline = time.monotonic() + 0.25"));
+        assert!(WATCHDOG_PROGRAM.contains("\"probe-budget-exhausted\""));
         assert!(!WATCHDOG_PROGRAM.contains("\"token\": identity[2]"));
         assert!(!WATCHDOG_PROGRAM.contains("\"environment\": environment"));
     }
