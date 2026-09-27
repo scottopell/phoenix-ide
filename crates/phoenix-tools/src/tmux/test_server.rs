@@ -348,6 +348,20 @@ def terminal_state(quiet, unconfirmed, unconfirmed_state, sockets, creators, sta
         "states": states,
     }
 
+def record_uncaught_cleanup_failure(error_type, error, traceback):
+    if issubclass(error_type, SystemExit):
+        return sys.__excepthook__(error_type, error, traceback)
+    reason = {
+        subprocess.TimeoutExpired: "cleanup-subprocess-timeout",
+        DeadlineExpired: "cleanup-deadline-expired",
+        IdentityOutputError: "cleanup-identity-output-error",
+        OSError: "cleanup-os-error",
+    }.get(error_type, "cleanup-runtime-error")
+    record_cleanup_failure(reason, globals().get("terminal", {}))
+    return sys.__excepthook__(error_type, error, traceback)
+
+sys.excepthook = record_uncaught_cleanup_failure
+
 def owner_alive():
     if (not original_root_exists() or not original_control_root_exists()
             or (root / ".cleanup-request").exists()):
@@ -1379,7 +1393,7 @@ fn read_cleanup_receipt(root_anchor: &fs::File) -> io::Result<String> {
         libc::openat(
             root_anchor.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if descriptor == -1 {
@@ -2141,6 +2155,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uncaught_cleanup_failures_publish_receipts_and_receipt_reads_are_nonblocking() {
+        assert!(WATCHDOG_PROGRAM.contains("sys.excepthook = record_uncaught_cleanup_failure"));
+        assert!(WATCHDOG_PROGRAM.contains("\"cleanup-subprocess-timeout\""));
+        assert!(WATCHDOG_PROGRAM.contains("globals().get(\"terminal\", {})"));
+    }
+
+    #[test]
     fn watchdog_identity_protocol_rejects_out_of_range_pids_and_classifies_query_errors() {
         assert!(WATCHDOG_PROGRAM.contains("server_pid > 2_147_483_647"));
         assert!(WATCHDOG_PROGRAM.contains("pid > 2_147_483_647 for pid in pane_pids"));
@@ -2172,6 +2193,21 @@ mod tests {
         fs::remove_dir_all(root.path()).unwrap();
         fs::remove_dir_all(replacement).unwrap();
         std::mem::forget(root);
+    }
+
+    #[test]
+    fn cleanup_receipt_reader_rejects_fifo_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let anchor = fs::File::open(root.path()).unwrap();
+        let fifo_path = root.path().join(".cleanup-failure.json");
+        let fifo = CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let error = read_cleanup_receipt(&anchor).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
