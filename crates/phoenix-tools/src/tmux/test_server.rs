@@ -23,6 +23,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WATCHDOG_PROGRAM: &str = r##"
 import ctypes
 import fcntl
+import itertools
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ control_root = Path(sys.argv[3])
 root_stat = root.stat()
 root_identity = (root_stat.st_dev, root_stat.st_ino)
 root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+control_root_fd = os.open(control_root, os.O_RDONLY | os.O_DIRECTORY)
 control_root_stat = control_root.stat()
 control_root_identity = (control_root_stat.st_dev, control_root_stat.st_ino)
 owned = []
@@ -215,24 +217,23 @@ def original_control_root_exists():
     except OSError:
         return False
 
-def path_identity(path):
+def anchored_identity(directory_fd, name):
     try:
-        current = path.stat()
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         return [current.st_dev, current.st_ino]
     except OSError:
         return None
 
-def capped(values, limit):
-    materialized = list(values)
-    return materialized[:limit], max(0, len(materialized) - limit)
+def capped(values, size, limit):
+    return list(itertools.islice(values, limit)), max(0, size - limit)
 
 def record_cleanup_failure(reason, terminal):
     records = []
-    bounded_owned, omitted_records = capped(owned, 16)
+    bounded_owned, omitted_records = capped(iter(owned), len(owned), 16)
     omitted_processes = 0
     probe_deadline = time.monotonic() + 0.25
     for socket, device, inode, control, processes in bounded_owned:
-        bounded_processes, omitted = capped(processes, 32)
+        bounded_processes, omitted = capped(iter(processes), len(processes), 32)
         omitted_processes += omitted
         process_records = []
         for identity in bounded_processes:
@@ -261,16 +262,20 @@ def record_cleanup_failure(reason, terminal):
         records.append({
             "socket": socket.name,
             "control": control.name,
-            "socket_identity": path_identity(socket),
-            "control_identity": path_identity(control),
+            "socket_identity": anchored_identity(root_fd, socket.name),
+            "control_identity": anchored_identity(control_root_fd, control.name),
             "expected_identity": [device, inode],
             "processes": process_records,
         })
     visible_paths, omitted_visible_paths = capped(
-        sorted(path.name for path in preserved_visible_paths), 32
+        (path.name for path in preserved_visible_paths), len(preserved_visible_paths), 32
     )
-    controls, omitted_controls = capped(sorted(retained_controls), 32)
-    statuses, omitted_statuses = capped(sorted(cleanup_record_status.items()), 32)
+    controls, omitted_controls = capped(
+        iter(retained_controls), len(retained_controls), 32
+    )
+    statuses, omitted_statuses = capped(
+        iter(cleanup_record_status.items()), len(cleanup_record_status), 32
+    )
     receipt = {
         "version": 1,
         "reason": reason,
@@ -313,7 +318,13 @@ def record_cleanup_failure(reason, terminal):
             dir_fd=root_fd,
         )
         try:
-            os.write(descriptor, serialized.encode())
+            payload = serialized.encode()
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count == 0:
+                    raise OSError("cleanup receipt write made no progress")
+                written += count
         finally:
             os.close(descriptor)
         os.replace(pending, ".cleanup-failure.json", src_dir_fd=root_fd, dst_dir_fd=root_fd)
@@ -4723,8 +4734,10 @@ mod tests {
     #[test]
     fn cleanup_failure_receipt_is_bounded_and_excludes_owner_tokens() {
         assert!(WATCHDOG_PROGRAM.contains("dst_dir_fd=root_fd"));
-        assert!(WATCHDOG_PROGRAM.contains("bounded_owned, omitted_records = capped(owned, 16)"));
-        assert!(WATCHDOG_PROGRAM.contains("bounded_processes, omitted = capped(processes, 32)"));
+        assert!(WATCHDOG_PROGRAM.contains("capped(iter(owned), len(owned), 16)"));
+        assert!(WATCHDOG_PROGRAM.contains("capped(iter(processes), len(processes), 32)"));
+        assert!(WATCHDOG_PROGRAM.contains("while written < len(payload):"));
+        assert!(WATCHDOG_PROGRAM.contains("anchored_identity(root_fd, socket.name)"));
         assert!(WATCHDOG_PROGRAM.contains("len(serialized.encode()) > 16384"));
         assert!(WATCHDOG_PROGRAM.contains("probe_deadline = time.monotonic() + 0.25"));
         assert!(WATCHDOG_PROGRAM.contains("\"probe-budget-exhausted\""));
