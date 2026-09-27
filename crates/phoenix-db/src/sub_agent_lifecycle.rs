@@ -1103,6 +1103,7 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn update_child_state_and_record_sub_agent_terminal(
         &self,
         child_conversation_id: &str,
@@ -1120,30 +1121,68 @@ impl Database {
                 )))
             }
         };
-        let state_kind = state.variant_name();
+        let state_kind = crate::conv_state_kind(state);
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        let changed = sqlx::query(
+        let existing = sqlx::query(
+            "SELECT r.terminal_cause, r.terminal_at_unix_micros, c.state
+             FROM sub_agent_runs r
+             JOIN conversations c ON c.id = r.child_conversation_id
+             WHERE r.child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await;
+        let existing = match existing {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(
+                    format!("child {child_conversation_id} has no lifecycle row"),
+                )))
+            }
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let existing_cause = match existing.try_get::<Option<String>, _>("terminal_cause") {
+            Ok(cause) => cause,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let existing_at = match existing.try_get::<Option<i64>, _>("terminal_at_unix_micros") {
+            Ok(at) => at,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        if existing_cause.is_some() || existing_at.is_some() {
+            let existing_state = match existing
+                .try_get::<String, _>("state")
+                .map_err(DbError::from)
+                .and_then(|json| {
+                    serde_json::from_str::<ConvState>(&json)
+                        .map_err(|error| DbError::Serialization(error.to_string()))
+                }) {
+                Ok(state) => state,
+                Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+            };
+            if existing_cause.as_deref() == Some(cause.as_db_str()) && existing_state == *state {
+                return LocalAuthorityResult::DurableFactEstablished(Ok(()));
+            }
+            return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(format!(
+                "child {child_conversation_id} already has different terminal evidence"
+            ))));
+        }
+        if let Err(error) = sqlx::query(
             "UPDATE sub_agent_runs
-             SET terminal_cause = COALESCE(terminal_cause, ?2),
-                 terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3)
-             WHERE child_conversation_id = ?1",
+             SET terminal_cause = ?2, terminal_at_unix_micros = ?3
+             WHERE child_conversation_id = ?1
+               AND terminal_cause IS NULL AND terminal_at_unix_micros IS NULL",
         )
         .bind(child_conversation_id)
         .bind(cause.as_db_str())
         .bind(terminal_at.timestamp_micros())
         .execute(&mut *tx)
-        .await;
-        let changed = match changed {
-            Ok(result) => result.rows_affected(),
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
-        };
-        if changed != 1 {
-            return LocalAuthorityResult::DurableFactEstablished(Err(lifecycle_conflict(format!(
-                "child {child_conversation_id} has no lifecycle row"
-            ))));
+        .await
+        {
+            return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
         }
         if let Err(error) = sqlx::query(
             "UPDATE conversations
@@ -1841,6 +1880,98 @@ mod tests {
                 SubAgentCancellationOutcome::CancelledBeforeDispatch
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn joint_terminal_writer_accepts_exact_replay_and_rejects_conflicting_projection() {
+        for (suffix, cause, error_kind) in [
+            (
+                "timeout",
+                SubAgentTerminalCause::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "cancel",
+                SubAgentTerminalCause::Cancelled,
+                ErrorKind::Cancelled,
+            ),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let child = format!("child-{suffix}");
+            parent_with_children(&db, "parent", &[&child]).await;
+            db.admit_sub_agent_batch(&batch(
+                "batch",
+                "parent",
+                false,
+                &[(&child, SubAgentExecutionAuthority::ReadOnly)],
+            ))
+            .await
+            .unwrap();
+            let terminal_at = Utc::now();
+            let backstop = ConvState::Failed {
+                error: "Sub-agent did not report within the cancellation deadline".to_string(),
+                error_kind,
+            };
+            let first = db
+                .update_child_state_and_record_sub_agent_terminal(
+                    &child,
+                    &backstop,
+                    terminal_at,
+                    cause,
+                    terminal_at,
+                )
+                .await;
+            assert!(
+                matches!(
+                    first,
+                    crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                ),
+                "first terminal write failed: {first:?}"
+            );
+
+            let replay = db
+                .update_child_state_and_record_sub_agent_terminal(
+                    &child,
+                    &backstop,
+                    terminal_at + chrono::Duration::seconds(1),
+                    cause,
+                    terminal_at + chrono::Duration::seconds(1),
+                )
+                .await;
+            assert!(matches!(
+                replay,
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+            ));
+
+            let conflicting = db
+                .update_child_state_and_record_sub_agent_terminal(
+                    &child,
+                    &ConvState::Completed {
+                        result: "late completion".to_string(),
+                    },
+                    terminal_at + chrono::Duration::seconds(2),
+                    SubAgentTerminalCause::SubmitResult,
+                    terminal_at + chrono::Duration::seconds(2),
+                )
+                .await;
+            assert!(matches!(
+                conflicting,
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(_))
+            ));
+
+            assert_eq!(db.get_conversation(&child).await.unwrap().state, backstop);
+            let stored: (String, i64, Option<i64>) = sqlx::query_as(
+                "SELECT terminal_cause, terminal_at_unix_micros, parent_accepted_at_unix_micros
+                 FROM sub_agent_runs WHERE child_conversation_id = ?1",
+            )
+            .bind(&child)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(stored.0, cause.as_db_str());
+            assert_eq!(stored.1, terminal_at.timestamp_micros());
+            assert_eq!(stored.2, None);
+        }
     }
 
     #[tokio::test]
