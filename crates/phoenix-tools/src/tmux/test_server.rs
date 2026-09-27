@@ -1067,7 +1067,9 @@ for index, record in enumerate(owned):
             if pane_pid not in known_pids:
                 started = birth(pane_pid)
                 if started is None:
-                    raise RuntimeError("late pane birth identity was unavailable")
+                    if not pid_exists(pane_pid):
+                        continue
+                    raise RuntimeError("live late pane birth identity was unavailable")
                 expanded.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
         record = (socket, device, inode, control, tuple(expanded))
@@ -3235,16 +3237,6 @@ mod tests {
         let hook_dir = TempDir::new().unwrap();
         let enabled = hook_dir.path().join("enabled");
         let exited_pid = hook_dir.path().join("exited-pid");
-        let hook = hook_dir.path().join("enable-absent-pane");
-        fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\nsh -c 'exit 0' &\npid=$!\nwait \"$pid\"\nprintf '%s' \"$pid\" > '{}'\ntouch '{}'\n",
-                exited_pid.display(),
-                enabled.display()
-            ),
-        )
-        .unwrap();
         let tmux = hook_dir.path().join("tmux");
         fs::write(
             &tmux,
@@ -3256,11 +3248,9 @@ mod tests {
             ),
         )
         .unwrap();
-        for executable in [&hook, &tmux] {
-            let mut permissions = fs::metadata(executable).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(executable, permissions).unwrap();
-        }
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
             Some(hook_dir.path()),
             (None, Some(Duration::from_secs(2))),
@@ -3268,9 +3258,14 @@ mod tests {
             None,
             None,
             (None, None),
-            (None, Some(&hook), None, None),
+            (None, None, None, None),
         );
         let (_, processes) = spawn_server_with_processes(&owner, "absent-late-pane");
+        let exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let exited_pid_value = exited.id();
+        exited.wait_with_output().unwrap();
+        fs::write(&exited_pid, exited_pid_value.to_string()).unwrap();
+        fs::write(&enabled, b"enabled").unwrap();
 
         owner.shutdown();
 
