@@ -205,7 +205,8 @@ pub enum SubAgentInitialDispatchAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentCancellationOutcome {
     CancelledBeforeDispatch,
-    DeliverToRuntime,
+    DeliverToRuntime(SubAgentTerminalCause),
+    AlreadyRequested,
     AlreadyTerminal,
 }
 
@@ -941,14 +942,15 @@ impl Database {
     pub async fn request_sub_agent_cancellation(
         &self,
         child_conversation_id: &str,
+        cause: SubAgentTerminalCause,
         requested_at: DateTime<Utc>,
     ) -> DbResult<SubAgentCancellationOutcome> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let at = requested_at.timestamp_micros();
         let cancelled_before_dispatch = sqlx::query(
             "UPDATE sub_agent_runs
-             SET cancellation_requested_at_unix_micros = ?2,
-                 terminal_cause = 'cancelled', terminal_at_unix_micros = ?2
+             SET cancellation_requested_at_unix_micros = ?2, cancellation_cause = ?3,
+                 terminal_cause = ?3, terminal_at_unix_micros = ?2
              WHERE child_conversation_id = ?1
                AND cancellation_requested_at_unix_micros IS NULL
                AND initial_dispatch_claimed_at_unix_micros IS NULL
@@ -956,6 +958,7 @@ impl Database {
         )
         .bind(child_conversation_id)
         .bind(at)
+        .bind(cause.as_db_str())
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -984,18 +987,22 @@ impl Database {
         let outcome = if cancelled_before_dispatch {
             SubAgentCancellationOutcome::CancelledBeforeDispatch
         } else {
-            sqlx::query(
+            let changed = sqlx::query(
                 "UPDATE sub_agent_runs
-                 SET cancellation_requested_at_unix_micros = COALESCE(
-                     cancellation_requested_at_unix_micros, ?2)
-                 WHERE child_conversation_id = ?1 AND terminal_at_unix_micros IS NULL",
+                 SET cancellation_requested_at_unix_micros = ?2, cancellation_cause = ?3
+                 WHERE child_conversation_id = ?1 AND terminal_at_unix_micros IS NULL
+                   AND cancellation_requested_at_unix_micros IS NULL",
             )
             .bind(child_conversation_id)
             .bind(at)
+            .bind(cause.as_db_str())
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+                == 1;
             let row = sqlx::query(
-                "SELECT initial_dispatch_claimed_at_unix_micros, terminal_at_unix_micros
+                "SELECT initial_dispatch_claimed_at_unix_micros, terminal_at_unix_micros,
+                        cancellation_cause
                  FROM sub_agent_runs WHERE child_conversation_id = ?1",
             )
             .bind(child_conversation_id)
@@ -1007,8 +1014,13 @@ impl Database {
                 .is_some()
             {
                 SubAgentCancellationOutcome::AlreadyTerminal
+            } else if changed {
+                let persisted = SubAgentTerminalCause::from_db_str(
+                    &row.try_get::<String, _>("cancellation_cause")?,
+                )?;
+                SubAgentCancellationOutcome::DeliverToRuntime(persisted)
             } else {
-                SubAgentCancellationOutcome::DeliverToRuntime
+                SubAgentCancellationOutcome::AlreadyRequested
             }
         };
         tx.commit().await?;
@@ -1863,7 +1875,9 @@ mod tests {
         });
         let cancel = tokio::spawn(async move {
             barrier.wait().await;
-            second.request_sub_agent_cancellation("child", at).await
+            second
+                .request_sub_agent_cancellation("child", SubAgentTerminalCause::Cancelled, at)
+                .await
         });
         let SubAgentInitialDispatchAuthority::Established(claim) = claim.await.unwrap() else {
             panic!("claim must classify");
@@ -1873,7 +1887,7 @@ mod tests {
             (claim.outcome, cancel),
             (
                 SubAgentInitialDispatchOutcome::Claimed,
-                SubAgentCancellationOutcome::DeliverToRuntime
+                SubAgentCancellationOutcome::DeliverToRuntime(SubAgentTerminalCause::Cancelled)
             ) | (
                 SubAgentInitialDispatchOutcome::AlreadyTerminal
                     | SubAgentInitialDispatchOutcome::CancelledBeforeDispatch,

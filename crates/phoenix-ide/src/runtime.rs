@@ -4090,16 +4090,25 @@ impl RuntimeManager {
             tokio::time::sleep(std::time::Duration::from_millis(dispatch.timeout_millis)).await;
             match manager
                 .db
-                .request_sub_agent_cancellation(&agent_id, Utc::now())
+                .request_sub_agent_cancellation(
+                    &agent_id,
+                    phoenix_db::SubAgentTerminalCause::TimedOut,
+                    Utc::now(),
+                )
                 .await
             {
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime) => {
+                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
                     let _ = AddressedConversationEventDispatcher::new(Arc::clone(&manager))
                         .dispatch(
                             &agent_id,
                             Event::UserCancel {
                                 reason: Some("Sub-agent timed out".to_string()),
-                                cause: crate::state_machine::event::CancelCause::Timeout,
+                                cause: match cause {
+                                    phoenix_db::SubAgentTerminalCause::TimedOut => {
+                                        crate::state_machine::event::CancelCause::Timeout
+                                    }
+                                    _ => crate::state_machine::event::CancelCause::UserRequested,
+                                },
                             },
                         )
                         .await;
@@ -4120,7 +4129,18 @@ impl RuntimeManager {
         for agent_id in req.ids {
             let outcome = self
                 .db
-                .request_sub_agent_cancellation(&agent_id, Utc::now())
+                .request_sub_agent_cancellation(
+                    &agent_id,
+                    match req.cause {
+                        crate::state_machine::event::CancelCause::Timeout => {
+                            phoenix_db::SubAgentTerminalCause::TimedOut
+                        }
+                        crate::state_machine::event::CancelCause::UserRequested => {
+                            phoenix_db::SubAgentTerminalCause::Cancelled
+                        }
+                    },
+                    Utc::now(),
+                )
                 .await;
             dispositions.push((agent_id, outcome));
         }
@@ -4146,7 +4166,7 @@ impl RuntimeManager {
                         let _ = dispatcher.reconcile(&req.parent_conversation_id).await;
                     }
                 }
-                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime) => {
+                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
                     let dispatcher = dispatcher.clone();
                     runtime_deliveries.push(tokio::spawn(async move {
                         if let Err(error) = dispatcher
@@ -4154,7 +4174,10 @@ impl RuntimeManager {
                                 &agent_id,
                                 Event::UserCancel {
                                     reason: None,
-                                    cause: req.cause,
+                                    cause: match cause {
+                                        phoenix_db::SubAgentTerminalCause::TimedOut => crate::state_machine::event::CancelCause::Timeout,
+                                        _ => crate::state_machine::event::CancelCause::UserRequested,
+                                    },
                                 },
                             )
                             .await
@@ -4163,7 +4186,10 @@ impl RuntimeManager {
                         }
                     }));
                 }
-                Ok(phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal) => {}
+                Ok(
+                    phoenix_db::SubAgentCancellationOutcome::AlreadyRequested
+                    | phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal,
+                ) => {}
                 Err(error) => {
                     tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
                 }
@@ -8713,7 +8739,11 @@ mod scope_liveness_tests {
         barrier.wait().await;
         let disposition = manager
             .db()
-            .request_sub_agent_cancellation(agent_id, Utc::now())
+            .request_sub_agent_cancellation(
+                agent_id,
+                phoenix_db::SubAgentTerminalCause::Cancelled,
+                Utc::now(),
+            )
             .await
             .expect("durable cancellation");
         assert_eq!(

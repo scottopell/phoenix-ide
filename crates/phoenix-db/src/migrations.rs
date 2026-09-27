@@ -575,6 +575,7 @@ CREATE TABLE sub_agent_runs (
             typeof(cancellation_requested_at_unix_micros) = 'integer'
             AND cancellation_requested_at_unix_micros >= 0
         )),
+    cancellation_cause TEXT CHECK(cancellation_cause IS NULL OR cancellation_cause IN ('timed_out', 'cancelled')),
     initial_dispatch_claimed_at_unix_micros INTEGER
         CHECK(initial_dispatch_claimed_at_unix_micros IS NULL OR (
             typeof(initial_dispatch_claimed_at_unix_micros) = 'integer'
