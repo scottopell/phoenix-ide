@@ -7311,7 +7311,12 @@ where
             matches!(
                 self.context.resource_authority,
                 crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
+            ) && matches!(mode_context, Some(ModeContext::Explore { .. }))
+                && self
+                    .storage
+                    .get_approved_task_objective(&self.context.conversation_id)
+                    .await?
+                    .is_some();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -7362,8 +7367,15 @@ where
                     ),
             );
         }
+        let prompt_authority = if matches!(mode_context, Some(ModeContext::Explore { .. }))
+            && !has_approved_task_write_authority
+        {
+            crate::work_scope::ResourceAuthority::Restricted
+        } else {
+            self.context.resource_authority
+        };
         let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
-            self.context.resource_authority,
+            prompt_authority,
             mode_context.as_ref(),
             explore_bash,
         );

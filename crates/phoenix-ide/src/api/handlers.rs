@@ -4122,8 +4122,30 @@ async fn get_system_prompt(
         crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+    let has_approved_explore_authority = resource_authority.authority
+        == crate::work_scope::ResourceAuthority::Work
+        && matches!(
+            mode_context,
+            crate::system_prompt::ModeContext::Explore { .. }
+        )
+        && state
+            .runtime
+            .db()
+            .get_approved_task_objective(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .is_some();
+    let prompt_authority = if matches!(
+        mode_context,
+        crate::system_prompt::ModeContext::Explore { .. }
+    ) && !has_approved_explore_authority
+    {
+        crate::work_scope::ResourceAuthority::Restricted
+    } else {
+        resource_authority.authority
+    };
     let explore_bash = crate::system_prompt::explore_bash_prompt_capability(
-        resource_authority.authority,
+        prompt_authority,
         Some(&mode_context),
         crate::tools::ExploreToolPolicy::from_platform(&state.platform).bash(),
     );

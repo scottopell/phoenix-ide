@@ -3904,12 +3904,18 @@ impl RuntimeManager {
         }
     }
 
-    fn sub_agent_child_mode(spec: &SubAgentSpec) -> Result<ConvMode, String> {
+    fn sub_agent_child_mode(
+        spec: &SubAgentSpec,
+        parent_mode: &ConvMode,
+    ) -> Result<ConvMode, String> {
         match spec.mode {
             SubAgentMode::Explore => Ok(ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
             }),
+            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => {
+                Ok(parent_mode.clone())
+            }
             SubAgentMode::Work => Ok(ConvMode::AttachedWorkChild {
                 worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
                     spec.cwd.clone(),
@@ -3939,7 +3945,7 @@ impl RuntimeManager {
         let children = specs
             .iter()
             .map(|spec| {
-                let conv_mode = Self::sub_agent_child_mode(spec)?;
+                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode)?;
                 Ok(phoenix_db::SubAgentChildAdmission {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
@@ -8925,7 +8931,20 @@ mod scope_liveness_tests {
         };
 
         assert_eq!(
-            RuntimeManager::sub_agent_child_mode(&spec).unwrap(),
+            RuntimeManager::sub_agent_child_mode(
+                &spec,
+                &ConvMode::Explore {
+                    worktree_path:
+                        Some(
+                            phoenix_core::domain::db_schema::NonEmptyString::new(
+                                "/tmp/owned-worktree",
+                            )
+                            .unwrap(),
+                        ),
+                    next_taskmd_id_hint: None,
+                },
+            )
+            .unwrap(),
             ConvMode::AttachedWorkChild {
                 worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
                     "/tmp/owned-worktree",
@@ -8933,6 +8952,32 @@ mod scope_liveness_tests {
                 .unwrap(),
             }
         );
+    }
+
+    #[test]
+    fn direct_work_subagent_preserves_unscoped_direct_mode() {
+        let mut spec = SubAgentSpec {
+            agent_id: "direct-work-child".to_string(),
+            task: "inherit the unowned cwd".to_string(),
+            cwd: "/tmp/direct-cwd".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Work,
+            model_id: "gpt-5.6-sol".to_string(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        assert_eq!(
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            ConvMode::Direct
+        );
+        spec.mode = SubAgentMode::Explore;
+        assert!(matches!(
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            ConvMode::Explore { .. }
+        ));
     }
 
     #[tokio::test]
