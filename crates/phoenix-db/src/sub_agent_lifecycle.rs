@@ -459,6 +459,7 @@ impl Database {
                 || child.model.trim().is_empty()
                 || child.connection.trim().is_empty()
                 || child.initial_message_id.trim().is_empty()
+                || child.initial_task.trim().is_empty()
                 || child.max_turns == 0
                 || child.timeout_millis == 0
         }) {

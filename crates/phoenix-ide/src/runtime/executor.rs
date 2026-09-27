@@ -3271,6 +3271,17 @@ where
             return self.process_adopted_wake_batch().await;
         }
 
+        if matches!(event, Event::RetryBufferedSubAgentResults) {
+            let buffered = self.drain_buffer_for_round();
+            for event in buffered.into_iter().rev() {
+                self.event_tx
+                    .send(event)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(());
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -3295,6 +3306,11 @@ where
                     Ok(false) => {}
                     Err(error) => {
                         self.sub_agent_result_buffer.push(current_event);
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            let _ = event_tx.send(Event::RetryBufferedSubAgentResults).await;
+                        });
                         return Err(error);
                     }
                 }

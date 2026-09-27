@@ -435,6 +435,8 @@ pub enum Event {
     },
     /// Starts an admitted sub-agent whose initial user message is already durable.
     PersistedSubAgentBootstrap,
+    /// Retries exact buffered child outcomes after a transient acceptance read failure.
+    RetryBufferedSubAgentResults,
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
@@ -660,6 +662,7 @@ impl Event {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
             Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
+            Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -899,6 +902,10 @@ impl TryFrom<Event> for ParentEvent {
             }
             Event::PersistedSubAgentBootstrap => Err(EventConversionError {
                 event_variant: "PersistedSubAgentBootstrap",
+                target_type: "ParentEvent",
+            }),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
                 target_type: "ParentEvent",
             }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
@@ -1185,6 +1192,10 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::PersistedBootstrap,
             )),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "SubAgentEvent",
+            }),
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
