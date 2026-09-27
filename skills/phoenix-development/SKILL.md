@@ -9,7 +9,7 @@ Build the smallest correct change from a verified failure model. Repository guid
 
 ## The loop
 
-1. **Orient.** Verify the worktree and `git status`. Read the generated body of GitHub Issue #651 for current delivery context. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
+1. **Orient.** Verify the worktree and `git status`. Read the generated body of GitHub Issue #806 (the delivery roadmap) for current delivery context. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
 2. **Model.** State the user-visible failure, violated invariant, and boundary that should own the fix. Do not edit from a symptom alone.
 3. **Trace.** Follow the path end to end where relevant: UI/state → API/SSE → runtime/state machine → persistence/provider/tool. Read existing tests and history around the seam.
 4. **Regress.** Add or identify the narrowest test that can falsify the hypothesis. Reproduce first when practical.
@@ -58,20 +58,14 @@ Treat a failed sub-agent patch as untrusted until inspected. Before continuing:
 
 Prefer delegating bounded leaf slices with explicit file limits and validation commands. Keep ownership-sensitive integration work with one implementation owner.
 
-## Report an owned workstream
+## Report on the roadmap
 
-Use the roadmap only for work substantial enough that another agent needs to know its owner, blocker, or next step. Do not post routine edits, transient test failures, or leaf tasks already clear from an active parent workstream.
+Use the roadmap only for outcomes substantial enough that another agent or harness needs to know their owner, gate, or delivery state. Do not post routine edits, transient test failures, or leaf tasks.
 
-1. Fetch Issue #651 by its known number; do not discover it with GitHub search. If GitHub is unavailable, continue from specs, ADRs, taskmd, PR data already available locally, and `main`; state that roadmap context could not be verified.
-2. Read the generated body and the first comment, which defines the current schema, limits, and allowed sections.
-3. Choose one stable kebab-case `workstream` identifier. Reuse it for every later update; a new valid comment supersedes the prior projection for that identifier.
-4. Report only facts your workstream owns: state, owner, blockers, next concrete step, evidence links, and concise context. Portfolio priority and critical-path ordering require coordinator direction; do not infer them from local importance.
-5. Post a comment consisting only of one exact `phoenix-roadmap-update` fenced JSON object. Do not add surrounding prose or edit the generated Issue body.
-6. For a newly created structured record, poll bot-authored reactions with a bounded wait: 👀 means processing, 🚀 means accepted, and 😕 means rejected. Reactions do not track later edits or deletions. A terminal reaction takes precedence over leftover 👀; if 🚀 and 😕 both appear, inspect the reducer Actions log instead of inferring an outcome. On 😕, inspect the reducer Actions log and report the validation or application error. If no bot reaction appears within the bounded wait, inspect the workflow run because setup may have failed before lifecycle processing began.
-7. On 🚀, verify that the Issue body's `phoenix-roadmap:snapshot-through` marker includes the comment. For an update, also require the projected entry to link to that exact source comment; for a retirement, require the entry to be absent.
-8. Append a replacement when material state, owner, blocker, or next step changes. When the workstream completes or is abandoned, append the retirement record defined by the first Issue comment. It must identify the current projected source comment and be posted by that same GitHub author.
-
-Keep detailed plans in their existing authorities and link them. The roadmap should answer “what is active, who owns it, what blocks it, and what happens next?” without becoming a second spec, task database, or PR mirror.
+1. Fetch Issue #806 by its known number; do not discover it with GitHub search. If GitHub is unavailable, state that roadmap context could not be verified.
+2. Follow `specs/roadmap/requirements.md`: post one `phoenix-roadmap` fenced record per comment, declare `actor.role` and `actor.harness`, and post only the kinds your role allows.
+3. Report runtime and transcript mechanics in your own harness, not on the roadmap. The roadmap sees their effects: evidence, status, gates, and decisions.
+4. After posting, re-read the Issue body. The record is accepted once the `phoenix-roadmap:snapshot-through` marker is at or above its comment ID and it is not listed under "Recent rejections"; fix and re-post a rejected record.
 
 ## Reasoning about async test completion
 

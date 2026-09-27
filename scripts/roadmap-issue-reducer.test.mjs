@@ -4,375 +4,380 @@ import test from "node:test";
 import {
   PROJECTION_END,
   PROJECTION_START,
+  parseRecordComment,
+  reduceComments,
   renderRoadmap,
   run,
-  updatesFromComments,
-  validateRetirement,
-  validateUpdate,
+  surfaceDelivery,
+  validateRecord,
 } from "./roadmap-issue-reducer.mjs";
 
-function update(overrides = {}) {
-  return {
-    kind: "workstream-update",
-    version: 1,
-    workstream: "ios-vnext",
-    title: "iOS vNext",
-    state: "Blocked",
-    owner: "iOS vNext",
-    blocked_by: ["ProductConversation PR 3"],
-    next: "ProductConversation migration",
-    section: "blocked-programs",
-    order: 20,
-    evidence: [{ label: "#641", url: "https://github.com/scottopell/phoenix-ide/pull/641" }],
-    context: "Use the stable aggregate contract.",
-    ...overrides,
-  };
+const COORDINATOR = { role: "coordinator", harness: "phoenix@primary" };
+const WORKER = { role: "worker", harness: "phoenix@devmbp" };
+const CODEX = { role: "worker", harness: "codex" };
+const USER = { role: "user", harness: "claude-code" };
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+const MERGE = "c".repeat(40);
+const NOW = new Date("2026-09-27T12:00:00Z");
+
+function body(record) {
+  return `\`\`\`phoenix-roadmap\n${JSON.stringify({ version: 2, ...record }, null, 2)}\n\`\`\``;
 }
 
-function comment(id, body, overrides = {}) {
+function comment(id, record, overrides = {}) {
+  const created = new Date(Date.UTC(2026, 8, 27, 0, 0, id)).toISOString();
   return {
     id,
-    body,
+    body: typeof record === "string" ? record : body(record),
     html_url: `https://github.test/issues/1#issuecomment-${id}`,
-    created_at: `2026-08-09T16:${String(id).padStart(2, "0")}:00Z`,
-    updated_at: `2026-08-09T16:${String(id).padStart(2, "0")}:00Z`,
-    user: { login: "agent" },
-    author_association: "COLLABORATOR",
+    created_at: created,
+    updated_at: created,
+    author_association: "OWNER",
     ...overrides,
   };
 }
 
-function fenced(value) {
-  return `\`\`\`phoenix-roadmap-update\n${JSON.stringify(value, null, 2)}\n\`\`\``;
-}
-
-function retired(workstream = "ios-vnext", supersedesCommentId = 1) {
-  return `\`\`\`phoenix-roadmap-retirement\n${JSON.stringify({ kind: "workstream-retirement", version: 1, workstream, supersedes_comment_id: supersedesCommentId }, null, 2)}\n\`\`\``;
-}
-
-function event(action, trigger) {
+function outcome(overrides = {}) {
   return {
-    action,
-    issue: { number: 7 },
-    comment: trigger,
-    repository: { full_name: "owner/repo" },
+    kind: "outcome",
+    actor: COORDINATOR,
+    id: "ios-core-journeys",
+    title: "Native iOS core journeys",
+    intent: "Auth, send/stream, reconnect and safe delete work on device.",
+    acceptance: ["Critical device journeys pass on a TestFlight build"],
+    owner: { harness: "phoenix@devmbp", label: "iOS owner" },
+    order: 10,
+    surfaces: ["ios"],
+    ...overrides,
   };
 }
 
-test("latest valid current comment wins per workstream", () => {
-  const result = updatesFromComments([
-    comment(1, fenced(update({ state: "Planning" }))),
-    comment(2, fenced(update({ state: "Blocked" })), { user: { login: "ios-agent" } }),
-  ]);
+function qualified(pr, head, result = "pass", overrides = {}) {
+  return {
+    kind: "evidence",
+    actor: WORKER,
+    outcome: "ios-core-journeys",
+    surface: "ios",
+    stage: "qualified",
+    result,
+    subject: { pr, head },
+    url: `https://github.com/o/r/pull/${pr}/checks`,
+    ...overrides,
+  };
+}
 
-  assert.equal(result.length, 1);
-  assert.equal(result[0].state, "Blocked");
-  assert.equal(result[0].source.id, 2);
-  assert.equal(result[0].source.author, "ios-agent");
+function reduce(records) {
+  return reduceComments(records.map((record, index) => comment(index + 1, record)));
+}
+
+function reasons(state) {
+  return state.rejections.map((rejection) => rejection.reason);
+}
+
+test("only a comment consisting of one v2 fence is a record", () => {
+  assert.deepEqual(parseRecordComment("hello"), null);
+  assert.ok(parseRecordComment(body(outcome())).payload);
+  assert.match(parseRecordComment("```phoenix-roadmap-update\n{}\n```").error, /v1 roadmap records/);
+  assert.match(parseRecordComment(`note\n${body(outcome())}`).error, /only of one/);
 });
 
-test("retirement removes the prior workstream and a later update can reactivate it", () => {
-  const comments = [
-    comment(1, fenced(update())),
-    comment(2, retired()),
-  ];
-  assert.deepEqual(updatesFromComments(comments), []);
-  assert.equal(updatesFromComments([...comments, comment(3, fenced(update({ state: "Restarted" })))])[0].state, "Restarted");
-});
-
-test("retirement has a minimal exact schema bound to a source comment", () => {
-  assert.deepEqual(
-    validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42 }),
-    { kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42 },
-  );
+test("records are validated structurally", () => {
+  assert.throws(() => validateRecord({ version: 1, kind: "outcome", actor: COORDINATOR }), /version must be 2/);
+  assert.throws(() => validateRecord({ version: 2, kind: "workstream", actor: COORDINATOR }), /unknown kind/);
+  assert.throws(() => validateRecord({ version: 2, ...outcome({ extra: true }) }), /unknown field extra/);
+  assert.throws(() => validateRecord({ version: 2, ...outcome({ id: "Not Kebab" }) }), /kebab-case/);
+  assert.throws(() => validateRecord({ version: 2, ...qualified(5, "nothex") }), /commit SHA/);
   assert.throws(
-    () => validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42, state: "Done" }),
-    /only kind, version, workstream, and supersedes_comment_id/,
+    () => validateRecord({ version: 2, ...qualified(5, HEAD_A, "pass", { url: "http://devmbp:8031/c/x" }) }),
+    /must use https/,
   );
 });
 
-test("retirement requires the same author and cannot retire a newer source", () => {
-  const current = comment(1, fenced(update()), { user: { login: "owner" } });
-  const wrongAuthor = comment(2, retired("ios-vnext", 1), { user: { login: "other" } });
-  const newer = comment(3, fenced(update({ state: "Newer" })), { user: { login: "owner" } });
-  const staleRetirement = comment(4, retired("ios-vnext", 1), { user: { login: "owner" } });
-  const matching = comment(5, retired("ios-vnext", 3), { user: { login: "owner" } });
-  assert.equal(updatesFromComments([current, wrongAuthor]).length, 1);
-  assert.equal(updatesFromComments([current, newer, staleRetirement])[0].state, "Newer");
-  assert.equal(updatesFromComments([current, newer, matching]).length, 0);
+test("roles bound which record kinds an actor may post", () => {
+  const state = reduce([
+    outcome({ actor: WORKER }),
+    outcome(),
+    { kind: "decision", actor: USER, id: "d-1", statement: "Ship it", scope: ["ios-core-journeys"] },
+    { kind: "decision", actor: WORKER, id: "d-2", statement: "Ship it", scope: ["ios-core-journeys"] },
+    { kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "accepted", result: "pass", subject: {}, url: "https://github.com/o/r" },
+  ]);
+  assert.deepEqual(reasons(state), [
+    "worker may not post outcome records",
+    "user decisions must quote the user's words",
+    "worker may not post decision records",
+    "accepted evidence comes from the user or the coordinator",
+  ]);
 });
 
-test("retirement remains authoritative if its superseded source disappears", () => {
-  const older = comment(1, fenced(update({ state: "Older" })), { user: { login: "owner" } });
-  const retiredCurrent = comment(3, retired("ios-vnext", 2), { user: { login: "owner" } });
-
-  assert.equal(updatesFromComments([older, retiredCurrent]).length, 0);
-  assert.equal(updatesFromComments([retiredCurrent]).length, 0);
-});
-
-test("edited comments remain current instead of silently deleting a workstream", () => {
-  const edited = comment(1, fenced(update({ state: "Ready" })), {
-    updated_at: "2026-08-09T17:00:00Z",
-  });
-  assert.equal(updatesFromComments([edited])[0].state, "Ready");
-});
-
-test("roadmap-update examples nested in larger fences are not live updates", () => {
-  const nested = [
-    "````markdown",
-    "```phoenix-roadmap-update",
-    JSON.stringify(update()),
-    "```",
-    "````",
-  ].join("\n");
-  assert.deepEqual(updatesFromComments([comment(1, nested)]), []);
-});
-
-test("roadmap-update fences with surrounding or hidden content are not live", () => {
-  const live = fenced(update());
-  assert.deepEqual(updatesFromComments([comment(1, `Prose\n${live}`)]), []);
-  assert.deepEqual(updatesFromComments([comment(2, `<!--\n${live}\n-->`)]), []);
-  assert.deepEqual(updatesFromComments([comment(3, `<pre>\n${live}\n</pre>`)]), []);
-});
-
-test("untrusted comments and invalid replacements are ignored", () => {
-  const untrusted = comment(2, fenced(update({ state: "Ready" })), { author_association: "NONE" });
-  const invalid = comment(3, fenced(update({ evidence: [] })));
-  const result = updatesFromComments([comment(1, fenced(update())), untrusted, invalid]);
-
-  assert.equal(result.length, 1);
-  assert.equal(result[0].source.id, 1);
-});
-
-test("roadmap has fixed section and explicit order with verbatim context", () => {
-  const comments = [
-    comment(1, fenced(update({ workstream: "later", order: 20, title: "Later" }))),
-    comment(2, fenced(update({ workstream: "first", order: 10, title: "First", context: "Line one\nLine two" }))),
-    comment(3, fenced(update({ workstream: "p0", section: "parallel-p0", title: "P0", order: 90 }))),
-  ];
-  const body = renderRoadmap(updatesFromComments(comments));
-
-  assert.ok(body.indexOf("### Parallel P0") < body.indexOf("### Blocked programs"));
-  assert.ok(body.indexOf("<strong>First</strong>") < body.indexOf("<strong>Later</strong>"));
-  assert.match(body, /> Line one\n> Line two/);
-  assert.match(body, /_Generated from the current trusted comment set\._/);
-  assert.match(body, new RegExp(PROJECTION_START));
-  assert.match(body, new RegExp(PROJECTION_END));
-  assert.match(body, /This entire body is generated.*do not edit it manually/);
-  assert.match(body, /<!-- phoenix-roadmap:snapshot-through:0 -->/);
-});
-
-test("schema bounds each update before it can poison future reductions", () => {
-  assert.throws(() => validateUpdate(update({ context: "x".repeat(801) })), /at most 800/);
-  assert.throws(() => validateUpdate(update({ title: "x".repeat(201) })), /at most 200/);
-  assert.throws(() => validateUpdate(update({ evidence: [] })), /between one and five/);
-  assert.throws(() => validateUpdate(update({ section: "whatever" })), /unknown section/);
-});
-
-test("workstream overflow is deterministically omitted without wedging reduction", () => {
-  const comments = Array.from({ length: 13 }, (_, index) =>
-    comment(index + 1, fenced(update({ workstream: `stream-${index}`, order: index }))),
+test("coordinator records must come from the configured coordinator harness", () => {
+  const state = reduceComments(
+    [comment(1, outcome({ actor: { role: "coordinator", harness: "codex" } }))],
+    { coordinatorHarness: "phoenix@primary" },
   );
-  const result = updatesFromComments(comments);
-  assert.equal(result.length, 12);
-  assert.deepEqual(result.map(({ workstream }) => workstream), Array.from({ length: 12 }, (_, index) => `stream-${index}`));
+  assert.deepEqual(reasons(state), ["coordinator records must come from phoenix@primary"]);
 });
 
-test("evidence URL uses its dedicated 500-character limit", () => {
-  const longUrl = `https://example.test/${"x".repeat(470)}`;
-  assert.equal(validateUpdate(update({ evidence: [{ label: "long", url: longUrl }] })).evidence[0].url.length > 200, true);
+test("edited records, untrusted authors, and v1 records do not apply", () => {
+  const state = reduceComments([
+    comment(1, outcome(), { updated_at: "2026-09-28T00:00:00Z" }),
+    comment(2, outcome({ id: "other" }), { author_association: "NONE" }),
+    comment(3, "```phoenix-roadmap-update\n{}\n```"),
+  ]);
+  assert.equal(state.outcomes.size, 0);
+  assert.deepEqual(state.rejections.map((rejection) => rejection.id), [1, 3]);
 });
 
-test("context HTML is escaped inside details markup", () => {
-  const source = comment(1, fenced(update({ context: "</details><strong>escape me</strong>" })));
-  const body = renderRoadmap(updatesFromComments([source]));
-  assert.doesNotMatch(body, /> <\/details>/);
-  assert.match(body, /\\<\/details\\>/);
+test("ids are unique across kinds and references must already exist", () => {
+  const state = reduce([
+    outcome(),
+    { kind: "gate", actor: COORDINATOR, id: "ios-core-journeys", blocks: { outcome: "ios-core-journeys" }, clearer: "owner", condition: "x" },
+    { kind: "gate", actor: COORDINATOR, id: "g-1", blocks: { outcome: "missing" }, clearer: "owner", condition: "x" },
+    { kind: "status", actor: WORKER, outcome: "missing", next: "x" },
+  ]);
+  assert.deepEqual(reasons(state), [
+    "id ios-core-journeys is already used; gate ids are single-use",
+    "outcome missing does not exist",
+    "outcome missing does not exist",
+  ]);
 });
 
-test("summary fields use HTML entity escaping", () => {
-  const source = comment(1, fenced(update({ title: "<!-- title", state: "<ready> & done" })));
-  const body = renderRoadmap(updatesFromComments([source]));
-  assert.match(body, /&lt;!-- title/);
-  assert.match(body, /&lt;ready&gt; &amp; done/);
-  assert.doesNotMatch(body, /<summary><strong><!--/);
+// Scenario: a hold the user cleared must not resurrect.
+test("a user-cleared gate clears only through a user decision and never reopens", () => {
+  const gate = { kind: "gate", actor: COORDINATOR, id: "rc-env-secrets", blocks: { outcome: "ios-core-journeys" }, clearer: "user", condition: "Signing environment configured" };
+  const state = reduce([
+    outcome(),
+    gate,
+    { kind: "gate-clear", actor: COORDINATOR, gate: "rc-env-secrets", evidence: "https://github.com/o/r/settings" },
+    { kind: "decision", actor: COORDINATOR, id: "d-env", statement: "Env done", scope: ["rc-env-secrets"], clears: ["rc-env-secrets"] },
+    { kind: "decision", actor: USER, id: "d-env-user", statement: "Env done", scope: ["rc-env-secrets"], clears: ["rc-env-secrets"], quote: "setup is complete" },
+    { ...gate, actor: WORKER },
+  ]);
+  assert.deepEqual(reasons(state), [
+    "gate rc-env-secrets is cleared only by a user decision",
+    "gate rc-env-secrets is cleared only by a user decision",
+    "id rc-env-secrets is already used; gate ids are single-use",
+  ]);
+  assert.equal(state.gates.get("rc-env-secrets").cleared.decision, "d-env-user");
+  assert.doesNotMatch(renderRoadmap(state, { now: NOW }), /Signing environment configured/);
 });
 
-test("edited events rebuild the reducer-owned body without lifecycle reactions", async () => {
-  for (const action of ["edited"]) {
-    const trigger = comment(2, fenced(update()), {
-      updated_at: action === "edited" ? "2026-08-09T17:00:00Z" : "2026-08-09T16:02:00Z",
-    });
-    const requests = [];
-    const responses = [
-      new Response(JSON.stringify([trigger]), { status: 200 }),
-      new Response(JSON.stringify({}), { status: 200 }),
-      new Response(JSON.stringify([trigger]), { status: 200 }),
-    ];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (_url, options = {}) => {
-      requests.push(options);
-      return responses.shift();
-    };
-    try {
-      const result = await run({ event: event(action, trigger), configuredIssueNumber: 7, token: "token" });
-      assert.deepEqual(result, { changed: true, updates: 1 });
-      const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
-      assert.match(body, /Generated from the current trusted comment set/);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  }
+test("owner gates clear with evidence; coordinator gates only by the coordinator", () => {
+  const state = reduce([
+    outcome(),
+    { kind: "gate", actor: WORKER, id: "g-review", blocks: { outcome: "ios-core-journeys" }, clearer: "owner", condition: "Review on head" },
+    { kind: "gate", actor: WORKER, id: "g-scope", blocks: { outcome: "ios-core-journeys" }, clearer: "coordinator", condition: "Scope" },
+    { kind: "gate-clear", actor: WORKER, gate: "g-review", evidence: "https://github.com/o/r/pull/5#pullrequestreview-1" },
+    { kind: "gate-clear", actor: WORKER, gate: "g-scope", evidence: "https://github.com/o/r" },
+    { kind: "gate-clear", actor: WORKER, gate: "g-review", evidence: "https://github.com/o/r" },
+  ]);
+  assert.deepEqual(reasons(state), ["gate g-scope is cleared only by the coordinator", "gate g-review is already cleared"]);
 });
 
-test("created structured record transitions from eyes to rocket", async () => {
-  const trigger = comment(2, fenced(update()));
-  const requests = [];
-  const responses = [
-    new Response(JSON.stringify({}), { status: 201 }),
-    new Response(JSON.stringify([]), { status: 200 }),
-    new Response(JSON.stringify([trigger]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-    new Response(JSON.stringify([trigger]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 201 }),
-    new Response(JSON.stringify([{ id: 10, content: "eyes", user: { login: "github-actions[bot]" } }]), { status: 200 }),
-    new Response(null, { status: 204 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, options = {}) => {
-    requests.push({ url: String(url), ...options });
-    return responses.shift();
+// Scenario: a changed PR head invalidates old qualification without adopting late results.
+test("qualification binds to the PR's current head", () => {
+  const state = reduce([
+    outcome(),
+    qualified(5, HEAD_A),
+    qualified(5, HEAD_B, "fail"),
+    qualified(5, HEAD_A, "fail"),
+  ]);
+  const atB = surfaceDelivery(state, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false }]]));
+  assert.equal(atB.stage, undefined);
+  assert.deepEqual(atB.notes, ["✗ qualification failed at bbbbbbb"]);
+
+  const withPass = reduce([outcome(), qualified(5, HEAD_B), qualified(5, HEAD_A)]);
+  const current = surfaceDelivery(withPass, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_B, merged: false }]]));
+  assert.equal(current.stage, "qualified");
+  assert.equal(current.detail, "#5@bbbbbbb");
+  assert.deepEqual(current.notes, ["qualified at old head aaaaaaa; PR #5 is now bbbbbbb"]);
+});
+
+test("unverified PR state is shown rather than assumed", () => {
+  const state = reduce([outcome(), qualified(5, HEAD_A)]);
+  assert.equal(surfaceDelivery(state, "ios-core-journeys", "ios", new Map()).detail, "#5@aaaaaaa (head unverified)");
+});
+
+test("pass and fail for the same head needs the coordinator", () => {
+  const state = reduce([outcome(), qualified(5, HEAD_A), qualified(5, HEAD_A, "fail"), qualified(5, HEAD_A)]);
+  assert.equal(state.conflicts.length, 1);
+  assert.match(state.conflicts[0].message, /both pass and fail/);
+});
+
+test("merge state is derived from GitHub", () => {
+  const state = reduce([outcome(), qualified(5, HEAD_A)]);
+  const delivery = surfaceDelivery(state, "ios-core-journeys", "ios", new Map([[5, { head: HEAD_A, merged: true, mergeCommit: MERGE }]]));
+  assert.equal(delivery.stage, "merged");
+  assert.equal(delivery.detail, "#5→ccccccc");
+});
+
+// Scenario: continued ownership survives transcript continuation; other harnesses are flagged.
+test("status replaces execution pointers and flags non-owner harnesses", () => {
+  const state = reduce([
+    outcome(),
+    { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "Qualify", pointers: [{ label: "old transcript", url: "http://devmbp:8031/c/old", harness: "phoenix@devmbp" }] },
+    { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "Build for TestFlight", pointers: [{ label: "continuation", url: "http://devmbp:8031/c/new", harness: "phoenix@devmbp" }] },
+    { kind: "status", actor: CODEX, outcome: "ios-core-journeys", next: "I own this now" },
+  ]);
+  assert.equal(state.outcomes.get("ios-core-journeys").owner.harness, "phoenix@devmbp");
+  assert.equal(state.conflicts.length, 1);
+  assert.match(state.conflicts[0].message, /status from codex, but the accountable owner is phoenix@devmbp/);
+  const rendered = renderRoadmap(state, { now: NOW });
+  assert.doesNotMatch(rendered, /old transcript/);
+});
+
+// Scenario: web and native delivery coexist without flattening.
+test("each surface reports its own delivery stage", () => {
+  const state = reduce([
+    outcome({ id: "auto-continue", title: "Auto-continuation", surfaces: ["web", "ios"] }),
+    { kind: "evidence", actor: WORKER, outcome: "auto-continue", surface: "web", stage: "deployed", result: "pass", subject: { target: "prod@devmbp", commit: "87606f42404d8d169b85cea2f6de3e6732a3e58f" }, url: "https://github.com/o/r/commit/87606f4" },
+  ]);
+  assert.equal(surfaceDelivery(state, "auto-continue", "web", new Map()).detail, "prod@devmbp@87606f4");
+  assert.equal(surfaceDelivery(state, "auto-continue", "ios", new Map()).stage, undefined);
+  assert.match(renderRoadmap(state, { now: NOW }), /web: deployed prod@devmbp@87606f4<br>ios: —/);
+});
+
+// Scenario: an optional outcome's gates never block its milestone.
+test("optional outcomes do not block and requirement changes need a decision", () => {
+  const milestone = {
+    kind: "milestone",
+    actor: COORDINATOR,
+    id: "testflight-1",
+    title: "Native iOS on TestFlight",
+    required: [{ outcome: "ios-core-journeys", surface: "ios", stage: "released" }],
+    optional: ["native-auto-continue"],
   };
-  try {
-    assert.deepEqual(
-      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
-      { changed: true, updates: 1, acknowledged: "accepted" },
-    );
-    const reactions = requests
-      .filter((request) => request.method === "POST" && request.url.includes("/reactions"))
-      .map((request) => JSON.parse(request.body).content);
-    assert.deepEqual(reactions, ["eyes", "rocket"]);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const state = reduce([
+    outcome(),
+    outcome({ id: "native-auto-continue", title: "Native auto-continue controls", order: 50 }),
+    milestone,
+    { kind: "gate", actor: WORKER, id: "g-parity", blocks: { outcome: "native-auto-continue" }, clearer: "owner", condition: "Parity design approved" },
+    { ...milestone, required: [...milestone.required, { outcome: "native-auto-continue", surface: "ios", stage: "released" }], optional: [] },
+    { kind: "decision", actor: USER, id: "d-tf-scope", statement: "Auto-continue is not a TestFlight prerequisite", scope: ["testflight-1"], quote: "not a TestFlight blocker" },
+    { kind: "gate", actor: WORKER, id: "g-milestone", blocks: { milestone: "testflight-1" }, clearer: "owner", condition: "x" },
+  ]);
+  assert.deepEqual(reasons(state), [
+    "changing milestone testflight-1 requirements needs a current decision scoped to it",
+    "only the coordinator may gate a milestone",
+  ]);
+  const rendered = renderRoadmap(state, { now: NOW });
+  const milestoneSection = rendered.slice(rendered.indexOf("## Milestones"), rendered.indexOf("## Outcomes outside milestones"));
+  assert.match(milestoneSection, /0\/1 required met/);
+  assert.match(milestoneSection, /Optional, not blocking: Native auto-continue controls/);
+  assert.doesNotMatch(milestoneSection, /Parity design approved/);
+  assert.match(milestoneSection, /d-tf-scope/);
+
+  const changed = reduce([
+    outcome(),
+    outcome({ id: "native-auto-continue", title: "Native auto-continue controls" }),
+    milestone,
+    { kind: "decision", actor: USER, id: "d-add", statement: "Now required", scope: ["testflight-1"], quote: "make it required" },
+    { ...milestone, required: [...milestone.required, { outcome: "native-auto-continue", surface: "ios", stage: "released" }], optional: [], decision: "d-add" },
+  ]);
+  assert.deepEqual(reasons(changed), []);
+  assert.equal(changed.milestones.get("testflight-1").required.length, 2);
 });
 
-test("created retirement is accepted when its workstream is absent", async () => {
-  const trigger = comment(2, retired("ios-vnext", 1));
-  const responses = [
-    new Response(JSON.stringify({}), { status: 201 }),
-    new Response(JSON.stringify([]), { status: 200 }),
-    new Response(JSON.stringify([trigger]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-    new Response(JSON.stringify([trigger]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 201 }),
-    new Response(JSON.stringify([]), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => responses.shift();
-  try {
-    assert.deepEqual(
-      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
-      { changed: true, updates: 0, acknowledged: "accepted" },
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+test("retired outcomes stay retired and dropped requirements need the coordinator", () => {
+  const state = reduce([
+    outcome(),
+    { kind: "milestone", actor: COORDINATOR, id: "m-1", title: "M", required: [{ outcome: "ios-core-journeys", surface: "ios", stage: "merged" }] },
+    { kind: "outcome-retire", actor: COORDINATOR, outcome: "ios-core-journeys", reason: "dropped", note: "Superseded" },
+    qualified(5, HEAD_A),
+    outcome(),
+  ]);
+  assert.deepEqual(reasons(state), ["outcome ios-core-journeys is retired", "outcome ios-core-journeys is retired"]);
+  const rendered = renderRoadmap(state, { now: NOW });
+  assert.match(rendered, /M requires dropped outcome ios-core-journeys/);
+  assert.match(rendered, /## Retired in the last 14 days\n\n- Native iOS core journeys — dropped: Superseded/);
 });
 
-test("processing transition failure attempts a confused terminal reaction", async () => {
-  const trigger = comment(2, fenced(update()));
-  const posts = [];
-  let call = 0;
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, options = {}) => {
-    call += 1;
-    if (options.method === "POST") posts.push(JSON.parse(options.body).content);
-    if (call === 1) return new Response(JSON.stringify({}), { status: 201 });
-    if (call === 2) return new Response("temporary", { status: 500 });
-    if (call === 3) return new Response(JSON.stringify({}), { status: 201 });
-    return new Response(JSON.stringify([]), { status: 200 });
+test("forked supersession is a coordinator conflict", () => {
+  const state = reduce([
+    outcome(),
+    { kind: "decision", actor: COORDINATOR, id: "d-1", statement: "A", scope: ["ios-core-journeys"] },
+    { kind: "decision", actor: COORDINATOR, id: "d-2", statement: "B", scope: ["ios-core-journeys"], supersedes: ["d-1"] },
+    { kind: "decision", actor: COORDINATOR, id: "d-3", statement: "C", scope: ["ios-core-journeys"], supersedes: ["d-1"] },
+  ]);
+  assert.match(state.conflicts[0].message, /d-1 is superseded by both d-2 and d-3/);
+});
+
+test("rendering shows freshness, rejections, and escapes table text", () => {
+  const state = reduceComments([
+    comment(1, outcome({ title: "Pipes | and *stars*" })),
+    comment(2, { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "Next | step" }),
+    comment(3, "```phoenix-roadmap\nnot json\n```"),
+  ]);
+  const rendered = renderRoadmap(state, { now: NOW, snapshotThroughCommentId: 3 });
+  assert.ok(rendered.includes(PROJECTION_START) && rendered.includes(PROJECTION_END));
+  assert.match(rendered, /snapshot-through:3/);
+  assert.match(rendered, /Pipes \\\| and \\\*stars\\\*/);
+  assert.match(rendered, /Next \\\| step/);
+  assert.match(rendered, /\| 11h \|/);
+  assert.match(rendered, /## Recent rejections\n\n- \[3\]\(.*\): invalid JSON/);
+
+  const stale = renderRoadmap(state, { now: new Date("2026-10-05T00:00:00Z") });
+  assert.match(stale, /\| 7d ⚠ \|/);
+});
+
+function fakeApi(comments, pulls = {}) {
+  const calls = { reactions: [], bodies: [], pulls: [] };
+  return {
+    calls,
+    listComments: async () => comments,
+    replaceBody: async (next) => calls.bodies.push(next),
+    getPull: async (number) => {
+      calls.pulls.push(number);
+      if (!pulls[number]) throw new Error("404");
+      return pulls[number];
+    },
+    setReaction: async (id, content) => calls.reactions.push([id, content]),
   };
-  try {
-    await assert.rejects(run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }));
-    assert.deepEqual(posts, ["eyes", "confused"]);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+}
+
+function commentEvent(created) {
+  return { action: "created", issue: { number: 7 }, comment: created };
+}
+
+test("run acknowledges an accepted record created on the roadmap Issue", async () => {
+  const created = comment(2, qualified(5, HEAD_A));
+  const api = fakeApi([comment(1, outcome()), created], { 5: { head: HEAD_A, merged: false } });
+  const result = await run({ eventName: "issue_comment", event: commentEvent(created), configuredIssueNumber: 7, api, now: () => NOW });
+  assert.equal(result.acknowledged, "accepted");
+  assert.deepEqual(api.calls.reactions, [[2, "eyes"], [2, "rocket"]]);
+  assert.deepEqual(api.calls.pulls, [5]);
+  assert.match(api.calls.bodies[0], /PR state verified at render/);
+  assert.match(api.calls.bodies[0], /ios: qualified #5@aaaaaaa/);
 });
 
-test("editing an update into invalid content removes it immediately", async () => {
-  const trigger = comment(2, "No structured update remains.", { updated_at: "2026-08-09T17:00:00Z" });
-  const responses = [
-    new Response(JSON.stringify([]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-    new Response(JSON.stringify([]), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => responses.shift();
-  try {
-    const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
-    assert.deepEqual(result, { changed: true, updates: 0 });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+test("run marks a rejected record confused", async () => {
+  const created = comment(1, qualified(5, HEAD_A));
+  const api = fakeApi([created]);
+  const result = await run({ eventName: "issue_comment", event: commentEvent(created), configuredIssueNumber: 7, api, now: () => NOW });
+  assert.equal(result.acknowledged, "rejected");
+  assert.deepEqual(api.calls.reactions.at(-1), [1, "confused"]);
 });
 
-test("deleted update rebuilds from remaining live comments", async () => {
-  const deleted = comment(2, fenced(update({ workstream: "deleted" })));
-  const remaining = comment(1, fenced(update({ workstream: "remaining", title: "Remaining" })));
-  const responses = [
-    new Response(JSON.stringify([remaining]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-    new Response(JSON.stringify([remaining]), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  const requests = [];
-  globalThis.fetch = async (_url, options = {}) => {
-    requests.push(options);
-    return responses.shift();
-  };
-  try {
-    const result = await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
-    assert.deepEqual(result, { changed: true, updates: 1 });
-    const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
-    assert.match(body, /Generated from the current trusted comment set/);
-    assert.doesNotMatch(body, new RegExp(deleted.updated_at));
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+test("run skips other Issues and untrusted authors", async () => {
+  const api = fakeApi([]);
+  const created = comment(1, outcome());
+  assert.deepEqual(
+    await run({ eventName: "issue_comment", event: { ...commentEvent(created), issue: { number: 8 } }, configuredIssueNumber: 7, api }),
+    { skipped: "not the configured roadmap Issue" },
+  );
+  const untrusted = { ...created, author_association: "NONE" };
+  assert.deepEqual(
+    await run({ eventName: "issue_comment", event: commentEvent(untrusted), configuredIssueNumber: 7, api }),
+    { skipped: "triggering author is not trusted" },
+  );
+  assert.equal(api.calls.bodies.length, 0);
 });
 
-test("ordinary trusted comments still rebuild from the live snapshot", async () => {
-  const trigger = comment(2, "Ordinary coordination note.");
-  const remaining = comment(1, fenced(update()));
-  const responses = [
-    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => responses.shift();
-  try {
-    assert.deepEqual(
-      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
-      { changed: true, updates: 1 },
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("untrusted trigger is rejected before API access", async () => {
-  const trigger = comment(1, fenced(update()), { author_association: "NONE" });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => assert.fail("untrusted trigger must not call GitHub");
-  try {
-    assert.deepEqual(
-      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
-      { skipped: "triggering author is not trusted" },
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+test("scheduled runs re-render without acknowledging and tolerate PR read failures", async () => {
+  const api = fakeApi([comment(1, outcome()), comment(2, qualified(5, HEAD_A))]);
+  const result = await run({ eventName: "schedule", event: {}, configuredIssueNumber: 7, api, now: () => NOW });
+  assert.deepEqual(result, { outcomes: 1, rejections: 0 });
+  assert.deepEqual(api.calls.reactions, []);
+  assert.match(api.calls.bodies[0], /PR state not verified/);
+  assert.match(api.calls.bodies[0], /head unverified/);
 });
