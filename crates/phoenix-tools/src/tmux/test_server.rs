@@ -1,5 +1,7 @@
+use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WATCHDOG_PROGRAM: &str = r##"
 import ctypes
 import fcntl
+import itertools
 import json
 import os
 from pathlib import Path
@@ -35,6 +38,8 @@ parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 root_stat = root.stat()
 root_identity = (root_stat.st_dev, root_stat.st_ino)
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+control_root_fd = os.open(control_root, os.O_RDONLY | os.O_DIRECTORY)
 control_root_stat = control_root.stat()
 control_root_identity = (control_root_stat.st_dev, control_root_stat.st_ino)
 owned = []
@@ -57,6 +62,7 @@ completion_hook = os.environ.get("PHOENIX_TMUX_COMPLETION_HOOK")
 provisional = []
 adopted_pending_publication = []
 preserved_visible_paths = set()
+cleanup_record_status = {}
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -73,7 +79,7 @@ class ProcBsdInfo(ctypes.Structure):
         ("start_tvsec", ctypes.c_uint64), ("start_tvusec", ctypes.c_uint64),
     ]
 
-def process(pid):
+def process(pid, timeout=0.5):
     try:
         if sys.platform.startswith("linux"):
             stat = Path(f"/proc/{pid}/stat").read_text()
@@ -92,7 +98,7 @@ def process(pid):
             capture_output=True,
             check=False,
             text=True,
-            timeout=0.5,
+            timeout=timeout,
         )
         birth = info.start_tvsec * 1_000_000 + info.start_tvusec
         return str(birth), info.status == 5, result.stdout.split()
@@ -106,6 +112,8 @@ def pid_exists(pid):
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    except OverflowError:
         return True
 
 def birth(pid):
@@ -135,10 +143,16 @@ def publish_response(path, value):
     pending.write_text(value)
     os.replace(pending, path)
 
+class DeadlineExpired(RuntimeError):
+    pass
+
+class IdentityOutputError(RuntimeError):
+    pass
+
 def remaining_timeout(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RuntimeError("tmux identity registration deadline expired")
+        raise DeadlineExpired("tmux identity registration deadline expired")
     return min(0.5, remaining)
 
 def query_control_processes(control, deadline):
@@ -157,8 +171,12 @@ def query_control_processes(control, deadline):
     if (server.returncode != 0 or panes.returncode != 0 or not pane_pids
             or not server_pid.isascii() or not server_pid.isdecimal()
             or any(not pid.isascii() or not pid.isdecimal() for pid in pane_pids)):
-        raise RuntimeError("tmux identity output was malformed")
-    return int(server_pid), tuple(dict.fromkeys(int(pid) for pid in pane_pids))
+        raise IdentityOutputError("tmux identity output was malformed")
+    server_pid = int(server_pid)
+    pane_pids = tuple(dict.fromkeys(int(pid) for pid in pane_pids))
+    if server_pid > 2_147_483_647 or any(pid > 2_147_483_647 for pid in pane_pids):
+        raise IdentityOutputError("tmux identity PID was out of range")
+    return server_pid, pane_pids
 
 def observe_control(control, expected_token, deadline):
     last_error = RuntimeError("tmux identity query did not run")
@@ -198,6 +216,155 @@ def original_control_root_exists():
         return (current.st_dev, current.st_ino) == control_root_identity
     except OSError:
         return False
+
+def anchored_identity(directory_fd, name):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        return [current.st_dev, current.st_ino]
+    except OSError:
+        return None
+
+def capped(values, size, limit):
+    return list(itertools.islice(values, limit)), max(0, size - limit)
+
+def record_cleanup_failure(reason, terminal):
+    records = []
+    bounded_owned, omitted_records = capped(iter(owned), len(owned), 16)
+    omitted_processes = 0
+    probe_deadline = time.monotonic() + 0.25
+    for socket, device, inode, control, processes in bounded_owned:
+        bounded_processes, omitted = capped(iter(processes), len(processes), 32)
+        omitted_processes += omitted
+        process_records = []
+        for identity in bounded_processes:
+            remaining = probe_deadline - time.monotonic()
+            if remaining <= 0:
+                state = "probe-budget-exhausted"
+            else:
+                observed = process(identity[0], min(0.05, remaining))
+                if observed is None:
+                    state = "unverifiable" if pid_exists(identity[0]) else "absent"
+                elif observed[0] != identity[1]:
+                    state = "mismatched"
+                elif observed[1]:
+                    state = "absent"
+                elif identity[2] is None:
+                    state = "owned"
+                else:
+                    token_bytes = f"PHOENIX_TMUX_SERVER_TOKEN={identity[2]}".encode()
+                    state = "owned" if any(
+                        value == token_bytes or value == token_bytes.decode()
+                        for value in observed[2]
+                    ) else "mismatched"
+            process_records.append({
+                "pid": identity[0], "birth": identity[1], "state": state
+            })
+        records.append({
+            "socket": socket.name,
+            "control": control.name,
+            "socket_identity": anchored_identity(root_fd, socket.name),
+            "control_identity": anchored_identity(control_root_fd, control.name),
+            "expected_identity": [device, inode],
+            "processes": process_records,
+        })
+    visible_paths, omitted_visible_paths = capped(
+        (path.name for path in preserved_visible_paths), len(preserved_visible_paths), 32
+    )
+    controls, omitted_controls = capped(
+        iter(retained_controls), len(retained_controls), 32
+    )
+    statuses, omitted_statuses = capped(
+        iter(cleanup_record_status.items()), len(cleanup_record_status), 32
+    )
+    receipt = {
+        "version": 1,
+        "reason": reason,
+        "root_identity_matches": original_root_exists(),
+        "control_root_identity_matches": original_control_root_exists(),
+        "cleanup_failed": cleanup_failed,
+        "quiet": terminal.get("quiet", 0),
+        "unconfirmed": terminal.get("unconfirmed", True),
+        "unconfirmed_state": terminal.get("unconfirmed_state", True),
+        "sockets": terminal.get("sockets", True),
+        "creators": terminal.get("creators", True),
+        "unconfirmed_obligations": len(unconfirmed_obligations),
+        "preserved_visible_paths": visible_paths,
+        "retained_controls": controls,
+        "record_status": dict(statuses),
+        "records": records,
+        "omitted": {
+            "records": omitted_records,
+            "processes": omitted_processes,
+            "preserved_visible_paths": omitted_visible_paths,
+            "retained_controls": omitted_controls,
+            "record_status": omitted_statuses,
+        },
+    }
+    serialized = json.dumps(receipt, sort_keys=True)
+    if len(serialized.encode()) > 16384:
+        serialized = json.dumps({
+            "version": 1,
+            "reason": reason,
+            "receipt_too_large": True,
+            "owned_records": len(owned),
+            "unconfirmed_obligations": len(unconfirmed_obligations),
+        }, sort_keys=True)
+    pending = f".pending-cleanup-failure-{uuid.uuid4().hex}.json"
+    try:
+        descriptor = os.open(
+            pending,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_fd,
+        )
+        try:
+            payload = serialized.encode()
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count == 0:
+                    raise OSError("cleanup receipt write made no progress")
+                written += count
+        finally:
+            os.close(descriptor)
+        os.replace(pending, ".cleanup-failure.json", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    except OSError:
+        try:
+            os.unlink(pending, dir_fd=root_fd)
+        except OSError:
+            pass
+
+def fail_cleanup(reason, terminal):
+    record_cleanup_failure(reason, terminal)
+    sys.exit(1)
+
+def terminal_state(quiet, unconfirmed, unconfirmed_state, sockets, creators, states):
+    return {
+        "quiet": quiet,
+        "unconfirmed": unconfirmed,
+        "unconfirmed_state": unconfirmed_state,
+        "sockets": sockets,
+        "creators": creators,
+        "states": states,
+    }
+
+def record_uncaught_cleanup_failure(error_type, error, traceback):
+    if issubclass(error_type, SystemExit):
+        return sys.__excepthook__(error_type, error, traceback)
+    if issubclass(error_type, subprocess.TimeoutExpired):
+        reason = "cleanup-subprocess-timeout"
+    elif issubclass(error_type, DeadlineExpired):
+        reason = "cleanup-deadline-expired"
+    elif issubclass(error_type, IdentityOutputError):
+        reason = "cleanup-identity-output-error"
+    elif issubclass(error_type, OSError):
+        reason = "cleanup-os-error"
+    else:
+        reason = "cleanup-runtime-error"
+    record_cleanup_failure(reason, globals().get("terminal", {}))
+    return sys.__excepthook__(error_type, error, traceback)
+
+sys.excepthook = record_uncaught_cleanup_failure
 
 def owner_alive():
     if (not original_root_exists() or not original_control_root_exists()
@@ -293,18 +460,24 @@ def persist_record_processes(record, processes):
         )
     return updated
 
+def set_cleanup_record_status(control, stage, detail):
+    cleanup_record_status[control.name] = {"stage": stage, "detail": detail}
+
 def retire_record(record, deadline):
     _, device, inode, control, recorded_processes = record
     processes = list(recorded_processes)
     expected_token = tmux_format_literal(processes[0][2])
     states = [identity_state(identity) for identity in processes]
     if all(state == "absent" for state in states):
+        set_cleanup_record_status(control, "preflight", "already-absent")
         return record
     if states[0] != "owned" or any(state not in ("owned", "absent") for state in states[1:]):
+        set_cleanup_record_status(control, "preflight", "identity-not-owned")
         return None
     try:
         control_stat = control.stat()
         if control_stat.st_dev != device or control_stat.st_ino != inode:
+            set_cleanup_record_status(control, "preflight", "control-identity-mismatch")
             return None
         expected_server = processes[0][0]
         if retirement_hook:
@@ -314,18 +487,24 @@ def retire_record(record, deadline):
                 stderr=subprocess.DEVNULL, check=False,
                 timeout=remaining_timeout(deadline),
             )
+        set_cleanup_record_status(control, "query", "started")
         observed_server, pane_pids = query_control_processes(control, deadline)
         if observed_server != expected_server:
+            set_cleanup_record_status(control, "query", "server-pid-mismatch")
             return None
         known_pids = {identity[0] for identity in processes}
         for pane_pid in pane_pids:
             if pane_pid not in known_pids:
                 started = birth(pane_pid)
                 if started is None:
+                    if not pid_exists(pane_pid):
+                        continue
+                    set_cleanup_record_status(control, "query", "live-late-pane-birth-unavailable")
                     return None
                 processes.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
         record = persist_record_processes(record, processes)
+        set_cleanup_record_status(control, "atomic-kill", "started")
         subprocess.run(
             ["tmux", "-S", str(control), "if-shell", "-F",
              f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
@@ -334,12 +513,28 @@ def retire_record(record, deadline):
             stderr=subprocess.DEVNULL, check=False,
             timeout=remaining_timeout(deadline),
         )
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        set_cleanup_record_status(control, "subprocess", "timeout")
         return None
+    except DeadlineExpired:
+        set_cleanup_record_status(control, "subprocess", "deadline-expired")
+        return None
+    except IdentityOutputError as error:
+        set_cleanup_record_status(control, "query", str(error))
+        return None
+    except RuntimeError as error:
+        set_cleanup_record_status(control, "runtime", str(error))
+        return None
+    except OSError:
+        set_cleanup_record_status(control, "subprocess", "os-error")
+        return None
+    set_cleanup_record_status(control, "final-absence", "waiting")
     while time.monotonic() < deadline:
         if all(identity_state(identity) == "absent" for identity in processes):
+            set_cleanup_record_status(control, "final-absence", "verified")
             return record
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    set_cleanup_record_status(control, "final-absence", "deadline-expired")
     return None
 
 class EnvironmentError(RuntimeError):
@@ -890,7 +1085,9 @@ for index, record in enumerate(owned):
             if pane_pid not in known_pids:
                 started = birth(pane_pid)
                 if started is None:
-                    raise RuntimeError("late pane birth identity was unavailable")
+                    if not pid_exists(pane_pid):
+                        continue
+                    raise RuntimeError("live late pane birth identity was unavailable")
                 expanded.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
         record = (socket, device, inode, control, tuple(expanded))
@@ -968,17 +1165,18 @@ def remove_authenticated_control_root():
         pass
     return False
 
+terminal = terminal_state(0, True, True, True, True, {})
 quiet = 0
 while time.monotonic() < cleanup_deadline:
     root_replaced = not original_root_exists()
     unconfirmed = root_replaced or cleanup_failed
-    states = [
-        identity_state(identity)
-        for _, _, _, _, processes in owned
-        for identity in processes
-    ]
-    unconfirmed_state = (any(state != "absent" for state in states)
-                         or bool(unconfirmed_obligations))
+    process_states = {
+        control.name: [identity_state(identity) for identity in processes]
+        for _, _, _, control, processes in owned
+    }
+    unconfirmed_state = (any(
+        state != "absent" for states in process_states.values() for state in states
+    ) or bool(unconfirmed_obligations))
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -1079,6 +1277,9 @@ while time.monotonic() < cleanup_deadline:
         except OSError:
             creators = True
     quiet = quiet + 1 if not unconfirmed_state and not unconfirmed and not sockets and not creators else 0
+    terminal = terminal_state(
+        quiet, unconfirmed, unconfirmed_state, sockets, creators, process_states
+    )
     if quiet >= 5:
         if not remove_authenticated_control_root():
             quiet = 0
@@ -1091,7 +1292,7 @@ while time.monotonic() < cleanup_deadline:
             if (moved_root_stat.st_dev, moved_root_stat.st_ino) != root_identity:
                 if not root.exists():
                     os.replace(root_quarantine, root)
-                sys.exit(1)
+                fail_cleanup("root-quarantine-identity-mismatch", terminal)
             if root_quarantine_hook:
                 subprocess.run(
                     [root_quarantine_hook, str(root_quarantine)],
@@ -1116,31 +1317,38 @@ while time.monotonic() < cleanup_deadline:
             if not reconciled:
                 if not root.exists():
                     os.replace(root_quarantine, root)
-                sys.exit(1)
+                fail_cleanup("root-quarantine-reconciliation-failed", terminal)
+            if completion_hook:
+                subprocess.run(
+                    [completion_hook, str(control_root)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                    timeout=remaining_timeout(cleanup_deadline),
+                )
             shutil.rmtree(root_quarantine)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            try:
+                if root_quarantine.exists() and not root.exists():
+                    os.replace(root_quarantine, root)
+            except OSError:
+                pass
+            raise
         except OSError:
             try:
                 if root_quarantine.exists() and not root.exists():
                     os.replace(root_quarantine, root)
             except OSError:
                 pass
-            sys.exit(1)
-        if completion_hook:
-            subprocess.run(
-                [completion_hook, str(control_root)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, check=False,
-                timeout=remaining_timeout(cleanup_deadline),
-            )
+            fail_cleanup("root-quarantine-operation-failed", terminal)
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
-print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
-sys.exit(1)
+fail_cleanup("cleanup-deadline-expired", terminal)
 "##;
 
 /// Owns real tmux servers created by tests, including after abrupt runner death.
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
+    root_anchor: Option<fs::File>,
     control_root: Option<TempDir>,
     watchdog: Option<Child>,
     heartbeat_stop: Arc<AtomicBool>,
@@ -1190,6 +1398,31 @@ fn configure_watchdog_env(
     set_path_env(command, "PHOENIX_TMUX_COMPLETION_HOOK", lifecycle_hooks.3);
 }
 
+fn read_cleanup_receipt(root_anchor: &fs::File) -> io::Result<String> {
+    let name = CString::new(".cleanup-failure.json").expect("static receipt name has no NUL");
+    let descriptor = unsafe {
+        libc::openat(
+            root_anchor.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("cleanup receipt is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(16_385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16_384 {
+        bytes.truncate(16_384);
+        bytes.extend_from_slice(b"...[truncated]");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl TestTmuxServerOwner {
     /// Creates an isolated short socket root and its detached cleanup watchdog.
     ///
@@ -1236,6 +1469,7 @@ impl TestTmuxServerOwner {
             .or_else(|_| tempfile::Builder::new().prefix("ptt-").tempdir_in("/tmp"))
             .expect("create short isolated tmux test root");
         let canonical_root = root.path().canonicalize().expect("canonicalize test root");
+        let root_anchor = fs::File::open(&canonical_root).expect("open anchored tmux test root");
         let control_root = tempfile::Builder::new()
             .prefix("ptw-")
             .tempdir_in(canonical_root.parent().expect("test root has parent"))
@@ -1308,6 +1542,7 @@ impl TestTmuxServerOwner {
 
         Self {
             root: Some(root),
+            root_anchor: Some(root_anchor),
             control_root: Some(control_root),
             watchdog: Some(watchdog),
             heartbeat_stop,
@@ -1360,6 +1595,7 @@ impl TestTmuxServerOwner {
 
     fn finish(&mut self, graceful: bool) -> io::Result<()> {
         let root = self.root.take().expect("owner root is live");
+        let root_anchor = self.root_anchor.take().expect("owner root anchor is live");
         let control_root = self
             .control_root
             .take()
@@ -1374,8 +1610,10 @@ impl TestTmuxServerOwner {
 
         let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
             if !status.success() {
+                let receipt = read_cleanup_receipt(&root_anchor)
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
                 return Err(io::Error::other(format!(
-                    "tmux test watchdog reported cleanup failure: {status}"
+                    "tmux test watchdog reported cleanup failure: {status}; receipt: {receipt}"
                 )));
             }
             if root_path.exists() {
@@ -1926,6 +2164,101 @@ mod tests {
     use std::process::ExitStatus;
 
     use super::*;
+
+    #[test]
+    fn uncaught_cleanup_failures_publish_receipts_and_receipt_reads_are_nonblocking() {
+        assert!(WATCHDOG_PROGRAM.contains("sys.excepthook = record_uncaught_cleanup_failure"));
+        assert!(WATCHDOG_PROGRAM.contains("issubclass(error_type, OSError)"));
+        assert!(WATCHDOG_PROGRAM.contains("globals().get(\"terminal\", {})"));
+        let hook = WATCHDOG_PROGRAM.find("if completion_hook:").unwrap();
+        let removal = WATCHDOG_PROGRAM
+            .find("shutil.rmtree(root_quarantine)")
+            .unwrap();
+        assert!(hook < removal);
+        assert!(WATCHDOG_PROGRAM.contains(
+            "except (RuntimeError, subprocess.TimeoutExpired):\n            try:\n                if root_quarantine.exists() and not root.exists():\n                    os.replace(root_quarantine, root)"
+        ));
+    }
+
+    #[test]
+    fn watchdog_identity_protocol_rejects_out_of_range_pids_and_classifies_query_errors() {
+        assert!(WATCHDOG_PROGRAM.contains("server_pid > 2_147_483_647"));
+        assert!(WATCHDOG_PROGRAM.contains("pid > 2_147_483_647 for pid in pane_pids"));
+        assert!(WATCHDOG_PROGRAM.contains("except IdentityOutputError as error:"));
+        assert!(
+            WATCHDOG_PROGRAM.contains("set_cleanup_record_status(control, \"query\", str(error))")
+        );
+        assert!(WATCHDOG_PROGRAM.contains("except DeadlineExpired:"));
+    }
+
+    #[test]
+    fn cleanup_receipt_reader_is_anchored_and_bounded() {
+        let root = TempDir::new().unwrap();
+        let anchor = fs::File::open(root.path()).unwrap();
+        fs::write(
+            root.path().join(".cleanup-failure.json"),
+            vec![b'x'; 20_000],
+        )
+        .unwrap();
+        let replacement = root.path().with_extension("replacement");
+        fs::rename(root.path(), &replacement).unwrap();
+        fs::create_dir(root.path()).unwrap();
+        fs::write(root.path().join(".cleanup-failure.json"), b"forged").unwrap();
+
+        let receipt = read_cleanup_receipt(&anchor).unwrap();
+
+        assert!(!receipt.contains("forged"));
+        assert!(receipt.ends_with("...[truncated]"));
+        fs::remove_dir_all(root.path()).unwrap();
+        fs::remove_dir_all(replacement).unwrap();
+        std::mem::forget(root);
+    }
+
+    #[test]
+    fn completion_hook_timeout_restores_reported_fixture_root() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hooks = TempDir::new().unwrap();
+        let hook = hooks.path().join("slow-completion");
+        fs::write(&hook, "#!/bin/sh\nsleep 10\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, Some(Duration::from_millis(300))),
+            None,
+            None,
+            None,
+            (None, None),
+            (None, None, None, Some(&hook)),
+        );
+        let root = owner.path().to_path_buf();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert!(root.exists(), "reported retained root was not restored");
+        let receipt = fs::read_to_string(root.join(".cleanup-failure.json")).unwrap();
+        assert!(receipt.contains("cleanup-deadline-expired"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_receipt_reader_rejects_fifo_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let anchor = fs::File::open(root.path()).unwrap();
+        let fifo_path = root.path().join(".cleanup-failure.json");
+        let fifo = CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let error = read_cleanup_receipt(&anchor).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn process_identity_parser_accepts_exact_tmux_form_and_rejects_malformed_output() {
@@ -2983,35 +3316,42 @@ mod tests {
     }
 
     #[test]
-    fn retirement_discovered_exited_pane_uses_updated_owned_record() {
-        if which::which("tmux").is_err() {
+    fn retirement_ignores_discovered_pane_that_is_proven_absent() {
+        let Ok(real_tmux) = which::which("tmux") else {
             return;
-        }
+        };
         let hook_dir = TempDir::new().unwrap();
-        let once = hook_dir.path().join("once");
-        let hook = hook_dir.path().join("add-short-pane");
+        let enabled = hook_dir.path().join("enabled");
+        let exited_pid = hook_dir.path().join("exited-pid");
+        let tmux = hook_dir.path().join("tmux");
         fs::write(
-            &hook,
+            &tmux,
             format!(
-                "#!/bin/sh\n[ -e '{}' ] && exit 0\ntouch '{}'\ntmux -S \"$1\" new-window -d -t main sleep 0.05\n",
-                once.display(),
-                once.display()
+                "#!/bin/sh\n'{}' \"$@\"\nstatus=$?\nfor arg in \"$@\"; do\n  if [ \"$arg\" = list-panes ] && [ -e '{}' ]; then\n    cat '{}'\n    printf '\\n'\n  fi\ndone\nexit \"$status\"\n",
+                real_tmux.display(),
+                enabled.display(),
+                exited_pid.display()
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
+        fs::set_permissions(&tmux, permissions).unwrap();
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
-            None,
+            Some(hook_dir.path()),
             (None, Some(Duration::from_secs(2))),
             None,
             None,
             None,
             (None, None),
-            (None, Some(&hook), None, None),
+            (None, None, None, None),
         );
-        let (_, processes) = spawn_server_with_processes(&owner, "late-exited-pane");
+        let (_, processes) = spawn_server_with_processes(&owner, "absent-late-pane");
+        let exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let exited_pid_value = exited.id();
+        exited.wait_with_output().unwrap();
+        fs::write(&exited_pid, exited_pid_value.to_string()).unwrap();
+        fs::write(&enabled, b"enabled").unwrap();
 
         owner.shutdown();
 
@@ -3417,6 +3757,13 @@ mod tests {
             replacement.local_addr().unwrap().as_pathname(),
             Some(replacement_socket.as_path())
         );
+        assert!(
+            !root.join(".cleanup-failure.json").exists(),
+            "diagnostic receipt was written into replacement root"
+        );
+        let receipt = fs::read_to_string(moved_root.join(".cleanup-failure.json"))
+            .expect("failure receipt is retained with original root");
+        assert!(receipt.contains("\"reason\": \"cleanup-deadline-expired\""));
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(moved_root).unwrap();
@@ -4466,11 +4813,24 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_receipt_is_bounded_and_excludes_owner_tokens() {
+        assert!(WATCHDOG_PROGRAM.contains("dst_dir_fd=root_fd"));
+        assert!(WATCHDOG_PROGRAM.contains("capped(iter(owned), len(owned), 16)"));
+        assert!(WATCHDOG_PROGRAM.contains("capped(iter(processes), len(processes), 32)"));
+        assert!(WATCHDOG_PROGRAM.contains("while written < len(payload):"));
+        assert!(WATCHDOG_PROGRAM.contains("anchored_identity(root_fd, socket.name)"));
+        assert!(WATCHDOG_PROGRAM.contains("len(serialized.encode()) > 16384"));
+        assert!(WATCHDOG_PROGRAM.contains("probe_deadline = time.monotonic() + 0.25"));
+        assert!(WATCHDOG_PROGRAM.contains("\"probe-budget-exhausted\""));
+        assert!(!WATCHDOG_PROGRAM.contains("\"token\": identity[2]"));
+        assert!(!WATCHDOG_PROGRAM.contains("\"environment\": environment"));
+    }
+
+    #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
-        assert!(WATCHDOG_PROGRAM
-            .contains("if all(state == \"absent\" for state in states):\n        return record"));
+        assert!(WATCHDOG_PROGRAM.contains("if all(state == \"absent\" for state in states):"));
         assert!(WATCHDOG_PROGRAM.contains(
-            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):\n        return None"
+            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):"
         ));
         assert!(WATCHDOG_PROGRAM.contains("retire_record(record, cleanup_deadline)"));
     }

@@ -65,6 +65,7 @@ impl DirectTurnAttemptAuthority {
 pub enum SubmittedDirectTurnExpansionPolicy {
     ExpandReferences,
     LiteralText,
+    GeneratedPredecessorContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +313,15 @@ impl PreparedDirectTurnPayload {
         crate::domain::db_schema::MessageContent,
         Option<serde_json::Value>,
     ) {
-        let content = if let Some(invocation) = &self.delivery.skill_invocation {
+        let content = if self.submitted.expansion_policy
+            == SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext
+        {
+            crate::domain::db_schema::MessageContent::Continuation(
+                crate::domain::db_schema::ContinuationContent {
+                    summary: self.delivery.text.clone(),
+                },
+            )
+        } else if let Some(invocation) = &self.delivery.skill_invocation {
             crate::domain::db_schema::MessageContent::Skill(
                 crate::domain::db_schema::SkillContent {
                     name: invocation.name.clone(),
@@ -424,6 +433,10 @@ pub enum Event {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
     },
+    /// Starts an admitted sub-agent whose initial user message is already durable.
+    PersistedSubAgentBootstrap,
+    /// Retries exact buffered child outcomes after a transient acceptance read failure.
+    RetryBufferedSubAgentResults,
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
@@ -648,6 +661,8 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
+            Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -689,9 +704,10 @@ impl Event {
 /// forced teardown (task 61004). `UserRequested` is a human-initiated or
 /// parent-propagated cancel; `Timeout` is the parent's sub-agent completion
 /// timeout forcing teardown.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
+    #[default]
     UserRequested,
     Timeout,
 }
@@ -809,6 +825,7 @@ pub enum ParentOnlyEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum SubAgentOnlyEvent {
+    PersistedBootstrap,
     GraceTurnExhausted { result: Option<String> },
 }
 
@@ -883,6 +900,14 @@ impl TryFrom<Event> for ParentEvent {
                     authority,
                 }))
             }
+            Event::PersistedSubAgentBootstrap => Err(EventConversionError {
+                event_variant: "PersistedSubAgentBootstrap",
+                target_type: "ParentEvent",
+            }),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "ParentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -1164,6 +1189,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 }))
             }
             // Sub-agent-only events
+            Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
+                SubAgentOnlyEvent::PersistedBootstrap,
+            )),
+            Event::RetryBufferedSubAgentResults => Err(EventConversionError {
+                event_variant: "RetryBufferedSubAgentResults",
+                target_type: "SubAgentEvent",
+            }),
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
@@ -1246,6 +1278,7 @@ impl SubAgentEvent {
         match self {
             SubAgentEvent::Core(e) => e.variant_name(),
             SubAgentEvent::SubAgent(e) => match e {
+                SubAgentOnlyEvent::PersistedBootstrap => "PersistedSubAgentBootstrap",
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }
@@ -1352,6 +1385,22 @@ mod direct_turn_payload_tests {
                 if actual == PreparedDirectTurnPayload::VERSION + 1
                     && expected == PreparedDirectTurnPayload::VERSION
         ));
+    }
+
+    #[test]
+    fn generated_predecessor_context_materializes_as_typed_continuation() {
+        let payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-generated",
+                SubmittedDirectTurnExpansionPolicy::GeneratedPredecessorContext,
+            ),
+            delivery("display summary", Some("authority-wrapped context")),
+        );
+        let (content, _) = payload.message_content_and_display_data();
+        let crate::domain::db_schema::MessageContent::Continuation(continuation) = content else {
+            panic!("expected typed continuation content");
+        };
+        assert_eq!(continuation.summary, "display summary");
     }
 
     #[test]

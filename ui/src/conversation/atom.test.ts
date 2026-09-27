@@ -1510,6 +1510,54 @@ describe('conversationReducer', () => {
       expect(next.phase.type).toBe('awaiting_llm');
     });
 
+    it('clears failed streamed tokens when llm_requesting ends in error/refusal', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 2,
+        streamingBuffer: {
+          text: 'partial',
+          lastSequence: 2,
+          startedAt: Date.now(),
+          requestId: 'req-1',
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 3,
+        phase: { type: 'error', message: 'refused', error_kind: 'prompt_rejected' },
+        stateUpdatedAt: Date.parse('2024-01-01T00:00:01Z'),
+      });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.phase.type).toBe('error');
+    });
+
+    it('does not let a non-requesting phase change clear a newer stream buffer', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'tool_executing', current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } }, remaining_tools: [] },
+        lastAppliedEventSeq: 9,
+        firstByteRequestId: 'req-2',
+        streamingBuffer: {
+          text: 'newer stream',
+          lastSequence: 9,
+          startedAt: Date.now(),
+          requestId: 'req-2',
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 10,
+        phase: { type: 'error', message: 'old failure surfaced late', error_kind: 'server_error' },
+        stateUpdatedAt: Date.parse('2024-01-01T00:00:02Z'),
+      });
+
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
+    });
+
     it('applies live awaiting_continuation state changes', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
@@ -1785,6 +1833,65 @@ describe('conversationReducer', () => {
         reasonText: 'request timeout',
       });
     });
+
+    it('clears only the failed attempt buffer on retry', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 4,
+        firstByteRequestId: 'attempt-1',
+        streamingBuffer: {
+          text: 'partial from attempt 1',
+          lastSequence: 4,
+          startedAt: Date.now(),
+          requestId: 'attempt-1',
+        },
+      };
+
+      const next = conversationReducer(atom, {
+        type: 'sse_llm_attempt',
+        sequenceId: 5,
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'network',
+        backingOffMs: 250,
+        resetsAt: null,
+      });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.turnRetryContext).toMatchObject({
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'network',
+      });
+    });
+
+    it('does not let a stale retry clear a newer stream buffer', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'llm_requesting', attempt: 2 },
+        lastAppliedEventSeq: 7,
+        firstByteRequestId: 'attempt-2',
+        streamingBuffer: {
+          text: 'fresh stream',
+          lastSequence: 7,
+          startedAt: Date.now(),
+          requestId: 'attempt-2',
+        },
+      };
+
+      const next = conversationReducer(atom, {
+        type: 'sse_llm_attempt',
+        sequenceId: 8,
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'server_error',
+        backingOffMs: 250,
+        resetsAt: null,
+      });
+
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
+    });
   });
 
   describe('sse_token', () => {
@@ -1923,6 +2030,37 @@ describe('conversationReducer', () => {
       expect(a3.streamingBuffer?.text).toBe('Before reconnect works correctly');
       expect(a3.lastAppliedEventSeq).toBe(53);
     });
+
+    it('reconnect preserves a newer in-flight stream buffer', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: testConversation.id,
+        conversation: testConversation,
+        phase: { type: 'llm_requesting', attempt: 2 },
+        lastAppliedEventSeq: 50,
+        transcriptGeneration: 1,
+        streamIncarnation: 'test-stream',
+        firstByteRequestId: 'req-2',
+        streamingBuffer: { text: 'Before reconnect ', lastSequence: 50, startedAt: 1000, requestId: 'req-2' },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_init',
+        payload: makeInitPayload({
+          conversation: testConversation,
+          phase: { type: 'llm_requesting', attempt: 2 },
+          transcriptGeneration: 1,
+          streamIncarnation: 'test-stream',
+          pendingAnchorSequenceId: 50,
+          lastAppliedEventSeq: 50,
+          pendingEvents: [],
+          pendingTruncated: false,
+          transcriptCoverage: 'tail',
+        }),
+      });
+
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
+    });
   });
 
   describe('sse_error', () => {
@@ -1950,6 +2088,55 @@ describe('conversationReducer', () => {
 
       expect(next.uiError).toEqual({ type: 'BackendError', message: 'server hiccup' });
       expect(next.lastAppliedEventSeq).toBe(43);
+    });
+
+    it('clears the affected stream buffer on error', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 42,
+        firstByteRequestId: 'req-1',
+        streamingBuffer: {
+          text: 'partial',
+          lastSequence: 42,
+          startedAt: Date.now(),
+          requestId: 'req-1',
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        sequenceId: 43,
+        error: { type: 'BackendError', message: 'server hiccup' },
+      });
+
+      expect(next.uiError).toEqual({ type: 'BackendError', message: 'server hiccup' });
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.lastAppliedEventSeq).toBe(43);
+    });
+
+    it('does not let a stale error erase a newer request buffer', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        phase: { type: 'tool_executing', current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } }, remaining_tools: [] },
+        lastAppliedEventSeq: 12,
+        firstByteRequestId: 'req-2',
+        streamingBuffer: {
+          text: 'new request still visible',
+          lastSequence: 12,
+          startedAt: Date.now(),
+          requestId: 'req-2',
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_error',
+        sequenceId: 13,
+        error: { type: 'BackendError', message: 'older request failed' },
+      });
+
+      expect(next.uiError).toEqual({ type: 'BackendError', message: 'older request failed' });
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
     });
 
     it('drops replayed wire errors after the user has moved on', () => {

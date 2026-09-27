@@ -627,7 +627,7 @@ fn conversation_message_href(conv: &Conversation, message: Option<(&str, Message
 fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     matches!(
         message_type,
-        MessageType::User | MessageType::Agent | MessageType::Skill
+        MessageType::User | MessageType::Agent | MessageType::Skill | MessageType::Continuation
     )
 }
 
@@ -1103,6 +1103,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
+        | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseAdmissionFenced(_)

@@ -1640,6 +1640,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageConflict(_)
         | DbError::SlugExists(_)
         | DbError::Serialization(_)
+        | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseAdmissionFenced(_)

@@ -29,6 +29,17 @@
   right: 12px;
 }
 
+.coordinator-page__automatic-continuation {
+  position: absolute;
+  z-index: 10;
+  top: 12px;
+  right: 16px;
+  padding: 4px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
 .coordinator-muted {
   color: var(--text-muted);
   font-size: 0.875rem;

@@ -15,6 +15,7 @@ mod svg_artifacts;
 pub use svg_artifacts::SvgArtifact;
 mod migrations;
 mod product_creation;
+mod provider_replay;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
@@ -26,7 +27,9 @@ pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
+mod sub_agent_lifecycle;
 pub mod workflow;
+pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -227,6 +230,8 @@ pub enum DbError {
     CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]
     CloseFoundationNotFound(String),
+    #[error("Sub-agent lifecycle conflict: {0}")]
+    SubAgentLifecycleConflict(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
@@ -1300,10 +1305,25 @@ pub struct AutomaticContinuationAdmission {
     pub first_message_id: ClientTurnKey,
     pub opening_authority: ContinuationOpeningAuthority,
     pub phase: AutomaticContinuationPhase,
+    pub resume_phase: AutomaticContinuationPhase,
     pub no_progress_attempts: u32,
     pub last_error: Option<String>,
     pub admitted_at_unix_micros: i64,
     pub updated_at_unix_micros: i64,
+}
+
+fn accepted_continuation_message_matches(
+    successor_conversation_id: &str,
+    accepted_message_id: &str,
+    first_message_id: &ClientTurnKey,
+) -> bool {
+    accepted_message_id == first_message_id.as_str()
+        || accepted_message_id
+            == format!("{successor_conversation_id}:{}", first_message_id.as_str())
+}
+
+impl AutomaticContinuationAdmission {
+    pub const MAX_NO_PROGRESS_ATTEMPTS: u32 = 3;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4349,13 +4369,12 @@ impl Database {
         model: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: DbResult<String> = async {
             if let Some(id) = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut *tx)
             .await?
             {
                 return Ok(id);
@@ -4370,7 +4389,7 @@ impl Database {
                  VALUES (?1, 'coordinator', NULL)",
             )
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             let now = Utc::now().to_rfc3339();
             let idle = serde_json::to_string(&ConvState::Idle)
@@ -4387,7 +4406,7 @@ impl Database {
             .bind(model)
             .bind(llm_language.as_str())
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             Ok(id)
         }
@@ -4395,12 +4414,11 @@ impl Database {
 
         match result {
             Ok(conversation_id) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                drop(conn);
+                tx.commit().await?;
                 self.get_conversation(&conversation_id).await
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let _ = tx.rollback().await;
                 Err(error)
             }
         }
@@ -4464,6 +4482,27 @@ impl Database {
             })
         })
         .transpose()
+    }
+
+    /// Returns the reserved opening intent for a continuation successor.
+    ///
+    /// # Errors
+    /// Returns a database error when the query fails.
+    pub async fn continuation_dispatch_intent_for_successor(
+        &self,
+        successor_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        let parent_id: Option<String> = sqlx::query_scalar(
+            "SELECT parent_conversation_id FROM continuation_dispatch_intents
+             WHERE successor_conversation_id = ?1",
+        )
+        .bind(successor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match parent_id {
+            Some(parent_id) => self.continuation_dispatch_intent(&parent_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Deletes a continuation intent after its message is durably represented elsewhere.
@@ -6585,7 +6624,7 @@ impl Database {
     ) -> DbResult<Option<AutomaticContinuationAdmission>> {
         let row = sqlx::query(
             "SELECT product_conversation_id, summary_message_id, operation_id,
-                    first_message_id, opening_authority, phase,
+                    first_message_id, opening_authority, phase, resume_phase,
                     no_progress_attempts, last_error,
                     admitted_at_unix_micros, updated_at_unix_micros
              FROM automatic_continuation_admissions
@@ -6601,6 +6640,7 @@ impl Database {
         let first_message_id: String = row.try_get("first_message_id")?;
         let opening_authority: String = row.try_get("opening_authority")?;
         let phase: String = row.try_get("phase")?;
+        let resume_phase: String = row.try_get("resume_phase")?;
         let attempts: i64 = row.try_get("no_progress_attempts")?;
         Ok(Some(AutomaticContinuationAdmission {
             predecessor_conversation_id: predecessor_conversation_id.to_string(),
@@ -6619,6 +6659,13 @@ impl Database {
             phase: AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
                 DbError::Serialization(format!("unknown automatic continuation phase: {phase}"))
             })?,
+            resume_phase: AutomaticContinuationPhase::from_db_str(&resume_phase).ok_or_else(
+                || {
+                    DbError::Serialization(format!(
+                        "unknown automatic continuation resume phase: {resume_phase}"
+                    ))
+                },
+            )?,
             no_progress_attempts: u32::try_from(attempts).map_err(|_| {
                 DbError::Serialization(format!(
                     "invalid automatic continuation no-progress attempts: {attempts}"
@@ -6628,6 +6675,506 @@ impl Database {
             admitted_at_unix_micros: row.try_get("admitted_at_unix_micros")?,
             updated_at_unix_micros: row.try_get("updated_at_unix_micros")?,
         }))
+    }
+
+    /// Return the newest automatic-continuation admission for one stable aggregate.
+    ///
+    /// # Errors
+    /// Returns an error when the query or admission decoding fails.
+    pub async fn latest_automatic_continuation_admission(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<AutomaticContinuationAdmission>> {
+        let predecessor: Option<String> = sqlx::query_scalar(
+            "WITH RECURSIVE transcript(id, ordinal) AS (
+                 SELECT conversation.id, 0
+                 FROM conversations AS conversation
+                 WHERE conversation.product_conversation_id = ?1
+                   AND conversation.parent_conversation_id IS NULL
+                   AND conversation.runtime_role IN ('user', 'coordinator')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations AS candidate
+                       WHERE candidate.continued_in_conv_id = conversation.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, transcript.ordinal + 1
+                 FROM transcript
+                 JOIN conversations AS predecessor ON predecessor.id = transcript.id
+                 JOIN conversations AS successor ON successor.id = predecessor.continued_in_conv_id
+                 WHERE successor.product_conversation_id = ?1
+                   AND successor.parent_conversation_id IS NULL
+                   AND successor.runtime_role IN ('user', 'coordinator')
+             )
+             SELECT admission.predecessor_conversation_id
+             FROM transcript
+             JOIN automatic_continuation_admissions AS admission
+               ON admission.predecessor_conversation_id = transcript.id
+             ORDER BY transcript.ordinal DESC
+             LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        match predecessor {
+            Some(predecessor) => self.automatic_continuation_admission(&predecessor).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Return whether the predecessor's continuation opening has settled durably.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn has_completed_continuation_handoff(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM completed_continuation_handoffs
+                 WHERE predecessor_conversation_id = ?1
+             )",
+        )
+        .bind(predecessor_conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    /// Returns whether a successor is still waiting for its reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn has_pending_continuation_opening(&self, successor_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM continuation_dispatch_intents AS intent
+                 WHERE intent.successor_conversation_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM completed_continuation_handoffs AS completed
+                       WHERE completed.predecessor_conversation_id = intent.parent_conversation_id
+                   )
+             )",
+        )
+        .bind(successor_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
+    /// Returns whether the supplied message is the successor's reserved opening.
+    ///
+    /// # Errors
+    /// Returns an error when the intent query fails.
+    pub async fn is_reserved_continuation_opening(
+        &self,
+        successor_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        let matches: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM continuation_dispatch_intents
+                 WHERE successor_conversation_id = ?1
+                   AND (message_id = ?2 OR successor_conversation_id || ':' || message_id = ?2)
+             )",
+        )
+        .bind(successor_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(matches != 0)
+    }
+
+    /// Returns the durable successor that accepted a completed handoff.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn completed_continuation_successor(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT successor_conversation_id
+             FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(predecessor_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Classify and persist any completed handoff for an automatic admission atomically.
+    ///
+    /// # Errors
+    /// Returns an error when classification or terminalization fails.
+    pub async fn reconcile_completed_automatic_continuation(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+    ) -> DbResult<Option<AutomaticContinuationPhase>> {
+        let phase: Option<String> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET phase = CASE WHEN EXISTS(
+                     SELECT 1
+                     FROM completed_continuation_handoffs AS completed
+                     WHERE completed.predecessor_conversation_id = ?1
+                       AND (completed.accepted_successor_message_id = ?2
+                            OR completed.accepted_successor_message_id =
+                               completed.successor_conversation_id || ':' || ?2)
+                       AND completed.continuation_message_id = ?3
+                       AND completed.opening_authority = 'generated_predecessor_context'
+                 ) THEN 'message_settled' ELSE 'superseded' END,
+                 no_progress_attempts = 0,
+                 last_error = NULL,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded')
+               AND EXISTS(
+                   SELECT 1 FROM completed_continuation_handoffs
+                   WHERE predecessor_conversation_id = ?1
+               )
+             RETURNING phase",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(admission.first_message_id.as_str())
+        .bind(&admission.summary_message_id)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&self.pool)
+        .await?;
+        phase
+            .map(|phase| {
+                AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
+                    DbError::Serialization(format!(
+                        "unknown reconciled automatic continuation phase: {phase}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Return whether the automatic admission's exact generated opening settled durably.
+    ///
+    /// # Errors
+    /// Returns an error when the settlement query fails.
+    pub async fn has_settled_automatic_continuation(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+    ) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM completed_continuation_handoffs
+                 WHERE predecessor_conversation_id = ?1
+                   AND (accepted_successor_message_id = ?2
+                        OR accepted_successor_message_id = successor_conversation_id || ':' || ?2)
+                   AND continuation_message_id = ?3
+                   AND opening_authority = 'generated_predecessor_context'
+             )",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(admission.first_message_id.as_str())
+        .bind(&admission.summary_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    /// List automatic continuation obligations that still require reconciliation.
+    ///
+    /// # Errors
+    /// Returns an error when persisted admission fields are invalid or cannot be read.
+    pub async fn pending_automatic_continuation_admissions(
+        &self,
+    ) -> DbResult<Vec<AutomaticContinuationAdmission>> {
+        let predecessors: Vec<String> = sqlx::query_scalar(
+            "SELECT predecessor_conversation_id
+             FROM automatic_continuation_admissions
+             WHERE phase NOT IN ('message_settled', 'superseded')
+               AND ((phase = 'failed' AND EXISTS (
+                       SELECT 1 FROM completed_continuation_handoffs AS completed
+                       WHERE completed.predecessor_conversation_id =
+                             automatic_continuation_admissions.predecessor_conversation_id
+                   )) OR (phase != 'failed' AND updated_at_unix_micros <= ?1 - CASE no_progress_attempts
+                   WHEN 0 THEN 0
+                   WHEN 1 THEN 5000000
+                   WHEN 2 THEN 10000000
+                   WHEN 3 THEN 20000000
+                   ELSE 40000000
+               END))
+             ORDER BY admitted_at_unix_micros, predecessor_conversation_id",
+        )
+        .bind(Utc::now().timestamp_micros())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut admissions = Vec::with_capacity(predecessors.len());
+        for predecessor in predecessors {
+            if let Some(admission) = self.automatic_continuation_admission(&predecessor).await? {
+                admissions.push(admission);
+            }
+        }
+        Ok(admissions)
+    }
+
+    /// Advance an automatic continuation after one durable progress boundary.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or the update fails.
+    pub async fn advance_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+        phase: AutomaticContinuationPhase,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = ?2,
+                 resume_phase = CASE
+                     WHEN ?2 IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+                     THEN ?2 ELSE resume_phase
+                 END,
+                 no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?3
+             WHERE predecessor_conversation_id = ?1
+               AND (
+                   (phase = 'admitted' AND ?2 = 'successor_reserved')
+                   OR (phase = 'successor_reserved' AND ?2 = 'ownership_transferred')
+                   OR (phase = 'ownership_transferred' AND ?2 = 'dispatch_accepted')
+                   OR (phase = 'dispatch_accepted' AND ?2 = 'message_settled')
+               )",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(phase.as_str())
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve an automatic admission after a different manual opening wins.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing, terminal, or the update fails.
+    pub async fn supersede_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+    ) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = 'superseded', no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?2
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded', 'failed')",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Classify a failed attempt against durable handoff settlement before charging the breaker.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or classification/update fails.
+    pub async fn reconcile_or_record_automatic_continuation_no_progress(
+        &self,
+        admission: &AutomaticContinuationAdmission,
+        error: &str,
+    ) -> DbResult<AutomaticContinuationPhase> {
+        let mut tx = self.pool.begin().await?;
+        let completed: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT successor_conversation_id, accepted_successor_message_id,
+                    continuation_message_id, opening_authority
+             FROM completed_continuation_handoffs
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((successor_id, accepted_message_id, summary_message_id, opening_authority)) =
+            completed
+        {
+            let exact_message = accepted_continuation_message_matches(
+                &successor_id,
+                &accepted_message_id,
+                &admission.first_message_id,
+            );
+            let phase = if exact_message
+                && summary_message_id == admission.summary_message_id
+                && opening_authority
+                    == ContinuationOpeningAuthority::GeneratedPredecessorContext.as_str()
+            {
+                AutomaticContinuationPhase::MessageSettled
+            } else {
+                AutomaticContinuationPhase::Superseded
+            };
+            sqlx::query(
+                "UPDATE automatic_continuation_admissions
+             SET phase = ?2,
+                 resume_phase = CASE
+                     WHEN ?2 IN ('admitted', 'successor_reserved', 'ownership_transferred', 'dispatch_accepted')
+                     THEN ?2 ELSE resume_phase
+                 END,
+                 no_progress_attempts = 0, last_error = NULL,
+                 updated_at_unix_micros = ?3
+
+                 WHERE predecessor_conversation_id = ?1
+                   AND phase NOT IN ('message_settled', 'superseded', 'failed')",
+            )
+            .bind(&admission.predecessor_conversation_id)
+            .bind(phase.as_str())
+            .bind(Utc::now().timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(phase);
+        }
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET no_progress_attempts = no_progress_attempts + 1,
+                 phase = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN 'failed'
+                     ELSE phase
+                 END,
+                 last_error = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN ?3
+                     ELSE NULL
+                 END,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'superseded', 'failed')
+             RETURNING no_progress_attempts",
+        )
+        .bind(&admission.predecessor_conversation_id)
+        .bind(i64::from(
+            AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS,
+        ))
+        .bind(error)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(attempts) = attempts else {
+            return Err(DbError::ConversationNotFound(
+                admission.predecessor_conversation_id.clone(),
+            ));
+        };
+        tx.commit().await?;
+        if u32::try_from(attempts).map_err(|_| {
+            DbError::Serialization(format!(
+                "invalid automatic continuation no-progress attempts: {attempts}"
+            ))
+        })? >= AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS
+        {
+            Ok(AutomaticContinuationPhase::Failed)
+        } else {
+            Ok(admission.phase)
+        }
+    }
+
+    /// Record one automatic-continuation attempt that made no durable progress.
+    ///
+    /// The admission opens its breaker at the bounded attempt cap.
+    ///
+    /// # Errors
+    /// Returns an error when the admission is missing or the update fails.
+    pub async fn record_automatic_continuation_no_progress(
+        &self,
+        predecessor_conversation_id: &str,
+        error: &str,
+    ) -> DbResult<AutomaticContinuationPhase> {
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "UPDATE automatic_continuation_admissions
+             SET no_progress_attempts = no_progress_attempts + 1,
+                 phase = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN 'failed'
+                     ELSE phase
+                 END,
+                 last_error = CASE
+                     WHEN no_progress_attempts + 1 >= ?2 THEN ?3
+                     ELSE NULL
+                 END,
+                 updated_at_unix_micros = ?4
+             WHERE predecessor_conversation_id = ?1
+               AND phase NOT IN ('message_settled', 'failed')
+             RETURNING no_progress_attempts",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(i64::from(
+            AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS,
+        ))
+        .bind(error)
+        .bind(Utc::now().timestamp_micros())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(attempts) = attempts else {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        };
+        if attempts >= i64::from(AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS) {
+            Ok(AutomaticContinuationPhase::Failed)
+        } else {
+            Ok(self
+                .automatic_continuation_admission(predecessor_conversation_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::ConversationNotFound(predecessor_conversation_id.to_string())
+                })?
+                .phase)
+        }
+    }
+
+    /// Explicitly re-open one failed automatic continuation with its accepted identity intact.
+    ///
+    /// # Errors
+    /// Returns an error when no failed admission was updated.
+    pub async fn retry_failed_automatic_continuation(
+        &self,
+        predecessor_conversation_id: &str,
+        resume_phase: AutomaticContinuationPhase,
+    ) -> DbResult<()> {
+        if !matches!(
+            resume_phase,
+            AutomaticContinuationPhase::Admitted
+                | AutomaticContinuationPhase::SuccessorReserved
+                | AutomaticContinuationPhase::OwnershipTransferred
+                | AutomaticContinuationPhase::DispatchAccepted
+        ) {
+            return Err(DbError::Serialization(format!(
+                "invalid automatic continuation retry phase: {}",
+                resume_phase.as_str()
+            )));
+        }
+        let updated = sqlx::query(
+            "UPDATE automatic_continuation_admissions
+             SET phase = CASE WHEN phase = 'failed' THEN ?2 ELSE phase END,
+                 resume_phase = CASE WHEN phase = 'failed' THEN ?2 ELSE resume_phase END,
+                 no_progress_attempts = CASE WHEN phase = 'failed' THEN 0 ELSE no_progress_attempts END,
+                 last_error = CASE WHEN phase = 'failed' THEN NULL ELSE last_error END,
+                 updated_at_unix_micros = CASE WHEN phase = 'failed' THEN ?3 ELSE updated_at_unix_micros END
+             WHERE predecessor_conversation_id = ?1
+               AND phase IN ('failed', 'admitted', 'successor_reserved',
+                             'ownership_transferred', 'dispatch_accepted', 'message_settled',
+                             'superseded')",
+        )
+        .bind(predecessor_conversation_id)
+        .bind(resume_phase.as_str())
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(
+                predecessor_conversation_id.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Atomically commit a generated continuation summary when the persisted
@@ -8029,7 +8576,19 @@ impl Database {
             .continue_conversation_inner(parent_id, Some(&intent))
             .await?;
         let stored = self.continuation_dispatch_intent(parent_id).await?;
-        Ok((outcome, stored))
+        let accepted = match (&outcome, stored) {
+            (_, Some(stored)) => Some(stored),
+            (ContinueOutcome::Created(successor), None) => Some(ContinuationDispatchIntent {
+                parent_conversation_id: parent_id.to_string(),
+                successor_conversation_id: successor.id.clone(),
+                message_id: intent.message_id,
+                handoff: intent.handoff,
+                user_agent: intent.user_agent,
+                opening_authority: intent.opening_authority,
+            }),
+            _ => None,
+        };
+        Ok((outcome, accepted))
     }
 
     #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
@@ -8289,6 +8848,29 @@ impl Database {
              WHERE predecessor_conversation_id = ?1",
         )
         .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE steering_messages
+             SET conversation_id = ?2
+             WHERE conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .bind(&new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE steering_acceptance_receipts
+             SET conversation_id = ?2
+             WHERE conversation_id = ?1
+               AND message_id IN (
+                   SELECT message_id FROM steering_messages
+                   WHERE conversation_id = ?2
+               )",
+        )
+        .bind(parent_id)
+        .bind(&new_id)
         .execute(&mut *tx)
         .await?;
 
@@ -9343,6 +9925,10 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -9937,56 +10523,29 @@ impl Database {
         let (mut connection, acquisition) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let ((), timing) = telemetry
+        let (mut tx, timing) = telemetry
             .observe_transaction_admission_db(acquisition, async {
-                sqlx::query("BEGIN IMMEDIATE")
-                    .execute(&mut *connection)
-                    .await
-                    .map(|_| ())
-                    .map_err(DbError::from)
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
             })
             .await?;
-        let body = Self::hard_delete_conversation_tx(
-            &mut connection,
-            id,
-            telemetry.parent_observer(),
-            None,
-        )
-        .await;
+        let body =
+            Self::hard_delete_conversation_tx(&mut tx, id, telemetry.parent_observer(), None).await;
 
         match body {
             Ok(true) => {
                 telemetry
-                    .observe_commit_db(timing, async {
-                        sqlx::query("COMMIT")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
                     .await
             }
             Ok(false) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(DbError::ConversationNotFound(id.to_string()))
             }
             Err(error) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(error)
             }
@@ -10045,7 +10604,22 @@ impl Database {
              FROM durable_turns AS t
              JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
              JOIN conversations AS child ON child.id = t.conversation_id
-             WHERE child.parent_conversation_id IS NOT NULL",
+             WHERE child.parent_conversation_id IS NOT NULL
+             UNION
+             SELECT a.conversation_id
+             FROM startup_parent_actions a
+             JOIN conversations c ON c.id = a.conversation_id
+             LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE a.action IN ('Reconcile', 'Cancel')
+               AND a.transcript_generation = c.transcript_generation
+               AND (a.turn_id IS NULL OR (a.turn_id = t.turn_id AND a.turn_generation = t.generation))
+             UNION
+             SELECT DISTINCT b.parent_conversation_id
+             FROM sub_agent_runs r
+             JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+             WHERE r.parent_accepted_at_unix_micros IS NULL
+",
         )
         .fetch_all(&self.pool)
         .await?
@@ -10154,6 +10728,17 @@ impl Database {
         //   - awaiting_user_response: user questions pending; state data (questions/tool_use_id)
         //     is in the JSON column and must survive restart
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
+        self.reset_restartable_conversations(&idle_state, now)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn reset_restartable_conversations(
+        &self,
+        idle_state: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
@@ -10170,6 +10755,12 @@ impl Database {
                              WHERE child.parent_conversation_id = conversations.id
                          )
                      )
+               )
+               AND conversations.id NOT IN (
+                   SELECT b.parent_conversation_id
+                   FROM sub_agent_runs r
+                   JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+                   WHERE r.parent_accepted_at_unix_micros IS NULL
                )
                AND NOT (
                    state_kind = 'llm_requesting'
@@ -10213,12 +10804,11 @@ impl Database {
                    )
                )",
         )
-        .bind(&idle_state)
+        .bind(idle_state)
         .bind(conv_state_kind(&ConvState::Idle))
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
-
         Ok(())
     }
 
@@ -10272,12 +10862,18 @@ impl Database {
 
         let mut outcomes = HashMap::new();
         for agent in pending {
-            let row: Option<String> =
-                sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
-                    .bind(&agent.agent_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            let Some(state_json) = row else { continue };
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT c.state, r.terminal_cause
+                 FROM conversations c
+                 LEFT JOIN sub_agent_runs r ON r.child_conversation_id = c.id
+                 WHERE c.id = ?1",
+            )
+            .bind(&agent.agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((state_json, terminal_cause)) = row else {
+                continue;
+            };
             let state = serde_json::from_str::<ConvState>(&state_json).map_err(|error| {
                 DbError::Serialization(format!(
                     "decode pending sub-agent {} state: {error}",
@@ -10289,12 +10885,19 @@ impl Database {
             // uses the interrupted fallback. `if let` chain rather than a match
             // with a wildcard arm (denied by `wildcard_enum_match_arm`).
             if let ConvState::Completed { result } = state {
-                outcomes.insert(agent.agent_id.clone(), SubAgentOutcome::Success { result });
+                let outcome = if terminal_cause.as_deref() == Some("implicit_completion") {
+                    SubAgentOutcome::ImplicitCompletion { result }
+                } else {
+                    SubAgentOutcome::Success { result }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             } else if let ConvState::Failed { error, error_kind } = state {
-                outcomes.insert(
-                    agent.agent_id.clone(),
-                    SubAgentOutcome::Failure { error, error_kind },
-                );
+                let outcome = if terminal_cause.as_deref() == Some("timed_out") {
+                    SubAgentOutcome::TimedOut
+                } else {
+                    SubAgentOutcome::Failure { error, error_kind }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             }
         }
         Ok(outcomes)
@@ -10306,7 +10909,7 @@ impl Database {
         now: &DateTime<Utc>,
         only_conversations: Option<&std::collections::HashSet<String>>,
     ) -> DbResult<std::collections::HashSet<String>> {
-        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::domain::sm_state::{ConvState, SubAgentOutcome};
 
         // Both `tool_executing` and `cancelling_tool` rows carry an
         // un-persisted assistant turn (the cancel snapshots the in-flight round
@@ -10438,37 +11041,84 @@ impl Database {
                 continue;
             }
 
-            self.persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                .await?;
-            materialized.insert(conv_id.clone());
-
-            let interrupted_state = serde_json::to_string(&ConvState::Failed {
+            let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-            })
-            .unwrap();
-            for agent in &pending_sub_agents {
-                if sub_agent_outcomes.contains_key(&agent.agent_id) {
-                    continue;
-                }
-                sqlx::query(
-                    "UPDATE conversations
-                     SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-                     WHERE id = ?4
-                       AND state_kind NOT IN
-                           ('completed', 'failed', 'creation_failed', 'creation_cancelled',
-                            'context_exhausted', 'handed_off', 'terminal')",
-                )
-                .bind(&interrupted_state)
-                .bind(conv_state_kind(&ConvState::Failed {
-                    error: "Sub-agent interrupted by server restart".to_string(),
-                    error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                }))
-                .bind(now.to_rfc3339())
-                .bind(&agent.agent_id)
-                .execute(&self.pool)
-                .await?;
+            };
+            let interrupted_state = serde_json::to_string(&interrupted).unwrap();
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            insert_message_tx(&mut tx, &agent_msg).await?;
+            for message in &tool_msgs {
+                insert_message_tx(&mut tx, message).await?;
             }
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(&conv_id)
+                .execute(&mut *tx)
+                .await?;
+            for agent in &pending_sub_agents {
+                let cause =
+                    sub_agent_outcomes
+                        .get(&agent.agent_id)
+                        .map_or("runtime_failure", |outcome| match outcome {
+                            SubAgentOutcome::Success { .. } => "submit_result",
+                            SubAgentOutcome::ImplicitCompletion { .. } => "implicit_completion",
+                            SubAgentOutcome::TimedOut => "timed_out",
+                            SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                                ErrorKind::Cancelled => "cancelled",
+                                ErrorKind::ContextExhausted => "context_exhausted",
+                                ErrorKind::SubAgentError => "submit_error",
+                                ErrorKind::TurnLimitExhausted => "turn_limit",
+                                ErrorKind::Auth
+                                | ErrorKind::RateLimit
+                                | ErrorKind::UsageLimitReached
+                                | ErrorKind::Network
+                                | ErrorKind::InvalidRequest
+                                | ErrorKind::PromptRejected
+                                | ErrorKind::InvalidResponse
+                                | ErrorKind::ServerError
+                                | ErrorKind::ServerOverloaded
+                                | ErrorKind::TimedOut
+                                | ErrorKind::ContentFilter => "runtime_failure",
+                            },
+                        });
+                if !sub_agent_outcomes.contains_key(&agent.agent_id) {
+                    sqlx::query(
+                        "UPDATE conversations
+                         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+                         WHERE id = ?4
+                           AND state_kind NOT IN
+                               ('completed', 'failed', 'creation_failed', 'creation_cancelled',
+                                'context_exhausted', 'handed_off', 'terminal')",
+                    )
+                    .bind(&interrupted_state)
+                    .bind(conv_state_kind(&interrupted))
+                    .bind(now.to_rfc3339())
+                    .bind(&agent.agent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                let lifecycle = sqlx::query(
+                    "UPDATE sub_agent_runs
+                     SET terminal_cause = COALESCE(terminal_cause, ?2),
+                         terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3),
+                         parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?3)
+                     WHERE child_conversation_id = ?1",
+                )
+                .bind(&agent.agent_id)
+                .bind(cause)
+                .bind(now.timestamp_micros())
+                .execute(&mut *tx)
+                .await?;
+                if lifecycle.rows_affected() != 1 {
+                    return Err(DbError::Serialization(format!(
+                        "materialized tool round lifecycle row missing for {}",
+                        agent.agent_id
+                    )));
+                }
+            }
+            tx.commit().await?;
+            materialized.insert(conv_id.clone());
 
             tracing::info!(
                 conv_id = %conv_id,
@@ -10607,6 +11257,49 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
+        for result in results {
+            use phoenix_core::domain::sm_state::SubAgentOutcome;
+            let cause = match &result.outcome {
+                SubAgentOutcome::Success { .. } => "submit_result",
+                SubAgentOutcome::ImplicitCompletion { .. } => "implicit_completion",
+                SubAgentOutcome::TimedOut => "timed_out",
+                SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                    ErrorKind::Cancelled => "cancelled",
+                    ErrorKind::ContextExhausted => "context_exhausted",
+                    ErrorKind::SubAgentError => "submit_error",
+                    ErrorKind::TurnLimitExhausted => "turn_limit",
+                    ErrorKind::Auth
+                    | ErrorKind::RateLimit
+                    | ErrorKind::UsageLimitReached
+                    | ErrorKind::Network
+                    | ErrorKind::InvalidRequest
+                    | ErrorKind::PromptRejected
+                    | ErrorKind::InvalidResponse
+                    | ErrorKind::ServerError
+                    | ErrorKind::ServerOverloaded
+                    | ErrorKind::TimedOut
+                    | ErrorKind::ContentFilter => "runtime_failure",
+                },
+            };
+            let updated = sqlx::query(
+                "UPDATE sub_agent_runs
+                 SET terminal_cause = COALESCE(terminal_cause, ?2),
+                     terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3),
+                     parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?3)
+                 WHERE child_conversation_id = ?1",
+            )
+            .bind(&result.agent_id)
+            .bind(cause)
+            .bind(now.timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "startup fan-in lifecycle row missing for {}",
+                    result.agent_id
+                )));
+            }
+        }
         sqlx::query(
             "INSERT OR REPLACE INTO startup_parent_actions
                  (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
@@ -10645,7 +11338,12 @@ impl Database {
              LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                  AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
              WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO NOTHING",
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 action = excluded.action,
+                 transcript_generation = excluded.transcript_generation,
+                 turn_id = excluded.turn_id,
+                 turn_generation = excluded.turn_generation,
+                 created_at = excluded.created_at",
         )
         .bind(conversation_id)
         .bind(Utc::now().to_rfc3339())
@@ -10672,6 +11370,23 @@ impl Database {
                              AND t.terminal_kind IS NOT NULL
                        ))
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM startup_parent_actions
+             WHERE action IN ('Reconcile', 'Cancel')
+               AND EXISTS (
+                   SELECT 1 FROM conversations c
+                   LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                       AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                   WHERE c.id = startup_parent_actions.conversation_id
+                     AND (c.transcript_generation != startup_parent_actions.transcript_generation
+                          OR (startup_parent_actions.turn_id IS NOT NULL
+                              AND (t.turn_id IS NULL
+                                   OR t.turn_id != startup_parent_actions.turn_id
+                                   OR t.generation != startup_parent_actions.turn_generation)))
+               )",
         )
         .execute(&self.pool)
         .await?;
@@ -12265,12 +12980,14 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the persistence boundary together
     pub async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: EffectiveEffort,
+        service_tier: ServiceTier,
         usage: &phoenix_core::domain::llm_types::Usage,
         first_byte_at: Option<DateTime<Utc>>,
     ) -> DbResult<()> {
@@ -12278,15 +12995,16 @@ impl Database {
         let first_byte_str = first_byte_at.map(|t| t.to_rfc3339());
         sqlx::query(
             "INSERT INTO turn_usage \
-             (conversation_id, root_conversation_id, model, effort_source, effort_level, \
+             (conversation_id, root_conversation_id, model, effort_source, effort_level, service_tier, \
               input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(conversation_id)
         .bind(root_conversation_id)
         .bind(model)
         .bind(effective_effort.source().as_str())
         .bind(effective_effort.level().map(ModelEffort::as_wire_name))
+        .bind(service_tier.as_wire_name())
         .bind(usage.input_tokens.cast_signed())
         .bind(usage.output_tokens.cast_signed())
         .bind(usage.reasoning_tokens.map(u64::cast_signed))
@@ -12408,13 +13126,13 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_daily_by_model(&self) -> DbResult<Vec<UsageDailyModelRow>> {
         let rows = sqlx::query(
-            "SELECT date(created_at) AS day, model, \
+            "SELECT date(created_at) AS day, model, service_tier, \
              COALESCE(SUM(input_tokens), 0) AS input_tokens, \
              COALESCE(SUM(output_tokens), 0) AS output_tokens, \
              COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, \
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
              COUNT(*) AS turns \
-             FROM turn_usage GROUP BY day, model ORDER BY day ASC",
+             FROM turn_usage GROUP BY day, model, service_tier ORDER BY day ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -12425,6 +13143,8 @@ impl Database {
                     day: r.try_get("day")?,
                     model: r.try_get("model")?,
                     input_tokens: r.try_get("input_tokens")?,
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     output_tokens: r.try_get("output_tokens")?,
                     cache_creation_tokens: r.try_get("cache_creation_tokens")?,
                     cache_read_tokens: r.try_get("cache_read_tokens")?,
@@ -12444,7 +13164,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_by_conversation(&self) -> DbResult<Vec<UsageConversationModelRow>> {
         let rows = sqlx::query(
-            "SELECT tu.root_conversation_id AS rid, tu.model AS model, \
+            "SELECT tu.root_conversation_id AS rid, tu.model AS model, tu.service_tier AS service_tier, \
              c.slug AS slug, c.title AS title, c.project_id AS project_id, \
              e.worktree_path AS worktree_path, MIN(tu.created_at) AS started_at, \
              COALESCE(SUM(tu.input_tokens), 0) AS input_tokens, \
@@ -12455,7 +13175,7 @@ impl Database {
              FROM turn_usage tu \
              LEFT JOIN conversations c ON c.id = tu.root_conversation_id \
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id \
-             GROUP BY tu.root_conversation_id, tu.model",
+             GROUP BY tu.root_conversation_id, tu.model, tu.service_tier",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -12466,6 +13186,8 @@ impl Database {
                     root_conversation_id: r.try_get("rid")?,
                     model: r.try_get("model")?,
                     slug: r.try_get("slug").ok().flatten(),
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     title: r.try_get("title").ok().flatten(),
                     project_id: r.try_get("project_id").ok().flatten(),
                     worktree_path: r.try_get("worktree_path").ok().flatten(),
@@ -12507,7 +13229,7 @@ impl Database {
     pub async fn usage_conversation_turns(&self, root_id: &str) -> DbResult<Vec<UsageTurnRow>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, root_conversation_id, model, created_at, first_byte_at, \
-             input_tokens, output_tokens, reasoning_tokens, effort_source, effort_level, cache_creation_tokens, cache_read_tokens \
+             input_tokens, output_tokens, reasoning_tokens, effort_source, effort_level, service_tier, cache_creation_tokens, cache_read_tokens \
              FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY created_at ASC",
         )
         .bind(root_id)
@@ -12536,6 +13258,8 @@ impl Database {
                                 .map_err(|error| sqlx::Error::Decode(error.into()))
                         })
                         .transpose()?,
+                    service_tier: ServiceTier::from_str(r.try_get::<&str, _>("service_tier")?)
+                        .map_err(|error| sqlx::Error::Decode(error.into()))?,
                     cache_read_tokens: r.try_get("cache_read_tokens")?,
                 })
             })
@@ -13378,6 +14102,7 @@ fn normalize_in_flight_round(
     }
     if let ConvState::CancellingTool {
         tool_use_id,
+        cause: _,
         skipped_tools,
         completed_results,
         assistant_message,
@@ -13533,7 +14258,8 @@ fn build_sub_agent_fan_in(
         .iter()
         .map(|r| {
             let outcome = match &r.outcome {
-                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Success { result }
+                | SubAgentOutcome::ImplicitCompletion { result } => format!("Result: {result}"),
                 SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
                 SubAgentOutcome::TimedOut => {
                     "Timed out: sub-agent exceeded its time limit".to_string()
@@ -17397,6 +18123,7 @@ mod tests {
             "conv-fb",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Standard,
             &usage,
             None,
         )
@@ -17408,6 +18135,7 @@ mod tests {
             "conv-fb",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Fast,
             &usage,
             Some(observed),
         )
@@ -17417,6 +18145,8 @@ mod tests {
         let rows = db.usage_conversation_turns("conv-fb").await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].first_byte_at, None);
+        assert_eq!(rows[0].service_tier, ServiceTier::Standard);
+        assert_eq!(rows[1].service_tier, ServiceTier::Fast);
         assert_eq!(
             rows[1].first_byte_at.as_deref(),
             Some(observed.to_rfc3339().as_str())
@@ -17581,6 +18311,7 @@ mod tests {
             "root-anchor",
             "mock",
             EffectiveEffort::native_unknown(),
+            ServiceTier::Standard,
             &usage,
             None,
         )
@@ -18195,6 +18926,65 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let second_product = db
+            .get_conversation("auto-on-second")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let latest = db
+            .latest_automatic_continuation_admission(&second_product)
+            .await
+            .unwrap()
+            .expect("stable aggregate lookup returns its admission");
+        assert_eq!(latest.predecessor_conversation_id, "auto-on-second");
+
+        let second_admission = db
+            .automatic_continuation_admission("auto-on-second")
+            .await
+            .unwrap()
+            .unwrap();
+        let (exact_outcome, _) = db
+            .continue_conversation_with_intent(
+                "auto-on-second",
+                NewContinuationDispatchIntent::generated_predecessor_context(
+                    second_admission.first_message_id.clone(),
+                    "exact summary for auto-on-second  \n".to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        let exact_successor = match exact_outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected exact automatic successor, got {other:?}")
+            }
+        };
+        db.add_message(
+            second_admission.first_message_id.as_str(),
+            &exact_successor.id,
+            &MessageContent::Continuation(schema::ContinuationContent {
+                summary: "exact summary for auto-on-second  \n".to_string(),
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_completed_automatic_continuation(&second_admission)
+                .await
+                .unwrap(),
+            Some(AutomaticContinuationPhase::MessageSettled)
+        );
+        assert_eq!(
+            db.automatic_continuation_admission("auto-on-second")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::MessageSettled
+        );
 
         let auto_on_product = admitted.product_conversation_id.clone();
         db.set_auto_continue_on_context_exhaustion(
@@ -18222,6 +19012,56 @@ mod tests {
             .unwrap(),
             ContinuationCommitOutcome::Duplicate
         );
+        let (manual_outcome, _) = db
+            .continue_conversation_with_intent(
+                "auto-on",
+                NewContinuationDispatchIntent::user_authorized(
+                    admitted.first_message_id.clone(),
+                    "manual handoff".to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let manual_successor = match manual_outcome {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected manual race winner, got {other:?}")
+            }
+        };
+        db.add_message(
+            admitted.first_message_id.as_str(),
+            &manual_successor.id,
+            &MessageContent::user("manual handoff"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .has_settled_automatic_continuation(&admitted)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.reconcile_completed_automatic_continuation(&admitted)
+                .await
+                .unwrap(),
+            Some(AutomaticContinuationPhase::Superseded)
+        );
+        let superseded = db
+            .automatic_continuation_admission("auto-on")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(superseded.phase, AutomaticContinuationPhase::Superseded);
+        assert!(!db
+            .pending_automatic_continuation_admissions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|admission| admission.predecessor_conversation_id == "auto-on"));
+
         let admission_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM automatic_continuation_admissions
              WHERE operation_id = 'shared-operation'",
@@ -18230,6 +19070,211 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(admission_count, 2);
+    }
+
+    #[test]
+    fn accepted_continuation_identity_requires_exact_successor_namespace() {
+        let first = ClientTurnKey::try_from("automatic-opening").unwrap();
+        assert!(accepted_continuation_message_matches(
+            "successor",
+            "automatic-opening",
+            &first,
+        ));
+        assert!(accepted_continuation_message_matches(
+            "successor",
+            "successor:automatic-opening",
+            &first,
+        ));
+        assert!(!accepted_continuation_message_matches(
+            "successor",
+            "other:automatic-opening",
+            &first,
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_summary_lookup_is_independent_of_transcript_length() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("summary-lookup", "summary-lookup", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..2_000 {
+            db.add_message(
+                &format!("history-{index}"),
+                "summary-lookup",
+                &MessageContent::user(format!("history {index}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "target-summary",
+            "summary-lookup",
+            &MessageContent::continuation("exact summary"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let summary = db
+            .get_message_by_id_in_conversation("summary-lookup", "target-summary")
+            .await
+            .unwrap();
+        assert_eq!(summary.message_id, "target-summary");
+        assert!(matches!(summary.content, MessageContent::Continuation(_)));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn automatic_continuation_breaker_is_bounded_and_explicit_retry_preserves_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("breaker-parent", "breaker-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_id = db
+            .get_conversation("breaker-parent")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.set_auto_continue_on_context_exhaustion(
+            &product_id,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        let operation_id = "breaker-operation";
+        db.update_conversation_state(
+            "breaker-parent",
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let summary = "breaker summary".to_string();
+        let content = MessageContent::continuation(&summary);
+        let message = Message {
+            message_id: "breaker-summary".to_string(),
+            conversation_id: "breaker-parent".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.commit_continuation(
+            "breaker-parent",
+            operation_id,
+            &message,
+            &ConvState::ContextExhausted { summary },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let original = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::SuccessorReserved,
+        )
+        .await
+        .unwrap();
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::OwnershipTransferred,
+        )
+        .await
+        .unwrap();
+        for attempt in 1..=AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+            let phase = db
+                .record_automatic_continuation_no_progress("breaker-parent", "runtime unavailable")
+                .await
+                .unwrap();
+            if attempt < AutomaticContinuationAdmission::MAX_NO_PROGRESS_ATTEMPTS {
+                assert_eq!(phase, AutomaticContinuationPhase::OwnershipTransferred);
+            } else {
+                assert_eq!(phase, AutomaticContinuationPhase::Failed);
+            }
+        }
+        let failed = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.resume_phase,
+            AutomaticContinuationPhase::OwnershipTransferred
+        );
+        assert!(db
+            .pending_automatic_continuation_admissions()
+            .await
+            .unwrap()
+            .is_empty());
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .unwrap();
+        let retried = db
+            .automatic_continuation_admission("breaker-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retried.phase,
+            AutomaticContinuationPhase::OwnershipTransferred
+        );
+        assert_eq!(retried.no_progress_attempts, 0);
+        assert!(retried.last_error.is_none());
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("an identical concurrent retry accepts the already-reopened admission");
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::DispatchAccepted,
+        )
+        .await
+        .unwrap();
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("a retry racing with later durable progress remains idempotent");
+        assert_eq!(
+            db.automatic_continuation_admission("breaker-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::DispatchAccepted
+        );
+        assert_eq!(retried.summary_message_id, original.summary_message_id);
+        assert_eq!(retried.first_message_id, original.first_message_id);
+        db.advance_automatic_continuation(
+            "breaker-parent",
+            AutomaticContinuationPhase::MessageSettled,
+        )
+        .await
+        .unwrap();
+        db.retry_failed_automatic_continuation("breaker-parent", failed.resume_phase)
+            .await
+            .expect("a retry racing with exact terminal settlement remains idempotent");
+        assert_eq!(
+            db.automatic_continuation_admission("breaker-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            AutomaticContinuationPhase::MessageSettled
+        );
+        assert_eq!(retried.opening_authority, original.opening_authority);
     }
 
     #[tokio::test]
@@ -21454,6 +22499,7 @@ mod tests {
             None,
         );
         let state = ConvState::CancellingTool {
+            cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
             tool_use_id: "tool-2".to_string(),
             skipped_tools: vec![ToolCall::new("tool-3", think("c"))],
             completed_results: vec![ToolResult::success(
@@ -21612,6 +22658,32 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('reset-batch', 'conv-sa', 0, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child, cause, terminal_at) in [
+            (0_i64, agent_a, None, None),
+            (1_i64, agent_b, Some("context_exhausted"), Some(2_i64)),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                     (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                      timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'reset-batch', ?2, 'read_only', 10, 1000, ?3, ?4)",
+            )
+            .bind(child)
+            .bind(ordinal)
+            .bind(cause)
+            .bind(terminal_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
         let placeholder = format!("Spawning 2 sub-agent(s): {agent_a}, {agent_b}");
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("tool-2", think("t")),
@@ -21748,6 +22820,25 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('startup-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_runs
+                 (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                  timeout_millis, terminal_cause, terminal_at_unix_micros)
+             VALUES (?1, 'startup-batch', 0, 'read_only', 10, 1000, 'submit_result', 2)",
+        )
+        .bind(child_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.update_conversation_state(
             child_id,
             &ConvState::Completed {
@@ -21806,6 +22897,15 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].conversation_id, parent_id);
         assert_eq!(actions[0].action, StartupParentAction::Resume);
+        let accepted_at: Option<i64> = sqlx::query_scalar(
+            "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs
+             WHERE child_conversation_id = ?1",
+        )
+        .bind(child_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(accepted_at.is_some());
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::Idle
@@ -22051,6 +23151,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_outcomes_preserve_wall_clock_and_provider_timeout_distinction() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "timeout-cause-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('timeout-cause-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut pending = Vec::new();
+        for (ordinal, (child_id, cause)) in [
+            ("wall-clock-timeout", "timed_out"),
+            ("provider-timeout", "runtime_failure"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            db.update_conversation_state(
+                child_id,
+                &ConvState::Failed {
+                    error: format!("{child_id} exact error"),
+                    error_kind: ErrorKind::TimedOut,
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                     timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'timeout-cause-batch', ?2, 'read_only', 10, 1000, ?3, 2)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .bind(cause)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            pending.push(PendingSubAgent {
+                agent_id: child_id.to_string(),
+                task: child_id.to_string(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+
+        let outcomes = db
+            .resolve_pending_sub_agent_outcomes(&pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes.get("wall-clock-timeout"),
+            Some(&SubAgentOutcome::TimedOut)
+        );
+        assert_eq!(
+            outcomes.get("provider-timeout"),
+            Some(&SubAgentOutcome::Failure {
+                error: "provider-timeout exact error".to_string(),
+                error_kind: ErrorKind::TimedOut,
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_fan_in_preserves_terminal_child_and_interrupts_live_sibling() {
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
 
@@ -22065,6 +23241,27 @@ mod tests {
             db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
                 .await
                 .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('startup-fan-in-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child_id) in [done_id, live_id].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, 'startup-fan-in-batch', ?2, 'read_only', 10, 1000)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
         }
         db.update_conversation_state(
             done_id,
@@ -22166,6 +23363,30 @@ mod tests {
         let destination = ConvState::LlmRequesting { attempt: 1 };
         let mut action_ids = Vec::new();
         for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
+            let batch_id = format!("batch-{agent_id}");
+            db.create_conversation(agent_id, agent_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(&batch_id)
+            .bind(parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(agent_id)
+            .bind(&batch_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
             let expected_state = db.get_conversation(parent_id).await.unwrap().state;
             db.persist_startup_sub_agent_fan_in(
                 parent_id,
@@ -22264,6 +23485,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_cancelling_sub_agents_reaches_cause_destination() {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
@@ -22281,6 +23503,26 @@ mod tests {
             db.create_conversation(&child_id, &child_id, "/tmp", false, Some(&parent_id), None)
                 .await
                 .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(format!("batch-{suffix}"))
+            .bind(&parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(&child_id)
+            .bind(format!("batch-{suffix}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
             if expects_request {
                 db.update_conversation_state(
                     &child_id,
@@ -22449,6 +23691,7 @@ mod tests {
     /// conversation before the restart must be fanned in with its REAL outcome
     /// (success/failure), not rewritten as "interrupted by server restart". A
     /// sibling still running keeps the interrupted fallback.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_materialize_uses_real_outcome_for_completed_sub_agent() {
         use phoenix_core::domain::db_schema::ToolResult;
@@ -22493,6 +23736,32 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('materialize-batch', 'conv-p', 0, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child, cause, terminal_at) in [
+            (0_i64, done_agent, Some("submit_result"), Some(2_i64)),
+            (1_i64, running_agent, None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                     (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                      timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'materialize-batch', ?2, 'read_only', 10, 1000, ?3, ?4)",
+            )
+            .bind(child)
+            .bind(ordinal)
+            .bind(cause)
+            .bind(terminal_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
 
         let think = |t: &str| ToolInput::Think(ThinkInput { thoughts: t.into() });
         let assistant = AssistantMessage::new(
@@ -22532,6 +23801,26 @@ mod tests {
             .unwrap();
 
         db.reset_all_to_idle().await.unwrap();
+
+        let lifecycle: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT child_conversation_id, terminal_cause,
+                    parent_accepted_at_unix_micros IS NOT NULL
+             FROM sub_agent_runs ORDER BY ordinal",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            lifecycle,
+            vec![
+                (done_agent.to_string(), "submit_result".to_string(), true),
+                (
+                    running_agent.to_string(),
+                    "runtime_failure".to_string(),
+                    true
+                ),
+            ]
+        );
 
         let msgs = db.get_messages("conv-p").await.unwrap();
         let spawn = msgs
@@ -23443,7 +24732,7 @@ mod tests {
             intent.unwrap().opening_authority,
             ContinuationOpeningAuthority::GeneratedPredecessorContext
         );
-        let opening = MessageContent::User(UserContent::new("exact generated context"));
+        let opening = MessageContent::continuation("exact generated context");
         db.add_message("generated-opening", &successor.id, &opening, None, None)
             .await
             .unwrap();

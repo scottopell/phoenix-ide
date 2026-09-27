@@ -41,6 +41,7 @@ use crate::tools::{
 };
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
+#[cfg(test)]
 use phoenix_core::domain::llm_types::ServiceTier;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
@@ -106,27 +107,108 @@ fn deposit_turn_trigger(handle: &ConversationHandle) {
     }
 }
 
-/// Request to spawn a sub-agent
+#[async_trait::async_trait]
+pub(crate) trait ConversationEventDispatcher: Send + Sync + 'static {
+    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String>;
+
+    async fn reconcile(&self, _conversation_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AddressedConversationEventDispatcher {
+    manager: Arc<RuntimeManager>,
+}
+
+impl AddressedConversationEventDispatcher {
+    fn new(manager: Arc<RuntimeManager>) -> Self {
+        Self { manager }
+    }
+
+    async fn resolve(&self, conversation_id: &str) -> Result<ConversationHandle, String> {
+        self.manager.get_or_create(conversation_id).await
+    }
+
+    async fn dispatch_resolved(
+        &self,
+        handle: &ConversationHandle,
+        event: Event,
+    ) -> Result<(), String> {
+        handle
+            .event_tx
+            .send(event)
+            .await
+            .map_err(|error| format!("Failed to send addressed conversation event: {error}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationEventDispatcher for AddressedConversationEventDispatcher {
+    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        let handle = self.resolve(conversation_id).await?;
+        self.dispatch_resolved(&handle, event).await
+    }
+
+    async fn reconcile(&self, conversation_id: &str) -> Result<(), String> {
+        self.manager
+            .db
+            .establish_parent_reconcile_action(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestConversationEventDispatcher {
+    sender: mpsc::Sender<Event>,
+}
+
+#[cfg(test)]
+impl TestConversationEventDispatcher {
+    pub(crate) fn new(sender: mpsc::Sender<Event>) -> Self {
+        Self { sender }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ConversationEventDispatcher for TestConversationEventDispatcher {
+    async fn dispatch(&self, _conversation_id: &str, event: Event) -> Result<(), String> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// One atomic request to admit and start a complete sub-agent batch.
+#[derive(Debug)]
+pub enum SubAgentAdmissionResponse {
+    Admitted,
+    Rejected(String),
+    Unclassified,
+}
+
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
-    pub spec: SubAgentSpec,
+    pub batch_id: String,
+    pub specs: Vec<SubAgentSpec>,
     pub parent_conversation_id: String,
     pub parent_scope: Option<WorkScopeId>,
-    pub parent_event_tx: mpsc::Sender<Event>,
-    /// The parent's `conversation.turn` span context at spawn time
-    /// (invalid when tracing export is disabled). Seeded into the sub-agent's
-    /// [`TurnTriggerSlot`] so the sub-agent's turn trace links back to the
-    /// parent turn that spawned it.
+    pub parallel_work_qualified: bool,
     pub parent_turn_link: opentelemetry::trace::SpanContext,
+    pub response_tx: oneshot::Sender<SubAgentAdmissionResponse>,
+    pub activation_rx: oneshot::Receiver<()>,
 }
 
 /// Request to cancel sub-agents
 #[derive(Debug)]
 pub struct SubAgentCancelRequest {
     pub ids: Vec<String>,
-    #[allow(dead_code)] // Used for logging/debugging
+    #[allow(dead_code)]
     pub parent_conversation_id: String,
-    pub parent_event_tx: mpsc::Sender<Event>,
+    pub cause: crate::state_machine::event::CancelCause,
 }
 
 /// Why a runtime was evicted. Passed to `evict_runtime` so the next
@@ -144,6 +226,8 @@ pub enum EvictionReason {
     SteeringReconciliation,
     /// Durable recovery replaced an in-memory state with its exact DB projection.
     RecoveryReconciliation,
+    /// Sub-agent admission resolved terminal before initial dispatch.
+    SubAgentTerminalBeforeDispatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,14 +584,13 @@ pub struct RuntimeManager {
     /// same typed success or failure.
     runtime_creations: AsyncMutex<HashMap<String, Arc<RuntimeMaterializationSlot>>>,
     conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
+    subagent_dispatch: ConversationMutexGates,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
-    subagent_persistence_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -2233,14 +2316,13 @@ impl RuntimeManager {
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
+            subagent_dispatch: ConversationMutexGates::default(),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
-            #[cfg(test)]
-            subagent_persistence_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3692,10 +3774,12 @@ impl RuntimeManager {
                 loop {
                     tokio::select! {
                         Some(req) = spawn_rx.recv() => {
-                            manager.handle_spawn_request(req).await;
+                            let manager = Arc::clone(&manager);
+                            tokio::spawn(async move { manager.handle_spawn_request(req).await; });
                         }
                         Some(req) = cancel_rx.recv() => {
-                            manager.handle_cancel_request(req).await;
+                            let manager = Arc::clone(&manager);
+                            tokio::spawn(async move { manager.handle_cancel_request(req).await; });
                         }
                         Some(req) = handoff_rx.recv() => {
                             manager.handle_task_handoff_request(req).await;
@@ -3775,513 +3859,384 @@ impl RuntimeManager {
         }
     }
 
-    /// Handle a sub-agent spawn request
-    #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
         let SubAgentSpawnRequest {
-            spec,
+            batch_id,
+            specs,
             parent_conversation_id,
             parent_scope,
-            parent_event_tx,
+            parallel_work_qualified,
             parent_turn_link,
+            response_tx,
+            activation_rx,
         } = req;
-
-        tracing::info!(
-            agent_id = %spec.agent_id,
-            parent_id = %parent_conversation_id,
-            task = %spec.task,
-            "Spawning sub-agent"
-        );
-
-        // 1. Look up parent conversation to inherit its conv_mode
-        let parent_conv = match self.db.get_conversation(&parent_conversation_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to look up parent conversation");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Failed to look up parent conversation: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
-                return;
-            }
-        };
-        if parent_conv.attached_work_scope_id != parent_scope {
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: format!(
-                            "Parent WorkScope changed before sub-agent persistence: expected {parent_scope:?}"
-                        ),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
-
-        let parent_resource =
-            match crate::resource_authority::resolve_resource_authority(&self.db, &parent_conv)
-                .await
-            {
-                Ok(resource) => resource,
-                Err(error) => {
-                    let _ = parent_event_tx
-                        .send(Event::SubAgentResult {
-                            agent_id: spec.agent_id,
-                            outcome: SubAgentOutcome::Failure {
-                                error: format!("failed to resolve parent capability: {error}"),
-                                error_kind: crate::db::ErrorKind::SubAgentError,
-                            },
-                        })
-                        .await;
-                    return;
-                }
-            };
-        if spec.mode == SubAgentMode::Work
-            && parent_resource.authority != crate::work_scope::ResourceAuthority::Work
-        {
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: "Parent capability does not authorize a Work child".to_string(),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
-
-        if let Err(error) = self.llm_registry.validate_execution_route(
-            &spec.model_id,
-            &spec.connection,
-            spec.effort,
-        ) {
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error,
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
-
-        // Derive sub-agent conv_mode from spec.mode + parent's mode.
-        // Explore sub-agents are always Explore. Work sub-agents inherit
-        // the parent's Work mode (branch, base_branch, worktree_path).
-        let sub_conv_mode = match spec.mode {
-            SubAgentMode::Explore => ConvMode::Explore {
-                worktree_path: None,
-                next_taskmd_id_hint: None,
-            },
-            SubAgentMode::Work => match &parent_conv.conv_mode {
-                ConvMode::Explore {
-                    worktree_path: Some(worktree_path),
-                    ..
-                }
-                | ConvMode::DetachedProductCreation { worktree_path, .. } => {
-                    ConvMode::AttachedWorkChild {
-                        worktree_path: worktree_path.clone(),
-                    }
-                }
-                mode => mode.clone(),
-            },
-        };
-
-        if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. })
-            && !self.platform.has_sandbox()
-        {
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: "Attached Work children require OS sandbox support".to_string(),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
-
-        let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                tracing::warn!(agent_id = %spec.agent_id, cwd = %spec.cwd, error = %e, "Rejected sub-agent spawn with invalid cwd");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Invalid sub-agent working directory: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
-                return;
-            }
-        };
-
-        let Ok(persistence_owner) = self.fatal_local_authority_fence.try_acquire() else {
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: "runtime admission closed after fatal local authority loss"
-                            .to_string(),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        };
-        #[cfg(test)]
-        if let Some(barrier) = self
-            .subagent_persistence_barriers
-            .lock()
-            .await
-            .get(&spec.agent_id)
-            .cloned()
-        {
-            barrier.wait().await;
-            barrier.wait().await;
-        }
-        if let Err(error) = self
-            .db
-            .establish_parent_reconcile_action(&parent_conversation_id)
-            .await
-        {
-            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
-            drop(persistence_owner);
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
-                        error: format!("failed to persist parent recovery authority: {error}"),
-                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
-
-        // 2. Create conversation in DB with correct conv_mode
-        let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
-        let conv = match self
-            .db
-            .create_subagent_conversation(
-                &spec.agent_id,
-                &slug,
-                spec_cwd.raw(),
+        match self
+            .admit_sub_agent_batch(
+                &batch_id,
+                &specs,
                 &parent_conversation_id,
-                &spec.model_id,
-                &sub_conv_mode,
-                parent_conv.llm_language,
-                parent_scope.as_ref(),
-                phoenix_db::SubAgentExecution {
-                    connection: &spec.connection,
-                    effort: spec.effort,
-                    persona: spec.persona.as_deref(),
-                },
+                parent_scope,
+                parallel_work_qualified,
             )
             .await
         {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create sub-agent conversation");
-                drop(persistence_owner);
-                // Notify parent of failure
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Failed to create conversation: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
-                return;
+            Ok(()) => {
+                if response_tx
+                    .send(SubAgentAdmissionResponse::Admitted)
+                    .is_err()
+                {
+                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
+                    return;
+                }
+                if activation_rx.await.is_err() {
+                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
+                    return;
+                }
+                self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
             }
-        };
+            Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
+                self.signal_fatal_local_authority("sub_agent_batch_admission");
+                let _ = response_tx.send(SubAgentAdmissionResponse::Unclassified);
+            }
+            Err(error) => {
+                let _ = response_tx.send(SubAgentAdmissionResponse::Rejected(error));
+            }
+        }
+    }
 
-        // 2. Insert initial task as synthetic user message
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let content = crate::db::MessageContent::user(&spec.task);
-        if let Err(e) = self
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_sub_agent_batch(
+        self: &Arc<Self>,
+        batch_id: &str,
+        specs: &[SubAgentSpec],
+        parent_conversation_id: &str,
+        parent_scope: Option<WorkScopeId>,
+        parallel_work_qualified: bool,
+    ) -> Result<(), String> {
+        let parent = self
             .db
-            .add_message(&message_id, &conv.id, &content, None, None)
+            .get_conversation(parent_conversation_id)
             .await
-        {
-            tracing::error!(error = %e, "Failed to add initial message");
-            drop(persistence_owner);
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: format!("Failed to add initial message: {e}"),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
+            .map_err(|error| format!("Failed to load sub-agent parent: {error}"))?;
+        if parent.attached_work_scope_id != parent_scope {
+            return Err("Parent WorkScope changed before sub-agent admission".to_string());
+        }
+        let children = specs
+            .iter()
+            .map(|spec| {
+                let conv_mode = match spec.mode {
+                    SubAgentMode::Explore => ConvMode::Explore {
+                        worktree_path: None,
+                        next_taskmd_id_hint: None,
                     },
+                    SubAgentMode::Work => parent.conv_mode.clone(),
+                };
+                Ok(phoenix_db::SubAgentChildAdmission {
+                    run: phoenix_db::SubAgentRunAdmission {
+                        child_conversation_id: spec.agent_id.clone(),
+                        execution_authority: match spec.mode {
+                            SubAgentMode::Explore => {
+                                phoenix_db::SubAgentExecutionAuthority::ReadOnly
+                            }
+                            SubAgentMode::Work => {
+                                phoenix_db::SubAgentExecutionAuthority::WriteCapable
+                            }
+                        },
+                    },
+                    slug: format!("sub-{}", spec.agent_id),
+                    cwd: spec.cwd.clone(),
+                    model: spec.model_id.clone(),
+                    conv_mode,
+                    llm_language: parent.llm_language,
+                    connection: spec.connection.clone(),
+                    effort: spec.effort,
+                    persona: spec.persona.clone(),
+                    initial_message_id: uuid::Uuid::new_v4().to_string(),
+                    initial_task: spec.task.clone(),
+                    max_turns: spec.max_turns,
+                    timeout_millis: u64::try_from(spec.timeout.as_millis())
+                        .map_err(|_| "sub-agent timeout is too large".to_string())?,
                 })
-                .await;
-            return;
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let admission = phoenix_db::AtomicSubAgentBatchAdmission {
+            batch_id: batch_id.to_string(),
+            parent_conversation_id: parent_conversation_id.to_string(),
+            parent_scope,
+            parallel_work_qualified,
+            children,
+        };
+        match self.db.admit_sub_agent_batch_atomically(&admission).await {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| error.to_string())?;
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent batch admission commit could not be classified".to_string());
+            }
         }
 
-        drop(persistence_owner);
+        Ok(())
+    }
 
-        // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
-        let root_conversation_id =
-            find_root_conversation_id(&self.db, &parent_conversation_id).await;
-        let context_window = self.llm_registry.context_window(&spec.model_id);
-        let mut conv_context = ConvContext::sub_agent(
-            &conv.id,
-            spec_cwd.path_buf(),
-            &spec.model_id,
-            context_window,
-            root_conversation_id,
-        );
-        conv_context.max_turns = spec.max_turns;
-        conv_context.effort = conv.effort;
-        conv_context.service_tier = ServiceTier::Standard;
-        conv_context.effective_effort = self
-            .llm_registry
-            .effective_effort(&spec.model_id, conv.effort);
-        conv_context.resource_scope = conv.attached_work_scope_id.clone().map_or_else(
-            || crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone()),
-            crate::work_scope::ResourceScopeKey::Work,
-        );
-        conv_context.resource_authority = match spec.mode {
-            SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
-            SubAgentMode::Work => crate::work_scope::ResourceAuthority::Work,
-        };
-        conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
-        conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
-        conv_context.mode = match &sub_conv_mode {
-            ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore { .. }
-            | ConvMode::AttachedWorkChild { .. }
-            | ConvMode::Work { .. }
-            | ConvMode::DetachedProductCreation { .. }
-            | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
-            ConvMode::Branch { .. } => ModeKind::Branch,
-        };
-        conv_context.work_scope_worktree = sub_conv_mode.worktree_path().map(PathBuf::from);
-        // Sub-agent inherits parent's worktree cwd; discover the project's
-        // tasks directory the same way the parent did.
-        conv_context.tasks_dir_name =
-            taskmd_core::discover::discover_or_default(conv_context.filesystem_root())
-                .to_string_lossy()
-                .into_owned();
-        // Sub-agents inherit their parent's LLM language.
-        conv_context.llm_language = conv.llm_language;
-        // Named-agent persona (REQ-AG-006): replaces the base preamble in the
-        // sub-agent's system prompt. `None` for anonymous spawns.
-        conv_context.persona = spec.persona.clone();
+    async fn abandon_unactivated_sub_agent_batch(&self, batch_id: &str) {
+        if let Err(error) = self
+            .db
+            .abandon_unactivated_sub_agent_batch(batch_id, Utc::now())
+            .await
+        {
+            tracing::error!(%batch_id, %error, "failed to terminalize unactivated sub-agent batch");
+        }
+    }
 
-        // 4. Create channels for the sub-agent runtime. The broadcaster
-        // seeds its counter from the message we just inserted (sequence_id=1)
-        // so the first non-message event is ordered strictly after it.
-        let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1)
-            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
-        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+    fn kick_admitted_sub_agent_batch(
+        self: &Arc<Self>,
+        specs: Vec<SubAgentSpec>,
+        parent_turn_link: opentelemetry::trace::SpanContext,
+    ) {
+        for (spec, turn_link) in specs.into_iter().zip(std::iter::repeat(parent_turn_link)) {
+            let manager = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(error) = manager.kick_admitted_sub_agent(spec, turn_link).await {
+                    tracing::error!(agent_id = %error.0, error = %error.1, "failed to kick admitted sub-agent");
+                }
+            });
+        }
+    }
 
-        // 5. Create production adapters
-        let storage = DatabaseStorage::new(self.db.clone());
-        let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone())
-            .with_connection(Some(spec.connection.clone()));
-        // Select tool registry based on sub-agent mode (REQ-PROJ-008).
-        // Sub-agents get MCP access via the parent's MCP manager.
-        let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
-        let registry = match spec.mode {
-            SubAgentMode::Explore => ToolRegistry::for_subagent_explore(explore_policy),
-            SubAgentMode::Work if matches!(sub_conv_mode, ConvMode::AttachedWorkChild { .. }) => {
-                ToolRegistry::for_attached_subagent_work()
-            }
-            SubAgentMode::Work => ToolRegistry::for_subagent_work(),
-        };
-        // Sub-agents cannot spawn, so they carry an empty agent catalog.
-        let tool_executor = ToolRegistryExecutor::with_mcp(
-            registry,
-            self.mcp_manager.clone(),
-            Arc::from(Vec::new()),
-        );
-
-        // 6. Create runtime with parent notification
-        let runtime: ProductionRuntime = ConversationRuntime::new(
-            conv_context,
-            ConvState::Idle,
-            storage,
-            llm_client,
-            tool_executor,
-            self.browser_sessions.clone(),
-            self.bash_handles.clone(),
-            self.tmux_registry.clone(),
-            self.llm_registry.clone(),
-            self.terminals.clone(),
-            event_rx,
-            event_tx.clone(),
-            broadcaster.clone(),
-        )
-        .with_wake_registrar(self.wake_registrar())
-        .with_parent(parent_event_tx.clone())
-        .with_acknowledged_event_receiver(acknowledged_event_rx)
-        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-        .with_task_handoff_channel(self.handoff_tx.clone())
-        .with_credential_helper(self.credential_helper.clone());
-
-        // Live-state watch channel for sub-agent (seeded Idle; transitions publish updates).
-        let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
-        let runtime = runtime
-            .with_state_watcher(sub_state_tx)
-            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
-
-        // Seed the sub-agent's trigger slot with the parent's turn context. A
-        // sub-agent's whole life is one turn (it never leaves "working"
-        // until terminal), so its single conversation.turn span links back
-        // to the parent turn that spawned it.
-        let turn_trigger = runtime.turn_trigger_slot();
+    #[allow(clippy::too_many_lines)]
+    async fn kick_admitted_sub_agent(
+        self: &Arc<Self>,
+        spec: SubAgentSpec,
+        parent_turn_link: opentelemetry::trace::SpanContext,
+    ) -> Result<(), (String, String)> {
+        let agent_id = spec.agent_id.clone();
+        let gate = self.subagent_dispatch.lock(&agent_id).await;
+        if self.llm_registry.get(&spec.model_id).is_none() {
+            return Err((
+                agent_id,
+                format!(
+                    "Admitted sub-agent model '{}' is no longer available",
+                    spec.model_id
+                ),
+            ));
+        }
+        let handle = self
+            .get_or_create(&agent_id)
+            .await
+            .map_err(|error| (agent_id.clone(), error))?;
         if parent_turn_link.is_valid() {
-            if let Ok(mut slot) = turn_trigger.lock() {
+            if let Ok(mut slot) = handle.turn_trigger.lock() {
                 *slot = Some(parent_turn_link);
             }
         }
-
-        // 7. Store handle
-        let sub_agent_identity = Arc::new(());
+        let dispatch = match self
+            .db
+            .claim_sub_agent_initial_dispatch(&agent_id, Utc::now())
+            .await
         {
-            let mut runtimes = self.runtimes.write().await;
-            let Ok(_admission) = self.fatal_local_authority_fence.try_acquire() else {
-                broadcaster.close_publication();
-                return;
-            };
-            runtimes.insert(
-                conv.id.clone(),
-                ConversationHandle {
-                    event_tx: event_tx.clone(),
-                    acknowledged_event_tx,
-                    turn_trigger,
-                    broadcast_tx: broadcaster.clone(),
-                    identity: sub_agent_identity.clone(),
-                    state_rx: sub_state_rx,
-                },
-            );
-        }
-
-        // 8. Set up per-agent timeout — sends UserCancel if sub-agent exceeds its limit.
-        // This is a safety net; the parent's AwaitingSubAgents deadline is the primary
-        // enforcement (REQ-SA-006). Both fire independently.
-        let timeout_duration = spec.timeout;
-        let timeout_task = {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout_duration).await;
-                tracing::info!("Sub-agent timeout reached, sending cancel");
-                let _ = event_tx
-                    .send(Event::UserCancel {
-                        reason: Some("Sub-agent timed out".to_string()),
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    })
-                    .await;
-            })
+            phoenix_db::SubAgentInitialDispatchAuthority::Established(dispatch) => dispatch,
+            phoenix_db::SubAgentInitialDispatchAuthority::Rejected(error) => {
+                return Err((agent_id, error));
+            }
+            phoenix_db::SubAgentInitialDispatchAuthority::Unclassified => {
+                self.signal_fatal_local_authority("sub_agent_initial_dispatch");
+                return Err((
+                    agent_id,
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent initial dispatch commit could not be classified".to_string(),
+                ));
+            }
         };
-
-        // 9. Start runtime task
-        let conv_id = conv.id.clone();
-        let task_text = spec.task.clone();
-        let cleanup_conversation = conv.clone();
-        let manager_for_cleanup = Arc::clone(self);
-        tokio::spawn(async move {
-            // Send initial UserMessage event to start the conversation
-            // Sub-agents generate their own message_id since they don't have a client
-            let _ = event_tx
-                .send(Event::UserMessage {
-                    text: task_text,
-                    llm_text: None, // Sub-agent tasks are already fully specified
-                    images: vec![],
-                    files: vec![],
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                    user_agent: Some("Phoenix Sub-Agent".to_string()),
-                    skill_invocation: None,
-                })
-                .await;
-
-            let disposition = runtime.run().await;
-            manager_for_cleanup
-                .propagate_fatal_runtime_exit(disposition, "spawned conversation runtime");
-
-            // Its sender targets this exited runtime's event channel.
-            timeout_task.abort();
-
-            manager_for_cleanup
-                .handle_runtime_exit(&cleanup_conversation, disposition)
-                .await;
-
-            // Only remove this sub-agent's entry. The identity check guards
-            // against the (unlikely) case where a replacement was inserted
-            // under the same key between run() finishing and this write lock.
-            let removed = {
-                let mut runtimes = manager_for_cleanup.runtimes.write().await;
-                if runtimes
-                    .get(&conv_id)
-                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &sub_agent_identity))
-                {
-                    runtimes.remove(&conv_id);
-                    true
-                } else {
-                    false
-                }
+        if dispatch.outcome != phoenix_db::SubAgentInitialDispatchOutcome::Claimed {
+            if matches!(
+                dispatch.outcome,
+                phoenix_db::SubAgentInitialDispatchOutcome::CancelledBeforeDispatch
+                    | phoenix_db::SubAgentInitialDispatchOutcome::AlreadyTerminal
+            ) {
+                drop(gate);
+                self.evict_runtime(&agent_id, EvictionReason::SubAgentTerminalBeforeDispatch)
+                    .await;
+            }
+            return Ok(());
+        }
+        if let Err(error) = handle
+            .event_tx
+            .send(Event::PersistedSubAgentBootstrap)
+            .await
+        {
+            let terminal_at = Utc::now();
+            let failed = ConvState::Failed {
+                error: error.to_string(),
+                error_kind: crate::db::ErrorKind::SubAgentError,
             };
-            if removed {
-                tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
-            } else {
-                tracing::debug!(
-                    conv_id = %conv_id,
-                    "Sub-agent cleanup: entry was replaced, skipping remove"
-                );
+            match self
+                .db
+                .update_child_state_and_record_sub_agent_terminal(
+                    &agent_id,
+                    &failed,
+                    terminal_at,
+                    phoenix_db::SubAgentTerminalCause::RuntimeFailure,
+                    terminal_at,
+                )
+                .await
+            {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    result
+                        .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.signal_fatal_local_authority("sub_agent_bootstrap_terminal");
+                    return Err((agent_id, "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: bootstrap failure terminal commit could not be classified".to_string()));
+                }
+            }
+            let parent_id = self
+                .db
+                .sub_agent_parent_conversation_id(&agent_id)
+                .await
+                .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+            let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
+            let outcome = SubAgentOutcome::Failure {
+                error: error.to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+            };
+            if let Err(dispatch_error) = dispatcher
+                .dispatch(
+                    &parent_id,
+                    Event::SubAgentResult {
+                        agent_id: agent_id.clone(),
+                        outcome,
+                    },
+                )
+                .await
+            {
+                dispatcher
+                    .reconcile(&parent_id)
+                    .await
+                    .map_err(|reconcile_error| (agent_id.clone(), reconcile_error))?;
+                tracing::warn!(%agent_id, %parent_id, %dispatch_error, "parent delivery deferred to durable reconciliation");
+            }
+            return Err((agent_id, error.to_string()));
+        }
+        drop(gate);
+
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(dispatch.timeout_millis)).await;
+            match manager
+                .db
+                .request_sub_agent_cancellation(
+                    &agent_id,
+                    phoenix_db::SubAgentTerminalCause::TimedOut,
+                    Utc::now(),
+                )
+                .await
+            {
+                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                    let _ = AddressedConversationEventDispatcher::new(Arc::clone(&manager))
+                        .dispatch(
+                            &agent_id,
+                            Event::UserCancel {
+                                reason: Some("Sub-agent timed out".to_string()),
+                                cause: match cause {
+                                    phoenix_db::SubAgentTerminalCause::TimedOut => {
+                                        crate::state_machine::event::CancelCause::Timeout
+                                    }
+                                    _ => crate::state_machine::event::CancelCause::UserRequested,
+                                },
+                            },
+                        )
+                        .await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %agent_id, "failed to persist sub-agent timeout");
+                }
             }
         });
+        Ok(())
     }
 
     /// Handle a sub-agent cancel request
-    async fn handle_cancel_request(&self, req: SubAgentCancelRequest) {
-        let SubAgentCancelRequest {
-            ids,
-            parent_conversation_id: _,
-            parent_event_tx,
-        } = req;
-
-        let runtimes = self.runtimes.read().await;
-
-        for agent_id in ids {
-            if let Some(handle) = runtimes.get(&agent_id) {
-                tracing::info!(agent_id = %agent_id, "Sending cancel to sub-agent");
-                let _ = handle
-                    .event_tx
-                    .send(Event::UserCancel {
-                        reason: None,
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    })
-                    .await;
-            } else {
-                // Runtime not found - synthesize failure result
-                tracing::warn!(agent_id = %agent_id, "Sub-agent runtime not found, synthesizing failure");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: "Sub-agent runtime not found".to_string(),
-                            error_kind: crate::db::ErrorKind::Cancelled,
-                        },
-                    })
-                    .await;
+    async fn handle_cancel_request(self: &Arc<Self>, req: SubAgentCancelRequest) {
+        let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
+        let mut dispositions = Vec::with_capacity(req.ids.len());
+        for agent_id in req.ids {
+            let outcome = self
+                .db
+                .request_sub_agent_cancellation(
+                    &agent_id,
+                    match req.cause {
+                        crate::state_machine::event::CancelCause::Timeout => {
+                            phoenix_db::SubAgentTerminalCause::TimedOut
+                        }
+                        crate::state_machine::event::CancelCause::UserRequested => {
+                            phoenix_db::SubAgentTerminalCause::Cancelled
+                        }
+                    },
+                    Utc::now(),
+                )
+                .await;
+            dispositions.push((agent_id, outcome));
+        }
+        let mut runtime_deliveries = Vec::new();
+        for (agent_id, outcome) in dispositions {
+            match outcome {
+                Ok(phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch) => {
+                    if let Err(error) = dispatcher
+                        .dispatch(
+                            &req.parent_conversation_id,
+                            Event::SubAgentResult {
+                                agent_id,
+                                outcome: match req.cause {
+                                    crate::state_machine::event::CancelCause::Timeout => {
+                                        SubAgentOutcome::TimedOut
+                                    }
+                                    crate::state_machine::event::CancelCause::UserRequested => {
+                                        SubAgentOutcome::Failure {
+                                            error: "Sub-agent cancelled before initial dispatch"
+                                                .to_string(),
+                                            error_kind: crate::db::ErrorKind::Cancelled,
+                                        }
+                                    }
+                                },
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, parent_id = %req.parent_conversation_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
+                        let _ = dispatcher.reconcile(&req.parent_conversation_id).await;
+                    }
+                }
+                Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime(cause)) => {
+                    let dispatcher = dispatcher.clone();
+                    runtime_deliveries.push(tokio::spawn(async move {
+                        if let Err(error) = dispatcher
+                            .dispatch(
+                                &agent_id,
+                                Event::UserCancel {
+                                    reason: None,
+                                    cause: match cause {
+                                        phoenix_db::SubAgentTerminalCause::TimedOut => crate::state_machine::event::CancelCause::Timeout,
+                                        _ => crate::state_machine::event::CancelCause::UserRequested,
+                                    },
+                                },
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, %agent_id, "child cancellation delivery deferred to durable terminal backstop");
+                        }
+                    }));
+                }
+                Ok(
+                    phoenix_db::SubAgentCancellationOutcome::AlreadyRequested
+                    | phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal,
+                ) => {}
+                Err(error) => {
+                    tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
+                }
             }
+        }
+        for delivery in runtime_deliveries {
+            let _ = delivery.await;
         }
     }
 
@@ -4661,6 +4616,10 @@ impl RuntimeManager {
                                                 state_updated_at: projection.state_updated_at,
                                             },
                                         ),
+                                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                            &conversation_id,
+                                            &projection.state,
+                                        ),
                                     },
                                 )
                                 .await
@@ -4744,9 +4703,13 @@ impl RuntimeManager {
                                     },
                                     projection: Some(
                                         phoenix_db::workflow::PersistedConversationProjection {
-                                            state: conversation.state,
+                                            state: conversation.state.clone(),
                                             state_updated_at: conversation.state_updated_at,
                                         },
+                                    ),
+                                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                                        &conversation_id,
+                                        &conversation.state,
                                     ),
                                 },
                             )
@@ -4827,6 +4790,10 @@ impl RuntimeManager {
                 &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                     command,
                     projection: Some(obligation.projection.clone()),
+                    provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                        conversation_id,
+                        &obligation.projection.state,
+                    ),
                 },
             )
             .await
@@ -5011,7 +4978,7 @@ impl RuntimeManager {
             .model
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id());
-        let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
+        let model_id = self.llm_registry.resolve_model_id(&stored_model_id)?;
         let context_window = self.llm_registry.context_window(&model_id);
         let approved_task_objective = self
             .db
@@ -5120,6 +5087,14 @@ impl RuntimeManager {
                     "Failed to read sub-agent persona on resume; falling back to the generic prompt"
                 ),
             }
+        }
+        if is_sub_agent {
+            context.max_turns = self
+                .db
+                .sub_agent_dispatch_config(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .0;
         }
 
         let (event_tx, event_rx) = mpsc::channel(32);
@@ -5374,6 +5349,14 @@ impl RuntimeManager {
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
+        let runtime = if let Some(parent_conversation_id) = conv.parent_conversation_id.clone() {
+            runtime.with_parent_dispatch(
+                parent_conversation_id,
+                Arc::new(AddressedConversationEventDispatcher::new(Arc::clone(self))),
+            )
+        } else {
+            runtime
+        };
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -5660,7 +5643,8 @@ impl RuntimeManager {
             }
             EvictionReason::CreationProvisioned
             | EvictionReason::SteeringReconciliation
-            | EvictionReason::RecoveryReconciliation => {}
+            | EvictionReason::RecoveryReconciliation
+            | EvictionReason::SubAgentTerminalBeforeDispatch => {}
         }
 
         if let Some(handle) = old {
@@ -8916,7 +8900,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn subagent_persistence_keeps_one_owner_across_all_semantic_writes() {
+    async fn subagent_batch_admission_persists_all_semantic_writes_atomically() {
         let mut manager = test_manager().await;
         manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
             openai_api_key: Some("test-key".into()),
@@ -8928,21 +8912,16 @@ mod scope_liveness_tests {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .expect("create parent");
-        let agent_id = "fenced-subagent";
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        manager
-            .subagent_persistence_barriers
-            .lock()
-            .await
-            .insert(agent_id.to_string(), Arc::clone(&barrier));
-        let (parent_event_tx, _parent_event_rx) = mpsc::channel(1);
-        let spawn = {
+        let agent_id = "atomic-subagent";
+        let (response_tx, response_rx) = oneshot::channel();
+        let (activation_tx, activation_rx) = oneshot::channel();
+        let spawn = tokio::spawn({
             let manager = Arc::clone(&manager);
-            let parent_id = parent.id.clone();
-            tokio::spawn(async move {
+            async move {
                 manager
                     .handle_spawn_request(SubAgentSpawnRequest {
-                        spec: SubAgentSpec {
+                        batch_id: "atomic-subagent-batch".to_string(),
+                        specs: vec![SubAgentSpec {
                             agent_id: agent_id.to_string(),
                             task: "persist all child semantics".to_string(),
                             cwd: "/tmp".to_string(),
@@ -8952,33 +8931,35 @@ mod scope_liveness_tests {
                             connection: "openai_responses".into(),
                             effort: None,
                             max_turns: 1,
-                            agent_name: Some("fence-test".to_string()),
+                            agent_name: Some("atomic-test".to_string()),
                             persona: Some("test persona".to_string()),
-                        },
-                        parent_conversation_id: parent_id,
+                        }],
+                        parent_conversation_id: parent.id,
                         parent_scope: None,
-                        parent_event_tx,
+                        parallel_work_qualified: false,
                         parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                        response_tx,
+                        activation_rx,
                     })
                     .await;
-            })
-        };
-
-        barrier.wait().await;
-        manager.signal_fatal_local_authority("test_authority_boundary");
-        assert_eq!(
-            manager.fatal_local_authority_fence.owners_at_first_close(),
-            Some(1)
+            }
+        });
+        assert!(matches!(
+            response_rx.await.expect("admission response"),
+            SubAgentAdmissionResponse::Admitted
+        ));
+        assert!(
+            !spawn.is_finished(),
+            "launch waits for committed parent membership"
         );
-        assert!(manager.fatal_local_authority_fence.try_acquire().is_err());
-        barrier.wait().await;
+        activation_tx.send(()).expect("commit parent membership");
         spawn.await.expect("spawn handler joins");
 
         let child = manager
             .db()
             .get_conversation(agent_id)
             .await
-            .expect("child conversation persisted under admitted owner");
+            .expect("atomic child conversation");
         assert_eq!(
             manager
                 .db()
@@ -8997,7 +8978,124 @@ mod scope_liveness_tests {
                 .len(),
             1
         );
-        assert!(manager.try_get_handle(agent_id).await.is_none());
+        assert!(manager
+            .db()
+            .sub_agent_lifecycle_exists(agent_id)
+            .await
+            .expect("lifecycle lookup"));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn cancellation_during_materialization_prevents_subagent_bootstrap() {
+        let mut manager = test_manager().await;
+        manager.llm_registry = Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        }));
+        let manager = Arc::new(manager);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create parent");
+        let agent_id = "cancel-during-materialization";
+        let spec = SubAgentSpec {
+            agent_id: agent_id.to_string(),
+            task: "must never begin".to_string(),
+            cwd: "/tmp".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Explore,
+            model_id: "gpt-5.6-sol".to_string(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        manager
+            .handle_spawn_request(SubAgentSpawnRequest {
+                batch_id: "cancel-during-materialization-batch".to_string(),
+                specs: vec![spec.clone()],
+                parent_conversation_id: parent.id.clone(),
+                parent_scope: None,
+                parallel_work_qualified: false,
+                parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                response_tx,
+                activation_rx: {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(());
+                    rx
+                },
+            })
+            .await;
+        assert!(matches!(
+            response_rx.await.expect("admission response"),
+            SubAgentAdmissionResponse::Admitted
+        ));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(agent_id.to_string(), Arc::clone(&barrier));
+        let kick = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .kick_admitted_sub_agent(spec, opentelemetry::trace::SpanContext::NONE)
+                    .await
+            }
+        });
+        barrier.wait().await;
+        let disposition = manager
+            .db()
+            .request_sub_agent_cancellation(
+                agent_id,
+                phoenix_db::SubAgentTerminalCause::Cancelled,
+                Utc::now(),
+            )
+            .await
+            .expect("durable cancellation");
+        assert_eq!(
+            disposition,
+            phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch
+        );
+        barrier.wait().await;
+        assert_eq!(kick.await.expect("kick task joins"), Ok(()));
+        let lifecycle = manager
+            .db()
+            .sub_agent_lifecycle_exists(agent_id)
+            .await
+            .expect("lifecycle row");
+        assert!(lifecycle);
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(agent_id)
+                .await
+                .expect("cancelled child")
+                .state,
+            ConvState::Failed {
+                error_kind: crate::db::ErrorKind::Cancelled,
+                ..
+            }
+        ));
+        assert!(
+            !manager.runtimes.read().await.contains_key(agent_id),
+            "terminal child runtime must be retired"
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(agent_id)
+                .await
+                .expect("initial task remains singular")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9329,6 +9427,7 @@ mod scope_liveness_tests {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
                 content: Vec::new(),
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
@@ -11212,6 +11311,39 @@ mod scope_liveness_tests {
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
 
+        let replay_response =
+            phoenix_core::domain::provider_replay::AnthropicResponseSet::with_public_content(
+                phoenix_core::domain::provider_replay::AnthropicResponseIdentity {
+                    response_id: "recovery-private-response".into(),
+                    model: "claude-opus-5-5".into(),
+                },
+                vec![phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-recovery".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![
+                    phoenix_core::domain::provider_replay::AnthropicPrivateBlock::Thinking {
+                        index: phoenix_core::domain::provider_replay::ContentIndex(0),
+                        thinking: String::new(),
+                        signature: "private-signature".into(),
+                    },
+                ],
+            )
+            .expect("valid replay response")
+            .with_owner_message_id("direct-final-response".into());
+        mgr.db()
+            .update_state_and_provider_replay(
+                conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+                &phoenix_core::domain::provider_replay::AnthropicReplayUpdate::Append(
+                    replay_response,
+                ),
+            )
+            .await
+            .expect("seed private replay before database recovery");
+
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,
@@ -11262,6 +11394,13 @@ mod scope_liveness_tests {
             })
         ));
         assert!(terminal_events.try_recv().is_err());
+
+        assert!(mgr
+            .db()
+            .load_provider_replay_state(conversation_id)
+            .await
+            .expect("load replay after recovery")
+            .is_none());
 
         let durable_turn = repo
             .load_authoritative_turn(turn_id)

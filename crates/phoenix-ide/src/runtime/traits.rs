@@ -7,6 +7,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use phoenix_db::SubAgentTerminalCause;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
@@ -118,6 +119,8 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String>;
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,
@@ -193,6 +196,33 @@ pub trait MessageStore: Send + Sync {
         usage_data: Option<&UsageData>,
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Message, String>;
+
+    /// Persist a child terminal fact before its outcome enters the parent fan-in.
+    async fn record_sub_agent_terminal(
+        &self,
+        _child_conversation_id: &str,
+        _cause: phoenix_db::SubAgentTerminalCause,
+        _terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+    }
+
+    async fn sub_agent_terminal_is_accepted(
+        &self,
+        _child_conversation_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
 
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
@@ -413,6 +443,24 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String>;
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String>;
+
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
@@ -493,14 +541,50 @@ pub trait StateStore: Send + Sync {
     /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
     async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String>;
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String>;
+
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
@@ -648,6 +732,10 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
+        (**self).has_pending_continuation_opening(conv_id).await
+    }
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,
@@ -959,6 +1047,44 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             .await
     }
 
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_record_sub_agent_terminal(
+                conv_id,
+                state,
+                state_updated_at,
+                cause,
+                terminal_at,
+            )
+            .await
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_accept_sub_agent(
+                conv_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
+            .await
+    }
+
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
     }
@@ -1074,12 +1200,78 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        (**self).load_provider_replay_state(conversation_id).await
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_tool_round_state_and_provider_replay(
+                conversation_id,
+                assistant,
+                tool_results,
+                state,
+                state_updated_at,
+                update,
+            )
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_and_clear_provider_replay(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                state,
+                state_updated_at,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -1089,6 +1281,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )
@@ -1226,6 +1419,13 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn has_pending_continuation_opening(&self, conv_id: &str) -> Result<bool, String> {
+        self.db
+            .has_pending_continuation_opening(conv_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,
@@ -1372,6 +1572,41 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn record_sub_agent_terminal(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .terminalize_sub_agent_cancellation_backstop(child_conversation_id, cause, terminal_at)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn sub_agent_terminal_is_accepted(
+        &self,
+        child_conversation_id: &str,
+    ) -> Result<bool, String> {
+        self.db
+            .sub_agent_terminal_is_accepted(child_conversation_id)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
@@ -1622,6 +1857,10 @@ impl MessageStore for DatabaseStorage {
                     state: settlement.state.clone(),
                     state_updated_at: settlement.state_updated_at,
                 }),
+                provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                    &settlement.conversation_id,
+                    &settlement.state,
+                ),
             },
         )
         .await
@@ -1906,6 +2145,62 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        match self
+            .db
+            .update_child_state_and_record_sub_agent_terminal(
+                conv_id,
+                state,
+                state_updated_at,
+                cause,
+                terminal_at,
+            )
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: child terminal state and lifecycle fact commit could not be classified".to_string(),
+            ),
+        }
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        match self
+            .db
+            .update_parent_state_and_accept_sub_agent(
+                conv_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
+            .await
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ()).map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: parent state and sub-agent acceptance commit could not be classified".to_string(),
+            ),
+        }
+    }
+
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         let conv = self
             .db
@@ -2081,12 +2376,84 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        self.db
+            .load_provider_replay_state(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.db
+            .update_state_and_provider_replay(conversation_id, state, state_updated_at, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.db
+            .persist_tool_round_state_and_provider_replay(
+                conversation_id,
+                assistant,
+                tool_results,
+                state,
+                state_updated_at,
+                update,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_and_clear_provider_replay(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2096,6 +2463,7 @@ impl StateStore for DatabaseStorage {
                 root_conversation_id,
                 model,
                 effective_effort,
+                service_tier,
                 usage,
                 first_byte_at,
             )
@@ -2488,7 +2856,7 @@ mod registry_llm_client_tests {
     #[test]
     fn pinned_route_mismatch_is_not_a_retryable_network_failure() {
         let (_dir, registry) = codex_registry();
-        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
             .with_connection(Some("openai_responses".to_string()));
         let Err(error) = client.service() else {
             panic!("must not substitute Codex for the selected direct connection");
@@ -2497,7 +2865,7 @@ mod registry_llm_client_tests {
         assert!(!error.kind.is_auto_retryable());
         assert!(error.message.contains("openai_responses"));
         assert!(
-            RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+            RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
                 .with_connection(Some("codex".to_string()))
                 .service()
                 .is_ok()
@@ -2509,13 +2877,13 @@ mod registry_llm_client_tests {
     #[test]
     fn continuation_limits_use_the_selected_connection() {
         let (_dir, registry) = codex_registry();
-        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
+        let client = RegistryLlmClient::new(registry.clone(), "gpt-5.6-sol".to_string())
             .with_connection(Some("codex".to_string()));
         assert!(matches!(
             client.continuation_request_limits(),
             phoenix_llm::ContinuationRequestLimits::MaxInputItems { .. }
         ));
-        let mismatch = RegistryLlmClient::new(registry, "gpt-5.5".to_string())
+        let mismatch = RegistryLlmClient::new(registry, "gpt-5.6-sol".to_string())
             .with_connection(Some("openai_responses".to_string()));
         assert_eq!(
             mismatch.continuation_request_limits(),

@@ -70,7 +70,11 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
 | [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
-| [059](059_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
+| [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
+| [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
+| [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
+| [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
+| [063](063_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
 
 ## For agents: which decisions bind your task
 
@@ -78,7 +82,9 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -97,7 +103,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
-| Specifying approval-time or restart-time runtime capability projection from WorkScope authority | 059, then 049, 026, and 039 |
+| Specifying approval-time or restart-time runtime capability projection from WorkScope authority | 063, then 049, 026, and 039 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -132,7 +138,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
-      │   └── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
@@ -160,6 +167,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
+          ├── ADR-063 (WorkScope authority projects one runtime capability)
           ├── ADR-028 (iOS companion adds read-only project context and prose review)
           │   └── ADR-029 (iOS companion uses session-scoped prose feedback)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)

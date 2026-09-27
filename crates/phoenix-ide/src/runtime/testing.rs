@@ -171,6 +171,7 @@ impl LlmClient for StreamingMockLlmClient {
                 .await;
         }
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
@@ -561,6 +562,16 @@ pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    sub_agent_terminals: Mutex<
+        HashMap<
+            String,
+            (
+                phoenix_db::SubAgentTerminalCause,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >,
+    >,
+    sub_agent_acceptances: Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
@@ -610,6 +621,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -634,6 +646,8 @@ impl InMemoryStorage {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
+            sub_agent_terminals: Mutex::new(HashMap::new()),
+            sub_agent_acceptances: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
@@ -677,6 +691,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -722,6 +737,14 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn fail_sub_agent_acceptance_once(&self) {
+        *self.fail_sub_agent_acceptance_once.lock().unwrap() = true;
+    }
+
+    pub fn sub_agent_acceptance_count(&self) -> usize {
+        self.sub_agent_acceptances.lock().unwrap().len()
     }
 
     pub fn set_fail_message_add(&self, fail: bool) {
@@ -1116,6 +1139,10 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,
@@ -1908,6 +1935,41 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_terminals
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), (cause, terminal_at));
+        Ok(())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_conversation_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_sub_agent_acceptance_once.lock().unwrap()) {
+            return Err("injected sub-agent acceptance failure".to_string());
+        }
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_acceptances.lock().unwrap().insert(
+            child_conversation_id.to_string(),
+            (conv_id.to_string(), accepted_at),
+        );
+        Ok(())
+    }
+
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         Ok(self
             .states
@@ -2158,12 +2220,72 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        Ok(None)
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.update_state(conversation_id, state, state_updated_at)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.persist_tool_round_and_state(
+            conversation_id,
+            assistant,
+            tool_results,
+            state,
+            state_updated_at,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &crate::db::MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&crate::db::UsageData>,
+        _state: &phoenix_core::domain::sm_state::ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::Message, String> {
+        self.add_message_with_seq(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_turn_usage(
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         _usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2510,6 +2632,7 @@ mod tests {
     async fn test_mock_llm_client() {
         let mock = MockLlmClient::new("test-model");
         mock.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
@@ -2517,6 +2640,7 @@ mod tests {
         });
 
         let request = LlmRequest {
+            provider_replay: None,
             system: vec![],
             messages: vec![],
             tools: vec![],
@@ -2593,6 +2717,7 @@ mod tests {
     async fn test_simple_text_response() {
         let llm = MockLlmClient::new("test-model");
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2618,6 +2743,7 @@ mod tests {
         let llm = MockLlmClient::new("test-model");
         // First response: tool call
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2629,6 +2755,7 @@ mod tests {
         });
         // Second response: text after tool
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2681,6 +2808,7 @@ mod tests {
             Duration::from_secs(5),
         ));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
@@ -2791,6 +2919,7 @@ mod tests {
         // Fast LLM, long tool delay that we'll cancel
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2802,6 +2931,7 @@ mod tests {
         });
         // This response won't be used since tool is cancelled
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -2904,6 +3034,7 @@ mod tests {
         // 5 second tool delay - we should NOT wait for this
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3021,6 +3152,7 @@ mod tests {
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3725,6 +3857,7 @@ mod tests {
         // LLM returns a single tool call
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3736,6 +3869,7 @@ mod tests {
         });
         // After tool completes, LLM returns text
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -3841,6 +3975,7 @@ mod tests {
         // 4th RequestLlm should trip it. Queue 10 for headroom.
         for _ in 0..10 {
             llm.queue_response(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::tool_use(
                     "tool-x",
                     "bash",
@@ -4410,6 +4545,7 @@ mod tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         // Turn 1: a tool call (will wedge).
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -4421,6 +4557,7 @@ mod tests {
         });
         // Turn 2: a tool call (cooperative now), then...
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-2",
                 "bash",
@@ -4432,6 +4569,7 @@ mod tests {
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
@@ -4608,6 +4746,7 @@ mod tests {
         );
         let initial_state = ConvState::CancellingTool {
             tool_use_id: "wedged-tool".to_string(),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
             skipped_tools: vec![],
             completed_results: vec![],
             assistant_message,
@@ -4628,7 +4767,12 @@ mod tests {
             event_tx,
             broadcast_tx,
         )
-        .with_parent(parent_tx);
+        .with_parent_dispatch(
+            "parent-conv".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        );
 
         tokio::spawn(async move { runtime.run().await });
 

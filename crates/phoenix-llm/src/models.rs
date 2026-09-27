@@ -156,13 +156,6 @@ const EFFORT_LEVELS_GPT_55_PLUS: &[ModelEffort] = &[
     ModelEffort::Xhigh,
     ModelEffort::Max,
 ];
-const EFFORT_LEVELS_GPT_54: &[ModelEffort] = &[
-    ModelEffort::None,
-    ModelEffort::Low,
-    ModelEffort::Medium,
-    ModelEffort::High,
-    ModelEffort::Xhigh,
-];
 const EFFORT_LEVELS_GPT_6_ASTRA: &[ModelEffort] = &[
     ModelEffort::Low,
     ModelEffort::Medium,
@@ -178,16 +171,28 @@ fn effort_anthropic_xhigh() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_XHIGH, ModelEffort::High)
 }
 
+/// Opus 5.5 shares the xhigh-capable Anthropic effort set but its native
+/// default is `medium`, not `high`. It must not reuse [`effort_anthropic_xhigh`]:
+/// omitting `output_config` on a no-override request has to represent the true
+/// native default the model applies.
+fn effort_anthropic_opus_55() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_XHIGH, ModelEffort::Medium)
+}
+
 fn effort_gpt_55_plus() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
 }
 
-fn effort_gpt_54() -> EffortCapabilities {
-    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_54, ModelEffort::None)
-}
-
 fn effort_gpt_6_astra() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Low)
+}
+
+fn effort_gpt_6_sol_luna_direct() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
+}
+
+fn effort_gpt_6_sol_luna_codex() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Medium)
 }
 
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
@@ -319,12 +324,6 @@ pub enum ModelSource {
     External,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexAvailability {
-    Established,
-    AccountCatalog,
-}
-
 /// Model specification with metadata
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
@@ -356,7 +355,6 @@ pub struct ModelSpec {
     /// specs bypass the Codex bridge because their endpoint is operator-configured,
     /// not `ChatGPT`'s backend.
     pub source: ModelSource,
-    pub codex_availability: CodexAvailability,
     /// Route-aware effort capabilities. Built-in specs describe the native
     /// provider defaults, while external specs carry validated optional metadata
     /// when an operator knows the target route's support. When absent on an
@@ -397,8 +395,16 @@ impl ModelSpec {
     }
 
     #[must_use]
-    pub fn effort_capabilities_for(&self, _service: &dyn crate::LlmService) -> EffortCapabilities {
-        self.effort_capabilities.clone()
+    pub fn effort_capabilities_for(&self, service: &dyn crate::LlmService) -> EffortCapabilities {
+        if matches!(self.api_name.as_str(), "gpt-6-sol" | "gpt-6-luna") {
+            if service.uses_codex_bridge() {
+                effort_gpt_6_sol_luna_codex()
+            } else {
+                effort_gpt_6_sol_luna_direct()
+            }
+        } else {
+            self.effort_capabilities.clone()
+        }
     }
 
     #[must_use]
@@ -406,9 +412,18 @@ impl ModelSpec {
         &self,
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
-        if service.uses_codex_bridge()
-            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses())
-        {
+        let openai_fast = service.uses_codex_bridge()
+            || (matches!(
+                self.api_name.as_str(),
+                "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+            ) && service.uses_official_openai_responses());
+        // Anthropic Fast mode is a research-preview capability of the official
+        // direct Claude API only. A compatible/proxy base URL or a cloud route
+        // must not advertise it, so gate on the official-Anthropic route.
+        let anthropic_fast = self.backend == ModelBackend::Anthropic
+            && self.api_name == "claude-opus-5-5"
+            && service.uses_official_anthropic();
+        if openai_fast || anthropic_fast {
             self.service_tier_capabilities
         } else {
             ServiceTierCapabilities::Unsupported
@@ -576,7 +591,6 @@ fn external_model_spec_from_config(
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
-        codex_availability: CodexAvailability::Established,
         effort_capabilities,
         service_tier_capabilities: ServiceTierCapabilities::Unsupported,
     })
@@ -614,6 +628,23 @@ pub fn all_models() -> Vec<ModelSpec> {
         // retired April 30, 2026 and is no longer required (or accepted on
         // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
+            id: "claude-opus-5-5".into(),
+            api_name: "claude-opus-5-5".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Opus 5.5 (most capable, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_opus_55(),
+            // Fast mode is available only on the official direct Claude API
+            // route; `service_tier_capabilities_for` gates this per route so a
+            // compatible/proxy base URL is not falsely advertised as Fast.
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
             id: "claude-opus-4-8".into(),
             api_name: "claude-opus-4-8".into(),
             backend: ModelBackend::Anthropic,
@@ -624,7 +655,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -639,7 +669,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -654,7 +683,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -669,7 +697,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -684,7 +711,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -699,7 +725,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unsupported(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -720,8 +745,35 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::AccountCatalog,
             effort_capabilities: effort_gpt_6_astra(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6-sol".into(),
+            api_name: "gpt-6-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Sol (workhorse, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
+            id: "gpt-6-luna".into(),
+            api_name: "gpt-6-luna".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Luna (fast, affordable, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_6_sol_luna_direct(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
@@ -735,7 +787,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -750,7 +801,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -765,54 +815,8 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
-        },
-        ModelSpec {
-            id: "gpt-5.5".into(),
-            api_name: "gpt-5.5".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.5 (frontier, 1M context)".into(),
-            context_window: 1_000_000,
-            max_output_tokens: None,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_55_plus(),
-            service_tier_capabilities: ServiceTierCapabilities::Supported,
-        },
-        ModelSpec {
-            id: "gpt-5.4".into(),
-            api_name: "gpt-5.4".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.4 (frontier, native computer use)".into(),
-            context_window: 400_000,
-            max_output_tokens: None,
-            recommended: false,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_54(),
-            service_tier_capabilities: ServiceTierCapabilities::Supported,
-        },
-        ModelSpec {
-            id: "gpt-5.4-mini".into(),
-            api_name: "gpt-5.4-mini".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.4 Mini (fast, efficient)".into(),
-            context_window: 400_000,
-            max_output_tokens: None,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
-            effort_capabilities: effort_gpt_54(),
-            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         // Mock model for frontend development without API keys
         ModelSpec {
@@ -826,7 +830,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unknown(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -875,6 +878,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing built-in model {id}"))
         };
 
+        let opus_55 = by_id("claude-opus-5-5");
+        assert_eq!(opus_55.api_name, "claude-opus-5-5");
+        assert_eq!(opus_55.context_window, 1_000_000);
+        assert_eq!(opus_55.output_token_limit(), Some(128_000));
+        assert_eq!(opus_55.effort_capabilities, effort_anthropic_opus_55());
+        assert!(opus_55.recommended);
+        assert_eq!(
+            opus_55.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
+        );
+
         assert_eq!(
             by_id("claude-sonnet-5").effort_capabilities,
             effort_anthropic_xhigh()
@@ -899,18 +913,43 @@ mod tests {
         assert!(!by_id("gpt-6-astra")
             .effort_capabilities
             .supports(ModelEffort::None));
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = by_id(id);
+            assert_eq!(model.context_window, 1_050_000);
+            assert_eq!(model.output_token_limit(), Some(128_000));
+            assert_eq!(model.effort_capabilities, effort_gpt_6_sol_luna_direct());
+            assert!(model.effort_capabilities.supports(ModelEffort::None));
+            assert_eq!(
+                model.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+        }
         assert_eq!(
             by_id("gpt-5.6-sol").effort_capabilities,
             effort_gpt_55_plus()
         );
-        assert_eq!(by_id("gpt-5.4-mini").effort_capabilities, effort_gpt_54());
         assert!(by_id("gpt-5.6-sol")
             .effort_capabilities
             .supports(ModelEffort::Max));
-        assert!(!by_id("gpt-5.4-mini")
-            .effort_capabilities
-            .supports(ModelEffort::Max));
-        assert!(models.iter().all(|model| model.id != "gpt-5.3-codex"));
+        let openai_builtins = models
+            .iter()
+            .filter(|model| {
+                model.backend == ModelBackend::OpenAIResponses
+                    && model.source == ModelSource::BuiltIn
+            })
+            .map(|model| model.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            openai_builtins,
+            std::collections::BTreeSet::from([
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+            ])
+        );
     }
 
     #[test]
