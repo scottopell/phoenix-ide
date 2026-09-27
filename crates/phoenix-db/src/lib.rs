@@ -10528,7 +10528,14 @@ impl Database {
              FROM durable_turns AS t
              JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
              JOIN conversations AS child ON child.id = t.conversation_id
-             WHERE child.parent_conversation_id IS NOT NULL",
+             WHERE child.parent_conversation_id IS NOT NULL
+             UNION
+             SELECT DISTINCT b.parent_conversation_id
+             FROM sub_agent_runs r
+             JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+             WHERE r.parent_accepted_at_unix_micros IS NULL
+             UNION
+             SELECT conversation_id FROM startup_parent_actions",
         )
         .fetch_all(&self.pool)
         .await?
@@ -10558,6 +10565,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
+    #[allow(clippy::too_many_lines)]
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -10632,6 +10640,14 @@ impl Database {
                              WHERE child.parent_conversation_id = conversations.id
                          )
                      )
+               )
+               AND conversations.id NOT IN (
+                   SELECT b.parent_conversation_id
+                   FROM sub_agent_runs r
+                   JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+                   WHERE r.parent_accepted_at_unix_micros IS NULL
+                   UNION
+                   SELECT conversation_id FROM startup_parent_actions
                )
                AND NOT (
                    state_kind = 'llm_requesting'
@@ -11066,15 +11082,47 @@ impl Database {
             )));
         }
         for result in results {
-            sqlx::query(
+            use phoenix_core::domain::sm_state::SubAgentOutcome;
+            let cause = match &result.outcome {
+                SubAgentOutcome::Success { .. } => "submit_result",
+                SubAgentOutcome::ImplicitCompletion { .. } => "implicit_completion",
+                SubAgentOutcome::TimedOut => "timed_out",
+                SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                    ErrorKind::Cancelled => "cancelled",
+                    ErrorKind::ContextExhausted => "context_exhausted",
+                    ErrorKind::SubAgentError => "submit_error",
+                    ErrorKind::TurnLimitExhausted => "turn_limit",
+                    ErrorKind::Auth
+                    | ErrorKind::RateLimit
+                    | ErrorKind::UsageLimitReached
+                    | ErrorKind::Network
+                    | ErrorKind::InvalidRequest
+                    | ErrorKind::PromptRejected
+                    | ErrorKind::InvalidResponse
+                    | ErrorKind::ServerError
+                    | ErrorKind::ServerOverloaded
+                    | ErrorKind::TimedOut
+                    | ErrorKind::ContentFilter => "runtime_failure",
+                },
+            };
+            let updated = sqlx::query(
                 "UPDATE sub_agent_runs
-                 SET parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?2)
-                 WHERE child_conversation_id = ?1 AND terminal_at_unix_micros IS NOT NULL",
+                 SET terminal_cause = COALESCE(terminal_cause, ?2),
+                     terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3),
+                     parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?3)
+                 WHERE child_conversation_id = ?1",
             )
             .bind(&result.agent_id)
+            .bind(cause)
             .bind(now.timestamp_micros())
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "startup fan-in lifecycle row missing for {}",
+                    result.agent_id
+                )));
+            }
         }
         sqlx::query(
             "INSERT OR REPLACE INTO startup_parent_actions
@@ -13994,7 +14042,8 @@ fn build_sub_agent_fan_in(
         .iter()
         .map(|r| {
             let outcome = match &r.outcome {
-                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Success { result }
+                | SubAgentOutcome::ImplicitCompletion { result } => format!("Result: {result}"),
                 SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
                 SubAgentOutcome::TimedOut => {
                     "Timed out: sub-agent exceeded its time limit".to_string()
@@ -22834,6 +22883,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_fan_in_preserves_terminal_child_and_interrupts_live_sibling() {
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
 
@@ -22848,6 +22898,27 @@ mod tests {
             db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
                 .await
                 .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('startup-fan-in-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child_id) in [done_id, live_id].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, 'startup-fan-in-batch', ?2, 'read_only', 10, 1000)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
         }
         db.update_conversation_state(
             done_id,
@@ -22949,6 +23020,30 @@ mod tests {
         let destination = ConvState::LlmRequesting { attempt: 1 };
         let mut action_ids = Vec::new();
         for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
+            let batch_id = format!("batch-{agent_id}");
+            db.create_conversation(agent_id, agent_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(&batch_id)
+            .bind(parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(agent_id)
+            .bind(&batch_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
             let expected_state = db.get_conversation(parent_id).await.unwrap().state;
             db.persist_startup_sub_agent_fan_in(
                 parent_id,
@@ -23047,6 +23142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_cancelling_sub_agents_reaches_cause_destination() {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
@@ -23064,6 +23160,26 @@ mod tests {
             db.create_conversation(&child_id, &child_id, "/tmp", false, Some(&parent_id), None)
                 .await
                 .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(format!("batch-{suffix}"))
+            .bind(&parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(&child_id)
+            .bind(format!("batch-{suffix}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
             if expects_request {
                 db.update_conversation_state(
                     &child_id,

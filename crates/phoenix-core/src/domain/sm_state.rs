@@ -2168,6 +2168,9 @@ pub enum SubAgentOutcome {
     Success {
         result: String,
     },
+    ImplicitCompletion {
+        result: String,
+    },
     Failure {
         error: String,
         error_kind: ErrorKind,

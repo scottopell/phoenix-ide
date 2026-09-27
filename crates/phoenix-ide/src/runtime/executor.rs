@@ -1514,7 +1514,8 @@ fn render_sub_agent_summary(results: &[SubAgentResult]) -> String {
         .iter()
         .map(|r| {
             let outcome = match &r.outcome {
-                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Success { result }
+                | SubAgentOutcome::ImplicitCompletion { result } => format!("Result: {result}"),
                 SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
                 SubAgentOutcome::TimedOut => {
                     "Timed out: sub-agent exceeded its time limit".to_string()
@@ -1720,6 +1721,9 @@ impl ActivePromptProjection {
 fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTerminalCause {
     match outcome {
         SubAgentOutcome::Success { .. } => phoenix_db::SubAgentTerminalCause::SubmitResult,
+        SubAgentOutcome::ImplicitCompletion { .. } => {
+            phoenix_db::SubAgentTerminalCause::ImplicitCompletion
+        }
         SubAgentOutcome::TimedOut => phoenix_db::SubAgentTerminalCause::TimedOut,
         SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
             crate::db::ErrorKind::Cancelled => phoenix_db::SubAgentTerminalCause::Cancelled,

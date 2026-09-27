@@ -2851,7 +2851,7 @@ pub fn transition_sub_agent(
         })
         .with_effect(Effect::PersistState)
         .with_effect(Effect::NotifyParent {
-            outcome: SubAgentOutcome::Success { result: text },
+            outcome: SubAgentOutcome::ImplicitCompletion { result: text },
         })),
 
         (
