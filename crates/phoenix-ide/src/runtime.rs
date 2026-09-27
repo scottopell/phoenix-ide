@@ -3978,6 +3978,15 @@ impl RuntimeManager {
     ) -> Result<(), (String, String)> {
         let agent_id = spec.agent_id.clone();
         let gate = self.subagent_dispatch.lock(&agent_id).await;
+        if self.llm_registry.get(&spec.model_id).is_none() {
+            return Err((
+                agent_id,
+                format!(
+                    "Admitted sub-agent model '{}' is no longer available",
+                    spec.model_id
+                ),
+            ));
+        }
         let handle = self
             .get_or_create(&agent_id)
             .await

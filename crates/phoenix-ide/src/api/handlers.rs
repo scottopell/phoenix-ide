@@ -4321,7 +4321,7 @@ async fn stream_conversation(
         let model_id = state
             .llm_registry
             .resolve_model_id(&stored_model)
-            .map_err(AppError::BadRequest)?;
+            .unwrap_or(stored_model);
         if !state.llm_registry.supports_service_tier(
             &model_id,
             phoenix_core::domain::llm_types::ServiceTier::Fast,
