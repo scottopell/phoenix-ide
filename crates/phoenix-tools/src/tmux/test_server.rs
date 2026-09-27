@@ -351,12 +351,16 @@ def terminal_state(quiet, unconfirmed, unconfirmed_state, sockets, creators, sta
 def record_uncaught_cleanup_failure(error_type, error, traceback):
     if issubclass(error_type, SystemExit):
         return sys.__excepthook__(error_type, error, traceback)
-    reason = {
-        subprocess.TimeoutExpired: "cleanup-subprocess-timeout",
-        DeadlineExpired: "cleanup-deadline-expired",
-        IdentityOutputError: "cleanup-identity-output-error",
-        OSError: "cleanup-os-error",
-    }.get(error_type, "cleanup-runtime-error")
+    if issubclass(error_type, subprocess.TimeoutExpired):
+        reason = "cleanup-subprocess-timeout"
+    elif issubclass(error_type, DeadlineExpired):
+        reason = "cleanup-deadline-expired"
+    elif issubclass(error_type, IdentityOutputError):
+        reason = "cleanup-identity-output-error"
+    elif issubclass(error_type, OSError):
+        reason = "cleanup-os-error"
+    else:
+        reason = "cleanup-runtime-error"
     record_cleanup_failure(reason, globals().get("terminal", {}))
     return sys.__excepthook__(error_type, error, traceback)
 
@@ -1314,6 +1318,13 @@ while time.monotonic() < cleanup_deadline:
                 if not root.exists():
                     os.replace(root_quarantine, root)
                 fail_cleanup("root-quarantine-reconciliation-failed", terminal)
+            if completion_hook:
+                subprocess.run(
+                    [completion_hook, str(control_root)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                    timeout=remaining_timeout(cleanup_deadline),
+                )
             shutil.rmtree(root_quarantine)
         except OSError:
             try:
@@ -1322,13 +1333,6 @@ while time.monotonic() < cleanup_deadline:
             except OSError:
                 pass
             fail_cleanup("root-quarantine-operation-failed", terminal)
-        if completion_hook:
-            subprocess.run(
-                [completion_hook, str(control_root)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, check=False,
-                timeout=remaining_timeout(cleanup_deadline),
-            )
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
 fail_cleanup("cleanup-deadline-expired", terminal)
@@ -2157,8 +2161,13 @@ mod tests {
     #[test]
     fn uncaught_cleanup_failures_publish_receipts_and_receipt_reads_are_nonblocking() {
         assert!(WATCHDOG_PROGRAM.contains("sys.excepthook = record_uncaught_cleanup_failure"));
-        assert!(WATCHDOG_PROGRAM.contains("\"cleanup-subprocess-timeout\""));
+        assert!(WATCHDOG_PROGRAM.contains("issubclass(error_type, OSError)"));
         assert!(WATCHDOG_PROGRAM.contains("globals().get(\"terminal\", {})"));
+        let hook = WATCHDOG_PROGRAM.find("if completion_hook:").unwrap();
+        let removal = WATCHDOG_PROGRAM
+            .find("shutil.rmtree(root_quarantine)")
+            .unwrap();
+        assert!(hook < removal);
     }
 
     #[test]
