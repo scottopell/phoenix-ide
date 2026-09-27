@@ -57,6 +57,7 @@ completion_hook = os.environ.get("PHOENIX_TMUX_COMPLETION_HOOK")
 provisional = []
 adopted_pending_publication = []
 preserved_visible_paths = set()
+cleanup_record_status = {}
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -199,6 +200,64 @@ def original_control_root_exists():
     except OSError:
         return False
 
+def path_identity(path):
+    try:
+        current = path.stat()
+        return [current.st_dev, current.st_ino]
+    except OSError:
+        return None
+
+def record_cleanup_failure(reason, terminal):
+    records = []
+    for socket, device, inode, control, processes in owned:
+        states = terminal.get("states", {}).get(control.name, [])
+        records.append({
+            "socket": socket.name,
+            "control": control.name,
+            "socket_identity": path_identity(socket),
+            "control_identity": path_identity(control),
+            "expected_identity": [device, inode],
+            "processes": [
+                {"pid": identity[0], "birth": identity[1], "state": state}
+                for identity, state in zip(processes, states)
+            ],
+        })
+    receipt = {
+        "version": 1,
+        "reason": reason,
+        "root_identity_matches": original_root_exists(),
+        "control_root_identity_matches": original_control_root_exists(),
+        "cleanup_failed": cleanup_failed,
+        "quiet": terminal.get("quiet", 0),
+        "unconfirmed": terminal.get("unconfirmed", True),
+        "unconfirmed_state": terminal.get("unconfirmed_state", True),
+        "sockets": terminal.get("sockets", True),
+        "creators": terminal.get("creators", True),
+        "unconfirmed_obligations": len(unconfirmed_obligations),
+        "preserved_visible_paths": sorted(path.name for path in preserved_visible_paths),
+        "retained_controls": sorted(retained_controls),
+        "record_status": cleanup_record_status,
+        "records": records,
+    }
+    try:
+        publish_response(root / ".cleanup-failure.json", json.dumps(receipt, sort_keys=True))
+    except OSError:
+        pass
+
+def fail_cleanup(reason, terminal):
+    record_cleanup_failure(reason, terminal)
+    sys.exit(1)
+
+def terminal_state(quiet, unconfirmed, unconfirmed_state, sockets, creators, states):
+    return {
+        "quiet": quiet,
+        "unconfirmed": unconfirmed,
+        "unconfirmed_state": unconfirmed_state,
+        "sockets": sockets,
+        "creators": creators,
+        "states": states,
+    }
+
 def owner_alive():
     if (not original_root_exists() or not original_control_root_exists()
             or (root / ".cleanup-request").exists()):
@@ -293,18 +352,24 @@ def persist_record_processes(record, processes):
         )
     return updated
 
+def set_cleanup_record_status(control, stage, detail):
+    cleanup_record_status[control.name] = {"stage": stage, "detail": detail}
+
 def retire_record(record, deadline):
     _, device, inode, control, recorded_processes = record
     processes = list(recorded_processes)
     expected_token = tmux_format_literal(processes[0][2])
     states = [identity_state(identity) for identity in processes]
     if all(state == "absent" for state in states):
+        set_cleanup_record_status(control, "preflight", "already-absent")
         return record
     if states[0] != "owned" or any(state not in ("owned", "absent") for state in states[1:]):
+        set_cleanup_record_status(control, "preflight", "identity-not-owned")
         return None
     try:
         control_stat = control.stat()
         if control_stat.st_dev != device or control_stat.st_ino != inode:
+            set_cleanup_record_status(control, "preflight", "control-identity-mismatch")
             return None
         expected_server = processes[0][0]
         if retirement_hook:
@@ -314,18 +379,24 @@ def retire_record(record, deadline):
                 stderr=subprocess.DEVNULL, check=False,
                 timeout=remaining_timeout(deadline),
             )
+        set_cleanup_record_status(control, "query", "started")
         observed_server, pane_pids = query_control_processes(control, deadline)
         if observed_server != expected_server:
+            set_cleanup_record_status(control, "query", "server-pid-mismatch")
             return None
         known_pids = {identity[0] for identity in processes}
         for pane_pid in pane_pids:
             if pane_pid not in known_pids:
                 started = birth(pane_pid)
                 if started is None:
+                    if not pid_exists(pane_pid):
+                        continue
+                    set_cleanup_record_status(control, "query", "live-late-pane-birth-unavailable")
                     return None
                 processes.append((pane_pid, started, None))
                 known_pids.add(pane_pid)
         record = persist_record_processes(record, processes)
+        set_cleanup_record_status(control, "atomic-kill", "started")
         subprocess.run(
             ["tmux", "-S", str(control), "if-shell", "-F",
              f"#{{&&:#{{==:#{{pid}},{expected_server}}},#{{==:#{{PHOENIX_TMUX_SERVER_TOKEN}},{expected_token}}}}}",
@@ -334,12 +405,22 @@ def retire_record(record, deadline):
             stderr=subprocess.DEVNULL, check=False,
             timeout=remaining_timeout(deadline),
         )
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        set_cleanup_record_status(control, "subprocess", "timeout")
         return None
+    except RuntimeError:
+        set_cleanup_record_status(control, "subprocess", "deadline-expired")
+        return None
+    except OSError:
+        set_cleanup_record_status(control, "subprocess", "os-error")
+        return None
+    set_cleanup_record_status(control, "final-absence", "waiting")
     while time.monotonic() < deadline:
         if all(identity_state(identity) == "absent" for identity in processes):
+            set_cleanup_record_status(control, "final-absence", "verified")
             return record
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    set_cleanup_record_status(control, "final-absence", "deadline-expired")
     return None
 
 class EnvironmentError(RuntimeError):
@@ -968,17 +1049,18 @@ def remove_authenticated_control_root():
         pass
     return False
 
+terminal = terminal_state(0, True, True, True, True, {})
 quiet = 0
 while time.monotonic() < cleanup_deadline:
     root_replaced = not original_root_exists()
     unconfirmed = root_replaced or cleanup_failed
-    states = [
-        identity_state(identity)
-        for _, _, _, _, processes in owned
-        for identity in processes
-    ]
-    unconfirmed_state = (any(state != "absent" for state in states)
-                         or bool(unconfirmed_obligations))
+    process_states = {
+        control.name: [identity_state(identity) for identity in processes]
+        for _, _, _, control, processes in owned
+    }
+    unconfirmed_state = (any(
+        state != "absent" for states in process_states.values() for state in states
+    ) or bool(unconfirmed_obligations))
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -1079,6 +1161,9 @@ while time.monotonic() < cleanup_deadline:
         except OSError:
             creators = True
     quiet = quiet + 1 if not unconfirmed_state and not unconfirmed and not sockets and not creators else 0
+    terminal = terminal_state(
+        quiet, unconfirmed, unconfirmed_state, sockets, creators, process_states
+    )
     if quiet >= 5:
         if not remove_authenticated_control_root():
             quiet = 0
@@ -1091,7 +1176,7 @@ while time.monotonic() < cleanup_deadline:
             if (moved_root_stat.st_dev, moved_root_stat.st_ino) != root_identity:
                 if not root.exists():
                     os.replace(root_quarantine, root)
-                sys.exit(1)
+                fail_cleanup("root-quarantine-identity-mismatch", terminal)
             if root_quarantine_hook:
                 subprocess.run(
                     [root_quarantine_hook, str(root_quarantine)],
@@ -1116,7 +1201,7 @@ while time.monotonic() < cleanup_deadline:
             if not reconciled:
                 if not root.exists():
                     os.replace(root_quarantine, root)
-                sys.exit(1)
+                fail_cleanup("root-quarantine-reconciliation-failed", terminal)
             shutil.rmtree(root_quarantine)
         except OSError:
             try:
@@ -1124,7 +1209,7 @@ while time.monotonic() < cleanup_deadline:
                     os.replace(root_quarantine, root)
             except OSError:
                 pass
-            sys.exit(1)
+            fail_cleanup("root-quarantine-operation-failed", terminal)
         if completion_hook:
             subprocess.run(
                 [completion_hook, str(control_root)],
@@ -1134,8 +1219,7 @@ while time.monotonic() < cleanup_deadline:
             )
         sys.exit(0)
     time.sleep(min(0.1, max(0, cleanup_deadline - time.monotonic())))
-print(f"tmux test watchdog retained failed control root: {control_root}", file=sys.stderr)
-sys.exit(1)
+fail_cleanup("cleanup-deadline-expired", terminal)
 "##;
 
 /// Owns real tmux servers created by tests, including after abrupt runner death.
@@ -1374,8 +1458,10 @@ impl TestTmuxServerOwner {
 
         let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
             if !status.success() {
+                let receipt = fs::read_to_string(root_path.join(".cleanup-failure.json"))
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
                 return Err(io::Error::other(format!(
-                    "tmux test watchdog reported cleanup failure: {status}"
+                    "tmux test watchdog reported cleanup failure: {status}; receipt: {receipt}"
                 )));
             }
             if root_path.exists() {
@@ -2983,27 +3069,41 @@ mod tests {
     }
 
     #[test]
-    fn retirement_discovered_exited_pane_uses_updated_owned_record() {
-        if which::which("tmux").is_err() {
+    fn retirement_ignores_discovered_pane_that_is_proven_absent() {
+        let Ok(real_tmux) = which::which("tmux") else {
             return;
-        }
+        };
         let hook_dir = TempDir::new().unwrap();
-        let once = hook_dir.path().join("once");
-        let hook = hook_dir.path().join("add-short-pane");
+        let enabled = hook_dir.path().join("enabled");
+        let exited_pid = hook_dir.path().join("exited-pid");
+        let hook = hook_dir.path().join("enable-absent-pane");
         fs::write(
             &hook,
             format!(
-                "#!/bin/sh\n[ -e '{}' ] && exit 0\ntouch '{}'\ntmux -S \"$1\" new-window -d -t main sleep 0.05\n",
-                once.display(),
-                once.display()
+                "#!/bin/sh\nsh -c 'exit 0' &\npid=$!\nwait \"$pid\"\nprintf '%s' \"$pid\" > '{}'\ntouch '{}'\n",
+                exited_pid.display(),
+                enabled.display()
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
+        let tmux = hook_dir.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\n'{}' \"$@\"\nstatus=$?\nfor arg in \"$@\"; do\n  if [ \"$arg\" = list-panes ] && [ -e '{}' ]; then\n    cat '{}'\n    printf '\\n'\n  fi\ndone\nexit \"$status\"\n",
+                real_tmux.display(),
+                enabled.display(),
+                exited_pid.display()
+            ),
+        )
+        .unwrap();
+        for executable in [&hook, &tmux] {
+            let mut permissions = fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
         let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
-            None,
+            Some(hook_dir.path()),
             (None, Some(Duration::from_secs(2))),
             None,
             None,
@@ -3011,7 +3111,7 @@ mod tests {
             (None, None),
             (None, Some(&hook), None, None),
         );
-        let (_, processes) = spawn_server_with_processes(&owner, "late-exited-pane");
+        let (_, processes) = spawn_server_with_processes(&owner, "absent-late-pane");
 
         owner.shutdown();
 
@@ -4466,11 +4566,20 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_receipt_is_bounded_and_excludes_owner_tokens() {
+        assert!(WATCHDOG_PROGRAM.contains("root / \".cleanup-failure.json\""));
+        assert!(WATCHDOG_PROGRAM.contains("\"reason\": reason"));
+        assert!(WATCHDOG_PROGRAM.contains("\"record_status\": cleanup_record_status"));
+        assert!(WATCHDOG_PROGRAM.contains("\"state\": state"));
+        assert!(!WATCHDOG_PROGRAM.contains("\"token\": identity[2]"));
+        assert!(!WATCHDOG_PROGRAM.contains("\"environment\": environment"));
+    }
+
+    #[test]
     fn cleanup_accepts_only_jointly_owned_or_jointly_absent_processes() {
-        assert!(WATCHDOG_PROGRAM
-            .contains("if all(state == \"absent\" for state in states):\n        return record"));
+        assert!(WATCHDOG_PROGRAM.contains("if all(state == \"absent\" for state in states):"));
         assert!(WATCHDOG_PROGRAM.contains(
-            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):\n        return None"
+            "if states[0] != \"owned\" or any(state not in (\"owned\", \"absent\") for state in states[1:]):"
         ));
         assert!(WATCHDOG_PROGRAM.contains("retire_record(record, cleanup_deadline)"));
     }

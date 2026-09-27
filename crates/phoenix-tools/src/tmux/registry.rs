@@ -5409,9 +5409,17 @@ mod tests {
             .expect("retirement fence should be acquired");
         assert_eq!(permit.instance.socket_path, stale_socket);
         assert_eq!(permit.instance.server_token, stale_token);
+        let stale_identity = exact_server_process_identity_until(
+            &stale_socket,
+            &stale_token,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("capture exact stale server identity");
 
         reg.reopen_after_repair(&work_scope).await;
         kill_socket(&stale_socket).await;
+        wait_for_exact_process_absence(stale_identity).await;
         let replacement = reg
             .ensure_live(&work_scope, owner.path(), None, None)
             .await
