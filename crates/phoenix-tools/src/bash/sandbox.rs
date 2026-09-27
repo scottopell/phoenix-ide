@@ -195,7 +195,7 @@ impl ExploreReadOnlyPolicy {
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
-        if self.platform_temp.is_dir() {
+        if self.worktree_write_root.is_none() && self.platform_temp.is_dir() {
             caps = caps
                 .allow_path(&self.platform_temp, AccessMode::ReadWrite)
                 .map_err(|e| format!("{}: {e}", self.platform_temp.display()))?;
@@ -468,6 +468,26 @@ mod tests {
             ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path(),)
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_policy_does_not_regrant_replaced_platform_temp() {
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let outside = tempfile::TempDir::new().expect("outside");
+        let policy =
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
+                .expect("worktree policy");
+        std::fs::remove_dir(&policy.platform_temp).expect("remove platform temp");
+        std::os::unix::fs::symlink(outside.path(), &policy.platform_temp)
+            .expect("replace platform temp with symlink");
+
+        let caps = policy.capability_set().expect("capabilities");
+
+        assert!(caps
+            .path_covered_with_access(&worktree.path().canonicalize().unwrap(), AccessMode::Write));
+        assert!(!caps
+            .path_covered_with_access(&outside.path().canonicalize().unwrap(), AccessMode::Write));
     }
 
     #[test]
