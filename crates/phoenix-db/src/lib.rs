@@ -10530,12 +10530,20 @@ impl Database {
              JOIN conversations AS child ON child.id = t.conversation_id
              WHERE child.parent_conversation_id IS NOT NULL
              UNION
+             SELECT a.conversation_id
+             FROM startup_parent_actions a
+             JOIN conversations c ON c.id = a.conversation_id
+             LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE a.action IN ('Reconcile', 'Cancel')
+               AND a.transcript_generation = c.transcript_generation
+               AND (a.turn_id IS NULL OR (a.turn_id = t.turn_id AND a.turn_generation = t.generation))
+             UNION
              SELECT DISTINCT b.parent_conversation_id
              FROM sub_agent_runs r
              JOIN sub_agent_batches b ON b.batch_id = r.batch_id
              WHERE r.parent_accepted_at_unix_micros IS NULL
-             UNION
-             SELECT conversation_id FROM startup_parent_actions",
+",
         )
         .fetch_all(&self.pool)
         .await?
@@ -10646,8 +10654,6 @@ impl Database {
                    FROM sub_agent_runs r
                    JOIN sub_agent_batches b ON b.batch_id = r.batch_id
                    WHERE r.parent_accepted_at_unix_micros IS NULL
-                   UNION
-                   SELECT conversation_id FROM startup_parent_actions
                )
                AND NOT (
                    state_kind = 'llm_requesting'
@@ -11175,7 +11181,12 @@ impl Database {
              LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                  AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
              WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO NOTHING",
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 action = excluded.action,
+                 transcript_generation = excluded.transcript_generation,
+                 turn_id = excluded.turn_id,
+                 turn_generation = excluded.turn_generation,
+                 created_at = excluded.created_at",
         )
         .bind(conversation_id)
         .bind(Utc::now().to_rfc3339())
@@ -11202,6 +11213,23 @@ impl Database {
                              AND t.terminal_kind IS NOT NULL
                        ))
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM startup_parent_actions
+             WHERE action IN ('Reconcile', 'Cancel')
+               AND EXISTS (
+                   SELECT 1 FROM conversations c
+                   LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                       AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                   WHERE c.id = startup_parent_actions.conversation_id
+                     AND (c.transcript_generation != startup_parent_actions.transcript_generation
+                          OR (startup_parent_actions.turn_id IS NOT NULL
+                              AND (t.turn_id IS NULL
+                                   OR t.turn_id != startup_parent_actions.turn_id
+                                   OR t.generation != startup_parent_actions.turn_generation)))
+               )",
         )
         .execute(&self.pool)
         .await?;

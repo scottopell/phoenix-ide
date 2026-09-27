@@ -3909,7 +3909,7 @@ impl RuntimeManager {
                             }
                         },
                     },
-                    slug: format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id)),
+                    slug: format!("sub-{}", spec.agent_id),
                     cwd: spec.cwd.clone(),
                     model: spec.model_id.clone(),
                     conv_mode,
@@ -4020,14 +4020,31 @@ impl RuntimeManager {
             .send(Event::PersistedSubAgentBootstrap)
             .await
         {
-            self.db
-                .record_sub_agent_terminal(
+            let terminal_at = Utc::now();
+            let failed = ConvState::Failed {
+                error: error.to_string(),
+                error_kind: crate::db::ErrorKind::SubAgentError,
+            };
+            match self
+                .db
+                .update_child_state_and_record_sub_agent_terminal(
                     &agent_id,
+                    &failed,
+                    terminal_at,
                     phoenix_db::SubAgentTerminalCause::RuntimeFailure,
-                    Utc::now(),
+                    terminal_at,
                 )
                 .await
-                .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+            {
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                    result
+                        .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+                }
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                    self.signal_fatal_local_authority("sub_agent_bootstrap_terminal");
+                    return Err((agent_id, "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: bootstrap failure terminal commit could not be classified".to_string()));
+                }
+            }
             let parent_id = self
                 .db
                 .sub_agent_parent_conversation_id(&agent_id)
