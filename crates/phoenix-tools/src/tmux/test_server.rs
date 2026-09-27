@@ -1326,6 +1326,13 @@ while time.monotonic() < cleanup_deadline:
                     timeout=remaining_timeout(cleanup_deadline),
                 )
             shutil.rmtree(root_quarantine)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            try:
+                if root_quarantine.exists() and not root.exists():
+                    os.replace(root_quarantine, root)
+            except OSError:
+                pass
+            raise
         except OSError:
             try:
                 if root_quarantine.exists() and not root.exists():
@@ -2168,6 +2175,9 @@ mod tests {
             .find("shutil.rmtree(root_quarantine)")
             .unwrap();
         assert!(hook < removal);
+        assert!(WATCHDOG_PROGRAM.contains(
+            "except (RuntimeError, subprocess.TimeoutExpired):\n            try:\n                if root_quarantine.exists() and not root.exists():\n                    os.replace(root_quarantine, root)"
+        ));
     }
 
     #[test]
@@ -2202,6 +2212,37 @@ mod tests {
         fs::remove_dir_all(root.path()).unwrap();
         fs::remove_dir_all(replacement).unwrap();
         std::mem::forget(root);
+    }
+
+    #[test]
+    fn completion_hook_timeout_restores_reported_fixture_root() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let hooks = TempDir::new().unwrap();
+        let hook = hooks.path().join("slow-completion");
+        fs::write(&hook, "#!/bin/sh\nsleep 10\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_test_options(
+            None,
+            (None, Some(Duration::from_millis(300))),
+            None,
+            None,
+            None,
+            (None, None),
+            (None, None, None, Some(&hook)),
+        );
+        let root = owner.path().to_path_buf();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+
+        assert!(panic.is_err());
+        assert!(root.exists(), "reported retained root was not restored");
+        let receipt = fs::read_to_string(root.join(".cleanup-failure.json")).unwrap();
+        assert!(receipt.contains("cleanup-deadline-expired"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
