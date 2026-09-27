@@ -6869,6 +6869,7 @@ mod tests {
             (
                 "cancel-tool",
                 ConvState::CancellingTool {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                     tool_use_id: "tool-1".to_string(),
                     skipped_tools: Vec::new(),
                     completed_results: Vec::new(),

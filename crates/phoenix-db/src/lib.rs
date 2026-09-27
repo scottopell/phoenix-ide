@@ -13887,6 +13887,7 @@ fn normalize_in_flight_round(
     }
     if let ConvState::CancellingTool {
         tool_use_id,
+        cause: _,
         skipped_tools,
         completed_results,
         assistant_message,
@@ -22286,6 +22287,7 @@ mod tests {
             None,
         );
         let state = ConvState::CancellingTool {
+            cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
             tool_use_id: "tool-2".to_string(),
             skipped_tools: vec![ToolCall::new("tool-3", think("c"))],
             completed_results: vec![ToolResult::success(

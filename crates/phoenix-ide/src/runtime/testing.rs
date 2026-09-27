@@ -4662,6 +4662,7 @@ mod tests {
         );
         let initial_state = ConvState::CancellingTool {
             tool_use_id: "wedged-tool".to_string(),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
             skipped_tools: vec![],
             completed_results: vec![],
             assistant_message,

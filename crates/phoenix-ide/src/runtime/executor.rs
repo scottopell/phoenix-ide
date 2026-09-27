@@ -14548,6 +14548,7 @@ mod authoritative_user_message_effect_tests {
         ));
         rt.state = ConvState::CancellingTool {
             tool_use_id: "cancelled-tool".to_string(),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
             skipped_tools: Vec::new(),
             completed_results: Vec::new(),
             assistant_message: crate::state_machine::AssistantMessage::new(

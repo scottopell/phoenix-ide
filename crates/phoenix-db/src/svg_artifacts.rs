@@ -328,6 +328,7 @@ mod tests {
         let completed_results = vec![ToolResult::success("done".into(), "Ready".into())];
         if cancelling {
             ConvState::CancellingTool {
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
                 tool_use_id: "svg".into(),
                 skipped_tools: vec![],
                 completed_results,

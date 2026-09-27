@@ -819,6 +819,7 @@ mod tests {
             },
             ConvState::CancellingTool {
                 tool_use_id: "t1".into(),
+                cause: crate::domain::sm_event::CancelCause::UserRequested,
                 skipped_tools: vec![],
                 completed_results: vec![],
                 assistant_message: AssistantMessage::default(),
@@ -1150,6 +1151,9 @@ pub enum ConvState {
     CancellingTool {
         /// The tool being aborted
         tool_use_id: String,
+        // owned: pre-cause rows were created only by user cancellation.
+        #[serde(default)]
+        cause: crate::domain::sm_event::CancelCause,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
         /// Tool results completed before cancellation
@@ -1314,6 +1318,7 @@ pub enum CoreState {
     },
     CancellingTool {
         tool_use_id: String,
+        cause: crate::domain::sm_event::CancelCause,
         skipped_tools: Vec<ToolCall>,
         completed_results: Vec<ToolResult>,
         assistant_message: AssistantMessage,
@@ -1471,12 +1476,14 @@ impl From<CoreState> for ConvState {
             },
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1567,12 +1574,14 @@ impl TryFrom<ConvState> for ParentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(ParentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1691,12 +1700,14 @@ impl TryFrom<ConvState> for SubAgentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,

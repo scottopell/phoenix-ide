@@ -701,9 +701,10 @@ impl Event {
 /// forced teardown (task 61004). `UserRequested` is a human-initiated or
 /// parent-propagated cancel; `Timeout` is the parent's sub-agent completion
 /// timeout forcing teardown.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
+    #[default]
     UserRequested,
     Timeout,
 }
