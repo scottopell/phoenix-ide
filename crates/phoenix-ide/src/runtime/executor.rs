@@ -3274,12 +3274,13 @@ where
                 _ => None,
             };
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
-                if self
-                    .storage
-                    .sub_agent_terminal_is_accepted(agent_id)
-                    .await?
-                {
-                    continue;
+                match self.storage.sub_agent_terminal_is_accepted(agent_id).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.sub_agent_result_buffer.push(current_event);
+                        return Err(error);
+                    }
                 }
             }
             // Pure state transition
@@ -4800,7 +4801,7 @@ where
             };
             if let Err(error) = self
                 .storage
-                .record_sub_agent_terminal(&agent_id, terminal_cause, Utc::now())
+                .terminalize_sub_agent_cancellation_backstop(&agent_id, terminal_cause, Utc::now())
                 .await
             {
                 tracing::warn!(%error, %agent_id, "failed to persist cancellation backstop terminal evidence");

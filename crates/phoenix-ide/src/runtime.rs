@@ -3969,6 +3969,7 @@ impl RuntimeManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn kick_admitted_sub_agent(
         self: &Arc<Self>,
         spec: SubAgentSpec,
@@ -3985,11 +3986,23 @@ impl RuntimeManager {
                 *slot = Some(parent_turn_link);
             }
         }
-        let dispatch = self
+        let dispatch = match self
             .db
             .claim_sub_agent_initial_dispatch(&agent_id, Utc::now())
             .await
-            .map_err(|error| (agent_id.clone(), error.to_string()))?;
+        {
+            phoenix_db::SubAgentInitialDispatchAuthority::Established(dispatch) => dispatch,
+            phoenix_db::SubAgentInitialDispatchAuthority::Rejected(error) => {
+                return Err((agent_id, error));
+            }
+            phoenix_db::SubAgentInitialDispatchAuthority::Unclassified => {
+                self.signal_fatal_local_authority("sub_agent_initial_dispatch");
+                return Err((
+                    agent_id,
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: sub-agent initial dispatch commit could not be classified".to_string(),
+                ));
+            }
+        };
         if dispatch.outcome != phoenix_db::SubAgentInitialDispatchOutcome::Claimed {
             if matches!(
                 dispatch.outcome,
@@ -4084,10 +4097,11 @@ impl RuntimeManager {
                 .await;
             dispositions.push((agent_id, outcome));
         }
+        let mut runtime_deliveries = Vec::new();
         for (agent_id, outcome) in dispositions {
             match outcome {
                 Ok(phoenix_db::SubAgentCancellationOutcome::CancelledBeforeDispatch) => {
-                    let _ = dispatcher
+                    if let Err(error) = dispatcher
                         .dispatch(
                             &req.parent_conversation_id,
                             Event::SubAgentResult {
@@ -4099,24 +4113,34 @@ impl RuntimeManager {
                                 },
                             },
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(%error, parent_id = %req.parent_conversation_id, "pre-dispatch cancellation delivery deferred to durable reconciliation");
+                        let _ = dispatcher.reconcile(&req.parent_conversation_id).await;
+                    }
                 }
                 Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime) => {
-                    let _ = dispatcher
-                        .dispatch(
-                            &agent_id,
-                            Event::UserCancel {
-                                reason: None,
-                                cause: crate::state_machine::event::CancelCause::UserRequested,
-                            },
-                        )
-                        .await;
+                    let dispatcher = dispatcher.clone();
+                    runtime_deliveries.push(tokio::spawn(async move {
+                        let _ = dispatcher
+                            .dispatch(
+                                &agent_id,
+                                Event::UserCancel {
+                                    reason: None,
+                                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                                },
+                            )
+                            .await;
+                    }));
                 }
                 Ok(phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal) => {}
                 Err(error) => {
                     tracing::error!(%error, %agent_id, "failed to request sub-agent cancellation");
                 }
             }
+        }
+        for delivery in runtime_deliveries {
+            let _ = delivery.await;
         }
     }
 

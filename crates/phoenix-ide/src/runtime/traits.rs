@@ -207,6 +207,16 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
+            .await
+    }
+
     async fn sub_agent_terminal_is_accepted(
         &self,
         _child_conversation_id: &str,
@@ -1528,6 +1538,18 @@ impl MessageStore for DatabaseStorage {
             .record_sub_agent_terminal(child_conversation_id, cause, terminal_at)
             .await
             .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .terminalize_sub_agent_cancellation_backstop(child_conversation_id, cause, terminal_at)
+            .await
             .map_err(|error| error.to_string())
     }
 

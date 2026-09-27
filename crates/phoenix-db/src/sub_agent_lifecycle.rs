@@ -195,6 +195,13 @@ pub enum SubAgentInitialDispatchOutcome {
     AlreadyTerminal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubAgentInitialDispatchAuthority {
+    Established(SubAgentInitialDispatch),
+    Rejected(String),
+    Unclassified,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentCancellationOutcome {
     CancelledBeforeDispatch,
@@ -724,6 +731,73 @@ impl Database {
         &self,
         child_conversation_id: &str,
         claimed_at: DateTime<Utc>,
+    ) -> SubAgentInitialDispatchAuthority {
+        match self
+            .claim_sub_agent_initial_dispatch_inner(child_conversation_id, claimed_at)
+            .await
+        {
+            Ok(dispatch) => SubAgentInitialDispatchAuthority::Established(dispatch),
+            Err(error) => match self
+                .classify_sub_agent_initial_dispatch(child_conversation_id)
+                .await
+            {
+                Ok(Some(dispatch)) => SubAgentInitialDispatchAuthority::Established(dispatch),
+                Ok(None) => SubAgentInitialDispatchAuthority::Rejected(error.to_string()),
+                Err(classification_error) => {
+                    tracing::error!(%error, %classification_error, %child_conversation_id, "initial dispatch claim commit could not be classified");
+                    SubAgentInitialDispatchAuthority::Unclassified
+                }
+            },
+        }
+    }
+
+    async fn classify_sub_agent_initial_dispatch(
+        &self,
+        child_conversation_id: &str,
+    ) -> DbResult<Option<SubAgentInitialDispatch>> {
+        let row = sqlx::query(
+            "SELECT initial_dispatch_claimed_at_unix_micros,
+                    cancellation_requested_at_unix_micros,
+                    terminal_at_unix_micros, max_turns, timeout_millis
+             FROM sub_agent_runs WHERE child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let outcome = if row
+            .try_get::<Option<i64>, _>("terminal_at_unix_micros")?
+            .is_some()
+        {
+            SubAgentInitialDispatchOutcome::AlreadyTerminal
+        } else if row
+            .try_get::<Option<i64>, _>("initial_dispatch_claimed_at_unix_micros")?
+            .is_some()
+        {
+            SubAgentInitialDispatchOutcome::AlreadyClaimed
+        } else if row
+            .try_get::<Option<i64>, _>("cancellation_requested_at_unix_micros")?
+            .is_some()
+        {
+            SubAgentInitialDispatchOutcome::CancelledBeforeDispatch
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(SubAgentInitialDispatch {
+            outcome,
+            max_turns: u32::try_from(row.try_get::<i64, _>("max_turns")?)
+                .map_err(|_| lifecycle_conflict("invalid persisted max turns"))?,
+            timeout_millis: u64::try_from(row.try_get::<i64, _>("timeout_millis")?)
+                .map_err(|_| lifecycle_conflict("invalid persisted timeout"))?,
+        }))
+    }
+
+    async fn claim_sub_agent_initial_dispatch_inner(
+        &self,
+        child_conversation_id: &str,
+        claimed_at: DateTime<Utc>,
     ) -> DbResult<SubAgentInitialDispatch> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
@@ -900,6 +974,36 @@ impl Database {
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    pub async fn terminalize_sub_agent_cancellation_backstop(
+        &self,
+        child_conversation_id: &str,
+        cause: SubAgentTerminalCause,
+        terminal_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let state = ConvState::Failed {
+            error: "Sub-agent did not report within the cancellation deadline".to_string(),
+            error_kind: ErrorKind::Cancelled,
+        };
+        match self
+            .update_child_state_and_record_sub_agent_terminal(
+                child_conversation_id,
+                &state,
+                terminal_at,
+                cause,
+                terminal_at,
+            )
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "child cancellation-backstop terminal commit could not be classified"
+                        .to_string(),
+                ))
+            }
+        }
     }
 
     pub async fn update_child_state_and_record_sub_agent_terminal(
@@ -1575,7 +1679,9 @@ mod tests {
             barrier.wait().await;
             second.request_sub_agent_cancellation("child", at).await
         });
-        let claim = claim.await.unwrap().unwrap();
+        let SubAgentInitialDispatchAuthority::Established(claim) = claim.await.unwrap() else {
+            panic!("claim must classify");
+        };
         let cancel = cancel.await.unwrap().unwrap();
         assert!(matches!(
             (claim.outcome, cancel),
