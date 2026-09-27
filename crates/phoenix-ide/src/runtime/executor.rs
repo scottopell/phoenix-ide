@@ -1944,6 +1944,19 @@ enum FollowUpApprovalError {
     AuthorityLost(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskApprovalExecution {
+    Initial,
+    FollowUp,
+    DetachedApprovedTaskCheckpoint,
+}
+
+impl TaskApprovalExecution {
+    fn commits_state(self) -> bool {
+        matches!(self, Self::Initial | Self::FollowUp)
+    }
+}
+
 impl<S, L, T> ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -3305,6 +3318,11 @@ where
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::ApproveTask { .. }));
+        let task_approval_execution = if is_task_approval_adoption {
+            Some(self.resolve_task_approval_execution().await?)
+        } else {
+            None
+        };
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
@@ -3500,11 +3518,8 @@ where
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                 );
-                let approval_commits_state = matches!(
-                    effect,
-                    Effect::ApproveTask { .. }
-                        if self.has_existing_write_scope()
-                );
+                let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
+                    && task_approval_execution.is_some_and(TaskApprovalExecution::commits_state);
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
                     && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
@@ -3679,7 +3694,8 @@ where
                                         result
                                     }
                                     effect => {
-                                        self.execute_authoritative_effect(effect, admitted).await
+                                        self.execute_authoritative_effect(effect, admitted, None)
+                                            .await
                                     }
                                 },
                                 ClassifiedEffect::Control(_) => unreachable!(
@@ -3722,6 +3738,7 @@ where
                                     terminal_unit_admission
                                         .as_deref_mut()
                                         .expect("terminal direct-turn unit is admitted"),
+                                    None,
                                 )
                                 .await
                             }
@@ -3755,7 +3772,10 @@ where
                         }
                     }
                 } else {
-                    Box::pin(self.execute_effect(effect)).await
+                    Box::pin(
+                        self.execute_effect_with_task_approval(effect, task_approval_execution),
+                    )
+                    .await
                 };
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
@@ -5275,6 +5295,14 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
+        self.execute_effect_with_task_approval(effect, None).await
+    }
+
+    async fn execute_effect_with_task_approval(
+        &mut self,
+        effect: Effect,
+        task_approval_execution: Option<TaskApprovalExecution>,
+    ) -> Result<Option<Event>, String> {
         match ClassifiedEffect::classify(effect) {
             ClassifiedEffect::Control(effect) => self.execute_control_effect(effect).await,
             ClassifiedEffect::Authoritative(effect) => {
@@ -5285,7 +5313,7 @@ where
                     None => self.admit_authoritative_effect()?,
                 };
                 let result = self
-                    .execute_authoritative_effect(*effect, &mut admitted)
+                    .execute_authoritative_effect(*effect, &mut admitted, task_approval_execution)
                     .await;
                 if restore_retained {
                     self.handoff_completion_authority = Some(admitted);
@@ -5306,6 +5334,7 @@ where
         &mut self,
         effect: AuthoritativeEffect,
         admitted: &mut crate::runtime::AdmittedOperation,
+        task_approval_execution: Option<TaskApprovalExecution>,
     ) -> Result<Option<Event>, String> {
         #[cfg(test)]
         if matches!(
@@ -6318,8 +6347,18 @@ where
                 priority,
                 plan,
             } => {
-                self.execute_approve_task(task_file, title, priority, plan, admitted)
-                    .await?;
+                self.execute_approve_task(
+                    task_file,
+                    title,
+                    priority,
+                    plan,
+                    task_approval_execution.ok_or_else(|| {
+                        "task approval execution was not resolved before effect admission"
+                            .to_string()
+                    })?,
+                    admitted,
+                )
+                .await?;
                 Ok(None)
             }
 
@@ -6609,9 +6648,11 @@ where
                         self.state_updated_at,
                     );
                 self.publish_live_state_admitted();
-                match Box::pin(
-                    self.execute_authoritative_effect(AuthoritativeEffect::RequestLlm, admitted),
-                )
+                match Box::pin(self.execute_authoritative_effect(
+                    AuthoritativeEffect::RequestLlm,
+                    admitted,
+                    None,
+                ))
                 .await
                 {
                     Ok(event) => Ok(event),
@@ -8498,9 +8539,22 @@ where
         Ok(())
     }
 
-    fn has_existing_write_scope(&self) -> bool {
-        self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
-            && self.context.work_scope_worktree.is_some()
+    async fn resolve_task_approval_execution(&self) -> Result<TaskApprovalExecution, String> {
+        if self
+            .storage
+            .get_approved_task_objective(&self.context.conversation_id)
+            .await?
+            .is_some()
+        {
+            return Ok(TaskApprovalExecution::FollowUp);
+        }
+        if matches!(
+            self.context.mode_context.as_ref(),
+            Some(ModeContext::DetachedApprovedTask { .. })
+        ) {
+            return Ok(TaskApprovalExecution::DetachedApprovedTaskCheckpoint);
+        }
+        Ok(TaskApprovalExecution::Initial)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8681,9 +8735,10 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
-        if self.has_existing_write_scope() {
+        if execution == TaskApprovalExecution::FollowUp {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
                 .await;
@@ -8706,10 +8761,7 @@ where
                 )),
             };
         }
-        if matches!(
-            self.context.mode_context.as_ref(),
-            Some(ModeContext::DetachedApprovedTask { .. })
-        ) {
+        if execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint {
             let tasks_dir_name = self.context.tasks_dir_name.clone();
             let reviewed = reread_reviewed_task_handoff_snapshot(
                 self.context.filesystem_root(),
@@ -15695,7 +15747,7 @@ mod authoritative_user_message_effect_tests {
 
 #[cfg(test)]
 mod approved_explore_follow_up_tests {
-    use super::test_git_helpers::{add_worktree, init_repo};
+    use super::test_git_helpers::{add_explore_worktree, add_worktree, init_repo};
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::ConvContext;
@@ -15747,6 +15799,24 @@ mod approved_explore_follow_up_tests {
         )
     }
 
+    async fn seed_existing_objective(storage: &InMemoryStorage) {
+        storage
+            .persist_approved_task_authority(
+                "approved-explore-follow-up",
+                &TaskApprovalHandoffData {
+                    task_id: "72003".to_string(),
+                    task_title: "Existing task".to_string(),
+                    title: "Existing task".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: "# Existing task\n".to_string(),
+                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
+                    artifact_body: "# Existing task\n".to_string(),
+                },
+            )
+            .await
+            .expect("existing approved objective");
+    }
+
     #[test]
     fn reread_rejects_symlink_replacement() {
         use std::os::unix::fs::symlink;
@@ -15774,6 +15844,59 @@ mod approved_explore_follow_up_tests {
     }
 
     #[tokio::test]
+    async fn preallocated_work_capability_without_objective_uses_initial_approval() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = add_explore_worktree(&repo_root, "approved-explore-follow-up", "main");
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the first approved objective.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        assert_eq!(
+            runtime.resolve_task_approval_execution().await.unwrap(),
+            TaskApprovalExecution::Initial
+        );
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::Initial,
+                &mut admitted,
+            )
+            .await
+            .expect("initial approval");
+
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            "task-72004-follow-up"
+        );
+        assert!(!worktree.join(task_file).exists());
+        assert!(worktree
+            .join("tasks/72004-p1-in-progress--follow-up.md")
+            .exists());
+        assert_eq!(storage.recorded_messages().len(), 1);
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        let objective = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("initial objective");
+        assert_eq!(objective.task_id, "72004");
+        assert_eq!(objective.task_file, task_file);
+    }
+
+    #[tokio::test]
     async fn follow_up_validation_failure_restores_approval_state() {
         let (_tmp, repo_root) = init_repo();
         let worktree = PathBuf::from(add_worktree(
@@ -15786,6 +15909,7 @@ mod approved_explore_follow_up_tests {
         let reviewed_plan = "# Follow up\n\nReviewed.\n";
         std::fs::write(worktree.join(task_file), "# Follow up\n\nEdited.\n").unwrap();
         let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut runtime =
             approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
@@ -15799,6 +15923,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 reviewed_plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await
@@ -15824,6 +15949,7 @@ mod approved_explore_follow_up_tests {
         let plan = "# Follow up\n\nImplement the next bounded change.\n";
         std::fs::write(worktree.join(task_file), plan).unwrap();
         let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
         storage.set_fail_approval_authority_persistence(true);
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut runtime =
@@ -15837,6 +15963,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await
@@ -15862,6 +15989,7 @@ mod approved_explore_follow_up_tests {
         let plan = "# Follow up\n\nImplement the next bounded change.\n";
         std::fs::write(worktree.join(task_file), plan).unwrap();
         let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
         storage.set_approval_authority_unclassified(true);
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut runtime =
@@ -15876,6 +16004,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await
@@ -15907,21 +16036,7 @@ mod approved_explore_follow_up_tests {
         run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
 
         let storage = Arc::new(InMemoryStorage::new());
-        storage
-            .persist_approved_task_authority(
-                "approved-explore-follow-up",
-                &TaskApprovalHandoffData {
-                    task_id: "72003".to_string(),
-                    task_title: "Existing task".to_string(),
-                    title: "Existing task".to_string(),
-                    priority: crate::task_source::Priority::P1,
-                    plan: "# Existing task\n".to_string(),
-                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
-                    artifact_body: "# Existing task\n".to_string(),
-                },
-            )
-            .await
-            .expect("existing approved objective");
+        seed_existing_objective(&storage).await;
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
         let mut runtime = approved_explore_runtime(
@@ -15941,6 +16056,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await

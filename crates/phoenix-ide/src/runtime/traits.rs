@@ -458,6 +458,11 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<crate::db::LocalAuthorityResult<()>, String>;
 
+    async fn get_approved_task_objective(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>, String>;
+
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
     /// `ModeKind` discriminant, not the concrete paths).
@@ -1034,6 +1039,13 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 state_updated_at,
             )
             .await
+    }
+
+    async fn get_approved_task_objective(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>, String> {
+        (**self).get_approved_task_objective(conv_id).await
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String> {
@@ -2016,6 +2028,16 @@ impl StateStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn get_approved_task_objective(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>, String> {
+        self.db
+            .get_approved_task_objective(conv_id)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String> {

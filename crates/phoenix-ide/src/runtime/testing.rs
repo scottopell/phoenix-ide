@@ -2098,6 +2098,13 @@ impl StateStore for InMemoryStorage {
         }
     }
 
+    async fn get_approved_task_objective(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>, String> {
+        Ok(self.approved_task_authority(conv_id))
+    }
+
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
         Ok(self
             .modes
