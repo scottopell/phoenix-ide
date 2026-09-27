@@ -208,6 +208,7 @@ pub struct SubAgentCancelRequest {
     pub ids: Vec<String>,
     #[allow(dead_code)]
     pub parent_conversation_id: String,
+    pub cause: crate::state_machine::event::CancelCause,
 }
 
 /// Why a runtime was evicted. Passed to `evict_runtime` so the next
@@ -4139,15 +4140,18 @@ impl RuntimeManager {
                 Ok(phoenix_db::SubAgentCancellationOutcome::DeliverToRuntime) => {
                     let dispatcher = dispatcher.clone();
                     runtime_deliveries.push(tokio::spawn(async move {
-                        let _ = dispatcher
+                        if let Err(error) = dispatcher
                             .dispatch(
                                 &agent_id,
                                 Event::UserCancel {
                                     reason: None,
-                                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                                    cause: req.cause,
                                 },
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(%error, %agent_id, "child cancellation delivery deferred to durable terminal backstop");
+                        }
                     }));
                 }
                 Ok(phoenix_db::SubAgentCancellationOutcome::AlreadyTerminal) => {}

@@ -1134,7 +1134,7 @@ fn handle_core_cancellation(
                 cause,
                 spawn_tool_id: spawn_tool_id.clone(),
             })
-            .with_effect(Effect::CancelSubAgents { ids })
+            .with_effect(Effect::CancelSubAgents { ids, cause })
             .with_effect(Effect::PersistState))
         }
 
@@ -1167,7 +1167,7 @@ fn handle_core_cancellation(
                     .iter()
                     .map(|p| p.agent_id.clone())
                     .collect();
-                result = result.with_effect(Effect::CancelSubAgents { ids });
+                result = result.with_effect(Effect::CancelSubAgents { ids, cause });
             }
 
             Ok(result)
@@ -7607,7 +7607,7 @@ mod teardown_tests {
             .effects
             .iter()
             .find_map(|e| {
-                if let Effect::CancelSubAgents { ids } = e {
+                if let Effect::CancelSubAgents { ids, .. } = e {
                     Some(ids.clone())
                 } else {
                     None

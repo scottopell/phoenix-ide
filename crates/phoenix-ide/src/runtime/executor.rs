@@ -148,12 +148,21 @@ enum AuthoritativeEffect {
 }
 
 enum ControlEffect {
-    AbortTool { tool_use_id: String },
-    CancelSubAgents { ids: Vec<String> },
-    NotifyParent { outcome: SubAgentOutcome },
+    AbortTool {
+        tool_use_id: String,
+    },
+    CancelSubAgents {
+        ids: Vec<String>,
+        cause: crate::state_machine::event::CancelCause,
+    },
+    NotifyParent {
+        outcome: SubAgentOutcome,
+    },
     NotifyStateChange,
     NotifyAgentDone,
-    NotifyContextExhausted { summary: String },
+    NotifyContextExhausted {
+        summary: String,
+    },
 }
 
 enum ClassifiedEffect {
@@ -173,8 +182,8 @@ impl ClassifiedEffect {
             Effect::AbortTool { tool_use_id } => {
                 Self::Control(ControlEffect::AbortTool { tool_use_id })
             }
-            Effect::CancelSubAgents { ids } => {
-                Self::Control(ControlEffect::CancelSubAgents { ids })
+            Effect::CancelSubAgents { ids, cause } => {
+                Self::Control(ControlEffect::CancelSubAgents { ids, cause })
             }
             Effect::NotifyParent { outcome } => {
                 Self::Control(ControlEffect::NotifyParent { outcome })
@@ -6694,12 +6703,13 @@ where
                 }
                 Ok(None)
             }
-            ControlEffect::CancelSubAgents { ids } => {
+            ControlEffect::CancelSubAgents { ids, cause } => {
                 tracing::info!(?ids, "Cancelling sub-agents");
                 if let Some(cancel_tx) = &self.cancel_tx {
                     let request = SubAgentCancelRequest {
                         ids,
                         parent_conversation_id: self.context.conversation_id.clone(),
+                        cause,
                     };
                     if let Err(error) = cancel_tx.send(request).await {
                         tracing::error!(%error, "Failed to send cancel request");
