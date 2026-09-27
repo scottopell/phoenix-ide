@@ -16065,7 +16065,8 @@ mod tests {
                     (100, 'temporarily_skip_automatic_continuation_admission'),
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
         )
         .execute(&pool)
         .await
@@ -16961,7 +16962,8 @@ mod tests {
                     (100, 'temporarily_skip_automatic_continuation_admission'),
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase')",
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
         )
         .execute(pool)
         .await
