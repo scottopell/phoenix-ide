@@ -146,6 +146,13 @@ AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or c
 AND SHALL NOT infer a default repository or cwd
 AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
+WHEN the singleton Global Coordinator publishes a static SVG
+THE SYSTEM MAY provide the existing `present_svg` capability with one required active WorkScope target
+AND SHALL re-resolve that WorkScope through the same active persisted authority used by Coordinator Bash
+AND SHALL restrict the source read to a contained regular file beneath the resolved root without following symlinks
+AND SHALL own the durable artifact and invocation by the executing Coordinator transcript rather than the selected WorkScope or its conversation
+AND SHALL NOT thereby grant generic filesystem authority or any unrelated write capability.
+
 THE SYSTEM MAY provide exactly one dedicated cross-conversation mutation tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
