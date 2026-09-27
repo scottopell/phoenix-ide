@@ -10746,12 +10746,18 @@ impl Database {
 
         let mut outcomes = HashMap::new();
         for agent in pending {
-            let row: Option<String> =
-                sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
-                    .bind(&agent.agent_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            let Some(state_json) = row else { continue };
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT c.state, r.terminal_cause
+                 FROM conversations c
+                 LEFT JOIN sub_agent_runs r ON r.child_conversation_id = c.id
+                 WHERE c.id = ?1",
+            )
+            .bind(&agent.agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((state_json, terminal_cause)) = row else {
+                continue;
+            };
             let state = serde_json::from_str::<ConvState>(&state_json).map_err(|error| {
                 DbError::Serialization(format!(
                     "decode pending sub-agent {} state: {error}",
@@ -10763,12 +10769,19 @@ impl Database {
             // uses the interrupted fallback. `if let` chain rather than a match
             // with a wildcard arm (denied by `wildcard_enum_match_arm`).
             if let ConvState::Completed { result } = state {
-                outcomes.insert(agent.agent_id.clone(), SubAgentOutcome::Success { result });
+                let outcome = if terminal_cause.as_deref() == Some("implicit_completion") {
+                    SubAgentOutcome::ImplicitCompletion { result }
+                } else {
+                    SubAgentOutcome::Success { result }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             } else if let ConvState::Failed { error, error_kind } = state {
-                outcomes.insert(
-                    agent.agent_id.clone(),
-                    SubAgentOutcome::Failure { error, error_kind },
-                );
+                let outcome = if terminal_cause.as_deref() == Some("timed_out") {
+                    SubAgentOutcome::TimedOut
+                } else {
+                    SubAgentOutcome::Failure { error, error_kind }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             }
         }
         Ok(outcomes)
