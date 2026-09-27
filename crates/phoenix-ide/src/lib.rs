@@ -726,6 +726,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let db = open_database_with_migrations(&runtime_env).await?;
     db.clear_direct_turn_retirements().await?;
     let terminal_obligated_conversations = db.terminal_obligated_conversation_ids().await?;
+    db.abandon_all_unactivated_sub_agent_batches(chrono::Utc::now())
+        .await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;

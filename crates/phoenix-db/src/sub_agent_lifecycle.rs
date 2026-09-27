@@ -637,6 +637,30 @@ impl Database {
         Ok((tx, SubAgentBatchAdmissionOutcome::Admitted))
     }
 
+    pub async fn abandon_all_unactivated_sub_agent_batches(
+        &self,
+        abandoned_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let batch_ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT r.batch_id
+             FROM sub_agent_runs r
+             WHERE r.initial_dispatch_claimed_at_unix_micros IS NULL
+               AND r.terminal_at_unix_micros IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM sub_agent_runs claimed
+                   WHERE claimed.batch_id = r.batch_id
+                     AND claimed.initial_dispatch_claimed_at_unix_micros IS NOT NULL
+               )",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for batch_id in batch_ids {
+            self.abandon_unactivated_sub_agent_batch(&batch_id, abandoned_at)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn abandon_unactivated_sub_agent_batch(
         &self,
         batch_id: &str,
@@ -689,7 +713,25 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
-        tx.commit().await?;
+        if let Err(error) = tx.commit().await {
+            let remaining = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sub_agent_runs
+                 WHERE batch_id = ?1
+                   AND initial_dispatch_claimed_at_unix_micros IS NULL
+                   AND (terminal_at_unix_micros IS NULL
+                        OR parent_accepted_at_unix_micros IS NULL)",
+            )
+            .bind(batch_id)
+            .fetch_one(&self.pool)
+            .await;
+            return match remaining {
+                Ok(0) => Ok(()),
+                Ok(_) => Err(error.into()),
+                Err(_) => Err(DbError::Serialization(
+                    "unactivated batch cleanup commit could not be classified".to_string(),
+                )),
+            };
+        }
         Ok(())
     }
 
