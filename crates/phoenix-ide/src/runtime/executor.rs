@@ -3030,27 +3030,13 @@ where
 
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
 
-        // Apply transition result and process any generated events
-        let mut events_to_process = self.apply_transition_result(result).await?;
-
-        // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
-        while let Some(event) = events_to_process.pop() {
-            let settles_handoff = matches!(event, Event::TaskHandoffComplete { .. });
-            let chained_result = match transition(&self.state, &self.context, event) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Chained event from outcome rejected");
-                    continue;
-                }
-            };
-            let generated = self.apply_transition_result(chained_result).await?;
-            if settles_handoff {
-                self.handoff_completion_authority = None;
-                self.handoff_completion_timestamp = None;
-            }
-            events_to_process.extend(generated);
+        let generated_events = self.apply_transition_result(result).await?;
+        for event in generated_events.into_iter().rev() {
+            self.event_tx
+                .send(event)
+                .await
+                .map_err(|error| error.to_string())?;
         }
-
         Ok(())
     }
 
@@ -3342,8 +3328,28 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            self.pending_sub_agent_acceptance = accepted_sub_agent;
-            let generated = self.apply_transition_result(result).await?;
+            self.pending_sub_agent_acceptance
+                .clone_from(&accepted_sub_agent);
+            let generated = match self.apply_transition_result(result).await {
+                Ok(generated) => generated,
+                Err(error) => {
+                    if accepted_sub_agent.is_some() {
+                        self.sub_agent_result_buffer.push(terminal_event.clone());
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            let _ = event_tx.send(Event::RetryBufferedSubAgentResults).await;
+                        });
+                    } else if matches!(terminal_event, Event::PersistedSubAgentBootstrap) {
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            let _ = event_tx.send(Event::PersistedSubAgentBootstrap).await;
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             if settles_handoff {
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
@@ -18629,6 +18635,47 @@ mod steer_drain_detector_tests {
         assert!(result.is_err());
         assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
         assert!(storage.get_all_messages("conv-missing-fan-in").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_sub_agent_acceptance_requeues_exact_result_in_both_fan_in_states() {
+        for initial_state in [
+            mk_awaiting_with_pending("child"),
+            ConvState::CancellingSubAgents {
+                pending: vec![PendingSubAgent {
+                    agent_id: "child".to_string(),
+                    task: "task child".to_string(),
+                    mode: SubAgentMode::Work,
+                }],
+                completed_results: vec![],
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+                spawn_tool_id: None,
+            },
+        ] {
+            let (mut rt, storage) =
+                build_runtime_with_state_and_queue("accept-retry", initial_state, vec![]);
+            storage.fail_sub_agent_acceptance_once();
+            let event = Event::SubAgentResult {
+                agent_id: "child".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "exact".to_string(),
+                },
+            };
+
+            assert!(rt.process_event(event.clone()).await.is_err());
+            assert_eq!(storage.sub_agent_acceptance_count(), 0);
+            assert!(matches!(
+                rt.sub_agent_result_buffer.as_slice(),
+                [Event::SubAgentResult { agent_id, outcome: SubAgentOutcome::Success { result } }]
+                    if agent_id == "child" && result == "exact"
+            ));
+
+            let redelivered = rt.sub_agent_result_buffer.pop().unwrap();
+            rt.process_event(redelivered.clone()).await.unwrap();
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+            rt.process_event(redelivered).await.unwrap();
+            assert_eq!(storage.sub_agent_acceptance_count(), 1);
+        }
     }
 
     #[tokio::test]

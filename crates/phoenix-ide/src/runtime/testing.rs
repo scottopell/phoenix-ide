@@ -619,6 +619,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -686,6 +687,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -723,6 +725,14 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn fail_sub_agent_acceptance_once(&self) {
+        *self.fail_sub_agent_acceptance_once.lock().unwrap() = true;
+    }
+
+    pub fn sub_agent_acceptance_count(&self) -> usize {
+        self.sub_agent_acceptances.lock().unwrap().len()
     }
 
     pub fn set_fail_message_add(&self, fail: bool) {
@@ -1937,6 +1947,9 @@ impl StateStore for InMemoryStorage {
         child_conversation_id: &str,
         accepted_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_sub_agent_acceptance_once.lock().unwrap()) {
+            return Err("injected sub-agent acceptance failure".to_string());
+        }
         self.update_state(conv_id, state, state_updated_at).await?;
         self.sub_agent_acceptances.lock().unwrap().insert(
             child_conversation_id.to_string(),
