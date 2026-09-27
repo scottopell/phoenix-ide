@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 workflow = Path('.github/workflows/release.yml').read_text()
@@ -78,12 +80,13 @@ if not build_macos_job.startswith('    environment: macos-release-signing\n'):
     raise SystemExit('macOS signing must use the protected macos-release-signing environment')
 if not publish_job.startswith('    needs: [gate, build-linux, build-macos]\n    environment: macos-release-signing\n'):
     raise SystemExit('release publication must use the protected macos-release-signing environment')
-if 'concurrency:\n      group: publish-release-assets\n      cancel-in-progress: false' not in publish_job:
-    raise SystemExit('release publication must be serialized across tags')
-if 'publish-release-assets-${{ needs.gate.outputs.tag }}' in publish_job:
-    raise SystemExit('tag-specific publication concurrency permits stable latest races')
-if 'concurrency:\n      group: release-tag-gate\n      cancel-in-progress: false' not in workflow.split('\n  build-linux:', 1)[0]:
-    raise SystemExit('release tag validation and creation must be serialized')
+workflow_header = workflow.split('\njobs:\n', 1)[0]
+if 'concurrency:\n  group: release-main\n  cancel-in-progress: false' not in workflow_header:
+    raise SystemExit('the whole release workflow must use one non-cancelling sole-writer group')
+if workflow.count('concurrency:') != 1:
+    raise SystemExit('job-local concurrency can break whole-workflow tag/publication serialization')
+if 'Wait for earlier release workflows' in workflow or 'actions/workflows/release.yml/runs' in workflow:
+    raise SystemExit('release serialization must not claim an application-managed lossless queue')
 if 'ref: ${{ needs.gate.outputs.commit }}' not in build_macos_job:
     raise SystemExit('macOS artifacts must be built from the immutable tagged commit')
 if 'ref: ${{ github.sha }}' not in publish_job:
@@ -101,6 +104,25 @@ expected_secrets = {
 }
 if secret_names != expected_secrets:
     raise SystemExit(f'release workflow secret allowlist mismatch: {sorted(secret_names)}')
+
+version_helper = Path('scripts/release_version.py')
+stale_retry = subprocess.run(
+    [sys.executable, str(version_helper), 'validate-new-from-tags', '0.13.1'],
+    input='v0.13.2\n',
+    capture_output=True,
+    text=True,
+)
+if stale_retry.returncode == 0 or 'must be newer than released version 0.13.2' not in stale_retry.stderr:
+    raise SystemExit('a canceled older release must refuse retry after a newer version exists')
+still_valid = subprocess.run(
+    [sys.executable, str(version_helper), 'validate-new-from-tags', '0.13.3'],
+    input='v0.13.2\n',
+    check=True,
+    capture_output=True,
+    text=True,
+)
+if still_valid.stdout != '0.13.3\n':
+    raise SystemExit('a still-valid canceled release must remain explicitly retryable')
 
 version_check = workflow.index('VERSION=$(python3 scripts/release_version.py validate "$VERSION")')
 tag_creation = workflow.index('git tag -a "$TAG"', version_check)

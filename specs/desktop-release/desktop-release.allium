@@ -150,8 +150,11 @@ surface DesktopReleaseWorkflow {
 --   complete authoritative stable or RC release identity.
 -- tag_absent(gate) -> Boolean
 --   no tag derived from gate.identity.version exists.
--- tag_gate_is_serialized(gate) -> Boolean
---   validation against existing supported tags and tag creation hold one sole-writer gate.
+-- no_other_release_workflow_is_mutating(gate) -> Boolean
+--   the workflow-level sole-writer group prevents concurrent tag or publication mutation.
+-- pending_replacement_is_visible_for_manual_retry(gate) -> Boolean
+--   a GitHub-replaced pending run remains visible as canceled in Actions history
+--   and can be retried explicitly after the active release workflow completes.
 -- version_follows_existing_supported_tags(identity) -> Boolean
 --   identity.version is newer than every existing supported release tag.
 -- tag_exists_at_different_commit(gate) -> Boolean
@@ -189,8 +192,8 @@ surface DesktopReleaseWorkflow {
 --   stable publication metadata is prerelease=false and make_latest=true unless a
 --   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
--- publication_is_serialized(publication) -> Boolean
---   publication verification and mutation hold one sole-writer gate across tags.
+-- publication_has_workflow_sole_writer(publication) -> Boolean
+--   no other release workflow can concurrently create a tag or mutate publication.
 -- public_release_differs(publication) -> Boolean
 --   a public release exists but is not the exact required release.
 -- release_absent_for_identity(identity) -> Boolean
@@ -205,7 +208,8 @@ rule GateCreatesOnlyRepresentableReleaseTag {
     requires: valid_release_identity(gate.identity)
     requires: bundle_version_representable(gate.identity)
     requires: tag_absent(gate)
-    requires: tag_gate_is_serialized(gate)
+    requires: no_other_release_workflow_is_mutating(gate)
+    requires: pending_replacement_is_visible_for_manual_retry(gate)
     requires: version_follows_existing_supported_tags(gate.identity)
     ensures: gate.state = new_tag_created
     ensures: tag_points_at_exact_commit(gate)
@@ -324,7 +328,7 @@ rule VerifiedInaccessiblePublicationBecomesPublic {
     requires: exact_inaccessible_assets_and_digests(publication)
     requires: required_architecture_pairs_validated(publication)
     requires: publication_channel_is_exact(publication)
-    requires: publication_is_serialized(publication)
+    requires: publication_has_workflow_sole_writer(publication)
     ensures: publication.state = public
     ensures: publication.failure_domain = none
 }

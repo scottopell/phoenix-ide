@@ -66,6 +66,8 @@ For an explicitly authorized RC, substitute the exact `vX.Y.Z-rc.N` tag and `rc`
 
 If the build fails, do not retry blindly. Open the run and fix the underlying issue. A manual dispatch may retry only when the existing version tag still points at that exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
 
+The workflow uses one non-cancelling concurrency group across tag creation, builds, and publication. GitHub keeps at most one pending run in a concurrency group, so a third overlapping request can visibly cancel and replace the older pending run. This is not a lossless queue. After the active release finishes, inspect Actions history and explicitly rerun any canceled release workflow; exact-tag and private-draft retries are designed to converge without moving tags or mutating a differing public release.
+
 ## Step 4 — Draft polished release notes via sub-agent
 
 The auto-generated notes are a commit dump. For any release with >20 commits, swap in a sub-agent-drafted writeup.

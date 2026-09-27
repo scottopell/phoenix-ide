@@ -95,11 +95,14 @@ THEN THE SYSTEM SHALL fail without rewriting public metadata or mutating public 
 
 Stable promotion SHALL use a new stable version and the normal version-bump release flow; the system SHALL NOT relabel release-candidate bytes as stable or move an existing tag.
 
-WHEN creating a new release tag,
-THE SYSTEM SHALL serialize tag-gate operations and require its supported version to follow every existing supported release tag.
+WHEN a release workflow is running,
+THE SYSTEM SHALL prevent another release workflow from concurrently creating a tag or mutating release publication.
 
-WHEN publishing a release draft,
-THE SYSTEM SHALL serialize publication across release tags.
+IF GitHub replaces a pending workflow because another release request enters the same concurrency group,
+THEN THE SYSTEM SHALL expose that canceled run in Actions history and an operator SHALL retry it explicitly after the active workflow completes.
+
+WHEN creating a new release tag,
+THE SYSTEM SHALL require its supported version to follow every existing supported release tag.
 
 WHEN publishing a stable draft,
 THE SYSTEM SHALL refuse to make it latest if a newer stable release is already latest.
