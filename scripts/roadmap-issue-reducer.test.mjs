@@ -267,6 +267,17 @@ test("optional outcomes do not block and requirement changes need a decision", (
   assert.doesNotMatch(milestoneSection, /Parity design approved/);
   assert.match(milestoneSection, /d-tf-scope/);
 
+  const superseding = reduce([
+    outcome(),
+    outcome({ id: "native-auto-continue", title: "Native auto-continue controls" }),
+    milestone,
+    { kind: "decision", actor: COORDINATOR, id: "d-hold", statement: "Hold for setup", scope: ["ios-core-journeys"] },
+    { kind: "decision", actor: COORDINATOR, id: "d-hold-cleared", statement: "Setup complete", scope: ["ios-core-journeys"], supersedes: ["d-hold"] },
+  ]);
+  const decisionsLine = renderRoadmap(superseding, { now: NOW }).split("\n").find((text) => text.startsWith("Decisions:"));
+  assert.match(decisionsLine, /d-hold-cleared/);
+  assert.doesNotMatch(decisionsLine, /Hold for setup/);
+
   const changed = reduce([
     outcome(),
     outcome({ id: "native-auto-continue", title: "Native auto-continue controls" }),

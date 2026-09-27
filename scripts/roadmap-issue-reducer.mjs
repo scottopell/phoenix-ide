@@ -677,8 +677,9 @@ function renderMilestone(state, milestone, pulls, now) {
     const optional = milestone.optional.map((outcomeId) => markdownText(state.outcomes.get(outcomeId).title)).join(", ");
     lines.push("", `Optional, not blocking: ${optional}`);
   }
+  const related = new Set([milestone.id, ...wantedByOutcome.keys(), ...milestone.optional]);
   const decisions = [...state.decisions.values()].filter(
-    (decision) => decision.supersededBy.length === 0 && decision.scope.includes(milestone.id),
+    (decision) => decision.supersededBy.length === 0 && decision.scope.some((scopeId) => related.has(scopeId)),
   );
   if (decisions.length) {
     lines.push("", `Decisions: ${decisions.map((decision) => `${link(decision.id, decision.source.url)} ${markdownText(decision.statement)}`).join(" · ")}`);
