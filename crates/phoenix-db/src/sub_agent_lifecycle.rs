@@ -154,6 +154,39 @@ impl SubAgentAdmissionCommit {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SubAgentAcceptanceCommit {
+    Normal,
+    #[cfg(test)]
+    CommittedError,
+    #[cfg(test)]
+    RolledBackError,
+    #[cfg(test)]
+    CommittedLookupUnavailable,
+}
+
+impl SubAgentAcceptanceCommit {
+    async fn execute(self, transaction: Transaction<'_, Sqlite>) -> DbResult<()> {
+        match self {
+            Self::Normal => transaction.commit().await.map_err(Into::into),
+            #[cfg(test)]
+            Self::CommittedError | Self::CommittedLookupUnavailable => {
+                transaction.commit().await?;
+                Err(DbError::Serialization(
+                    "injected sub-agent acceptance commit acknowledgement failure".into(),
+                ))
+            }
+            #[cfg(test)]
+            Self::RolledBackError => {
+                transaction.rollback().await?;
+                Err(DbError::Serialization(
+                    "injected sub-agent acceptance commit failure".into(),
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentInitialDispatchOutcome {
     Claimed,
@@ -653,6 +686,22 @@ impl Database {
         Ok(())
     }
 
+    pub async fn sub_agent_parent_conversation_id(
+        &self,
+        child_conversation_id: &str,
+    ) -> DbResult<String> {
+        sqlx::query_scalar(
+            "SELECT b.parent_conversation_id
+             FROM sub_agent_runs r
+             JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+             WHERE r.child_conversation_id = ?1",
+        )
+        .bind(child_conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn sub_agent_dispatch_config(
         &self,
         child_conversation_id: &str,
@@ -860,7 +909,69 @@ impl Database {
         state_updated_at: DateTime<Utc>,
         child_conversation_id: &str,
         accepted_at: DateTime<Utc>,
-    ) -> DbResult<SubAgentParentAcceptanceOutcome> {
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<SubAgentParentAcceptanceOutcome>> {
+        self.update_parent_state_and_accept_sub_agent_with_commit(
+            parent_conversation_id,
+            state,
+            state_updated_at,
+            child_conversation_id,
+            accepted_at,
+            SubAgentAcceptanceCommit::Normal,
+        )
+        .await
+    }
+
+    async fn update_parent_state_and_accept_sub_agent_with_commit(
+        &self,
+        parent_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+        commit: SubAgentAcceptanceCommit,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<SubAgentParentAcceptanceOutcome>> {
+        use crate::workflow::LocalAuthorityResult;
+        let prepared = self
+            .prepare_parent_state_and_sub_agent_acceptance(
+                parent_conversation_id,
+                state,
+                state_updated_at,
+                child_conversation_id,
+                accepted_at,
+            )
+            .await;
+        let (tx, outcome) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        match commit.execute(tx).await {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(outcome)),
+            Err(error) => match self
+                .classify_parent_state_and_sub_agent_acceptance(
+                    parent_conversation_id,
+                    state,
+                    state_updated_at,
+                    child_conversation_id,
+                    accepted_at,
+                    commit,
+                )
+                .await
+            {
+                Ok(true) => LocalAuthorityResult::DurableFactEstablished(Ok(outcome)),
+                Ok(false) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    async fn prepare_parent_state_and_sub_agent_acceptance<'a>(
+        &'a self,
+        parent_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> DbResult<(Transaction<'a, Sqlite>, SubAgentParentAcceptanceOutcome)> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -912,8 +1023,48 @@ impl Database {
                 )));
             }
         };
-        tx.commit().await?;
-        Ok(outcome)
+        Ok((tx, outcome))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_parent_state_and_sub_agent_acceptance(
+        &self,
+        parent_conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        child_conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+        commit: SubAgentAcceptanceCommit,
+    ) -> DbResult<bool> {
+        let _ = commit;
+        #[cfg(test)]
+        if matches!(commit, SubAgentAcceptanceCommit::CommittedLookupUnavailable) {
+            return Err(DbError::Serialization(
+                "injected sub-agent acceptance classification failure".into(),
+            ));
+        }
+        let expected_state = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let row = sqlx::query(
+            "SELECT c.state, c.state_updated_at, r.parent_accepted_at_unix_micros
+             FROM conversations c
+             JOIN sub_agent_runs r ON r.child_conversation_id = ?2
+             WHERE c.id = ?1",
+        )
+        .bind(parent_conversation_id)
+        .bind(child_conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some_and(|row| {
+            row.try_get::<String, _>("state").ok().as_deref() == Some(expected_state.as_str())
+                && row.try_get::<String, _>("state_updated_at").ok().as_deref()
+                    == Some(state_updated_at.to_rfc3339().as_str())
+                && row
+                    .try_get::<Option<i64>, _>("parent_accepted_at_unix_micros")
+                    .ok()
+                    .flatten()
+                    == Some(accepted_at.timestamp_micros())
+        }))
     }
 
     pub async fn sub_agent_lifecycle_exists(&self, child_conversation_id: &str) -> DbResult<bool> {
@@ -1147,6 +1298,60 @@ mod tests {
                     assert!(db.sub_agent_lifecycle_exists("child").await.unwrap());
                 }
                 SubAgentAdmissionCommit::Normal => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_acceptance_classifies_commit_acknowledgement_failure() {
+        for commit in [
+            SubAgentAcceptanceCommit::CommittedError,
+            SubAgentAcceptanceCommit::RolledBackError,
+            SubAgentAcceptanceCommit::CommittedLookupUnavailable,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let parent_scope = atomic_parent(&db).await;
+            let admission = atomic_batch("batch", parent_scope);
+            db.admit_sub_agent_batch_atomically(&admission)
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let terminal_at = Utc::now();
+            db.record_sub_agent_terminal(
+                "child",
+                SubAgentTerminalCause::RuntimeFailure,
+                terminal_at,
+            )
+            .await
+            .unwrap();
+            let state = ConvState::Idle;
+            let state_at = Utc::now();
+            let accepted_at = Utc::now();
+            let result = db
+                .update_parent_state_and_accept_sub_agent_with_commit(
+                    "parent",
+                    &state,
+                    state_at,
+                    "child",
+                    accepted_at,
+                    commit,
+                )
+                .await;
+            match commit {
+                SubAgentAcceptanceCommit::CommittedError => assert!(
+                    result.established().unwrap().is_ok(),
+                    "lost acknowledgement is classified as committed"
+                ),
+                SubAgentAcceptanceCommit::RolledBackError => assert!(
+                    result.established().unwrap().is_err(),
+                    "rolled back acceptance remains uncommitted"
+                ),
+                SubAgentAcceptanceCommit::CommittedLookupUnavailable => assert!(matches!(
+                    result,
+                    crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                )),
+                SubAgentAcceptanceCommit::Normal => unreachable!(),
             }
         }
     }

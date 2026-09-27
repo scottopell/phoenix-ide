@@ -7289,7 +7289,7 @@ where
                 &self.agent_config,
                 self.llm_registry.available_execution_routes(),
             );
-            tool.input_schema = catalog.schema(
+            *tool = catalog.tool_definition(
                 &self.context.model_id,
                 self.llm_registry.is_builtin_model(&self.context.model_id),
             );

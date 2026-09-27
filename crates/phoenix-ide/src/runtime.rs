@@ -218,6 +218,8 @@ pub enum EvictionReason {
     SteeringReconciliation,
     /// Durable recovery replaced an in-memory state with its exact DB projection.
     RecoveryReconciliation,
+    /// Sub-agent admission resolved terminal before initial dispatch.
+    SubAgentTerminalBeforeDispatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3827,34 +3829,45 @@ impl RuntimeManager {
             response_tx,
             activation_rx,
         } = req;
-        let result = self
-            .admit_and_kick_sub_agent_batch(
-                batch_id,
-                specs,
-                parent_conversation_id,
+        match self
+            .admit_sub_agent_batch(
+                &batch_id,
+                &specs,
+                &parent_conversation_id,
                 parent_scope,
                 parallel_work_qualified,
-                parent_turn_link,
-                activation_rx,
             )
-            .await;
-        let _ = response_tx.send(result);
+            .await
+        {
+            Ok(()) => {
+                if response_tx.send(Ok(())).is_err() {
+                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
+                    return;
+                }
+                if activation_rx.await.is_err() {
+                    self.abandon_unactivated_sub_agent_batch(&batch_id).await;
+                    return;
+                }
+                self.kick_admitted_sub_agent_batch(specs, parent_turn_link);
+            }
+            Err(error) => {
+                let _ = response_tx.send(Err(error));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn admit_and_kick_sub_agent_batch(
+    async fn admit_sub_agent_batch(
         self: &Arc<Self>,
-        batch_id: String,
-        specs: Vec<SubAgentSpec>,
-        parent_conversation_id: String,
+        batch_id: &str,
+        specs: &[SubAgentSpec],
+        parent_conversation_id: &str,
         parent_scope: Option<WorkScopeId>,
         parallel_work_qualified: bool,
-        parent_turn_link: opentelemetry::trace::SpanContext,
-        activation_rx: oneshot::Receiver<()>,
     ) -> Result<(), String> {
         let parent = self
             .db
-            .get_conversation(&parent_conversation_id)
+            .get_conversation(parent_conversation_id)
             .await
             .map_err(|error| format!("Failed to load sub-agent parent: {error}"))?;
         if parent.attached_work_scope_id != parent_scope {
@@ -3899,8 +3912,8 @@ impl RuntimeManager {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let admission = phoenix_db::AtomicSubAgentBatchAdmission {
-            batch_id: batch_id.clone(),
-            parent_conversation_id: parent_conversation_id.clone(),
+            batch_id: batch_id.to_string(),
+            parent_conversation_id: parent_conversation_id.to_string(),
             parent_scope,
             parallel_work_qualified,
             children,
@@ -3914,16 +3927,24 @@ impl RuntimeManager {
             }
         }
 
-        if activation_rx.await.is_err() {
-            self.db
-                .abandon_unactivated_sub_agent_batch(&batch_id, Utc::now())
-                .await
-                .map_err(|error| {
-                    format!("failed to terminalize unactivated sub-agent batch: {error}")
-                })?;
-            return Ok(());
-        }
+        Ok(())
+    }
 
+    async fn abandon_unactivated_sub_agent_batch(&self, batch_id: &str) {
+        if let Err(error) = self
+            .db
+            .abandon_unactivated_sub_agent_batch(batch_id, Utc::now())
+            .await
+        {
+            tracing::error!(%batch_id, %error, "failed to terminalize unactivated sub-agent batch");
+        }
+    }
+
+    fn kick_admitted_sub_agent_batch(
+        self: &Arc<Self>,
+        specs: Vec<SubAgentSpec>,
+        parent_turn_link: opentelemetry::trace::SpanContext,
+    ) {
         for (spec, turn_link) in specs.into_iter().zip(std::iter::repeat(parent_turn_link)) {
             let manager = Arc::clone(self);
             tokio::spawn(async move {
@@ -3932,7 +3953,6 @@ impl RuntimeManager {
                 }
             });
         }
-        Ok(())
     }
 
     async fn kick_admitted_sub_agent(
@@ -3957,6 +3977,15 @@ impl RuntimeManager {
             .await
             .map_err(|error| (agent_id.clone(), error.to_string()))?;
         if dispatch.outcome != phoenix_db::SubAgentInitialDispatchOutcome::Claimed {
+            if matches!(
+                dispatch.outcome,
+                phoenix_db::SubAgentInitialDispatchOutcome::CancelledBeforeDispatch
+                    | phoenix_db::SubAgentInitialDispatchOutcome::AlreadyTerminal
+            ) {
+                drop(gate);
+                self.evict_runtime(&agent_id, EvictionReason::SubAgentTerminalBeforeDispatch)
+                    .await;
+            }
             return Ok(());
         }
         if let Err(error) = handle
@@ -3972,6 +4001,32 @@ impl RuntimeManager {
                 )
                 .await
                 .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+            let parent_id = self
+                .db
+                .sub_agent_parent_conversation_id(&agent_id)
+                .await
+                .map_err(|persist_error| (agent_id.clone(), persist_error.to_string()))?;
+            let dispatcher = AddressedConversationEventDispatcher::new(Arc::clone(self));
+            let outcome = SubAgentOutcome::Failure {
+                error: error.to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+            };
+            if let Err(dispatch_error) = dispatcher
+                .dispatch(
+                    &parent_id,
+                    Event::SubAgentResult {
+                        agent_id: agent_id.clone(),
+                        outcome,
+                    },
+                )
+                .await
+            {
+                dispatcher
+                    .reconcile(&parent_id)
+                    .await
+                    .map_err(|reconcile_error| (agent_id.clone(), reconcile_error))?;
+                tracing::warn!(%agent_id, %parent_id, %dispatch_error, "parent delivery deferred to durable reconciliation");
+            }
             return Err((agent_id, error.to_string()));
         }
         drop(gate);
@@ -5416,7 +5471,8 @@ impl RuntimeManager {
             }
             EvictionReason::CreationProvisioned
             | EvictionReason::SteeringReconciliation
-            | EvictionReason::RecoveryReconciliation => {}
+            | EvictionReason::RecoveryReconciliation
+            | EvictionReason::SubAgentTerminalBeforeDispatch => {}
         }
 
         if let Some(handle) = old {
@@ -8451,35 +8507,43 @@ mod scope_liveness_tests {
             .expect("create parent");
         let agent_id = "atomic-subagent";
         let (response_tx, response_rx) = oneshot::channel();
-        manager
-            .handle_spawn_request(SubAgentSpawnRequest {
-                batch_id: "atomic-subagent-batch".to_string(),
-                specs: vec![SubAgentSpec {
-                    agent_id: agent_id.to_string(),
-                    task: "persist all child semantics".to_string(),
-                    cwd: "/tmp".to_string(),
-                    timeout: std::time::Duration::from_secs(60),
-                    mode: SubAgentMode::Explore,
-                    model_id: "gpt-5.6-sol".to_string(),
-                    connection: "openai_responses".into(),
-                    effort: None,
-                    max_turns: 1,
-                    agent_name: Some("atomic-test".to_string()),
-                    persona: Some("test persona".to_string()),
-                }],
-                parent_conversation_id: parent.id,
-                parent_scope: None,
-                parallel_work_qualified: false,
-                parent_turn_link: opentelemetry::trace::SpanContext::NONE,
-                response_tx,
-                activation_rx: {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx.send(());
-                    rx
-                },
-            })
-            .await;
+        let (activation_tx, activation_rx) = oneshot::channel();
+        let spawn = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .handle_spawn_request(SubAgentSpawnRequest {
+                        batch_id: "atomic-subagent-batch".to_string(),
+                        specs: vec![SubAgentSpec {
+                            agent_id: agent_id.to_string(),
+                            task: "persist all child semantics".to_string(),
+                            cwd: "/tmp".to_string(),
+                            timeout: std::time::Duration::from_secs(60),
+                            mode: SubAgentMode::Explore,
+                            model_id: "gpt-5.6-sol".to_string(),
+                            connection: "openai_responses".into(),
+                            effort: None,
+                            max_turns: 1,
+                            agent_name: Some("atomic-test".to_string()),
+                            persona: Some("test persona".to_string()),
+                        }],
+                        parent_conversation_id: parent.id,
+                        parent_scope: None,
+                        parallel_work_qualified: false,
+                        parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                        response_tx,
+                        activation_rx,
+                    })
+                    .await;
+            }
+        });
         assert_eq!(response_rx.await.expect("admission response"), Ok(()));
+        assert!(
+            !spawn.is_finished(),
+            "launch waits for committed parent membership"
+        );
+        activation_tx.send(()).expect("commit parent membership");
+        spawn.await.expect("spawn handler joins");
 
         let child = manager
             .db()
@@ -8601,6 +8665,10 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+        assert!(
+            !manager.runtimes.read().await.contains_key(agent_id),
+            "terminal child runtime must be retired"
+        );
         assert_eq!(
             manager
                 .db()

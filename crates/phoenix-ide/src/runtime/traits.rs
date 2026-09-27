@@ -2072,7 +2072,8 @@ impl StateStore for DatabaseStorage {
         child_conversation_id: &str,
         accepted_at: DateTime<Utc>,
     ) -> Result<(), String> {
-        self.db
+        match self
+            .db
             .update_parent_state_and_accept_sub_agent(
                 conv_id,
                 state,
@@ -2081,8 +2082,14 @@ impl StateStore for DatabaseStorage {
                 accepted_at,
             )
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ()).map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: parent state and sub-agent acceptance commit could not be classified".to_string(),
+            ),
+        }
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
