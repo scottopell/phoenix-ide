@@ -48,7 +48,22 @@ AND fall back per backend to the configured model list if model listing is unava
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-**Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
+THE built-in OpenAI Responses catalog SHALL contain `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol`
+AND SHALL NOT contain `gpt-5.4-mini`, `gpt-5.4`, or `gpt-5.5`
+AND provider discovery SHALL NOT introduce a model that is absent from both the built-in and operator-configured catalogs
+
+WHEN an exact operator-configured route uses an identifier that is also a legacy built-in identifier
+THE SYSTEM SHALL preserve the exact operator-configured route rather than replace its identifier
+
+WHEN resolving a persisted live model pin or named-worker pin whose exact route is unavailable
+THE SYSTEM SHALL map `gpt-5.3-codex`, `gpt-5.4`, and `gpt-5.5` to `gpt-5.6-sol`
+AND SHALL map `gpt-5.4-mini` to `gpt-5.6-luna`
+AND SHALL require the mapped replacement to be available instead of falling back to the deployment default
+
+THE SYSTEM SHALL preserve the original model identity on historical turns and requests or runtimes whose model was already resolved
+AND SHALL NOT use catalog family or version ordering to infer orchestration qualification for an unlisted model
+
+**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative.
 
 ---
 
@@ -207,13 +222,18 @@ THE successor SHALL preserve the parent's request-speed selection
 
 ---
 
-### REQ-LLM-004h: Account-Scoped Codex Model Availability
+### REQ-LLM-004h: Codex Model Discovery and Route Identity
 
-WHEN a built-in model requires account-scoped Codex availability
-THE SYSTEM SHALL advertise and route that model through ChatGPT/Codex authentication only when the active account's model catalog lists its exact wire identifier
+WHEN ChatGPT/Codex authentication has a configured connection and loaded credential
+THE SYSTEM SHALL advertise and route Phoenix-supported built-in Codex models independently of whether provider discovery lists their exact wire identifiers
 
-WHEN Codex model discovery fails or the account catalog omits that model
-THE SYSTEM SHALL withhold that account-scoped model without suppressing established Codex models whose availability does not depend on that discovery
+WHEN Codex model discovery fails or omits a Phoenix-supported built-in model
+THE SYSTEM SHALL treat that result as advisory
+AND SHALL surface an honest provider model error if execution rejects the selected model
+AND SHALL NOT substitute another model, account, authentication route, or billing route
+
+WHEN provider discovery lists a model absent from both the built-in and operator-configured catalogs
+THE SYSTEM SHALL NOT register or qualify that model
 
 WHEN direct OpenAI API authentication is configured
 THE SYSTEM SHALL determine direct model availability independently of the ChatGPT account catalog
@@ -225,7 +245,7 @@ AND SHALL NOT send direct-only values through the Codex route
 WHEN the active Codex credential changes while model discovery is in flight
 THE SYSTEM SHALL NOT publish the discovered catalog with a different account's credential
 
-**Rationale:** A global built-in catalog describes what Phoenix can speak, not what a particular ChatGPT account may use. Binding discovered availability to the credential identity prevents false picker choices and cross-account stale results while preserving direct API routing as a separate billing and authentication path.
+**Rationale:** Phoenix's built-in catalog defines the exact models and protocols Phoenix supports, while provider listing can omit executable models and therefore cannot deny a supported route. Credential and account binding still protect route identity, and provider execution remains authoritative for actual account entitlement without fallback to another identity or billing path.
 
 ---
 

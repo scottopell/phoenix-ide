@@ -159,6 +159,7 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
                 });
             }
             ConvState::CancellingTool {
+                cause: CancelCause::UserRequested,
                 tool_use_id,
                 skipped_tools,
                 completed_results: vec![],
@@ -918,6 +919,7 @@ proptest! {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &tr.new_state {
             ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
                 tool_use_id,
                 skipped_tools,
                 ..
@@ -960,6 +962,7 @@ proptest! {
         let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
             completed_results: vec![],
@@ -1015,6 +1018,7 @@ proptest! {
         let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: skipped.clone(),
             completed_results: vec![],
@@ -2247,6 +2251,7 @@ proptest! {
             input: serde_json::json!({}),
         }];
         let state = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: tool_use_id.clone(),
             skipped_tools: vec![],
             completed_results: vec![],

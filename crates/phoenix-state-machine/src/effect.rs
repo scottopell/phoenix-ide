@@ -165,7 +165,10 @@ pub enum Effect {
     AbortLlm,
 
     /// Cancel all pending sub-agents
-    CancelSubAgents { ids: Vec<String> },
+    CancelSubAgents {
+        ids: Vec<String>,
+        cause: crate::event::CancelCause,
+    },
 
     /// Notify parent of sub-agent completion (sub-agent only)
     NotifyParent { outcome: SubAgentOutcome },

@@ -7,8 +7,8 @@ tasks to parallel sub-agents so that complex operations complete faster and
 the agent can synthesize multiple perspectives without exhausting its own
 context window.
 
-> Detailed behaviour (states, transitions, authority rules, one-writer
-> constraint, and cwd scoping) lives in [`subagents.allium`](./subagents.allium)
+> Detailed behaviour (states, transitions, authority rules, qualified Work
+> admission, and cwd scoping) lives in [`subagents.allium`](./subagents.allium)
 > and [`bedrock.allium`](../bedrock/bedrock.allium).
 >
 > Named workers supply optional personas and execution preferences; see
@@ -21,8 +21,13 @@ context window.
 ### REQ-SA-001: Parallel Task Execution
 
 WHEN LLM requests sub-agent spawn with one or more tasks
-THE SYSTEM SHALL create an independent conversation for each task
-AND execute all sub-agent conversations in parallel
+THE SYSTEM SHALL validate and admit the complete batch atomically before any child starts
+AND SHALL create an independent conversation for each admitted task
+AND execute admitted Explore children in parallel
+AND execute admitted Work children according to the parent-model qualification policy in REQ-PROJ-008
+
+IF any task in a requested batch is invalid or the complete batch is not admissible
+THEN THE SYSTEM SHALL admit no child from that batch
 
 WHEN spawning sub-agents
 THE SYSTEM SHALL assign a mandatory time limit to each sub-agent
@@ -71,7 +76,12 @@ AND the error submission tool SHALL be the only tool in that LLM response
 
 WHEN sub-agent submits a result or error
 THE SYSTEM SHALL transition the sub-agent to a terminal state
-AND report the outcome to the parent conversation
+AND persist terminal evidence before reporting the outcome
+AND resolve the receiving parent from the child's durable parent-conversation identity
+
+WHEN the parent accepts a terminal outcome for an admitted child
+THE SYSTEM SHALL treat repeated delivery of that child's terminal outcome as idempotent success
+AND SHALL NOT append a second result or resume the parent more than once
 
 **Rationale:** Explicit result submission provides clean completion
 semantics. The terminal-tool-must-be-alone constraint prevents ambiguity
@@ -81,12 +91,16 @@ about whether other tools in the same response should execute.
 
 ### REQ-SA-004: Parent Fan-In
 
-WHEN sub-agents are running
-THE SYSTEM SHALL track pending and completed sub-agent counts
+WHEN sub-agents are admitted
+THE SYSTEM SHALL track each admitted child by durable identity as exactly one of pending or parent-accepted
 
-WHEN all sub-agents have submitted results (success or failure)
+WHEN an admitted child's terminal outcome is accepted
+THE SYSTEM SHALL remove that exact child from pending and add exactly one completed result
+
+WHEN every admitted child has a parent-accepted terminal outcome
 THE SYSTEM SHALL aggregate all results
 AND return them to the parent conversation for the LLM to process
+AND SHALL NOT settle or resume the parent while any admitted child remains pending
 
 WHEN a sub-agent result arrives before the parent is ready to receive it
 THE SYSTEM SHALL buffer the result without losing it
@@ -99,12 +113,21 @@ make informed decisions.
 
 ### REQ-SA-005: Cancellation Propagation
 
-WHEN user cancels the parent conversation while sub-agents are running
-THE SYSTEM SHALL propagate cancellation to all pending sub-agents
-AND wait for all sub-agents to acknowledge cancellation before returning to idle
+WHEN user cancels the parent conversation while sub-agents are admitted
+THE SYSTEM SHALL durably request cancellation for every pending child
+AND wait for every admitted child to reach a parent-accepted terminal outcome before ordinary settlement
 
-WHEN sub-agent receives cancellation
-THE SYSTEM SHALL terminate immediately regardless of current operation
+WHEN cancellation is requested before a child's initial work starts
+THE SYSTEM SHALL prevent that initial work from starting
+AND produce one terminal cancellation outcome for parent fan-in
+
+WHEN cancellation races child materialization or initial start
+THE SYSTEM SHALL atomically choose either cancellation-before-start or one initial start followed by cancellation
+AND SHALL NOT perform initial work more than once
+
+WHEN a child runtime must be created or recovered
+THE SYSTEM SHALL join concurrent creation attempts for that child identity
+AND materialize at most one live runtime and dispatch initial work at most once
 
 **Rationale:** Cancellation must be comprehensive. Orphaned sub-agents
 consuming resources after the parent is cancelled would confuse users and
@@ -170,11 +193,34 @@ across server restart.
 WHEN a Git-backed parent conversation spawns a sub-agent with write authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
 AND grant write access to that same worktree
-AND allow only one write-authority sub-agent per parent conversation at a time
 AND place the parent conversation in AwaitingSubAgentResult state for the duration
 AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
 AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
 AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
+
+WHEN deciding whether multiple Work children may be pending for one parent
+THE SYSTEM SHALL qualify only the parent's actual resolved model identifier
+AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, and `gpt-6-sol`
+AND SHALL NOT infer qualification from provider, model family, version ordering, reasoning effort, service tier, configuration tier, named worker, child model, or child persona
+AND SHALL treat `gpt-5.6-luna`, `gpt-6-luna`, every unknown or newly introduced identifier, every custom route, and every otherwise unlisted parent model as unqualified
+
+WHEN a qualified parent requests a valid bounded batch
+THE SYSTEM SHALL allow multiple Work tasks in that batch and multiple pending Work children across calls
+
+WHEN an unqualified parent requests Work tasks
+THE SYSTEM SHALL admit at most one Work child while no other admitted Work child remains pending
+AND SHALL reject a batch containing multiple Work tasks
+AND SHALL reject a new Work admission while an earlier Work child remains pending
+
+WHEN the parent's resolved model changes
+THE SYSTEM SHALL preserve every child and result admitted before the change
+AND SHALL use the newly resolved parent model only for subsequent admission decisions
+
+WHEN qualified parallel Work children share a `WorkScope`
+THE SYSTEM SHALL identify them as trusted collaborators in parent and child instructions
+AND SHALL instruct the parent to partition assignments and integrate results
+AND SHALL instruct each child to inspect and preserve unrelated edits and report overlap, conflicts, or uncertainty
+AND SHALL NOT promise structural prevention of overlapping writes
 
 WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
@@ -187,7 +233,7 @@ AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than in
 WHEN a planning/read-only conversation spawns sub-agents
 THE SYSTEM SHALL configure those sub-agents with read-only authority
 
-**Rationale:** The important distinction is execution authority, not lifecycle naming. Phoenix must preserve the single-writer guarantee for one worktree while still allowing parallel read-only analysis.
+**Rationale:** Execution authority remains independent from orchestration qualification. Explicitly qualified parents may coordinate trusted writers in one owned environment; every other parent fails closed to sequential Work admission. Exact durable `WorkScope` attachment keeps shared authority structural, while collaborator instructions make integration and conflict reporting explicit without claiming arbitrary-write atomicity.
 
 ---
 

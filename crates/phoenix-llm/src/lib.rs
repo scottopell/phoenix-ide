@@ -67,15 +67,16 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, CodexAvailability, EffortCapabilities,
-    ModelBackend, ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{
-    AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
+    legacy_model_replacement, AuthStyle, CredentialSource, ExecutionRoute, LlmAuth, LlmConfig,
+    ModelRegistry, ResolvedAuth,
 };
 pub use service::{LlmAttemptDeadline, LlmServiceImpl};
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias

@@ -172,6 +172,15 @@ Phoenix knowing a model identifier
 AND SHALL NOT restrict children to the parent's provider when other usable
 connections exist
 
+WHEN a configured candidate names a retired built-in model and its exact route is unavailable
+THE SYSTEM SHALL resolve the explicit compatibility replacement through the candidate's same connection
+AND SHALL preserve its optional effort
+AND SHALL report failure when that replacement is unavailable through that connection
+AND SHALL NOT continue to a later candidate or the deployment default
+
+WHEN an exact configured route exists for an identifier that is also a retired built-in identifier
+THE SYSTEM SHALL select that exact route without applying compatibility replacement
+
 WHEN the selected connection cannot be used
 THE SYSTEM SHALL report failure without silently rerouting the child
 

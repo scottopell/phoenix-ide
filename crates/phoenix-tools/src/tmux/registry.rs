@@ -3877,7 +3877,24 @@ mod tests {
 
     async fn wait_for_exact_process_absence(identity: ProcessIdentity) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while process_identity_matches(identity) {
+        loop {
+            match current_process_identity(identity.pid) {
+                Some(current) if current == identity => {}
+                Some(_) => return,
+                None => {
+                    let exists = match libc::pid_t::try_from(identity.pid) {
+                        Ok(pid) => {
+                            (unsafe { libc::kill(pid, 0) }) == 0
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::ESRCH)
+                        }
+                        Err(_) => true,
+                    };
+                    if !exists {
+                        return;
+                    }
+                }
+            }
             assert!(tokio::time::Instant::now() < deadline);
             // test-timing-allow: outer bound observes exact kernel process identity disappearance.
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5409,9 +5426,17 @@ mod tests {
             .expect("retirement fence should be acquired");
         assert_eq!(permit.instance.socket_path, stale_socket);
         assert_eq!(permit.instance.server_token, stale_token);
+        let stale_identity = exact_server_process_identity_until(
+            &stale_socket,
+            &stale_token,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("capture exact stale server identity");
 
         reg.reopen_after_repair(&work_scope).await;
         kill_socket(&stale_socket).await;
+        wait_for_exact_process_absence(stale_identity).await;
         let replacement = reg
             .ensure_live(&work_scope, owner.path(), None, None)
             .await

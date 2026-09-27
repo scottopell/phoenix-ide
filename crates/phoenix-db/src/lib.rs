@@ -27,7 +27,9 @@ pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
+mod sub_agent_lifecycle;
 pub mod workflow;
+pub use sub_agent_lifecycle::*;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -228,6 +230,8 @@ pub enum DbError {
     CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]
     CloseFoundationNotFound(String),
+    #[error("Sub-agent lifecycle conflict: {0}")]
+    SubAgentLifecycleConflict(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
@@ -4362,13 +4366,12 @@ impl Database {
         model: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: DbResult<String> = async {
             if let Some(id) = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut *tx)
             .await?
             {
                 return Ok(id);
@@ -4383,7 +4386,7 @@ impl Database {
                  VALUES (?1, 'coordinator', NULL)",
             )
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             let now = Utc::now().to_rfc3339();
             let idle = serde_json::to_string(&ConvState::Idle)
@@ -4400,7 +4403,7 @@ impl Database {
             .bind(model)
             .bind(llm_language.as_str())
             .bind(product_conversation_id.as_str())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
             Ok(id)
         }
@@ -4408,12 +4411,11 @@ impl Database {
 
         match result {
             Ok(conversation_id) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                drop(conn);
+                tx.commit().await?;
                 self.get_conversation(&conversation_id).await
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let _ = tx.rollback().await;
                 Err(error)
             }
         }
@@ -10445,56 +10447,29 @@ impl Database {
         let (mut connection, acquisition) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let ((), timing) = telemetry
+        let (mut tx, timing) = telemetry
             .observe_transaction_admission_db(acquisition, async {
-                sqlx::query("BEGIN IMMEDIATE")
-                    .execute(&mut *connection)
-                    .await
-                    .map(|_| ())
-                    .map_err(DbError::from)
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
             })
             .await?;
-        let body = Self::hard_delete_conversation_tx(
-            &mut connection,
-            id,
-            telemetry.parent_observer(),
-            None,
-        )
-        .await;
+        let body =
+            Self::hard_delete_conversation_tx(&mut tx, id, telemetry.parent_observer(), None).await;
 
         match body {
             Ok(true) => {
                 telemetry
-                    .observe_commit_db(timing, async {
-                        sqlx::query("COMMIT")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
                     .await
             }
             Ok(false) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(DbError::ConversationNotFound(id.to_string()))
             }
             Err(error) => {
                 telemetry
-                    .observe_failure_rollback_db(timing, async {
-                        sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
-                            .await
-                            .map(|_| ())
-                            .map_err(DbError::from)
-                    })
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
                     .await?;
                 Err(error)
             }
@@ -10553,7 +10528,22 @@ impl Database {
              FROM durable_turns AS t
              JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
              JOIN conversations AS child ON child.id = t.conversation_id
-             WHERE child.parent_conversation_id IS NOT NULL",
+             WHERE child.parent_conversation_id IS NOT NULL
+             UNION
+             SELECT a.conversation_id
+             FROM startup_parent_actions a
+             JOIN conversations c ON c.id = a.conversation_id
+             LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE a.action IN ('Reconcile', 'Cancel')
+               AND a.transcript_generation = c.transcript_generation
+               AND (a.turn_id IS NULL OR (a.turn_id = t.turn_id AND a.turn_generation = t.generation))
+             UNION
+             SELECT DISTINCT b.parent_conversation_id
+             FROM sub_agent_runs r
+             JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+             WHERE r.parent_accepted_at_unix_micros IS NULL
+",
         )
         .fetch_all(&self.pool)
         .await?
@@ -10583,6 +10573,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
+    #[allow(clippy::too_many_lines)]
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -10657,6 +10648,12 @@ impl Database {
                              WHERE child.parent_conversation_id = conversations.id
                          )
                      )
+               )
+               AND conversations.id NOT IN (
+                   SELECT b.parent_conversation_id
+                   FROM sub_agent_runs r
+                   JOIN sub_agent_batches b ON b.batch_id = r.batch_id
+                   WHERE r.parent_accepted_at_unix_micros IS NULL
                )
                AND NOT (
                    state_kind = 'llm_requesting'
@@ -10755,12 +10752,18 @@ impl Database {
 
         let mut outcomes = HashMap::new();
         for agent in pending {
-            let row: Option<String> =
-                sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
-                    .bind(&agent.agent_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            let Some(state_json) = row else { continue };
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT c.state, r.terminal_cause
+                 FROM conversations c
+                 LEFT JOIN sub_agent_runs r ON r.child_conversation_id = c.id
+                 WHERE c.id = ?1",
+            )
+            .bind(&agent.agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((state_json, terminal_cause)) = row else {
+                continue;
+            };
             let state = serde_json::from_str::<ConvState>(&state_json).map_err(|error| {
                 DbError::Serialization(format!(
                     "decode pending sub-agent {} state: {error}",
@@ -10772,12 +10775,19 @@ impl Database {
             // uses the interrupted fallback. `if let` chain rather than a match
             // with a wildcard arm (denied by `wildcard_enum_match_arm`).
             if let ConvState::Completed { result } = state {
-                outcomes.insert(agent.agent_id.clone(), SubAgentOutcome::Success { result });
+                let outcome = if terminal_cause.as_deref() == Some("implicit_completion") {
+                    SubAgentOutcome::ImplicitCompletion { result }
+                } else {
+                    SubAgentOutcome::Success { result }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             } else if let ConvState::Failed { error, error_kind } = state {
-                outcomes.insert(
-                    agent.agent_id.clone(),
-                    SubAgentOutcome::Failure { error, error_kind },
-                );
+                let outcome = if terminal_cause.as_deref() == Some("timed_out") {
+                    SubAgentOutcome::TimedOut
+                } else {
+                    SubAgentOutcome::Failure { error, error_kind }
+                };
+                outcomes.insert(agent.agent_id.clone(), outcome);
             }
         }
         Ok(outcomes)
@@ -10789,7 +10799,7 @@ impl Database {
         now: &DateTime<Utc>,
         only_conversations: Option<&std::collections::HashSet<String>>,
     ) -> DbResult<std::collections::HashSet<String>> {
-        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::domain::sm_state::{ConvState, SubAgentOutcome};
 
         // Both `tool_executing` and `cancelling_tool` rows carry an
         // un-persisted assistant turn (the cancel snapshots the in-flight round
@@ -10921,37 +10931,84 @@ impl Database {
                 continue;
             }
 
-            self.persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                .await?;
-            materialized.insert(conv_id.clone());
-
-            let interrupted_state = serde_json::to_string(&ConvState::Failed {
+            let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-            })
-            .unwrap();
-            for agent in &pending_sub_agents {
-                if sub_agent_outcomes.contains_key(&agent.agent_id) {
-                    continue;
-                }
-                sqlx::query(
-                    "UPDATE conversations
-                     SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-                     WHERE id = ?4
-                       AND state_kind NOT IN
-                           ('completed', 'failed', 'creation_failed', 'creation_cancelled',
-                            'context_exhausted', 'handed_off', 'terminal')",
-                )
-                .bind(&interrupted_state)
-                .bind(conv_state_kind(&ConvState::Failed {
-                    error: "Sub-agent interrupted by server restart".to_string(),
-                    error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                }))
-                .bind(now.to_rfc3339())
-                .bind(&agent.agent_id)
-                .execute(&self.pool)
-                .await?;
+            };
+            let interrupted_state = serde_json::to_string(&interrupted).unwrap();
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            insert_message_tx(&mut tx, &agent_msg).await?;
+            for message in &tool_msgs {
+                insert_message_tx(&mut tx, message).await?;
             }
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(&conv_id)
+                .execute(&mut *tx)
+                .await?;
+            for agent in &pending_sub_agents {
+                let cause =
+                    sub_agent_outcomes
+                        .get(&agent.agent_id)
+                        .map_or("runtime_failure", |outcome| match outcome {
+                            SubAgentOutcome::Success { .. } => "submit_result",
+                            SubAgentOutcome::ImplicitCompletion { .. } => "implicit_completion",
+                            SubAgentOutcome::TimedOut => "timed_out",
+                            SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                                ErrorKind::Cancelled => "cancelled",
+                                ErrorKind::ContextExhausted => "context_exhausted",
+                                ErrorKind::SubAgentError => "submit_error",
+                                ErrorKind::TurnLimitExhausted => "turn_limit",
+                                ErrorKind::Auth
+                                | ErrorKind::RateLimit
+                                | ErrorKind::UsageLimitReached
+                                | ErrorKind::Network
+                                | ErrorKind::InvalidRequest
+                                | ErrorKind::PromptRejected
+                                | ErrorKind::InvalidResponse
+                                | ErrorKind::ServerError
+                                | ErrorKind::ServerOverloaded
+                                | ErrorKind::TimedOut
+                                | ErrorKind::ContentFilter => "runtime_failure",
+                            },
+                        });
+                if !sub_agent_outcomes.contains_key(&agent.agent_id) {
+                    sqlx::query(
+                        "UPDATE conversations
+                         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+                         WHERE id = ?4
+                           AND state_kind NOT IN
+                               ('completed', 'failed', 'creation_failed', 'creation_cancelled',
+                                'context_exhausted', 'handed_off', 'terminal')",
+                    )
+                    .bind(&interrupted_state)
+                    .bind(conv_state_kind(&interrupted))
+                    .bind(now.to_rfc3339())
+                    .bind(&agent.agent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                let lifecycle = sqlx::query(
+                    "UPDATE sub_agent_runs
+                     SET terminal_cause = COALESCE(terminal_cause, ?2),
+                         terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3),
+                         parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?3)
+                     WHERE child_conversation_id = ?1",
+                )
+                .bind(&agent.agent_id)
+                .bind(cause)
+                .bind(now.timestamp_micros())
+                .execute(&mut *tx)
+                .await?;
+                if lifecycle.rows_affected() != 1 {
+                    return Err(DbError::Serialization(format!(
+                        "materialized tool round lifecycle row missing for {}",
+                        agent.agent_id
+                    )));
+                }
+            }
+            tx.commit().await?;
+            materialized.insert(conv_id.clone());
 
             tracing::info!(
                 conv_id = %conv_id,
@@ -11090,6 +11147,49 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
+        for result in results {
+            use phoenix_core::domain::sm_state::SubAgentOutcome;
+            let cause = match &result.outcome {
+                SubAgentOutcome::Success { .. } => "submit_result",
+                SubAgentOutcome::ImplicitCompletion { .. } => "implicit_completion",
+                SubAgentOutcome::TimedOut => "timed_out",
+                SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
+                    ErrorKind::Cancelled => "cancelled",
+                    ErrorKind::ContextExhausted => "context_exhausted",
+                    ErrorKind::SubAgentError => "submit_error",
+                    ErrorKind::TurnLimitExhausted => "turn_limit",
+                    ErrorKind::Auth
+                    | ErrorKind::RateLimit
+                    | ErrorKind::UsageLimitReached
+                    | ErrorKind::Network
+                    | ErrorKind::InvalidRequest
+                    | ErrorKind::PromptRejected
+                    | ErrorKind::InvalidResponse
+                    | ErrorKind::ServerError
+                    | ErrorKind::ServerOverloaded
+                    | ErrorKind::TimedOut
+                    | ErrorKind::ContentFilter => "runtime_failure",
+                },
+            };
+            let updated = sqlx::query(
+                "UPDATE sub_agent_runs
+                 SET terminal_cause = COALESCE(terminal_cause, ?2),
+                     terminal_at_unix_micros = COALESCE(terminal_at_unix_micros, ?3),
+                     parent_accepted_at_unix_micros = COALESCE(parent_accepted_at_unix_micros, ?3)
+                 WHERE child_conversation_id = ?1",
+            )
+            .bind(&result.agent_id)
+            .bind(cause)
+            .bind(now.timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "startup fan-in lifecycle row missing for {}",
+                    result.agent_id
+                )));
+            }
+        }
         sqlx::query(
             "INSERT OR REPLACE INTO startup_parent_actions
                  (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
@@ -11128,7 +11228,12 @@ impl Database {
              LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                  AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
              WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO NOTHING",
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 action = excluded.action,
+                 transcript_generation = excluded.transcript_generation,
+                 turn_id = excluded.turn_id,
+                 turn_generation = excluded.turn_generation,
+                 created_at = excluded.created_at",
         )
         .bind(conversation_id)
         .bind(Utc::now().to_rfc3339())
@@ -11155,6 +11260,23 @@ impl Database {
                              AND t.terminal_kind IS NOT NULL
                        ))
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM startup_parent_actions
+             WHERE action IN ('Reconcile', 'Cancel')
+               AND EXISTS (
+                   SELECT 1 FROM conversations c
+                   LEFT JOIN durable_turns t ON t.conversation_id = c.id
+                       AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                   WHERE c.id = startup_parent_actions.conversation_id
+                     AND (c.transcript_generation != startup_parent_actions.transcript_generation
+                          OR (startup_parent_actions.turn_id IS NOT NULL
+                              AND (t.turn_id IS NULL
+                                   OR t.turn_id != startup_parent_actions.turn_id
+                                   OR t.generation != startup_parent_actions.turn_generation)))
+               )",
         )
         .execute(&self.pool)
         .await?;
@@ -13853,6 +13975,7 @@ fn normalize_in_flight_round(
     }
     if let ConvState::CancellingTool {
         tool_use_id,
+        cause: _,
         skipped_tools,
         completed_results,
         assistant_message,
@@ -14008,7 +14131,8 @@ fn build_sub_agent_fan_in(
         .iter()
         .map(|r| {
             let outcome = match &r.outcome {
-                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Success { result }
+                | SubAgentOutcome::ImplicitCompletion { result } => format!("Result: {result}"),
                 SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
                 SubAgentOutcome::TimedOut => {
                     "Timed out: sub-agent exceeded its time limit".to_string()
@@ -22251,6 +22375,7 @@ mod tests {
             None,
         );
         let state = ConvState::CancellingTool {
+            cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
             tool_use_id: "tool-2".to_string(),
             skipped_tools: vec![ToolCall::new("tool-3", think("c"))],
             completed_results: vec![ToolResult::success(
@@ -22409,6 +22534,32 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('reset-batch', 'conv-sa', 0, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child, cause, terminal_at) in [
+            (0_i64, agent_a, None, None),
+            (1_i64, agent_b, Some("context_exhausted"), Some(2_i64)),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                     (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                      timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'reset-batch', ?2, 'read_only', 10, 1000, ?3, ?4)",
+            )
+            .bind(child)
+            .bind(ordinal)
+            .bind(cause)
+            .bind(terminal_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
         let placeholder = format!("Spawning 2 sub-agent(s): {agent_a}, {agent_b}");
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("tool-2", think("t")),
@@ -22545,6 +22696,25 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('startup-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_runs
+                 (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                  timeout_millis, terminal_cause, terminal_at_unix_micros)
+             VALUES (?1, 'startup-batch', 0, 'read_only', 10, 1000, 'submit_result', 2)",
+        )
+        .bind(child_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.update_conversation_state(
             child_id,
             &ConvState::Completed {
@@ -22603,6 +22773,15 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].conversation_id, parent_id);
         assert_eq!(actions[0].action, StartupParentAction::Resume);
+        let accepted_at: Option<i64> = sqlx::query_scalar(
+            "SELECT parent_accepted_at_unix_micros FROM sub_agent_runs
+             WHERE child_conversation_id = ?1",
+        )
+        .bind(child_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(accepted_at.is_some());
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::Idle
@@ -22848,6 +23027,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_outcomes_preserve_wall_clock_and_provider_timeout_distinction() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "timeout-cause-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('timeout-cause-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut pending = Vec::new();
+        for (ordinal, (child_id, cause)) in [
+            ("wall-clock-timeout", "timed_out"),
+            ("provider-timeout", "runtime_failure"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            db.update_conversation_state(
+                child_id,
+                &ConvState::Failed {
+                    error: format!("{child_id} exact error"),
+                    error_kind: ErrorKind::TimedOut,
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                     timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'timeout-cause-batch', ?2, 'read_only', 10, 1000, ?3, 2)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .bind(cause)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            pending.push(PendingSubAgent {
+                agent_id: child_id.to_string(),
+                task: child_id.to_string(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+
+        let outcomes = db
+            .resolve_pending_sub_agent_outcomes(&pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes.get("wall-clock-timeout"),
+            Some(&SubAgentOutcome::TimedOut)
+        );
+        assert_eq!(
+            outcomes.get("provider-timeout"),
+            Some(&SubAgentOutcome::Failure {
+                error: "provider-timeout exact error".to_string(),
+                error_kind: ErrorKind::TimedOut,
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_fan_in_preserves_terminal_child_and_interrupts_live_sibling() {
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
 
@@ -22862,6 +23117,27 @@ mod tests {
             db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
                 .await
                 .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('startup-fan-in-batch', ?1, 0, 1)",
+        )
+        .bind(parent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child_id) in [done_id, live_id].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, 'startup-fan-in-batch', ?2, 'read_only', 10, 1000)",
+            )
+            .bind(child_id)
+            .bind(i64::try_from(ordinal).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
         }
         db.update_conversation_state(
             done_id,
@@ -22963,6 +23239,30 @@ mod tests {
         let destination = ConvState::LlmRequesting { attempt: 1 };
         let mut action_ids = Vec::new();
         for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
+            let batch_id = format!("batch-{agent_id}");
+            db.create_conversation(agent_id, agent_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(&batch_id)
+            .bind(parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(agent_id)
+            .bind(&batch_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
             let expected_state = db.get_conversation(parent_id).await.unwrap().state;
             db.persist_startup_sub_agent_fan_in(
                 parent_id,
@@ -23061,6 +23361,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn startup_cancelling_sub_agents_reaches_cause_destination() {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
@@ -23078,6 +23379,26 @@ mod tests {
             db.create_conversation(&child_id, &child_id, "/tmp", false, Some(&parent_id), None)
                 .await
                 .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_batches
+                    (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+                 VALUES (?1, ?2, 0, 1)",
+            )
+            .bind(format!("batch-{suffix}"))
+            .bind(&parent_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                    (child_conversation_id, batch_id, ordinal, execution_authority, max_turns, timeout_millis)
+                 VALUES (?1, ?2, 0, 'read_only', 10, 1000)",
+            )
+            .bind(&child_id)
+            .bind(format!("batch-{suffix}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
             if expects_request {
                 db.update_conversation_state(
                     &child_id,
@@ -23246,6 +23567,7 @@ mod tests {
     /// conversation before the restart must be fanned in with its REAL outcome
     /// (success/failure), not rewritten as "interrupted by server restart". A
     /// sibling still running keeps the interrupted fallback.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_materialize_uses_real_outcome_for_completed_sub_agent() {
         use phoenix_core::domain::db_schema::ToolResult;
@@ -23290,6 +23612,32 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO sub_agent_batches
+                 (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros)
+             VALUES ('materialize-batch', 'conv-p', 0, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (ordinal, child, cause, terminal_at) in [
+            (0_i64, done_agent, Some("submit_result"), Some(2_i64)),
+            (1_i64, running_agent, None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agent_runs
+                     (child_conversation_id, batch_id, ordinal, execution_authority, max_turns,
+                      timeout_millis, terminal_cause, terminal_at_unix_micros)
+                 VALUES (?1, 'materialize-batch', ?2, 'read_only', 10, 1000, ?3, ?4)",
+            )
+            .bind(child)
+            .bind(ordinal)
+            .bind(cause)
+            .bind(terminal_at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
 
         let think = |t: &str| ToolInput::Think(ThinkInput { thoughts: t.into() });
         let assistant = AssistantMessage::new(
@@ -23329,6 +23677,26 @@ mod tests {
             .unwrap();
 
         db.reset_all_to_idle().await.unwrap();
+
+        let lifecycle: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT child_conversation_id, terminal_cause,
+                    parent_accepted_at_unix_micros IS NOT NULL
+             FROM sub_agent_runs ORDER BY ordinal",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            lifecycle,
+            vec![
+                (done_agent.to_string(), "submit_result".to_string(), true),
+                (
+                    running_agent.to_string(),
+                    "runtime_failure".to_string(),
+                    true
+                ),
+            ]
+        );
 
         let msgs = db.get_messages("conv-p").await.unwrap();
         let spawn = msgs
