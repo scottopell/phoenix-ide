@@ -10,6 +10,7 @@ import {
 } from '../notifications';
 import { useDensity } from '../hooks/useDensity';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { formatGitShaForDisplay } from '../utils';
 
 type BrowserPermission = NotificationPermission | 'unsupported';
 
@@ -620,7 +621,9 @@ function VersionFooter() {
   return (
     <div className="settings-version-footer">
       <span>v{info.version}</span>
-      <code title="Git SHA">{info.git_sha}</code>
+      <code title={info.git_sha} aria-label={`Git SHA ${info.git_sha}`}>
+        {formatGitShaForDisplay(info.git_sha)}
+      </code>
     </div>
   );
 }
