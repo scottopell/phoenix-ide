@@ -152,9 +152,10 @@ surface DesktopReleaseWorkflow {
 --   no tag derived from gate.identity.version exists.
 -- no_other_release_workflow_is_mutating(gate) -> Boolean
 --   the workflow-level sole-writer group prevents concurrent tag or publication mutation.
--- pending_replacement_is_visible_for_manual_retry(gate) -> Boolean
---   a GitHub-replaced pending run remains visible as canceled in Actions history
---   and can be retried explicitly after the active release workflow completes.
+-- pending_replacement_has_explicit_disposition(gate) -> Boolean
+--   a GitHub-replaced pending run remains visible as canceled in Actions history;
+--   after the active workflow completes, an operator resumes it only if its exact
+--   tag and version remain valid, otherwise its stale-version refusal is retained.
 -- version_follows_existing_supported_tags(identity) -> Boolean
 --   identity.version is newer than every existing supported release tag.
 -- tag_exists_at_different_commit(gate) -> Boolean
@@ -209,7 +210,7 @@ rule GateCreatesOnlyRepresentableReleaseTag {
     requires: bundle_version_representable(gate.identity)
     requires: tag_absent(gate)
     requires: no_other_release_workflow_is_mutating(gate)
-    requires: pending_replacement_is_visible_for_manual_retry(gate)
+    requires: pending_replacement_has_explicit_disposition(gate)
     requires: version_follows_existing_supported_tags(gate.identity)
     ensures: gate.state = new_tag_created
     ensures: tag_points_at_exact_commit(gate)

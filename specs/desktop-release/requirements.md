@@ -99,7 +99,7 @@ WHEN a release workflow is running,
 THE SYSTEM SHALL prevent another release workflow from concurrently creating a tag or mutating release publication.
 
 IF GitHub replaces a pending workflow because another release request enters the same concurrency group,
-THEN THE SYSTEM SHALL expose that canceled run in Actions history and an operator SHALL retry it explicitly after the active workflow completes.
+THEN THE SYSTEM SHALL expose that canceled run in Actions history for operator inspection and explicit disposition after the active workflow completes: resume it only when its exact tag and version remain valid, otherwise retain its safe stale-version refusal.
 
 WHEN creating a new release tag,
 THE SYSTEM SHALL require its supported version to follow every existing supported release tag.
