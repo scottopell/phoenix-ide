@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ parent = int(sys.argv[2])
 control_root = Path(sys.argv[3])
 root_stat = root.stat()
 root_identity = (root_stat.st_dev, root_stat.st_ino)
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
 control_root_stat = control_root.stat()
 control_root_identity = (control_root_stat.st_dev, control_root_stat.st_ino)
 owned = []
@@ -207,10 +208,17 @@ def path_identity(path):
     except OSError:
         return None
 
+def capped(values, limit):
+    materialized = list(values)
+    return materialized[:limit], max(0, len(materialized) - limit)
+
 def record_cleanup_failure(reason, terminal):
     records = []
-    for socket, device, inode, control, processes in owned:
-        states = terminal.get("states", {}).get(control.name, [])
+    bounded_owned, omitted_records = capped(owned, 16)
+    omitted_processes = 0
+    for socket, device, inode, control, processes in bounded_owned:
+        bounded_processes, omitted = capped(processes, 32)
+        omitted_processes += omitted
         records.append({
             "socket": socket.name,
             "control": control.name,
@@ -218,10 +226,15 @@ def record_cleanup_failure(reason, terminal):
             "control_identity": path_identity(control),
             "expected_identity": [device, inode],
             "processes": [
-                {"pid": identity[0], "birth": identity[1], "state": state}
-                for identity, state in zip(processes, states)
+                {"pid": identity[0], "birth": identity[1], "state": identity_state(identity)}
+                for identity in bounded_processes
             ],
         })
+    visible_paths, omitted_visible_paths = capped(
+        sorted(path.name for path in preserved_visible_paths), 32
+    )
+    controls, omitted_controls = capped(sorted(retained_controls), 32)
+    statuses, omitted_statuses = capped(sorted(cleanup_record_status.items()), 32)
     receipt = {
         "version": 1,
         "reason": reason,
@@ -234,15 +247,45 @@ def record_cleanup_failure(reason, terminal):
         "sockets": terminal.get("sockets", True),
         "creators": terminal.get("creators", True),
         "unconfirmed_obligations": len(unconfirmed_obligations),
-        "preserved_visible_paths": sorted(path.name for path in preserved_visible_paths),
-        "retained_controls": sorted(retained_controls),
-        "record_status": cleanup_record_status,
+        "preserved_visible_paths": visible_paths,
+        "retained_controls": controls,
+        "record_status": dict(statuses),
         "records": records,
+        "omitted": {
+            "records": omitted_records,
+            "processes": omitted_processes,
+            "preserved_visible_paths": omitted_visible_paths,
+            "retained_controls": omitted_controls,
+            "record_status": omitted_statuses,
+        },
     }
+    serialized = json.dumps(receipt, sort_keys=True)
+    if len(serialized.encode()) > 16384:
+        serialized = json.dumps({
+            "version": 1,
+            "reason": reason,
+            "receipt_too_large": True,
+            "owned_records": len(owned),
+            "unconfirmed_obligations": len(unconfirmed_obligations),
+        }, sort_keys=True)
+    pending = f".pending-cleanup-failure-{uuid.uuid4().hex}.json"
     try:
-        publish_response(root / ".cleanup-failure.json", json.dumps(receipt, sort_keys=True))
+        descriptor = os.open(
+            pending,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_fd,
+        )
+        try:
+            os.write(descriptor, serialized.encode())
+        finally:
+            os.close(descriptor)
+        os.replace(pending, ".cleanup-failure.json", src_dir_fd=root_fd, dst_dir_fd=root_fd)
     except OSError:
-        pass
+        try:
+            os.unlink(pending, dir_fd=root_fd)
+        except OSError:
+            pass
 
 def fail_cleanup(reason, terminal):
     record_cleanup_failure(reason, terminal)
@@ -1458,7 +1501,16 @@ impl TestTmuxServerOwner {
 
         let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
             if !status.success() {
-                let receipt = fs::read_to_string(root_path.join(".cleanup-failure.json"))
+                let receipt = fs::File::open(root_path.join(".cleanup-failure.json"))
+                    .and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(16_385).read_to_end(&mut bytes)?;
+                        if bytes.len() > 16_384 {
+                            bytes.truncate(16_384);
+                            bytes.extend_from_slice(b"...[truncated]");
+                        }
+                        Ok(String::from_utf8_lossy(&bytes).into_owned())
+                    })
                     .unwrap_or_else(|error| format!("unavailable ({error})"));
                 return Err(io::Error::other(format!(
                     "tmux test watchdog reported cleanup failure: {status}; receipt: {receipt}"
@@ -3517,6 +3569,13 @@ mod tests {
             replacement.local_addr().unwrap().as_pathname(),
             Some(replacement_socket.as_path())
         );
+        assert!(
+            !root.join(".cleanup-failure.json").exists(),
+            "diagnostic receipt was written into replacement root"
+        );
+        let receipt = fs::read_to_string(moved_root.join(".cleanup-failure.json"))
+            .expect("failure receipt is retained with original root");
+        assert!(receipt.contains("\"reason\": \"cleanup-deadline-expired\""));
         drop(replacement);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(moved_root).unwrap();
@@ -4567,10 +4626,11 @@ mod tests {
 
     #[test]
     fn cleanup_failure_receipt_is_bounded_and_excludes_owner_tokens() {
-        assert!(WATCHDOG_PROGRAM.contains("root / \".cleanup-failure.json\""));
-        assert!(WATCHDOG_PROGRAM.contains("\"reason\": reason"));
-        assert!(WATCHDOG_PROGRAM.contains("\"record_status\": cleanup_record_status"));
-        assert!(WATCHDOG_PROGRAM.contains("\"state\": state"));
+        assert!(WATCHDOG_PROGRAM.contains("dst_dir_fd=root_fd"));
+        assert!(WATCHDOG_PROGRAM.contains("bounded_owned, omitted_records = capped(owned, 16)"));
+        assert!(WATCHDOG_PROGRAM.contains("bounded_processes, omitted = capped(processes, 32)"));
+        assert!(WATCHDOG_PROGRAM.contains("len(serialized.encode()) > 16384"));
+        assert!(WATCHDOG_PROGRAM.contains("\"state\": identity_state(identity)"));
         assert!(!WATCHDOG_PROGRAM.contains("\"token\": identity[2]"));
         assert!(!WATCHDOG_PROGRAM.contains("\"environment\": environment"));
     }
