@@ -222,13 +222,18 @@ THE successor SHALL preserve the parent's request-speed selection
 
 ---
 
-### REQ-LLM-004h: Account-Scoped Codex Model Availability
+### REQ-LLM-004h: Codex Model Discovery and Route Identity
 
-WHEN a built-in model requires account-scoped Codex availability
-THE SYSTEM SHALL advertise and route that model through ChatGPT/Codex authentication only when the active account's model catalog lists its exact wire identifier
+WHEN ChatGPT/Codex authentication has a configured connection and loaded credential
+THE SYSTEM SHALL advertise and route Phoenix-supported built-in Codex models independently of whether provider discovery lists their exact wire identifiers
 
-WHEN Codex model discovery fails or the account catalog omits that model
-THE SYSTEM SHALL withhold that account-scoped model without suppressing established Codex models whose availability does not depend on that discovery
+WHEN Codex model discovery fails or omits a Phoenix-supported built-in model
+THE SYSTEM SHALL treat that result as advisory
+AND SHALL surface an honest provider model error if execution rejects the selected model
+AND SHALL NOT substitute another model, account, authentication route, or billing route
+
+WHEN provider discovery lists a model absent from both the built-in and operator-configured catalogs
+THE SYSTEM SHALL NOT register or qualify that model
 
 WHEN direct OpenAI API authentication is configured
 THE SYSTEM SHALL determine direct model availability independently of the ChatGPT account catalog
@@ -240,7 +245,7 @@ AND SHALL NOT send direct-only values through the Codex route
 WHEN the active Codex credential changes while model discovery is in flight
 THE SYSTEM SHALL NOT publish the discovered catalog with a different account's credential
 
-**Rationale:** A global built-in catalog describes what Phoenix can speak, not what a particular ChatGPT account may use. Binding discovered availability to the credential identity prevents false picker choices and cross-account stale results while preserving direct API routing as a separate billing and authentication path.
+**Rationale:** Phoenix's built-in catalog defines the exact models and protocols Phoenix supports, while provider listing can omit executable models and therefore cannot deny a supported route. Credential and account binding still protect route identity, and provider execution remains authoritative for actual account entitlement without fallback to another identity or billing path.
 
 ---
 

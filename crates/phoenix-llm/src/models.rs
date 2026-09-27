@@ -324,12 +324,6 @@ pub enum ModelSource {
     External,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexAvailability {
-    Established,
-    AccountCatalog,
-}
-
 /// Model specification with metadata
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
@@ -361,7 +355,6 @@ pub struct ModelSpec {
     /// specs bypass the Codex bridge because their endpoint is operator-configured,
     /// not `ChatGPT`'s backend.
     pub source: ModelSource,
-    pub codex_availability: CodexAvailability,
     /// Route-aware effort capabilities. Built-in specs describe the native
     /// provider defaults, while external specs carry validated optional metadata
     /// when an operator knows the target route's support. When absent on an
@@ -598,7 +591,6 @@ fn external_model_spec_from_config(
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
-        codex_availability: CodexAvailability::Established,
         effort_capabilities,
         service_tier_capabilities: ServiceTierCapabilities::Unsupported,
     })
@@ -646,7 +638,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_opus_55(),
             // Fast mode is available only on the official direct Claude API
             // route; `service_tier_capabilities_for` gates this per route so a
@@ -664,7 +655,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -679,7 +669,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -694,7 +683,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -709,7 +697,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -724,7 +711,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -739,7 +725,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unsupported(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -760,7 +745,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::AccountCatalog,
             effort_capabilities: effort_gpt_6_astra(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -775,7 +759,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::AccountCatalog,
             effort_capabilities: effort_gpt_6_sol_luna_direct(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -790,7 +773,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::AccountCatalog,
             effort_capabilities: effort_gpt_6_sol_luna_direct(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -805,7 +787,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -820,7 +801,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -835,7 +815,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -851,7 +830,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unknown(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -941,7 +919,6 @@ mod tests {
             assert_eq!(model.output_token_limit(), Some(128_000));
             assert_eq!(model.effort_capabilities, effort_gpt_6_sol_luna_direct());
             assert!(model.effort_capabilities.supports(ModelEffort::None));
-            assert_eq!(model.codex_availability, CodexAvailability::AccountCatalog);
             assert_eq!(
                 model.service_tier_capabilities,
                 ServiceTierCapabilities::Supported

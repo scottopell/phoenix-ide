@@ -73,6 +73,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
 | [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
 | [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
+| [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
 
 ## For agents: which decisions bind your task
 
@@ -80,6 +81,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
 | Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
