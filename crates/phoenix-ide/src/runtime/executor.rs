@@ -21102,7 +21102,10 @@ mod work_subagent_cwd_guard_tests {
         rt.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
         let responder = tokio::spawn(async move {
-            let request = spawn_rx.recv().await.expect("spawn admission request");
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
+                .await
+                .expect("admission request must arrive")
+                .expect("spawn admission request");
             let parent = crate::db::ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
