@@ -2043,7 +2043,15 @@ where
 #[derive(Debug)]
 enum FollowUpApprovalError {
     BeforeGit(String),
+    PersistenceFailed(String),
     AuthorityLost(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskApprovalExecution {
+    Initial,
+    FollowUp,
+    DetachedApprovedTaskCheckpoint,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -3470,6 +3478,15 @@ where
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_task_approval_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ApproveTask { .. }));
+        let task_approval_execution = if is_task_approval_adoption {
+            Some(self.resolve_task_approval_execution().await?)
+        } else {
+            None
+        };
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
@@ -3478,6 +3495,9 @@ where
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
             });
+        } else if is_task_approval_adoption {
+            // Approval persists the proposed state atomically with its objective and
+            // WorkScope authority before this state becomes live.
         } else {
             let state_changed = result.new_state != old_state;
             if self.pending_provider_replay_update.is_none()
@@ -3668,11 +3688,8 @@ where
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                 );
-                let approval_commits_state = matches!(
-                    effect,
-                    Effect::ApproveTask { .. }
-                        if self.has_existing_write_scope()
-                );
+                let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
+                    && task_approval_execution.is_some();
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
                     && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
@@ -3849,7 +3866,8 @@ where
                                         result
                                     }
                                     effect => {
-                                        self.execute_authoritative_effect(effect, admitted).await
+                                        self.execute_authoritative_effect(effect, admitted, None)
+                                            .await
                                     }
                                 },
                                 ClassifiedEffect::Control(_) => unreachable!(
@@ -3892,6 +3910,7 @@ where
                                     terminal_unit_admission
                                         .as_deref_mut()
                                         .expect("terminal direct-turn unit is admitted"),
+                                    None,
                                 )
                                 .await
                             }
@@ -3925,7 +3944,10 @@ where
                         }
                     }
                 } else {
-                    Box::pin(self.execute_effect(effect)).await
+                    Box::pin(
+                        self.execute_effect_with_task_approval(effect, task_approval_execution),
+                    )
+                    .await
                 };
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
@@ -5150,16 +5172,8 @@ where
             .iter()
             .map(|task| task.mode.unwrap_or_default())
             .collect();
-        // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { .. }
-                | ModeContext::Direct
-                | ModeContext::Branch { .. }
-                | ModeContext::DetachedApprovedTask { .. },
-            ) => true,
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let parent_allows_work =
+            self.context.resource_authority == crate::work_scope::ResourceAuthority::Work;
 
         let mut work_count_in_batch = 0u32;
         for &mode in &resolved_tasks {
@@ -5167,9 +5181,8 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in a write-capable mode \
-                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
-                         for read-only sub-agents."
+                        "Work sub-agents require Work authority on the parent WorkScope. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -5207,17 +5220,12 @@ where
         // `cwd` must stay inside the parent's worktree. Without this guard
         // a Work sub-agent could write outside the worktree because its
         // own runtime would see a different working_dir than the parent.
-        // Direct parents have no worktree to scope against -- writes there
-        // are unscoped by design -- so the check only fires for parents
-        // that own a worktree (Work/Branch).
-        let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { worktree_path, .. }
-                | ModeContext::Branch { worktree_path, .. }
-                | ModeContext::DetachedApprovedTask { worktree_path, .. },
-            ) => Some(worktree_path.as_str()),
-            _ => None,
-        };
+        // Direct parents have no WorkScope worktree, so writes there are unscoped by design.
+        let parent_worktree_path = self
+            .context
+            .work_scope_worktree
+            .as_ref()
+            .map(|path| path.to_string_lossy());
         // Resolve and validate every spec BEFORE sending any spawn request.
         // Model validation can fail per-task; doing it inside the send loop
         // would leave earlier tasks already spawned (and untracked, since the
@@ -5262,9 +5270,11 @@ where
             };
 
             if mode == SubAgentMode::Work
-                && parent_worktree_path.is_some_and(|root| !path_is_within(&cwd, root))
+                && parent_worktree_path
+                    .as_deref()
+                    .is_some_and(|root| !path_is_within(&cwd, root))
             {
-                let worktree_root = parent_worktree_path.expect("checked as present");
+                let worktree_root = parent_worktree_path.as_deref().expect("checked as present");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
                     format!(
@@ -5555,6 +5565,14 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
+        self.execute_effect_with_task_approval(effect, None).await
+    }
+
+    async fn execute_effect_with_task_approval(
+        &mut self,
+        effect: Effect,
+        task_approval_execution: Option<TaskApprovalExecution>,
+    ) -> Result<Option<Event>, String> {
         match ClassifiedEffect::classify(effect) {
             ClassifiedEffect::Control(effect) => self.execute_control_effect(effect).await,
             ClassifiedEffect::Authoritative(effect) => {
@@ -5565,7 +5583,7 @@ where
                     None => self.admit_authoritative_effect()?,
                 };
                 let result = self
-                    .execute_authoritative_effect(*effect, &mut admitted)
+                    .execute_authoritative_effect(*effect, &mut admitted, task_approval_execution)
                     .await;
                 if restore_retained {
                     self.handoff_completion_authority = Some(admitted);
@@ -5586,6 +5604,7 @@ where
         &mut self,
         effect: AuthoritativeEffect,
         admitted: &mut crate::runtime::AdmittedOperation,
+        task_approval_execution: Option<TaskApprovalExecution>,
     ) -> Result<Option<Event>, String> {
         #[cfg(test)]
         if matches!(
@@ -6618,8 +6637,18 @@ where
                 priority,
                 plan,
             } => {
-                self.execute_approve_task(task_file, title, priority, plan, admitted)
-                    .await?;
+                self.execute_approve_task(
+                    task_file,
+                    title,
+                    priority,
+                    plan,
+                    task_approval_execution.ok_or_else(|| {
+                        "task approval execution was not resolved before effect admission"
+                            .to_string()
+                    })?,
+                    admitted,
+                )
+                .await?;
                 Ok(None)
             }
 
@@ -6911,9 +6940,11 @@ where
                         self.state_updated_at,
                     );
                 self.publish_live_state_admitted();
-                match Box::pin(
-                    self.execute_authoritative_effect(AuthoritativeEffect::RequestLlm, admitted),
-                )
+                match Box::pin(self.execute_authoritative_effect(
+                    AuthoritativeEffect::RequestLlm,
+                    admitted,
+                    None,
+                ))
                 .await
                 {
                     Ok(event) => Ok(event),
@@ -7269,7 +7300,12 @@ where
             matches!(
                 self.context.resource_authority,
                 crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
+            ) && matches!(mode_context, Some(ModeContext::Explore { .. }))
+                && self
+                    .storage
+                    .get_approved_task_objective(&self.context.conversation_id)
+                    .await?
+                    .is_some();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -7319,12 +7355,18 @@ where
                     ),
             );
         }
-        let explore_bash_capability =
-            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
-                explore_bash
-            } else {
-                phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-            };
+        let prompt_authority = if matches!(mode_context, Some(ModeContext::Explore { .. }))
+            && !has_approved_task_write_authority
+        {
+            crate::work_scope::ResourceAuthority::Restricted
+        } else {
+            self.context.resource_authority
+        };
+        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
+            prompt_authority,
+            mode_context.as_ref(),
+            explore_bash,
+        );
         let mut system_prompt = if is_coordinator {
             crate::system_prompt::build_coordinator_system_prompt(
                 llm_language,
@@ -8830,9 +8872,22 @@ where
         Ok(())
     }
 
-    fn has_existing_write_scope(&self) -> bool {
-        self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
-            && self.context.work_scope_worktree.is_some()
+    async fn resolve_task_approval_execution(&self) -> Result<TaskApprovalExecution, String> {
+        if self
+            .storage
+            .get_approved_task_objective(&self.context.conversation_id)
+            .await?
+            .is_some()
+        {
+            return Ok(TaskApprovalExecution::FollowUp);
+        }
+        if matches!(
+            self.context.mode_context.as_ref(),
+            Some(ModeContext::DetachedApprovedTask { .. })
+        ) {
+            return Ok(TaskApprovalExecution::DetachedApprovedTaskCheckpoint);
+        }
+        Ok(TaskApprovalExecution::Initial)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8844,7 +8899,7 @@ where
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), FollowUpApprovalError> {
-        reread_reviewed_task_handoff_snapshot_at_exact_path(
+        reread_reviewed_task_handoff_snapshot(
             self.context.filesystem_root(),
             self.context.filesystem_root(),
             &self.context.tasks_dir_name,
@@ -8901,7 +8956,10 @@ where
             usage_data: None,
             created_at: Utc::now(),
         };
-        self.storage
+        let approved_state = ConvState::LlmRequesting { attempt: 1 };
+        let state_updated_at = Utc::now();
+        let establishment = self
+            .storage
             .persist_approved_task_authority_and_state(
                 &self.context.conversation_id,
                 &TaskApprovalHandoffData {
@@ -8910,14 +8968,25 @@ where
                     title: title.to_string(),
                     priority,
                     plan: plan.to_string(),
-                    task_file: task_file.to_string(),
+                    task_file: reviewed.task_file,
                     artifact_body: reviewed.artifact_body,
                 },
                 &message,
-                &self.state,
-                self.state_updated_at,
+                &approved_state,
+                state_updated_at,
             )
             .await
+            .map_err(FollowUpApprovalError::PersistenceFailed)?;
+        if matches!(
+            establishment,
+            crate::db::LocalAuthorityResult::DurableFactUnclassified
+        ) {
+            admitted.close("follow_up_approval_authority_establishment");
+            return Err(FollowUpApprovalError::AuthorityLost(
+                "approval authority establishment is unclassified".to_string(),
+            ));
+        }
+        self.install_live_state(approved_state, state_updated_at, true)
             .map_err(FollowUpApprovalError::AuthorityLost)?;
 
         let _ = self
@@ -8999,9 +9068,10 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
-        if self.has_existing_write_scope() {
+        if execution == TaskApprovalExecution::FollowUp {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
                 .await;
@@ -9013,15 +9083,18 @@ where
                     )?;
                     Err(error)
                 }
+                Err(FollowUpApprovalError::PersistenceFailed(error)) => {
+                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                    Err(format!(
+                        "follow-up approval persistence failed after Git mutation; recreate actor from database: {error}"
+                    ))
+                }
                 Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
                 )),
             };
         }
-        if matches!(
-            self.context.mode_context.as_ref(),
-            Some(ModeContext::DetachedApprovedTask { .. })
-        ) {
+        if execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint {
             let tasks_dir_name = self.context.tasks_dir_name.clone();
             let reviewed = reread_reviewed_task_handoff_snapshot(
                 self.context.filesystem_root(),
@@ -9039,24 +9112,51 @@ where
                 priority,
                 plan,
             );
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-            let seq = self.broadcast_tx.next_seq();
-            let msg = self
+            let approved_state = ConvState::LlmRequesting { attempt: 1 };
+            let state_updated_at = Utc::now();
+            let message = crate::db::Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: self.broadcast_tx.next_seq(),
+                message_type: crate::db::MessageType::User,
+                content: MessageContent::User(crate::db::UserContent::meta(&approval_msg)),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            };
+            let establishment = self
                 .storage
-                .add_message_with_seq(
-                    &msg_id,
+                .persist_approved_task_authority_and_state(
                     &self.context.conversation_id,
-                    seq,
-                    &content,
-                    None,
-                    None,
+                    &TaskApprovalHandoffData {
+                        task_id: reviewed.task_id,
+                        task_title: reviewed.task_title,
+                        title,
+                        priority,
+                        plan,
+                        task_file,
+                        artifact_body: reviewed.artifact_body,
+                    },
+                    &message,
+                    &approved_state,
+                    state_updated_at,
                 )
                 .await?;
+            if matches!(
+                establishment,
+                crate::db::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                admitted.close("detached_approval_authority_establishment");
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: detached task approval authority establishment is unclassified"
+                        .to_string(),
+                );
+            }
+            self.install_live_state(approved_state, state_updated_at, true)?;
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
-                .persisted_message(msg);
+                .persisted_message(message);
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -9094,8 +9194,31 @@ where
 
         match result {
             Ok(approval_result) => {
-                storage
-                    .persist_approved_task_authority(
+                let branch_msg = format!(
+                    "Task approved. You are on branch {} in {}.\n\n\
+                     ## Approved plan: {}\n\n\
+                     Priority: {}\n\n\
+                     {}",
+                    approval_result.branch_name,
+                    approval_result.worktree_path,
+                    title_backup,
+                    priority_backup,
+                    plan_backup,
+                );
+                let msg = crate::db::Message {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: crate::db::MessageType::User,
+                    content: MessageContent::User(crate::db::UserContent::meta(&branch_msg)),
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                };
+                let approved_state = ConvState::LlmRequesting { attempt: 1 };
+                let state_updated_at = Utc::now();
+                let establishment = match storage
+                    .persist_approved_task_authority_and_state(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
                             task_id: approval_result.task_id.clone(),
@@ -9106,9 +9229,47 @@ where
                             task_file: task_file_backup.clone(),
                             artifact_body: approval_result.artifact_body.clone(),
                         },
+                        &msg,
+                        &approved_state,
+                        state_updated_at,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(establishment) => establishment,
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
+                };
+                if matches!(
+                    establishment,
+                    crate::db::LocalAuthorityResult::DurableFactUnclassified
+                ) {
+                    admitted.close("task_approval_authority_establishment");
+                    return Err("approval authority establishment is unclassified".to_string());
+                }
+                self.install_live_state(approved_state, state_updated_at, true)?;
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+                let browser_promoted = self
+                    .browser_sessions
+                    .promote_actor_to_work_scope(
+                        &self.context.resource_scope,
+                        &self.context.conversation_id,
+                    )
+                    .await;
+                if !browser_promoted {
+                    let restricted_actor = phoenix_core::work_scope::EffectiveResourceAccess::new(
+                        &self.context.conversation_id,
+                        crate::work_scope::ResourceAuthority::Restricted,
+                    );
+                    self.browser_sessions
+                        .request_kill_session_for_actor(
+                            &self.context.resource_scope,
+                            &restricted_actor,
+                        )
+                        .await;
+                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -9124,35 +9285,6 @@ where
                     "Task approved — worktree created"
                 );
 
-                // Persist as a user message so the LLM sees the approval + plan context.
-                // This must be the last message before the next LLM call to avoid ending
-                // on an assistant message (Anthropic rejects trailing assistant as
-                // "prefill").
-                let branch_msg = format!(
-                    "Task approved. You are on branch {} in {}.\n\n\
-                     ## Approved plan: {}\n\n\
-                     Priority: {}\n\n\
-                     {}",
-                    approval_result.branch_name,
-                    approval_result.worktree_path,
-                    title_backup,
-                    priority_backup,
-                    plan_backup,
-                );
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &msg_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        None,
-                        None,
-                    )
-                    .await?;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -9424,7 +9556,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original_path_was_tracked =
         run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
-    let mut snapshot = reread_reviewed_task_handoff_snapshot_at_exact_path(
+    let mut snapshot = reread_reviewed_task_handoff_snapshot(
         cwd,
         cwd,
         tasks_dir_name,
@@ -9435,7 +9567,7 @@ fn persist_fresh_approved_task_artifact_blocking(
     )
     .map_err(FollowUpArtifactError::BeforeGit)?;
     let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
-    if detect_plain_markdown_task_stem(task_file).is_none() {
+    if snapshot.task_file == task_file && detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
             .and_then(|name| name.to_str())
@@ -16137,7 +16269,7 @@ mod authoritative_user_message_effect_tests {
 
 #[cfg(test)]
 mod approved_explore_follow_up_tests {
-    use super::test_git_helpers::{add_worktree, init_repo};
+    use super::test_git_helpers::{add_explore_worktree, add_worktree, init_repo};
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::ConvContext;
@@ -16189,6 +16321,76 @@ mod approved_explore_follow_up_tests {
         )
     }
 
+    async fn seed_existing_objective(storage: &InMemoryStorage) {
+        storage
+            .persist_approved_task_authority(
+                "approved-explore-follow-up",
+                &TaskApprovalHandoffData {
+                    task_id: "72003".to_string(),
+                    task_title: "Existing task".to_string(),
+                    title: "Existing task".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: "# Existing task\n".to_string(),
+                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
+                    artifact_body: "# Existing task\n".to_string(),
+                },
+            )
+            .await
+            .expect("existing approved objective");
+    }
+
+    #[tokio::test]
+    async fn detached_checkpoint_atomically_settles_approval() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "detached-approved-checkpoint",
+            "detached-approved-checkpoint-branch",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72005-p1-ready--detached-checkpoint.md";
+        let plan = "# Detached checkpoint\n\nContinue in this worktree.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let worktree_path = worktree.display().to_string();
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, plan, storage.clone(), broadcast_tx);
+        runtime.context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path,
+            task_id: "72005".to_string(),
+            task_title: "Detached checkpoint".to_string(),
+        });
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let execution = runtime.resolve_task_approval_execution().await.unwrap();
+        assert_eq!(
+            execution,
+            TaskApprovalExecution::DetachedApprovedTaskCheckpoint
+        );
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Detached checkpoint".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                execution,
+                &mut admitted,
+            )
+            .await
+            .expect("detached checkpoint approval");
+
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let objective = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("detached checkpoint objective");
+        assert_eq!(objective.task_id, "72005");
+        assert_eq!(objective.task_file, task_file);
+    }
+
     #[test]
     fn reread_rejects_symlink_replacement() {
         use std::os::unix::fs::symlink;
@@ -16216,6 +16418,59 @@ mod approved_explore_follow_up_tests {
     }
 
     #[tokio::test]
+    async fn preallocated_work_capability_without_objective_uses_initial_approval() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = add_explore_worktree(&repo_root, "approved-explore-follow-up", "main");
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the first approved objective.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        assert_eq!(
+            runtime.resolve_task_approval_execution().await.unwrap(),
+            TaskApprovalExecution::Initial
+        );
+        runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::Initial,
+                &mut admitted,
+            )
+            .await
+            .expect("initial approval");
+
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            "task-72004-follow-up"
+        );
+        assert!(!worktree.join(task_file).exists());
+        assert!(worktree
+            .join("tasks/72004-p1-in-progress--follow-up.md")
+            .exists());
+        assert_eq!(storage.recorded_messages().len(), 1);
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        let objective = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("initial objective");
+        assert_eq!(objective.task_id, "72004");
+        assert_eq!(objective.task_file, task_file);
+    }
+
+    #[tokio::test]
     async fn follow_up_validation_failure_restores_approval_state() {
         let (_tmp, repo_root) = init_repo();
         let worktree = PathBuf::from(add_worktree(
@@ -16228,6 +16483,7 @@ mod approved_explore_follow_up_tests {
         let reviewed_plan = "# Follow up\n\nReviewed.\n";
         std::fs::write(worktree.join(task_file), "# Follow up\n\nEdited.\n").unwrap();
         let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut runtime =
             approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
@@ -16241,6 +16497,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 reviewed_plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await
@@ -16251,6 +16508,123 @@ mod approved_explore_follow_up_tests {
             runtime.state,
             ConvState::AwaitingTaskApproval { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_persistence_failure_retires_post_git_actor() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-persist-failure",
+            "task-72003-existing-persist-failure",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
+        storage.set_fail_approval_authority_persistence(true);
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::FollowUp,
+                &mut admitted,
+            )
+            .await
+            .expect_err("post-Git persistence failure must retire actor");
+
+        assert!(error.starts_with("follow-up approval persistence failed after Git mutation"));
+        assert_eq!(
+            runtime.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+        let committed_head = run_git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        storage.set_fail_approval_authority_persistence(false);
+        let mut recovered = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            SseBroadcaster::new(16, 0),
+        );
+        recovered
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::FollowUp,
+                &mut admitted,
+            )
+            .await
+            .expect("retry recovers committed promoted artifact");
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            committed_head
+        );
+        assert_eq!(
+            storage
+                .approved_task_authority("approved-explore-follow-up")
+                .unwrap()
+                .task_file,
+            "tasks/72004-p1-in-progress--follow-up.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_unclassified_commit_closes_authority_fence() {
+        let (_tmp, repo_root) = init_repo();
+        let worktree = PathBuf::from(add_worktree(
+            &repo_root,
+            "approved-explore-follow-up-unclassified",
+            "task-72003-existing-unclassified",
+        ));
+        std::fs::create_dir(worktree.join("tasks")).unwrap();
+        let task_file = "tasks/72004-p1-ready--follow-up.md";
+        let plan = "# Follow up\n\nImplement the next bounded change.\n";
+        std::fs::write(worktree.join(task_file), plan).unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        seed_existing_objective(&storage).await;
+        storage.set_approval_authority_unclassified(true);
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime =
+            approved_explore_runtime(worktree, task_file, plan, storage, broadcast_tx);
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = authority_fence.subscribe();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        let error = runtime
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::FollowUp,
+                &mut admitted,
+            )
+            .await
+            .expect_err("unclassified follow-up must fail stop");
+
+        assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("follow_up_approval_authority_establishment")
+        );
     }
 
     #[tokio::test]
@@ -16272,21 +16646,7 @@ mod approved_explore_follow_up_tests {
         run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
 
         let storage = Arc::new(InMemoryStorage::new());
-        storage
-            .persist_approved_task_authority(
-                "approved-explore-follow-up",
-                &TaskApprovalHandoffData {
-                    task_id: "72003".to_string(),
-                    task_title: "Existing task".to_string(),
-                    title: "Existing task".to_string(),
-                    priority: crate::task_source::Priority::P1,
-                    plan: "# Existing task\n".to_string(),
-                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
-                    artifact_body: "# Existing task\n".to_string(),
-                },
-            )
-            .await
-            .expect("existing approved objective");
+        seed_existing_objective(&storage).await;
         let broadcast_tx = SseBroadcaster::new(16, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
         let mut runtime = approved_explore_runtime(
@@ -16306,6 +16666,7 @@ mod approved_explore_follow_up_tests {
                 "Follow up".to_string(),
                 crate::task_source::Priority::P1,
                 plan.to_string(),
+                TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
             .await
@@ -16334,11 +16695,16 @@ mod approved_explore_follow_up_tests {
             "unrelated staged work must remain staged"
         );
         assert_eq!(storage.recorded_messages().len(), 1);
+        assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
+        assert_eq!(
+            storage.get_current_state("approved-explore-follow-up"),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        );
         let replacement = storage
             .approved_task_authority("approved-explore-follow-up")
             .expect("replacement objective");
         assert_eq!(replacement.task_id, "72004");
-        assert_eq!(replacement.task_file, task_file);
+        assert_eq!(replacement.task_file, promoted_task_file);
         assert!(
             std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
                 event,
@@ -17413,6 +17779,59 @@ mod approve_task_failure_effect_tests {
         .expect("fresh handoff approval should succeed");
 
         assert_eq!(waiter.await.unwrap(), conv_id);
+    }
+
+    #[tokio::test]
+    async fn approval_persistence_failure_retires_post_git_actor() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "approval-persistence-failure";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--persist-failure.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Persist failure\n").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.desired_base_branch = Some(base_branch.to_string());
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_approval_authority_persistence(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Persist failure".to_string(),
+                priority: crate::task_source::Priority::P2,
+                plan: "# Persist failure\n".to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect_err("post-Git persistence failure must retire actor");
+
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
     }
 
     #[tokio::test]
@@ -20336,6 +20755,14 @@ mod work_subagent_cwd_guard_tests {
             "gpt-5.6-sol",
             200_000,
         );
+        context.resource_authority = match &mode_context {
+            ModeContext::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        };
+        context.work_scope_worktree = match &mode_context {
+            ModeContext::Direct => None,
+            _ => Some(working_dir.to_path_buf()),
+        };
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
 
@@ -20658,6 +21085,59 @@ mod work_subagent_cwd_guard_tests {
         assert!(
             matches!(result, Some(Event::ToolComplete { ref result, .. }) if result.is_error())
         );
+    }
+
+    #[tokio::test]
+    async fn approved_explore_origin_surfaces_work_child_isolation_rejection() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_mode(
+            worktree.path(),
+            ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            },
+        )
+        .with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+
+        let responder = tokio::spawn(async move {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
+                .await
+                .expect("admission request must arrive")
+                .expect("spawn admission request");
+            let parent = crate::db::ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            };
+            let error =
+                crate::runtime::RuntimeManager::validate_work_child_admission(true, &parent)
+                    .expect_err("Git-backed Work admission requires isolation");
+            request
+                .response_tx
+                .send(crate::runtime::SubAgentAdmissionResponse::Rejected(error))
+                .expect("requester remains live");
+        });
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "implement the fix".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    execution: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        let Some(Event::ToolComplete { result, .. }) = result else {
+            panic!("expected rejected Work admission");
+        };
+        assert!(result.is_error());
+        assert!(tool_result_text(&result).contains("filesystem isolation"));
+        responder.await.expect("admission responder joins");
     }
 
     #[tokio::test]

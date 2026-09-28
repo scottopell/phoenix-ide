@@ -158,24 +158,17 @@ rule SpawnRejectedTooManyTasks {
 -- 2. MODE VALIDATION (REQ-PROJ-008, REQ-BED-018)
 -- ===========================================================
 
--- A Work sub-agent requires the parent to be writeable. "Writeable" here
--- means the parent's mode grants write access to a worktree (Work or
--- Branch) or to the user's cwd (Direct). An Explore parent has no place
--- to put a Work sub-agent's writes.
-rule WorkSubAgentRequiresWriteableParent {
+rule WorkSubAgentRequiresUnscopedParent {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: any_task_mode_is_work(tasks)
-    requires: parent.mode not in { work, branch, direct }
+    requires: parent.mode != direct
     ensures: SpawnAgentsRejected(parent,
-        reason: "Work sub-agents require the parent to be in a \
-                 write-capable mode (Work, Branch, or Direct)")
+        reason: "Git-backed Work sub-agents require enforceable filesystem isolation")
 
     @guidance
-        -- Parent mode is read from `ConvContext.mode_context` at the
-        -- call site. The only writeable-disqualifying mode is `explore`;
-        -- `parent.execution_authority = read_only` => reject. The error string also
-        -- instructs the LLM to use `mode: "explore"` or omit `mode` for
-        -- read-only sub-agents.
+        -- RuntimeManager validates the persisted parent before durable batch
+        -- admission. Direct parents retain unscoped Work delegation. Git-backed
+        -- parents keep their own write authority and may delegate Explore work.
 }
 
 -- REQ-PROJ-008: qualification is an exact allowlist over the parent's resolved
@@ -200,6 +193,7 @@ rule UnqualifiedParentRejectsConcurrentWork {
 
 rule QualifiedParentAllowsParallelWork {
     when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: parent.mode = direct
     requires: parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1 or pending_work_admissions(parent) > 0
     requires: batch_is_otherwise_valid(parent, tasks)
@@ -349,7 +343,7 @@ rule SubAgentSpecsResolved {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
-    requires: parent.mode in { work, branch, direct }
+    requires: parent.mode = direct
         or not any_task_mode_is_work(tasks)
     requires: parallel_work_qualified(parent.resolved_model_id)
         or work_task_count(tasks) <= 1

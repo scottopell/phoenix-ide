@@ -97,3 +97,15 @@ THE SYSTEM SHALL reject negative values
 THE SYSTEM SHALL format that integer as a human-readable date and time only at an application or presentation boundary
 
 **Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
+
+
+---
+
+### REQ-COMP-006 — Legacy Direct Authority Repair Is Forward-Only
+
+WHEN a database upgrade encounters a Direct conversation whose attached `WorkScope` is classified as Restricted Explore
+THE SYSTEM SHALL migrate that `WorkScope` to Direct authority
+AND SHALL leave WorkScopes classified as Work unchanged
+AND SHALL NOT infer a downgrade or rollback guarantee from this forward repair
+
+**Rationale:** Direct conversations are write-authorized by contract. Repairing legacy rows restores that contract without expanding project-wide rollback guarantees.

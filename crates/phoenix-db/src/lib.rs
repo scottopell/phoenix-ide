@@ -2031,7 +2031,8 @@ impl Database {
 
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
-            "work" | "branch" => AuthorityKind::Work,
+            "direct" => AuthorityKind::Direct,
+            "work" | "branch" | "detached_approved_task" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -8092,8 +8093,17 @@ impl Database {
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> DbResult<()> {
-        self.persist_approved_task_authority_inner(conversation_id, approval, None)
-            .await
+        match self
+            .persist_approved_task_authority_inner(conversation_id, approval, None)
+            .await?
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(()) => Ok(()),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "approved-task authority commit is unclassified".to_string(),
+                ))
+            }
+        }
     }
 
     /// Persist replacement task authority and the selected state atomically.
@@ -8108,7 +8118,7 @@ impl Database {
         approval_message: &Message,
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
         self.persist_approved_task_authority_inner(
             conversation_id,
             approval,
@@ -8117,15 +8127,27 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn persist_approved_task_authority_inner(
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
         settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
-    ) -> DbResult<()> {
+    ) -> DbResult<crate::workflow::LocalAuthorityResult<()>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let settlement_identity = settlement
+            .map(|(message, state, updated_at)| {
+                Ok::<_, DbError>((
+                    message.message_id.clone(),
+                    serde_json::to_string(state)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    conv_state_kind(state).to_string(),
+                    updated_at.to_rfc3339(),
+                ))
+            })
+            .transpose()?;
         let now_us = Utc::now().timestamp_micros();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let work_scope_id: Option<String> =
@@ -8187,6 +8209,19 @@ impl Database {
         .await?;
         if let Some((approval_message, state, state_updated_at)) = settlement {
             insert_message_tx(&mut tx, approval_message).await?;
+            sqlx::query(
+                "INSERT INTO approval_request_obligations
+                 (conversation_id, approval_message_id, created_at_us)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     approval_message_id = excluded.approval_message_id,
+                     created_at_us = excluded.created_at_us",
+            )
+            .bind(conversation_id)
+            .bind(&approval_message.message_id)
+            .bind(approval_message.created_at.timestamp_micros())
+            .execute(&mut *tx)
+            .await?;
             let state_json = serde_json::to_string(state).unwrap();
             sqlx::query(
                 "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -8199,8 +8234,45 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
-        tx.commit().await?;
-        Ok(())
+        match tx.commit().await {
+            Ok(()) => Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(())),
+            Err(commit_error) => {
+                let Some((message_id, expected_state, expected_kind, expected_updated_at)) =
+                    settlement_identity
+                else {
+                    return Err(commit_error.into());
+                };
+                let established = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM conversations c
+                         JOIN conversation_approved_task_objectives o ON o.conversation_id = c.id
+                         JOIN work_scope_approved_task_authorities a
+                           ON a.objective_conversation_id = c.id
+                          AND a.work_scope_id = c.work_scope_id
+                         JOIN work_scopes s ON s.id = a.work_scope_id AND s.authority_kind = 'work'
+                         JOIN messages m ON m.message_id = ?2 AND m.conversation_id = c.id
+                         WHERE c.id = ?1 AND c.state = ?3 AND c.state_kind = ?4
+                           AND c.state_updated_at = ?5 AND o.task_id = ?6
+                     )",
+                )
+                .bind(conversation_id)
+                .bind(message_id)
+                .bind(expected_state)
+                .bind(expected_kind)
+                .bind(expected_updated_at)
+                .bind(&snapshot.task_id)
+                .fetch_one(&self.pool)
+                .await;
+                match established {
+                    Ok(true) => {
+                        Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(()))
+                    }
+                    Ok(false) => Err(commit_error.into()),
+                    Err(_) => Ok(crate::workflow::LocalAuthorityResult::DurableFactUnclassified),
+                }
+            }
+        }
     }
 
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
@@ -10570,10 +10642,30 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     ///
-    /// # Panics
+    /// Whether a committed approval owns the first post-approval provider request.
     ///
-    /// Panics if persisted JSON columns cannot be (de)serialized.
-    #[allow(clippy::too_many_lines)]
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn has_pending_approval_request(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM approval_request_obligations
+                 WHERE conversation_id = ?1
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Reset transient conversation states after restart.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when recovery persistence fails.
+    ///
+    /// # Panics
+    /// Panics only if the static `Idle` state cannot be serialized.
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -10632,6 +10724,17 @@ impl Database {
         //   - awaiting_user_response: user questions pending; state data (questions/tool_use_id)
         //     is in the JSON column and must survive restart
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
+        self.reset_restartable_conversations(&idle_state, now)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn reset_restartable_conversations(
+        &self,
+        idle_state: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
@@ -10664,6 +10767,10 @@ impl Database {
                              AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
                        )
                        OR EXISTS (
+                           SELECT 1 FROM approval_request_obligations approval
+                           WHERE approval.conversation_id = conversations.id
+                       )
+                       OR EXISTS (
                            SELECT 1 FROM durable_turns t
                            WHERE t.conversation_id = conversations.id
                              AND t.owns_conversation = 1
@@ -10693,12 +10800,11 @@ impl Database {
                    )
                )",
         )
-        .bind(&idle_state)
+        .bind(idle_state)
         .bind(conv_state_kind(&ConvState::Idle))
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
-
         Ok(())
     }
 
@@ -18398,12 +18504,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_receives_restricted_authority() {
+    fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
-        assert_eq!(
-            Database::authority_for_mode(&cm),
-            AuthorityKind::RestrictedExplore
-        );
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
     }
 
     #[tokio::test]

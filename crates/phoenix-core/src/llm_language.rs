@@ -18,6 +18,22 @@
 use crate::domain::sm_state::ExploreBashCapability;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExploreBashPromptCapability {
+    Sandboxed,
+    Unsandboxed,
+    Unavailable,
+}
+
+impl From<ExploreBashCapability> for ExploreBashPromptCapability {
+    fn from(value: ExploreBashCapability) -> Self {
+        match value {
+            ExploreBashCapability::Sandboxed => Self::Sandboxed,
+            ExploreBashCapability::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum LlmLanguage {
@@ -99,7 +115,7 @@ impl LlmLanguage {
                 explore_mode_block_template: mode_explore(
                     self,
                     TASKS_DIR,
-                    ExploreBashCapability::Unavailable,
+                    ExploreBashPromptCapability::Unavailable,
                 ),
                 work_mode_block_template: mode_work(self, BRANCH_NAME, BASE_BRANCH, WORKTREE_PATH),
                 direct_mode_block: mode_direct(self).to_string(),
@@ -204,19 +220,25 @@ pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
 pub fn mode_explore(
     lang: LlmLanguage,
     tasks_dir_name: &str,
-    bash: ExploreBashCapability,
+    bash: impl Into<ExploreBashPromptCapability>,
 ) -> String {
-    let bash_guidance = match (lang, bash) {
-        (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
+    let bash_guidance = match (lang, bash.into()) {
+        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Sandboxed) => {
             "`bash` is available for read-only local investigation under an OS sandbox: it can read local files broadly like other Explore read tools, but source/Git metadata/task writes and network access are blocked. Use `patch` for task proposal drafts; bash may write only to scratch, synthetic home, and platform temp."
         }
-        (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
+        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Unsandboxed) => {
+            "`bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox."
+        }
+        (LlmLanguage::PhoenixNative, ExploreBashPromptCapability::Unavailable) => {
             "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
         }
-        (LlmLanguage::Caveman, ExploreBashCapability::Sandboxed) => {
+        (LlmLanguage::Caveman, ExploreBashPromptCapability::Sandboxed) => {
             "Bash can look wide but no write code and no network."
         }
-        (LlmLanguage::Caveman, ExploreBashCapability::Unavailable) => "No bash here.",
+        (LlmLanguage::Caveman, ExploreBashPromptCapability::Unsandboxed) => {
+            "Bash has approved WorkScope write power."
+        }
+        (LlmLanguage::Caveman, ExploreBashPromptCapability::Unavailable) => "No bash here.",
     };
     match lang {
         LlmLanguage::PhoenixNative => format!(
@@ -259,6 +281,18 @@ pub fn mode_explore(
              `12345-p2-ready--slug.md`), then call propose_task with that file. \
              Big caveman say yes? You get new cave with write power. \
              {bash_guidance} patch only in `{tasks_dir_name}/`."
+        ),
+    }
+}
+
+#[must_use]
+pub fn mode_approved_explore_work(lang: LlmLanguage, worktree_path: &str) -> String {
+    match lang {
+        LlmLanguage::PhoenixNative => format!(
+            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Git-backed Work sub-agents are unavailable because filesystem isolation cannot be enforced; use Explore children for read-only delegation and perform writes in this parent. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
+        ),
+        LlmLanguage::Caveman => format!(
+            "\n\nTask approved. Work power in {worktree_path}. Do this task now. No same plan again. User ask different next task? New plan allowed."
         ),
     }
 }
