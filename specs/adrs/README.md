@@ -33,7 +33,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [019](019_runtime-ownership-requires-positive-evidence.md) | Runtime ownership requires positive evidence | Accepted | REQ-DEPLOY-002A, REQ-RU-004A |
 | [020](020_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
-| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 | REQ-GR-001–005, REQ-GR-007–011A |
+| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 and ADR-066 | REQ-GR-001–005, REQ-GR-007–011A |
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
@@ -77,6 +77,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
 | [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 | [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
+| [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
 
 ## For agents: which decisions bind your task
 
