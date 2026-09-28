@@ -631,16 +631,17 @@ WHEN a sub-agent is spawned by a parent without approved write authority
 THE SYSTEM SHALL create only Explore-mode sub-agents
 AND configure their working directory from the parent's read-only context
 
-WHEN an Explore-origin parent has persisted WorkScope write authority and an approved objective
-THE SYSTEM SHALL admit requested Work sub-agents under the same inherited-worktree and host-confinement rules as other Git-backed writing parents
+WHEN a Git-backed parent requests a Work sub-agent
+THE SYSTEM SHALL reject the request with a descriptive isolation-unavailable error
+AND SHALL leave the parent conversation's approved write authority unchanged
 
 WHEN sub-agent is spawned by a Work conversation with Explore mode requested
 THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)
 AND configure its working directory as the parent's worktree path
 
-WHEN sub-agent is spawned by a write-capable parent conversation with write capability requested
+WHEN sub-agent is spawned by a Direct parent conversation with write capability requested
 THE SYSTEM SHALL create the sub-agent with write capability against the parent's attached `WorkScope`
-AND configure its working directory as the parent's worktree path
+AND configure its working directory as the parent's working directory
 AND enforce the fail-closed parent-model Work admission policy defined by REQ-PROJ-008 in [`../subagents/requirements.md`](../subagents/requirements.md)
 
 WHEN sub-agent is running

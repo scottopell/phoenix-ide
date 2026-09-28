@@ -8,8 +8,7 @@ use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
-const WORKTREE_WRITE_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_WRITE";
-const WORKTREE_ROOT_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_ROOT";
+
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
     repo_root: PathBuf,
@@ -17,8 +16,6 @@ pub struct ExploreReadOnlyPolicy {
     home: PathBuf,
     platform_temp: PathBuf,
     path: OsString,
-    worktree_write_root: Option<PathBuf>,
-    inherited_work_env: Vec<(OsString, OsString)>,
 }
 
 impl ExploreReadOnlyPolicy {
@@ -54,67 +51,6 @@ impl ExploreReadOnlyPolicy {
             home,
             platform_temp,
             path,
-            worktree_write_root: None,
-            inherited_work_env: Vec::new(),
-        })
-    }
-
-    /// Build a policy that permits writes only within `worktree_root`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when either path cannot be canonicalized, the working
-    /// directory is outside the worktree, or the in-worktree scratch cannot be created.
-    pub fn discover_worktree_write(
-        working_dir: &Path,
-        worktree_root: &Path,
-    ) -> std::io::Result<Self> {
-        let runtime_env = PhoenixRuntimeEnvironment::detect();
-        let repo_root = working_dir.canonicalize()?;
-        let worktree_root = worktree_root.canonicalize()?;
-        if !repo_root.starts_with(&worktree_root) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "working directory is outside the inherited worktree",
-            ));
-        }
-        let scratch_root = worktree_root.join(".phoenix").join("bash-scratch");
-        let worktree =
-            cap_std::fs::Dir::open_ambient_dir(&worktree_root, cap_std::ambient_authority())?;
-        worktree.create_dir_all(".phoenix/bash-scratch")?;
-        let canonical_scratch_root = scratch_root.canonicalize()?;
-        if !canonical_scratch_root.starts_with(&worktree_root) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "sandbox scratch resolves outside the inherited worktree",
-            ));
-        }
-        let scratch_dir = canonical_scratch_root.join(uuid::Uuid::new_v4().to_string());
-        let platform_temp = scratch_dir.join("platform-temp");
-        worktree.create_dir_all(
-            platform_temp
-                .strip_prefix(&worktree_root)
-                .map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-                })?,
-        )?;
-        if !platform_temp
-            .canonicalize()?
-            .starts_with(&canonical_scratch_root)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "sandbox temp resolves outside the inherited worktree",
-            ));
-        }
-        Ok(Self {
-            repo_root,
-            scratch_dir,
-            home: runtime_env.home().to_path_buf(),
-            platform_temp,
-            path: inherited_path(),
-            worktree_write_root: Some(worktree_root),
-            inherited_work_env: std::env::vars_os().collect(),
         })
     }
 
@@ -122,17 +58,10 @@ impl ExploreReadOnlyPolicy {
         command.env(REPO_ROOT_ENV, &self.repo_root);
         command.env(SCRATCH_ENV, &self.scratch_dir);
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
-        if let Some(worktree_root) = &self.worktree_write_root {
-            command.env(WORKTREE_WRITE_ENV, "1");
-            command.env(WORKTREE_ROOT_ENV, worktree_root);
-        }
         self.apply_child_env(command);
     }
 
     fn apply_child_env(&self, command: &mut Command) {
-        if self.worktree_write_root.is_some() {
-            command.envs(self.inherited_work_env.iter().cloned());
-        }
         command.env("PHOENIX_SANDBOX_SCRATCH", &self.scratch_dir);
         command.env("HOME", &self.home);
         command.env("TMPDIR", &self.platform_temp);
@@ -153,23 +82,12 @@ impl ExploreReadOnlyPolicy {
         let home = env_path("HOME")?;
         let platform_temp = env_path(PLATFORM_TEMP_ENV)?;
         let path = inherited_path();
-        let worktree_write_root = if std::env::var_os(WORKTREE_WRITE_ENV).is_some() {
-            Some(env_path(WORKTREE_ROOT_ENV)?)
-        } else {
-            None
-        };
         Ok(Self {
             repo_root: repo_root.clone(),
             scratch_dir,
             home,
             platform_temp,
             path,
-            worktree_write_root,
-            inherited_work_env: if std::env::var_os(WORKTREE_WRITE_ENV).is_some() {
-                std::env::vars_os().collect()
-            } else {
-                Vec::new()
-            },
         })
     }
 
@@ -177,17 +95,9 @@ impl ExploreReadOnlyPolicy {
         let mut caps = CapabilitySet::new()
             .set_signal_mode(SignalMode::Isolated)
             .allow_path("/", AccessMode::Read)
+            .map_err(|e| e.to_string())?
+            .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
-        if self.worktree_write_root.is_none() {
-            caps = caps
-                .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
-                .map_err(|e| e.to_string())?;
-        }
-        if let Some(worktree_root) = &self.worktree_write_root {
-            caps = caps
-                .allow_path(worktree_root, AccessMode::ReadWrite)
-                .map_err(|e| e.to_string())?;
-        }
 
         for path in system_writable_files() {
             if path.exists() {
@@ -195,101 +105,24 @@ impl ExploreReadOnlyPolicy {
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
-        if self.worktree_write_root.is_none() && self.platform_temp.is_dir() {
+        if self.platform_temp.is_dir() {
             caps = caps
                 .allow_path(&self.platform_temp, AccessMode::ReadWrite)
                 .map_err(|e| format!("{}: {e}", self.platform_temp.display()))?;
         }
-        if self.worktree_write_root.is_some() {
-            Ok(caps)
-        } else {
-            Ok(caps.block_network())
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum SandboxScratch {
-    HostOwned(PathBuf),
-    Worktree {
-        root: cap_std::fs::Dir,
-        relative_path: PathBuf,
-    },
-}
-
-impl SandboxScratch {
-    /// Remove scratch through the directory authority that created it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if removal fails or a worktree path escapes its root.
-    pub fn remove(&self) -> std::io::Result<()> {
-        match self {
-            Self::HostOwned(path) => std::fs::remove_dir_all(path),
-            Self::Worktree {
-                root,
-                relative_path,
-            } => root.remove_dir_all(relative_path),
-        }
+        Ok(caps.block_network())
     }
 }
 
 pub struct ExploreSandboxCommand {
     pub command: Command,
-    pub scratch_dir: SandboxScratch,
+    pub scratch_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExploreSandboxLauncher;
 
 impl ExploreSandboxLauncher {
-    /// Build a child-process command with writes confined to `worktree_root`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the policy or launcher command cannot be constructed.
-    pub fn worktree_write_command(
-        cmd: &str,
-        working_dir: &Path,
-        worktree_root: &Path,
-    ) -> Result<ExploreSandboxCommand, String> {
-        let policy = ExploreReadOnlyPolicy::discover_worktree_write(working_dir, worktree_root)
-            .map_err(|e| format!("failed to create worktree sandbox policy: {e}"))?;
-        Self::command_for_policy(cmd, &policy)
-    }
-
-    fn command_for_policy(
-        cmd: &str,
-        policy: &ExploreReadOnlyPolicy,
-    ) -> Result<ExploreSandboxCommand, String> {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("failed to resolve phoenix executable: {e}"))?;
-        let mut command = Command::new(exe);
-        command
-            .arg("--sandbox-exec")
-            .arg("--")
-            .arg(cmd)
-            .current_dir(&policy.repo_root)
-            .env_clear();
-        let scratch_dir = match &policy.worktree_write_root {
-            Some(root) => SandboxScratch::Worktree {
-                root: cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
-                    .map_err(|error| error.to_string())?,
-                relative_path: policy
-                    .scratch_dir
-                    .strip_prefix(root)
-                    .map_err(|error| error.to_string())?
-                    .to_path_buf(),
-            },
-            None => SandboxScratch::HostOwned(policy.scratch_dir.clone()),
-        };
-        policy.to_command_env(&mut command);
-        Ok(ExploreSandboxCommand {
-            command,
-            scratch_dir,
-        })
-    }
-
     /// Build the Phoenix child-process command that applies the Explore
     /// sandbox and execs `bash -c cmd`.
     ///
@@ -300,7 +133,21 @@ impl ExploreSandboxLauncher {
     pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
         let policy = ExploreReadOnlyPolicy::discover(working_dir)
             .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
-        Self::command_for_policy(cmd, &policy)
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("failed to resolve phoenix executable: {e}"))?;
+        let mut command = Command::new(exe);
+        command
+            .arg("--sandbox-exec")
+            .arg("--")
+            .arg(cmd)
+            .current_dir(&policy.repo_root)
+            .env_clear();
+        let scratch_dir = policy.scratch_dir.clone();
+        policy.to_command_env(&mut command);
+        Ok(ExploreSandboxCommand {
+            command,
+            scratch_dir,
+        })
     }
 
     #[must_use]
@@ -480,151 +327,6 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn worktree_scratch_creation_cannot_follow_external_parent_symlink() {
-        let worktree = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        std::os::unix::fs::symlink(outside.path(), worktree.path().join(".phoenix")).unwrap();
-
-        assert!(
-            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
-                .is_err()
-        );
-        assert!(!outside.path().join("bash-scratch").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worktree_scratch_cleanup_cannot_follow_replaced_parent_symlink() {
-        let worktree = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        let policy =
-            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
-                .unwrap();
-        let command = ExploreSandboxLauncher::command_for_policy("true", &policy).unwrap();
-        let name = policy.scratch_dir.file_name().unwrap();
-        let external_target = outside.path().join(name);
-        std::fs::create_dir(&external_target).unwrap();
-        std::fs::write(external_target.join("keep"), "outside").unwrap();
-        let parent = policy.scratch_dir.parent().unwrap();
-        std::fs::rename(parent, worktree.path().join("saved-scratch")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), parent).unwrap();
-
-        assert!(command.scratch_dir.remove().is_err());
-        assert_eq!(
-            std::fs::read_to_string(external_target.join("keep")).unwrap(),
-            "outside"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worktree_policy_rejects_symlinked_scratch_root() {
-        let worktree = tempfile::TempDir::new().expect("worktree");
-        let outside = tempfile::TempDir::new().expect("outside");
-        std::fs::create_dir(worktree.path().join(".phoenix")).unwrap();
-        std::os::unix::fs::symlink(
-            outside.path(),
-            worktree.path().join(".phoenix/bash-scratch"),
-        )
-        .unwrap();
-
-        assert!(
-            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path(),)
-                .is_err()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worktree_policy_does_not_regrant_replaced_platform_temp() {
-        let worktree = tempfile::TempDir::new().expect("worktree");
-        let outside = tempfile::TempDir::new().expect("outside");
-        let policy =
-            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
-                .expect("worktree policy");
-        std::fs::remove_dir(&policy.platform_temp).expect("remove platform temp");
-        std::os::unix::fs::symlink(outside.path(), &policy.platform_temp)
-            .expect("replace platform temp with symlink");
-
-        let caps = policy.capability_set().expect("capabilities");
-
-        assert!(caps
-            .path_covered_with_access(&worktree.path().canonicalize().unwrap(), AccessMode::Write));
-        assert!(!caps
-            .path_covered_with_access(&outside.path().canonicalize().unwrap(), AccessMode::Write));
-    }
-
-    #[test]
-    fn worktree_child_env_preserves_inherited_work_configuration() {
-        let worktree = tempfile::TempDir::new().expect("worktree");
-        let mut policy =
-            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
-                .expect("worktree policy");
-        policy.inherited_work_env = vec![
-            (OsString::from("GH_TOKEN"), OsString::from("test-token")),
-            (
-                OsString::from("SSH_AUTH_SOCK"),
-                OsString::from("/tmp/test-agent.sock"),
-            ),
-            (
-                OsString::from("CARGO_HOME"),
-                OsString::from("/tmp/test-cargo-home"),
-            ),
-        ];
-        let mut command = Command::new("bash");
-        command.env_clear();
-        policy.apply_child_env(&mut command);
-
-        let env = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_os_string(),
-                    value.map(std::ffi::OsStr::to_os_string),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(
-            env[std::ffi::OsStr::new("GH_TOKEN")].as_deref(),
-            Some(std::ffi::OsStr::new("test-token"))
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new("SSH_AUTH_SOCK")].as_deref(),
-            Some(std::ffi::OsStr::new("/tmp/test-agent.sock"))
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new("CARGO_HOME")].as_deref(),
-            Some(std::ffi::OsStr::new("/tmp/test-cargo-home"))
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new("TMPDIR")].as_deref(),
-            Some(policy.platform_temp.as_os_str())
-        );
-    }
-
-    #[test]
-    fn worktree_write_policy_grants_only_worktree_and_scratch_writes() {
-        let worktree = tempfile::TempDir::new().expect("worktree");
-        let outside = tempfile::TempDir::new().expect("outside");
-        let child_cwd = worktree.path().join("nested");
-        std::fs::create_dir(&child_cwd).unwrap();
-        let policy = ExploreReadOnlyPolicy::discover_worktree_write(&child_cwd, worktree.path())
-            .expect("worktree policy");
-        let caps = policy.capability_set().expect("capabilities");
-
-        assert!(caps
-            .path_covered_with_access(&worktree.path().canonicalize().unwrap(), AccessMode::Write));
-        let canonical_worktree = worktree.path().canonicalize().unwrap();
-        assert!(policy.scratch_dir.starts_with(&canonical_worktree));
-        assert!(policy.platform_temp.starts_with(&canonical_worktree));
-        assert!(caps.path_covered_with_access(&policy.scratch_dir, AccessMode::Write));
-        assert_eq!(caps.network_mode(), &nono::NetworkMode::AllowAll);
-        assert!(!caps
-            .path_covered_with_access(&outside.path().canonicalize().unwrap(), AccessMode::Write));
-    }
 
     #[test]
     fn git_worktree_root_resolves_from_subdirectory() {

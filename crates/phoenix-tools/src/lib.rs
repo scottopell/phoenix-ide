@@ -28,7 +28,7 @@ pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
     BashOp, BashTerminalEffect, BashTool, BashToolInput,
     ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
-    ValidatedBashSpawnTarget, WorktreeSandboxedBashTool,
+    ValidatedBashSpawnTarget,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -1196,17 +1196,6 @@ impl ToolRegistry {
         Self { tools }
     }
 
-    /// Tool registry for a Work sub-agent attached to its parent's worktree.
-    #[must_use]
-    pub fn for_attached_subagent_work() -> Self {
-        let mut tools = read_only_tools();
-        tools.push(Arc::new(PresentSvgTool));
-        tools.push(Arc::new(WorktreeSandboxedBashTool));
-        tools.extend(browser_tools());
-        tools.extend(sub_agent_terminal_tools());
-        Self { tools }
-    }
-
     /// Create tool registry for sub-agents (different tool set)
     #[deprecated(note = "Use for_subagent_explore() or for_subagent_work() instead")]
     #[must_use]
@@ -1491,13 +1480,6 @@ mod tests {
     /// every mode and keep this test passing; forgetting to add it to a
     /// specific constructor will fail this test.
     #[test]
-    fn attached_work_registry_keeps_present_svg_without_patch() {
-        let registry = ToolRegistry::for_attached_subagent_work();
-        assert!(registry.find_tool("present_svg").is_some());
-        assert!(registry.find_tool("patch").is_none());
-    }
-
-    #[test]
     fn registry_mode_matrix_read_only_tools_everywhere() {
         let read_only_expected: BTreeSet<&str> = [
             "think",
@@ -1524,10 +1506,6 @@ mod tests {
                 ToolRegistry::for_subagent_explore(sandbox_policy()),
             ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
-            (
-                "attached_subagent_work",
-                ToolRegistry::for_attached_subagent_work(),
-            ),
         ];
 
         for (label, registry) in &registries {
@@ -1707,10 +1685,6 @@ mod tests {
                 ToolRegistry::for_subagent_explore(sandbox_policy()),
             ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
-            (
-                "attached_subagent_work",
-                ToolRegistry::for_attached_subagent_work(),
-            ),
         ] {
             let bash = registry
                 .find_tool("bash")

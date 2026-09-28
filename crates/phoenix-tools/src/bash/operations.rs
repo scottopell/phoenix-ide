@@ -30,7 +30,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
-use super::sandbox::{ExploreSandboxLauncher, SandboxScratch};
+use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
 use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
@@ -424,7 +424,6 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 pub enum BashSpawnMode {
     Direct,
     ExploreReadOnly,
-    WorktreeSandboxed,
     ExplicitTarget(ValidatedBashSpawnTarget),
 }
 
@@ -438,7 +437,7 @@ struct SpawnContext {
 impl BashSpawnMode {
     fn authority(&self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
-            Self::Direct | Self::WorktreeSandboxed | Self::ExplicitTarget(_) => {
+            Self::Direct | Self::ExplicitTarget(_) => {
                 phoenix_core::work_scope::ResourceAuthority::Work
             }
             Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
@@ -453,10 +452,6 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
     dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
-}
-
-pub async fn dispatch_worktree_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::WorktreeSandboxed).await
 }
 
 pub async fn dispatch_explicit_target(
@@ -487,9 +482,7 @@ async fn dispatch_with_spawn_mode(
             read_args,
         } => {
             let spawn_context = match &spawn_mode {
-                BashSpawnMode::Direct
-                | BashSpawnMode::ExploreReadOnly
-                | BashSpawnMode::WorktreeSandboxed => SpawnContext {
+                BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
                     working_dir: ctx.working_dir().to_path_buf(),
                     lifecycle_scope: ctx.work_scope.clone(),
                     terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
@@ -642,14 +635,14 @@ async fn run_run(
 struct SpawnedProcessGroup {
     child: Option<tokio::process::Child>,
     pgid: i32,
-    sandbox_scratch_dir: Option<SandboxScratch>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 }
 
 impl SpawnedProcessGroup {
     fn new(
         child: tokio::process::Child,
         pgid: i32,
-        sandbox_scratch_dir: Option<SandboxScratch>,
+        sandbox_scratch_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             child: Some(child),
@@ -658,7 +651,7 @@ impl SpawnedProcessGroup {
         }
     }
 
-    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<SandboxScratch>) {
+    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<std::path::PathBuf>) {
         let child = self
             .child
             .take()
@@ -691,7 +684,7 @@ impl Drop for SpawnedProcessGroup {
             libc::kill(-self.pgid, libc::SIGKILL);
         }
         if let Some(dir) = self.sandbox_scratch_dir.take() {
-            let _ = dir.remove();
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -737,18 +730,6 @@ fn spawn_child(
                 .current_dir(&spawn_context.working_dir);
             command
         }
-        BashSpawnMode::WorktreeSandboxed => {
-            let worktree_root = ctx.worktree_path.as_deref().ok_or_else(|| {
-                "attached Work sub-agent is missing its worktree root".to_string()
-            })?;
-            let sandbox_command = ExploreSandboxLauncher::worktree_write_command(
-                cmd,
-                &spawn_context.working_dir,
-                worktree_root,
-            )?;
-            sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
-            Command::from(sandbox_command.command)
-        }
         BashSpawnMode::ExploreReadOnly => {
             let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
@@ -781,7 +762,7 @@ fn spawn_child(
         Ok(child) => child,
         Err(e) => {
             if let Some(dir) = &sandbox_scratch_dir {
-                let _ = dir.remove();
+                let _ = std::fs::remove_dir_all(dir);
             }
             return Err(format!("failed to spawn bash child: {e}"));
         }
@@ -820,7 +801,7 @@ struct WaiterContext {
     owner_scope: ResourceScopeKey,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     terminal_effect: BashTerminalEffect,
-    sandbox_scratch_dir: Option<SandboxScratch>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 }
 
@@ -830,7 +811,7 @@ fn start_io_tasks(
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     terminal_effect: BashTerminalEffect,
-    sandbox_scratch_dir: Option<SandboxScratch>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let stdout = child.stdout.take();
@@ -1199,8 +1180,8 @@ async fn run_waiter(
         }
     }
     if let Some(dir) = context.sandbox_scratch_dir {
-        if let Err(e) = dir.remove() {
-            tracing::debug!(scratch = ?dir, error = %e, "failed to remove bash scratch directory");
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
         }
     }
     panic_guard.disarm();
@@ -2054,7 +2035,7 @@ mod tests {
         let scratch_parent = tempfile::tempdir().expect("scratch parent");
         let scratch = scratch_parent.path().join("spawn-scratch");
         std::fs::create_dir(&scratch).expect("create scratch");
-        spawned.sandbox_scratch_dir = Some(SandboxScratch::HostOwned(scratch.clone()));
+        spawned.sandbox_scratch_dir = Some(scratch.clone());
         let stdout = spawned.child_mut().stdout.take().expect("child stdout");
         let mut ready = String::new();
         tokio::time::timeout(

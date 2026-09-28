@@ -2098,16 +2098,13 @@ fn approved_managed_registry(
 }
 
 fn sub_agent_registry_for_authority(
-    mode: &ConvMode,
+    _mode: &ConvMode,
     authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
-    match (mode, authority) {
+    match (_mode, authority) {
         (_, crate::work_scope::ResourceAuthority::Restricted) => {
             ToolRegistry::for_subagent_explore(policy)
-        }
-        (ConvMode::AttachedWorkChild { .. }, crate::work_scope::ResourceAuthority::Work) => {
-            ToolRegistry::for_attached_subagent_work()
         }
         (_, crate::work_scope::ResourceAuthority::Work) => ToolRegistry::for_subagent_work(),
     }
@@ -2192,7 +2189,6 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
         | ConvMode::Direct
-        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
@@ -3916,34 +3912,13 @@ impl RuntimeManager {
             SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => {
                 Ok(parent_mode.clone())
             }
-            SubAgentMode::Work => Ok(ConvMode::AttachedWorkChild {
-                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
-                    spec.cwd.clone(),
-                )
-                .map_err(|error| format!("Invalid attached Work-child worktree path: {error}"))?,
-            }),
+            SubAgentMode::Work => Err("Git-backed Work sub-agents are unavailable until filesystem isolation is enforced; execute the approved work in the parent conversation".to_string()),
         }
     }
 
-    fn validate_work_child_admission(
-        has_work: bool,
-        parent_mode: &ConvMode,
-        has_approved_objective: bool,
-        platform: &PlatformCapability,
-    ) -> Result<(), String> {
-        if has_work
-            && matches!(
-                parent_mode,
-                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
-            )
-            && !has_approved_objective
-        {
-            return Err(
-                "Work sub-agents require an approved objective for this managed scope".to_string(),
-            );
-        }
-        if has_work && !matches!(parent_mode, ConvMode::Direct) && !platform.has_sandbox() {
-            return Err("Attached Work sub-agents require an enforceable host sandbox".to_string());
+    fn validate_work_child_admission(has_work: bool, parent_mode: &ConvMode) -> Result<(), String> {
+        if has_work && !matches!(parent_mode, ConvMode::Direct) {
+            return Err("Git-backed Work sub-agents are unavailable until filesystem isolation is enforced; execute the approved work in the parent conversation".to_string());
         }
         Ok(())
     }
@@ -3966,25 +3941,7 @@ impl RuntimeManager {
             return Err("Parent WorkScope changed before sub-agent admission".to_string());
         }
         let has_work = specs.iter().any(|spec| spec.mode == SubAgentMode::Work);
-        let has_approved_objective = if has_work
-            && matches!(
-                parent.conv_mode,
-                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
-            ) {
-            self.db
-                .get_approved_task_objective(parent_conversation_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .is_some()
-        } else {
-            false
-        };
-        Self::validate_work_child_admission(
-            has_work,
-            &parent.conv_mode,
-            has_approved_objective,
-            &self.platform,
-        )?;
+        Self::validate_work_child_admission(has_work, &parent.conv_mode)?;
         let children = specs
             .iter()
             .map(|spec| {
@@ -5097,28 +5054,12 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
-            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = match (&conv.conv_mode, &authority_resolution.environment) {
-            (
-                ConvMode::AttachedWorkChild { .. },
-                Some(phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
-                    worktree_path,
-                    ..
-                }),
-            ) => Some(PathBuf::from(worktree_path)),
-            (ConvMode::AttachedWorkChild { .. }, _) => None,
-            _ => conv.conv_mode.worktree_path().map(PathBuf::from),
-        };
-        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild { .. })
-            && context.work_scope_worktree.is_none()
-        {
-            return Err("Attached Work child is missing its persisted worktree path".to_string());
-        }
+        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -5276,7 +5217,6 @@ impl RuntimeManager {
                         None,
                         ConvMode::Work { .. }
                         | ConvMode::Branch { .. }
-                        | ConvMode::AttachedWorkChild { .. }
                         | ConvMode::DetachedApprovedTask { .. },
                     ) => (
                         ToolRegistry::git_backed_writing_parent(
@@ -6464,9 +6404,6 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
-        ConvMode::AttachedWorkChild { worktree_path } => ModeContext::AttachedWorkChild {
-            worktree_path: worktree_path.to_string(),
-        },
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -6798,18 +6735,6 @@ mod sub_agent_registry_resume_tests {
             &mode,
             ResourceAuthority::Restricted,
             "submit_result"
-        ));
-    }
-
-    #[test]
-    fn attached_work_child_resume_excludes_racy_patch_tool() {
-        assert!(!registry_has(
-            &crate::db::ConvMode::AttachedWorkChild {
-                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/worktree")
-                    .unwrap(),
-            },
-            ResourceAuthority::Work,
-            "patch"
         ));
     }
 }
@@ -8950,78 +8875,6 @@ mod scope_liveness_tests {
     }
 
     #[test]
-    fn managed_work_child_requires_objective_and_enforceable_sandbox() {
-        let mode = ConvMode::DetachedProductCreation {
-            worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
-                "/tmp/owned-worktree",
-            )
-            .unwrap(),
-            base_branch: phoenix_core::domain::db_schema::NonEmptyString::new("main").unwrap(),
-        };
-        let unavailable = PlatformCapability::None {
-            details: "test host has no sandbox".to_string(),
-        };
-        let available = PlatformCapability::Nono {
-            platform: "test".to_string(),
-            details: "test sandbox".to_string(),
-        };
-
-        assert!(
-            RuntimeManager::validate_work_child_admission(true, &mode, false, &available,)
-                .unwrap_err()
-                .contains("approved objective")
-        );
-        assert!(
-            RuntimeManager::validate_work_child_admission(true, &mode, true, &unavailable,)
-                .unwrap_err()
-                .contains("enforceable host sandbox")
-        );
-        RuntimeManager::validate_work_child_admission(true, &mode, true, &available).unwrap();
-        RuntimeManager::validate_work_child_admission(true, &ConvMode::Direct, false, &unavailable)
-            .unwrap();
-    }
-
-    #[test]
-    fn work_subagent_persists_attached_work_child_mode() {
-        let spec = SubAgentSpec {
-            agent_id: "attached-work-child".to_string(),
-            task: "inherit the parent scope".to_string(),
-            cwd: "/tmp/owned-worktree".to_string(),
-            timeout: std::time::Duration::from_secs(60),
-            mode: SubAgentMode::Work,
-            model_id: "gpt-5.6-sol".to_string(),
-            connection: "openai_responses".into(),
-            effort: None,
-            max_turns: 1,
-            agent_name: None,
-            persona: None,
-        };
-
-        assert_eq!(
-            RuntimeManager::sub_agent_child_mode(
-                &spec,
-                &ConvMode::Explore {
-                    worktree_path:
-                        Some(
-                            phoenix_core::domain::db_schema::NonEmptyString::new(
-                                "/tmp/owned-worktree",
-                            )
-                            .unwrap(),
-                        ),
-                    next_taskmd_id_hint: None,
-                },
-            )
-            .unwrap(),
-            ConvMode::AttachedWorkChild {
-                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
-                    "/tmp/owned-worktree",
-                )
-                .unwrap(),
-            }
-        );
-    }
-
-    #[test]
     fn direct_work_subagent_preserves_unscoped_direct_mode() {
         let mut spec = SubAgentSpec {
             agent_id: "direct-work-child".to_string(),
@@ -9040,6 +8893,21 @@ mod scope_liveness_tests {
             RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
             ConvMode::Direct
         );
+        RuntimeManager::validate_work_child_admission(true, &ConvMode::Direct).unwrap();
+        let managed = ConvMode::Explore {
+            worktree_path: Some(
+                phoenix_core::domain::db_schema::NonEmptyString::new("/tmp/owned-worktree")
+                    .unwrap(),
+            ),
+            next_taskmd_id_hint: None,
+        };
+        assert!(
+            RuntimeManager::validate_work_child_admission(true, &managed)
+                .unwrap_err()
+                .contains("filesystem isolation")
+        );
+        assert!(RuntimeManager::sub_agent_child_mode(&spec, &managed).is_err());
+        RuntimeManager::validate_work_child_admission(false, &managed).unwrap();
         spec.mode = SubAgentMode::Explore;
         assert!(matches!(
             RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),

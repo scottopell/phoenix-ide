@@ -106,7 +106,7 @@ enum ParentWorkScopeKind { unattached | attached }
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
 -- the two variants and which mode picks which.
-enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable | attached_work_confined }
+enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable }
 
 ------------------------------------------------------------
 -- Config
@@ -158,26 +158,17 @@ rule SpawnRejectedTooManyTasks {
 -- 2. MODE VALIDATION (REQ-PROJ-008, REQ-BED-018)
 -- ===========================================================
 
--- A Work sub-agent requires Work authority on the parent's exact scope.
--- Mode remains provenance and does not independently grant or deny writes.
-rule WorkSubAgentRequiresWriteableParent {
+rule WorkSubAgentRequiresUnscopedParent {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: any_task_mode_is_work(tasks)
-    requires: parent.execution_authority = read_only
+    requires: parent.mode != direct
     ensures: SpawnAgentsRejected(parent,
-        reason: "Work sub-agents require Work authority on the parent WorkScope")
-}
-
-rule WorkSubAgentAllowedForApprovedExploreOrigin {
-    when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: any_task_mode_is_work(tasks)
-    requires: parent.execution_authority = write_capable
-    ensures: SpawnAgentsAuthorityAccepted(parent)
+        reason: "Git-backed Work sub-agents require enforceable filesystem isolation")
 
     @guidance
-        -- Explore-origin mode may remain as provenance after approval. The
-        -- parent's execution authority is the same WorkScope projection used by
-        -- tool dispatch and Bash isolation.
+        -- RuntimeManager validates the persisted parent before durable batch
+        -- admission. Direct parents retain unscoped Work delegation. Git-backed
+        -- parents keep their own write authority and may delegate Explore work.
 }
 
 -- REQ-PROJ-008: qualification is an exact allowlist over the parent's resolved
@@ -284,8 +275,7 @@ rule SpawnRejectedSystemRootCwd {
 -- runtime would see a different working_dir).
 rule SpawnRejectedWorkCwdOutsideWorktree {
     when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: parent.work_scope_authority = write_capable
-    requires: parent.worktree_path != absent
+    requires: parent.mode in { work, branch }
     requires: any_work_task_has_cwd_outside_worktree(tasks, parent.worktree_path)
     ensures: SpawnAgentsRejected(parent,
         reason: "Work sub-agent cwd must be inside the parent's worktree")
@@ -297,7 +287,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
         -- symlink that escapes the worktree is rejected.
         --
         -- When the task omits `cwd`, the effective cwd is the parent's
-        -- working_dir, which for any attached write-capable WorkScope equals
+        -- working_dir, which for parent.mode in { work, branch } equals
         -- worktree_path by REQ-PROJ-008's inherited-workspace contract — that
         -- case satisfies the invariant trivially.
 }
@@ -352,7 +342,7 @@ rule SubAgentSpecsResolved {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
-    requires: parent.work_scope_authority = write_capable
+    requires: parent.mode = direct
         or not any_task_mode_is_work(tasks)
     requires: parallel_work_qualified(parent.resolved_model_id)
         or work_task_count(tasks) <= 1
@@ -363,8 +353,7 @@ rule SubAgentSpecsResolved {
     requires: not any_task_has_unknown_agent_type(tasks, parent)
     requires: not any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
-    requires: parent.work_scope_authority != write_capable
-        or parent.worktree_path = absent
+    requires: parent.mode not in { work, branch }
         or not any_work_task_has_cwd_outside_worktree(
             tasks, parent.worktree_path)
     ensures: SubAgentSpecsCreated(parent, tasks)
@@ -492,10 +481,8 @@ rule DuplicateParentDeliveryIsIdempotent {
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
 -- Explore => `subagent_read_only` (read-only information tools + browser +
 -- sandboxed bash when the platform capability is available +
--- submit_result/submit_error). Ordinary Work => `subagent_write_capable`
--- (Explore set + Work bash + patch). AttachedWorkChild => `attached_work_confined`
--- (Work bash confined to its inherited worktree, without patch). All modes get
--- the parent's MCP tool set.
+-- submit_result/submit_error). Work => `subagent_write_capable`
+-- (Explore set + Work bash + patch). Both modes get the parent's MCP tool set.
 --
 -- Top-level Explore delegation is independent of sandbox support: the parent may
 -- call `spawn_agents` even when platform capability omits bash. The spawned
@@ -508,9 +495,7 @@ rule DuplicateParentDeliveryIsIdempotent {
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
     ensures:
-        if sub_agent.mode = attached_work_child:
-            sub_agent.tool_registry = attached_work_confined
-        else if execution_authority = write_capable:
+        if execution_authority = write_capable:
             sub_agent.tool_registry = subagent_write_capable
         else:
             sub_agent.tool_registry = subagent_read_only
@@ -526,9 +511,7 @@ rule SubAgentRegistryOnFreshSpawn {
 rule SubAgentRegistryOnResume {
     when: SubAgentRuntimeResumed(sub_agent)
     ensures:
-        if sub_agent.mode = attached_work_child:
-            sub_agent.tool_registry = attached_work_confined
-        else if sub_agent.execution_authority = read_only:
+        if sub_agent.execution_authority = read_only:
             sub_agent.tool_registry = subagent_read_only
         else:
             sub_agent.tool_registry = subagent_write_capable
@@ -544,17 +527,15 @@ rule SubAgentRegistryOnResume {
         -- The persisted `conv_mode` encodes the explore/work distinction:
         --   Explore sub-agents are spawned with
         --     ConvMode::Explore { worktree_path: None }
-        --   Work sub-agents inherit a Work-capable parent `conv_mode`.
-        --     When a write-capable parent retains Explore provenance after
-        --     approval, its Work child is persisted as AttachedWorkChild with
-        --     the inherited worktree path so recovery preserves both authority
-        --     and filesystem identity while distinguishing it from Explore.
+        --   Work sub-agents inherit the parent's `conv_mode`, which is one
+        --     of Direct, Work, or Branch (never Explore -- an Explore
+        --     parent cannot spawn a Work sub-agent; see
+        --     WorkSubAgentRequiresWriteableParent).
         --
         -- So the resume mapping is: Explore variant -> subagent_read_only;
-        -- Direct / Work / Branch / DetachedApprovedTask -> subagent_write_capable;
-        -- AttachedWorkChild -> attached_work_confined. A Work child of an approved
-        -- Explore-origin parent therefore keeps its OS-enforced inherited worktree
-        -- boundary and does not regain the pathname-based patch tool on recreation.
+        -- Direct / Work / Branch -> subagent_write_capable. A Work sub-agent
+        -- spawned from a Direct parent therefore keeps `patch` across
+        -- runtime re-creation despite being persisted as Direct.
 }
 
 ------------------------------------------------------------
@@ -590,11 +571,13 @@ invariant ParentAcceptsChildTerminalAtMostOnce {
 -- guarantees that sub-agent writes cannot escape the parent's
 -- isolation boundary.
 --
--- Direct mode has no worktree to scope against and remains unscoped by design.
--- Every write-capable sub-agent whose parent owns a worktree, including one from
--- an approved Explore-origin parent, stays within that inherited worktree.
+-- Work sub-agents spawned from a Direct parent are out of scope here:
+-- Direct mode has no worktree to scope against, and Direct's writes are
+-- unscoped by design (see REQ-PROJ-007's
+-- `parent.mode in { work, branch }` precondition). Explore sub-agents
+-- are read-only, so escape-via-cwd is not a write-safety concern.
 invariant WorkSubAgentCwdInsideWorktree {
-    for sa in SubAgents where sa.execution_authority = write_capable and sa.parent.worktree_path != absent:
+    for sa in SubAgents where sa.execution_authority = write_capable and sa.parent.mode in { work, branch }:
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 
@@ -611,10 +594,7 @@ invariant ToolRegistryMatchesMode {
         (sa.execution_authority = read_only
             implies sa.tool_registry = subagent_read_only)
         and
-        (sa.execution_authority = write_capable and sa.mode = attached_work_child
-            implies sa.tool_registry = attached_work_confined)
-        and
-        (sa.execution_authority = write_capable and sa.mode != attached_work_child
+        (sa.execution_authority = write_capable
             implies sa.tool_registry = subagent_write_capable)
 }
 

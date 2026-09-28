@@ -6743,7 +6743,6 @@ async fn cascade_project_target(
             Some((String::new(), worktree_path.to_string(), false))
         }
         ConvMode::Direct
-        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::Explore {
             worktree_path: None,
             ..

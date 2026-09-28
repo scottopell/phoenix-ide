@@ -506,8 +506,7 @@ rule BashIsolationMatchesWorkScopeAuthority {
 
     @guidance
         -- Restricted WorkScope authority selects the Explore OS sandbox.
-        -- AttachedWorkChild with Work authority selects the inherited-worktree
-        -- confined OS sandbox. Other Work authority selects unsandboxed Bash.
+        -- Work authority selects unsandboxed Bash.
         -- Conversation mode otherwise remains provenance, not authority.
 }
 

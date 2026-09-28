@@ -9299,7 +9299,6 @@ where
                         (Some(branch_name.clone()), "Branch")
                     }
                     Some(ModeContext::Explore { .. }) => (None, "Explore"),
-                    Some(ModeContext::AttachedWorkChild { .. }) => (None, "Work Child"),
                     Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
                     Some(ModeContext::Direct) | None => (None, "Direct"),
                 };

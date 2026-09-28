@@ -1227,7 +1227,6 @@ impl RuntimeManager {
             ConvMode::Work { .. }
             | ConvMode::Branch { .. }
             | ConvMode::Direct
-            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::DetachedApprovedTask { .. } => {}
             ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                 return Err(ForkResolveError::Conflict(

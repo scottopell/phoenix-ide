@@ -2032,9 +2032,7 @@ impl Database {
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
             "direct" => AuthorityKind::Direct,
-            "work" | "branch" | "attached_work_child" | "detached_approved_task" => {
-                AuthorityKind::Work
-            }
+            "work" | "branch" | "detached_approved_task" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -7829,7 +7827,6 @@ impl Database {
                 AuthorityKind::RestrictedExplore
             }
             ConvMode::Direct
-            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::Branch { .. }
             | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
@@ -10188,7 +10185,6 @@ impl Database {
                             AuthorityKind::RestrictedExplore
                         }
                         ConvMode::Direct
-                        | ConvMode::AttachedWorkChild { .. }
                         | ConvMode::Work { .. }
                         | ConvMode::Branch { .. }
                         | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
@@ -13393,15 +13389,6 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
-        ConvMode::AttachedWorkChild { worktree_path } => ConvModeCols {
-            kind: "attached_work_child",
-            branch_name: None,
-            worktree_path: Some(worktree_path.as_str()),
-            base_branch: None,
-            task_id: None,
-            task_title: None,
-            next_taskmd_id_hint: None,
-        },
         ConvMode::DetachedProductCreation {
             worktree_path,
             base_branch,
@@ -13482,14 +13469,6 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
-                ConvMode::default()
-            }
-        }
-        Some("attached_work_child") => {
-            if let Some(worktree_path) = ne_env("env_worktree_path") {
-                ConvMode::AttachedWorkChild { worktree_path }
-            } else {
-                tracing::warn!(conv_id = %conv_id, "attached Work child row missing worktree, defaulting to Explore");
                 ConvMode::default()
             }
         }

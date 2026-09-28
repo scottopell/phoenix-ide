@@ -44,9 +44,13 @@ The authority projection change is forward-only. A forward migration repairs leg
 
 Pre-feature approval rows have no durable operation-scoped message discriminator. Migration creates an empty obligation table; it does not manufacture replay ownership from lifetime objectives or presentation text. Such interrupted legacy requests retain ordinary startup recovery, while new approvals atomically persist their exact message-bound obligation.
 
+## Scope decision
+
+On 2026-09-28, a live macOS probe demonstrated that an in-worktree hard link allowed a sandboxed child to modify an externally aliased inode. The user chose to separate child isolation from parent approval repair. Git-backed Work-child admission is rejected explicitly; the incomplete confined-child mode and sandbox are excluded. Restoring it requires an isolation design that handles inode aliasing and concurrent filesystem mutation.
+
 ## Consequences
 
-- Explore-origin conversations with approved WorkScope authority receive unsandboxed Work Bash and may spawn one Work child under existing single-writer rules.
+- Explore-origin conversations with approved WorkScope authority receive unsandboxed Work Bash while Git-backed Work-child admission fails closed until filesystem isolation is enforceable. Direct-mode Work-child execution remains available.
 - Unapproved Explore-origin conversations remain fully Restricted even when a Git worktree exists.
 - Mode-based capability branches and no-op authority-upgrade hooks are removed or narrowed to provenance-only behavior.
 - Approval and reconstruction tests must exercise real authority-dependent consumers, including Bash and Work-child admission.

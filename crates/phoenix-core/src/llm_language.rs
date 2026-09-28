@@ -289,7 +289,7 @@ pub fn mode_explore(
 pub fn mode_approved_explore_work(lang: LlmLanguage, worktree_path: &str) -> String {
     match lang {
         LlmLanguage::PhoenixNative => format!(
-            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
+            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Git-backed Work sub-agents are unavailable because filesystem isolation cannot be enforced; use Explore children for read-only delegation and perform writes in this parent. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
         ),
         LlmLanguage::Caveman => format!(
             "\n\nTask approved. Work power in {worktree_path}. Do this task now. No same plan again. User ask different next task? New plan allowed."
@@ -397,18 +397,6 @@ pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String
         ),
         LlmLanguage::Caveman => format!(
             "{prefix}{artifact_path}`. File is actionable snapshot: failed CI (logs inline when Phoenix grab them) and unresolved/actionable review feedback. No inline log? Fetch current log yourself. Review-thread item carry `thread_id` (`PRRT_…` node id) — feed that, not comment `id`, to `resolveReviewThread` mutation when mark thread resolved. Fix in this cave. Run focused tests. Commit changes. Say what changed."
-        ),
-    }
-}
-
-#[must_use]
-pub fn mode_attached_work_child(lang: LlmLanguage, worktree_path: &str) -> String {
-    match lang {
-        LlmLanguage::PhoenixNative => format!(
-            "\n\nYou are a Work sub-agent attached to the parent's isolated worktree at {worktree_path}. You have write-capable tools for the delegated objective. Keep every write within this worktree. When the task explicitly names an external resource, you may read it but must not modify it. Do not create, remove, or claim ownership of the parent worktree."
-        ),
-        LlmLanguage::Caveman => format!(
-            "\n\nYou Work sub-agent in parent worktree {worktree_path}. Write tools yours for delegated job. All writes stay in this worktree. Job name outside resource? Read only, no change. Do not create, remove, or own parent worktree."
         ),
     }
 }

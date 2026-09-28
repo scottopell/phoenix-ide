@@ -1,5 +1,9 @@
 # Make Explore-to-Work approval one atomic capability transition
 
+## Approved split (2026-09-28)
+
+The user authorized landing Part 1: parent approval capability, durable recovery, and consistent runtime projection. Git-backed Work-child execution is explicitly rejected; Direct Work delegation remains available. The original Work-child success criteria below are deferred to task66007, which owns enforceable filesystem isolation. This split supersedes those delivery criteria without dropping the follow-up.
+
 ## Commission and preservation constraints
 
 This P0 owns the product defect end-to-end and is separate from task 98016, whose implementation is already dirty in another WorkScope. Preserve incident conversation `6854e5c5-080d-4d3f-8874-75a08df7f051`, WorkScope `2c27bc33-3dcc-4f1b-ba2c-a7851fe50deb`, and worktree `.phoenix/worktrees/b4546ad2-138e-4c72-b527-9028428b16eb` read-only while fixing this defect: never discard/reset its changes, never manufacture context exhaustion, and never use child delegation as a rescue workaround. No deployment is authorized.
