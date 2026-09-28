@@ -2318,17 +2318,8 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
     manager.shutdown_all().await.expect("browser shutdown");
 }
 
-/// Gated (chrome only): real Tracing long-task extraction.
-///
-/// The `Tracing.dataCollected` listener, the `tracingComplete`
-/// notify-wait (with the `Notified::enable()` lost-wakeup fix), and the
-/// `dur > 50_000us` long-task parse have never run against a live trace.
-/// A single >50ms blocking task is generated; the load-bearing assertion
-/// is that `trace_stop` completes without timing out and reports a
-/// long-task count (trace category timing varies by Chrome build, so the
-/// count itself is not hard-asserted).
 #[tokio::test]
-async fn test_browser_profile_trace_stop_long_task_real() {
+async fn test_browser_profile_trace_round_trip_real() {
     require_chrome!();
 
     let (ctx, manager) = test_context("test-profile-trace-real");
@@ -2346,53 +2337,30 @@ async fn test_browser_profile_trace_stop_long_task_real() {
         start.output()
     );
 
-    // One blocking task well over the 50ms long-task threshold.
-    let block = BrowserEvalTool
-        .run(
-            json!({ "expression": "var t=Date.now(); while(Date.now()-t<120){}; 'done'" }),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        block.is_success(),
-        "blocking eval failed: {}",
-        block.output()
-    );
-
     let stop = BrowserProfileTool
         .run(json!({ "action": "trace_stop" }), ctx.clone())
         .await;
-    // Load-bearing: trace_stop completed (drain path + enable() race fix
-    // worked end-to-end; a timeout would still succeed but append a note).
     assert!(
         stop.is_success(),
         "trace_stop should succeed: {}",
         stop.output()
     );
     assert!(
-        stop.output().contains("Trace saved to"),
-        "trace_stop must report a saved trace: {}",
+        !stop.output().contains("tracingComplete timed out"),
+        "real trace round trip must observe completion: {}",
         stop.output()
     );
+    let path = extract_tmp_path(stop.output(), "/tmp/phoenix-trace-", ".json")
+        .expect("trace_stop reports its saved trace");
+    let trace: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).expect("saved trace remains readable after trace_stop"),
+    )
+    .expect("saved trace is valid JSON");
     assert!(
-        extract_tmp_path(stop.output(), "/tmp/phoenix-trace-", ".json").is_some(),
-        "trace_stop must report a /tmp/phoenix-trace- path: {}",
-        stop.output()
+        trace["traceEvents"].is_array(),
+        "saved trace contains a traceEvents array"
     );
-    // The extraction ran and reported a count: "Long tasks (>50ms): <n>".
-    let marker = "Long tasks (>50ms):";
-    let (_, after) = stop.output().split_once(marker).unwrap_or_else(|| {
-        panic!(
-            "trace_stop must report a long-task count: {}",
-            stop.output()
-        )
-    });
-    let after = after.trim_start();
-    assert!(
-        after.chars().next().is_some_and(|c| c.is_ascii_digit()),
-        "long-task marker must be followed by a numeric count: {}",
-        stop.output()
-    );
+    std::fs::remove_file(path).expect("remove test trace");
 
     manager.shutdown_all().await.expect("browser shutdown");
 }

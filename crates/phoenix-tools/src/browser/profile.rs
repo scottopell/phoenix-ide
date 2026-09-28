@@ -1746,6 +1746,53 @@ async fn action_trace_start(
     ))
 }
 
+#[derive(Debug, PartialEq)]
+struct TraceLongTask {
+    name: String,
+    duration_us: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct TraceEventSummary {
+    event_count: usize,
+    long_tasks: Vec<TraceLongTask>,
+}
+
+impl TraceEventSummary {
+    fn from_events(events: &[Value]) -> Self {
+        let mut long_tasks: Vec<TraceLongTask> = events
+            .iter()
+            .filter_map(|event| {
+                let duration_us = event.get("dur").and_then(Value::as_f64)?;
+                (duration_us > LONG_TASK_US).then(|| TraceLongTask {
+                    name: event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(unnamed)")
+                        .to_string(),
+                    duration_us,
+                })
+            })
+            .collect();
+        long_tasks.sort_by(|a, b| {
+            b.duration_us
+                .partial_cmp(&a.duration_us)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Self {
+            event_count: events.len(),
+            long_tasks,
+        }
+    }
+
+    fn long_task_total_ms(&self) -> f64 {
+        self.long_tasks
+            .iter()
+            .map(|task| task.duration_us / 1000.0)
+            .sum()
+    }
+}
+
 async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     // Allium TraceStopWhenActive: stop-when-idle is an error.
     if with_profiling(session, |st| st.tracing_active).await != Some(true) {
@@ -1793,30 +1840,14 @@ async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
         None => return ToolOutput::error("profiling state lock poisoned"),
     };
 
-    // Long-task extraction (REQ-BT-019.9): events with dur > 50_000us.
-    let mut long_tasks: Vec<(String, f64)> = events
-        .iter()
-        .filter_map(|e| {
-            let dur = e.get("dur").and_then(Value::as_f64)?;
-            if dur > LONG_TASK_US {
-                let name = e
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(unnamed)")
-                    .to_string();
-                Some((name, dur))
-            } else {
-                None
-            }
-        })
-        .collect();
-    long_tasks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let long_count = long_tasks.len();
-    let long_total_ms: f64 = long_tasks.iter().map(|(_, d)| d / 1000.0).sum();
-    let top: Vec<String> = long_tasks
+    let event_summary = TraceEventSummary::from_events(&events);
+    let long_count = event_summary.long_tasks.len();
+    let long_total_ms = event_summary.long_task_total_ms();
+    let top: Vec<String> = event_summary
+        .long_tasks
         .iter()
         .take(5)
-        .map(|(n, d)| format!("    {n}: {:.1}ms", d / 1000.0))
+        .map(|task| format!("    {}: {:.1}ms", task.name, task.duration_us / 1000.0))
         .collect();
 
     let wrapper = json!({ "traceEvents": events });
@@ -1829,7 +1860,7 @@ async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
         return ToolOutput::error(format!("Failed to write trace: {e}"));
     }
 
-    let event_count = events.len();
+    let event_count = event_summary.event_count;
     let mut summary = format!(
         "Trace saved to {path} ({event_count} events). Long tasks (>50ms): {long_count}, \
          total {long_total_ms:.1}ms."
@@ -1845,12 +1876,13 @@ async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
     // Structured payload for the UI renderer. `long_tasks` carries the
     // full sorted list (text shows only top 5); `ms` is wall-time
     // milliseconds, derived from the CDP `dur` field (microseconds).
-    let long_tasks_payload: Vec<Value> = long_tasks
+    let long_tasks_payload: Vec<Value> = event_summary
+        .long_tasks
         .iter()
-        .map(|(name, dur_us)| {
+        .map(|task| {
             json!({
-                "name": name,
-                "ms": dur_us / 1000.0,
+                "name": task.name,
+                "ms": task.duration_us / 1000.0,
             })
         })
         .collect();
@@ -2226,6 +2258,35 @@ mod tests {
         let h = help_text();
         assert!(h.contains("run_scenario"));
         assert!(h.contains("RAW per-run"));
+    }
+
+    #[test]
+    fn trace_event_summary_uses_strict_long_task_threshold() {
+        let events = vec![
+            json!({"name":"below", "dur": 49_999}),
+            json!({"name":"boundary", "dur": 50_000}),
+            json!({"name":"longer", "dur": 75_000}),
+            json!({"dur": 50_001}),
+            json!({"name":"missing"}),
+            json!({"name":"malformed", "dur":"90000"}),
+        ];
+
+        let summary = TraceEventSummary::from_events(&events);
+        assert_eq!(summary.event_count, 6);
+        assert_eq!(
+            summary.long_tasks,
+            vec![
+                TraceLongTask {
+                    name: "longer".to_string(),
+                    duration_us: 75_000.0,
+                },
+                TraceLongTask {
+                    name: "(unnamed)".to_string(),
+                    duration_us: 50_001.0,
+                },
+            ]
+        );
+        assert_eq!(summary.long_task_total_ms(), 125.001);
     }
 
     #[test]
