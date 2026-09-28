@@ -1567,15 +1567,6 @@ impl TestTmuxServerOwner {
             .with_test_spawn_containment(self.control_root_path().to_path_buf())
     }
 
-    #[cfg(test)]
-    pub(crate) fn registry_with_sink(
-        &self,
-        sink: Option<super::registry::TmuxLifecycleSink>,
-    ) -> TmuxRegistry {
-        TmuxRegistry::with_socket_dir_binary_and_sink(self.socket_dir().to_path_buf(), true, sink)
-            .with_test_spawn_containment(self.control_root_path().to_path_buf())
-    }
-
     pub(crate) fn control_root_path(&self) -> &Path {
         self.control_root
             .as_ref()

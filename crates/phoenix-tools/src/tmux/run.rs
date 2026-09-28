@@ -220,6 +220,7 @@ impl Tool for TmuxRunTool {
     }
 }
 
+#[derive(Debug)]
 enum ValidReadiness {
     ReturnImmediately,
     WaitForText { text: String, timeout: Duration },
@@ -265,6 +266,31 @@ fn effective_file_root(ctx: &ToolContext) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
+fn new_window_args(
+    cwd: &Path,
+    requested_name: &str,
+    cmd: &str,
+    keep_open_on_exit: bool,
+    preserve_for_readiness: bool,
+) -> Vec<String> {
+    let wrapper = shell_wrapper(cmd, keep_open_on_exit, preserve_for_readiness);
+    let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
+    vec![
+        "new-window".to_string(),
+        "-d".to_string(),
+        "-P".to_string(),
+        "-F".to_string(),
+        "#{window_id}|#{window_name}".to_string(),
+        "-t".to_string(),
+        "main".to_string(),
+        "-n".to_string(),
+        requested_name.to_string(),
+        "-c".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        shell_command,
+    ]
+}
+
 async fn start_tmux_window(
     config_path: &Path,
     socket_path: &Path,
@@ -274,28 +300,16 @@ async fn start_tmux_window(
     keep_open_on_exit: bool,
     preserve_for_readiness: bool,
 ) -> Result<TmuxRunTarget, ToolOutput> {
-    let wrapper = shell_wrapper(cmd, keep_open_on_exit, preserve_for_readiness);
-    let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
-    let start_output = run_tmux_cli(
-        config_path,
-        socket_path,
-        &[
-            "new-window".to_string(),
-            "-d".to_string(),
-            "-P".to_string(),
-            "-F".to_string(),
-            "#{window_id}|#{window_name}".to_string(),
-            "-t".to_string(),
-            "main".to_string(),
-            "-n".to_string(),
-            requested_name.to_string(),
-            "-c".to_string(),
-            cwd.to_string_lossy().into_owned(),
-            shell_command,
-        ],
-    )
-    .await
-    .map_err(|e| error_envelope("tmux_run_start_failed", &e))?;
+    let args = new_window_args(
+        cwd,
+        requested_name,
+        cmd,
+        keep_open_on_exit,
+        preserve_for_readiness,
+    );
+    let start_output = run_tmux_cli(config_path, socket_path, &args)
+        .await
+        .map_err(|e| error_envelope("tmux_run_start_failed", &e))?;
     if !start_output.status.success() {
         let (stdout, stderr, truncated) = truncate_pair(&start_output.stdout, &start_output.stderr);
         return Err(structured_response(
@@ -373,19 +387,52 @@ async fn return_immediately_response(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CompletionCleanup {
-    KillWindow,
-    RestoreExitCleanup,
+    KillWindow(String),
+    RestoreExitCleanup(String),
 }
 
-fn completion_cleanup(close_after_completion: bool, exited: bool) -> Option<CompletionCleanup> {
+fn completion_cleanup(
+    close_after_completion: bool,
+    exited: bool,
+    window_id: &str,
+) -> Option<CompletionCleanup> {
     if !close_after_completion {
         None
     } else if exited {
-        Some(CompletionCleanup::KillWindow)
+        Some(CompletionCleanup::KillWindow(window_id.to_string()))
     } else {
-        Some(CompletionCleanup::RestoreExitCleanup)
+        Some(CompletionCleanup::RestoreExitCleanup(window_id.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitStatus {
+    Ready,
+    Exited,
+    TimedOut,
+    Pending,
+}
+
+fn wait_status(readiness_seen: bool, exited: bool, timed_out: bool) -> WaitStatus {
+    if readiness_seen {
+        WaitStatus::Ready
+    } else if exited {
+        WaitStatus::Exited
+    } else if timed_out {
+        WaitStatus::TimedOut
+    } else {
+        WaitStatus::Pending
+    }
+}
+
+fn status_name(status: WaitStatus) -> Option<&'static str> {
+    match status {
+        WaitStatus::Ready => Some("ready"),
+        WaitStatus::Exited => Some("exited"),
+        WaitStatus::TimedOut => Some("readiness_timed_out"),
+        WaitStatus::Pending => None,
     }
 }
 
@@ -415,15 +462,11 @@ async fn wait_for_text_response(
                 readiness_seen: false,
             });
         let exited = observation.exit_code.is_some();
-        let status = if observation.readiness_seen {
-            Some("ready")
-        } else if exited {
-            Some("exited")
-        } else if Instant::now() >= deadline {
-            Some("readiness_timed_out")
-        } else {
-            None
-        };
+        let status = status_name(wait_status(
+            observation.readiness_seen,
+            exited,
+            Instant::now() >= deadline,
+        ));
         if let Some(status) = status {
             let response = structured_response(
                 status,
@@ -434,12 +477,12 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            match completion_cleanup(close_after_completion, exited) {
-                Some(CompletionCleanup::KillWindow) => {
-                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            match completion_cleanup(close_after_completion, exited, &target.window_id) {
+                Some(CompletionCleanup::KillWindow(window_id)) => {
+                    let _ = kill_window(config_path, socket_path, &window_id).await;
                 }
-                Some(CompletionCleanup::RestoreExitCleanup) => {
-                    match restore_exit_cleanup(config_path, socket_path, &target.window_id).await {
+                Some(CompletionCleanup::RestoreExitCleanup(window_id)) => {
+                    match restore_exit_cleanup(config_path, socket_path, &window_id).await {
                         Ok(()) => {}
                         Err(error) => {
                             tracing::debug!(window_id = target.window_id, %error, "failed to restore tmux exit cleanup");
@@ -776,333 +819,147 @@ mod tests {
         ctx
     }
 
-    async fn assert_window_eventually_closed(
-        config_path: &Path,
-        socket_path: &Path,
-        window_id: &str,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let capture = run_tmux_cli(
-                config_path,
-                socket_path,
-                &[
-                    "capture-pane".into(),
-                    "-p".into(),
-                    "-t".into(),
-                    window_id.into(),
-                ],
-            )
-            .await
-            .expect("query tmux window");
-            if !capture.status.success() {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "window should close after command completion"
-            );
-            // test-timing-allow: tmux window disappearance is the observable completion behavior
-            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-        }
-    }
-
     #[tokio::test]
-    async fn direct_conversations_run_in_immutable_working_dir() {
+    async fn real_lifecycle_smoke_covers_run_and_explicit_cleanup() {
         if skip_unless_tmux() {
             return;
         }
         let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let cwd = cwd_tmp.path().canonicalize().unwrap();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx("tmux-run-direct-cwd", cwd.clone(), registry, None);
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "pwd",
-                    "name": "tmux-run-direct-cwd",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ready");
-        assert_eq!(v["cwd"].as_str().unwrap(), cwd.to_string_lossy());
-        assert!(v["captured_output"]["stdout"]
-            .as_str()
-            .unwrap()
-            .contains(&cwd.to_string_lossy().to_string()));
-
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn worktree_conversations_run_in_worktree_path() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let unrelated_cwd = TempDir::new().unwrap();
+        let direct_tmp = TempDir::new().unwrap();
         let worktree_tmp = TempDir::new().unwrap();
+        let direct = direct_tmp.path().canonicalize().unwrap();
         let worktree = worktree_tmp.path().canonicalize().unwrap();
+        let unrelated = TempDir::new().unwrap();
         let registry = Arc::new(owner.registry());
-        let ctx = ctx(
-            "tmux-run-worktree-cwd",
-            unrelated_cwd.path().canonicalize().unwrap(),
-            registry,
-            Some(worktree.clone()),
-        );
+        let config_path = registry.config_path();
+        let registrar = MockWakeRegistrar::new();
+        let mut owned_windows = Vec::new();
 
-        let result = TmuxRunTool
+        let cases = [
+            (
+                "tmux-run-smoke-direct",
+                direct.clone(),
+                None,
+                "pwd",
+                "__PHOENIX_EXIT__",
+            ),
+            (
+                "tmux-run-smoke-worktree",
+                unrelated.path().canonicalize().unwrap(),
+                Some(worktree.clone()),
+                "echo trailing-comment-ok # comment",
+                "__PHOENIX_EXIT__",
+            ),
+            (
+                "tmux-run-smoke-failure",
+                direct.clone(),
+                None,
+                "echo before-failure; exit 7",
+                "__PHOENIX_EXIT__",
+            ),
+        ];
+        for (name, cwd, worktree_path, cmd, readiness_text) in cases {
+            let case_ctx = ctx_with_registrar(
+                name,
+                cwd,
+                registry.clone(),
+                worktree_path,
+                Some(registrar.clone()),
+            );
+            let result = TmuxRunTool
+                .run(
+                    json!({
+                        "cmd": cmd,
+                        "name": name,
+                        "readiness": {"mode": "wait_for_text", "text": readiness_text, "timeout_seconds": 5}
+                    }),
+                    case_ctx.clone(),
+                )
+                .await;
+            assert!(result.is_success(), "got: {}", result.output());
+            let v = parse_response(&result);
+            assert_eq!(v["status"], "ready");
+            assert!(v.get("wake_registration").is_none());
+            let window_id = v["window_id"].as_str().unwrap().to_string();
+            let socket_path = case_ctx
+                .tmux()
+                .await
+                .unwrap()
+                .read()
+                .await
+                .socket_path
+                .clone();
+            owned_windows.push((socket_path, window_id));
+            match name {
+                "tmux-run-smoke-direct" => {
+                    assert_eq!(v["cwd"], direct.to_string_lossy().as_ref());
+                    assert!(v["captured_output"]["stdout"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&direct.to_string_lossy().to_string()));
+                }
+                "tmux-run-smoke-worktree" => {
+                    assert_eq!(v["cwd"], worktree.to_string_lossy().as_ref());
+                    assert!(v["captured_output"]["stdout"]
+                        .as_str()
+                        .unwrap()
+                        .contains("trailing-comment-ok"));
+                    assert!(v["captured_output"]["stdout"]
+                        .as_str()
+                        .unwrap()
+                        .contains("__PHOENIX_EXIT__ exit_code=0"));
+                }
+                "tmux-run-smoke-failure" => {
+                    assert_eq!(v["exit_code"], 7);
+                    let output = v["captured_output"]["stdout"].as_str().unwrap();
+                    assert!(output.contains("before-failure"));
+                    assert!(output.contains("__PHOENIX_EXIT__ exit_code=7"));
+                    assert_eq!(v["captured_output"]["truncated"], false);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let immediate_ctx = ctx_with_registrar(
+            "tmux-run-smoke-immediate",
+            direct.clone(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+        let immediate = TmuxRunTool
             .run(
-                json!({
-                    "cmd": "pwd",
-                    "name": "tmux-run-worktree-cwd",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
+                json!({"cmd": "echo immediate-smoke", "name": "tmux-run-smoke-immediate"}),
+                immediate_ctx.clone(),
             )
             .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["cwd"].as_str().unwrap(), worktree.to_string_lossy());
-        assert!(v["captured_output"]["stdout"]
-            .as_str()
+        assert!(immediate.is_success(), "got: {}", immediate.output());
+        let immediate_value = parse_response(&immediate);
+        assert_eq!(immediate_value["status"], "started");
+        assert!(immediate_value.get("wake_registration").is_none());
+        let provider_value: Value =
+            serde_json::from_str(immediate.output()).expect("provider JSON");
+        assert!(provider_value.get("wake_registration").is_none());
+        let socket_path = immediate_ctx
+            .tmux()
+            .await
             .unwrap()
-            .contains(&worktree.to_string_lossy().to_string()));
-
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn quick_failure_leaves_inspectable_output_and_exit_marker() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx(
-            "tmux-run-quick-failure",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo before-failure; exit 7",
-                    "name": "tmux-run-quick-failure",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["window_name"], "tmux-run-quick-failure");
-        assert!(
-            v["window_id"].as_str().unwrap().starts_with('@'),
-            "window_id should be a unique tmux id: {v}"
-        );
-        assert_eq!(v["exit_code"], 7);
-        let pane = v["captured_output"]["stdout"].as_str().unwrap();
-        assert!(pane.contains("before-failure"), "pane output: {pane}");
-        assert!(
-            pane.contains("__PHOENIX_EXIT__ exit_code=7"),
-            "pane output: {pane}"
-        );
-        assert_eq!(v["captured_output"]["truncated"], false);
-
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn return_immediately_does_not_register_wake() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            "tmux-run-wake-immediate",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-            Some(registrar.clone()),
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "sleep 10",
-                    "name": "tmux-run-wake-immediate"
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "started");
-        assert!(v.get("wake_registration").is_none());
-        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn return_immediately_with_keep_closed_closes_without_wake() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let config_path = registry.config_path();
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            "tmux-run-immediate-close",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-            Some(registrar.clone()),
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "sleep 0.2",
-                    "name": "tmux-run-immediate-close",
-                    "keep_open_on_exit": false
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "started");
-        assert!(v.get("wake_registration").is_none());
+            .read()
+            .await
+            .socket_path
+            .clone();
+        owned_windows.push((
+            socket_path,
+            immediate_value["window_id"].as_str().unwrap().to_string(),
+        ));
         assert_eq!(registrar.register_calls(), 0);
 
-        let socket_path = owner.path().join("conv-tmux-run-immediate-close.sock");
-        assert_window_eventually_closed(
-            &config_path,
-            &socket_path,
-            v["window_id"].as_str().unwrap(),
-        )
-        .await;
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn readiness_response_does_not_register_wake() {
-        if skip_unless_tmux() {
-            return;
+        // Invoke production cleanup explicitly; owner shutdown is only the backstop.
+        for (socket_path, window_id) in owned_windows {
+            kill_window(&config_path, &socket_path, &window_id)
+                .await
+                .unwrap_or_else(|error| panic!("explicit cleanup for {window_id}: {error}"));
         }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            "tmux-run-wake-ready",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-            Some(registrar.clone()),
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo READY; sleep 10",
-                    "name": "tmux-run-wake-ready",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "READY",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ready");
-        assert!(v.get("wake_registration").is_none());
-        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn readiness_timeout_with_keep_closed_closes_after_command_without_wake() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let config_path = registry.config_path();
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            "tmux-run-readiness-timeout-close",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-            Some(registrar.clone()),
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "sleep 1.2",
-                    "name": "tmux-run-readiness-timeout-close",
-                    "keep_open_on_exit": false,
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "never-appears",
-                        "timeout_seconds": 1
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "readiness_timed_out");
-        assert!(v.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
-
-        let socket_path = owner
-            .path()
-            .join("conv-tmux-run-readiness-timeout-close.sock");
-        assert_window_eventually_closed(
-            &config_path,
-            &socket_path,
-            v["window_id"].as_str().unwrap(),
-        )
-        .await;
         owner.shutdown();
     }
 
@@ -1144,207 +1001,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wrapper_preserves_commands_with_trailing_comments() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx(
-            "tmux-run-trailing-comment",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo trailing-comment-ok # comment",
-                    "name": "tmux-run-trailing-comment",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["exit_code"], 0);
-        let pane = v["captured_output"]["stdout"].as_str().unwrap();
-        assert!(pane.contains("trailing-comment-ok"), "pane output: {pane}");
-        assert!(
-            pane.contains("__PHOENIX_EXIT__ exit_code=0"),
-            "pane output: {pane}"
-        );
-
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn window_name_rejects_pipe_delimiter() {
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
-            owner.path().to_path_buf(),
-            false,
-        ));
-        let ctx = ctx(
-            "tmux-run-name-pipe",
-            cwd_tmp.path().to_path_buf(),
-            registry,
-            None,
-        );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo hi",
-                    "name": "api|watch"
-                }),
-                ctx,
-            )
-            .await;
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "invalid_window_name");
+    #[test]
+    fn input_validation_rejects_pipe_and_empty_readiness_and_orphan_fields() {
+        let error = normalize_window_name("api|watch").unwrap_err();
+        assert_eq!(parse_response(&error)["error"], "invalid_window_name");
+        let error = validate_readiness(Readiness::WaitForText {
+            text: "   ".to_string(),
+            timeout_seconds: 5,
+        })
+        .unwrap_err();
+        assert_eq!(parse_response(&error)["error"], "empty_readiness_text");
+        let error = serde_json::from_value::<TmuxRunInput>(json!({
+            "cmd": "echo hi",
+            "readiness": {"mode": "return_immediately", "timeout_seconds": 5}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn completed_wait_for_text_selects_window_cleanup() {
+    fn completed_wait_for_text_selects_exact_window_cleanup() {
+        let window_id = "@42";
         assert_eq!(
-            completion_cleanup(true, true),
-            Some(CompletionCleanup::KillWindow)
+            completion_cleanup(true, true, window_id),
+            Some(CompletionCleanup::KillWindow("@42".to_string()))
         );
         assert_eq!(
-            completion_cleanup(true, false),
-            Some(CompletionCleanup::RestoreExitCleanup)
+            completion_cleanup(true, false, window_id),
+            Some(CompletionCleanup::RestoreExitCleanup("@42".to_string()))
         );
-        assert_eq!(completion_cleanup(false, true), None);
+        assert_eq!(completion_cleanup(false, true, window_id), None);
+        assert_eq!(
+            completion_cleanup(true, true, "@timeout-window"),
+            Some(CompletionCleanup::KillWindow("@timeout-window".to_string()))
+        );
+        assert_eq!(
+            status_name(wait_status(false, false, true)),
+            Some("readiness_timed_out")
+        );
     }
 
-    #[tokio::test]
-    async fn tmux_run_targets_main_session() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let ctx = ctx(
-            "tmux-run-main-session",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-        );
-
-        let server = ctx
-            .tmux_registry()
-            .ensure_live(
-                &ctx.work_scope,
-                ctx.working_dir(),
-                ctx.worktree_path.as_deref(),
-                Some(&ctx.conversation_id),
-            )
-            .await
-            .unwrap();
-        let socket_path = server.read().await.socket_path.clone();
-        let config_path = ctx.tmux_registry().config_path();
-        let _ = run_tmux_cli(
-            &config_path,
-            &socket_path,
-            &[
-                "new-session".to_string(),
-                "-d".to_string(),
-                "-s".to_string(),
-                "other".to_string(),
-            ],
-        )
-        .await
-        .unwrap();
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo session-target",
-                    "name": "tmux-run-main-session",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        let window_id = v["window_id"].as_str().unwrap();
-        let display = run_tmux_cli(
-            &config_path,
-            &socket_path,
-            &[
-                "display-message".to_string(),
-                "-p".to_string(),
-                "-t".to_string(),
-                window_id.to_string(),
-                "#{session_name}".to_string(),
-            ],
-        )
-        .await
-        .unwrap();
-        assert_eq!(String::from_utf8_lossy(&display.stdout).trim(), "main");
-        owner.shutdown();
-    }
-
-    #[tokio::test]
-    async fn readiness_rejects_empty_text_and_orphan_timeout() {
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
-            owner.path().to_path_buf(),
-            false,
-        ));
-        let ctx = ctx(
-            "tmux-run-readiness-invalid",
-            cwd_tmp.path().to_path_buf(),
-            registry,
-            None,
-        );
-
-        let empty = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo hi",
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "   ",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx.clone(),
-            )
-            .await;
-        let v = parse_response(&empty);
-        assert_eq!(v["error"], "empty_readiness_text");
-
-        let orphan = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo hi",
-                    "readiness": {
-                        "mode": "return_immediately",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        let v = parse_response(&orphan);
-        assert_eq!(v["error"], "invalid_input");
+    #[test]
+    fn production_new_window_argv_uses_main_and_immutable_cwd() {
+        let cwd = Path::new("/project/worktree");
+        let args = new_window_args(cwd, "smoke", "echo hi", false, false);
+        assert_eq!(args[0], "new-window");
+        assert_eq!(args[6], "main");
+        assert_eq!(args[8], "smoke");
+        assert_eq!(args[10], "/project/worktree");
+        assert!(args[11].starts_with("bash -lc "));
+        let wrapper = shell_wrapper("echo hi", false, false);
+        assert!(args[11].contains(&shell_quote(&wrapper)));
     }
 }
