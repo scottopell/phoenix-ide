@@ -63,6 +63,19 @@ pub enum ScreencastEvent {
     Url(String),
 }
 
+#[derive(Default)]
+pub(crate) struct ScreencastLifecycle {
+    generation: Mutex<u64>,
+}
+
+fn next_generation(current: u64) -> u64 {
+    current.wrapping_add(1)
+}
+
+fn generation_owns_stop(current: u64, broker: u64) -> bool {
+    current == broker
+}
+
 /// Per-`BrowserSession` screencast broker. One source (CDP), many sinks
 /// (WebSocket clients). Created on first viewer attach, dropped when the
 /// last viewer detaches.
@@ -77,6 +90,8 @@ pub struct ScreencastBroker {
     /// Aborted on `Drop` so we don't leak a CDP listener after the last
     /// viewer detaches.
     listener_task: JoinHandle<()>,
+    lifecycle: Arc<ScreencastLifecycle>,
+    generation: u64,
 }
 
 impl ScreencastBroker {
@@ -90,7 +105,10 @@ impl ScreencastBroker {
     /// # Errors
     /// Returns [`BrowserError`] when subscribing to CDP events or issuing
     /// `Page.startScreencast` fails.
-    pub async fn start(page: Page) -> Result<Arc<Self>, BrowserError> {
+    pub(crate) async fn start(
+        page: Page,
+        lifecycle: Arc<ScreencastLifecycle>,
+    ) -> Result<Arc<Self>, BrowserError> {
         // Subscribe to events FIRST so we don't miss the first frame between
         // startScreencast returning and the listener actually being ready.
         let frame_events = page
@@ -118,9 +136,13 @@ impl ScreencastBroker {
             max_height: None,
             every_nth_frame: Some(1),
         };
+        let mut generation = lifecycle.generation.lock().await;
         page.execute(params).await.map_err(|e| {
             BrowserError::OperationFailed(format!("screencast: Page.startScreencast failed: {e}"))
         })?;
+        *generation = next_generation(*generation);
+        let broker_generation = *generation;
+        drop(generation);
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let last_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -144,6 +166,8 @@ impl ScreencastBroker {
             last_url,
             page,
             listener_task,
+            lifecycle,
+            generation: broker_generation,
         }))
     }
 
@@ -172,7 +196,13 @@ impl Drop for ScreencastBroker {
         // already gone, the call will just fail and the screencast was
         // implicitly torn down.
         let page = self.page.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let broker_generation = self.generation;
         tokio::spawn(async move {
+            let generation = lifecycle.generation.lock().await;
+            if !generation_owns_stop(*generation, broker_generation) {
+                return;
+            }
             if let Err(e) = page.execute(StopScreencastParams::default()).await {
                 tracing::debug!(error = %e, "Page.stopScreencast failed during broker drop — likely page already closed");
             }
@@ -290,5 +320,19 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{generation_owns_stop, next_generation};
+
+    #[test]
+    fn stale_broker_cannot_stop_replacement_generation() {
+        let first = next_generation(0);
+        assert!(generation_owns_stop(first, first));
+        let replacement = next_generation(first);
+        assert!(!generation_owns_stop(replacement, first));
+        assert!(generation_owns_stop(replacement, replacement));
     }
 }

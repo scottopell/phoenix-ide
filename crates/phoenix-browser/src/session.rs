@@ -650,6 +650,7 @@ pub struct BrowserSession {
     /// the last viewer drops, the broker drops, and `Page.stopScreencast`
     /// fires automatically.
     screencast: Arc<tokio::sync::Mutex<std::sync::Weak<crate::screencast::ScreencastBroker>>>,
+    screencast_lifecycle: Arc<crate::screencast::ScreencastLifecycle>,
 }
 
 /// Maximum bytes stored per console arg in the capture buffer.
@@ -939,6 +940,7 @@ impl BrowserSession {
             console_event: Arc::new(tokio::sync::Notify::new()),
             last_activity: Instant::now(),
             screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+            screencast_lifecycle: Arc::new(crate::screencast::ScreencastLifecycle::default()),
         })
     }
 
@@ -1068,7 +1070,11 @@ impl BrowserSession {
         }
         // No live broker — create one. The first attach pays the screencast
         // start-up cost; subsequent attaches share the same broker.
-        let broker = crate::screencast::ScreencastBroker::start(self.page.clone()).await?;
+        let broker = crate::screencast::ScreencastBroker::start(
+            self.page.clone(),
+            Arc::clone(&self.screencast_lifecycle),
+        )
+        .await?;
         *slot = Arc::downgrade(&broker);
         let (rx, url) = broker.subscribe().await;
         Ok((broker, rx, url))

@@ -43,6 +43,9 @@ enum BrowserOperationPhase {
     Evaluation,
     Resize,
     WaitForSelector,
+    TypeFocus,
+    TypeClear,
+    TypeInput,
 }
 
 impl std::fmt::Display for BrowserOperationPhase {
@@ -52,6 +55,9 @@ impl std::fmt::Display for BrowserOperationPhase {
             Self::Evaluation => "JavaScript evaluation",
             Self::Resize => "viewport resize",
             Self::WaitForSelector => "selector wait helper",
+            Self::TypeFocus => "type focus readiness",
+            Self::TypeClear => "type clear",
+            Self::TypeInput => "type input",
         })
     }
 }
@@ -1017,11 +1023,12 @@ impl Tool for BrowserTypeTool {
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        let _timeout = input
+        let timeout = input
             .timeout
             .as_deref()
             .and_then(parse_duration)
             .unwrap_or(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + timeout;
 
         // Get browser session
         let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
@@ -1031,42 +1038,72 @@ impl Tool for BrowserTypeTool {
 
         let guard = session.read().await;
 
-        // Find the element
-        let element = match guard.page.find_element(&input.selector).await {
-            Ok(el) => el,
-            Err(e) => {
-                return ToolOutput::error(format!(
-                    "Could not find element '{}': {}",
-                    input.selector, e
-                ));
-            }
+        let selector = serde_json::to_string(&input.selector).unwrap();
+        let element = match operation_phase(
+            BrowserOperationPhase::TypeFocus,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            async {
+                let element = guard
+                    .page
+                    .find_element(&input.selector)
+                    .await
+                    .map_err(|error| {
+                        format!("Could not find element '{}': {error}", input.selector)
+                    })?;
+                element
+                    .click()
+                    .await
+                    .map_err(|error| format!("Failed to focus element: {error}"))?;
+                loop {
+                    let result = guard
+                        .page
+                        .evaluate(format!(
+                            "document.activeElement === document.querySelector({selector})"
+                        ))
+                        .await
+                        .map_err(|error| format!("Failed to verify element focus: {error}"))?;
+                    if result.into_value::<bool>().unwrap_or(false) {
+                        return Ok::<_, String>(element);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        {
+            Ok(Ok(element)) => element,
+            Ok(Err(message)) | Err(message) => return ToolOutput::error(message),
         };
-
-        // Click to focus
-        if let Err(e) = element.click().await {
-            return ToolOutput::error(format!("Failed to focus element: {e}"));
-        }
-
-        // Small delay to ensure focus
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Clear existing text if requested
         if input.clear {
-            // Select all and delete
-            if let Err(e) = guard
-                .page
-                .evaluate(format!(
-                    "document.querySelector({}).select()",
-                    serde_json::to_string(&input.selector).unwrap()
-                ))
-                .await
+            match operation_phase(
+                BrowserOperationPhase::TypeClear,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                guard
+                    .page
+                    .evaluate(format!("document.querySelector({}).select()", selector)),
+            )
+            .await
             {
-                return ToolOutput::error(format!("Failed to select text: {e}"));
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to select text: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
             }
-
-            // Press backspace to delete selected text
-            if let Err(e) = element.press_key("Backspace").await {
-                return ToolOutput::error(format!("Failed to clear text: {e}"));
+            match operation_phase(
+                BrowserOperationPhase::TypeClear,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                element.press_key("Backspace"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return ToolOutput::error(format!("Failed to clear text: {error}"));
+                }
+                Err(message) => return ToolOutput::error(message),
             }
         }
 
@@ -1076,14 +1113,34 @@ impl Tool for BrowserTypeTool {
         for (i, part) in parts.iter().enumerate() {
             // Type the text part
             if !part.is_empty() {
-                if let Err(e) = element.type_str(part).await {
-                    return ToolOutput::error(format!("Type failed: {e}"));
+                match operation_phase(
+                    BrowserOperationPhase::TypeInput,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    element.type_str(part),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return ToolOutput::error(format!("Type failed: {error}"));
+                    }
+                    Err(message) => return ToolOutput::error(message),
                 }
             }
             // Add Enter between parts (not after last)
             if i < parts.len() - 1 {
-                if let Err(e) = element.press_key("Enter").await {
-                    return ToolOutput::error(format!("Failed to press Enter: {e}"));
+                match operation_phase(
+                    BrowserOperationPhase::TypeInput,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    element.press_key("Enter"),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return ToolOutput::error(format!("Failed to press Enter: {error}"));
+                    }
+                    Err(message) => return ToolOutput::error(message),
                 }
             }
         }
