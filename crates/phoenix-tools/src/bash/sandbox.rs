@@ -79,7 +79,9 @@ impl ExploreReadOnlyPolicy {
             ));
         }
         let scratch_root = worktree_root.join(".phoenix").join("bash-scratch");
-        std::fs::create_dir_all(&scratch_root)?;
+        let worktree =
+            cap_std::fs::Dir::open_ambient_dir(&worktree_root, cap_std::ambient_authority())?;
+        worktree.create_dir_all(".phoenix/bash-scratch")?;
         let canonical_scratch_root = scratch_root.canonicalize()?;
         if !canonical_scratch_root.starts_with(&worktree_root) {
             return Err(std::io::Error::new(
@@ -89,7 +91,13 @@ impl ExploreReadOnlyPolicy {
         }
         let scratch_dir = canonical_scratch_root.join(uuid::Uuid::new_v4().to_string());
         let platform_temp = scratch_dir.join("platform-temp");
-        std::fs::create_dir_all(&platform_temp)?;
+        worktree.create_dir_all(
+            platform_temp
+                .strip_prefix(&worktree_root)
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?,
+        )?;
         if !platform_temp
             .canonicalize()?
             .starts_with(&canonical_scratch_root)
@@ -200,9 +208,35 @@ impl ExploreReadOnlyPolicy {
     }
 }
 
+#[derive(Debug)]
+pub enum SandboxScratch {
+    HostOwned(PathBuf),
+    Worktree {
+        root: cap_std::fs::Dir,
+        relative_path: PathBuf,
+    },
+}
+
+impl SandboxScratch {
+    /// Remove scratch through the directory authority that created it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if removal fails or a worktree path escapes its root.
+    pub fn remove(&self) -> std::io::Result<()> {
+        match self {
+            Self::HostOwned(path) => std::fs::remove_dir_all(path),
+            Self::Worktree {
+                root,
+                relative_path,
+            } => root.remove_dir_all(relative_path),
+        }
+    }
+}
+
 pub struct ExploreSandboxCommand {
     pub command: Command,
-    pub scratch_dir: PathBuf,
+    pub scratch_dir: SandboxScratch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,7 +271,18 @@ impl ExploreSandboxLauncher {
             .arg(cmd)
             .current_dir(&policy.repo_root)
             .env_clear();
-        let scratch_dir = policy.scratch_dir.clone();
+        let scratch_dir = match &policy.worktree_write_root {
+            Some(root) => SandboxScratch::Worktree {
+                root: cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+                    .map_err(|error| error.to_string())?,
+                relative_path: policy
+                    .scratch_dir
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_path_buf(),
+            },
+            None => SandboxScratch::HostOwned(policy.scratch_dir.clone()),
+        };
         policy.to_command_env(&mut command);
         Ok(ExploreSandboxCommand {
             command,
@@ -435,6 +480,44 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_scratch_creation_cannot_follow_external_parent_symlink() {
+        let worktree = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), worktree.path().join(".phoenix")).unwrap();
+
+        assert!(
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
+                .is_err()
+        );
+        assert!(!outside.path().join("bash-scratch").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_scratch_cleanup_cannot_follow_replaced_parent_symlink() {
+        let worktree = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let policy =
+            ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
+                .unwrap();
+        let command = ExploreSandboxLauncher::command_for_policy("true", &policy).unwrap();
+        let name = policy.scratch_dir.file_name().unwrap();
+        let external_target = outside.path().join(name);
+        std::fs::create_dir(&external_target).unwrap();
+        std::fs::write(external_target.join("keep"), "outside").unwrap();
+        let parent = policy.scratch_dir.parent().unwrap();
+        std::fs::rename(parent, worktree.path().join("saved-scratch")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), parent).unwrap();
+
+        assert!(command.scratch_dir.remove().is_err());
+        assert_eq!(
+            std::fs::read_to_string(external_target.join("keep")).unwrap(),
+            "outside"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

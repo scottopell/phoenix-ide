@@ -97,6 +97,7 @@ tempfile = { version = "3", optional = true }
 thiserror = "2"
 
 tracing = "0.1"
+cap-std = "3"
 
 [dev-dependencies]
 proptest = "1"

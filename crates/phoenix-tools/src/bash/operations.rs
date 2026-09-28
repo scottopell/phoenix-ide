@@ -30,7 +30,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
-use super::sandbox::ExploreSandboxLauncher;
+use super::sandbox::{ExploreSandboxLauncher, SandboxScratch};
 use super::types::{BashOp, BashToolInput};
 use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
@@ -642,14 +642,14 @@ async fn run_run(
 struct SpawnedProcessGroup {
     child: Option<tokio::process::Child>,
     pgid: i32,
-    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    sandbox_scratch_dir: Option<SandboxScratch>,
 }
 
 impl SpawnedProcessGroup {
     fn new(
         child: tokio::process::Child,
         pgid: i32,
-        sandbox_scratch_dir: Option<std::path::PathBuf>,
+        sandbox_scratch_dir: Option<SandboxScratch>,
     ) -> Self {
         Self {
             child: Some(child),
@@ -658,7 +658,7 @@ impl SpawnedProcessGroup {
         }
     }
 
-    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<std::path::PathBuf>) {
+    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<SandboxScratch>) {
         let child = self
             .child
             .take()
@@ -691,7 +691,7 @@ impl Drop for SpawnedProcessGroup {
             libc::kill(-self.pgid, libc::SIGKILL);
         }
         if let Some(dir) = self.sandbox_scratch_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = dir.remove();
         }
     }
 }
@@ -781,7 +781,7 @@ fn spawn_child(
         Ok(child) => child,
         Err(e) => {
             if let Some(dir) = &sandbox_scratch_dir {
-                let _ = std::fs::remove_dir_all(dir);
+                let _ = dir.remove();
             }
             return Err(format!("failed to spawn bash child: {e}"));
         }
@@ -820,7 +820,7 @@ struct WaiterContext {
     owner_scope: ResourceScopeKey,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     terminal_effect: BashTerminalEffect,
-    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    sandbox_scratch_dir: Option<SandboxScratch>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 }
 
@@ -830,7 +830,7 @@ fn start_io_tasks(
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     terminal_effect: BashTerminalEffect,
-    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    sandbox_scratch_dir: Option<SandboxScratch>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let stdout = child.stdout.take();
@@ -1199,8 +1199,8 @@ async fn run_waiter(
         }
     }
     if let Some(dir) = context.sandbox_scratch_dir {
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
+        if let Err(e) = dir.remove() {
+            tracing::debug!(scratch = ?dir, error = %e, "failed to remove bash scratch directory");
         }
     }
     panic_guard.disarm();
@@ -2054,7 +2054,7 @@ mod tests {
         let scratch_parent = tempfile::tempdir().expect("scratch parent");
         let scratch = scratch_parent.path().join("spawn-scratch");
         std::fs::create_dir(&scratch).expect("create scratch");
-        spawned.sandbox_scratch_dir = Some(scratch.clone());
+        spawned.sandbox_scratch_dir = Some(SandboxScratch::HostOwned(scratch.clone()));
         let stdout = spawned.child_mut().stdout.take().expect("child stdout");
         let mut ready = String::new();
         tokio::time::timeout(
