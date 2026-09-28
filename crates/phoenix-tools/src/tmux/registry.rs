@@ -772,7 +772,6 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
-    test_spawn_control_root: Option<PathBuf>,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
     #[cfg(test)]
@@ -814,7 +813,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -872,7 +870,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -901,7 +898,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
-            test_spawn_control_root: None,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -911,12 +907,6 @@ impl TmuxRegistry {
             #[cfg(test)]
             cancel_retirement_test_hook: None,
         }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_test_spawn_containment(mut self, control_root: PathBuf) -> Self {
-        self.test_spawn_control_root = Some(control_root);
-        self
     }
 
     #[cfg(test)]
@@ -980,13 +970,7 @@ impl TmuxRegistry {
     }
 
     async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
-        spawn_session_owned(
-            socket_path,
-            &self.config_path(),
-            cwd,
-            self.test_spawn_control_root.as_deref(),
-        )
-        .await
+        spawn_session_owned(socket_path, &self.config_path(), cwd).await
     }
 
     /// Cached `which("tmux")` result (REQ-TMUX-003). Discovered once at
@@ -3404,135 +3388,6 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
-type TestCreatorHandoff = (PathBuf, PathBuf, PathBuf);
-
-fn tmux_spawn_command(
-    socket_path: &Path,
-    tmux_args: &[String],
-    contain_test_spawn: bool,
-) -> (tokio::process::Command, Option<TestCreatorHandoff>) {
-    let Some(root) = socket_path.parent().filter(|_| contain_test_spawn) else {
-        let mut command = tokio::process::Command::new("tmux");
-        command.args(tmux_args);
-        return (command, None);
-    };
-    let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
-    let gate = root.join(format!(".creator-gate-{}", uuid::Uuid::new_v4()));
-    let wrapper = r#"
-import fcntl
-import os
-from pathlib import Path
-import signal
-import subprocess
-import sys
-import time
-
-parent = int(sys.argv[1])
-gate = Path(sys.argv[2])
-marker = Path(sys.argv[3])
-locked = marker.with_suffix(".locked")
-root = marker.parent
-while (
-    root.exists()
-    and not (root / ".cleanup-request").exists()
-    and not gate.exists()
-    and os.getppid() == parent
-):
-    time.sleep(0.01)
-if not gate.exists():
-    sys.exit(1)
-with marker.open("r+") as marker_file:
-    fcntl.flock(marker_file, fcntl.LOCK_EX)
-    locked.touch()
-    child = subprocess.Popen(sys.argv[4:], start_new_session=True)
-    try:
-        sys.exit(child.wait(timeout=5))
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.wait()
-        sys.exit(124)
-    finally:
-        locked.unlink(missing_ok=True)
-        gate.unlink(missing_ok=True)
-        marker.unlink(missing_ok=True)
-"#;
-    let mut command = tokio::process::Command::new("python3");
-    command
-        .arg("-c")
-        .arg(wrapper)
-        .arg(std::process::id().to_string())
-        .arg(&gate)
-        .arg(&marker)
-        .arg("tmux");
-    command.args(tmux_args);
-    let locked = marker.with_extension("locked");
-    (command, Some((marker, gate, locked)))
-}
-
-/// # Errors
-/// Returns a [`TmuxError`] when the `tmux new-session` process fails to
-/// spawn or exits non-zero.
-async fn contained_spawn_failure(
-    child: &mut tokio::process::Child,
-    socket_path: &Path,
-    reason: String,
-) -> TmuxError {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    TmuxError::SpawnFailed {
-        socket_path: socket_path.to_path_buf(),
-        reason,
-    }
-}
-
-async fn publish_creator_handoff(
-    child: &mut tokio::process::Child,
-    socket_path: &Path,
-    handoff: TestCreatorHandoff,
-) -> Result<(), TmuxError> {
-    let (marker, gate, locked) = handoff;
-    let pending = marker.with_extension("pending");
-    if let Err(error) = std::fs::write(&pending, child.id().unwrap_or_default().to_string()) {
-        return Err(contained_spawn_failure(
-            child,
-            socket_path,
-            format!("failed to write creator identity: {error}"),
-        )
-        .await);
-    }
-    if let Err(error) = std::fs::rename(pending, marker) {
-        return Err(contained_spawn_failure(
-            child,
-            socket_path,
-            format!("failed to publish creator identity: {error}"),
-        )
-        .await);
-    }
-    if let Err(error) = std::fs::write(gate, []) {
-        return Err(contained_spawn_failure(
-            child,
-            socket_path,
-            format!("failed to release creator gate: {error}"),
-        )
-        .await);
-    }
-    if let Err(error) = tokio::time::timeout(Duration::from_secs(2), async {
-        while !locked.exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    {
-        return Err(contained_spawn_failure(
-            child,
-            socket_path,
-            format!("creator ownership lock was not acquired: {error}"),
-        )
-        .await);
-    }
-    Ok(())
-}
-
 /// # Errors
 /// Returns a [`TmuxError`] when the `tmux new-session` process fails to
 /// spawn or exits non-zero.
@@ -3541,206 +3396,32 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    spawn_session_owned(socket_path, config_path, cwd, None).await
+    spawn_session_owned(socket_path, config_path, cwd).await
 }
 
 fn tmux_new_session_args(
-    launch_socket_path: &Path,
+    socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
-    contain_test_spawn: bool,
     server_token: &str,
 ) -> Vec<String> {
-    let mut args = vec![
+    vec![
         "-f".to_string(),
         config_path.to_string_lossy().into_owned(),
         "-S".to_string(),
-        launch_socket_path.to_string_lossy().into_owned(),
+        socket_path.to_string_lossy().into_owned(),
         "new-session".to_string(),
         "-d".to_string(),
         "-c".to_string(),
         cwd.to_string_lossy().into_owned(),
         "-s".to_string(),
         TMUX_DEFAULT_SESSION.to_string(),
-    ];
-    if contain_test_spawn {
-        args.extend([
-            ";".to_string(),
-            "set-environment".to_string(),
-            "-g".to_string(),
-            SERVER_TOKEN_VAR.to_string(),
-            server_token.to_owned(),
-        ]);
-    }
-    args
-}
-
-fn test_control_socket(test_control_root: Option<&Path>) -> Result<Option<PathBuf>, TmuxError> {
-    let Some(root) = test_control_root else {
-        return Ok(None);
-    };
-    std::fs::create_dir_all(root).map_err(|error| TmuxError::SpawnFailed {
-        socket_path: root.to_path_buf(),
-        reason: format!("failed to prepare test control root: {error}"),
-    })?;
-    Ok(Some(root.join(format!(
-        "{}.sock",
-        uuid::Uuid::new_v4().as_simple()
-    ))))
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn retire_test_spawn_sync(control_socket: &Path) {
-    let Ok(mut child) = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(control_socket)
-        .arg("kill-server")
-        .env_remove("TMUX")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while child.try_wait().ok().flatten().is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        // test-timing-allow: Drop must synchronously bound and reap the exact cleanup child.
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct TestSpawnRetirementGuard {
-    control_socket: PathBuf,
-    armed: bool,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl TestSpawnRetirementGuard {
-    fn new(control_socket: PathBuf) -> Self {
-        Self {
-            control_socket,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Drop for TestSpawnRetirementGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            retire_test_spawn_sync(&self.control_socket);
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-async fn retire_failed_test_spawn(control_socket: &Path) {
-    let mut command = tokio::process::Command::new("tmux");
-    command
-        .arg("-S")
-        .arg(control_socket)
-        .arg("kill-server")
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else {
-        return;
-    };
-    if tokio::time::timeout(Duration::from_millis(500), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-async fn publish_and_register_test_spawn(
-    socket_path: &Path,
-    control_socket: &Path,
-    server_token: &str,
-) -> Result<(), TmuxError> {
-    if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
-        retire_failed_test_spawn(control_socket).await;
-        return Err(TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to publish contained tmux socket: {error}"),
-        });
-    }
-    if let Err(error) =
-        super::test_server::register_owned_server(socket_path, control_socket, server_token)
-    {
-        retire_failed_test_spawn(control_socket).await;
-        return Err(TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to register exact test-owned processes: {error}"),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(any(test, feature = "test-support"))]
-async fn watchdog_owned_spawn(
-    socket_path: &Path,
-    control_socket: &Path,
-    config_path: &Path,
-    cwd: &Path,
-    server_token: &str,
-    server_env: &[(String, String)],
-) -> Result<(), TmuxError> {
-    let adopted = super::test_server::spawn_owned_server(
-        socket_path,
-        control_socket,
-        config_path,
-        cwd,
-        server_token,
-        server_env,
-    )
-    .await
-    .map_err(|error| TmuxError::SpawnFailed {
-        socket_path: socket_path.to_path_buf(),
-        reason: format!("watchdog-owned tmux spawn failed: {error}"),
-    })?;
-    if let Err(error) = std::fs::hard_link(control_socket, socket_path) {
-        if let Err(retire_error) = adopted
-            .retire(socket_path, control_socket, server_token)
-            .await
-        {
-            tracing::error!(
-                socket = %socket_path.display(),
-                control = %control_socket.display(),
-                %retire_error,
-                "watchdog could not prove retirement after tmux publication failure"
-            );
-        }
-        return Err(TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to publish contained tmux socket: {error}"),
-        });
-    }
-    let processes = adopted
-        .commit_publication()
-        .await
-        .map_err(|error| TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("watchdog publication handshake failed: {error}"),
-        })?;
-    debug_assert!(processes.server.pid > 0 && processes.pane.pid > 0);
-    Ok(())
+        ";".to_string(),
+        "set-environment".to_string(),
+        "-g".to_string(),
+        SERVER_TOKEN_VAR.to_string(),
+        server_token.to_owned(),
+    ]
 }
 
 async fn wait_for_spawned_pane(socket_path: &Path, config_path: &Path) -> Result<(), TmuxError> {
@@ -3786,62 +3467,22 @@ async fn spawn_session_owned(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
-    test_control_root: Option<&Path>,
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
     let server_env = tmux_server_env(&server_token);
-    let control_socket = test_control_socket(test_control_root)?;
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(control_socket) = control_socket.as_deref() {
-        watchdog_owned_spawn(
-            socket_path,
-            control_socket,
-            config_path,
-            cwd,
-            &server_token,
-            &server_env,
-        )
-        .await?;
-        return Ok(());
-    }
-    let launch_socket = control_socket.as_deref().unwrap_or(socket_path);
-    #[cfg(any(test, feature = "test-support"))]
-    let mut retirement_guard = control_socket
-        .as_ref()
-        .map(|socket| TestSpawnRetirementGuard::new(socket.clone()));
-    let tmux_args = tmux_new_session_args(
-        launch_socket,
-        config_path,
-        cwd,
-        test_control_root.is_some(),
-        &server_token,
-    );
-    let (mut cmd, creator_handoff) =
-        tmux_spawn_command(socket_path, &tmux_args, test_control_root.is_some());
-    // A tmux pane shell inherits the tmux *server's* environment, captured here.
-    // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
-    // than inheriting Phoenix's env, which would leak server secrets into every
-    // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
-    // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd, &server_env);
-    let mut child = cmd
+    let tmux_args = tmux_new_session_args(socket_path, config_path, cwd, &server_token);
+    let mut command = tokio::process::Command::new("tmux");
+    command.args(&tmux_args);
+    set_tmux_server_env(&mut command, &server_env);
+    let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| TmuxError::SpawnFailed {
-            socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to invoke tmux: {e}"),
-        })?;
-    if let Some(handoff) = creator_handoff {
-        publish_creator_handoff(&mut child, socket_path, handoff).await?;
-    }
-    let output = child
-        .wait_with_output()
+        .output()
         .await
-        .map_err(|e| TmuxError::SpawnFailed {
+        .map_err(|error| TmuxError::SpawnFailed {
             socket_path: socket_path.to_path_buf(),
-            reason: format!("failed to invoke tmux: {e}"),
+            reason: format!("failed to invoke tmux: {error}"),
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -3854,21 +3495,7 @@ async fn spawn_session_owned(
             ),
         });
     }
-
-    // `new-session -d` returns once the server has accepted the session, but
-    // the pane's shell is not necessarily in steady state — under load, a
-    // format-string query (`display-message -p '#{pane_current_path}'`) issued
-    // immediately after can come back empty with a 0 exit. Poll list-panes
-    // until the pane exists so the postcondition "spawn_session returns =>
-    // pane usable" holds for every caller, not just well-timed ones. Task 62006.
-    wait_for_spawned_pane(launch_socket, config_path).await?;
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(control_socket) = control_socket.as_deref() {
-        publish_and_register_test_spawn(socket_path, control_socket, &server_token).await?;
-        if let Some(guard) = retirement_guard.as_mut() {
-            guard.disarm();
-        }
-    }
+    wait_for_spawned_pane(socket_path, config_path).await?;
     Ok(())
 }
 
