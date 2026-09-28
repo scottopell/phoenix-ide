@@ -152,7 +152,7 @@ class BareDeployCommandTests(unittest.TestCase):
             with mock.patch.object(
                 self.dev.subprocess,
                 "run",
-                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1}), ""),
+                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1, "supervisor_sha256": "0" * 64}), ""),
             ) as run, mock.patch.object(self.dev.subprocess, "Popen") as started:
                 with self.assertRaisesRegex(SystemExit, "production was left running"):
                     self.dev._start_bare_supervisor(layout, "1", selected)
@@ -161,6 +161,30 @@ class BareDeployCommandTests(unittest.TestCase):
             self.assertEqual(1, run.call_count)
             started.assert_not_called()
             self.assertTrue(socket.exists())
+
+    def test_controller_mode_also_refuses_changed_running_supervisor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket = root / "run/supervisor.sock"
+            socket.parent.mkdir(parents=True)
+            socket.touch()
+            installed = root / "bin/phoenix-supervisor.py"
+            installed.parent.mkdir()
+            installed.write_text("old supervisor")
+            selected = root / "selected.py"
+            selected.write_text("new supervisor")
+            layout = {"root": root, "socket": socket, "supervisor": installed}
+
+            with mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1, "supervisor_sha256": "0" * 64}), ""),
+            ), mock.patch.object(self.dev.subprocess, "Popen") as started:
+                with self.assertRaisesRegex(SystemExit, "production was left running"):
+                    self.dev._start_bare_supervisor(layout, "1", selected)
+
+            self.assertEqual("old supervisor", installed.read_text())
+            started.assert_not_called()
 
     def test_reboot_persistence_installs_idempotent_owner_crontab_entry(self):
         root = Path("/tmp/phoenix owner")
@@ -247,7 +271,7 @@ class BareDeployCommandTests(unittest.TestCase):
                 binary=candidate_binary,
                 source_kind=self.dev.ProdSourceKind.PUBLISHED_RELEASE,
                 source_commit="b" * 40,
-                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 12),
+                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 40),
                 release_tag="v2.0.0",
                 release_commit="b" * 40,
             )
@@ -260,7 +284,7 @@ class BareDeployCommandTests(unittest.TestCase):
                 if "activate" in command:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "state": "committed"}), "")
                 if "status" in command:
-                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1, "child": None}), "")
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1, "supervisor_sha256": self.dev._file_sha256(self.dev.ROOT / "scripts" / "bare_supervisor.py"), "child": None}), "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def materialize(_commit, _source, destination, _kind):
@@ -269,8 +293,7 @@ class BareDeployCommandTests(unittest.TestCase):
 
             staged_supervisors = []
 
-            def start(_layout, _protocol, selected_source, *, reuse_compatible=False):
-                self.assertFalse(reuse_compatible)
+            def start(_layout, _protocol, selected_source):
                 staged_supervisors.append(selected_source.read_text())
 
             with mock.patch.object(self.dev, "_bare_layout", return_value=layout), \
@@ -324,7 +347,7 @@ class BareDeployCommandTests(unittest.TestCase):
             binary.write_text("installed binary")
             (root / "deployed.sha").write_text("c" * 40 + "\n")
             layout = {"binary": binary, "deployed_sha": root / "deployed.sha"}
-            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 12)
+            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 40)
             with mock.patch.object(self.dev, "_binary_identity", return_value=identity):
                 prepared = self.dev._prepare_installed_candidate(layout)
             self.assertEqual(prepared.binary, binary)
@@ -341,9 +364,9 @@ class BareDeployCommandTests(unittest.TestCase):
             # Recorded commit does not begin with the binary's embedded SHA.
             (root / "deployed.sha").write_text("d" * 40 + "\n")
             layout = {"binary": binary, "deployed_sha": root / "deployed.sha"}
-            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 12)
+            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 40)
             with mock.patch.object(self.dev, "_binary_identity", return_value=identity):
-                with self.assertRaisesRegex(SystemExit, "does not match recorded commit"):
+                with self.assertRaisesRegex(SystemExit, "does not exactly match recorded commit"):
                     self.dev._prepare_installed_candidate(layout)
 
     def test_daemon_restart_resnapshots_env_and_reuses_installed_binary(self):
@@ -360,7 +383,7 @@ class BareDeployCommandTests(unittest.TestCase):
                 binary=binary,
                 source_kind=self.dev.ProdSourceKind.INSTALLED_RESTART,
                 source_commit="c" * 40,
-                identity=self.dev.RuntimeIdentity("0.10.0", "c" * 12),
+                identity=self.dev.RuntimeIdentity("0.10.0", "c" * 40),
             )
 
             def load_env(env, filename=".phoenix-ide.env"):

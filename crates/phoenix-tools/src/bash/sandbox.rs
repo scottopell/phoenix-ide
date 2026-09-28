@@ -10,19 +10,6 @@ const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
 const WORKTREE_WRITE_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_WRITE";
 const WORKTREE_ROOT_ENV: &str = "PHOENIX_SANDBOX_WORKTREE_ROOT";
-const NETWORK_ENV_ALLOWLIST: &[&str] = &[
-    "ALL_PROXY",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
-    "all_proxy",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-];
-
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
     repo_root: PathBuf,
@@ -31,6 +18,7 @@ pub struct ExploreReadOnlyPolicy {
     platform_temp: PathBuf,
     path: OsString,
     worktree_write_root: Option<PathBuf>,
+    inherited_work_env: Vec<(OsString, OsString)>,
 }
 
 impl ExploreReadOnlyPolicy {
@@ -67,6 +55,7 @@ impl ExploreReadOnlyPolicy {
             platform_temp,
             path,
             worktree_write_root: None,
+            inherited_work_env: Vec::new(),
         })
     }
 
@@ -117,6 +106,7 @@ impl ExploreReadOnlyPolicy {
             platform_temp,
             path: inherited_path(),
             worktree_write_root: Some(worktree_root),
+            inherited_work_env: std::env::vars_os().collect(),
         })
     }
 
@@ -128,20 +118,17 @@ impl ExploreReadOnlyPolicy {
             command.env(WORKTREE_WRITE_ENV, "1");
             command.env(WORKTREE_ROOT_ENV, worktree_root);
         }
-        if self.worktree_write_root.is_some() {
-            apply_network_env(command, std::env::vars_os());
-        }
         self.apply_child_env(command);
     }
 
     fn apply_child_env(&self, command: &mut Command) {
+        if self.worktree_write_root.is_some() {
+            command.envs(self.inherited_work_env.iter().cloned());
+        }
         command.env("PHOENIX_SANDBOX_SCRATCH", &self.scratch_dir);
         command.env("HOME", &self.home);
         command.env("TMPDIR", &self.platform_temp);
         command.env("PATH", &self.path);
-        if self.worktree_write_root.is_some() {
-            apply_network_env(command, std::env::vars_os());
-        }
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -170,6 +157,11 @@ impl ExploreReadOnlyPolicy {
             platform_temp,
             path,
             worktree_write_root,
+            inherited_work_env: if std::env::var_os(WORKTREE_WRITE_ENV).is_some() {
+                std::env::vars_os().collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -312,14 +304,6 @@ fn env_path(name: &str) -> Result<PathBuf, String> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("missing {name}"))
-}
-
-fn apply_network_env(command: &mut Command, vars: impl IntoIterator<Item = (OsString, OsString)>) {
-    for (name, value) in vars {
-        if NETWORK_ENV_ALLOWLIST.iter().any(|allowed| name == *allowed) {
-            command.env(name, value);
-        }
-    }
 }
 
 fn inherited_path() -> OsString {
@@ -491,26 +475,51 @@ mod tests {
     }
 
     #[test]
-    fn worktree_child_env_preserves_network_routing_allowlist() {
+    fn worktree_child_env_preserves_inherited_work_configuration() {
         let worktree = tempfile::TempDir::new().expect("worktree");
-        let policy =
+        let mut policy =
             ExploreReadOnlyPolicy::discover_worktree_write(worktree.path(), worktree.path())
                 .expect("worktree policy");
+        policy.inherited_work_env = vec![
+            (OsString::from("GH_TOKEN"), OsString::from("test-token")),
+            (
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("/tmp/test-agent.sock"),
+            ),
+            (
+                OsString::from("CARGO_HOME"),
+                OsString::from("/tmp/test-cargo-home"),
+            ),
+        ];
         let mut command = Command::new("bash");
         command.env_clear();
-        apply_network_env(
-            &mut command,
-            [(
-                OsString::from("HTTPS_PROXY"),
-                OsString::from("http://proxy.test:8080"),
-            )],
-        );
         policy.apply_child_env(&mut command);
-        let value = command
+
+        let env = command
             .get_envs()
-            .find_map(|(name, value)| (name == "HTTPS_PROXY").then_some(value))
-            .flatten();
-        assert_eq!(value, Some(std::ffi::OsStr::new("http://proxy.test:8080")));
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env[std::ffi::OsStr::new("GH_TOKEN")].as_deref(),
+            Some(std::ffi::OsStr::new("test-token"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("SSH_AUTH_SOCK")].as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/test-agent.sock"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CARGO_HOME")].as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/test-cargo-home"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("TMPDIR")].as_deref(),
+            Some(policy.platform_temp.as_os_str())
+        );
     }
 
     #[test]

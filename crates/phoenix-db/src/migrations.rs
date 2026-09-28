@@ -10787,14 +10787,14 @@ INSERT OR IGNORE INTO approval_request_obligations
     (conversation_id, approval_message_id, created_at_us)
 SELECT c.id, m.message_id, CAST(strftime('%s', m.created_at) AS INTEGER) * 1000000
 FROM conversations c
+JOIN work_scope_approved_task_authorities authority
+  ON authority.work_scope_id = c.work_scope_id
+ AND authority.objective_conversation_id = c.id
+JOIN conversation_approved_task_objectives objective
+  ON objective.conversation_id = authority.objective_conversation_id
 JOIN messages m ON m.conversation_id = c.id
 WHERE c.state_kind = 'llm_requesting'
   AND m.message_type = 'user'
-  AND json_extract(m.content, '$.is_meta') = 1
-  AND (
-      json_extract(m.content, '$.text') LIKE 'Task approved%'
-      OR json_extract(m.content, '$.text') LIKE 'Follow-up task approved%'
-  )
   AND m.sequence_id = (
       SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
   );
@@ -11276,13 +11276,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn migration_109_binds_approval_message_to_conversation() {
-        let pool = test_pool().await;
+    async fn setup_migration_109_fixture(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE conversations (
                  id TEXT PRIMARY KEY,
-                 state_kind TEXT NOT NULL DEFAULT 'idle'
+                 state_kind TEXT NOT NULL DEFAULT 'idle',
+                 work_scope_id TEXT
+             );
+             CREATE TABLE conversation_approved_task_objectives (
+                 conversation_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 task_title TEXT NOT NULL,
+                 approved_title TEXT NOT NULL,
+                 approved_priority TEXT NOT NULL,
+                 approved_plan TEXT NOT NULL,
+                 approved_task_file TEXT NOT NULL,
+                 approved_artifact_body TEXT NOT NULL,
+                 created_at_us INTEGER NOT NULL
+             );
+             CREATE TABLE work_scope_approved_task_authorities (
+                 work_scope_id TEXT PRIMARY KEY,
+                 objective_conversation_id TEXT NOT NULL UNIQUE,
+                 created_at_us INTEGER NOT NULL
              );
              CREATE TABLE messages (
                  message_id TEXT PRIMARY KEY,
@@ -11295,25 +11310,35 @@ mod tests {
              CREATE UNIQUE INDEX messages_conversation_message_id_unique
                  ON messages(conversation_id, message_id);
              INSERT INTO conversations (id) VALUES ('a'), ('b');
-             INSERT INTO conversations (id, state_kind)
-             VALUES ('legacy', 'llm_requesting'), ('follow-up', 'llm_requesting');
+             INSERT INTO conversations (id, state_kind, work_scope_id)
+             VALUES ('legacy', 'llm_requesting', 'scope-legacy'),
+                    ('follow-up', 'llm_requesting', 'scope-follow-up');
+             INSERT INTO conversation_approved_task_objectives
+             VALUES
+                 ('legacy','legacy-task','Legacy','Legacy','\"p1\"','plan','tasks/legacy.md','body',1),
+                 ('follow-up','follow-task','Follow','Follow','\"p1\"','plan','tasks/follow.md','body',2);
+             INSERT INTO work_scope_approved_task_authorities
+             VALUES ('scope-legacy','legacy',1), ('scope-follow-up','follow-up',2);
              INSERT INTO messages (message_id, conversation_id) VALUES ('approval', 'b');
              INSERT INTO messages
                  (message_id, conversation_id, message_type, sequence_id, content, created_at)
              VALUES
                  ('legacy-approval', 'legacy', 'user', 7,
                   '{\"text\":\"Task approved. Begin work.\",\"is_meta\":true}',
-                  '2025-01-01T00:00:00Z');
-             INSERT INTO messages
-                 (message_id, conversation_id, message_type, sequence_id, content, created_at)
-             VALUES
+                  '2025-01-01T00:00:00Z'),
                  ('follow-up-approval', 'follow-up', 'user', 8,
                   '{\"text\":\"Follow-up task approved. Continue.\",\"is_meta\":true}',
                   '2025-01-01T00:00:01Z');",
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_109_binds_approval_message_to_conversation() {
+        let pool = test_pool().await;
+        setup_migration_109_fixture(&pool).await;
         sqlx::raw_sql(MIGRATION_109).execute(&pool).await.unwrap();
         let legacy_obligation = sqlx::query_as::<_, (String, String)>(
             "SELECT conversation_id, approval_message_id

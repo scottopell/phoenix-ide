@@ -1,4 +1,4 @@
-# ADR-063: WorkScope authority projects one runtime capability
+# ADR-066: WorkScope authority projects one runtime capability
 
 - **Status:** Accepted
 - **Date:** 2026-09-13

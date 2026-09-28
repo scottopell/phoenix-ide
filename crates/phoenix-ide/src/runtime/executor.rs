@@ -8922,7 +8922,7 @@ where
         plan: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), FollowUpApprovalError> {
-        reread_reviewed_task_handoff_snapshot_at_exact_path(
+        reread_reviewed_task_handoff_snapshot(
             self.context.filesystem_root(),
             self.context.filesystem_root(),
             &self.context.tasks_dir_name,
@@ -9580,7 +9580,7 @@ fn persist_fresh_approved_task_artifact_blocking(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original_path_was_tracked =
         run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
-    let mut snapshot = reread_reviewed_task_handoff_snapshot_at_exact_path(
+    let mut snapshot = reread_reviewed_task_handoff_snapshot(
         cwd,
         cwd,
         tasks_dir_name,
@@ -9591,7 +9591,7 @@ fn persist_fresh_approved_task_artifact_blocking(
     )
     .map_err(FollowUpArtifactError::BeforeGit)?;
     let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
-    if detect_plain_markdown_task_stem(task_file).is_none() {
+    if snapshot.task_file == task_file && detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
             .and_then(|name| name.to_str())

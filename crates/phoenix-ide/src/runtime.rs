@@ -3925,6 +3925,29 @@ impl RuntimeManager {
         }
     }
 
+    fn validate_work_child_admission(
+        has_work: bool,
+        parent_mode: &ConvMode,
+        has_approved_objective: bool,
+        platform: &PlatformCapability,
+    ) -> Result<(), String> {
+        if has_work
+            && matches!(
+                parent_mode,
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+            )
+            && !has_approved_objective
+        {
+            return Err(
+                "Work sub-agents require an approved objective for this managed scope".to_string(),
+            );
+        }
+        if has_work && !matches!(parent_mode, ConvMode::Direct) && !platform.has_sandbox() {
+            return Err("Attached Work sub-agents require an enforceable host sandbox".to_string());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn admit_sub_agent_batch(
         self: &Arc<Self>,
@@ -3942,6 +3965,26 @@ impl RuntimeManager {
         if parent.attached_work_scope_id != parent_scope {
             return Err("Parent WorkScope changed before sub-agent admission".to_string());
         }
+        let has_work = specs.iter().any(|spec| spec.mode == SubAgentMode::Work);
+        let has_approved_objective = if has_work
+            && matches!(
+                parent.conv_mode,
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+            ) {
+            self.db
+                .get_approved_task_objective(parent_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        } else {
+            false
+        };
+        Self::validate_work_child_admission(
+            has_work,
+            &parent.conv_mode,
+            has_approved_objective,
+            &self.platform,
+        )?;
         let children = specs
             .iter()
             .map(|spec| {
@@ -8912,6 +8955,38 @@ mod scope_liveness_tests {
         assert!(!drain.is_finished());
         tokio::time::advance(crate::tls::SHUTDOWN_GRACE).await;
         assert!(drain.await.expect("bounded drain task joins").is_none());
+    }
+
+    #[test]
+    fn managed_work_child_requires_objective_and_enforceable_sandbox() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
+                "/tmp/owned-worktree",
+            )
+            .unwrap(),
+            base_branch: phoenix_core::domain::db_schema::NonEmptyString::new("main").unwrap(),
+        };
+        let unavailable = PlatformCapability::None {
+            details: "test host has no sandbox".to_string(),
+        };
+        let available = PlatformCapability::Nono {
+            platform: "test".to_string(),
+            details: "test sandbox".to_string(),
+        };
+
+        assert!(
+            RuntimeManager::validate_work_child_admission(true, &mode, false, &available,)
+                .unwrap_err()
+                .contains("approved objective")
+        );
+        assert!(
+            RuntimeManager::validate_work_child_admission(true, &mode, true, &unavailable,)
+                .unwrap_err()
+                .contains("enforceable host sandbox")
+        );
+        RuntimeManager::validate_work_child_admission(true, &mode, true, &available).unwrap();
+        RuntimeManager::validate_work_child_admission(true, &ConvMode::Direct, false, &unavailable)
+            .unwrap();
     }
 
     #[test]
