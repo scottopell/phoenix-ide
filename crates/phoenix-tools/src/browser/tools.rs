@@ -37,6 +37,35 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Debug, Clone, Copy)]
+enum BrowserOperationPhase {
+    Navigation,
+    Evaluation,
+    Resize,
+    WaitForSelector,
+}
+
+impl std::fmt::Display for BrowserOperationPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Navigation => "navigation",
+            Self::Evaluation => "JavaScript evaluation",
+            Self::Resize => "viewport resize",
+            Self::WaitForSelector => "selector wait helper",
+        })
+    }
+}
+
+async fn operation_phase<T>(
+    phase: BrowserOperationPhase,
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| format!("Browser {phase} timed out after {timeout:?}"))
+}
+
 // ============================================================================
 // browser_navigate (REQ-BT-001)
 // ============================================================================
@@ -99,12 +128,18 @@ impl Tool for BrowserNavigateTool {
         guard.last_activity = std::time::Instant::now();
 
         // Navigate with timeout
-        let result = tokio::time::timeout(timeout, guard.page.goto(&input.url)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Navigation,
+            timeout,
+            guard.page.goto(&input.url),
+        )
+        .await;
 
         match result {
             Ok(Ok(_)) => {
                 // Detect React and enrich the navigate result with __phoenix hints
-                let react_info = match tokio::time::timeout(
+                let react_info = match operation_phase(
+                    BrowserOperationPhase::Evaluation,
                     Duration::from_secs(2),
                     guard
                         .page
@@ -123,7 +158,7 @@ impl Tool for BrowserNavigateTool {
                 }
             }
             Ok(Err(e)) => ToolOutput::error(format!("Navigation failed: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?} waiting for page load")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -210,7 +245,12 @@ impl Tool for BrowserEvalTool {
             .build()
             .unwrap();
 
-        let result = tokio::time::timeout(timeout, guard.page.evaluate(params)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Evaluation,
+            timeout,
+            guard.page.evaluate(params),
+        )
+        .await;
 
         match result {
             Ok(Ok(eval_result)) => {
@@ -258,7 +298,7 @@ impl Tool for BrowserEvalTool {
                 }
             }
             Ok(Err(e)) => ToolOutput::error(format!("JavaScript error: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -621,12 +661,17 @@ impl Tool for BrowserResizeTool {
             Err(e) => return ToolOutput::error(e),
         };
 
-        let result = tokio::time::timeout(timeout, guard.page.execute(params)).await;
+        let result = operation_phase(
+            BrowserOperationPhase::Resize,
+            timeout,
+            guard.page.execute(params),
+        )
+        .await;
 
         match result {
             Ok(Ok(_)) => ToolOutput::success("done"),
             Ok(Err(e)) => ToolOutput::error(format!("Resize failed: {e}")),
-            Err(_) => ToolOutput::error(format!("Timeout after {timeout:?}")),
+            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -726,8 +771,14 @@ impl Tool for BrowserWaitForSelectorTool {
 
         loop {
             // Check if element exists/is visible
-            match guard.page.evaluate(check_script.clone()).await {
-                Ok(result) => {
+            match operation_phase(
+                BrowserOperationPhase::WaitForSelector,
+                timeout.saturating_sub(start.elapsed()),
+                guard.page.evaluate(check_script.clone()),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
                     if let Ok(found) = result.into_value::<bool>() {
                         if found {
                             let elapsed = start.elapsed();
@@ -739,7 +790,7 @@ impl Tool for BrowserWaitForSelectorTool {
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Check if it's a selector syntax error
                     let err_str = e.to_string();
                     if err_str.contains("SyntaxError")
@@ -751,6 +802,13 @@ impl Tool for BrowserWaitForSelectorTool {
                         ));
                     }
                     // Other errors might be transient, continue polling
+                }
+                Err(_) => {
+                    return ToolOutput::error(format!(
+                        "Browser selector wait helper timed out after {timeout:?}: element '{}' not found{}",
+                        input.selector,
+                        if input.visible { " or not visible" } else { "" }
+                    ));
                 }
             }
 
@@ -849,10 +907,25 @@ impl Tool for BrowserClickTool {
             let start = std::time::Instant::now();
 
             loop {
-                if let Ok(result) = guard.page.evaluate(check_script.clone()).await {
-                    if let Ok(true) = result.into_value::<bool>() {
-                        break;
+                match operation_phase(
+                    BrowserOperationPhase::WaitForSelector,
+                    timeout.saturating_sub(start.elapsed()),
+                    guard.page.evaluate(check_script.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        if let Ok(true) = result.into_value::<bool>() {
+                            break;
+                        }
                     }
+                    Err(_) => {
+                        return ToolOutput::error(format!(
+                            "Browser selector wait helper timed out after {timeout:?} waiting for element '{}'",
+                            input.selector
+                        ));
+                    }
+                    _ => {}
                 }
                 if start.elapsed() >= timeout {
                     return ToolOutput::error(format!(
@@ -1315,4 +1388,42 @@ async fn dispatch_key_cdp(
     }
 
     ToolOutput::success(format!("Pressed {chord} [cdp]"))
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn operation_phase_preserves_success_error_and_phase_timeout() {
+        let value = operation_phase(
+            BrowserOperationPhase::Navigation,
+            Duration::from_secs(5),
+            async { Ok::<_, &str>(42) },
+        )
+        .await
+        .expect("phase completes")
+        .expect("operation succeeds");
+        assert_eq!(value, 42);
+
+        let error = operation_phase(
+            BrowserOperationPhase::Resize,
+            Duration::from_secs(5),
+            async { Err::<(), _>("CDP rejected resize") },
+        )
+        .await
+        .expect("phase completes")
+        .expect_err("operation error is preserved");
+        assert_eq!(error, "CDP rejected resize");
+
+        let timeout = operation_phase(
+            BrowserOperationPhase::Evaluation,
+            Duration::ZERO,
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("pending operation times out");
+        assert!(timeout.contains("JavaScript evaluation"));
+        assert!(timeout.contains("0ns"));
+    }
 }

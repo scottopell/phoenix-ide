@@ -265,6 +265,16 @@ async fn test_browser_navigate_local() {
     let (ctx, manager) = test_context("test-navigate-local");
     let tool = BrowserNavigateTool;
 
+    let initial_eval = BrowserEvalTool
+        .run(json!({"expression": "1 + 1"}), ctx.clone())
+        .await;
+    assert!(
+        initial_eval.is_success(),
+        "about:blank eval failed: {}",
+        initial_eval.output()
+    );
+    assert!(initial_eval.output().contains('2'));
+
     let result = tool.run(json!({"url": server.url()}), ctx).await;
 
     assert!(result.is_success(), "Navigate failed: {}", result.output());
@@ -341,6 +351,20 @@ async fn test_browser_eval_local() {
         "Arithmetic wrong: {}",
         result.output()
     );
+
+    let resize = BrowserResizeTool
+        .run(json!({"width": 1024, "height": 768}), ctx.clone())
+        .await;
+    assert!(resize.is_success(), "Resize failed: {}", resize.output());
+    let width = eval_tool
+        .run(json!({"expression": "window.innerWidth"}), ctx.clone())
+        .await;
+    assert!(
+        width.is_success(),
+        "Eval after resize failed: {}",
+        width.output()
+    );
+    assert!(width.output().contains("1024") || width.output().contains("1008"));
 
     shutdown_test(manager, server).await;
 }
@@ -812,51 +836,6 @@ async fn test_browser_screenshot_local() {
 }
 
 #[tokio::test]
-async fn test_browser_resize_local() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r"<!DOCTYPE html>
-        <html>
-        <head><title>Resize Test</title></head>
-        <body></body>
-        </html>",
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-resize-local");
-
-    // Navigate
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Resize
-    let resize_tool = BrowserResizeTool;
-    let result = resize_tool
-        .run(json!({"width": 1024, "height": 768}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Resize failed: {}", result.output());
-
-    // Verify via JS
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "window.innerWidth"}), ctx.clone())
-        .await;
-    assert!(result.is_success());
-    // innerWidth should be close to 1024 (may vary slightly due to scrollbars)
-    assert!(
-        result.output().contains("1024") || result.output().contains("1008"),
-        "Width mismatch: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
 async fn test_browser_session_persistence() {
     require_chrome!();
 
@@ -958,29 +937,6 @@ async fn test_browser_navigate_remote() {
 // ============================================================================
 // Error handling tests
 // ============================================================================
-
-#[tokio::test]
-async fn test_browser_eval_before_navigate() {
-    require_chrome!();
-
-    let (ctx, manager) = test_context("test-eval-no-nav");
-
-    // Try to eval without navigating first - should still work on about:blank
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "1 + 1"}), ctx.clone())
-        .await;
-
-    // This should work - browser starts on about:blank
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        result.output().contains('2'),
-        "Wrong result: {}",
-        result.output()
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
-}
 
 #[tokio::test]
 async fn test_browser_eval_syntax_error() {
