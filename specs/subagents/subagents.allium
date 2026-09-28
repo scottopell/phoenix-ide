@@ -193,6 +193,7 @@ rule UnqualifiedParentRejectsConcurrentWork {
 
 rule QualifiedParentAllowsParallelWork {
     when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: parent.mode = direct
     requires: parallel_work_qualified(parent.resolved_model_id)
     requires: work_task_count(tasks) > 1 or pending_work_admissions(parent) > 0
     requires: batch_is_otherwise_valid(parent, tasks)

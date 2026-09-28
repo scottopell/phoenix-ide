@@ -190,13 +190,14 @@ across server restart.
 
 ### REQ-PROJ-008: Sub-Agent Capabilities Inherit the Parent Workspace Authority
 
-WHEN a Git-backed parent conversation spawns a sub-agent with write authority requested
-THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
-AND grant write access to that same worktree
-AND place the parent conversation in AwaitingSubAgentResult state for the duration
-AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
-AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
-AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
+WHEN a Git-backed parent conversation requests a sub-agent with write authority
+THE SYSTEM SHALL reject the request with a descriptive filesystem-isolation error
+AND SHALL preserve the parent's approved write capability
+AND SHALL allow read-only delegation
+
+WHEN a Direct parent requests a write-authority sub-agent
+THE SYSTEM SHALL preserve unscoped Work delegation in the parent's working directory
+AND SHALL attach the child to the parent's exact durable `WorkScope` identity
 
 WHEN deciding whether multiple Work children may be pending for one parent
 THE SYSTEM SHALL qualify only the parent's actual resolved model identifier
@@ -204,7 +205,7 @@ AND SHALL qualify exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, and `gp
 AND SHALL NOT infer qualification from provider, model family, version ordering, reasoning effort, service tier, configuration tier, named worker, child model, or child persona
 AND SHALL treat `gpt-5.6-luna`, `gpt-6-luna`, every unknown or newly introduced identifier, every custom route, and every otherwise unlisted parent model as unqualified
 
-WHEN a qualified parent requests a valid bounded batch
+WHEN a qualified Direct parent requests a valid bounded batch
 THE SYSTEM SHALL allow multiple Work tasks in that batch and multiple pending Work children across calls
 
 WHEN an unqualified parent requests Work tasks
