@@ -260,7 +260,7 @@ pub fn build_system_prompt_with_options(
             ModeContext::Work { .. }
                 | ModeContext::Branch { .. }
                 | ModeContext::DetachedApprovedTask { .. }
-                | ModeContext::AttachedWorkChild { .. }
+                | ModeContext::AttachedWorkChild
         )
     );
     if !mode_states_worktree_boundary
@@ -328,11 +328,8 @@ pub fn build_system_prompt_with_options(
                     task_title,
                 ));
             }
-            ModeContext::AttachedWorkChild { worktree_path } => {
-                prompt.push_str(&llm_language::mode_attached_work_child(
-                    language,
-                    worktree_path,
-                ));
+            ModeContext::AttachedWorkChild => {
+                prompt.push_str(llm_language::mode_attached_work_child(language));
             }
             ModeContext::Direct => {
                 prompt.push_str(llm_language::mode_direct(language));

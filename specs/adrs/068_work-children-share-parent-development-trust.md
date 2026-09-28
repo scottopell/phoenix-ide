@@ -16,7 +16,7 @@ PR #765 separated parent approval repair from Git-backed Work-child execution af
 
 ## Decision
 
-Choose trusted Work children. This supersedes ADR-067's deferred child-isolation requirement, not its parent capability projection. Work children use ordinary unsandboxed Bash, patch, and configured MCP tools. Git-backed children attach to the exact parent WorkScope and carry a non-owning mode. Direct delegation is preserved. Explore children retain their read-only Bash sandbox and omit Bash if the platform cannot enforce it.
+Choose trusted Work children. This supersedes ADR-067's deferred child-isolation requirement, not its parent capability projection. Work children use ordinary unsandboxed Bash, patch, and configured MCP tools. Git-backed children attach to the exact parent WorkScope and carry a non-owning marker with no duplicate worktree path. Runtime paths derive solely from the attached WorkScope environment. Direct delegation is preserved. Explore children retain their read-only Bash sandbox and omit Bash if the platform cannot enforce it.
 
 The parent owns task approval, worktree lifecycle, and integration. Starting-directory validation and assignment partitioning are coordination mechanisms, not security boundaries. Child Bash can run Git and access files outside the worktree; normal host permissions apply.
 

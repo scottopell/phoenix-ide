@@ -626,14 +626,10 @@ const CAVEMAN_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
 ];
 
 #[must_use]
-pub fn mode_attached_work_child(lang: LlmLanguage, worktree_path: &str) -> String {
+pub fn mode_attached_work_child(lang: LlmLanguage) -> &'static str {
     match lang {
-        LlmLanguage::PhoenixNative => format!(
-            "\n\nYou are a trusted Work sub-agent sharing the parent worktree at `{worktree_path}`. Bash and patch have normal write access without filesystem sandboxing. The parent owns task approval, worktree lifecycle, and integration. Complete your assigned work, preserve unrelated edits, and report conflicts or uncertainty. Do not remove the shared worktree."
-        ),
-        LlmLanguage::Caveman => format!(
-            "\n\nYou trusted helper in parent cave `{worktree_path}`. Bash and patch write, no sandbox. Parent owns task, cave, integration. Do assigned work. Keep others edits. Tell parent conflicts. No remove cave."
-        ),
+        LlmLanguage::PhoenixNative => "\n\nYou are a trusted Work sub-agent sharing the parent's worktree. Bash and patch have normal write access without filesystem sandboxing. The parent owns task approval, worktree lifecycle, and integration. Complete your assigned work, preserve unrelated edits, and report conflicts or uncertainty. Do not remove the shared worktree.",
+        LlmLanguage::Caveman => "\n\nYou trusted helper in parent cave. Bash and patch write, no sandbox. Parent owns task, cave, integration. Do assigned work. Keep others edits. Tell parent conflicts. No remove cave.",
     }
 }
 

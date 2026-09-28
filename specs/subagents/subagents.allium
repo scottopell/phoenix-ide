@@ -519,7 +519,7 @@ rule SubAgentRegistryOnResume {
 
     @guidance
         -- Explore children persist Explore with no owned worktree.
-        -- Git-backed Work children persist AttachedWorkChild; their worktree
+        -- Git-backed Work children persist the AttachedWorkChild marker; their worktree
         -- root comes from the inherited WorkScope environment, independently
         -- of a child cwd override. This mode carries no branch/task ownership.
         -- Direct Work children persist Direct. Both Work variants select

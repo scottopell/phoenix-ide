@@ -23,6 +23,15 @@ pub(crate) enum TaskApprovalAuthority {
 }
 
 impl ResolvedResourceAuthority {
+    pub(crate) fn worktree_path(&self) -> Option<&str> {
+        match &self.environment {
+            Some(EnvironmentContext::AllocatedWorktree { worktree_path, .. }) => {
+                Some(worktree_path)
+            }
+            Some(EnvironmentContext::None | EnvironmentContext::UnownedCwd { .. }) | None => None,
+        }
+    }
+
     pub(crate) fn task_approval_authority(&self) -> TaskApprovalAuthority {
         if self.runtime_role == RuntimeRole::SubAgent {
             return TaskApprovalAuthority::SubAgent;
@@ -75,7 +84,7 @@ pub(crate) async fn resolve_resource_authority(
                 ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                     ResourceAuthority::Restricted
                 }
-                ConvMode::AttachedWorkChild { .. }
+                ConvMode::AttachedWorkChild
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
                 | ConvMode::Branch { .. }

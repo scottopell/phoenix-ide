@@ -9295,7 +9295,7 @@ where
                     }
                     Some(ModeContext::Explore { .. }) => (None, "Explore"),
                     Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
-                    Some(ModeContext::AttachedWorkChild { .. }) => (None, "Work Child"),
+                    Some(ModeContext::AttachedWorkChild) => (None, "Work Child"),
                     Some(ModeContext::Direct) | None => (None, "Direct"),
                 };
                 let _ = self

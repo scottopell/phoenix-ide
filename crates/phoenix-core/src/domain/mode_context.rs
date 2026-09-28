@@ -24,7 +24,7 @@ pub enum ModeContext {
         task_title: String,
     },
     /// Trusted write-capable child borrowing the parent's worktree without owning it.
-    AttachedWorkChild { worktree_path: String },
+    AttachedWorkChild,
     /// Direct mode: full tool access, no lifecycle ceremony.
     Direct,
     /// Branch mode: work directly on an existing branch. No task file.

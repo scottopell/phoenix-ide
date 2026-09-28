@@ -2187,7 +2187,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
-        | ConvMode::AttachedWorkChild { .. }
+        | ConvMode::AttachedWorkChild
         | ConvMode::Direct
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
@@ -3900,26 +3900,14 @@ impl RuntimeManager {
         }
     }
 
-    fn sub_agent_child_mode(
-        spec: &SubAgentSpec,
-        parent_mode: &ConvMode,
-    ) -> Result<ConvMode, String> {
+    fn sub_agent_child_mode(spec: &SubAgentSpec, parent_mode: &ConvMode) -> ConvMode {
         match spec.mode {
-            SubAgentMode::Explore => Ok(ConvMode::Explore {
+            SubAgentMode::Explore => ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
-            }),
-            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => {
-                Ok(parent_mode.clone())
-            }
-            SubAgentMode::Work => Ok(ConvMode::AttachedWorkChild {
-                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new(
-                    parent_mode
-                        .worktree_path()
-                        .ok_or("Work parent has no worktree")?,
-                )
-                .map_err(ToString::to_string)?,
-            }),
+            },
+            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => ConvMode::Direct,
+            SubAgentMode::Work => ConvMode::AttachedWorkChild,
         }
     }
 
@@ -3964,10 +3952,16 @@ impl RuntimeManager {
                 "Work sub-agents require an approved objective for this managed scope".to_string(),
             );
         }
+        if has_work
+            && !matches!(parent.conv_mode, ConvMode::Direct)
+            && parent_authority.worktree_path().is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         let children = specs
             .iter()
             .map(|spec| {
-                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode)?;
+                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode);
                 Ok(phoenix_db::SubAgentChildAdmission {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
@@ -5076,13 +5070,18 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
-            | ConvMode::AttachedWorkChild { .. }
+            | ConvMode::AttachedWorkChild
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
+        context.work_scope_worktree = authority_resolution.worktree_path().map(PathBuf::from);
+        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild)
+            && context.work_scope_worktree.is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -5230,7 +5229,7 @@ impl RuntimeManager {
                             Some(writing_tools),
                         )
                     }
-                    (None, ConvMode::AttachedWorkChild { .. }) => {
+                    (None, ConvMode::AttachedWorkChild) => {
                         return Err(
                             "Attached Work child requires sub-agent runtime role".to_string()
                         );
@@ -6442,9 +6441,7 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
-        ConvMode::AttachedWorkChild { worktree_path } => ModeContext::AttachedWorkChild {
-            worktree_path: worktree_path.to_string(),
-        },
+        ConvMode::AttachedWorkChild => ModeContext::AttachedWorkChild,
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -8927,7 +8924,7 @@ mod scope_liveness_tests {
             persona: None,
         };
         assert_eq!(
-            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
             ConvMode::Direct
         );
         let managed = ConvMode::Explore {
@@ -8937,12 +8934,12 @@ mod scope_liveness_tests {
             ),
             next_taskmd_id_hint: None,
         };
-        let child = RuntimeManager::sub_agent_child_mode(&spec, &managed).unwrap();
-        assert!(matches!(child, ConvMode::AttachedWorkChild { .. }));
-        assert_eq!(child.worktree_path(), managed.worktree_path());
+        let child = RuntimeManager::sub_agent_child_mode(&spec, &managed);
+        assert!(matches!(child, ConvMode::AttachedWorkChild));
+        assert!(child.worktree_path().is_none());
         spec.mode = SubAgentMode::Explore;
         assert!(matches!(
-            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
             ConvMode::Explore { .. }
         ));
     }
@@ -9012,12 +9009,9 @@ mod scope_liveness_tests {
             .unwrap();
         admit().await.unwrap();
         let child = manager.db().get_conversation(&spec.agent_id).await.unwrap();
-        assert!(matches!(
-            child.conv_mode,
-            ConvMode::AttachedWorkChild { .. }
-        ));
+        assert!(matches!(child.conv_mode, ConvMode::AttachedWorkChild));
         assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
-        assert_eq!(child.conv_mode.worktree_path(), Some(root));
+        assert!(child.conv_mode.worktree_path().is_none());
         assert!(child.conv_mode.worktree_config().is_none());
         assert!(child.conv_mode.task_id().is_none());
         assert_eq!(child.cwd, subdir.to_str().unwrap());
@@ -9028,6 +9022,7 @@ mod scope_liveness_tests {
             authority.authority,
             crate::work_scope::ResourceAuthority::Work
         );
+        assert_eq!(authority.worktree_path(), Some(root));
         let registry = sub_agent_registry_for_authority(
             authority.authority,
             ExploreToolPolicy::from_platform(&manager.platform),

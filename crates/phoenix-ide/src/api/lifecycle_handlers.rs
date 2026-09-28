@@ -1138,9 +1138,7 @@ mod tests {
                 "/tmp/task-approval",
                 id,
                 "gpt-5.4",
-                &ConvMode::AttachedWorkChild {
-                    worktree_path: NonEmptyString::new("/tmp/task-approval").unwrap(),
-                },
+                &ConvMode::AttachedWorkChild,
                 phoenix_core::llm_language::LlmLanguage::default(),
                 parent.attached_work_scope_id.as_ref(),
                 phoenix_db::SubAgentExecution {

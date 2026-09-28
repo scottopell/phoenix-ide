@@ -49,7 +49,7 @@ only the architectural seams.
   sub-agent's `ConvMode` from the parent's mode and selects the
   per-mode tool registry (`for_subagent_explore` /
   `for_subagent_work`); on runtime re-creation the registry is
-  recovered from persisted WorkScope authority with an Explore-child restriction. Git-backed Work children persist a non-owning `AttachedWorkChild` mode; Work Bash is unsandboxed, while Explore Bash retains its read-only sandbox.
+  recovered from persisted WorkScope authority with an Explore-child restriction. Git-backed Work children persist a non-owning `AttachedWorkChild` marker; Work Bash is unsandboxed, while Explore Bash retains its read-only sandbox.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.

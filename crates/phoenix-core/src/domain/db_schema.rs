@@ -206,7 +206,7 @@ pub enum ConvMode {
         base_branch: NonEmptyString,
     },
     /// Trusted write-capable child borrowing the parent's worktree without owning it.
-    AttachedWorkChild { worktree_path: NonEmptyString },
+    AttachedWorkChild,
     /// `ProductCreation` checkout detached at an immutable starting pin, with no owned branch.
     DetachedProductCreation {
         /// Absolute path to the detached worktree.
@@ -246,7 +246,7 @@ impl ConvMode {
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
             Self::Branch { .. } => "Branch",
-            Self::AttachedWorkChild { .. } => "Work Child",
+            Self::AttachedWorkChild => "Work Child",
             Self::DetachedProductCreation { .. } => "Product",
             Self::DetachedApprovedTask { .. } => "Approved Task",
         }
@@ -261,7 +261,7 @@ impl ConvMode {
             }
             Self::Explore { .. }
             | Self::Direct
-            | Self::AttachedWorkChild { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. } => None,
         }
@@ -278,12 +278,11 @@ impl ConvMode {
             Self::Work { worktree_path, .. }
             | Self::Branch { worktree_path, .. }
             | Self::DetachedProductCreation { worktree_path, .. }
-            | Self::DetachedApprovedTask { worktree_path, .. }
-            | Self::AttachedWorkChild { worktree_path } => Some(worktree_path.as_str()),
+            | Self::DetachedApprovedTask { worktree_path, .. } => Some(worktree_path.as_str()),
             Self::Explore { worktree_path, .. } => {
                 worktree_path.as_ref().map(NonEmptyString::as_str)
             }
-            Self::Direct => None,
+            Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -295,7 +294,7 @@ impl ConvMode {
             | Self::Branch { base_branch, .. }
             | Self::DetachedProductCreation { base_branch, .. }
             | Self::DetachedApprovedTask { base_branch, .. } => Some(base_branch.as_str()),
-            Self::Explore { .. } | Self::Direct | Self::AttachedWorkChild { .. } => None,
+            Self::Explore { .. } | Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -309,7 +308,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
-            | Self::AttachedWorkChild { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -324,7 +323,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
-            | Self::AttachedWorkChild { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -352,7 +351,7 @@ impl ConvMode {
             }),
             Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. }
-            | Self::AttachedWorkChild { .. }
+            | Self::AttachedWorkChild
             | Self::Explore { .. }
             | Self::Direct => None,
         }
