@@ -3918,7 +3918,7 @@ impl RuntimeManager {
                         .worktree_path()
                         .ok_or("Work parent has no worktree")?,
                 )
-                .map_err(|error| error.to_string())?,
+                .map_err(ToString::to_string)?,
             }),
         }
     }
@@ -8948,6 +8948,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn trusted_work_child_admission_roundtrips_without_sandbox_and_preserves_parent() {
         use phoenix_core::domain::db_schema::NonEmptyString;
         let manager = Arc::new(test_manager().await);
