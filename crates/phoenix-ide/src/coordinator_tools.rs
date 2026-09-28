@@ -45,7 +45,7 @@ impl Tool for WorkScopeCoordinatorBash {
 
     fn description(&self) -> String {
         format!(
-            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run call must include work_scope_id copied from the authoritative active WorkScope row in Coordinator context. Phoenix resolves the canonical working directory from that persisted WorkScope, preferring worktree_path then cwd. There is no default repository or working directory. peek, wait, and kill use the handle and do not need work_scope_id.",
+            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run call must include work_scope_id copied from an authoritative active WorkScope row obtained through query_database. Phoenix resolves the canonical working directory from that persisted WorkScope, preferring worktree_path then cwd. There is no default repository or working directory. peek, wait, and kill use the handle and do not need work_scope_id.",
             BashTool.description()
         )
     }
@@ -55,7 +55,7 @@ impl Tool for WorkScopeCoordinatorBash {
         language: phoenix_core::llm_language::LlmLanguage,
     ) -> String {
         format!(
-            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run needs work_scope_id from the same active WorkScope row in context. Phoenix resolves canonical cwd from persisted WorkScope data, preferring worktree_path then cwd. No default repo or cwd. peek, wait, kill use handle without work_scope_id.",
+            "{}\n\nTrusted Global Coordinator capability: run commands are unsandboxed. Every op=run needs work_scope_id from an authoritative active WorkScope row obtained through query_database. Phoenix resolves canonical cwd from persisted WorkScope data, preferring worktree_path then cwd. No default repo or cwd. peek, wait, kill use handle without work_scope_id.",
             BashTool.description_for_language(language)
         )
     }

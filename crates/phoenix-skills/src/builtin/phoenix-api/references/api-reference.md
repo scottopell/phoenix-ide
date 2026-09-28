@@ -14,7 +14,7 @@ Use `curl --fail-with-body --silent --show-error` and capture response bodies wi
 
 ## WorkScope admission
 
-Coordinator API operations through scoped Bash require an active `work_scope_id` from the current snapshot. Phoenix resolves that WorkScope's server-side cwd; there is no default repository or cwd. When no active WorkScope exists, first-conversation creation is unavailable through this surface.
+Coordinator API operations through scoped Bash require an active `work_scope_id` obtained through `query_database`. Query current WorkScope and owner rows before choosing the target. Phoenix resolves that WorkScope's server-side cwd; there is no default repository or cwd. When no active WorkScope exists, first-conversation creation is unavailable through this surface.
 
 ## Discover the default model
 
