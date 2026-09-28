@@ -7,8 +7,7 @@ conversations that run concurrently and report results back to a parent
 conversation. Each sub-agent runs in isolation and cannot spawn its own
 sub-agents. The parent specifies mode (explore for read-only research,
 work for write access) and optionally a worker, execution selector, and turn budget per
-sub-agent. Mode enforcement rejects Work sub-agent requests from Explore parents
-when such requests are received. Top-level Explore always exposes `spawn_agents`;
+sub-agent. Mode enforcement rejects Work sub-agent requests from parents without Work authority. Approved Explore provenance does not restrict Work authority. Top-level Explore always exposes `spawn_agents`;
 process-wide sandbox support gates only whether Explore parents and spawned
 Explore sub-agents receive sandboxed bash. Without sandbox support, delegation
 still works with read/browser/submit tools and no bash. Work, Branch, and Direct
@@ -50,7 +49,7 @@ only the architectural seams.
   sub-agent's `ConvMode` from the parent's mode and selects the
   per-mode tool registry (`for_subagent_explore` /
   `for_subagent_work`); on runtime re-creation the registry is
-  recovered from the persisted `conv_mode`.
+  recovered from persisted WorkScope authority with an Explore-child restriction. Git-backed Work children persist a non-owning `AttachedWorkChild` mode; Work Bash is unsandboxed, while Explore Bash retains its read-only sandbox.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.

@@ -400,7 +400,8 @@ fn worktree_path(conv: &Conversation) -> Option<String> {
         ConvMode::Work { worktree_path, .. }
         | ConvMode::Branch { worktree_path, .. }
         | ConvMode::DetachedProductCreation { worktree_path, .. }
-        | ConvMode::DetachedApprovedTask { worktree_path, .. } => Some(worktree_path.to_string()),
+        | ConvMode::DetachedApprovedTask { worktree_path, .. }
+        | ConvMode::AttachedWorkChild { worktree_path } => Some(worktree_path.to_string()),
         ConvMode::Direct => None,
     }
 }
@@ -412,6 +413,7 @@ fn branch_name(conv: &Conversation) -> Option<String> {
         }
         ConvMode::Explore { .. }
         | ConvMode::Direct
+        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
     }
@@ -425,6 +427,7 @@ fn task_id(conv: &Conversation) -> Option<String> {
         ConvMode::Explore { .. }
         | ConvMode::Direct
         | ConvMode::Branch { .. }
+        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::DetachedProductCreation { .. } => None,
     }
 }
@@ -437,6 +440,7 @@ fn task_title(conv: &Conversation) -> Option<String> {
         ConvMode::Explore { .. }
         | ConvMode::Direct
         | ConvMode::Branch { .. }
+        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::DetachedProductCreation { .. } => None,
     }
 }

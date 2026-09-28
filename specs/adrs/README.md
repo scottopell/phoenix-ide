@@ -191,6 +191,8 @@ ADR-000 (adopt spEARS v2 for new work)
                   └── ADR-035 (Repository authority activation is consumer-triggered and offline)
 ```
 
+- [ADR-068: Work children share parent development trust](068_work_children_share_parent_development_trust.md)
+
 ## Conventions
 
 - **Numbering** is sequential across the whole project: `000`, `001`, … Copy

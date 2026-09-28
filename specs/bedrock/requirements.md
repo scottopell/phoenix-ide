@@ -632,8 +632,10 @@ THE SYSTEM SHALL create only Explore-mode sub-agents
 AND configure their working directory from the parent's read-only context
 
 WHEN a Git-backed parent requests a Work sub-agent
-THE SYSTEM SHALL reject the request with a descriptive isolation-unavailable error
-AND SHALL leave the parent conversation's approved write authority unchanged
+THE SYSTEM SHALL require approved parent Work authority
+AND SHALL create a non-owning Work child attached to the parent's exact WorkScope and existing worktree
+AND SHALL use ordinary unsandboxed write-capable tools for that child
+AND SHALL retain task approval, parent lifecycle, and worktree ownership in the parent
 
 WHEN sub-agent is spawned by a Work conversation with Explore mode requested
 THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)

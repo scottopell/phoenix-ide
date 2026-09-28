@@ -5216,11 +5216,6 @@ where
             }));
         }
 
-        // cwd-scoping guard (REQ-PROJ-008): a Work sub-agent's overridden
-        // `cwd` must stay inside the parent's worktree. Without this guard
-        // a Work sub-agent could write outside the worktree because its
-        // own runtime would see a different working_dir than the parent.
-        // Direct parents have no WorkScope worktree, so writes there are unscoped by design.
         let parent_worktree_path = self
             .context
             .work_scope_worktree
@@ -9300,6 +9295,7 @@ where
                     }
                     Some(ModeContext::Explore { .. }) => (None, "Explore"),
                     Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
+                    Some(ModeContext::AttachedWorkChild { .. }) => (None, "Work Child"),
                     Some(ModeContext::Direct) | None => (None, "Direct"),
                 };
                 let _ = self
@@ -21088,9 +21084,9 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn approved_explore_origin_surfaces_work_child_isolation_rejection() {
+    async fn approved_explore_origin_can_request_work_children() {
         let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (spawn_tx, spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
         let mut rt = runtime_in_mode(
             worktree.path(),
@@ -21101,23 +21097,7 @@ mod work_subagent_cwd_guard_tests {
         .with_spawn_channels(spawn_tx, cancel_tx);
         rt.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
-        let responder = tokio::spawn(async move {
-            let request = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
-                .await
-                .expect("admission request must arrive")
-                .expect("spawn admission request");
-            let parent = crate::db::ConvMode::Explore {
-                worktree_path: None,
-                next_taskmd_id_hint: None,
-            };
-            let error =
-                crate::runtime::RuntimeManager::validate_work_child_admission(true, &parent)
-                    .expect_err("Git-backed Work admission requires isolation");
-            request
-                .response_tx
-                .send(crate::runtime::SubAgentAdmissionResponse::Rejected(error))
-                .expect("requester remains live");
-        });
+        let responder = tokio::spawn(accept_spawn_batch(spawn_rx));
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -21132,11 +21112,7 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("handle_spawn_agents_tool returned error");
 
-        let Some(Event::ToolComplete { result, .. }) = result else {
-            panic!("expected rejected Work admission");
-        };
-        assert!(result.is_error());
-        assert!(tool_result_text(&result).contains("filesystem isolation"));
+        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
         responder.await.expect("admission responder joins");
     }
 
