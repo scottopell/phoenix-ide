@@ -289,7 +289,7 @@ pub fn mode_explore(
 pub fn mode_approved_explore_work(lang: LlmLanguage, worktree_path: &str) -> String {
     match lang {
         LlmLanguage::PhoenixNative => format!(
-            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Git-backed Work sub-agents are unavailable because filesystem isolation cannot be enforced; use Explore children for read-only delegation and perform writes in this parent. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
+            "\n\nThe conversation retains Explore provenance, but its approved WorkScope grants full write authority in `{worktree_path}`. `bash` is available with the approved WorkScope's full write authority and is not restricted by the Explore sandbox. Work sub-agents share this WorkScope as trusted, unsandboxed collaborators; partition assignments and integrate their results. Execute the current approved task directly; do not re-propose that same objective. A distinct follow-up task may still be proposed when the user asks for one. Source, task, Git metadata, generated-output, and external-cache writes are permitted within that WorkScope."
         ),
         LlmLanguage::Caveman => format!(
             "\n\nTask approved. Work power in {worktree_path}. Do this task now. No same plan again. User ask different next task? New plan allowed."
@@ -624,6 +624,14 @@ const CAVEMAN_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
         "Change file. Do exact replace, append at end, or overwrite whole file. Tell op and content.",
     ),
 ];
+
+#[must_use]
+pub fn mode_attached_work_child(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => "\n\nYou are a trusted Work sub-agent sharing the parent's worktree. Bash and patch have normal write access without filesystem sandboxing. The parent owns task approval, worktree lifecycle, and integration. Complete your assigned work, preserve unrelated edits, and report conflicts or uncertainty. Do not remove the shared worktree.",
+        LlmLanguage::Caveman => "\n\nYou trusted helper in parent cave. Bash and patch write, no sandbox. Parent owns task, cave, integration. Do assigned work. Keep others edits. Tell parent conflicts. No remove cave.",
+    }
+}
 
 #[cfg(test)]
 mod tests {

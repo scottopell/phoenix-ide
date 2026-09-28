@@ -341,6 +341,39 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[tokio::test]
+    async fn trusted_work_child_bash_writes_inside_and_outside_worktree() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let worktree = fixture.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let context = ToolContext::new(
+            CancellationToken::new(),
+            "trusted-child".into(),
+            worktree.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            Some(worktree.clone()),
+            phoenix_core::work_scope::WorkScopeId::parse("trusted-scope").unwrap(),
+        );
+        let tool = crate::ToolRegistry::for_subagent_work()
+            .find_tool("bash")
+            .unwrap();
+        let result = tool.run(json!({"op": "run", "cmd": "printf inside > inside.txt && printf outside > ../outside.txt", "wait_seconds": 5}), context).await;
+        assert!(result.is_success(), "{}", result.output());
+        assert_eq!(parse_response(&result)["exit_code"], 0);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("inside.txt")).unwrap(),
+            "inside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("outside.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[tokio::test]
     async fn run_exits_within_wait_seconds_returns_exited() {
         let tool = BashTool;
         let result = tool

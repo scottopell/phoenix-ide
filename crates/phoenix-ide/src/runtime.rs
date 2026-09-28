@@ -2187,6 +2187,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
+        | ConvMode::AttachedWorkChild
         | ConvMode::Direct
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
@@ -3899,27 +3900,15 @@ impl RuntimeManager {
         }
     }
 
-    fn sub_agent_child_mode(
-        spec: &SubAgentSpec,
-        parent_mode: &ConvMode,
-    ) -> Result<ConvMode, String> {
+    fn sub_agent_child_mode(spec: &SubAgentSpec, parent_mode: &ConvMode) -> ConvMode {
         match spec.mode {
-            SubAgentMode::Explore => Ok(ConvMode::Explore {
+            SubAgentMode::Explore => ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
-            }),
-            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => {
-                Ok(parent_mode.clone())
-            }
-            SubAgentMode::Work => Err("Git-backed Work sub-agents are unavailable until filesystem isolation is enforced; execute the approved work in the parent conversation".to_string()),
+            },
+            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => ConvMode::Direct,
+            SubAgentMode::Work => ConvMode::AttachedWorkChild,
         }
-    }
-
-    fn validate_work_child_admission(has_work: bool, parent_mode: &ConvMode) -> Result<(), String> {
-        if has_work && !matches!(parent_mode, ConvMode::Direct) {
-            return Err("Git-backed Work sub-agents are unavailable until filesystem isolation is enforced; execute the approved work in the parent conversation".to_string());
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3940,11 +3929,39 @@ impl RuntimeManager {
             return Err("Parent WorkScope changed before sub-agent admission".to_string());
         }
         let has_work = specs.iter().any(|spec| spec.mode == SubAgentMode::Work);
-        Self::validate_work_child_admission(has_work, &parent.conv_mode)?;
+        let parent_authority =
+            crate::resource_authority::resolve_resource_authority(&self.db, &parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        if has_work && parent_authority.authority != crate::work_scope::ResourceAuthority::Work {
+            return Err("Work sub-agents require parent Work authority".to_string());
+        }
+        if has_work
+            && matches!(
+                parent.conv_mode,
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+            )
+            && self
+                .db
+                .get_approved_task_objective(parent_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(
+                "Work sub-agents require an approved objective for this managed scope".to_string(),
+            );
+        }
+        if has_work
+            && !matches!(parent.conv_mode, ConvMode::Direct)
+            && parent_authority.worktree_path().is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         let children = specs
             .iter()
             .map(|spec| {
-                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode)?;
+                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode);
                 Ok(phoenix_db::SubAgentChildAdmission {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
@@ -5053,12 +5070,18 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
+        context.work_scope_worktree = authority_resolution.worktree_path().map(PathBuf::from);
+        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild)
+            && context.work_scope_worktree.is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -5205,6 +5228,11 @@ impl RuntimeManager {
                             ),
                             Some(writing_tools),
                         )
+                    }
+                    (None, ConvMode::AttachedWorkChild) => {
+                        return Err(
+                            "Attached Work child requires sub-agent runtime role".to_string()
+                        );
                     }
                     (None, ConvMode::Direct) => (
                         ToolRegistry::direct(agent_catalog.to_vec())
@@ -6413,6 +6441,7 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
+        ConvMode::AttachedWorkChild => ModeContext::AttachedWorkChild,
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -8895,10 +8924,9 @@ mod scope_liveness_tests {
             persona: None,
         };
         assert_eq!(
-            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
             ConvMode::Direct
         );
-        RuntimeManager::validate_work_child_admission(true, &ConvMode::Direct).unwrap();
         let managed = ConvMode::Explore {
             worktree_path: Some(
                 phoenix_core::domain::db_schema::NonEmptyString::new("/tmp/owned-worktree")
@@ -8906,18 +8934,129 @@ mod scope_liveness_tests {
             ),
             next_taskmd_id_hint: None,
         };
-        assert!(
-            RuntimeManager::validate_work_child_admission(true, &managed)
-                .unwrap_err()
-                .contains("filesystem isolation")
-        );
-        assert!(RuntimeManager::sub_agent_child_mode(&spec, &managed).is_err());
-        RuntimeManager::validate_work_child_admission(false, &managed).unwrap();
+        let child = RuntimeManager::sub_agent_child_mode(&spec, &managed);
+        assert!(matches!(child, ConvMode::AttachedWorkChild));
+        assert!(child.worktree_path().is_none());
         spec.mode = SubAgentMode::Explore;
         assert!(matches!(
-            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct).unwrap(),
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
             ConvMode::Explore { .. }
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn trusted_work_child_admission_roundtrips_without_sandbox_and_preserves_parent() {
+        use phoenix_core::domain::db_schema::NonEmptyString;
+        let manager = Arc::new(test_manager().await);
+        let worktree = tempfile::TempDir::new().unwrap();
+        let root = worktree.path().to_str().unwrap();
+        let subdir = worktree.path().join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(worktree.path().join("parent.txt"), "parent").unwrap();
+        let parent = manager
+            .db()
+            .create_conversation_with_project(
+                "trusted-parent",
+                "trusted-parent",
+                root,
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: Some(NonEmptyString::new(root).unwrap()),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let spec = SubAgentSpec {
+            agent_id: "trusted-work-child".into(),
+            task: "implement assigned work".into(),
+            cwd: subdir.to_str().unwrap().into(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Work,
+            model_id: "gpt-6-astra".into(),
+            connection: "mock".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        let admit = || {
+            manager.admit_sub_agent_batch(
+                "trusted-batch",
+                std::slice::from_ref(&spec),
+                &parent.id,
+                parent.attached_work_scope_id.clone(),
+                true,
+            )
+        };
+        assert!(admit().await.unwrap_err().contains("Work authority"));
+        assert!(manager.db().get_conversation(&spec.agent_id).await.is_err());
+        manager
+            .db()
+            .persist_approved_task_authority(
+                &parent.id,
+                &crate::resource_authority::tests::approval(),
+            )
+            .await
+            .unwrap();
+        admit().await.unwrap();
+        let child = manager.db().get_conversation(&spec.agent_id).await.unwrap();
+        assert!(matches!(child.conv_mode, ConvMode::AttachedWorkChild));
+        assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert!(child.conv_mode.worktree_path().is_none());
+        assert!(child.conv_mode.worktree_config().is_none());
+        assert!(child.conv_mode.task_id().is_none());
+        assert_eq!(child.cwd, subdir.to_str().unwrap());
+        let authority = crate::resource_authority::resolve_resource_authority(manager.db(), &child)
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(authority.worktree_path(), Some(root));
+        let registry = sub_agent_registry_for_authority(
+            authority.authority,
+            ExploreToolPolicy::from_platform(&manager.platform),
+        );
+        let names: Vec<_> = registry.definitions().into_iter().map(|d| d.name).collect();
+        for name in ["bash", "patch", "submit_result"] {
+            assert!(names.iter().any(|n| n == name), "missing {name}");
+        }
+        for name in ["propose_task", "spawn_agents", "ask_user_question"] {
+            assert!(!names.iter().any(|n| n == name), "unexpected {name}");
+        }
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("parent.txt")).unwrap(),
+            "parent"
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(&parent.id)
+                .await
+                .unwrap()
+                .attached_work_scope_id,
+            parent.attached_work_scope_id
+        );
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn(&ResourceScopeKey::Work(
+                parent.attached_work_scope_id.unwrap()
+            ))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

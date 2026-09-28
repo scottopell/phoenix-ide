@@ -205,6 +205,8 @@ pub enum ConvMode {
         /// The branch this worktree was created from (same as `branch_name` for Branch mode)
         base_branch: NonEmptyString,
     },
+    /// Trusted write-capable child borrowing the parent's worktree without owning it.
+    AttachedWorkChild,
     /// `ProductCreation` checkout detached at an immutable starting pin, with no owned branch.
     DetachedProductCreation {
         /// Absolute path to the detached worktree.
@@ -244,6 +246,7 @@ impl ConvMode {
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
             Self::Branch { .. } => "Branch",
+            Self::AttachedWorkChild => "Work Child",
             Self::DetachedProductCreation { .. } => "Product",
             Self::DetachedApprovedTask { .. } => "Approved Task",
         }
@@ -258,6 +261,7 @@ impl ConvMode {
             }
             Self::Explore { .. }
             | Self::Direct
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. } => None,
         }
@@ -278,7 +282,7 @@ impl ConvMode {
             Self::Explore { worktree_path, .. } => {
                 worktree_path.as_ref().map(NonEmptyString::as_str)
             }
-            Self::Direct => None,
+            Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -290,7 +294,7 @@ impl ConvMode {
             | Self::Branch { base_branch, .. }
             | Self::DetachedProductCreation { base_branch, .. }
             | Self::DetachedApprovedTask { base_branch, .. } => Some(base_branch.as_str()),
-            Self::Explore { .. } | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct | Self::AttachedWorkChild => None,
         }
     }
 
@@ -304,6 +308,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -318,6 +323,7 @@ impl ConvMode {
             Self::Explore { .. }
             | Self::Direct
             | Self::Branch { .. }
+            | Self::AttachedWorkChild
             | Self::DetachedProductCreation { .. } => None,
         }
     }
@@ -345,6 +351,7 @@ impl ConvMode {
             }),
             Self::DetachedProductCreation { .. }
             | Self::DetachedApprovedTask { .. }
+            | Self::AttachedWorkChild
             | Self::Explore { .. }
             | Self::Direct => None,
         }

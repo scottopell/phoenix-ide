@@ -776,10 +776,10 @@ AND SHALL include the process in the owning WorkScope's inventory, lifecycle bro
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
 AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
-WHEN conversation bash is authorized with write capability
+WHEN conversation bash, including Work-subagent bash, is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
-AND bash commands SHALL retain their writable behavior inside the attached
-  `WorkScope` or chat-only working directory, as applicable
+AND bash commands SHALL retain normal host filesystem write access
+AND the attached `WorkScope` or chat-only working directory SHALL identify the execution environment without constituting a filesystem confinement boundary
 
 **Rationale:** Explore bash is useful for local code investigation (`git log`,
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the

@@ -59,3 +59,5 @@ On 2026-09-28, a live macOS probe demonstrated that an in-worktree hard link all
 ## Supersession
 
 This ADR refines ADR-026's separation of ProductConversation lifecycle from WorkScope resource ownership and applies ADR-039's fail-closed resource identity policy to runtime capability projection. It does not supersede either decision.
+
+ADR-068 supersedes the child-isolation requirement in this ADR's scope decision; the parent authority projection remains in force.
