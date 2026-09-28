@@ -38,7 +38,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
 | [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
-| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Accepted | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
+| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Partially superseded by ADR-066 | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
@@ -120,7 +120,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-063 (non-binding), then 034, 018, and 017 |
 | Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
 | Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
-| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
+| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 066 for on-demand activity, 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-27
-- **Supersedes:** ADR-022's automatic activity snapshot injection
+- **Supersedes:** ADR-022's automatic activity snapshot injection and ADR-027's retention of that snapshot
 - **Affects:** REQ-GR-010, REQ-GR-011, REQ-GR-013
 
 ## Context
