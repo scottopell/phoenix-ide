@@ -498,6 +498,13 @@ enum ExactTmuxIdentityState {
     Ambiguous { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactShutdownToken {
+    NotRead,
+    Unreadable,
+    Value(String),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ExactShutdownObservation {
     Complete,
@@ -2220,6 +2227,16 @@ impl TmuxRegistry {
         Ok(permit)
     }
 
+    fn retirement_process_absence_is_proven(
+        authority: TmuxRetirementAuthority,
+        process: Option<ProcessIdentity>,
+        process_state: ExactProcessState,
+    ) -> bool {
+        authority == TmuxRetirementAuthority::ExactServer
+            && process.is_some()
+            && process_state == ExactProcessState::DeadOrReused
+    }
+
     fn matches_exact_instance(server: &TmuxServer, permit: &TmuxRetirementPermit) -> bool {
         server.retirement_fenced
             && server.retirement_generation == permit.generation.0
@@ -2251,6 +2268,47 @@ impl TmuxRegistry {
         .await
     }
 
+    fn dead_socket_shutdown_decision(
+        killed_socket: SocketFileIdentity,
+        observed_socket: Option<SocketFileIdentity>,
+    ) -> ExactShutdownObservation {
+        if observed_socket == Some(killed_socket) {
+            ExactShutdownObservation::Outstanding {
+                reason: "exact stale tmux socket remains after kill-server".to_string(),
+            }
+        } else {
+            ExactShutdownObservation::Complete
+        }
+    }
+
+    fn exact_shutdown_decision(
+        probe: ProbeResult,
+        token: ExactShutdownToken,
+        socket: Option<SocketFileIdentity>,
+        killed_socket: SocketFileIdentity,
+        expected_token: &str,
+    ) -> ExactShutdownObservation {
+        match probe {
+            ProbeResult::NoSocket | ProbeResult::NoServer => ExactShutdownObservation::Complete,
+            ProbeResult::DeadSocket => Self::dead_socket_shutdown_decision(killed_socket, socket),
+            ProbeResult::Live => match token {
+                ExactShutdownToken::Value(token) if token == expected_token => {
+                    ExactShutdownObservation::Outstanding {
+                        reason: "exact tmux server instance remains live after kill-server"
+                            .to_string(),
+                    }
+                }
+                ExactShutdownToken::Value(_) => ExactShutdownObservation::Complete,
+                ExactShutdownToken::Unreadable => ExactShutdownObservation::IdentityNotProven {
+                    reason: "live tmux server token is unreadable".to_string(),
+                },
+                ExactShutdownToken::NotRead => ExactShutdownObservation::Outstanding {
+                    reason: "tmux server token reader exceeded the shutdown deadline".to_string(),
+                },
+            },
+        }
+    }
+
     fn observe_dead_socket_shutdown(
         socket_path: &Path,
         killed_socket: SocketFileIdentity,
@@ -2260,18 +2318,8 @@ impl TmuxRegistry {
                 socket_path: socket_path.to_path_buf(),
                 source,
             })?;
-        if observed == Some(killed_socket) {
-            // The pathname is deliberately not unlinked here. An identity check followed by
-            // pathname removal can delete a replacement installed between those operations.
-            // The tmux server/OS owns cleanup of its exact socket incarnation.
-            Ok(ExactShutdownObservation::Outstanding {
-                reason: "exact stale tmux socket remains after kill-server".to_string(),
-            })
-        } else {
-            // A missing path or different inode proves that the killed incarnation is gone.
-            // Whatever now occupies the pathname is a replacement and must remain untouched.
-            Ok(ExactShutdownObservation::Complete)
-        }
+        // A replacement or missing path proves the killed incarnation is gone; never unlink by pathname.
+        Ok(Self::dead_socket_shutdown_decision(killed_socket, observed))
     }
 
     async fn observe_exact_shutdown(
@@ -2290,30 +2338,32 @@ impl TmuxRegistry {
                 reason: "tmux liveness probe exceeded the shutdown deadline".to_string(),
             });
         };
-        match result {
-            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactShutdownObservation::Complete),
-            ProbeResult::DeadSocket => {
-                Self::observe_dead_socket_shutdown(&permit.instance.socket_path, killed_socket)
+        let token = if result == ProbeResult::Live {
+            match read_server_token_until(&permit.instance.socket_path, expires).await {
+                Some(Some(token)) => ExactShutdownToken::Value(token),
+                Some(None) => ExactShutdownToken::Unreadable,
+                None => ExactShutdownToken::NotRead,
             }
-            ProbeResult::Live => {
-                match read_server_token_until(&permit.instance.socket_path, expires).await {
-                    Some(Some(token)) if token == permit.instance.server_token => {
-                        Ok(ExactShutdownObservation::Outstanding {
-                            reason: "exact tmux server instance remains live after kill-server"
-                                .to_string(),
-                        })
-                    }
-                    Some(Some(_)) => Ok(ExactShutdownObservation::Complete),
-                    Some(None) => Ok(ExactShutdownObservation::IdentityNotProven {
-                        reason: "live tmux server token is unreadable".to_string(),
-                    }),
-                    None => Ok(ExactShutdownObservation::Outstanding {
-                        reason: "tmux server token reader exceeded the shutdown deadline"
-                            .to_string(),
-                    }),
+        } else {
+            ExactShutdownToken::NotRead
+        };
+        let socket = if result == ProbeResult::DeadSocket {
+            socket_file_identity(&permit.instance.socket_path).map_err(|source| {
+                TmuxError::ProbeFailed {
+                    socket_path: permit.instance.socket_path.clone(),
+                    source,
                 }
-            }
-        }
+            })?
+        } else {
+            None
+        };
+        Ok(Self::exact_shutdown_decision(
+            result,
+            token,
+            socket,
+            killed_socket,
+            &permit.instance.server_token,
+        ))
     }
 
     async fn wait_for_exact_shutdown_with<F, Fut>(
@@ -2558,8 +2608,12 @@ impl TmuxRegistry {
             (None, _, TmuxRetirementAuthority::ServerAbsenceVerified) => {
                 TmuxRetirementOutcome::AbsenceVerified
             }
-            (_, _, TmuxRetirementAuthority::ExactServer)
-                if exact_process_exit == ExactProcessState::DeadOrReused =>
+            (_, _, authority)
+                if Self::retirement_process_absence_is_proven(
+                    authority,
+                    permit.exact_process,
+                    exact_process_exit,
+                ) =>
             {
                 TmuxRetirementOutcome::AbsenceVerified
             }
@@ -4992,6 +5046,143 @@ mod tests {
                 .unwrap(),
             TmuxRetirementOutcome::AbsenceVerified
         );
+    }
+
+    #[test]
+    fn retirement_process_absence_requires_exact_pid_birth_and_dead_state() {
+        let process = ProcessIdentity {
+            pid: 23,
+            start_time: 41,
+        };
+        for (authority, exact_process, state, expected) in [
+            (
+                TmuxRetirementAuthority::ExactServer,
+                Some(process),
+                ExactProcessState::DeadOrReused,
+                true,
+            ),
+            (
+                TmuxRetirementAuthority::ExactServer,
+                Some(process),
+                ExactProcessState::Live,
+                false,
+            ),
+            (
+                TmuxRetirementAuthority::ExactServer,
+                Some(process),
+                ExactProcessState::Unproven,
+                false,
+            ),
+            (
+                TmuxRetirementAuthority::ExactServer,
+                None,
+                ExactProcessState::DeadOrReused,
+                false,
+            ),
+            (
+                TmuxRetirementAuthority::EndpointAbsent,
+                Some(process),
+                ExactProcessState::DeadOrReused,
+                false,
+            ),
+            (
+                TmuxRetirementAuthority::ServerAbsenceVerified,
+                Some(process),
+                ExactProcessState::DeadOrReused,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                TmuxRegistry::retirement_process_absence_is_proven(authority, exact_process, state),
+                expected,
+                "authority={authority:?}, exact_process={exact_process:?}, state={state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_shutdown_decision_table_preserves_identity_authority() {
+        use super::super::probe::ProbeResult;
+
+        let killed = SocketFileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let replacement = SocketFileIdentity {
+            device: 7,
+            inode: 12,
+        };
+        let cases = [
+            (
+                ProbeResult::NoSocket,
+                ExactShutdownToken::NotRead,
+                None,
+                ExactShutdownObservation::Complete,
+            ),
+            (
+                ProbeResult::NoServer,
+                ExactShutdownToken::NotRead,
+                None,
+                ExactShutdownObservation::Complete,
+            ),
+            (
+                ProbeResult::DeadSocket,
+                ExactShutdownToken::NotRead,
+                Some(killed),
+                ExactShutdownObservation::Outstanding {
+                    reason: "exact stale tmux socket remains after kill-server".to_string(),
+                },
+            ),
+            (
+                ProbeResult::DeadSocket,
+                ExactShutdownToken::NotRead,
+                Some(replacement),
+                ExactShutdownObservation::Complete,
+            ),
+            (
+                ProbeResult::DeadSocket,
+                ExactShutdownToken::NotRead,
+                None,
+                ExactShutdownObservation::Complete,
+            ),
+            (
+                ProbeResult::Live,
+                ExactShutdownToken::Value("same".to_string()),
+                None,
+                ExactShutdownObservation::Outstanding {
+                    reason: "exact tmux server instance remains live after kill-server".to_string(),
+                },
+            ),
+            (
+                ProbeResult::Live,
+                ExactShutdownToken::Value("replacement".to_string()),
+                None,
+                ExactShutdownObservation::Complete,
+            ),
+            (
+                ProbeResult::Live,
+                ExactShutdownToken::Unreadable,
+                None,
+                ExactShutdownObservation::IdentityNotProven {
+                    reason: "live tmux server token is unreadable".to_string(),
+                },
+            ),
+            (
+                ProbeResult::Live,
+                ExactShutdownToken::NotRead,
+                None,
+                ExactShutdownObservation::Outstanding {
+                    reason: "tmux server token reader exceeded the shutdown deadline".to_string(),
+                },
+            ),
+        ];
+        for (probe, token, socket, expected) in cases {
+            assert_eq!(
+                TmuxRegistry::exact_shutdown_decision(probe, token.clone(), socket, killed, "same"),
+                expected,
+                "probe={probe:?}, socket={socket:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
