@@ -625,6 +625,18 @@ const CAVEMAN_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
 ];
 
+#[must_use]
+pub fn mode_attached_work_child(lang: LlmLanguage, worktree_path: &str) -> String {
+    match lang {
+        LlmLanguage::PhoenixNative => format!(
+            "\n\nYou are a trusted Work sub-agent sharing the parent worktree at `{worktree_path}`. Bash and patch have normal write access without filesystem sandboxing. The parent owns task approval, worktree lifecycle, and integration. Complete your assigned work, preserve unrelated edits, and report conflicts or uncertainty. Do not remove the shared worktree."
+        ),
+        LlmLanguage::Caveman => format!(
+            "\n\nYou trusted helper in parent cave `{worktree_path}`. Bash and patch write, no sandbox. Parent owns task, cave, integration. Do assigned work. Keep others edits. Tell parent conflicts. No remove cave."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,17 +734,5 @@ mod tests {
         // Tools without an override return None even in caveman mode (caller
         // falls back to phoenix-native description).
         assert!(tool_description_override("browser_navigate", LlmLanguage::Caveman).is_none());
-    }
-}
-
-#[must_use]
-pub fn mode_attached_work_child(lang: LlmLanguage, worktree_path: &str) -> String {
-    match lang {
-        LlmLanguage::PhoenixNative => format!(
-            "\n\nYou are a trusted Work sub-agent sharing the parent worktree at `{worktree_path}`. Bash and patch have normal write access without filesystem sandboxing. The parent owns task approval, worktree lifecycle, and integration. Complete your assigned work, preserve unrelated edits, and report conflicts or uncertainty. Do not remove the shared worktree."
-        ),
-        LlmLanguage::Caveman => format!(
-            "\n\nYou trusted helper in parent cave `{worktree_path}`. Bash and patch write, no sandbox. Parent owns task, cave, integration. Do assigned work. Keep others edits. Tell parent conflicts. No remove cave."
-        ),
     }
 }
