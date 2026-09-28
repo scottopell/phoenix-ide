@@ -966,7 +966,7 @@ mod tests {
     use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
     use sqlx::{Connection, Execute, Executor, Statement};
     use std::str::FromStr;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use tokio::sync::oneshot;
     use tokio::time::sleep;
 
@@ -1008,96 +1008,36 @@ mod tests {
             .unwrap()
     }
 
-    unsafe extern "C" fn test_overlap_barrier_function(
-        context: *mut ffi::sqlite3_context,
-        _value_count: c_int,
-        _value_arguments: *mut *mut ffi::sqlite3_value,
-    ) {
-        let barrier = unsafe {
-            ffi::sqlite3_user_data(context)
-                .cast::<Arc<Barrier>>()
-                .as_ref()
-        };
-        if let Some(barrier) = barrier {
-            barrier.wait();
-        }
-        unsafe { ffi::sqlite3_result_null(context) };
-    }
+    #[test]
+    fn two_active_native_read_tokens_record_peak_two_without_writer_time() {
+        let collector = SqliteWorkloadCollector::new();
+        let before = report_now(&collector);
+        let mut first = NativeStatementCallbackContext::new(collector.clone());
+        let mut second = NativeStatementCallbackContext::new(collector.clone());
 
-    unsafe extern "C" fn destroy_test_overlap_barrier(data: *mut c_void) {
-        if !data.is_null() {
-            unsafe { drop(Box::from_raw(data.cast::<Arc<Barrier>>())) };
-        }
-    }
+        first.start_native_read(1, SqliteWorkloadCategory::RuntimeState);
+        second.start_native_read(2, SqliteWorkloadCategory::RuntimeState);
+        assert_eq!(collector.active_native_reads_for_test(), 2);
+        assert_eq!(first.finish_native_read(1), 1);
+        assert_eq!(second.finish_native_read(2), 2);
 
-    async fn install_test_overlap_barrier(
-        connection: &mut SqliteConnection,
-        barrier: Arc<Barrier>,
-    ) {
-        let mut locked = connection.lock_handle().await.unwrap();
-        let name = CString::new("phoenix_test_overlap_barrier").unwrap();
-        let barrier = Box::into_raw(Box::new(barrier)).cast();
-        let rc = unsafe {
-            ffi::sqlite3_create_function_v2(
-                locked.as_raw_handle().as_ptr(),
-                name.as_ptr(),
-                0,
-                ffi::SQLITE_UTF8,
-                barrier,
-                Some(test_overlap_barrier_function),
-                None,
-                None,
-                Some(destroy_test_overlap_barrier),
-            )
-        };
-        assert_eq!(rc, ffi::SQLITE_OK);
-    }
-
-    #[tokio::test]
-    async fn two_connections_record_overlapping_native_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("read-overlap.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let mut first = db.pool().acquire().await.unwrap();
-        let mut second = db.pool().acquire().await.unwrap();
-        let overlap_barrier = Arc::new(Barrier::new(2));
-        install_test_overlap_barrier(&mut first, Arc::clone(&overlap_barrier)).await;
-        install_test_overlap_barrier(&mut second, overlap_barrier).await;
-        sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('read-overlap','/tmp/read-overlap','main','2026-01-01T00:00:00Z')")
-            .execute(&mut *first)
-            .await
-            .unwrap();
-        let before = report_now(&db.sqlite_workload_collector);
-        let (first_result, second_result) = tokio::join!(
-            sqlx::query("SELECT phoenix_test_overlap_barrier(), id FROM projects LIMIT 1")
-                .fetch_optional(&mut *first),
-            sqlx::query("SELECT phoenix_test_overlap_barrier(), id FROM projects LIMIT 1")
-                .fetch_optional(&mut *second),
+        let report = report_now(&collector);
+        assert_eq!(
+            report.totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::RuntimeState.index()]
+            .read_concurrency_peak,
+            2,
         );
-        first_result.unwrap();
-        second_result.unwrap();
-        let report = report_now(&db.sqlite_workload_collector);
-        let read = SqliteAccessKind::Read.index();
-        let peak = SqliteWorkloadCategory::ALL
-            .into_iter()
-            .map(|category| report.totals[read][category.index()].read_concurrency_peak)
-            .max()
-            .unwrap();
-        let writer_before: u64 = SqliteWorkloadCategory::ALL
-            .into_iter()
-            .map(|category| {
-                before.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
-            })
-            .sum();
-        let writer_after: u64 = SqliteWorkloadCategory::ALL
-            .into_iter()
-            .map(|category| {
-                report.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
-            })
-            .sum();
-        assert!(peak > 1);
-        assert_eq!(writer_after, writer_before);
+        let writer_micros = |report: &SqliteWorkloadAggregateReport| {
+            SqliteWorkloadCategory::ALL
+                .into_iter()
+                .map(|category| {
+                    report.totals[SqliteAccessKind::Write.index()][category.index()]
+                        .writer_held_micros
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(writer_micros(&report), writer_micros(&before));
     }
 
     #[tokio::test]

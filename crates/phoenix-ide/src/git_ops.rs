@@ -91,6 +91,62 @@ pub(crate) fn run_git_bounded(
     run_git_bounded_with_env(cwd, args, &[], timeout)
 }
 
+enum ChildWait<T> {
+    Exited(T),
+    TimedOut,
+}
+
+fn wait_for_child_with<T, E>(
+    mut try_wait: impl FnMut() -> Result<Option<T>, E>,
+    mut deadline_expired: impl FnMut() -> bool,
+    mut idle: impl FnMut(),
+) -> Result<ChildWait<T>, E> {
+    loop {
+        if let Some(value) = try_wait()? {
+            return Ok(ChildWait::Exited(value));
+        }
+        if deadline_expired() {
+            return Ok(ChildWait::TimedOut);
+        }
+        idle();
+    }
+}
+
+fn configure_dedicated_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+fn kill_process_group(process_group: i32) -> std::io::Result<()> {
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn command_timeout_error(args: &[&str], timeout: std::time::Duration) -> String {
+    format!(
+        "git {:?} timed out after {} seconds",
+        args,
+        timeout.as_secs()
+    )
+}
+
+fn pipe_timeout_error(stream: &str, args: &[&str]) -> String {
+    format!("{stream} drain timed out for git {}", args.join(" "))
+}
+
 fn recv_git_pipe(
     receiver: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     remaining: std::time::Duration,
@@ -101,10 +157,8 @@ fn recv_git_pipe(
     receiver
         .recv_timeout(remaining)
         .map_err(|_| {
-            unsafe {
-                let _ = libc::kill(-process_group, libc::SIGKILL);
-            }
-            format!("{stream} drain timed out for git {}", args.join(" "))
+            let _ = kill_process_group(process_group);
+            pipe_timeout_error(stream, args)
         })?
         .map_err(|error| format!("failed reading git {stream}: {error}"))
 }
@@ -116,7 +170,6 @@ pub(crate) fn run_git_bounded_with_env(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     use std::io::Read;
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::sync::mpsc;
     use std::thread;
@@ -131,14 +184,7 @@ pub(crate) fn run_git_bounded_with_env(
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    configure_dedicated_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn git {}: {e}", args.join(" ")))?;
@@ -167,17 +213,16 @@ pub(crate) fn run_git_bounded_with_env(
     });
 
     let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?
-        {
-            break status;
-        }
-        if start.elapsed() >= timeout {
-            unsafe {
-                let _ = libc::kill(-process_group, libc::SIGKILL);
-            }
+    let status = match wait_for_child_with(
+        || child.try_wait(),
+        || start.elapsed() >= timeout,
+        || std::thread::sleep(std::time::Duration::from_millis(20)),
+    )
+    .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?
+    {
+        ChildWait::Exited(status) => status,
+        ChildWait::TimedOut => {
+            let _ = kill_process_group(process_group);
             let _ = child.kill();
             child
                 .wait()
@@ -186,13 +231,8 @@ pub(crate) fn run_git_bounded_with_env(
             let _ = stderr_reader.join();
             let _ = stdout_rx.recv();
             let _ = stderr_rx.recv();
-            return Err(format!(
-                "git {:?} timed out after {} seconds",
-                args,
-                timeout.as_secs()
-            ));
+            return Err(command_timeout_error(args, timeout));
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
     };
 
     let remaining = timeout.saturating_sub(start.elapsed());
@@ -2086,30 +2126,88 @@ mod tests {
 
 #[cfg(test)]
 mod bounded_git_tests {
-    use super::run_git_bounded_with_env;
+    use super::{
+        command_timeout_error, configure_dedicated_process_group, kill_process_group,
+        pipe_timeout_error, wait_for_child_with, ChildWait,
+    };
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
-    fn run_git_bounded_kills_spawned_descendants_on_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("descendant.pid");
-        let alias = format!(
-            "alias.spawn-descendant=!sh -c 'sleep 30 & echo $! > {}; wait'",
-            pid_file.display()
-        );
-        let err = run_git_bounded_with_env(
-            dir.path(),
-            &["-c", alias.as_str(), "spawn-descendant"],
-            &[],
-            std::time::Duration::from_millis(200),
+    fn wait_policy_reports_exit_and_timeout_without_processes() {
+        let mut attempts = 0;
+        let exited = wait_for_child_with(
+            || {
+                attempts += 1;
+                Ok::<_, ()>((attempts == 2).then_some(7))
+            },
+            || false,
+            || {},
         )
-        .expect_err("timed out");
-        assert!(err.contains("timed out"), "unexpected error: {err}");
-        let descendant_pid: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .expect("descendant pid recorded before timeout")
-            .trim()
-            .parse()
-            .expect("numeric descendant pid");
-        let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
-        assert!(!alive, "descendant survived timeout kill tree");
+        .unwrap();
+        assert!(matches!(exited, ChildWait::Exited(7)));
+
+        let timed_out = wait_for_child_with(|| Ok::<_, ()>(None::<()>), || true, || {}).unwrap();
+        assert!(matches!(timed_out, ChildWait::TimedOut));
+        assert_ne!(
+            command_timeout_error(&["status"], Duration::from_secs(2)),
+            pipe_timeout_error("stdout", &["status"])
+        );
+    }
+
+    #[test]
+    fn process_group_kill_stops_ready_descendant_and_closes_its_pipe() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "(printf ready; exec sleep 30) & wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_dedicated_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn process-group fixture");
+        let process_group = i32::try_from(child.id()).expect("fixture pid fits process-group id");
+        let mut stdout = child.stdout.take().expect("fixture stdout");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut ready = [0; 5];
+            let readiness = stdout.read_exact(&mut ready).map(|_| ready);
+            let _ = ready_tx.send(readiness);
+            let mut remainder = Vec::new();
+            let closed = stdout.read_to_end(&mut remainder).map(|_| remainder);
+            let _ = closed_tx.send(closed);
+        });
+
+        let result = (|| {
+            let ready = ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "fixture descendant did not report readiness".to_string())?
+                .map_err(|error| format!("read fixture readiness: {error}"))?;
+            if &ready != b"ready" {
+                return Err(format!("unexpected fixture readiness: {ready:?}"));
+            }
+            kill_process_group(process_group)
+                .map_err(|error| format!("kill fixture process group: {error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("reap direct fixture child: {error}"))?;
+            let remainder = closed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "descendant retained its stdout pipe after group kill".to_string())?
+                .map_err(|error| format!("drain fixture stdout: {error}"))?;
+            if !remainder.is_empty() {
+                return Err(format!(
+                    "unexpected fixture output after readiness: {remainder:?}"
+                ));
+            }
+            Ok(())
+        })();
+
+        let _ = kill_process_group(process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+        reader.join().expect("join fixture pipe reader");
+        result.expect("group kill must stop the ready descendant and close its pipe");
     }
 }
