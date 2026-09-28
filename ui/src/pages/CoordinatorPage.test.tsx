@@ -91,7 +91,8 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     const action = screen.getByRole('button', { name: /Brief me/ });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages or change anything.');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('fresh current-work facts through query_database');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages, change anything, or start a polling loop.');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tablist', { name: 'Coordinator view' })).not.toBeInTheDocument();

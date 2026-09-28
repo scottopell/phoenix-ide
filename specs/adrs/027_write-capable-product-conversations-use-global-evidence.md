@@ -1,6 +1,6 @@
 # ADR-027: Write-capable ProductConversations use bounded global evidence
 
-- **Status:** Accepted
+- **Status:** Partially superseded by ADR-066 (automatic snapshot retention)
 - **Date:** 2026-08-08
 - **Supersedes:** ADR-022's Coordinator-exclusive placement of global evidence tools
 - **Affects:** REQ-GR-004, REQ-GR-007, REQ-GR-012

@@ -33,12 +33,12 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [019](019_runtime-ownership-requires-positive-evidence.md) | Runtime ownership requires positive evidence | Accepted | REQ-DEPLOY-002A, REQ-RU-004A |
 | [020](020_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
-| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 | REQ-GR-001–005, REQ-GR-007–011A |
+| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 and ADR-066 | REQ-GR-001–005, REQ-GR-007–011A |
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
 | [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
-| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Accepted | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
+| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Partially superseded by ADR-066 | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
@@ -77,7 +77,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
 | [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 | [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
-| [066](066_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
+| [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
+| [067](067_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 
 ## For agents: which decisions bind your task
 
@@ -120,7 +121,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-063 (non-binding), then 034, 018, and 017 |
 | Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
 | Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
-| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
+| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 066 for on-demand activity, 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
