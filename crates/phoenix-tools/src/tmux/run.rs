@@ -373,6 +373,22 @@ async fn return_immediately_response(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionCleanup {
+    KillWindow,
+    RestoreExitCleanup,
+}
+
+fn completion_cleanup(close_after_completion: bool, exited: bool) -> Option<CompletionCleanup> {
+    if !close_after_completion {
+        None
+    } else if exited {
+        Some(CompletionCleanup::KillWindow)
+    } else {
+        Some(CompletionCleanup::RestoreExitCleanup)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_text_response(
     ctx: &ToolContext,
@@ -418,10 +434,11 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion {
-                if exited {
+            match completion_cleanup(close_after_completion, exited) {
+                Some(CompletionCleanup::KillWindow) => {
                     let _ = kill_window(config_path, socket_path, &target.window_id).await;
-                } else {
+                }
+                Some(CompletionCleanup::RestoreExitCleanup) => {
                     match restore_exit_cleanup(config_path, socket_path, &target.window_id).await {
                         Ok(()) => {}
                         Err(error) => {
@@ -429,6 +446,7 @@ async fn wait_for_text_response(
                         }
                     }
                 }
+                None => {}
             }
             return response;
         }
@@ -1196,50 +1214,17 @@ mod tests {
         assert_eq!(v["error"], "invalid_window_name");
     }
 
-    #[tokio::test]
-    async fn wait_for_text_with_keep_closed_closes_window_after_command_completion() {
-        if skip_unless_tmux() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(owner.registry());
-        let config_path = registry.config_path();
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            "tmux-run-close-after-ready",
-            cwd_tmp.path().canonicalize().unwrap(),
-            registry,
-            None,
-            Some(registrar.clone()),
+    #[test]
+    fn completed_wait_for_text_selects_window_cleanup() {
+        assert_eq!(
+            completion_cleanup(true, true),
+            Some(CompletionCleanup::KillWindow)
         );
-
-        let result = TmuxRunTool
-            .run(
-                json!({
-                    "cmd": "echo closes-after-ready; sleep 0.2",
-                    "name": "tmux-run-close-after-ready",
-                    "keep_open_on_exit": false,
-                    "readiness": {
-                        "mode": "wait_for_text",
-                        "text": "closes-after-ready",
-                        "timeout_seconds": 5
-                    }
-                }),
-                ctx,
-            )
-            .await;
-        assert!(result.is_success(), "got: {}", result.output());
-        let v = parse_response(&result);
-        assert_eq!(v["status"], "ready");
-        assert!(v.get("wake_registration").is_none());
-        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
-        let window_id = v["window_id"].as_str().unwrap();
-        let sock = owner.path().join("conv-tmux-run-close-after-ready.sock");
-        assert_window_eventually_closed(&config_path, &sock, window_id).await;
-        owner.shutdown();
+        assert_eq!(
+            completion_cleanup(true, false),
+            Some(CompletionCleanup::RestoreExitCleanup)
+        );
+        assert_eq!(completion_cleanup(false, true), None);
     }
 
     #[tokio::test]

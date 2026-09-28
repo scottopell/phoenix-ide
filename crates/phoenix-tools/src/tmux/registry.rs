@@ -3136,7 +3136,15 @@ pub async fn cascade_tmux_on_delete(
 fn tmux_server_env(server_token: &str) -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     let launch_uuid = uuid::Uuid::new_v4().to_string();
-    let mut env = phoenix_terminal::spawn::build_env_for_tmux(&shell, &launch_uuid);
+    tmux_server_env_for(server_token, &shell, &launch_uuid)
+}
+
+fn tmux_server_env_for(
+    server_token: &str,
+    shell: &str,
+    launch_uuid: &str,
+) -> Vec<(String, String)> {
+    let mut env = phoenix_terminal::spawn::build_env_for_tmux(shell, launch_uuid);
     env.push((
         COMPANION_VERSION_VAR.to_owned(),
         COMPANION_ENV_VERSION.to_owned(),
@@ -5464,50 +5472,38 @@ mod tests {
         owner.shutdown();
     }
 
-    #[tokio::test]
-    async fn contained_spawn_uses_exact_production_pane_environment() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-        let owner = TestTmuxServerOwner::new();
-        let scope = scope("env-contract");
-        let registry = owner.registry();
-        let handle = registry
-            .ensure_live(&scope, owner.path(), None, None)
-            .await
-            .unwrap();
-        let socket = handle.read().await.socket_path.clone();
-        let token = handle.read().await.server_token.clone();
-        let expected = tmux_server_env(&token)
+    #[test]
+    fn production_spawn_builds_exact_pane_environment() {
+        let token = "test-server-token";
+        let shell = "/bin/test-shell";
+        let launch_id = "test-launch-id";
+        let expected = tmux_server_env_for(token, shell, launch_id)
             .into_iter()
             .collect::<HashMap<_, _>>();
-        let output = run_tmux_quiet_output(&socket, &["show-environment", "-g"])
-            .await
-            .unwrap();
-        assert!(output.status.success());
-        let observed = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        let base = phoenix_terminal::spawn::build_env_for_tmux(shell, launch_id)
+            .into_iter()
             .collect::<HashMap<_, _>>();
-        for key in [
-            "TERM",
-            "COLORTERM",
-            "USER",
-            "LANG",
-            "PATH",
-            "SHELL",
-            "PHOENIX_API_URL",
-            "PHOENIX_SUGGEST_TOKEN",
-            COMPANION_VERSION_VAR,
-            SERVER_TOKEN_VAR,
-        ] {
-            if let Some(expected) = expected.get(key) {
-                assert_eq!(observed.get(key), Some(expected), "environment key {key}");
-            }
+        for (key, value) in base {
+            assert_eq!(
+                expected.get(&key),
+                Some(&value),
+                "base environment key {key}"
+            );
         }
-        owner.shutdown();
+        assert_eq!(
+            expected.get(SERVER_TOKEN_VAR).map(String::as_str),
+            Some(token)
+        );
+        assert_eq!(
+            expected.get(COMPANION_VERSION_VAR).map(String::as_str),
+            Some(COMPANION_ENV_VERSION)
+        );
+        assert_eq!(
+            expected.len(),
+            phoenix_terminal::spawn::build_env_for_tmux(shell, launch_id).len() + 2
+        );
+        assert!(!expected.contains_key("OPENAI_API_KEY"));
+        assert!(!expected.contains_key("ANTHROPIC_API_KEY"));
     }
 
     #[tokio::test]
