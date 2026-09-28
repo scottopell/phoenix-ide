@@ -4,11 +4,11 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Write-capable ordinary ProductConversations may use bounded global evidence and singular cross-conversation messaging on explicit turns, while restricted planning conversations and sub-agents remain scoped. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
+The Coordinator is an open-ended cross-conversation console, not a manager for one global objective. It queries current-work facts on demand, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Write-capable ordinary ProductConversations may use bounded global evidence and singular cross-conversation messaging on explicit turns, while restricted planning conversations and sub-agents remain scoped. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
 
 ## Why the User Cares
 
-- **Orientation should be deterministic.** The user should not spend model tokens or trust an inference step just to discover current work.
+- **Orientation should be evidence-based.** Current-work briefings should use bounded fresh relational facts and distinguish observation from interpretation.
 - **Long-running work should not fragment identity.** A continuation chain represents one work item even though it spans multiple conversations.
 - **Intervention should be narrow and trustworthy.** The Coordinator may send text to existing conversations, while the receiving conversation's authoritative state determines whether the message starts immediately, becomes steering, or is rejected.
 - **Committed actions should be transparent.** The Coordinator reports acceptance per target without implying that another agent understood, acknowledged, or completed the instruction.
@@ -193,18 +193,18 @@ THE briefing action SHALL preserve the user's draft and SHALL NOT create a separ
 
 ---
 
-### REQ-GR-011: Inject a Bounded Relational Snapshot
+### REQ-GR-011: Obtain Current Activity on Demand
 
-WHEN the Coordinator dispatches an ordinary agent turn
-THE SYSTEM SHALL attach a bounded current-activity snapshot after the stable cached Coordinator prompt
+WHEN the Coordinator needs current activity facts for a user request
+THE SYSTEM SHALL provide the bounded read-only database query capability
+AND SHALL instruct the Coordinator to query relevant current transcript rows, timestamps, continuation identities, and authoritative active WorkScope identities and paths before making current-state claims or choosing a Bash target
 
-THE snapshot SHALL expose raw current continuation leaves with ProductConversation, root transcript-row, and current transcript-row identifiers, state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths
+WHEN the Coordinator dispatches a model request
+THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
-THE snapshot SHALL order active runtime states first and then by conversation update time, SHALL state its row limit and selection rule, and SHALL explicitly report result truncation
-
-THE snapshot SHALL state that it contains raw facts rather than open-work, stalled, attention, history, or exact-delta classifications
-
-THE SYSTEM SHALL keep the bounded read-only database query tool available when the snapshot is insufficient
+WHEN the user requests a current-work briefing through the composer action
+THE SYSTEM SHALL submit a normal read-only message requesting fresh relational facts, decisions or blockers needing user attention, and actively progressing work
+AND SHALL request supporting history only where needed, distinguish observed facts from uncertainty, and prohibit message delivery, mutation, and polling loops for that briefing
 
 ---
 
@@ -265,7 +265,7 @@ WHEN the global Coordinator requests a continuation summary
 THE SYSTEM SHALL select coordination-focused handoff instructions through the existing Coordinator identity
 AND SHALL use the shared tool-free continuation pipeline and protected accepted-handoff contract in [REQ-BED-020](../bedrock/requirements.md#req-bed-020-continuation-summary-generation)
 AND SHALL describe its actual capability boundaries without promising an ambient working directory, conversation creation, or background monitoring
-AND SHALL NOT inject the ordinary turn's live activity snapshot into summary generation
+AND SHALL NOT inject live activity facts into summary generation
 
 THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
 AND SHALL preserve owner identities and delegation relationships, with durable target references distinct from historical transcript references when available

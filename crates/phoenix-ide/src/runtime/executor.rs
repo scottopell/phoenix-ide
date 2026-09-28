@@ -1780,7 +1780,6 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
-    coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
     /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
     /// Static for the conversation's tool set, so it is computed once and only
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
@@ -2100,7 +2099,6 @@ where
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
-            coordinator_read_service: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
@@ -2280,15 +2278,6 @@ where
         let _owner = self.live_state_owner()?;
         self.publish_live_state_admitted();
         Ok(())
-    }
-
-    /// Set the credential helper for recovery settlement (REQ-BED-030).
-    pub(crate) fn with_coordinator_read_service(
-        mut self,
-        service: crate::api::global_read::GlobalReadService,
-    ) -> Self {
-        self.coordinator_read_service = Some(service);
-        self
     }
 
     pub fn with_credential_helper(
@@ -7320,7 +7309,6 @@ where
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
-        let coordinator_read_service = self.coordinator_read_service.clone();
         let explore_bash = self.context.explore_bash;
         let request_tool_surface = tool_surface;
 
@@ -7345,7 +7333,7 @@ where
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
-        // optional Coordinator capsule are request authority, not task-local inputs.
+        // provider context are request authority, not task-local inputs.
         let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
         if let Some(tool) = available_tools
             .iter_mut()
@@ -7420,21 +7408,10 @@ where
             &callable_tool_names,
             request_tool_surface == LlmToolSurface::SubAgentTerminal,
         );
-        let mut system = vec![SystemContent::cached(&system_prompt)];
-        if is_coordinator {
-            let capsule = match coordinator_read_service {
-                Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
-                    tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
-                    "# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn. Use query_database to inspect current relational facts directly.".to_string()
-                }),
-                None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
-            };
-            system.push(SystemContent::new(capsule));
-        }
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let request = LlmRequest {
-            system,
+            system: vec![SystemContent::cached(&system_prompt)],
             messages,
             provider_replay,
             tools,
@@ -12722,6 +12699,67 @@ mod dispatch_context_budget_tests {
             }
         ));
         assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_dispatch_keeps_one_stable_system_block_as_evidence_changes() {
+        let cwd = TempDir::new().unwrap();
+        let conv_id = "coordinator-on-demand";
+        let mut context =
+            ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        context.is_coordinator = true;
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage.clone(),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        for (id, text) in [
+            ("first", "Check the release"),
+            ("second", "The release owner reports completion"),
+        ] {
+            storage
+                .add_message(id, conv_id, &MessageContent::user(text), None, None)
+                .await
+                .unwrap();
+            llm.queue_response(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text("Query fresh evidence when needed")],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+            runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+            runtime.llm_task_handle.take().unwrap().await.unwrap();
+        }
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        let expected = crate::system_prompt::build_coordinator_system_prompt(
+            crate::llm_language::LlmLanguage::default(),
+            None,
+        );
+        for request in &requests {
+            assert_eq!(request.system.len(), 1);
+            assert_eq!(request.system[0].text, expected);
+            assert_eq!(request.cache_key.as_str(), conv_id);
+        }
+        assert_eq!(user_texts(&requests[0]), vec!["Check the release"]);
+        assert_eq!(
+            user_texts(&requests[1]),
+            vec!["Check the release", "The release owner reports completion"]
+        );
     }
 
     #[tokio::test]

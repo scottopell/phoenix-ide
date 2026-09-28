@@ -5391,14 +5391,6 @@ impl RuntimeManager {
             broadcaster.clone(),
         );
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
-        let runtime = if is_coordinator {
-            runtime.with_coordinator_read_service(crate::api::global_read::GlobalReadService::new(
-                self.db.clone(),
-                self.message_retriever.clone(),
-            ))
-        } else {
-            runtime
-        };
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
             .with_state_updated_at(initial_state_updated_at)
