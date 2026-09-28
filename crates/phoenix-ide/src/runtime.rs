@@ -5497,13 +5497,23 @@ impl RuntimeManager {
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
             // not evict that replacement.
+            let mut recreation_broadcaster = None;
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
                 if runtimes
                     .get(&conv_id)
                     .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
                 {
-                    runtimes.remove(&conv_id);
+                    let retired = runtimes.remove(&conv_id).expect("identity-checked runtime");
+                    if disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
+                        let broadcaster = retired.broadcast_tx;
+                        manager_for_cleanup
+                            .evicted_broadcasters
+                            .write()
+                            .await
+                            .insert(conv_id.clone(), broadcaster.clone());
+                        recreation_broadcaster = Some(broadcaster);
+                    }
                     true
                 } else {
                     false
@@ -5524,8 +5534,8 @@ impl RuntimeManager {
                     tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
                 }
             }
-            if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                manager_for_cleanup.schedule_runtime_recreation(conv_id);
+            if let Some(broadcaster) = recreation_broadcaster {
+                manager_for_cleanup.schedule_runtime_recreation(conv_id, broadcaster);
             }
         });
 
@@ -5534,17 +5544,21 @@ impl RuntimeManager {
         Ok(handle)
     }
 
-    fn schedule_runtime_recreation(self: &Arc<Self>, conversation_id: String) {
+    fn schedule_runtime_recreation(
+        self: &Arc<Self>,
+        conversation_id: String,
+        stale_broadcaster: SseBroadcaster,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = manager.get_or_create(&conversation_id).await {
-                tracing::error!(
-                    %error,
-                    conversation_id,
-                    "failed to rematerialize runtime after database-recreation exit"
-                );
+                tracing::warn!(%error, conversation_id,
+                    "Runtime reconstruction failed; scheduling one bounded retry");
+                let _ = manager
+                    .schedule_runtime_reconstruction_retry(conversation_id, stale_broadcaster)
+                    .await;
             }
-        });
+        })
     }
 
     /// Inject a fake live handle carrying a specific `ConvState` into the
@@ -5892,7 +5906,7 @@ impl RuntimeManager {
                         %reconstruction_error,
                         "Steering runtime reconstruction failed after durable admission; scheduling one bounded retry"
                     );
-                    self.schedule_steering_reconstruction_retry(
+                    self.schedule_runtime_reconstruction_retry(
                         conversation_id.to_string(),
                         stale_broadcaster,
                     );
@@ -5910,32 +5924,29 @@ impl RuntimeManager {
         Ok(())
     }
 
-    fn schedule_steering_reconstruction_retry(
+    fn schedule_runtime_reconstruction_retry(
         self: &Arc<Self>,
         conversation_id: String,
         stale_broadcaster: SseBroadcaster,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if let Err(error) = manager.get_or_create(&conversation_id).await {
                 let released = manager
-                    .release_failed_steering_reconstruction_broadcaster(
-                        &conversation_id,
-                        &stale_broadcaster,
-                    )
+                    .release_failed_reconstruction_broadcaster(&conversation_id, &stale_broadcaster)
                     .await;
                 tracing::warn!(
                     conversation_id,
                     %error,
                     released_stale_broadcaster = released,
-                    "Bounded steering runtime reconstruction retry failed"
+                    "Bounded runtime reconstruction retry failed"
                 );
             }
-        });
+        })
     }
 
-    async fn release_failed_steering_reconstruction_broadcaster(
+    async fn release_failed_reconstruction_broadcaster(
         &self,
         conversation_id: &str,
         expected: &SseBroadcaster,
@@ -10128,10 +10139,7 @@ mod scope_liveness_tests {
             let stale_broadcaster = stale_broadcaster.clone();
             tokio::spawn(async move {
                 manager
-                    .release_failed_steering_reconstruction_broadcaster(
-                        conversation_id,
-                        &stale_broadcaster,
-                    )
+                    .release_failed_reconstruction_broadcaster(conversation_id, &stale_broadcaster)
                     .await
             })
         };
@@ -10158,6 +10166,57 @@ mod scope_liveness_tests {
             stale_events.recv().await,
             Err(tokio::sync::broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn approval_reconstruction_failure_releases_reserved_stream() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "missing-approval-reconstruction";
+        let reserved = manager.conversation_broadcaster(conversation_id).await;
+        let mut events = reserved.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.schedule_runtime_recreation(conversation_id.to_string(), reserved),
+        )
+        .await
+        .expect("bounded reconstruction must finish")
+        .expect("reconstruction task joins");
+        assert!(!manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
+        while events.try_recv().is_ok() {}
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_reconstruction_preserves_reserved_stream_on_success() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "successful-approval-reconstruction";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reserved = manager.conversation_broadcaster(conversation_id).await;
+        manager
+            .schedule_runtime_recreation(conversation_id.to_string(), reserved.clone())
+            .await
+            .unwrap();
+        let live = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("rebuilt runtime");
+        assert!(reserved.same_channel(&live.broadcast_tx));
+        assert!(!manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
     }
 
     #[tokio::test]
