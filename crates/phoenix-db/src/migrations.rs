@@ -10783,21 +10783,6 @@ CREATE TABLE approval_request_obligations (
     FOREIGN KEY (conversation_id, approval_message_id)
         REFERENCES messages(conversation_id, message_id) ON DELETE CASCADE
 );
-INSERT OR IGNORE INTO approval_request_obligations
-    (conversation_id, approval_message_id, created_at_us)
-SELECT c.id, m.message_id, CAST(strftime('%s', m.created_at) AS INTEGER) * 1000000
-FROM conversations c
-JOIN work_scope_approved_task_authorities authority
-  ON authority.work_scope_id = c.work_scope_id
- AND authority.objective_conversation_id = c.id
-JOIN conversation_approved_task_objectives objective
-  ON objective.conversation_id = authority.objective_conversation_id
-JOIN messages m ON m.conversation_id = c.id
-WHERE c.state_kind = 'llm_requesting'
-  AND m.message_type = 'user'
-  AND m.sequence_id = (
-      SELECT max(m2.sequence_id) FROM messages m2 WHERE m2.conversation_id = c.id
-  );
 CREATE TRIGGER approval_request_obligation_after_agent_response
 AFTER INSERT ON messages
 WHEN NEW.message_type = 'agent'
@@ -11340,32 +11325,13 @@ mod tests {
         let pool = test_pool().await;
         setup_migration_109_fixture(&pool).await;
         sqlx::raw_sql(MIGRATION_109).execute(&pool).await.unwrap();
-        let legacy_obligation = sqlx::query_as::<_, (String, String)>(
-            "SELECT conversation_id, approval_message_id
-             FROM approval_request_obligations
-             WHERE conversation_id = 'legacy'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
         assert_eq!(
-            legacy_obligation,
-            ("legacy".to_string(), "legacy-approval".to_string())
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM approval_request_obligations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
         );
-        sqlx::query("DELETE FROM approval_request_obligations WHERE conversation_id = 'legacy'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                 SELECT 1 FROM approval_request_obligations
-                 WHERE conversation_id = 'follow-up'
-                   AND approval_message_id = 'follow-up-approval'
-             )",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap());
 
         assert!(sqlx::query(
             "INSERT INTO approval_request_obligations

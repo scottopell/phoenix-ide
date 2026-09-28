@@ -8968,7 +8968,7 @@ where
                     title: title.to_string(),
                     priority,
                     plan: plan.to_string(),
-                    task_file: task_file.to_string(),
+                    task_file: reviewed.task_file,
                     artifact_body: reviewed.artifact_body,
                 },
                 &message,
@@ -16527,8 +16527,13 @@ mod approved_explore_follow_up_tests {
         seed_existing_objective(&storage).await;
         storage.set_fail_approval_authority_persistence(true);
         let broadcast_tx = SseBroadcaster::new(16, 0);
-        let mut runtime =
-            approved_explore_runtime(worktree, task_file, plan, storage, broadcast_tx);
+        let mut runtime = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
         let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
         let mut admitted = authority_fence.try_acquire().expect("open authority fence");
 
@@ -16548,6 +16553,37 @@ mod approved_explore_follow_up_tests {
         assert_eq!(
             runtime.recovery_disposition,
             RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+        let committed_head = run_git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        storage.set_fail_approval_authority_persistence(false);
+        let mut recovered = approved_explore_runtime(
+            worktree.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            SseBroadcaster::new(16, 0),
+        );
+        recovered
+            .execute_approve_task(
+                task_file.to_string(),
+                "Follow up".to_string(),
+                crate::task_source::Priority::P1,
+                plan.to_string(),
+                TaskApprovalExecution::FollowUp,
+                &mut admitted,
+            )
+            .await
+            .expect("retry recovers committed promoted artifact");
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            committed_head
+        );
+        assert_eq!(
+            storage
+                .approved_task_authority("approved-explore-follow-up")
+                .unwrap()
+                .task_file,
+            "tasks/72004-p1-in-progress--follow-up.md"
         );
     }
 
@@ -16669,7 +16705,7 @@ mod approved_explore_follow_up_tests {
             .approved_task_authority("approved-explore-follow-up")
             .expect("replacement objective");
         assert_eq!(replacement.task_id, "72004");
-        assert_eq!(replacement.task_file, task_file);
+        assert_eq!(replacement.task_file, promoted_task_file);
         assert!(
             std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
                 event,

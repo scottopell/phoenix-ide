@@ -627,9 +627,12 @@ AND SHALL NOT treat that association as ownership of a Phoenix worktree lifecycl
 
 ### REQ-BED-018: Sub-Agent Mode Enforcement
 
-WHEN sub-agent is spawned by an Explore conversation
-THE SYSTEM SHALL always create the sub-agent in Explore mode
-AND configure its working directory as the parent's main branch checkout
+WHEN a sub-agent is spawned by a parent without approved write authority
+THE SYSTEM SHALL create only Explore-mode sub-agents
+AND configure their working directory from the parent's read-only context
+
+WHEN an Explore-origin parent has persisted WorkScope write authority and an approved objective
+THE SYSTEM SHALL admit requested Work sub-agents under the same inherited-worktree and host-confinement rules as other Git-backed writing parents
 
 WHEN sub-agent is spawned by a Work conversation with Explore mode requested
 THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)
@@ -1025,6 +1028,10 @@ AND SHALL derive the approval sequence from the referenced message rather than s
 AND SHALL preserve the requesting state across process restart while that obligation remains pending
 AND SHALL retire the obligation when the first later agent response is durably stored or the conversation leaves `LlmRequesting`
 AND SHALL NOT treat the lifetime approved-task objective as ownership of later requests
+
+WHEN upgrading rows created before operation-scoped approval provenance exists
+THE SYSTEM SHALL NOT infer a pending approval request from lifetime objectives or message presentation text
+AND SHALL retain the ordinary interrupted-request recovery behavior for those rows
 
 WHEN approval performs Git or worktree mutation before adopting `LlmRequesting`
 THE SYSTEM SHALL capture the requesting-state timestamp after that mutation succeeds and immediately before atomic persistence and live-state adoption

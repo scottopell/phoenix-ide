@@ -1,4 +1,4 @@
-# ADR-066: WorkScope authority projects one runtime capability
+# ADR-067: WorkScope authority projects one runtime capability
 
 - **Status:** Accepted
 - **Date:** 2026-09-13
@@ -41,6 +41,8 @@ Rejected as the primary structure. Repeated checks can support defense, but they
 ## Compatibility
 
 The authority projection change is forward-only. A forward migration repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore and strengthens timestamp storage-class checks without changing an already-applied migration; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
+
+Pre-feature approval rows have no durable operation-scoped message discriminator. Migration creates an empty obligation table; it does not manufacture replay ownership from lifetime objectives or presentation text. Such interrupted legacy requests retain ordinary startup recovery, while new approvals atomically persist their exact message-bound obligation.
 
 ## Consequences
 
