@@ -21088,7 +21088,7 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn approved_explore_origin_accepts_work_subagent() {
+    async fn approved_explore_origin_surfaces_work_child_isolation_rejection() {
         let worktree = TempDir::new().expect("worktree tempdir");
         let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
         let (cancel_tx, _cancel_rx) = mpsc::channel(1);
@@ -21101,6 +21101,20 @@ mod work_subagent_cwd_guard_tests {
         .with_spawn_channels(spawn_tx, cancel_tx);
         rt.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
+        let responder = tokio::spawn(async move {
+            let request = spawn_rx.recv().await.expect("spawn admission request");
+            let parent = crate::db::ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            };
+            let error =
+                crate::runtime::RuntimeManager::validate_work_child_admission(true, &parent)
+                    .expect_err("Git-backed Work admission requires isolation");
+            request
+                .response_tx
+                .send(crate::runtime::SubAgentAdmissionResponse::Rejected(error))
+                .expect("requester remains live");
+        });
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
                 tasks: vec![SubAgentTask {
@@ -21115,11 +21129,12 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("handle_spawn_agents_tool returned error");
 
-        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
-        assert_eq!(
-            spawn_rx.try_recv().expect("Work spawn request").specs[0].mode,
-            SubAgentMode::Work
-        );
+        let Some(Event::ToolComplete { result, .. }) = result else {
+            panic!("expected rejected Work admission");
+        };
+        assert!(result.is_error());
+        assert!(tool_result_text(&result).contains("filesystem isolation"));
+        responder.await.expect("admission responder joins");
     }
 
     #[tokio::test]

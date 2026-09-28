@@ -1,5 +1,9 @@
 # Distinguish first approval from follow-up by durable approved-objective provenance
 
+## User-approved delivery split (2026-09-28)
+
+The user authorized landing Part1 on PR765. Git-backed Work-child execution is deferred to task66007 and must reject explicitly; it is not a prerequisite for restoring this owner's parent Bash/Git/patch capability. The same-owner post-deploy probe must check that rejection without creating a child. This supersedes the Work-child-success criteria below and the earlier no-merge constraint; deployment remains separately authorized.
+
 ## Immediate objective
 
 Repair PR #765’s still-open initial-versus-follow-up approval bypass and prove the supported same-owner recovery for owner `b8876b92-5db4-40fa-9a26-1fafc848977c` / WorkScope `f659e833-a1aa-41bf-8f47-388fba693773` without replaying approval, editing production state, replacing the owner, or disturbing task 06009’s accepted artifact and commits.
