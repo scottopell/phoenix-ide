@@ -3326,8 +3326,9 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            if matches!(self.state, ConvState::AwaitingRecovery { .. })
-                && !matches!(terminal_event, Event::CredentialBecameAvailable)
+            if matches!(terminal_event, Event::UserCancel { .. })
+                || (matches!(self.state, ConvState::AwaitingRecovery { .. })
+                    && !matches!(terminal_event, Event::CredentialBecameAvailable))
             {
                 self.pending_trusted_tool_results.clear();
             }
@@ -20337,6 +20338,28 @@ mod steer_drain_detector_tests {
                 "authenticated payload".to_string()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_clears_when_active_llm_request_is_cancelled() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-llm-cancel",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![(
+            "phoenix-api-call".to_string(),
+            "authenticated payload".to_string(),
+        )];
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel active LLM request");
+
+        assert!(rt.pending_trusted_tool_results.is_empty());
     }
 
     #[tokio::test]

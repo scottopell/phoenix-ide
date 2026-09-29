@@ -38,6 +38,7 @@ value PhoenixApiRecipe {
     verifies_creation_separately_from_activity: Boolean
     distinguishes_product_root_and_current_transcript: Boolean
     performs_no_database_lifecycle_write: Boolean
+    objective_is_nonblank: Boolean
 }
 
 ------------------------------------------------------------
@@ -182,7 +183,6 @@ rule PhoenixApiCreationRecipe {
     when: CoordinatorCreationAuthorized(recipe, origin, work_scope_id, objective)
 
     requires: ActiveWorkScope(work_scope_id)
-    requires: objective != ""
 
     ensures: recipe.discovers_auth = true
     ensures: recipe.discovers_model_and_effort = true
@@ -193,6 +193,7 @@ rule PhoenixApiCreationRecipe {
     ensures: recipe.verifies_creation_separately_from_activity = true
     ensures: recipe.distinguishes_product_root_and_current_transcript = true
     ensures: recipe.performs_no_database_lifecycle_write = true
+    ensures: recipe.objective_is_nonblank = true
 
     @guidance
         -- Global retains the immutable request identity and exact intent across
