@@ -73,7 +73,7 @@ impl Database {
         update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
     ) -> DbResult<()> {
         use phoenix_core::domain::provider_replay::AnthropicReplayUpdate;
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let previous_kind: String =
             sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
                 .bind(conversation_id)

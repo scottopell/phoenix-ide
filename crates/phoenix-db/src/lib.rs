@@ -7253,7 +7253,7 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let state_json = serde_json::to_string(state).unwrap();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous_kind: String =
             sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
                 .bind(id)

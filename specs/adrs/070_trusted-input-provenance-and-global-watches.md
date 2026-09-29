@@ -18,7 +18,7 @@ Packets report outcome and identity facts only. Natural-language facts are allow
 
 Delivery discovery reuses the direct-turn worker rather than adding a subscription scheduler. Source and recipient lifecycle authority remain with their existing owners. No Project Coordinator extension or identity-grammar replacement is introduced.
 
-## Alternatives rejected
+## Options considered
 
 - Unattributed user-role text prefixes as the only stored representation: loses trustworthy provenance on retrieval and replay.
 - Historical-human default: fabricates attribution that was not recorded.
