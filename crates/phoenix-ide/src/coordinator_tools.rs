@@ -275,7 +275,7 @@ impl Tool for SendConversationMessage {
     }
 
     fn description(&self) -> String {
-        "Send one user message to another conversation by durable target reference (@work, @conv, app-local link, or conversation id). Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
+        "Send one conversation-authored message to another conversation by durable target reference (@work, @conv, app-local link, or conversation id). Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -326,6 +326,16 @@ impl Tool for SendConversationMessage {
         }
         let request = SendChatRequest {
             conversation_id: conversation_id.clone(),
+            origin: match self
+                .send_chat
+                .source_conversation(&ctx.conversation_id)
+                .await
+            {
+                Ok(source) => sender_origin(source),
+                Err(error) => {
+                    return ToolOutput::error(format!("sender membership unavailable: {error}"))
+                }
+            },
             text: parsed.message,
             message_id: parsed.message_id.clone(),
             images: Vec::new(),
@@ -405,6 +415,13 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Busy => "conversation_busy",
         SendChatServiceError::CloseAdmissionFenced => "close_admission_fenced",
         SendChatServiceError::HistoryUnavailable => "target_unavailable",
+    }
+}
+
+fn sender_origin(source: crate::db::Conversation) -> phoenix_core::domain::db_schema::InputOrigin {
+    phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+        product_conversation_id: source.product_conversation_id,
+        transcript_id: source.id,
     }
 }
 
@@ -541,6 +558,23 @@ mod tests {
         assert!(descriptions["search_conversations"].contains("untrusted stored data"));
         assert!(descriptions["read_conversation"].contains("untrusted stored data"));
         assert!(descriptions["send_conversation_message"].contains("acceptance only"));
+    }
+
+    #[tokio::test]
+    async fn sender_origin_comes_from_persisted_conversation_membership() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("sender-transcript", "sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let actual = db.get_conversation(&source.id).await.unwrap();
+        assert_eq!(
+            sender_origin(actual),
+            phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                product_conversation_id: source.product_conversation_id,
+                transcript_id: source.id,
+            }
+        );
     }
 
     #[tokio::test]

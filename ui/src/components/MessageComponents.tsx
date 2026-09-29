@@ -23,7 +23,7 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
+import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
 import { agentTurnsInHistoricalUnit, buildHistoricalUnits, type AgentTurnUnit } from '../conversation/renderUnits';
 import { cacheDB } from '../cache';
@@ -387,6 +387,26 @@ function FileChips({
   );
 }
 
+function InputSender({ origin }: { origin: InputOrigin | undefined }) {
+  if (!origin) return <span className="message-sender">Unknown input</span>;
+  switch (origin.kind) {
+    case 'user_api':
+      return <span className="message-sender">You</span>;
+    case 'internal_conversation':
+      return (
+        <span className="message-sender">
+          From conversation ID {origin.product_conversation_id} · transcript ID {origin.transcript_id}
+        </span>
+      );
+    case 'system_generated':
+      return <span className="message-sender">System input</span>;
+    case 'unknown_historical':
+      return <span className="message-sender">Unknown input</span>;
+    default:
+      return origin satisfies never;
+  }
+}
+
 export const UserMessage = memo(UserMessageImpl);
 
 function UserMessageImpl({ message, activeHighlight = null }: { message: Message; activeHighlight?: ConversationHighlight | null }) {
@@ -396,7 +416,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const files = content.files || [];
   const displayData = message.display_data as { type?: string } | null;
   const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
-  const isMeta = content.is_meta === true;
+  const isMeta = content.is_meta === true || message.origin?.kind === 'system_generated';
   const timestamp = message.created_at;
 
   if (isWakeMeta) {
@@ -415,7 +435,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
-          {!isMeta && <span className="message-sender">You</span>}
+          {content.is_meta !== true && <InputSender origin={message.origin} />}
           {timestamp && (
             <span className="message-time" title={new Date(timestamp).toLocaleString()}>
               {formatMessageTime(timestamp)}
@@ -424,7 +444,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
         </span>
         <span className="message-header-actions">
-          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : 'Copy your message'} />
+          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : message.origin?.kind === 'user_api' ? 'Copy your message' : 'Copy input message'} />
         </span>
       </div>
       <div className="message-content">
@@ -467,10 +487,11 @@ function QueuedUserMessageImpl({
   activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
+  const isMeta = message.origin?.kind === 'system_generated';
   return (
-    <div className={`message user${isSteeringQueued ? ' steering-queued' : ''}`}>
+    <div className={`message ${isMeta ? 'meta' : 'user'}${isSteeringQueued ? ' steering-queued' : ''}`}>
       <div className="message-header">
-        <span className="message-sender">You</span>
+        {message.origin ? <InputSender origin={message.origin} /> : <span className="message-sender">You</span>}
         {isSteeringQueued ? (
           <span className="message-status queued" title="Queued — will send when conversation is free">
             <span className="queued-label">⏳ Queued</span>

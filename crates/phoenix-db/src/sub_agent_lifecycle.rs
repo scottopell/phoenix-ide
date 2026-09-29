@@ -603,6 +603,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             let admitted_message = Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: child.initial_message_id.clone(),
                 conversation_id: child.run.child_conversation_id.clone(),
                 sequence_id: 1,

@@ -1269,6 +1269,7 @@ impl RuntimeManager {
 fn seed_message(conv_id: &str, text: String) -> Message {
     let now = Utc::now();
     Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
         message_id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conv_id.to_string(),
         sequence_id: 1,

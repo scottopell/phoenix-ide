@@ -1039,6 +1039,7 @@ mod tests {
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: format!("text-{message_id}"),
                 images: Vec::new(),
                 files: Vec::new(),

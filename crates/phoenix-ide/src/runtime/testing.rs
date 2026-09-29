@@ -1179,6 +1179,7 @@ impl MessageStore for InMemoryStorage {
         drop(id_guard);
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id: seq_id,
@@ -1231,6 +1232,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1322,6 +1324,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1472,6 +1475,7 @@ impl MessageStore for InMemoryStorage {
             });
         let sequence_id = allocate_sequence(persisted_sequence_max);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,

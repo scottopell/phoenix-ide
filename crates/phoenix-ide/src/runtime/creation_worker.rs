@@ -619,6 +619,7 @@ async fn deliver_product_creation_objective(
             manager,
             &conversation_id,
             Event::SteerMessage {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 text: expanded.display_text,
                 llm_text: expanded.llm_text,
                 images,
@@ -2407,6 +2408,7 @@ async fn provision_conversation(
         job_id: job.id.clone(),
         claim: claim.clone(),
         initial_message: phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: display_text,
             llm_text,
             images,
@@ -3075,6 +3077,7 @@ mod product_creation_delivery_replay_tests {
             .enqueue_steer_message(
                 other_conversation_id,
                 Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     text: "non-target".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -3231,6 +3234,7 @@ mod product_creation_delivery_replay_tests {
         db.append_steering_entry(
             conversation_id,
             &phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: intent.objective.clone(),
                 llm_text: None,
                 images: Vec::new(),

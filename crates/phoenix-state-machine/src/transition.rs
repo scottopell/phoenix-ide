@@ -852,6 +852,7 @@ fn steer_entry_to_drain_message(
     };
     crate::effect::SteeringDrainMessage {
         content,
+        origin: entry.origin.clone(),
         display_data,
         usage_data,
         message_id,
@@ -4315,6 +4316,7 @@ mod tests {
     fn authoritative_user_message_persists_distinct_effect_with_authority() {
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "Hello".to_string(),
                 images: vec![],
                 files: vec![],
@@ -4389,6 +4391,7 @@ mod tests {
             lease_until: 100,
         };
         let message = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "Hello".to_string(),
             llm_text: None,
             images: vec![],
@@ -4547,6 +4550,7 @@ mod tests {
                     lease_until: 100,
                 },
                 initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "Hello".to_string(),
                     llm_text: None,
                     images: vec![],
@@ -6541,6 +6545,7 @@ mod tests {
 
     fn mk_steer_entry(id: &str, text: &str) -> crate::event::SteerEntry {
         crate::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.to_string(),
             llm_text: None,
             images: vec![],

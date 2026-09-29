@@ -504,6 +504,7 @@ mod tests {
             MessageContent::Skill(_) => MessageType::Skill,
         };
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id: seq,

@@ -3155,6 +3155,7 @@ mod product_creation_tests {
         db.append_steering_entry(
             "conv-delivery-complete",
             &phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: delivery.job.intent.objective.clone(),
                 llm_text: None,
                 images: Vec::new(),

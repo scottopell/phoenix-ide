@@ -1450,7 +1450,24 @@ fn render_messages<'a>(
                 }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
-                let mut text_for_llm = user_content.llm_text().to_string();
+                let mut text_for_llm = match &msg.origin {
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                        product_conversation_id,
+                        transcript_id,
+                    } => format!(
+                        "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
+                        format!("[System-generated input]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => {
+                        format!("[Input of unknown historical origin]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi => {
+                        user_content.llm_text().to_string()
+                    }
+                };
                 if !user_content.files.is_empty() {
                     for file in &user_content.files {
                         text_for_llm.push('\n');
@@ -3228,6 +3245,7 @@ where
         let event = match event {
             Event::SteerMessage {
                 text,
+                origin,
                 llm_text,
                 images,
                 files,
@@ -3238,6 +3256,7 @@ where
                 self.steering_queue
                     .push(crate::state_machine::event::SteerEntry {
                         text,
+                        origin,
                         llm_text,
                         images,
                         files,
@@ -5912,6 +5931,7 @@ where
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let sequence_id = reserved_sequences[0];
                 let message = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id,
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id,
@@ -6117,6 +6137,7 @@ where
                 let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: format!(
                         "continuation-{}-{operation_id}",
                         self.context.conversation_id
@@ -6801,6 +6822,7 @@ where
                 let seq = self.broadcast_tx.next_seq();
                 let agent_content = MessageContent::agent(message.content);
                 let db_msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: message.message_id,
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id: seq,
@@ -6943,6 +6965,7 @@ where
             .zip(sequences)
             .map(|(message, sequence_id)| crate::db::Message {
                 message_id: message.message_id,
+                origin: message.origin,
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id,
                 message_type: message.content.message_type(),
@@ -8079,6 +8102,7 @@ where
         let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: assistant_message.message_id,
             conversation_id: conv_id.clone(),
             sequence_id: reserved_seqs[0],
@@ -8094,6 +8118,7 @@ where
             .map(|(result, sequence_id)| {
                 let content = tool_result_message_content(&result);
                 crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                     conversation_id: conv_id.clone(),
                     sequence_id,
@@ -8174,6 +8199,7 @@ where
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = reserved_seqs[0];
                 let agent_msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: assistant_message.message_id.clone(),
                     conversation_id: conv_id.clone(),
                     sequence_id: agent_seq,
@@ -8191,6 +8217,7 @@ where
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         message_id: tool_result_message_id(
                             &agent_msg.message_id,
                             &result.tool_use_id,
@@ -8310,6 +8337,7 @@ where
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_seq = reserved_seqs[0];
         let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: assistant_message.message_id.clone(),
             conversation_id: conv_id.clone(),
             sequence_id: agent_seq,
@@ -8334,6 +8362,7 @@ where
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             tool_msgs.push(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                 conversation_id: conv_id.clone(),
                 sequence_id: *tool_seq,
@@ -8545,6 +8574,7 @@ where
         } else {
             let content = MessageContent::User(crate::db::UserContent::meta(&llm_content));
             TerminalSubAgentEvidence::Insert(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: summary_message_id,
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id: self.broadcast_tx.next_seq(),
@@ -9045,6 +9075,7 @@ where
         let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
         let seq = self.broadcast_tx.next_seq();
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: msg_id,
             conversation_id: self.context.conversation_id.clone(),
             sequence_id: seq,
@@ -9213,6 +9244,7 @@ where
             let approved_state = ConvState::LlmRequesting { attempt: 1 };
             let state_updated_at = Utc::now();
             let message = crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id: self.broadcast_tx.next_seq(),
@@ -9304,6 +9336,7 @@ where
                     plan_backup,
                 );
                 let msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: uuid::Uuid::new_v4().to_string(),
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id: self.broadcast_tx.next_seq(),
@@ -12597,8 +12630,32 @@ mod dispatch_context_budget_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
+    #[test]
+    fn provider_context_attributes_internal_sender_without_changing_user_role() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, product_conversation::ProductConversationId,
+        };
+        let mut internal = message("recipient", 1, "please inspect this");
+        internal.origin = InputOrigin::InternalConversation {
+            product_conversation_id: ProductConversationId::parse("source-product").unwrap(),
+            transcript_id: "source-transcript".to_string(),
+        };
+        let mut api = message("recipient", 2, "user request");
+        api.origin = InputOrigin::UserApi;
+        let rendered = render_messages(&[internal, api], &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].role, phoenix_llm::MessageRole::User);
+        assert!(
+            matches!(&rendered[0].content[0], ContentBlock::Text { text } if text == "[Message from conversation source-product, transcript source-transcript]\nplease inspect this")
+        );
+        assert!(
+            matches!(&rendered[1].content[0], ContentBlock::Text { text } if text == "user request")
+        );
+    }
+
     fn message(conv_id: &str, sequence_id: i64, text: &str) -> crate::db::Message {
         crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("{conv_id}-{sequence_id}"),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -13108,6 +13165,7 @@ mod creation_completion_lifecycle_tests {
             job_id: "job".to_string(),
             claim: creation_claim(),
             initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "start".to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -13295,6 +13353,7 @@ mod creation_completion_lifecycle_tests {
             .runtime
             .with_startup_creation_completion("job".to_string(), creation_claim())
             .with_steering_queue(vec![phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "queued before restart".to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -13337,6 +13396,7 @@ mod authoritative_user_message_effect_tests {
     fn payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "hello".to_string(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -13362,6 +13422,7 @@ mod authoritative_user_message_effect_tests {
 
     fn message(message_id: &str, sequence_id: i64) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: "conv-direct".to_string(),
             sequence_id,
@@ -18363,6 +18424,7 @@ mod steer_drain_detector_tests {
 
     fn mk_entry(id: &str, text: &str) -> SteerEntry {
         SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.to_string(),
             llm_text: None,
             images: vec![],
@@ -18376,6 +18438,7 @@ mod steer_drain_detector_tests {
     fn mk_steer_event(id: &str, text: &str) -> Event {
         let entry = mk_entry(id, text);
         Event::SteerMessage {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: entry.text,
             llm_text: entry.llm_text,
             images: entry.images,
@@ -19326,6 +19389,7 @@ mod steer_drain_detector_tests {
     fn render_messages_withholds_unadopted_wake_observation() {
         let created_at = chrono::Utc::now();
         let msgs = vec![crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: "wake-msg".to_string(),
             conversation_id: "conv".to_string(),
             sequence_id: 7,

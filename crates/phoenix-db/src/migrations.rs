@@ -560,7 +560,64 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_approval_request_obligation",
         sql: MIGRATION_109,
     },
+    Migration {
+        version: 110,
+        name: "trusted_input_origin",
+        sql: MIGRATION_110,
+    },
 ];
+
+const MIGRATION_110: &str = r"
+ALTER TABLE messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated'));
+ALTER TABLE messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated'));
+ALTER TABLE steering_messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated'));
+ALTER TABLE durable_turns ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_transcript_id TEXT;
+CREATE TRIGGER messages_origin_insert BEFORE INSERT ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER messages_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER steering_origin_insert BEFORE INSERT ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER steering_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER durable_turn_origin_insert BEFORE INSERT ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER durable_turn_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE INDEX idx_messages_input_origin ON messages(origin_kind, origin_product_conversation_id, origin_transcript_id);
+";
 
 const MIGRATION_106: &str = r"
 CREATE TABLE sub_agent_batches (
@@ -11349,6 +11406,44 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_110_marks_preexisting_inputs_unknown_and_rejects_incomplete_sender() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE durable_turns (turn_id INTEGER PRIMARY KEY);
+             INSERT INTO messages VALUES ('historical-message');
+             INSERT INTO steering_messages VALUES ('historical-steer');
+             INSERT INTO durable_turns VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 110).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        for (select, invalid_update) in [
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM messages WHERE message_id = 'historical-message'",
+                "UPDATE messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-message'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM steering_messages WHERE message_id = 'historical-steer'",
+                "UPDATE steering_messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-steer'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM durable_turns WHERE turn_id = 1",
+                "UPDATE durable_turns SET origin_kind = 'internal_conversation' WHERE turn_id = 1",
+            ),
+        ] {
+            let (kind, product_id, transcript_id): (String, Option<String>, Option<String>) =
+                sqlx::query_as(select).fetch_one(&pool).await.unwrap();
+            assert_eq!(kind, "unknown_historical");
+            assert_eq!((product_id, transcript_id), (None, None));
+            assert!(sqlx::query(invalid_update).execute(&pool).await.is_err());
+        }
     }
 
     #[test]

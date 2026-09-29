@@ -499,7 +499,14 @@ fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
 
 fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
     let role = match message.message_type {
-        MessageType::User => "User",
+        MessageType::User => match &message.origin {
+            phoenix_core::domain::db_schema::InputOrigin::UserApi => "User API",
+            phoenix_core::domain::db_schema::InputOrigin::InternalConversation { .. } => {
+                "Conversation"
+            }
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "System input",
+            phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "Unknown input",
+        },
         MessageType::Agent => "Agent",
         MessageType::Tool => "Tool",
         MessageType::System => "System",
@@ -508,9 +515,17 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Skill => "Skill",
     };
     let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+    let sender = match &message.origin {
+        phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+        } => format!(" from @conv:{product_conversation_id} transcript:{transcript_id}"),
+        _ => String::new(),
+    };
     format!(
-        "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
+        "[{}{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
         role,
+        sender,
         message.created_at.format("%Y-%m-%d %H:%M"),
         message.message_id,
         href,
@@ -1007,8 +1022,8 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        message_id_fragment, parse_conv_handle, render_full_message_text, split_fragment,
-        GlobalMessageTargetError, GlobalReadService,
+        message_id_fragment, parse_conv_handle, render_full_message_text,
+        render_global_message_line, split_fragment, GlobalMessageTargetError, GlobalReadService,
     };
     use std::sync::Arc;
 
@@ -1024,6 +1039,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn global_message_line_attributes_server_recorded_sender_not_user_role() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("origin-reader", "origin-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let sender = db
+            .create_conversation("origin-sender", "origin-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "origin-reader-message",
+                &conv.id,
+                &MessageContent::user("message body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let source = InputOrigin::InternalConversation {
+            product_conversation_id: sender.product_conversation_id.clone(),
+            transcript_id: sender.id.clone(),
+        };
+        message.origin = source;
+        let rendered = render_global_message_line(&conv, &message);
+        assert!(rendered.contains(&format!(
+            "Conversation from @conv:{} transcript:{}",
+            sender.product_conversation_id, sender.id
+        )));
+        assert!(!rendered.contains("User API"));
+
+        message.origin = InputOrigin::UnknownHistorical;
+        let rendered = render_global_message_line(&conv, &message);
+        assert!(rendered.contains("Unknown input"));
+        assert!(!rendered.contains("User API"));
+    }
+
     #[test]
     fn transcript_image_placeholder_is_caller_neutral() {
         let mut content = phoenix_core::domain::db_schema::UserContent::new("text");
@@ -1034,6 +1090,7 @@ mod tests {
                 media_type: "image/png".to_string(),
             });
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "message".to_string(),
             conversation_id: "conversation".to_string(),
             sequence_id: 1,

@@ -29,6 +29,7 @@ function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agen
     conversation_id: ALIGNED_PREFIX_TRANSCRIPT_ROW_ID,
     sequence_id: sequenceId,
     message_type: messageType,
+    origin: { kind: 'unknown_historical' },
     content: messageType === 'agent' ? [{ type: 'text' as const, text }] : { text },
     display_data: conversationState ? { conversation_state: conversationState } : null,
     usage_data: null,

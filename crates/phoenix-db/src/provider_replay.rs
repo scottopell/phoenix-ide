@@ -277,6 +277,7 @@ impl Database {
             .await?;
         tx.commit().await?;
         let message = phoenix_core::domain::db_schema::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,

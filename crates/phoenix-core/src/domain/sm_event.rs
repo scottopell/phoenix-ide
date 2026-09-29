@@ -101,6 +101,9 @@ impl From<SubmittedDirectTurnFileAttachment> for FileAttachment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmittedDirectTurnIdentity {
     pub text: String,
+    // owned: accepted before provenance existed; unknown is the only truthful attribution.
+    #[serde(default)]
+    pub origin: crate::domain::db_schema::InputOrigin,
     pub images: Vec<ImageData>,
     pub files: Vec<SubmittedDirectTurnFileAttachment>,
     pub message_id: String,
@@ -139,7 +142,8 @@ pub enum PreparedDirectTurnPayloadCodecError {
 }
 
 impl PreparedDirectTurnPayload {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
+    const LEGACY_VERSION: u32 = 1;
     fn normalized_value_without_attachments(
         &self,
     ) -> Result<serde_json::Value, PreparedDirectTurnPayloadCodecError> {
@@ -149,6 +153,7 @@ impl PreparedDirectTurnPayload {
             if let Some(obj) = submitted.as_object_mut() {
                 obj.remove("images");
                 obj.remove("files");
+                obj.remove("origin");
             }
         }
         if let Some(delivery) = value.get_mut("delivery") {
@@ -242,7 +247,7 @@ impl PreparedDirectTurnPayload {
         );
         let payload: Self =
             serde_json::from_value(value).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
-        if payload.v != Self::VERSION {
+        if payload.v != Self::VERSION && payload.v != Self::LEGACY_VERSION {
             return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
                 actual: payload.v,
                 expected: Self::VERSION,
@@ -278,7 +283,41 @@ impl PreparedDirectTurnPayload {
     /// # Errors
     /// Returns [`PreparedDirectTurnPayloadCodecError::Encode`] if JSON encoding fails.
     pub fn to_exact_bytes(&self) -> Result<Vec<u8>, PreparedDirectTurnPayloadCodecError> {
-        serde_json::to_vec(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        if self.v == Self::LEGACY_VERSION {
+            #[derive(Serialize)]
+            struct LegacySubmitted<'a> {
+                text: &'a str,
+                images: &'a [ImageData],
+                files: &'a [SubmittedDirectTurnFileAttachment],
+                message_id: &'a str,
+                user_agent: &'a Option<String>,
+                skill_invocation: &'a Option<SkillInvocation>,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy,
+            }
+            #[derive(Serialize)]
+            struct LegacyPayload<'a> {
+                v: u32,
+                submitted: LegacySubmitted<'a>,
+                delivery: &'a PreparedDirectTurnDelivery,
+            }
+            let submitted = &self.submitted;
+            serde_json::to_vec(&LegacyPayload {
+                v: self.v,
+                submitted: LegacySubmitted {
+                    text: &submitted.text,
+                    images: &submitted.images,
+                    files: &submitted.files,
+                    message_id: &submitted.message_id,
+                    user_agent: &submitted.user_agent,
+                    skill_invocation: &submitted.skill_invocation,
+                    expansion_policy: submitted.expansion_policy,
+                },
+                delivery: &self.delivery,
+            })
+            .map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        } else {
+            serde_json::to_vec(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)
+        }
     }
 
     /// Decodes and version-checks a complete envelope.
@@ -289,7 +328,7 @@ impl PreparedDirectTurnPayload {
     pub fn from_exact_bytes(bytes: &[u8]) -> Result<Self, PreparedDirectTurnPayloadCodecError> {
         let payload: Self =
             serde_json::from_slice(bytes).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
-        if payload.v != Self::VERSION {
+        if payload.v != Self::VERSION && payload.v != Self::LEGACY_VERSION {
             return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
                 actual: payload.v,
                 expected: Self::VERSION,
@@ -380,6 +419,9 @@ pub fn exact_payload_fingerprint(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerEntry {
     pub text: String,
+    // owned: pre-provenance steering rows had no reliable origin.
+    #[serde(default)]
+    pub origin: crate::domain::db_schema::InputOrigin,
     pub llm_text: Option<String>,
     pub images: Vec<ImageData>,
     #[serde(default)]
@@ -393,6 +435,7 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
     fn from(value: PreparedDirectTurnPayload) -> Self {
         Self {
             text: value.delivery.text,
+            origin: value.submitted.origin,
             llm_text: value.delivery.llm_text,
             images: value.delivery.images,
             files: value.delivery.files,
@@ -609,6 +652,7 @@ pub enum Event {
     /// `UserMessage` when the conversation next enters `Idle`.
     SteerMessage {
         /// Display text — stored in DB and shown in history.
+        origin: crate::domain::db_schema::InputOrigin,
         text: String,
         /// Expanded text delivered to the LLM when `@` references are present.
         llm_text: Option<String>,
@@ -1326,6 +1370,7 @@ mod direct_turn_payload_tests {
         policy: SubmittedDirectTurnExpansionPolicy,
     ) -> SubmittedDirectTurnIdentity {
         SubmittedDirectTurnIdentity {
+            origin: crate::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "display @file".to_string(),
             images: Vec::new(),
             files: Vec::new(),

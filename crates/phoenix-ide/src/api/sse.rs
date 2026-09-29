@@ -557,6 +557,7 @@ mod tests {
 
     fn fixture_user_message() -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "msg-user".to_string(),
             conversation_id: "conv-1".to_string(),
             sequence_id: 1,
@@ -581,6 +582,7 @@ mod tests {
             },
         ];
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "msg-agent".to_string(),
             conversation_id: "conv-1".to_string(),
             sequence_id: 2,
@@ -602,6 +604,7 @@ mod tests {
 
     fn fixture_steer_entry(message_id: &str) -> crate::state_machine::event::SteerEntry {
         crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "queued from another client".to_string(),
             llm_text: Some("queued from another client".to_string()),
             images: Vec::new(),
@@ -1329,6 +1332,7 @@ mod tests {
             use crate::db::{Message, MessageContent, MessageType};
             use chrono::Utc;
             Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m1".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 5,

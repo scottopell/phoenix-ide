@@ -2434,6 +2434,7 @@ impl WakeRepository {
             .execute(&mut *tx.tx)
             .await?;
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: message_id.clone(),
             conversation_id: input.conversation_id.clone(),
             sequence_id,
@@ -2517,7 +2518,8 @@ impl WakeRepository {
                     l.message_id AS link_message_id, l.registering_tool_use_id, l.terminal_kind,
                     l.auto_resume, l.created_at AS link_created_at,
                     m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
-                    m.display_data, m.usage_data, m.created_at
+                    m.display_data, m.usage_data, m.created_at,
+                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
              FROM wake_delivery_messages l
              JOIN workflow_deliveries d
                ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
@@ -4437,7 +4439,8 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
                 l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
-                m.display_data, m.usage_data, m.created_at
+                m.display_data, m.usage_data, m.created_at,
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4500,7 +4503,8 @@ async fn fetch_materialized_pending_deliveries_tx(
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
                 l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
-                m.display_data, m.usage_data, m.created_at
+                m.display_data, m.usage_data, m.created_at,
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4932,6 +4936,7 @@ fn message_from_join_row(row: &sqlx::sqlite::SqliteRow) -> Result<Message, sqlx:
     let content = MessageContent::from_stored_json(msg_type, content_value)
         .unwrap_or_else(|_| MessageContent::error(format!("Failed to parse {msg_type} message")));
     Ok(Message {
+        origin: super::super::decode_origin(row)?,
         message_id: row.try_get("message_id")?,
         conversation_id: row.try_get("conversation_id")?,
         sequence_id: row.try_get("sequence_id")?,
@@ -4979,7 +4984,8 @@ async fn fetch_delivery_message_link_tx(
                 l.message_id AS link_message_id, l.registering_tool_use_id, l.terminal_kind,
                 l.auto_resume, l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
-                m.display_data, m.usage_data, m.created_at
+                m.display_data, m.usage_data, m.created_at,
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
          FROM wake_delivery_messages l
          JOIN messages m ON m.message_id = l.message_id
          WHERE l.workflow_id = ?1 AND l.delivery_id = ?2",
@@ -5608,7 +5614,7 @@ mod tests {
         conversation_id: &str,
     ) -> Vec<Message> {
         sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)

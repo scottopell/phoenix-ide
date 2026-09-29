@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { generateUUID } from '../utils/uuid';
-import type { FileAttachment, ImageData, QueuedSteeringMessage } from '../api';
+import type { FileAttachment, ImageData, InputOrigin, QueuedSteeringMessage } from '../api';
 
 /**
  * A queued message is either:
@@ -39,6 +39,7 @@ export interface QueuedMessage {
 /** The exact data needed to render a not-yet-delivered user bubble. */
 export interface PendingUserMessage {
   localId: string;
+  origin?: InputOrigin;
   text: string;
   images: ImageData[];
   files?: FileAttachment[];
@@ -81,6 +82,7 @@ export function deriveDisplayedPendingMessages(
   );
   const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
     localId: message.message_id,
+    origin: message.origin,
     text: message.text,
     images: message.images,
     files: message.files,

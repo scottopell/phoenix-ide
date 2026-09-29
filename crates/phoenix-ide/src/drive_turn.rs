@@ -553,6 +553,7 @@ mod tests {
     fn persisted_user_input_distinguishes_completed_empty_turn_from_initial_idle() {
         assert!(!turn_has_persisted_input(&[]));
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "user-message".into(),
             conversation_id: "conversation".into(),
             sequence_id: 1,

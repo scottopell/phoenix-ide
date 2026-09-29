@@ -46,6 +46,7 @@ pub enum PersistError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteeringDrainMessage {
     pub content: MessageContent,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub display_data: Option<Value>,
     pub usage_data: Option<UsageData>,
     pub message_id: String,
@@ -318,6 +319,7 @@ impl Effect {
     ) -> Self {
         let text = text.into();
         let submitted = SubmittedDirectTurnIdentity {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.clone(),
             images: images.clone(),
             files: files.clone().into_iter().map(Into::into).collect(),

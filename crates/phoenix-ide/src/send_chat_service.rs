@@ -31,6 +31,7 @@ pub(crate) enum MessageExpansionPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub text: String,
     pub message_id: String,
     pub images: Vec<ImageAttachment>,
@@ -91,6 +92,13 @@ impl SendChatApplicationService {
         Self { db, runtime }
     }
 
+    pub(crate) async fn source_conversation(
+        &self,
+        id: &str,
+    ) -> Result<crate::db::Conversation, crate::db::DbError> {
+        self.db.get_conversation(id).await
+    }
+
     pub(crate) async fn rearm_exact_terminal_turn(
         &self,
         predecessor_conversation_id: &str,
@@ -115,6 +123,7 @@ impl SendChatApplicationService {
         .await?;
         let submitted = SubmittedDirectTurnIdentity {
             message_id: message_id.as_str().to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             text: expanded.display_text,
             images: Vec::new(),
             files: Vec::new(),
@@ -405,6 +414,7 @@ impl SendChatApplicationService {
 
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
+                origin: req.origin.clone(),
                 llm_text: expanded.llm_text,
                 images: map_images(req.images.clone()),
                 files: validated_files.clone(),
@@ -756,6 +766,7 @@ fn submitted_expansion_policy(
 fn submitted_identity_from_request(req: &SendChatRequest) -> SubmittedDirectTurnIdentity {
     SubmittedDirectTurnIdentity {
         text: req.text.clone(),
+        origin: req.origin.clone(),
         images: req
             .images
             .iter()
@@ -1003,7 +1014,10 @@ async fn lookup_persisted_message_replay(
         | phoenix_core::domain::db_schema::MessageContent::Error(_)
         | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
     };
-    if message.conversation_id != req.conversation_id || !persisted_matches {
+    if message.conversation_id != req.conversation_id
+        || message.origin != req.origin
+        || !persisted_matches
+    {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
     Ok(Some(SendChatOutcome::AlreadyPersisted))
@@ -1014,6 +1028,7 @@ fn queued_retry_matches(
     req: &SendChatRequest,
 ) -> bool {
     entry.text == req.text
+        && entry.origin == req.origin
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -1089,6 +1104,7 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
     let canonical = serde_json::to_vec(&serde_json::json!({
         "conversation_id": req.conversation_id,
         "text": req.text,
+        "origin": req.origin,
         "images": req.images.iter().map(|image| serde_json::json!({
             "data": image.data,
             "media_type": image.media_type,
@@ -1173,6 +1189,7 @@ mod tests {
 
     fn request() -> SendChatRequest {
         SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "hello".to_string(),
             message_id: "message-1".to_string(),
@@ -1334,6 +1351,7 @@ mod tests {
     #[test]
     fn submitted_identity_tracks_submitted_fields_not_mutable_expansion() {
         let base = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1547,6 +1565,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1588,6 +1607,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1619,6 +1639,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1668,6 +1689,7 @@ mod tests {
         let req = request();
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1690,6 +1712,7 @@ mod tests {
 
     async fn persist_drained_legacy_steering(db: &crate::db::Database, req: &SendChatRequest) {
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1826,6 +1849,7 @@ mod tests {
     #[test]
     fn queued_retry_compares_submitted_payload_not_mutable_expansion() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1835,6 +1859,7 @@ mod tests {
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         };
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: request.text.clone(),
             llm_text: Some("old expanded file contents".to_string()),
             images: vec![],
@@ -1853,6 +1878,7 @@ mod tests {
     #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "/build now".to_string(),
             message_id: "message-1".to_string(),

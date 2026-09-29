@@ -15,11 +15,13 @@ describe('deriveDisplayedPendingMessages', () => {
     const unsent = queued('local-only', { text: 'waiting locally' });
     const displayed = deriveDisplayedPendingMessages([local, unsent], [{
       message_id: 'same-id',
+      origin: { kind: 'user_api' },
       text: 'server copy',
       images: [],
       files: [],
     }, {
       message_id: 'external-id',
+      origin: { kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row' },
       text: 'from coordinator',
       images: [],
       files: [],
@@ -30,6 +32,11 @@ describe('deriveDisplayedPendingMessages', () => {
       ['external-id', 'from coordinator'],
       ['local-only', 'waiting locally'],
     ]);
+    expect(displayed.map((message) => message.origin)).toEqual([
+      { kind: 'user_api' },
+      { kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row' },
+      undefined,
+    ]);
   });
 
   it('keeps a later authoritative steer behind an earlier accepted direct send', () => {
@@ -38,6 +45,7 @@ describe('deriveDisplayedPendingMessages', () => {
 
     const displayed = deriveDisplayedPendingMessages([direct, steer], [{
       message_id: 'steer-b',
+      origin: { kind: 'user_api' },
       text: 'authoritative B',
       images: [],
       files: [],
@@ -55,6 +63,7 @@ describe('deriveDisplayedPendingMessages', () => {
     const displayed = deriveDisplayedPendingMessages([laterLocal], [{
       message_id: 'server-a',
       text: 'authoritative A',
+      origin: { kind: 'unknown_historical' },
       images: [],
       files: [],
     }], false);
@@ -67,9 +76,9 @@ describe('deriveDisplayedPendingMessages', () => {
     const localB = queued('server-b', { status: 'steering_queued' });
 
     const displayed = deriveDisplayedPendingMessages([localB, localA], [{
-      message_id: 'server-a', text: 'A', images: [], files: [],
+      message_id: 'server-a', text: 'A', images: [], files: [], origin: { kind: 'user_api' },
     }, {
-      message_id: 'server-b', text: 'B', images: [], files: [],
+      message_id: 'server-b', text: 'B', images: [], files: [], origin: { kind: 'user_api' },
     }], false);
 
     expect(displayed.map((message) => message.localId)).toEqual(['server-a', 'server-b']);
@@ -80,6 +89,7 @@ describe('deriveDisplayedPendingMessages', () => {
       [queued('local-only')],
       [{
         message_id: 'server-queued',
+        origin: { kind: 'system_generated' },
         text: 'will never run',
         images: [],
         files: [],

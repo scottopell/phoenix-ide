@@ -5829,6 +5829,7 @@ impl RuntimeManager {
     ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
+            ref origin,
             ref llm_text,
             ref images,
             ref files,
@@ -5845,6 +5846,7 @@ impl RuntimeManager {
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
             text: text.clone(),
+            origin: origin.clone(),
             llm_text: llm_text.clone(),
             images: images.clone(),
             files: files.clone(),
@@ -7149,6 +7151,7 @@ mod broadcaster_tests {
         use crate::db::{MessageContent, MessageType};
         use chrono::Utc;
         crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -7235,6 +7238,7 @@ mod broadcaster_tests {
         let b = SseBroadcaster::new(16, 7);
         let mut rx = b.subscribe();
         let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "queued".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -8477,6 +8481,7 @@ mod scope_liveness_tests {
                 lease_until: u64::MAX,
             },
             initial_message: crate::state_machine::event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "must not persist".to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -9738,6 +9743,7 @@ mod scope_liveness_tests {
         let mut admitted = fence.try_acquire().expect("admit publication");
         let queued_seq = broadcaster.next_seq();
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "queued-admitted".to_string(),
             conversation_id: "conversation".to_string(),
             sequence_id: queued_seq,
@@ -9804,6 +9810,7 @@ mod scope_liveness_tests {
         broadcaster
             .admitted_publication(&mut admitted)
             .assistant_message(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "admitted-successor".to_string(),
                 conversation_id: "conversation".to_string(),
                 sequence_id: admitted_seq,
@@ -9946,6 +9953,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "removed during startup".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -10043,6 +10051,7 @@ mod scope_liveness_tests {
                     .enqueue_steer_message(
                         conversation_id,
                         Event::SteerMessage {
+                            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                             text: "fenced steer".to_string(),
                             llm_text: None,
                             images: Vec::new(),
@@ -10116,6 +10125,7 @@ mod scope_liveness_tests {
                     .enqueue_steer_message(
                         conversation_id,
                         Event::SteerMessage {
+                            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                             text: "survives eviction".to_string(),
                             llm_text: None,
                             images: Vec::new(),
@@ -10200,6 +10210,7 @@ mod scope_liveness_tests {
                     .enqueue_steer_message(
                         conversation_id,
                         Event::SteerMessage {
+                            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                             text: "durably accepted".to_string(),
                             llm_text: None,
                             images: Vec::new(),
@@ -10386,6 +10397,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "accepted once".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -10470,6 +10482,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "still pending".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -11094,6 +11107,7 @@ mod scope_liveness_tests {
             tokio::spawn(async move {
                 service
                     .send(crate::send_chat_service::SendChatRequest {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                         conversation_id: conversation_id.to_string(),
                         text: "new message during recovery".to_string(),
                         message_id: "new-message".to_string(),
@@ -11309,6 +11323,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "cancel before startup".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -11436,6 +11451,7 @@ mod scope_liveness_tests {
 
         let payload = PreparedDirectTurnPayload::from_parts(
             SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "resume me".to_string(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -11648,6 +11664,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "resume accepted steer".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -11665,6 +11682,7 @@ mod scope_liveness_tests {
             .commit_steering_drain(
                 conversation_id,
                 &[crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     message_id: "committed-steer".to_string(),
                     conversation_id: conversation_id.to_string(),
                     sequence_id: 1,
@@ -11742,6 +11760,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "/build".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -11768,6 +11787,7 @@ mod scope_liveness_tests {
             .commit_steering_drain(
                 conversation_id,
                 &[crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     message_id: "committed-skill-steer".to_string(),
                     conversation_id: conversation_id.to_string(),
                     sequence_id: 1,

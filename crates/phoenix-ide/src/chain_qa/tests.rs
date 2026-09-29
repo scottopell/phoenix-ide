@@ -691,6 +691,7 @@ async fn read_conversation_accepts_hash_prefixed_id() {
 fn read_page_paginates_large_transcript() {
     let big = "x".repeat(READ_PAGE_CHARS + 500);
     let messages = vec![crate::db::Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
         message_id: "m0".into(),
         conversation_id: "c".into(),
         sequence_id: 0,
@@ -725,6 +726,7 @@ fn read_page_paginates_large_transcript() {
 #[test]
 fn render_full_transcript_surfaces_skill_body_images_and_server_tools() {
     let mk = |seq: i64, mt: MessageType, content: MessageContent| crate::db::Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
         message_id: format!("m{seq}"),
         conversation_id: "c".to_string(),
         sequence_id: seq,
