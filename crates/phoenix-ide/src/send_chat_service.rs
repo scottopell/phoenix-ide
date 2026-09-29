@@ -223,6 +223,10 @@ impl SendChatApplicationService {
                         == req.message_id
             })
         {
+            req.origin = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            };
             req.text = intent.handoff;
             req.user_agent = intent.user_agent;
         }

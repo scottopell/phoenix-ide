@@ -244,7 +244,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'system_generated')",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -536,20 +536,21 @@ mod tests {
             .await
             .unwrap();
         let state = phoenix_core::domain::sm_state::ConvState::Idle;
-        db.add_message_and_clear_provider_replay(
-            "message-final",
-            "conv-atomic-close",
-            1,
-            &phoenix_core::domain::db_schema::MessageContent::agent(vec![
-                phoenix_core::domain::llm_types::ContentBlock::text("done"),
-            ]),
-            None,
-            None,
-            &state,
-            chrono::Utc::now(),
-        )
-        .await
-        .unwrap();
+        let returned = db
+            .add_message_and_clear_provider_replay(
+                "message-final",
+                "conv-atomic-close",
+                1,
+                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("done"),
+                ]),
+                None,
+                None,
+                &state,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
         assert!(db
             .load_provider_replay_state("conv-atomic-close")
             .await
@@ -561,6 +562,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(message_count, 1);
+        let persisted: String =
+            sqlx::query_scalar("SELECT origin_kind FROM messages WHERE message_id='message-final'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(returned.origin.db_parts().0, persisted);
+        assert_eq!(
+            returned.origin,
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        );
+        let loaded = db.get_messages("conv-atomic-close").await.unwrap();
+        assert_eq!(loaded[0].origin, returned.origin);
         let persisted: String =
             sqlx::query_scalar("SELECT state FROM conversations WHERE id='conv-atomic-close'")
                 .fetch_one(db.pool())

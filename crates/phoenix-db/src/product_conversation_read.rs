@@ -231,7 +231,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
      FROM json_each(?2)
- ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, transcript.ordinal
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, transcript.ordinal
  FROM transcript
  CROSS JOIN messages INDEXED BY messages_conversation_sequence
    ON messages.conversation_id = transcript.id
@@ -969,7 +969,7 @@ impl Database {
                    AND successor.parent_conversation_id IS NULL
              )
              SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, transcript.ordinal
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, transcript.ordinal
              FROM transcript
              JOIN messages ON messages.conversation_id = transcript.id
              WHERE (?2 IS NULL

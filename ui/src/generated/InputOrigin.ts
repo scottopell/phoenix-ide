@@ -4,4 +4,4 @@
  * Server-assigned attribution of an input. `UnknownHistorical` means no reliable
  * attribution was recorded; it does not mean the API user authored the input.
  */
-export type InputOrigin = { "kind": "unknown_historical" } | { "kind": "user_api" } | { "kind": "internal_conversation", product_conversation_id: string, transcript_id: string, } | { "kind": "system_generated" };
+export type InputOrigin = { "kind": "unknown_historical" } | { "kind": "user_api" } | { "kind": "internal_conversation", product_conversation_id: string, transcript_id: string, } | { "kind": "system_generated" } | { "kind": "subscription_event", event_id: string, };

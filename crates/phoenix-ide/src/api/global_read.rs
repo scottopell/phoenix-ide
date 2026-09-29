@@ -523,7 +523,10 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
             product_conversation_id,
             transcript_id,
         } => format!(" from @conv:{product_conversation_id} transcript:{transcript_id}"),
-        _ => String::new(),
+        phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+        | phoenix_core::domain::db_schema::InputOrigin::UserApi
+        | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        | phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => String::new(),
     };
     format!(
         "[{}{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",

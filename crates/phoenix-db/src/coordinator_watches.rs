@@ -25,7 +25,7 @@ pub struct PendingWatchEvent {
     pub occurred_at: String,
 }
 
-fn decode_snapshot(row: sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
+fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
     let id: String = row.try_get("source_product_conversation_id")?;
     let state: String = row.try_get("state")?;
     Ok(WatchSnapshot {
@@ -49,6 +49,11 @@ const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolle
     ORDER BY w.enrolled_at, w.id";
 
 impl Database {
+    /// Enroll an open ordinary product conversation and return its current snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if the product conversation is unavailable, a database operation
+    /// fails, or the persisted snapshot cannot be decoded.
     pub async fn watch_product_conversation(
         &self,
         product_id: &ProductConversationId,
@@ -77,11 +82,15 @@ impl Database {
             .bind(product_id.as_str())
             .fetch_one(&mut *tx)
             .await?;
-        let snapshot = decode_snapshot(row)?;
+        let snapshot = decode_snapshot(&row)?;
         tx.commit().await?;
         Ok(snapshot)
     }
 
+    /// End an active watch, suppressing its undelivered events.
+    ///
+    /// # Errors
+    /// Returns an error if a database operation fails.
     pub async fn unwatch_product_conversation(
         &self,
         product_id: &ProductConversationId,
@@ -105,14 +114,22 @@ impl Database {
         Ok(ended)
     }
 
+    /// List active watches with their current transcript snapshots.
+    ///
+    /// # Errors
+    /// Returns an error if a database operation fails or a persisted snapshot cannot be decoded.
     pub async fn list_coordinator_watches(&self) -> DbResult<Vec<WatchSnapshot>> {
         let rows = sqlx::query(WATCH_SNAPSHOT)
             .bind(Option::<&str>::None)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(decode_snapshot).collect()
+        rows.iter().map(decode_snapshot).collect()
     }
 
+    /// List eligible undelivered watch events up to `limit`.
+    ///
+    /// # Errors
+    /// Returns an error if a database operation fails or a persisted product ID is invalid.
     pub async fn pending_coordinator_watch_events(
         &self,
         limit: i64,
@@ -145,6 +162,10 @@ impl Database {
             .collect()
     }
 
+    /// Find the active coordinator transcript that receives watch events.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
     pub async fn coordinator_watch_target(&self) -> DbResult<Option<String>> {
         sqlx::query_scalar("SELECT c.id FROM product_conversations p
                  JOIN conversations head ON head.product_conversation_id = p.id AND head.coordinator_head = 1
@@ -183,7 +204,7 @@ pub(crate) async fn record_terminal_event_tx(
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at IS NULL
         WHERE c.id = ?7 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
           AND p.ordinary_lifecycle = 'open'
-          AND (?4 != 'completed' OR c.state_kind = 'idle')
+          AND (?4 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
           AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')
           AND NOT EXISTS (SELECT 1 FROM close_obligations o
                           WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
@@ -480,10 +501,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let successor = match outcome {
-            crate::ContinueOutcome::Created(conversation) => conversation,
-            other => panic!("expected successor, got {other:?}"),
-        };
+        let successor = expect_created(outcome);
         db.add_message(
             "watch-success-first",
             &successor.id,
@@ -510,6 +528,34 @@ mod tests {
             .is_empty());
     }
 
+    fn expect_created(outcome: crate::ContinueOutcome) -> crate::Conversation {
+        match outcome {
+            crate::ContinueOutcome::Created(conversation) => conversation,
+            other @ (crate::ContinueOutcome::AlreadyContinued(_)
+            | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected successor, got {other:?}")
+            }
+        }
+    }
+
+    async fn cancel_close_attempt(db: &Database) {
+        for phase in [
+            "awaiting_stop_work_confirmation",
+            "settling_active_work",
+            "cancel_requested_during_settlement",
+        ] {
+            sqlx::query(
+                "UPDATE close_obligations SET phase = ?1 WHERE attempt_id = 'watch-close-attempt'",
+            )
+            .bind(phase)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE close_obligations SET phase = 'completed', close_outcome = 'cancelled', completed_at = ?1 WHERE attempt_id = 'watch-close-attempt'")
+            .bind(Utc::now().to_rfc3339()).execute(db.pool()).await.unwrap();
+    }
+
     #[tokio::test]
     async fn requested_close_fences_delivery_but_cancel_keeps_watch_open() {
         let db = Database::open_in_memory().await.unwrap();
@@ -519,7 +565,7 @@ mod tests {
             .unwrap();
         let product = source.product_conversation_id.clone();
         let coordinator = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
         db.watch_product_conversation(&product).await.unwrap();
@@ -562,33 +608,23 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(state, "suppressed");
+        assert_eq!(state, "pending");
         let steering = "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text, origin_kind, origin_subscription_event_id)
                          VALUES (?1, ?2, ?3, 'terminal event', 'subscription_event', ?4)";
         assert!(sqlx::query(steering)
             .bind("blocked-close")
             .bind(&coordinator.id)
             .bind(0)
-            .bind(prior_id)
+            .bind(&prior_id)
             .execute(db.pool())
             .await
             .is_err());
-        for phase in [
-            "awaiting_stop_work_confirmation",
-            "settling_active_work",
-            "cancel_requested_during_settlement",
-        ] {
-            sqlx::query(
-                "UPDATE close_obligations SET phase = ?1 WHERE attempt_id = 'watch-close-attempt'",
-            )
-            .bind(phase)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        }
-        sqlx::query("UPDATE close_obligations SET phase = 'completed', close_outcome = 'cancelled', completed_at = ?1 WHERE attempt_id = 'watch-close-attempt'")
-            .bind(Utc::now().to_rfc3339()).execute(db.pool()).await.unwrap();
+        cancel_close_attempt(&db).await;
         assert_eq!(db.list_coordinator_watches().await.unwrap().len(), 1);
+        let exposed = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0].event_id, prior_id);
+        assert_eq!(exposed[0].source_turn_id, i64::try_from(turn).unwrap());
         let later = source_turn(&db, &source.id, "after-cancel").await;
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
@@ -604,21 +640,23 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source_turn_id, i64::try_from(later).unwrap());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_id, prior_id);
+        let later_event = events
+            .iter()
+            .find(|event| event.source_turn_id == i64::try_from(later).unwrap())
+            .unwrap();
         sqlx::query(steering)
             .bind("after-cancel")
             .bind(&coordinator.id)
             .bind(0)
-            .bind(&events[0].event_id)
+            .bind(&later_event.event_id)
             .execute(db.pool())
             .await
             .unwrap();
-        assert!(db
-            .pending_coordinator_watch_events(16)
-            .await
-            .unwrap()
-            .is_empty());
+        let remaining = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_id, prior_id);
     }
 
     #[tokio::test]
@@ -630,7 +668,7 @@ mod tests {
             .unwrap();
         let product = source.product_conversation_id.clone();
         let coordinator = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
         db.watch_product_conversation(&product).await.unwrap();

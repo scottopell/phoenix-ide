@@ -1577,6 +1577,8 @@ impl InputOrigin {
         }
     }
 
+    /// # Errors
+    /// Returns an error when persisted origin columns do not form a valid origin.
     pub fn from_db_parts(
         kind: &str,
         product_id: Option<String>,

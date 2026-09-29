@@ -22113,6 +22113,13 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'unknown_historical' WHERE message_id = 'a'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
         let statuses = db
             .commit_steering_drain(
                 "drain-legacy",

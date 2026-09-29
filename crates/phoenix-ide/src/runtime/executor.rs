@@ -12835,18 +12835,17 @@ mod dispatch_context_budget_tests {
             SseBroadcaster::new(16, 0),
         );
 
-        runtime
-            .process_event(Event::UserMessage {
-                text: "dispatch me".into(),
-                llm_text: None,
-                images: Vec::new(),
-                files: Vec::new(),
-                message_id: "projection-liveness-user".into(),
-                user_agent: None,
-                skill_invocation: None,
-            })
-            .await
-            .expect("projection failure is a state-machine outcome");
+        Box::pin(runtime.process_event(Event::UserMessage {
+            text: "dispatch me".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "projection-liveness-user".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }))
+        .await
+        .expect("projection failure is a state-machine outcome");
 
         assert!(runtime.llm_task_handle.is_none());
         assert!(matches!(
@@ -13204,9 +13203,7 @@ mod creation_completion_lifecycle_tests {
         ));
         let mut failed_attempt = runtime_with_storage(provisioning.clone(), Arc::clone(&storage));
 
-        let error = failed_attempt
-            .runtime
-            .process_event(creation_event())
+        let error = Box::pin(failed_attempt.runtime.process_event(creation_event()))
             .await
             .expect_err("completion persistence failure must fail the transition");
 
@@ -13226,9 +13223,7 @@ mod creation_completion_lifecycle_tests {
         storage.queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
         let mut reclaimed = runtime_with_storage(provisioning, storage);
         let mut request_count = reclaimed.llm.subscribe_request_count();
-        reclaimed
-            .runtime
-            .process_event(creation_event())
+        Box::pin(reclaimed.runtime.process_event(creation_event()))
             .await
             .unwrap();
         wait_for_provider_dispatch(&mut request_count).await;
@@ -13289,16 +13284,12 @@ mod creation_completion_lifecycle_tests {
             .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
         let mut request_count = harness.llm.subscribe_request_count();
 
-        harness
-            .runtime
-            .process_event(creation_event())
+        Box::pin(harness.runtime.process_event(creation_event()))
             .await
             .unwrap();
         wait_for_provider_dispatch(&mut request_count).await;
 
-        harness
-            .runtime
-            .process_event(creation_event())
+        Box::pin(harness.runtime.process_event(creation_event()))
             .await
             .expect_err("materialized creation event cannot be replayed");
         assert_eq!(*request_count.borrow(), 1);
@@ -17933,11 +17924,11 @@ mod approve_task_failure_effect_tests {
             observed_parent_id
         });
 
-        rt.process_event(Event::TaskApprovalDecided {
+        Box::pin(rt.process_event(Event::TaskApprovalDecided {
             outcome: TaskApprovalOutcome::Approved {
                 handoff: TaskApprovalHandoff::StartFreshWorkConversation,
             },
-        })
+        }))
         .await
         .expect("fresh handoff approval should succeed");
 
@@ -17983,11 +17974,11 @@ mod approve_task_failure_effect_tests {
         )
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
 
-        rt.process_event(Event::TaskApprovalDecided {
+        Box::pin(rt.process_event(Event::TaskApprovalDecided {
             outcome: TaskApprovalOutcome::Approved {
                 handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
             },
-        })
+        }))
         .await
         .expect_err("post-Git persistence failure must retire actor");
 
@@ -18036,13 +18027,12 @@ mod approve_task_failure_effect_tests {
         )
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
 
-        let result = rt
-            .process_event(Event::TaskApprovalDecided {
-                outcome: TaskApprovalOutcome::Approved {
-                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
-                },
-            })
-            .await;
+        let result = Box::pin(rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        }))
+        .await;
 
         assert!(
             result.is_err(),

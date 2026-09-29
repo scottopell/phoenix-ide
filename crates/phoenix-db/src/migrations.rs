@@ -708,12 +708,6 @@ BEGIN
     WHERE delivery_state = 'pending' AND watch_id IN
           (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = OLD.id);
 END;
-CREATE TRIGGER watch_close_requested AFTER INSERT ON close_obligations
-BEGIN
-    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
-    WHERE delivery_state = 'pending' AND watch_id IN
-      (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = NEW.product_conversation_id);
-END;
 CREATE TRIGGER watch_close_suppress AFTER UPDATE OF ordinary_lifecycle ON product_conversations
 WHEN NEW.ordinary_lifecycle != 'open'
 BEGIN
@@ -16310,7 +16304,8 @@ mod tests {
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches')",
         )
         .execute(&pool)
         .await
@@ -17207,7 +17202,8 @@ mod tests {
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches')",
         )
         .execute(pool)
         .await

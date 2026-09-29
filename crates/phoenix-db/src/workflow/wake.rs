@@ -2416,8 +2416,8 @@ impl WakeRepository {
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let created_at = timestamp_to_datetime(input.created_at);
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'system_generated')",
         )
         .bind(&message_id)
         .bind(&input.conversation_id)
@@ -2519,7 +2519,8 @@ impl WakeRepository {
                     l.auto_resume, l.created_at AS link_created_at,
                     m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at,
-                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
+                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
+                    m.origin_subscription_event_id
              FROM wake_delivery_messages l
              JOIN workflow_deliveries d
                ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
@@ -4440,7 +4441,8 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
-                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
+                m.origin_subscription_event_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4504,7 +4506,8 @@ async fn fetch_materialized_pending_deliveries_tx(
                 l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
-                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
+                m.origin_subscription_event_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4985,7 +4988,8 @@ async fn fetch_delivery_message_link_tx(
                 l.auto_resume, l.created_at AS link_created_at,
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
-                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
+                m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
+                m.origin_subscription_event_id
          FROM wake_delivery_messages l
          JOIN messages m ON m.message_id = l.message_id
          WHERE l.workflow_id = ?1 AND l.delivery_id = ?2",
@@ -5614,7 +5618,7 @@ mod tests {
         conversation_id: &str,
     ) -> Vec<Message> {
         sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -5796,6 +5800,23 @@ mod tests {
 
         let message = &link.linked_message.message;
         assert_eq!(message.message_id, expected_message_id);
+        let persisted: String =
+            sqlx::query_scalar("SELECT origin_kind FROM messages WHERE message_id = ?1")
+                .bind(&expected_message_id)
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            message.origin,
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        );
+        assert_eq!(message.origin.db_parts().0, persisted);
+        let reloaded = repo
+            .get_delivery_message_link(workflow_id, DeliveryId(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.linked_message.message.origin, message.origin);
         assert_eq!(message.conversation_id, "conv-1");
         assert_eq!(message.sequence_id, 17);
         assert_eq!(message.display_data, Some(display_data.clone()));
