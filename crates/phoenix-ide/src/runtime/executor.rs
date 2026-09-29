@@ -3497,6 +3497,7 @@ where
                     .any(|effect| matches!(effect, Effect::AbortLlm)))
                 || (matches!(old_state, ConvState::AwaitingRecovery { .. })
                     && !matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let mut pending_trusted_cleared = false;
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
@@ -3958,11 +3959,19 @@ where
                     )
                     .await
                 };
+                if state_committed
+                    && clears_pending_trusted_after_commit
+                    && !pending_trusted_cleared
+                {
+                    self.pending_trusted_tool_results.clear();
+                    pending_trusted_cleared = true;
+                }
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
                         state_committed |= is_state_persist;
                         if is_state_persist && clears_pending_trusted_after_commit {
                             self.pending_trusted_tool_results.clear();
+                            pending_trusted_cleared = true;
                         }
                         effect_result
                     }
