@@ -55,6 +55,23 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
     ProcessIncarnation(u64::from_le_bytes(bytes))
 }
 
+pub(crate) async fn dispatch_standalone(
+    manager: Arc<RuntimeManager>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    DirectTurnWorker::new(
+        manager.db().workflow_repository(),
+        Arc::new(ProductionDirectTurnDispatcher {
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
+        }),
+        Arc::new(SystemClock),
+        fresh_process_incarnation(),
+    )
+    .dispatch_conversation_once(conversation_id)
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,

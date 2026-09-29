@@ -3659,15 +3659,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<(), String> {
-        DirectTurnWorker::new(
-            self.db.direct_turn_repository(),
-            self.clone(),
-            Arc::new(SystemClock),
-            self.db.close_repository(),
-        )
-        .dispatch_conversation_once(conversation_id)
-        .await
-        .map_err(|error| error.to_string())
+        direct_turn_worker::dispatch_standalone(self.clone(), conversation_id).await
     }
 
     pub fn kick_direct_turn_worker(&self) {
