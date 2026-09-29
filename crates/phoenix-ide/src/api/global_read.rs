@@ -247,6 +247,17 @@ impl GlobalReadService {
         }
     }
 
+    pub(crate) async fn product_conversation_id_for_transcript(
+        &self,
+        conversation_id: &str,
+    ) -> Result<String, String> {
+        self.db
+            .get_conversation(conversation_id)
+            .await
+            .map(|conversation| conversation.product_conversation_id.to_string())
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) async fn resolve_message_target(
         &self,
         target: &str,
@@ -602,7 +613,27 @@ async fn resolve_reference_impl(
         let (id, _) = split_fragment(rest);
         return resolve_chain(service, id).await;
     }
-    if let Some(rest) = reference.strip_prefix("@conv:") {
+    if let Some(id) = reference.strip_prefix("@conv:") {
+        if id.is_empty() || id.contains('#') {
+            return Err(AppError::BadRequest(
+                "ProductConversation reference must be @conv:<product_conversation_id>".to_string(),
+            ));
+        }
+        let typed_id = phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
+            .expect("non-empty typed reference");
+        let aggregate = service
+            .db
+            .get_ordinary_product_conversation(&typed_id)
+            .await
+            .map_err(map_db_not_found)?;
+        let conv = service
+            .db
+            .get_conversation(&aggregate.latest_transcript_row_id)
+            .await
+            .map_err(map_db_not_found)?;
+        return Ok(resolve_conversation(conv, false));
+    }
+    if let Some(rest) = reference.strip_prefix("@transcript:") {
         let (id, message_id) = parse_conv_handle(rest);
         let conv = service
             .db

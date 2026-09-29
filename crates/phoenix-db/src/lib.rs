@@ -7660,6 +7660,36 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Resolve a previously accepted client message identity within one `ProductConversation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying query fails.
+    pub async fn product_conversation_client_message_owner(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        message_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT owner FROM (
+                 SELECT t.conversation_id AS owner
+                 FROM durable_turns t
+                 JOIN conversations c ON c.id = t.conversation_id
+                 WHERE c.product_conversation_id = ?1 AND t.client_turn_key = ?2
+                 UNION
+                 SELECT s.conversation_id AS owner
+                 FROM steering_messages s
+                 JOIN conversations c ON c.id = s.conversation_id
+                 WHERE c.product_conversation_id = ?1 AND s.message_id = ?2
+             ) LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Report whether a conversation has any durable pending steering work.
     ///
     /// # Errors

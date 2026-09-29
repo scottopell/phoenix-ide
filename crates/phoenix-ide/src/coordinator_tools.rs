@@ -250,7 +250,7 @@ impl Tool for ResolveReference {
         "resolve_reference"
     }
     fn description(&self) -> String {
-        "Resolve @conv, @chain, @work, and app-local conversation/chain references to durable source metadata.".to_string()
+        "Resolve @conv:<product_conversation_id>, @transcript:<conversation_id>, and supported app-local or work references to durable source metadata.".to_string()
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"reference":{"type":"string"}},"required":["reference"]})
@@ -292,6 +292,7 @@ impl Tool for SendConversationMessage {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         let parsed = match serde_json::from_value::<SendConversationMessageInput>(input) {
             Ok(value) => value,
@@ -318,7 +319,24 @@ impl Tool for SendConversationMessage {
         let send_target = match target {
             crate::api::global_read::GlobalMessageTarget::StableProductConversation {
                 product_conversation_id,
-            } => SendChatTarget::StableProductConversation(product_conversation_id),
+            } => {
+                if self
+                    .service
+                    .product_conversation_id_for_transcript(&ctx.conversation_id)
+                    .await
+                    .is_ok_and(|origin| origin == product_conversation_id)
+                {
+                    return encode_message_output(&SendConversationMessageOutput::Rejected {
+                            target: Some(parsed.target),
+                            conversation_id: Some(ctx.conversation_id),
+                            message_id: parsed.message_id,
+                            reason_code: "self_target_rejected",
+                            message: "send_conversation_message cannot target its originating ProductConversation"
+                                .to_string(),
+                        });
+                }
+                SendChatTarget::StableProductConversation(product_conversation_id)
+            }
             crate::api::global_read::GlobalMessageTarget::ExactTranscript { conversation_id } => {
                 if conversation_id == ctx.conversation_id {
                     return encode_message_output(&SendConversationMessageOutput::Rejected {

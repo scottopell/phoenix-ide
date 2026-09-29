@@ -123,7 +123,7 @@ impl ContinuationHistory {
             "\n\nInput selection: {baseline} The remaining history is a bounded newest suffix; \
              intervening details may be omitted. Do not infer completion or authorization from \
              omissions. Preserve this transcript reference for retrieving missing details when \
-             relevant: @conv:{conversation_id}."
+             relevant: @transcript:{conversation_id}."
         )
     }
 }

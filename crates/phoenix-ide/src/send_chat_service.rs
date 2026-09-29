@@ -217,6 +217,21 @@ impl SendChatApplicationService {
                         &product_conversation_id,
                     )
                     .expect("stable target has a non-empty typed id");
+                if let Some(conversation_id) = self
+                    .db
+                    .product_conversation_client_message_owner(
+                        &typed_product_conversation_id,
+                        &req.message_id,
+                    )
+                    .await
+                    .map_err(map_conversation_load_error)?
+                {
+                    req.conversation_id = conversation_id.clone();
+                    return self
+                        .send(req)
+                        .await
+                        .map(|outcome| (conversation_id, outcome));
+                }
                 let aggregate = self
                     .db
                     .get_ordinary_product_conversation(&typed_product_conversation_id)
