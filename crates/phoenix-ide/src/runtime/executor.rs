@@ -1458,6 +1458,9 @@ fn render_messages<'a>(
                         "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
                         user_content.llm_text()
                     ),
+                    phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
+                        format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
+                    }
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
                         format!("[System-generated input]\n{}", user_content.llm_text())
                     }
