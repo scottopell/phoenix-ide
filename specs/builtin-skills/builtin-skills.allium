@@ -148,6 +148,44 @@ rule InvokeCoordinatorBuiltin {
         -- and includes companion references in the authenticated result.
 }
 
+rule DeliverCoordinatorBuiltinToModel {
+    when: TrustedBuiltinSkillResultCreated(result, tool_use_id)
+
+    requires: result.audience = "global-coordinator"
+
+    ensures: visible_tool_result(tool_use_id) = authenticated_delivery_receipt
+    ensures: persisted_tool_result(tool_use_id) = authenticated_delivery_receipt
+    ensures: next_live_model_request.latest_tool_result(tool_use_id) =
+        trusted_envelope(audience: "global-coordinator", content: result.content)
+    ensures: historical_model_requests.exclude(result.content)
+
+    @guidance
+        -- The trusted payload stays opaque to transcript/UI surfaces. Its bytes
+        -- exist only in live memory and replace the latest matching tool result
+        -- while the immediately following provider request is assembled.
+}
+
+rule PhoenixApiCreationRecipe {
+    when: CoordinatorCreationAuthorized(origin, work_scope_id, objective)
+
+    requires: ActiveWorkScope(work_scope_id)
+    requires: objective != ""
+
+    ensures: recipe.discovers_auth_at(origin + "/api/auth/status")
+    ensures: recipe.discovers_model_and_effort_at(origin + "/api/models")
+    ensures: recipe.generates_request_uuid_once()
+    ensures: recipe.posts_supported_fields_to(origin + "/api/product-conversations/new")
+    ensures: recipe.reconciles_ambiguous_response_by_same_request_uuid_and_intent()
+    ensures: recipe.verifies_product_creation_separately_from_transcript_activity()
+    ensures: recipe.distinguishes_product_identity_from_root_and_current_transcripts()
+    ensures: recipe.performs_no_database_lifecycle_write()
+
+    @guidance
+        -- The operational recipe runs as one active scoped Bash command. It
+        -- keeps credentials out of argv/output and treats source inspection as
+        -- a version-mismatch diagnostic rather than a normal API workflow.
+}
+
 ------------------------------------------------------------
 -- Rules: Catalog Rendering
 ------------------------------------------------------------

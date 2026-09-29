@@ -1361,6 +1361,53 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_phoenix_api_payload_is_operational_and_cache_independent() {
+        let catalog = AuthenticatedCoordinatorSkillCatalog::discover(None)
+            .expect("authenticated coordinator catalog");
+        let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &catalog).unwrap();
+
+        for required in [
+            "POST /api/product-conversations/new",
+            "\"request_id\"",
+            "\"cwd\"",
+            "\"model\"",
+            "\"effort\"",
+            "\"objective\"",
+            "GET /api/auth/status",
+            "GET /api/models",
+            "effort_capabilities",
+            "work_scope_id",
+            "REQUEST_ID=$(uuidgen",
+            "INTENT=$(jq -cn",
+            "creation_request_id=%s",
+            "retrying exact request_id",
+            "GET /api/product-conversations/creation",
+            "product_conversation_id",
+            "root_transcript_row_id",
+            "current_transcript_row_id",
+            "canonical_route",
+            "agent_working",
+        ] {
+            assert!(
+                trusted.contains(required),
+                "missing operational contract: {required}"
+            );
+        }
+        assert!(trusted.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        for forbidden in [
+            "UPDATE conversations",
+            "INSERT INTO conversations",
+            "DELETE FROM conversations",
+            "localhost:8031",
+        ] {
+            assert!(
+                !trusted.contains(forbidden),
+                "forbidden bypass or guessed target: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn filesystem_skill_cannot_self_promote_to_coordinator() {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join(".agents/skills/impostor");

@@ -20304,6 +20304,60 @@ mod steer_drain_detector_tests {
         ));
     }
 
+    #[test]
+    fn authenticated_phoenix_api_payload_is_hidden_then_overlaid_for_live_model_request() {
+        use crate::db::{MessageContent, ToolOutcome, ToolResult};
+        use phoenix_llm::ContentBlock;
+
+        let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None)
+            .expect("authenticated coordinator catalog");
+        let payload = phoenix_skills::invoke_trusted_coordinator_builtin("phoenix-api", &catalog)
+            .expect("embedded phoenix-api payload");
+        let result = ToolResult {
+            tool_use_id: "phoenix-api-call".to_string(),
+            outcome: ToolOutcome::TrustedInstructions {
+                output: payload.clone(),
+            },
+            duration_ms: None,
+        };
+
+        let persisted = tool_result_message_content(&result);
+        let MessageContent::Tool(persisted) = persisted else {
+            panic!("trusted instructions must persist as a tool result receipt");
+        };
+        assert_eq!(
+            persisted.content,
+            "Authenticated built-in skill instructions were delivered for this live request."
+        );
+        assert!(!persisted
+            .content
+            .contains("POST /api/product-conversations/new"));
+
+        let trusted_results = trusted_tool_results(&[result]);
+        let mut messages = vec![LlmMessage {
+            source_message_id: None,
+            role: phoenix_llm::MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "phoenix-api-call".to_string(),
+                content: persisted.content,
+                is_error: false,
+                images: vec![],
+            }],
+        }];
+        overlay_trusted_tool_results(&mut messages, &trusted_results);
+
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content.starts_with("<trusted_builtin_skill audience=\"global-coordinator\">")
+                    && content.contains("POST /api/product-conversations/new")
+                    && content.contains("REQUEST_ID=$(uuidgen")
+                    && content.ends_with("</trusted_builtin_skill>")
+        ));
+        assert_eq!(count_trusted_envelopes(&messages), 1);
+        assert!(payload.contains("GET /api/models"));
+    }
+
     #[tokio::test]
     async fn persist_checkpoint_downgrades_trusted_instruction_to_ordinary_content() {
         use crate::db::{MessageContent, ToolOutcome, ToolResult};

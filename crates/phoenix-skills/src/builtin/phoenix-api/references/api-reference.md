@@ -1,47 +1,31 @@
 # Supported Phoenix HTTP API reference
 
-This reference describes the server API, not a privileged bypass. Use the Phoenix origin for the deployment the user named. Do not guess a localhost URL when the requested target may be remote.
+This is an authenticated operational reference for the live Phoenix deployment the user named. It is not a privileged bypass. Use the deployment's known origin; never guess that `localhost` is the intended server.
 
-## Authorization without disclosure
+## Safe execution boundary
 
-1. `GET /api/auth/status` is the safe, unauthenticated capability check. It returns whether authentication is required; it does not return a credential.
-2. If authentication is disabled, do not add credentials.
-3. If authentication is enabled, use a credential already supplied or explicitly identified by the user for this deployment. For non-browser requests, Phoenix accepts the configured password as `Authorization: Bearer …`. A `phoenix-auth` cookie is an opaque authenticated session token, not the configured password.
-4. Keep secrets out of command arguments, shell tracing, files, logs, summaries, and tool output. Prefer an already-populated environment variable expanded inside the scoped shell. Do not inspect the Phoenix database or process environment to hunt for a credential, and do not echo or interpolate a secret into diagnostic output.
-5. A `401` or `403` is a stop condition. Do not weaken or route around authorization.
+- Run HTTP commands only through Global's scoped Bash with an explicit active `work_scope_id` obtained from authoritative WorkScope rows. Phoenix selects that scope's server-side cwd; there is no default repository or cwd.
+- Use only the public routes and fields below. Never write lifecycle state through SQLite, call internal handlers, invent a receipt, or bypass authorization.
+- Prefer the live API contract. Inspect source only when `/api/version` proves the target deployment and checked-out source differ or a live response genuinely contradicts this embedded contract.
 
-Use `curl --fail-with-body --silent --show-error` and capture response bodies without verbose/header tracing when authentication is present. Keep the bearer credential out of argv and off disk: stream `Authorization: Bearer ` followed by the environment variable's raw bytes and a newline to curl's header stdin (for example, `printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD" | curl ... --header @-`). Do not place the credential in curl config syntax, which interprets backslash escapes. Parse JSON structurally rather than relying on display text.
+## Authorization and live capabilities
 
-## WorkScope admission
+1. Call unauthenticated `GET /api/auth/status`. It returns only `auth_required` and whether this request is `authenticated`.
+2. If auth is disabled, send no credential. If auth is enabled and the current request is not authenticated, use only a credential already supplied or explicitly identified by the user for this deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
+3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through stdin: `printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD" | curl ... --header @-`. Do not print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
+4. Authenticated `GET /api/models` is the live authority for model and effort support. Select an entry by exact `id`. Its `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Omit an override with JSON `null`, or send only a level listed for that exact model.
 
-Coordinator API operations through scoped Bash require an active `work_scope_id` obtained through `query_database`. Query current WorkScope and owner rows before choosing the target. Phoenix resolves that WorkScope's server-side cwd; there is no default repository or cwd. When no active WorkScope exists, first-conversation creation is unavailable through this surface.
+Use `curl --fail-with-body --silent --show-error`. Parse JSON structurally.
 
-## Discover the default model
+## Create one ProductConversation
 
-`GET /api/models` returns `models` and `default`. Read it before creating a conversation when the user did not name a supported model; use the `default` model identifier when present and do not guess a model ID.
-
-## Resolve the current target
-
-ProductConversation references accepted by the read APIs may be a product-conversation ID, transcript-row ID, or slug:
-
-- `GET /api/product-conversations` lists aggregate identities and canonical routes.
-- `GET /api/product-conversations/{reference}` returns the aggregate snapshot. Before a mutation, check `product_conversation_id`, `ordinary_lifecycle`, `latest_transcript_row_id`, and `writable_transcript_row_id`.
-- `GET /api/product-conversations/{reference}/route` returns the canonical `transcript_row_id` for routing.
-- `GET /api/conversations/{id}` returns transcript state, messages, `agent_working`, and `presentation_mode`.
-
-For chat or cancel, use the snapshot's current `writable_transcript_row_id`. If it is absent, Phoenix has not exposed a writable target for those operations; do not substitute `latest_transcript_row_id`. Re-resolve immediately before acting because continuation can change the writable transcript.
-
-Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, require `ordinary_lifecycle == "open"`, read that transcript, and continue only after `conversation.state.type == "context_exhausted"`. A History aggregate must receive a separate Open follow-up; do not call `/continue`. Do not require or target `writable_transcript_row_id` for continuation.
-
-## Create a ProductConversation
-
-`POST /api/product-conversations/new`
+`POST /api/product-conversations/new` accepts exactly:
 
 ```json
 {
   "request_id": "client-generated UUID",
   "cwd": "/absolute/server/path",
-  "model": "supported-model-id",
+  "model": "exact live model id",
   "effort": null,
   "objective": "opening user objective",
   "llm_language": null,
@@ -49,53 +33,153 @@ Continuation is different: a context-exhausted transcript is intentionally not w
 }
 ```
 
-The accepted response contains `canonical_route`, `product_conversation_id`, and `transcript_row_id`. `request_id` is the creation idempotency identity: create it once and reuse the same value and payload for an uncertain exact retry. A successful response proves publication/acceptance, not completion of the opening turn. Verify with `GET /api/product-conversations/{product_conversation_id}` and then the returned/current transcript state.
+`request_id`, `cwd`, `model`, `effort`, and `objective` are immutable creation intent. Generate the UUID once. If the response is ambiguous, retain that UUID and the identical JSON payload: reconcile by `request_id`, then make only an exact retry. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation.
 
-Creation recovery surfaces:
+### Copyable scoped-Bash recipe
 
-- `GET /api/product-conversations/creation` returns `product_creations` and optional `next_cursor`. Follow `?cursor={next_cursor}` until the requested `request_id` is found or no cursor remains.
-- `POST /api/product-conversations/creation/{request_id}/retry-delivery` retries delivery for that creation identity.
-- `POST /api/product-conversations/creation/{request_id}/cancel` requests cancellation.
-- `DELETE /api/product-conversations/creation/{request_id}` requests deletion where `allowed_actions` includes `delete`; it returns acceptance, then the creation worker performs cleanup. The current API exposes no terminal deletion tombstone: the recovery listing omits `deletion_pending` rows, so absence cannot distinguish in-progress cleanup from completion. Report deletion as accepted but not observably completed.
+Run the whole block in one Bash `op="run"` call with the admitted `work_scope_id`. Set `ORIGIN` to the user-selected Phoenix origin and place the exact opening objective inside the quoted heredoc. Optionally set `EFFORT` to a requested live-supported level; leaving it empty sends `null` and uses the model's native behavior.
 
-Read `allowed_actions` first. These are creation-recovery operations, not a general conversation retry API.
+```bash
+set -u
+ORIGIN='https://the-user-selected-phoenix-origin'
+EFFORT='' # optional exact level; empty means JSON null
+# Put the exact objective between these quoted-heredoc delimiters. Its contents
+# are data, not shell syntax, so quotes, `$`, backticks, and newlines stay literal.
+OBJECTIVE=$(cat <<'PHOENIX_OBJECTIVE'
+the exact opening objective
+PHOENIX_OBJECTIVE
+) || exit
 
-## Send or steer a message
-
-Do not use `POST /api/conversations/{id}/chat` from the Coordinator. That generic browser endpoint expands slash commands and `@file` references and accepts attachments and user-agent metadata, so it does not preserve the Coordinator's literal-text-only cross-conversation contract. Use the dedicated `send_conversation_message` tool for non-empty literal text to one existing non-Coordinator conversation. Its delivered/queued result is acceptance only; re-read the target conversation to report observed execution separately.
-
-## Continue a context-exhausted transcript
-
-`POST /api/conversations/{latest_transcript_row_id}/continue`
-
-```json
-{
-  "handoff": "opening continuation summary",
-  "message_id": "client-generated UUID",
-  "user_agent": null
+AUTH_STATUS=$(curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status") || exit
+AUTH_REQUIRED=$(jq -er '.auth_required' <<<"$AUTH_STATUS") || exit
+AUTHENTICATED=$(jq -er '.authenticated' <<<"$AUTH_STATUS") || exit
+if [[ "$AUTH_REQUIRED" == true && "$AUTHENTICATED" != true ]]; then
+  : "${PHOENIX_PASSWORD:?authenticated deployment requires a user-identified PHOENIX_PASSWORD}"
+fi
+api() {
+  if [[ "$AUTH_REQUIRED" == true && "$AUTHENTICATED" != true ]]; then
+    # Process substitution keeps the credential out of argv while leaving stdin
+    # available for a streamed JSON request body.
+    curl --fail-with-body --silent --show-error \
+      --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") "$@"
+  else
+    curl --fail-with-body --silent --show-error "$@"
+  fi
 }
+
+MODELS=$(api "$ORIGIN/api/models") || exit
+MODEL=$(jq -er '.default as $d | .models[] | select(.id == $d) | .id' <<<"$MODELS") || exit
+MODEL_INFO=$(jq -ec --arg model "$MODEL" '.models[] | select(.id == $model)' <<<"$MODELS") || exit
+if [[ -n "$EFFORT" ]]; then
+  jq -e --arg effort "$EFFORT" \
+    '.effort_capabilities.support == "supported" and (.effort_capabilities.levels | index($effort) != null)' \
+    <<<"$MODEL_INFO" >/dev/null || { printf '%s\n' 'requested effort is not supported by the selected live model' >&2; exit 1; }
+  EFFORT_JSON=$(jq -Rn --arg value "$EFFORT" '$value')
+else
+  EFFORT_JSON=null
+fi
+
+CWD=$PWD
+test -d "$CWD" || exit
+REQUEST_ID=$(uuidgen | tr '[:upper:]' '[:lower:]') || exit
+INTENT=$(jq -cn \
+  --arg request_id "$REQUEST_ID" --arg cwd "$CWD" --arg model "$MODEL" \
+  --argjson effort "$EFFORT_JSON" --arg objective "$OBJECTIVE" \
+  '{request_id:$request_id,cwd:$cwd,model:$model,effort:$effort,objective:$objective,llm_language:null,images:[]}') || exit
+
+# Persist the non-secret request identity in Bash output before dispatch. Keep
+# REQUEST_ID and INTENT unchanged until creation is reconciled.
+printf 'creation_request_id=%s\n' "$REQUEST_ID"
+post_creation() {
+  CREATE_WIRE=$(printf '%s' "$INTENT" | api --request POST --header 'Content-Type: application/json' \
+    --data-binary @- --write-out $'\n%{http_code}' "$ORIGIN/api/product-conversations/new")
+  POST_EXIT=$?
+  HTTP_STATUS=${CREATE_WIRE##*$'\n'}
+  CREATE=${CREATE_WIRE%$'\n'*}
+}
+find_creation() {
+  local cursor='' page
+  while :; do
+    if [[ -n "$cursor" ]]; then
+      page=$(api --get --data-urlencode "cursor=$cursor" "$ORIGIN/api/product-conversations/creation") || return
+    else
+      page=$(api "$ORIGIN/api/product-conversations/creation") || return
+    fi
+    RECONCILED=$(jq -ec --arg request_id "$REQUEST_ID" \
+      '.product_creations[] | select(.request_id == $request_id)' <<<"$page") && return 0
+    cursor=$(jq -er '.next_cursor // empty' <<<"$page") || return 1
+  done
+}
+
+post_creation
+if [[ $POST_EXIT -ne 0 ]]; then
+  if [[ "$HTTP_STATUS" == 4* ]]; then
+    printf 'creation rejected with HTTP %s; do not retry request_id=%s without correcting the request\n' "$HTTP_STATUS" "$REQUEST_ID" >&2
+    exit "$POST_EXIT"
+  fi
+  printf 'ambiguous creation response (HTTP %s); reconciling request_id=%s\n' "$HTTP_STATUS" "$REQUEST_ID" >&2
+  if find_creation; then
+    jq -e --arg cwd "$CWD" --arg model "$MODEL" --arg objective "$OBJECTIVE" --argjson effort "$EFFORT_JSON" \
+      '.cwd == $cwd and .model == $model and .objective == $objective and .effort == $effort' \
+      <<<"$RECONCILED" >/dev/null || { printf '%s\n' 'reconciled creation intent mismatch' >&2; exit 1; }
+    printf '%s\n' "$RECONCILED"
+    exit 0
+  fi
+  printf 'creation not found after bounded pagination; retrying exact request_id=%s once\n' "$REQUEST_ID" >&2
+  post_creation
+  [[ $POST_EXIT -eq 0 ]] || exit "$POST_EXIT"
+fi
+
+PRODUCT_ID=$(jq -er '.product_conversation_id' <<<"$CREATE") || exit
+ROOT_TRANSCRIPT=$(jq -er '.transcript_row_id' <<<"$CREATE") || exit
+CANONICAL_ROUTE=$(jq -er '.canonical_route' <<<"$CREATE") || exit
+SNAPSHOT=$(api "$ORIGIN/api/product-conversations/$PRODUCT_ID") || exit
+CURRENT_TRANSCRIPT=$(jq -er '.latest_transcript_row_id' <<<"$SNAPSHOT") || exit
+TRANSCRIPT=$(api "$ORIGIN/api/conversations/$CURRENT_TRANSCRIPT") || exit
+jq -n \
+  --arg request_id "$REQUEST_ID" --arg product_conversation_id "$PRODUCT_ID" \
+  --arg root_transcript_row_id "$ROOT_TRANSCRIPT" --arg current_transcript_row_id "$CURRENT_TRANSCRIPT" \
+  --arg canonical_route "$CANONICAL_ROUTE" \
+  --arg state "$(jq -r '.conversation.state.type' <<<"$TRANSCRIPT")" \
+  --argjson agent_working "$(jq '.agent_working' <<<"$TRANSCRIPT")" \
+  '{request_id:$request_id,product_conversation_id:$product_conversation_id,root_transcript_row_id:$root_transcript_row_id,current_transcript_row_id:$current_transcript_row_id,canonical_route:$canonical_route,state:$state,agent_working:$agent_working}'
 ```
 
-Before this request, re-resolve the ProductConversation topology, verify `ordinary_lifecycle == "open"`, and verify that `GET /api/conversations/{latest_transcript_row_id}` reports `conversation.state.type == "context_exhausted"`. Reuse the same `message_id` for an exact uncertain retry. The response contains successor `conversation_id`, optional `slug`, and status `accepted`, `dispatch_failed`, or `already_exists`; `error` is present only when the successor exists but opening-message dispatch was not accepted. Preserve the returned successor identity even on `dispatch_failed`. Verify by re-reading the ProductConversation snapshot, confirming the new writable transcript, and reading the successor conversation. `accepted` and `already_exists` identify durable continuation outcomes; neither alone proves subsequent assistant execution completed.
+A successful POST proves durable creation/publication and returns:
 
-Do not fold automatic continuation policy into this workflow. Continue only when the user authorized it.
+- `product_conversation_id`: stable ProductConversation identity;
+- `transcript_row_id`: the created root transcript row;
+- `canonical_route`: the product UI route.
 
-## Cancel in-flight transcript work
+It does **not** prove opening-turn dispatch or model activity completed. Verify creation through `GET /api/product-conversations/{product_conversation_id}`. Then use its `latest_transcript_row_id` as the current transcript and separately read `GET /api/conversations/{current_transcript_row_id}` for `conversation.state.type`, messages, and `agent_working`. The root transcript from creation is identity/history; after continuation it can differ from the current transcript. Never substitute one meaning for the other.
 
-`POST /api/conversations/{writable_transcript_row_id}/cancel`
+### Ambiguous-response reconciliation
 
-The response is `{ "ok": true, "no_op": boolean }`; false `no_op` may be omitted. `no_op: true` means Phoenix observed nothing cancellable. Cancel has no caller-provided idempotency key and no uniform operation receipt. After the response, re-read the ProductConversation and transcript state to report whether work is still observed.
+`GET /api/product-conversations/creation` returns `product_creations` and optional `next_cursor`. The recipe follows each cursor until the retained `request_id` is found or pagination ends, verifies `cwd`, `objective`, `model`, and `effort`, and retries the exact POST at most once only after transport/5xx ambiguity. A reconciled recovery row proves the creation request is durable but may not yet expose a published ProductConversation; report its status and use only its `allowed_actions`. Never claim absence from one page.
 
-## Honest API gaps
+Creation recovery routes are scoped to that request identity:
 
-Current APIs do not provide:
+- `POST /api/product-conversations/creation/{request_id}/retry-delivery`
+- `POST /api/product-conversations/creation/{request_id}/cancel`
+- `DELETE /api/product-conversations/creation/{request_id}` only when `allowed_actions` includes `delete`
 
-- a first-class Coordinator operator service or general lifecycle command endpoint;
-- one ProductConversation-targeted mutation contract across create, steer, continue, retry, and cancel;
-- a uniform operation ID, normalized receipt, or audit record across those actions;
-- a general retry endpoint for an existing conversation turn;
-- a caller idempotency key for cancel;
-- proof of asynchronous execution completion in an accepted HTTP response;
-- observable completion for accepted creation-recovery deletion.
+Read `allowed_actions` first. These are not general conversation retry APIs. Deletion acceptance is not observable cleanup completion because pending rows leave the listing before a terminal tombstone exists.
 
-Do not manufacture these guarantees with local files, ad-hoc receipt formats, database writes, polling loops, or background monitors. Use bounded follow-up reads when the user needs observation. If the requested result depends on a missing guarantee or endpoint, report the exact gap and propose a separately scoped server change.
+## Resolve and act on an existing ProductConversation
+
+Current read routes accept a ProductConversation ID, transcript-row ID, or slug as `{reference}`:
+
+- `GET /api/product-conversations` lists stable identities and canonical routes.
+- `GET /api/product-conversations/{reference}` returns the aggregate snapshot, including `ordinary_lifecycle`, `latest_transcript_row_id`, and `writable_transcript_row_id`.
+- `GET /api/product-conversations/{reference}/route` returns a canonical transcript route target.
+- `GET /api/conversations/{transcript_row_id}` returns exact transcript state and messages.
+
+For message steering, use `send_conversation_message` with non-empty literal text. Do not use `POST /api/conversations/{id}/chat`: that generic browser route expands slash commands and file references. Delivered/queued is acceptance only, so read state separately when observation is required.
+
+For cancel, re-resolve and use `POST /api/conversations/{writable_transcript_row_id}/cancel`. The response is `{ "ok": true, "no_op": boolean }`; `no_op: true` means nothing cancellable was observed. Cancel has no caller idempotency key or uniform operation receipt.
+
+For user-authorized continuation only, require `ordinary_lifecycle == "open"` and verify `conversation.state.type == "context_exhausted"` on the exact current transcript, then call `POST /api/conversations/{latest_transcript_row_id}/continue` with a once-generated UUID `message_id`, `handoff`, and `user_agent:null`. Reuse the same `message_id` for an exact uncertain retry. Preserve the returned successor identity even for `dispatch_failed`; re-read the aggregate and successor transcript. A History aggregate requires a separate Open follow-up, not `/continue`.
+
+## Honest gaps
+
+Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, or unsupported fields/routes. Report the exact gap and scope a server change separately.
