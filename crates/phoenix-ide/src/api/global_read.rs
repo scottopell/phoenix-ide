@@ -338,7 +338,11 @@ async fn format_global_search_hits(
             out,
             "- [{} · {} · {}]({}) @conv:{} msg:{} — {}",
             title,
-            hit.message_type,
+            format!(
+                "{}{}",
+                attributed_role(hit.message_type, &hit.origin),
+                attributed_sender(&hit.origin)
+            ),
             hit.created_at.format("%Y-%m-%d"),
             link,
             hit.conversation_id,
@@ -497,18 +501,18 @@ fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     )
 }
 
-fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
-    let role = match message.message_type {
-        MessageType::User => match &message.origin {
-            phoenix_core::domain::db_schema::InputOrigin::UserApi => "User API",
-            phoenix_core::domain::db_schema::InputOrigin::InternalConversation { .. } => {
-                "Conversation"
-            }
-            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "System input",
-            phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => {
-                "Conversation event"
-            }
-            phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "Unknown input",
+fn attributed_role(
+    message_type: MessageType,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> &'static str {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    match message_type {
+        MessageType::User => match origin {
+            InputOrigin::UserApi => "User API",
+            InputOrigin::InternalConversation { .. } => "Conversation",
+            InputOrigin::SystemGenerated => "System input",
+            InputOrigin::SubscriptionEvent { .. } => "Conversation event",
+            InputOrigin::UnknownHistorical => "Unknown input",
         },
         MessageType::Agent => "Agent",
         MessageType::Tool => "Tool",
@@ -516,18 +520,27 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Error => "Error",
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
-    };
-    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
-    let sender = match &message.origin {
-        phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+    }
+}
+
+fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    match origin {
+        InputOrigin::InternalConversation {
             product_conversation_id,
             transcript_id,
         } => format!(" from @conv:{product_conversation_id} transcript:{transcript_id}"),
-        phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
-        | phoenix_core::domain::db_schema::InputOrigin::UserApi
-        | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
-        | phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => String::new(),
-    };
+        InputOrigin::UnknownHistorical
+        | InputOrigin::UserApi
+        | InputOrigin::SystemGenerated
+        | InputOrigin::SubscriptionEvent { .. } => String::new(),
+    }
+}
+
+fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
+    let role = attributed_role(message.message_type, &message.origin);
+    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+    let sender = attributed_sender(&message.origin);
     format!(
         "[{}{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
         role,
@@ -1028,10 +1041,13 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        message_id_fragment, parse_conv_handle, render_full_message_text,
-        render_global_message_line, split_fragment, GlobalMessageTargetError, GlobalReadService,
+        format_global_search_hits, message_id_fragment, parse_conv_handle,
+        render_full_message_text, render_global_message_line, split_fragment,
+        GlobalMessageTargetError, GlobalReadService,
     };
     use std::sync::Arc;
+
+    use crate::db::MessageRetriever;
 
     #[test]
     fn message_target_rejections_are_caller_neutral() {
@@ -1084,6 +1100,66 @@ mod tests {
         let rendered = render_global_message_line(&conv, &message);
         assert!(rendered.contains("Unknown input"));
         assert!(!rendered.contains("User API"));
+    }
+
+    #[tokio::test]
+    async fn search_hit_uses_same_recorded_attribution_as_full_read() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("search-origin", "search-origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "search-origin-message",
+                &conv.id,
+                &MessageContent::user("search origin body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = Arc::new(db.fts_retriever());
+        let mut hit = retriever
+            .retrieve(crate::db::RetrievalRequest::natural_language(
+                "search origin",
+                crate::db::RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap()
+            .remove(0);
+        let service = GlobalReadService::new(db, retriever);
+        let cases = [
+            (InputOrigin::UnknownHistorical, "Unknown input"),
+            (InputOrigin::UserApi, "User API"),
+            (InputOrigin::SystemGenerated, "System input"),
+            (
+                InputOrigin::SubscriptionEvent {
+                    event_id: "event-1".into(),
+                },
+                "Conversation event",
+            ),
+            (
+                InputOrigin::InternalConversation {
+                    product_conversation_id: conv.product_conversation_id.clone(),
+                    transcript_id: conv.id.clone(),
+                },
+                "Conversation from @conv:",
+            ),
+        ];
+        for (origin, expected) in cases {
+            message.origin = origin.clone();
+            hit.origin = origin;
+            let search = format_global_search_hits(&service, &[hit.clone()]).await;
+            let full = render_global_message_line(&conv, &message);
+            assert!(search.contains(expected), "{search}");
+            assert!(full.contains(expected), "{full}");
+            if expected != "User API" {
+                assert!(!search.contains("User API"), "{search}");
+            }
+        }
     }
 
     #[test]

@@ -1667,6 +1667,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.kind())
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1746,6 +1752,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.kind())
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await

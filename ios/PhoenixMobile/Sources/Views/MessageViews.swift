@@ -31,7 +31,7 @@ struct MessageView: View {
             if message.content["is_meta"]?.boolValue == true {
                 SystemNote(text: noteText, style: .secondary)
             } else {
-                UserMessageView(content: message.content)
+                UserMessageView(content: message.content, origin: message.inputOrigin)
             }
         case "agent":
             AgentMessageView(content: message.content)
@@ -116,16 +116,22 @@ struct SkillRow: View {
 
 struct UserMessageView: View {
     let content: JSONValue
+    let origin: InputOrigin
 
     var body: some View {
         HStack {
-            Spacer(minLength: 40)
-            VStack(alignment: .trailing, spacing: 4) {
+            if origin == .userApi { Spacer(minLength: 40) }
+            VStack(alignment: origin == .userApi ? .trailing : .leading, spacing: 4) {
+                if origin != .userApi {
+                    Text(origin.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)
-                    .background(Color.accentColor)
-                    .foregroundStyle(.white)
+                    .background(origin == .userApi ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(origin == .userApi ? Color.white : Color.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 if let images = content["images"]?.arrayValue, !images.isEmpty {
                     ImageStrip(images: images, maxHeight: 140)
@@ -144,9 +150,10 @@ struct UserMessageView: View {
                     }
                 }
             }
+            if origin != .userApi { Spacer(minLength: 40) }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("message.user")
+        .accessibilityIdentifier(origin == .userApi ? "message.user" : "message.input")
     }
 }
 

@@ -18,7 +18,8 @@ pub struct PendingWatchEvent {
     pub event_id: String,
     pub product_conversation_id: ProductConversationId,
     pub source_transcript_id: String,
-    pub source_turn_id: i64,
+    pub source_occurrence_kind: String,
+    pub source_occurrence_id: String,
     pub source_generation: i64,
     pub terminal_kind: String,
     pub terminal_reason: Option<String>,
@@ -135,7 +136,8 @@ impl Database {
         limit: i64,
     ) -> DbResult<Vec<PendingWatchEvent>> {
         let rows = sqlx::query("SELECT e.event_id, w.source_product_conversation_id,
-                  e.source_transcript_id, e.source_turn_id, e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at
+                  e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
+                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at
              FROM coordinator_watch_events e JOIN coordinator_watches w ON w.id = e.watch_id
              JOIN product_conversations p ON p.id = w.source_product_conversation_id
              WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at IS NULL
@@ -152,7 +154,8 @@ impl Database {
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                     source_transcript_id: row.try_get("source_transcript_id")?,
-                    source_turn_id: row.try_get("source_turn_id")?,
+                    source_occurrence_kind: row.try_get("source_occurrence_kind")?,
+                    source_occurrence_id: row.try_get("source_occurrence_id")?,
                     source_generation: row.try_get("source_generation")?,
                     terminal_kind: row.try_get("terminal_kind")?,
                     terminal_reason: row.try_get("terminal_reason")?,
@@ -185,6 +188,50 @@ pub(crate) async fn record_terminal_event_tx(
     reason: Option<&str>,
     context_exhausted: bool,
 ) -> DbResult<()> {
+    record_watch_event_tx(
+        tx,
+        "direct_turn",
+        &turn_id.to_string(),
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        context_exhausted,
+    )
+    .await
+}
+
+pub(crate) async fn record_creation_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+) -> DbResult<()> {
+    record_watch_event_tx(
+        tx,
+        "creation",
+        job_id,
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        false,
+    )
+    .await
+}
+
+async fn record_watch_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    occurrence_kind: &str,
+    occurrence_id: &str,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+    context_exhausted: bool,
+) -> DbResult<()> {
     let category = match terminal_kind {
         "Completed" => "completed",
         "Failed" => "failed",
@@ -195,22 +242,23 @@ pub(crate) async fn record_terminal_event_tx(
         return Ok(());
     }
     sqlx::query("INSERT INTO coordinator_watch_events
-        (event_id, watch_id, source_turn_id, source_generation, source_transcript_id,
-         terminal_kind, terminal_reason, occurred_at, continuation_state)
-        SELECT ?1, w.id, ?2, ?3, c.id, ?4, ?5, ?6,
-          CASE WHEN ?8 AND ?4 = 'failed' AND p.auto_continue_on_context_exhaustion = 1
+        (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
+         source_generation, source_transcript_id, terminal_kind, terminal_reason,
+         occurred_at, continuation_state)
+        SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
+          CASE WHEN ?9 AND ?5 = 'failed' AND p.auto_continue_on_context_exhaustion = 1
                THEN 'awaiting' ELSE 'none' END
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at IS NULL
-        WHERE c.id = ?7 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
+        WHERE c.id = ?8 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
           AND p.ordinary_lifecycle = 'open'
-          AND (?4 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
+          AND (?5 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
           AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')
-          AND NOT EXISTS (SELECT 1 FROM close_obligations o
-                          WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
-        ON CONFLICT(source_turn_id, source_generation, watch_id) DO NOTHING")
+        ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id)
+        DO NOTHING")
         .bind(uuid::Uuid::new_v4().to_string())
-        .bind(i64::try_from(turn_id).map_err(|_| DbError::Serialization("turn id overflow".into()))?)
+        .bind(occurrence_kind)
+        .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
         .bind(category).bind(reason.or((category == "failed").then_some("turn failed")))
         .bind(Utc::now().to_rfc3339())
@@ -417,7 +465,8 @@ mod tests {
         let delivered = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].event_id, id);
-        assert_eq!(delivered[0].source_turn_id, i64::try_from(turn).unwrap());
+        assert_eq!(delivered[0].source_occurrence_kind, "direct_turn");
+        assert_eq!(delivered[0].source_occurrence_id, turn.to_string());
         assert_eq!(delivered[0].source_generation, 0);
         assert_eq!(delivered[0].terminal_kind, "failed");
         assert_eq!(
@@ -624,7 +673,8 @@ mod tests {
         let exposed = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(exposed.len(), 1);
         assert_eq!(exposed[0].event_id, prior_id);
-        assert_eq!(exposed[0].source_turn_id, i64::try_from(turn).unwrap());
+        assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
+        assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
         let later = source_turn(&db, &source.id, "after-cancel").await;
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
@@ -644,7 +694,10 @@ mod tests {
         assert_eq!(events[0].event_id, prior_id);
         let later_event = events
             .iter()
-            .find(|event| event.source_turn_id == i64::try_from(later).unwrap())
+            .find(|event| {
+                event.source_occurrence_kind == "direct_turn"
+                    && event.source_occurrence_id == later.to_string()
+            })
             .unwrap();
         sqlx::query(steering)
             .bind("after-cancel")
@@ -657,6 +710,53 @@ mod tests {
         let remaining = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_id, prior_id);
+    }
+
+    #[tokio::test]
+    async fn event_terminalized_while_close_is_pending_is_exposed_after_cancellation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-during-close", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        let turn = source_turn(&db, &source.id, "during-close").await;
+        db.begin_close_foundation(
+            &source.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse(source.id.clone())
+                .unwrap(),
+            "watch-close-attempt",
+        )
+        .await
+        .unwrap();
+
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(&mut tx, turn, 0, &source.id, "Cancelled", None, false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_occurrence_id = ?1",
+        )
+        .bind(turn.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(persisted, 1);
+
+        cancel_close_attempt(&db).await;
+        let exposed = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0].source_occurrence_kind, "direct_turn");
+        assert_eq!(exposed[0].source_occurrence_id, turn.to_string());
+        assert_eq!(exposed[0].terminal_kind, "cancelled");
     }
 
     #[tokio::test]

@@ -6382,6 +6382,8 @@ impl Database {
             &now_text,
         )
         .await?;
+        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
+            .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         let message = Message {
@@ -6448,6 +6450,8 @@ impl Database {
             &now,
         )
         .await?;
+        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
+            .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         Ok(CreationCasOutcome::Applied)
@@ -14577,6 +14581,32 @@ fn cleared_creation_intent_json() -> String {
     .to_string()
 }
 
+async fn classify_creation_watch_outcome(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    conversation_id: &str,
+    generation: u64,
+    state: &ConvState,
+) -> DbResult<()> {
+    let (terminal_kind, reason) = match state {
+        ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => ("Completed", None),
+        ConvState::CreationCancelled { .. } => ("Cancelled", None),
+        ConvState::CreationFailed { error, .. } | ConvState::Error { message: error, .. } => {
+            ("Failed", Some(error.as_str()))
+        }
+        _ => return Ok(()),
+    };
+    crate::coordinator_watches::record_creation_event_tx(
+        tx,
+        job_id,
+        generation,
+        conversation_id,
+        terminal_kind,
+        reason,
+    )
+    .await
+}
+
 async fn update_claimed_creation_job_ready(
     tx: &mut Transaction<'_, Sqlite>,
     job_id: &str,
@@ -15438,6 +15468,55 @@ mod tests {
                 .unwrap()
                 .state,
             requesting
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_creation_runtime_terminal_outcome_is_recorded_once() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let conversation = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.settle_conversation_creation_runtime(
+                "job-runtime-settle",
+                &claim,
+                "conv-runtime-settle",
+                &ConvState::Idle,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "creation");
+        assert_eq!(events[0].source_occurrence_id, "job-runtime-settle");
+        assert_eq!(
+            events[0].source_generation,
+            i64::try_from(claim.generation).unwrap()
+        );
+        assert_eq!(events[0].terminal_kind, "completed");
+
+        assert_eq!(
+            db.settle_conversation_creation_runtime(
+                "job-runtime-settle",
+                &claim,
+                "conv-runtime-settle",
+                &ConvState::Idle,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
         );
     }
 

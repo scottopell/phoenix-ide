@@ -589,7 +589,8 @@ BEGIN SELECT RAISE(ABORT, 'watch requires open ordinary ProductConversation'); E
 CREATE TABLE coordinator_watch_events (
     event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
     watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
-    source_turn_id INTEGER NOT NULL,
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation')),
+    source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
     source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
     source_transcript_id TEXT NOT NULL,
     terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('completed', 'failed', 'cancelled')),
@@ -601,7 +602,7 @@ CREATE TABLE coordinator_watch_events (
         CHECK(delivery_state IN ('pending', 'accepted', 'suppressed')),
     accepted_transcript_id TEXT,
     CHECK ((delivery_state = 'accepted') = (accepted_transcript_id IS NOT NULL)),
-    UNIQUE(source_turn_id, source_generation, watch_id),
+    UNIQUE(source_occurrence_kind, source_occurrence_id, source_generation, watch_id),
     CHECK ((terminal_kind = 'failed') = (terminal_reason IS NOT NULL))
 );
 CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at);
@@ -11359,9 +11360,9 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(3).copied().collect::<Vec<_>>(),
             vec![
+                (111, "coordinator_conversation_watches"),
+                (110, "trusted_input_origin"),
                 (109, "persist_approval_request_obligation"),
-                (108, "enforce_authority_timestamp_storage_class"),
-                (107, "repair_direct_execution_authority"),
             ]
         );
     }

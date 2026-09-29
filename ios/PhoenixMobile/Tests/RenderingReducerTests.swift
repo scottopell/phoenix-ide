@@ -24,6 +24,31 @@ final class RenderingReducerTests: XCTestCase {
             "Something failed")
     }
 
+    func testMessageOriginDecodingAndCachedHistoricalFallback() throws {
+        let cases: [(String, InputOrigin, String)] = [
+            (#"{"kind":"user_api"}"#, .userApi, "User API"),
+            (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1"}"#,
+             .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1"),
+             "Conversation from @conv:product-1 transcript:transcript-1"),
+            (#"{"kind":"system_generated"}"#, .systemGenerated, "System input"),
+            (#"{"kind":"subscription_event","event_id":"event-1"}"#,
+             .subscriptionEvent(eventId: "event-1"), "Conversation event"),
+            (#"{"kind":"unknown_historical"}"#, .unknownHistorical, "Unknown input"),
+        ]
+        let base = #"{"message_id":"m1","sequence_id":1,"message_type":"user","content":{"text":"hello"}"#
+        let historical = try JSONDecoder().decode(Message.self, from: Data((base + "}").utf8))
+        XCTAssertEqual(historical.inputOrigin, .unknownHistorical)
+        XCTAssertEqual(historical.inputOrigin.label, "Unknown input")
+        for (json, expected, label) in cases {
+            let raw = base + ",\"origin\":" + json + "}"
+            let decoded = try JSONDecoder().decode(Message.self, from: Data(raw.utf8))
+            XCTAssertEqual(decoded.inputOrigin, expected)
+            XCTAssertEqual(decoded.inputOrigin.label, label)
+            let roundTrip = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(decoded))
+            XCTAssertEqual(roundTrip.inputOrigin, expected)
+        }
+    }
+
     func testDisplayDataPatchPreservesExistingMetadataAndToolStarts() {
         let existing: JSONValue = .object([
             "command": .string("cargo test"),
