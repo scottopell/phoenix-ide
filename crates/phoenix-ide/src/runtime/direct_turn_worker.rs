@@ -63,11 +63,12 @@ pub(crate) async fn run(
     let worker = DirectTurnWorker::new(
         manager.db().workflow_repository(),
         Arc::new(ProductionDirectTurnDispatcher {
-            addressed: AddressedConversationEventDispatcher::new(manager),
+            addressed: AddressedConversationEventDispatcher::new(manager.clone()),
         }),
         Arc::new(SystemClock),
         fresh_process_incarnation(),
-    );
+    )
+    .with_watch_delivery(manager);
     if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
         match error {
             StartupReconciliationError::Retryable(error) => {
@@ -124,6 +125,7 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
+    watch_delivery: Option<Arc<RuntimeManager>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -147,8 +149,20 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
+            watch_delivery: None,
             #[cfg(test)]
             pre_dispatch_hook: None,
+        }
+    }
+
+    fn with_watch_delivery(mut self, manager: Arc<RuntimeManager>) -> Self {
+        self.watch_delivery = Some(manager);
+        self
+    }
+
+    async fn deliver_watch_events(&self) {
+        if let Some(manager) = &self.watch_delivery {
+            crate::coordinator_watch_delivery::deliver_pass(manager).await;
         }
     }
 
@@ -189,7 +203,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         }
         let _ = ready_tx.send(());
 
-        let mut wait = match self.dispatch_accepted_turns().await {
+        let initial_discovery = self.dispatch_accepted_turns().await;
+        self.deliver_watch_events().await;
+        let mut wait = match initial_discovery {
             Ok(wait) => wait,
             Err(error) => match StartupReconciliationError::from(error) {
                 StartupReconciliationError::Retryable(error) => {
@@ -210,7 +226,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     }
                 }
             }
-            wait = match self.run_once().await {
+            let discovery = self.run_once().await;
+            self.deliver_watch_events().await;
+            wait = match discovery {
                 Ok(wait) => wait,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::Retryable(error) => {

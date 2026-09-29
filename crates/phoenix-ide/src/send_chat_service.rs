@@ -91,6 +91,9 @@ impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
     }
+    pub(crate) fn db(&self) -> &crate::db::Database {
+        &self.db
+    }
 
     pub(crate) async fn source_conversation(
         &self,

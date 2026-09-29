@@ -398,6 +398,8 @@ function InputSender({ origin }: { origin: InputOrigin | undefined }) {
           From conversation ID {origin.product_conversation_id} · transcript ID {origin.transcript_id}
         </span>
       );
+    case 'subscription_event':
+      return <span className="message-sender">Conversation event</span>;
     case 'system_generated':
       return <span className="message-sender">System input</span>;
     case 'unknown_historical':

@@ -505,6 +505,9 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
                 "Conversation"
             }
             phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "System input",
+            phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => {
+                "Conversation event"
+            }
             phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "Unknown input",
         },
         MessageType::Agent => "Agent",

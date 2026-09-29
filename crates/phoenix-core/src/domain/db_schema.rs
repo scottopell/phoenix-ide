@@ -1550,14 +1550,17 @@ pub enum InputOrigin {
         transcript_id: String,
     },
     SystemGenerated,
+    SubscriptionEvent {
+        event_id: String,
+    },
 }
 
 impl InputOrigin {
     #[must_use]
-    pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>) {
+    pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
         match self {
-            Self::UnknownHistorical => ("unknown_historical", None, None),
-            Self::UserApi => ("user_api", None, None),
+            Self::UnknownHistorical => ("unknown_historical", None, None, None),
+            Self::UserApi => ("user_api", None, None, None),
             Self::InternalConversation {
                 product_conversation_id,
                 transcript_id,
@@ -1565,8 +1568,12 @@ impl InputOrigin {
                 "internal_conversation",
                 Some(product_conversation_id.as_str()),
                 Some(transcript_id),
+                None,
             ),
-            Self::SystemGenerated => ("system_generated", None, None),
+            Self::SystemGenerated => ("system_generated", None, None, None),
+            Self::SubscriptionEvent { event_id } => {
+                ("subscription_event", None, None, Some(event_id))
+            }
         }
     }
 
@@ -1574,12 +1581,16 @@ impl InputOrigin {
         kind: &str,
         product_id: Option<String>,
         transcript_id: Option<String>,
+        event_id: Option<String>,
     ) -> Result<Self, String> {
-        match (kind, product_id, transcript_id) {
-            ("unknown_historical", None, None) => Ok(Self::UnknownHistorical),
-            ("user_api", None, None) => Ok(Self::UserApi),
-            ("system_generated", None, None) => Ok(Self::SystemGenerated),
-            ("internal_conversation", Some(product_id), Some(transcript_id))
+        match (kind, product_id, transcript_id, event_id) {
+            ("unknown_historical", None, None, None) => Ok(Self::UnknownHistorical),
+            ("user_api", None, None, None) => Ok(Self::UserApi),
+            ("system_generated", None, None, None) => Ok(Self::SystemGenerated),
+            ("subscription_event", None, None, Some(event_id)) if !event_id.trim().is_empty() => {
+                Ok(Self::SubscriptionEvent { event_id })
+            }
+            ("internal_conversation", Some(product_id), Some(transcript_id), None)
                 if !transcript_id.trim().is_empty() =>
             {
                 Ok(Self::InternalConversation {

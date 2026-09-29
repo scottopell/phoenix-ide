@@ -10,6 +10,7 @@ mod chain_runtime;
 mod continuation_service;
 mod conversation_cwd;
 mod coordinator_tools;
+mod coordinator_watch_delivery;
 mod discovery;
 pub mod drive_turn;
 pub(crate) mod git_ops;

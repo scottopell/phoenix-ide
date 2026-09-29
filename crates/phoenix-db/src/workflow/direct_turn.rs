@@ -421,8 +421,8 @@ impl WorkflowRepository {
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
                 prepared_payload, disposition, generation, terminal_kind,
                 terminal_reason, owns_conversation, canonical_message_id, workflow_id,
-                origin_kind, origin_product_conversation_id, origin_transcript_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11)",
+                origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&input.conversation().0)
@@ -439,6 +439,7 @@ impl WorkflowRepository {
         .bind(prepared_payload.submitted.origin.db_parts().0)
         .bind(prepared_payload.submitted.origin.db_parts().1)
         .bind(prepared_payload.submitted.origin.db_parts().2)
+        .bind(prepared_payload.submitted.origin.db_parts().3)
         .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
@@ -1515,7 +1516,7 @@ impl WorkflowRepository {
                     ) AS materialization_committed,
                     m.message_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at,
-                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id
+                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id
              FROM durable_turns dt
              JOIN conversations c ON c.id = dt.conversation_id
              LEFT JOIN messages m ON m.message_id = dt.canonical_message_id
@@ -2504,6 +2505,22 @@ impl WorkflowRepository {
         if let Some(projection) = &input.projection {
             update_conversation_projection_tx(tx, &turn.conversation, projection).await?;
         }
+        crate::coordinator_watches::record_terminal_event_tx(
+            &mut tx.tx,
+            turn_id.0,
+            expected_generation,
+            &turn.conversation.0,
+            terminal_kind,
+            reason,
+            matches!(
+                input
+                    .projection
+                    .as_ref()
+                    .map(|projection| &projection.state),
+                Some(ConvState::ContextExhausted { .. })
+            ),
+        )
+        .await?;
         sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id")?)
             .execute(&mut *tx.tx)
@@ -3091,7 +3108,7 @@ async fn load_prepared_payload_pool(
     pool: &sqlx::SqlitePool,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(pool)
         .await?;
@@ -3115,7 +3132,7 @@ async fn load_prepared_payload_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(&mut **tx)
         .await?;
@@ -3351,8 +3368,8 @@ async fn insert_canonical_message_tx(
     sqlx::query(
         "INSERT INTO messages (
             message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at,
-            origin_kind, origin_product_conversation_id, origin_transcript_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)",
+            origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11)",
     )
     .bind(&canonical_message_id.0)
     .bind(&turn.conversation.0)
@@ -3364,6 +3381,7 @@ async fn insert_canonical_message_tx(
     .bind(prepared.submitted.origin.db_parts().0)
     .bind(prepared.submitted.origin.db_parts().1)
     .bind(prepared.submitted.origin.db_parts().2)
+    .bind(prepared.submitted.origin.db_parts().3)
     .execute(&mut *tx.tx)
     .await
     .map_err(map_constraint)?;
@@ -3429,7 +3447,7 @@ async fn load_message_by_id_tx(
     message_id: &str,
 ) -> DbResult<Message> {
     let row = sqlx::query(
-        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id
+        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(message_id)
