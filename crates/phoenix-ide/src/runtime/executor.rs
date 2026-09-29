@@ -23354,8 +23354,14 @@ mod stale_tool_result_clearing_tests {
             )
             .await;
             assert_eq!(messages.len(), 2);
-            assert_eq!(messages[0].content[0].render_text(), "same handoff text");
-            assert_eq!(messages[1].content[0].render_text(), "cancel Crick");
+            assert_eq!(
+                messages[0].content[0].render_text(),
+                "[Input of unknown historical origin]\nsame handoff text"
+            );
+            assert_eq!(
+                messages[1].content[0].render_text(),
+                "[Input of unknown historical origin]\ncancel Crick"
+            );
         }
         assert_eq!(projection.len(), 3);
         assert_eq!(projection[1].message_id, "accepted");
