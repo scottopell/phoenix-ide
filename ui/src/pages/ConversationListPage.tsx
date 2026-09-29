@@ -40,6 +40,15 @@ import {
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
 const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
 
+function projectProductConversationHistory(
+  rows: ProductConversationListRow[],
+  productConversationId: string,
+): ProductConversationListRow[] {
+  return rows.map((row) => row.product_conversation_id === productConversationId
+    ? { ...row, lifecycle: { state: 'history' }, close_action: null }
+    : row);
+}
+
 export function ConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
@@ -369,11 +378,10 @@ export function ConversationListPage() {
     setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      setProductConversations((rows) => rows.map((row) => (
-        row.product_conversation_id === productCloseTarget.product_conversation_id
-          ? { ...row, lifecycle: { state: 'history' }, close_action: null }
-          : row
-      )));
+      setProductConversations((rows) => projectProductConversationHistory(
+        rows,
+        productCloseTarget.product_conversation_id,
+      ));
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       setProductListRevision((revision) => revision + 1);
@@ -384,6 +392,12 @@ export function ConversationListPage() {
         current === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        if (err instanceof ApiResponseError && err.code === 'close_already_history') {
+          setProductConversations((rows) => projectProductConversationHistory(
+            rows,
+            productCloseTarget.product_conversation_id,
+          ));
+        }
         const confirmationRoute = productCloseTarget.canonical_route;
         if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
           setProductCloseTarget(null);

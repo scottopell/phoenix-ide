@@ -6653,6 +6653,10 @@ pub(super) async fn finish_hard_deleted_conversation(
     let id = conversation.id.clone();
     finalize_hard_deleted_conversation_resources(state, &conversation).await;
     broadcast_conversation_hard_deleted(state, &id).await;
+    state.runtime.publish_aggregate_hard_deleted(
+        conversation.product_conversation_id.to_string(),
+        vec![id.clone()],
+    );
 }
 
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {

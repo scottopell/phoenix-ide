@@ -23,6 +23,15 @@ import {
 } from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 
+function projectProductConversationHistory(
+  rows: ProductConversationListRow[],
+  productConversationId: string,
+): ProductConversationListRow[] {
+  return rows.map((row) => row.product_conversation_id === productConversationId
+    ? { ...row, lifecycle: { state: 'history' }, close_action: null }
+    : row);
+}
+
 const COLLAPSED_DOT_LIMIT = 9;
 const PRODUCT_REFRESH_COALESCE_MS = 50;
 
@@ -374,11 +383,10 @@ export function Sidebar({
     setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
-      setProductConversations((rows) => rows.map((row) => (
-        row.product_conversation_id === productCloseTarget.product_conversation_id
-          ? { ...row, lifecycle: { state: 'history' }, close_action: null }
-          : row
-      )));
+      setProductConversations((rows) => projectProductConversationHistory(
+        rows,
+        productCloseTarget.product_conversation_id,
+      ));
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       onConversationCreated();
@@ -391,6 +399,12 @@ export function Sidebar({
         current === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        if (err instanceof ApiResponseError && err.code === 'close_already_history') {
+          setProductConversations((rows) => projectProductConversationHistory(
+            rows,
+            productCloseTarget.product_conversation_id,
+          ));
+        }
         const confirmationRoute = productCloseTarget.canonical_route;
         if (productCloseTargetRef.current?.product_conversation_id === productCloseTarget.product_conversation_id) {
           setProductCloseTarget(null);

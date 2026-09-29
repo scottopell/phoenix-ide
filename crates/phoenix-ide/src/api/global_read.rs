@@ -299,7 +299,13 @@ async fn resolve_conversation_read_target(
             .db
             .read_ordinary_product_conversation_snapshot(id, None, None, 1)
             .await
-            .map_err(|_| "ProductConversation reference not found".to_string())?;
+            .map_err(|error| {
+                if matches!(error, crate::db::DbError::ConversationNotFound(_)) {
+                    "ProductConversation reference not found".to_string()
+                } else {
+                    format!("ProductConversation read failed: {error}")
+                }
+            })?;
         if snapshot.aggregate.product_conversation.id().as_str() != id {
             return Err("ProductConversation reference not found".to_string());
         }
@@ -309,7 +315,14 @@ async fn resolve_conversation_read_target(
         });
     }
     if let Some(rest) = reference.strip_prefix("@transcript:") {
-        let (id, message_id) = parse_conv_handle(rest);
+        let (id, fragment) = split_fragment(rest);
+        let message_id =
+            match fragment {
+                Some(fragment) => Some(message_id_fragment(fragment).ok_or_else(|| {
+                    "transcript fragment must be #message-<message_id>".to_string()
+                })?),
+                None => None,
+            };
         if id.is_empty() {
             return Err("transcript reference is missing an id".to_string());
         }
@@ -664,7 +677,15 @@ async fn resolve_reference_impl(
         });
     }
     if let Some(rest) = reference.strip_prefix("@transcript:") {
-        let (id, message_id) = parse_conv_handle(rest);
+        let (id, fragment) = split_fragment(rest);
+        let message_id = match fragment {
+            Some(fragment) => Some(message_id_fragment(fragment).ok_or_else(|| {
+                AppError::BadRequest(
+                    "transcript fragment must be #message-<message_id>".to_string(),
+                )
+            })?),
+            None => None,
+        };
         let conv = service
             .db
             .get_conversation(id)
@@ -774,33 +795,6 @@ fn message_id_fragment(fragment: &str) -> Option<&str> {
     fragment
         .strip_prefix("message-")
         .filter(|id| !id.is_empty())
-}
-
-fn handle_token(s: &str) -> &str {
-    s.trim_end_matches([':', ',', ';', '.', ')', ']', '}'])
-}
-
-fn parse_conv_handle(rest: &str) -> (&str, Option<&str>) {
-    let (id_part, fragment) = split_fragment(rest);
-    let mut parts = id_part.split_whitespace();
-    let id = parts.next().unwrap_or(id_part);
-    if id.is_empty() {
-        return (id, None);
-    }
-    let message_id = parts
-        .next()
-        .and_then(|part| {
-            part.strip_prefix("msg:")
-                .map(handle_token)
-                .filter(|id| !id.is_empty())
-                .or_else(|| {
-                    (part == "msg:")
-                        .then(|| parts.next().map(handle_token))
-                        .flatten()
-                })
-        })
-        .or_else(|| fragment.and_then(message_id_fragment));
-    (id, message_id)
 }
 
 async fn load_conversation_by_slug_or_id(
@@ -1060,9 +1054,8 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        message_id_fragment, parse_conv_handle, render_full_message_text,
-        resolve_conversation_read_target, split_fragment, GlobalMessageTarget,
-        GlobalMessageTargetError, GlobalReadService,
+        message_id_fragment, render_full_message_text, resolve_conversation_read_target,
+        split_fragment, GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService,
     };
     use std::sync::Arc;
 
@@ -1111,7 +1104,6 @@ mod tests {
             ("/c/slug", Some("message-id"))
         );
         assert_eq!(message_id_fragment("message-id"), Some("id"));
-        assert_eq!(parse_conv_handle("abc#message-def"), ("abc", Some("def")));
     }
 
     #[tokio::test]

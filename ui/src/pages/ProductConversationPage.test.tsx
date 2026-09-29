@@ -502,7 +502,11 @@ describe('ProductConversationPage', () => {
     expect(screen.queryByText('This product conversation was deleted.')).not.toBeInTheDocument();
   });
 
-  it('clears a writable snapshot when stream reconciliation proves the aggregate absent', async () => {
+  it('clears a writable snapshot when stream reconciliation is confirmed by authoritative absence', async () => {
+    const { api, ApiResponseError } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockRejectedValueOnce(new ApiResponseError('not found', 404));
     renderPage();
     expect(await screen.findByTestId('product-conversation-composer')).toBeInTheDocument();
 

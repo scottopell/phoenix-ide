@@ -869,7 +869,16 @@ function ProductConversationPageInner() {
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
-        setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
+        if (err instanceof ApiResponseError && err.status === 404 && isBackgroundRefresh) {
+          aggregateDeletedRef.current = true;
+          routeGenerationRef.current += 1;
+          paginationRequestRef.current += 1;
+          setOwnedSnapshot(null);
+          setLatestProjection(null);
+          setError('This product conversation was deleted.');
+        } else {
+          setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -931,13 +940,7 @@ function ProductConversationPageInner() {
     }
     pendingAuthoritativeIdentitiesRef.current = null;
     if (authoritativeIdentities.has(canonicalId)) return;
-    aggregateDeletedRef.current = true;
-    routeGenerationRef.current += 1;
-    paginationRequestRef.current += 1;
-    setOwnedSnapshot(null);
-    setLatestProjection(null);
-    setLoading(false);
-    setError('This product conversation was deleted.');
+    setSnapshotRetry((retry) => retry + 1);
   }), [snapshot?.product_conversation_id]);
 
   useEffect(() => {
@@ -946,13 +949,7 @@ function ProductConversationPageInner() {
     if (!canonicalId || !authoritativeIdentities) return;
     pendingAuthoritativeIdentitiesRef.current = null;
     if (authoritativeIdentities.has(canonicalId)) return;
-    aggregateDeletedRef.current = true;
-    routeGenerationRef.current += 1;
-    paginationRequestRef.current += 1;
-    setOwnedSnapshot(null);
-    setLatestProjection(null);
-    setLoading(false);
-    setError('This product conversation was deleted.');
+    setSnapshotRetry((retry) => retry + 1);
   }, [snapshot?.product_conversation_id]);
 
   useEffect(() => {
