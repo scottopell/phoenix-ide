@@ -3,18 +3,31 @@ name: Reduce roadmap Issue
 on:
   issue_comment:
     types: [created, edited, deleted]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
   issues: write
+  pull-requests: read
+
+concurrency:
+  group: roadmap-issue-reducer
+  cancel-in-progress: false
 
 jobs:
   reduce:
     if: >-
-      github.event.issue.pull_request == null &&
       vars.PHOENIX_ROADMAP_ISSUE_NUMBER != '' &&
-      github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      (
+        github.event_name != 'issue_comment' ||
+        (
+          github.event.issue.pull_request == null &&
+          github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -24,8 +37,9 @@ jobs:
           node-version: 26
       - name: Validate reducer
         run: node --test scripts/roadmap-issue-reducer.test.mjs
-      - name: Reduce agent updates
+      - name: Reduce roadmap records
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PHOENIX_ROADMAP_ISSUE_NUMBER: ${{ vars.PHOENIX_ROADMAP_ISSUE_NUMBER }}
+          PHOENIX_ROADMAP_COORDINATOR_HARNESS: ${{ vars.PHOENIX_ROADMAP_COORDINATOR_HARNESS }}
         run: node scripts/roadmap-issue-reducer.mjs

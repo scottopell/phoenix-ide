@@ -80,6 +80,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
 | [067](067_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
 | [068](068_work-children-share-parent-development-trust.md) | Work children share parent development trust | Accepted | REQ-PROJ-008, REQ-BED-018; unsandboxed Work children and parent lifecycle ownership |
+| [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 
 ## For agents: which decisions bind your task
 
