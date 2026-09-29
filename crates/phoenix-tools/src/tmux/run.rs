@@ -830,6 +830,10 @@ mod tests {
         let direct = direct_tmp.path().canonicalize().unwrap();
         let worktree = worktree_tmp.path().canonicalize().unwrap();
         let unrelated = TempDir::new().unwrap();
+        let pane_secret_name = "PHOENIX_TMUX_SMOKE_SENTINEL";
+        unsafe {
+            std::env::set_var(pane_secret_name, "must-not-reach-pane");
+        }
         let registry = Arc::new(owner.registry());
         let config_path = registry.config_path();
         let registrar = MockWakeRegistrar::new();
@@ -949,10 +953,33 @@ mod tests {
             .socket_path
             .clone();
         owned_windows.push((
-            socket_path,
+            socket_path.clone(),
             immediate_value["window_id"].as_str().unwrap().to_string(),
         ));
         assert_eq!(registrar.register_calls(), 0);
+
+        let environment = tokio::process::Command::new("tmux")
+            .args([
+                "-f",
+                &config_path.to_string_lossy(),
+                "-S",
+                &socket_path.to_string_lossy(),
+                "show-environment",
+                "-g",
+            ])
+            .env_remove("TMUX")
+            .output()
+            .await
+            .unwrap();
+        assert!(environment.status.success());
+        let environment = String::from_utf8_lossy(&environment.stdout);
+        assert!(environment.contains("PHOENIX_TMUX_SERVER_TOKEN="));
+        assert!(environment.contains("TERM="));
+        assert!(environment.contains("PATH="));
+        assert!(!environment.contains(pane_secret_name));
+        unsafe {
+            std::env::remove_var(pane_secret_name);
+        }
 
         // Invoke production cleanup explicitly; owner shutdown is only the backstop.
         for (socket_path, window_id) in owned_windows {

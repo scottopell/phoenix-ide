@@ -772,6 +772,8 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_spawn_handoff: bool,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
     #[cfg(test)]
@@ -813,6 +815,8 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_spawn_handoff: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -870,6 +874,8 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_spawn_handoff: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -898,6 +904,8 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
+            #[cfg(any(test, feature = "test-support"))]
+            test_spawn_handoff: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -907,6 +915,12 @@ impl TmuxRegistry {
             #[cfg(test)]
             cancel_retirement_test_hook: None,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_test_spawn_handoff(mut self) -> Self {
+        self.test_spawn_handoff = true;
+        self
     }
 
     #[cfg(test)]
@@ -970,7 +984,16 @@ impl TmuxRegistry {
     }
 
     async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
-        spawn_session_owned(socket_path, &self.config_path(), cwd).await
+        spawn_session_owned(
+            socket_path,
+            &self.config_path(),
+            cwd,
+            #[cfg(any(test, feature = "test-support"))]
+            self.test_spawn_handoff,
+            #[cfg(not(any(test, feature = "test-support")))]
+            false,
+        )
+        .await
     }
 
     /// Cached `which("tmux")` result (REQ-TMUX-003). Discovered once at
@@ -3396,7 +3419,16 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    spawn_session_owned(socket_path, config_path, cwd).await
+    spawn_session_owned(socket_path, config_path, cwd, false).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn spawn_test_session_with_handoff(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+) -> Result<(), TmuxError> {
+    spawn_session_owned(socket_path, config_path, cwd, true).await
 }
 
 fn tmux_new_session_args(
@@ -3463,16 +3495,69 @@ async fn wait_for_spawned_pane(socket_path: &Path, config_path: &Path) -> Result
     })
 }
 
+fn test_spawn_command(
+    socket_path: &Path,
+    tmux_args: &[String],
+    server_token: &str,
+    enabled: bool,
+) -> Result<(tokio::process::Command, Option<PathBuf>), TmuxError> {
+    if !enabled {
+        let mut command = tokio::process::Command::new("tmux");
+        command.args(tmux_args);
+        return Ok((command, None));
+    }
+    let root = socket_path.parent().ok_or_else(|| TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: "test socket has no parent root".to_string(),
+    })?;
+    let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
+    let marker_payload = serde_json::json!({
+        "socket": socket_path.file_name().and_then(|name| name.to_str()),
+        "token": server_token,
+    });
+    std::fs::write(&marker, marker_payload.to_string()).map_err(|error| {
+        TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to publish test spawn obligation: {error}"),
+        }
+    })?;
+    let wrapper = r#"
+import fcntl
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+with marker.open("r+") as marker_file:
+    fcntl.flock(marker_file, fcntl.LOCK_EX)
+    child = subprocess.Popen(sys.argv[2:], start_new_session=True)
+    active = marker.with_suffix(".active")
+    active.touch()
+    try:
+        while (marker.parent / ".pause-creators").exists():
+            time.sleep(0.01)
+        sys.exit(child.wait())
+    finally:
+        active.unlink(missing_ok=True)
+"#;
+    let mut command = tokio::process::Command::new("python3");
+    command.arg("-c").arg(wrapper).arg(&marker).arg("tmux");
+    command.args(tmux_args);
+    Ok((command, Some(marker)))
+}
+
 async fn spawn_session_owned(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
+    test_spawn_handoff: bool,
 ) -> Result<(), TmuxError> {
     let server_token = uuid::Uuid::new_v4().to_string();
     let server_env = tmux_server_env(&server_token);
     let tmux_args = tmux_new_session_args(socket_path, config_path, cwd, &server_token);
-    let mut command = tokio::process::Command::new("tmux");
-    command.args(&tmux_args);
+    let (mut command, spawn_marker) =
+        test_spawn_command(socket_path, &tmux_args, &server_token, test_spawn_handoff)?;
     set_tmux_server_env(&mut command, &server_env);
     let output = command
         .stdin(Stdio::null())
@@ -3485,6 +3570,9 @@ async fn spawn_session_owned(
             reason: format!("failed to invoke tmux: {error}"),
         })?;
     if !output.status.success() {
+        if let Some(marker) = &spawn_marker {
+            let _ = std::fs::remove_file(marker);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(TmuxError::SpawnFailed {
             socket_path: socket_path.to_path_buf(),
@@ -3496,6 +3584,12 @@ async fn spawn_session_owned(
         });
     }
     wait_for_spawned_pane(socket_path, config_path).await?;
+    if let Some(marker) = spawn_marker {
+        std::fs::remove_file(marker).map_err(|error| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to complete test spawn handoff: {error}"),
+        })?;
+    }
     Ok(())
 }
 

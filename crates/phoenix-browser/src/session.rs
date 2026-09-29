@@ -809,6 +809,34 @@ impl BrowserSession {
             .map_err(|e| BrowserError::LaunchFailed(e.clone()))
     }
 
+    async fn first_page(
+        browser: &mut Browser,
+        handler_task: &JoinHandle<()>,
+        user_data_dir: &Path,
+    ) -> Result<Page, BrowserError> {
+        match init_phase(
+            SessionInitPhase::FirstPage,
+            SESSION_INIT_TIMEOUT,
+            browser.new_page("about:blank"),
+        )
+        .await
+        {
+            Ok(Ok(page)) => Ok(page),
+            Ok(Err(error)) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(user_data_dir);
+                Err(BrowserError::LaunchFailed(error.to_string()))
+            }
+            Err(error) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(user_data_dir);
+                Err(error)
+            }
+        }
+    }
+
     /// Launch browser and create a session
     async fn launch_and_init(
         tmp_root: &Path,
@@ -879,30 +907,7 @@ impl BrowserSession {
             }
         });
 
-        // new_page can hang on a wedged CDP socket after launch. Bound it, and
-        // on timeout/error kill the chromium we already launched so the failure
-        // path doesn't orphan a process behind the returned error.
-        let page = match init_phase(
-            SessionInitPhase::FirstPage,
-            SESSION_INIT_TIMEOUT,
-            browser.new_page("about:blank"),
-        )
-        .await
-        {
-            Ok(Ok(page)) => page,
-            Ok(Err(e)) => {
-                handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-                return Err(BrowserError::LaunchFailed(e.to_string()));
-            }
-            Err(error) => {
-                handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-                return Err(error);
-            }
-        };
+        let page = Self::first_page(&mut browser, &handler_task, &user_data_dir).await?;
 
         // Auto-inject the __phoenix React helper into every future document.
         // Runs before page JS, so React registers its fiber roots into our hook

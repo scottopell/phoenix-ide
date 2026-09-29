@@ -392,6 +392,45 @@ def reserve_spawn(socket, control, token):
     unconfirmed_obligations.append(obligation)
     return obligation
 
+def admit_creator_obligations(deadline):
+    creators = False
+    creating_sockets = set()
+    for marker in root.glob(".creating-*"):
+        if marker.name.endswith(".active"):
+            continue
+        try:
+            with marker.open("r+") as marker_file:
+                payload = json.loads(marker_file.read())
+                socket_name = payload.get("socket")
+                token = payload.get("token")
+                if (not isinstance(socket_name, str) or Path(socket_name).name != socket_name
+                        or not isinstance(token, str) or not token):
+                    raise RuntimeError("invalid test spawn obligation")
+                socket = root / socket_name
+                creating_sockets.add(socket)
+                try:
+                    fcntl.flock(marker_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    creators = True
+                    continue
+                obligation = next((item for item in unconfirmed_obligations
+                                   if item[0] == socket), None)
+                if obligation is None:
+                    obligation = reserve_spawn(socket, socket, token)
+                try:
+                    identities = observe_control(socket, token, deadline)
+                    control_stat = socket.stat()
+                    record_owned(socket, control_stat.st_dev, control_stat.st_ino,
+                                 socket, identities)
+                    unconfirmed_obligations.remove(obligation)
+                except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
+                    pass
+                marker.with_suffix(".active").unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            creators = True
+    return creators, creating_sockets
+
 def record_owned(socket, device, inode, control, identities):
     tmux_format_literal(identities[0][2])
     conflicts = [
@@ -723,7 +762,7 @@ def retire_registered(socket, control, identities):
         visible_replacement = False
     if retired and visible_owned:
         retired = remove_exact_visible(record)
-    if retired:
+    if retired and record[3] != record[0]:
         retired = remove_retired_control(record)
     try:
         control_anchor.unlink()
@@ -1060,6 +1099,8 @@ if original_root_exists():
 
 if cleanup_deadline is None:
     cleanup_deadline = time.monotonic() + cleanup_timeout
+(root / ".pause-creators").unlink(missing_ok=True)
+creators, creating_sockets = admit_creator_obligations(cleanup_deadline)
 for socket, control, token in list(unconfirmed_obligations):
     if token is None or time.monotonic() >= cleanup_deadline:
         continue
@@ -1169,6 +1210,7 @@ terminal = terminal_state(0, True, True, True, True, {})
 quiet = 0
 while time.monotonic() < cleanup_deadline:
     root_replaced = not original_root_exists()
+    creators, creating_sockets = admit_creator_obligations(cleanup_deadline)
     unconfirmed = root_replaced or cleanup_failed
     process_states = {
         control.name: [identity_state(identity) for identity in processes]
@@ -1177,6 +1219,23 @@ while time.monotonic() < cleanup_deadline:
     unconfirmed_state = (any(
         state != "absent" for states in process_states.values() for state in states
     ) or bool(unconfirmed_obligations))
+    for retired_record in list(owned):
+        if (retired_record[3] == retired_record[0]
+                and not retired_record[0].exists()
+                and all(identity_state(identity) == "absent" for identity in retired_record[4])):
+            retained_controls.pop(retired_record[3].name, None)
+            for anchor in control_root.glob(".control-anchor-*"):
+                try:
+                    anchor_stat = anchor.stat()
+                    if (anchor_stat.st_dev, anchor_stat.st_ino) == (retired_record[1], retired_record[2]):
+                        anchor.unlink()
+                except FileNotFoundError:
+                    pass
+            if retired_record[3] == retired_record[0]:
+                for anchor in root.glob(".control-anchor-*"):
+                    anchor.unlink(missing_ok=True)
+            owned.remove(retired_record)
+            set_cleanup_record_status(retired_record[3], "final-absence", "verified")
     registered_sockets = {
         socket: (device, inode, control, processes)
         for socket, device, inode, control, processes in owned
@@ -1232,6 +1291,9 @@ while time.monotonic() < cleanup_deadline:
         if socket in preserved_visible_paths:
             unconfirmed = True
             continue
+        if socket in creating_sockets:
+            unconfirmed = True
+            continue
         quarantine = root / f".unregistered-{uuid.uuid4()}"
         try:
             socket_stat = socket.stat()
@@ -1264,18 +1326,6 @@ while time.monotonic() < cleanup_deadline:
                 pass
             unconfirmed = True
     sockets = any(path.is_socket() for path in root.glob("*.sock"))
-    creators = False
-    for marker in root.glob(".creating-*"):
-        try:
-            with marker.open("r+") as marker_file:
-                try:
-                    fcntl.flock(marker_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    marker.unlink(missing_ok=True)
-                    marker.with_suffix(".locked").unlink(missing_ok=True)
-                except BlockingIOError:
-                    creators = True
-        except OSError:
-            creators = True
     quiet = quiet + 1 if not unconfirmed_state and not unconfirmed and not sockets and not creators else 0
     terminal = terminal_state(
         quiet, unconfirmed, unconfirmed_state, sockets, creators, process_states
@@ -1563,7 +1613,7 @@ impl TestTmuxServerOwner {
     /// Creates a registry whose servers are confined to this owner's root.
     #[must_use]
     pub fn registry(&self) -> TmuxRegistry {
-        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf())
+        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf()).with_test_spawn_handoff()
     }
 
     pub(crate) fn control_root_path(&self) -> &Path {
@@ -1910,10 +1960,16 @@ mod tests {
     }
 
     #[test]
-    fn forced_parent_process_group_death_kills_exact_owned_processes() {
+    fn forced_parent_process_group_death_reclaims_registered_and_inflight_spawns() {
         if which::which("tmux").is_err() {
             return;
         }
+        for mode in ["registered", "inflight"] {
+            run_forced_parent_death_case(mode);
+        }
+    }
+
+    fn run_forced_parent_death_case(mode: &str) {
         let marker_dir = TempDir::new().unwrap();
         let marker = marker_dir.path().join("ready");
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -1925,6 +1981,7 @@ mod tests {
                 "--ignored",
             ])
             .env("PHOENIX_TMUX_TEST_DEATH_MARKER", &marker)
+            .env("PHOENIX_TMUX_TEST_DEATH_MODE", mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1942,16 +1999,20 @@ mod tests {
         let mut paths = paths.lines();
         let root = PathBuf::from(paths.next().unwrap());
         let socket = PathBuf::from(paths.next().unwrap());
-        let processes = TestServerProcesses {
-            server: ProcessIdentity {
-                pid: paths.next().unwrap().parse().unwrap(),
-                start_time: paths.next().unwrap().parse().unwrap(),
-            },
-            pane: ProcessIdentity {
-                pid: paths.next().unwrap().parse().unwrap(),
-                start_time: paths.next().unwrap().parse().unwrap(),
-            },
-            additional_panes: Vec::new(),
+        let processes = if mode == "registered" {
+            Some(TestServerProcesses {
+                server: ProcessIdentity {
+                    pid: paths.next().unwrap().parse().unwrap(),
+                    start_time: paths.next().unwrap().parse().unwrap(),
+                },
+                pane: ProcessIdentity {
+                    pid: paths.next().unwrap().parse().unwrap(),
+                    start_time: paths.next().unwrap().parse().unwrap(),
+                },
+                additional_panes: Vec::new(),
+            })
+        } else {
+            None
         };
         assert_eq!(probe_sync(&socket), ProbeResult::Live);
 
@@ -1960,7 +2021,9 @@ mod tests {
         assert_killed(child.wait().unwrap());
         wait_until(|| !root.exists(), "watchdog cleanup after forced death");
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
-        assert_exact_processes_gone(&processes);
+        if let Some(processes) = processes {
+            assert_exact_processes_gone(&processes);
+        }
     }
 
     #[test]
@@ -1971,16 +2034,57 @@ mod tests {
         };
         let owner = TestTmuxServerOwner::new();
         let root = owner.path().to_path_buf();
-        let (socket, processes) = spawn_server_with_processes(&owner, "forced-death");
+        let mode = std::env::var("PHOENIX_TMUX_TEST_DEATH_MODE").unwrap();
+        let (socket, processes) = if mode == "inflight" {
+            fs::write(root.join(".pause-creators"), []).unwrap();
+            let socket = root.join("inflight.sock");
+            let config = owner.registry().config_path();
+            let socket_for_spawn = socket.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        let _ = crate::tmux::registry::spawn_test_session_with_handoff(
+                            &socket_for_spawn,
+                            &config,
+                            Path::new("/tmp"),
+                        )
+                        .await;
+                    });
+            });
+            wait_until(
+                || {
+                    fs::read_dir(&root).unwrap().any(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().to_str().map(str::to_string))
+                            .is_some_and(|name| {
+                                name.starts_with(".creating-") && name.ends_with(".active")
+                            })
+                    })
+                },
+                "in-flight creator handoff",
+            );
+            wait_until(
+                || probe_sync(&socket) == ProbeResult::Live,
+                "in-flight server",
+            );
+            (socket, None)
+        } else {
+            let (socket, processes) = spawn_server_with_processes(&owner, "forced-death");
+            (socket, Some(processes))
+        };
         let marker = PathBuf::from(marker);
         let pending_marker = marker.with_extension("pending");
         let mut file = fs::File::create(&pending_marker).unwrap();
         writeln!(file, "{}", root.display()).unwrap();
         writeln!(file, "{}", socket.display()).unwrap();
-        writeln!(file, "{}", processes.server.pid).unwrap();
-        writeln!(file, "{}", processes.server.start_time).unwrap();
-        writeln!(file, "{}", processes.pane.pid).unwrap();
-        writeln!(file, "{}", processes.pane.start_time).unwrap();
+        if let Some(processes) = processes {
+            writeln!(file, "{}", processes.server.pid).unwrap();
+            writeln!(file, "{}", processes.server.start_time).unwrap();
+            writeln!(file, "{}", processes.pane.pid).unwrap();
+            writeln!(file, "{}", processes.pane.start_time).unwrap();
+        }
         file.sync_all().unwrap();
         fs::rename(pending_marker, marker).unwrap();
         let mut parent_pipe = String::new();
@@ -2029,6 +2133,7 @@ mod tests {
                 Instant::now() < deadline,
                 "timed out waiting for {description}"
             );
+            // test-timing-allow: polling drives an external-process protocol and the deadline is only a liveness ceiling.
             thread::sleep(Duration::from_millis(20));
         }
     }
