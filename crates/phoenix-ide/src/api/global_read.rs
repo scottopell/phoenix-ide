@@ -498,7 +498,7 @@ fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     )
 }
 
-fn attributed_role(
+pub(crate) fn attributed_role(
     message_type: MessageType,
     origin: &phoenix_core::domain::db_schema::InputOrigin,
 ) -> &'static str {
@@ -520,7 +520,7 @@ fn attributed_role(
     }
 }
 
-fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
+pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
     use phoenix_core::domain::db_schema::InputOrigin;
     match origin {
         InputOrigin::InternalConversation {

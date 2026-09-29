@@ -895,9 +895,10 @@ fn format_search_hits(hits: &[RetrievedChunk]) -> String {
     for hit in hits {
         let _ = writeln!(
             out,
-            "[#{} · {} · {}] {}",
+            "[#{} · {}{} · {}] {}",
             hit.conversation_id,
-            hit.message_type,
+            crate::api::global_read::attributed_role(hit.message_type, &hit.origin),
+            crate::api::global_read::attributed_sender(&hit.origin),
             hit.created_at.format("%Y-%m-%d"),
             hit.snippet.trim()
         );
@@ -966,15 +967,11 @@ fn render_full_transcript(messages: &[Message]) -> String {
 /// path. Factored out so [`read_page`] can stream the transcript a message at a
 /// time without materializing the whole thing.
 fn render_message_line(m: &Message) -> String {
-    let label = match m.message_type {
-        MessageType::User => "User",
-        MessageType::Agent => "Agent",
-        MessageType::Tool => "Tool",
-        MessageType::System => "System",
-        MessageType::Error => "Error",
-        MessageType::Continuation => "Continuation",
-        MessageType::Skill => "Skill",
-    };
+    let label = format!(
+        "{}{}",
+        crate::api::global_read::attributed_role(m.message_type, &m.origin),
+        crate::api::global_read::attributed_sender(&m.origin)
+    );
     let body = match &m.content {
         // `llm_text()` is the expanded form the model actually saw (e.g.
         // @file content), not the display shorthand. Attached images aren't
