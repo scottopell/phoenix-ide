@@ -12823,8 +12823,17 @@ mod dispatch_context_budget_tests {
         runtime.llm_task_handle.take().unwrap().await.unwrap();
         assert_eq!(storage.prompt_projection_load_counts(), (1, 2));
         let requests = llm.recorded_requests();
-        assert_eq!(user_texts(&requests[0]), vec!["initial"]);
-        assert_eq!(user_texts(&requests[1]), vec!["initial", "appended"]);
+        assert_eq!(
+            user_texts(&requests[0]),
+            vec!["[Input of unknown historical origin]\ninitial"]
+        );
+        assert_eq!(
+            user_texts(&requests[1]),
+            vec![
+                "[Input of unknown historical origin]\ninitial",
+                "[Input of unknown historical origin]\nappended"
+            ]
+        );
 
         storage.replace_message_content(
             conv_id,
@@ -12841,7 +12850,10 @@ mod dispatch_context_budget_tests {
         assert_eq!(llm.recorded_requests().len(), 3);
         assert_eq!(
             user_texts(&llm.recorded_requests()[2]),
-            vec!["initial edited provider-visible", "appended"]
+            vec![
+                "[Input of unknown historical origin]\ninitial edited provider-visible",
+                "[Input of unknown historical origin]\nappended"
+            ]
         );
     }
 
@@ -12947,10 +12959,16 @@ mod dispatch_context_budget_tests {
             assert_eq!(request.system[0].text, expected);
             assert_eq!(request.cache_key.as_str(), conv_id);
         }
-        assert_eq!(user_texts(&requests[0]), vec!["Check the release"]);
+        assert_eq!(
+            user_texts(&requests[0]),
+            vec!["[Input of unknown historical origin]\nCheck the release"]
+        );
         assert_eq!(
             user_texts(&requests[1]),
-            vec!["Check the release", "The release owner reports completion"]
+            vec![
+                "[Input of unknown historical origin]\nCheck the release",
+                "[Input of unknown historical origin]\nThe release owner reports completion"
+            ]
         );
     }
 
