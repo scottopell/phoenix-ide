@@ -3021,7 +3021,10 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
-            && !matches!(result.new_state, ConvState::AwaitingRecovery { .. })
+            && !matches!(
+                result.new_state,
+                ConvState::AwaitingRecovery { .. } | ConvState::ToolExecuting { .. }
+            )
         {
             self.pending_trusted_tool_results.clear();
         }
@@ -20329,6 +20332,42 @@ mod steer_drain_detector_tests {
             ContentBlock::ToolResult { content, .. }
                 if content.contains("authenticated current output")
         ));
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_staged_tool_round() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-tool-round",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![(
+            "phoenix-api-call".to_string(),
+            "authenticated payload".to_string(),
+        )];
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            content: vec![ContentBlock::ToolUse {
+                id: "bash-round".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }],
+            provider_replay: None,
+            tool_calls: vec![ToolCall::new(
+                "bash-round",
+                crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                    "echo staged",
+                )),
+            )],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "staged-request".into(),
+        }))
+        .await
+        .expect("enter staged tool round");
+
+        assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
     }
 
     #[tokio::test]
