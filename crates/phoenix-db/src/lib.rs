@@ -10415,7 +10415,7 @@ impl Database {
         .await?;
         sqlx::query(
             "DELETE FROM product_conversation_sources
-             WHERE (target_product_conversation_id = ?1 OR source_product_conversation_id = ?1)
+             WHERE target_product_conversation_id = ?1
                AND NOT EXISTS (
                    SELECT 1 FROM conversations
                    WHERE product_conversation_id = ?1
