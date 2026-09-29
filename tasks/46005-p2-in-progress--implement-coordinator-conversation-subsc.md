@@ -4,7 +4,7 @@
 
 Deliver trusted Global Coordinator subscriptions to selected ordinary ProductConversations. Deliver factual notifications when watched execution ends normally, fails, or is explicitly cancelled. Reuse existing durable input admission and steering rather than building another execution scheduler. First deliver shared input provenance so internal agent messages are distinguishable from user-facing API input.
 
-This is an implementation handoff to the Phoenix Coordinator. Coordinate ownership and dependencies, then execute the two bounded slices below. The approved product decisions are authoritative for this task; do not reopen them as generic discovery. See tasks/coordinator-conversation-subscriptions-design.md for investigation context.
+This is an implementation handoff to the Phoenix Coordinator. Coordinate ownership and dependencies, then execute the two bounded slices below. The approved product decisions are authoritative for this task; do not reopen them as generic discovery. See tasks/46004-p2-done--coordinator-conversation-subscriptions-d.md for investigation context.
 
 ## Settled product contract
 
