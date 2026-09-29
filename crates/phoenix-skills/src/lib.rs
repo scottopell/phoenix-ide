@@ -1378,28 +1378,30 @@ mod tests {
             "effort_capabilities",
             "work_scope_id",
             "UUID_HEX=$(od -An -N16 -tx1 /dev/urandom",
-            "INTENT=$(jq -cn",
             "creation_request_id=%s",
-            "retrying exact request_id",
+            "INTENT_B64",
+            "repeat the step-3 POST at most once",
             "GET /api/product-conversations/creation",
             "product_conversation_id",
-            "root_transcript_row_id",
-            "current_transcript_row_id",
+            "root `transcript_row_id`",
+            "current `latest_transcript_row_id`",
             "canonical_route",
             "agent_working",
             "ORIGIN_B64",
-            "MODEL_REQUESTED_B64",
-            "EFFORT_B64",
-            "missing required command",
             "same Phoenix server that owns that WorkScope",
             "llm_language",
             "ordered `images` collection",
+            "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
                 trusted.contains(required),
                 "missing operational contract: {required}"
             );
         }
+        assert!(
+            !trusted.contains("jq "),
+            "supported recipe must not require jq"
+        );
         assert!(trusted.contains("Do not use `POST /api/conversations/{id}/chat`"));
         for forbidden in [
             "UPDATE conversations",
