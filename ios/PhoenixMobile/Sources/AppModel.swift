@@ -1323,6 +1323,9 @@ final class AppModel {
             } else {
                 await listStore.refresh(api: api)
             }
+            if pendingProductCloseConfirmation == nil {
+                await rehydratePendingProductCloseConfirmation(api: api)
+            }
         } catch {
             guard isCurrentPendingCloseAction(
                 actionGeneration,

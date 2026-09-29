@@ -244,7 +244,11 @@ fn list_projection_from_row(
         })?;
     let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let close_availability = if row.try_get::<bool, _>("has_awaiting_task_approval")? {
+    let close_availability = if row.try_get::<bool, _>("has_active_close_attempt")? {
+        ProductConversationCloseAvailability::Unavailable(
+            ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
+        )
+    } else if row.try_get::<bool, _>("has_awaiting_task_approval")? {
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::AwaitingTaskApproval,
         )
@@ -255,10 +259,6 @@ fn list_projection_from_row(
     } else if matches!(&latest_state, crate::ConvState::HandedOff { .. }) {
         ProductConversationCloseAvailability::Unavailable(
             ProductConversationCloseUnavailableReason::HandedOffWithoutContinuation,
-        )
-    } else if row.try_get::<bool, _>("has_active_close_attempt")? {
-        ProductConversationCloseAvailability::Unavailable(
-            ProductConversationCloseUnavailableReason::ActiveCloseAttempt,
         )
     } else {
         ProductConversationCloseAvailability::Available

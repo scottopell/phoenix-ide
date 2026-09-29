@@ -609,11 +609,17 @@ async fn resolve_reference_impl(
         }
         return Ok(resolve_conversation(conv, true));
     }
-    if let Some(rest) = reference.strip_prefix("/chains/") {
+    if let Some(rest) = reference
+        .strip_prefix("/chains/")
+        .or_else(|| reference.strip_prefix("@chain:"))
+    {
         let (id, _) = split_fragment(rest);
         return resolve_chain(service, id).await;
     }
-    if let Some(id) = reference.strip_prefix("@conv:") {
+    if let Some(id) = reference
+        .strip_prefix("@conv:")
+        .or_else(|| reference.strip_prefix("/product-conversations/"))
+    {
         if id.is_empty() || id.contains('#') {
             return Err(AppError::BadRequest(
                 "ProductConversation reference must be @conv:<product_conversation_id>".to_string(),
@@ -638,8 +644,9 @@ async fn resolve_reference_impl(
             title: aggregate
                 .root
                 .conversation
-                .title
+                .chain_name
                 .clone()
+                .or(aggregate.root.conversation.title.clone())
                 .or(aggregate.root.conversation.slug.clone()),
             summary: format!(
                 "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
@@ -695,8 +702,14 @@ async fn resolve_global_message_target(
             .db
             .get_ordinary_product_conversation(&typed_id)
             .await
-            .map_err(|_| {
-                GlobalMessageTargetError::ConversationNotFound(product_conversation_id.to_string())
+            .map_err(|error| {
+                if matches!(error, crate::db::DbError::ConversationNotFound(_)) {
+                    GlobalMessageTargetError::ConversationNotFound(
+                        product_conversation_id.to_string(),
+                    )
+                } else {
+                    GlobalMessageTargetError::ResolutionFailed(error.to_string())
+                }
             })?;
         return Ok(GlobalMessageTarget::StableProductConversation {
             product_conversation_id: product_conversation_id.to_string(),
