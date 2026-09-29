@@ -1377,7 +1377,7 @@ mod tests {
             "GET /api/models",
             "effort_capabilities",
             "work_scope_id",
-            "UUID_HEX=$(od -An -N16 -tx1 /dev/urandom",
+            "UUID_BYTES <<<\"$(od -An -N16 -tx1 /dev/urandom)",
             "creation_request_id=%s",
             "INTENT_B64",
             "repeat the step-3 POST at most once",
@@ -1398,6 +1398,10 @@ mod tests {
                 "missing operational contract: {required}"
             );
         }
+        assert!(
+            !trusted.contains("tr -d"),
+            "UUID recipe must use Bash plus od"
+        );
         assert!(
             !trusted.contains("jq "),
             "supported recipe must not require jq"

@@ -171,10 +171,11 @@ rule DeliverCoordinatorBuiltinToModel {
         trusted_envelope(audience: "global-coordinator", content: result.content)
 
     @guidance
-        -- The trusted payload stays opaque to transcript/UI surfaces. While the
-        -- live runtime retains it, the bytes replace the latest matching tool
-        -- result for a provider request. Recovery of trusted provenance after
-        -- process loss is governed separately from this delivery rule.
+        -- The trusted payload stays opaque to transcript/UI surfaces. The live
+        -- runtime retains it across provider retries and credential recovery;
+        -- its bytes replace the latest matching tool result for each provider
+        -- request until that live request sequence reaches a terminal outcome.
+        -- Recovery after process loss is governed separately.
 }
 
 rule PhoenixApiCreationRecipe {
@@ -194,9 +195,12 @@ rule PhoenixApiCreationRecipe {
     ensures: recipe.performs_no_database_lifecycle_write = true
 
     @guidance
-        -- The operational recipe runs as one active scoped Bash command. It
-        -- keeps credentials out of argv/output and treats source inspection as
-        -- a version-mismatch diagnostic rather than a normal API workflow.
+        -- Global retains the immutable request identity and exact intent across
+        -- staged active scoped Bash calls for discovery, UUID generation, POST,
+        -- ambiguity reconciliation, and independent verification. Each shell
+        -- call receives data through encoded literals; credentials stay out of
+        -- argv/output. Source inspection is a version-mismatch diagnostic, not
+        -- a normal API workflow.
 }
 
 ------------------------------------------------------------

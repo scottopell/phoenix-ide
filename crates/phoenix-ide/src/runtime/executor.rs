@@ -3021,6 +3021,7 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
+            && !matches!(result.new_state, ConvState::AwaitingRecovery { .. })
         {
             self.pending_trusted_tool_results.clear();
         }
@@ -20304,6 +20305,35 @@ mod steer_drain_detector_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn trusted_payload_survives_live_credential_recovery() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-auth-recovery",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![(
+            "phoenix-api-call".to_string(),
+            "authenticated payload".to_string(),
+        )];
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::AuthError {
+            message: "credential helper active".to_string(),
+            recovery_in_progress: true,
+        }))
+        .await
+        .expect("enter credential recovery");
+
+        assert!(matches!(rt.state, ConvState::AwaitingRecovery { .. }));
+        assert_eq!(
+            rt.pending_trusted_tool_results,
+            vec![(
+                "phoenix-api-call".to_string(),
+                "authenticated payload".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn authenticated_phoenix_api_payload_is_hidden_then_overlaid_for_live_model_request() {
         use crate::db::{MessageContent, ToolOutcome, ToolResult};
@@ -20351,7 +20381,7 @@ mod steer_drain_detector_tests {
             ContentBlock::ToolResult { content, .. }
                 if content.starts_with("<trusted_builtin_skill audience=\"global-coordinator\">")
                     && content.contains("POST /api/product-conversations/new")
-                    && content.contains("UUID_HEX=$(od -An -N16 -tx1 /dev/urandom")
+                    && content.contains("UUID_BYTES <<<\"$(od -An -N16 -tx1 /dev/urandom)")
                     && content.ends_with("</trusted_builtin_skill>")
         ));
         assert_eq!(count_trusted_envelopes(&messages), 1);

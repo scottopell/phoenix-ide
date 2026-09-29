@@ -12,7 +12,15 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
 
 ## Authorization and live model discovery
 
-1. In scoped Bash, call `GET /api/auth/status` with `curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status"`. This public route returns only `auth_required` and `authenticated`.
+1. In scoped Bash, initialize the selected origin from data, then call `GET /api/auth/status`:
+
+   ```bash
+   ORIGIN_B64='base64-of-the-same-server-origin'
+   ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 --decode) || exit
+   curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status"
+   ```
+
+   This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls.
 2. If auth is disabled, send no credential. If auth is required and this request is not authenticated, use only a credential already supplied or explicitly identified by the user for this deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
 3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
 4. Call authenticated `GET /api/models`. Its `models` array and `default` field are the live authority. Select an exact model `id`: preserve a user-selected ID when present, otherwise use `default`. The selected model's `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Use JSON `null` for no override, or only a level listed for that exact model.
@@ -51,7 +59,9 @@ Run this in the admitted WorkScope. Its output is non-secret durable conversatio
 
 ```bash
 set -u
-UUID_HEX=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || exit
+read -r -a UUID_BYTES <<<"$(od -An -N16 -tx1 /dev/urandom)" || exit
+UUID_HEX=''
+for byte in "${UUID_BYTES[@]}"; do UUID_HEX+=$byte; done
 [[ "$UUID_HEX" =~ ^[0-9a-f]{32}$ ]] || exit
 UUID_VARIANT=$(printf '%x' $(( (16#${UUID_HEX:16:1} & 3) | 8 ))) || exit
 REQUEST_ID="${UUID_HEX:0:8}-${UUID_HEX:8:4}-4${UUID_HEX:13:3}-${UUID_VARIANT}${UUID_HEX:17:3}-${UUID_HEX:20:12}"
@@ -95,7 +105,7 @@ A definitive 4xx rejects the request; correct the request rather than retrying u
 
 For ambiguity, retain the same request UUID and `INTENT_B64`. Read `GET /api/product-conversations/creation` in scoped Bash and let Global inspect `product_creations` for that exact `request_id`. If the raw response has `next_cursor`, call the same route with URL-encoded `?cursor={next_cursor}` until found or pagination ends. Never claim absence from one page.
 
-When found, compare the row's `cwd`, `objective`, `model`, and `effort` to the retained intent. The fixed `llm_language:null` and `images:[]` remain part of the retained exact intent even though the recovery row does not echo them. A matching recovery row proves the request is durable but may not yet expose a published ProductConversation; report its status and use only its `allowed_actions`.
+When found, compare every echoed creation field to the retained intent: `cwd`, `objective`, `model`, `effort`, `llm_language`, and the ordered `images` collection. Account for the server's `llm_language:null` normalization to its configured default before deciding equivalence. A matching recovery row proves the request is durable but may not yet expose a published ProductConversation; report its status and use only its `allowed_actions`.
 
 If pagination ends without the UUID after a transport/5xx ambiguity, repeat the step-3 POST at most once with the exact same `INTENT_B64`. Never mint another UUID.
 
