@@ -635,9 +635,15 @@ async fn resolve_reference_impl(
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
             href: Some(format!("/product-conversations/{typed_id}")),
-            title: current.title.clone().or(current.slug.clone()),
+            title: aggregate
+                .root
+                .conversation
+                .title
+                .clone()
+                .or(aggregate.root.conversation.slug.clone()),
             summary: format!(
-                "stable ProductConversation @conv:{typed_id}; current transcript @transcript:{}; state {}; updated {}",
+                "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
+                aggregate.root.conversation.id,
                 current.id,
                 current.state.variant_name(),
                 current.updated_at.to_rfc3339()
