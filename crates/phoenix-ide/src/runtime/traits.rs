@@ -167,6 +167,18 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<Message, String>;
 
     #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> Result<Message, String>;
+
+    #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_and_terminal_obligation(
         &self,
         message_id: &str,
@@ -575,6 +587,20 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<Message, String>;
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay_with_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String>;
+
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
     #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
@@ -775,6 +801,30 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 content,
                 display_data,
                 usage_data,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_with_seq_and_origin(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                origin,
             )
             .await
     }
@@ -1264,6 +1314,34 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay_with_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_and_clear_provider_replay_with_origin(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                origin,
+                state,
+                state_updated_at,
+            )
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)] // typed immutable turn facts cross the storage boundary together
     async fn insert_turn_usage(
         &self,
@@ -1467,6 +1545,31 @@ impl MessageStore for DatabaseStorage {
                 content,
                 display_data,
                 usage_data,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_with_seq_and_origin(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                origin,
             )
             .await
             .map_err(|e| e.to_string())
@@ -2439,6 +2542,35 @@ impl StateStore for DatabaseStorage {
                 content,
                 display_data,
                 usage_data,
+                state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay_with_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_and_clear_provider_replay_with_origin(
+                message_id,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                origin,
                 state,
                 state_updated_at,
             )

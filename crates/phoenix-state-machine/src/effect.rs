@@ -119,6 +119,11 @@ pub enum Effect {
         /// extra `message_exists` query.
         idempotent: bool,
     },
+    /// User input accepted by a parent interaction (approval feedback or question response).
+    PersistUserInputMessage {
+        content: MessageContent,
+        message_id: String,
+    },
     PersistAuthoritativeUserMessage {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,

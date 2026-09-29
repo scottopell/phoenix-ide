@@ -58,6 +58,7 @@ enum AuthoritativeEffect {
         usage_data: Option<crate::db::UsageData>,
         message_id: String,
         idempotent: bool,
+        origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
         payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
@@ -205,6 +206,18 @@ impl ClassifiedEffect {
                 usage_data,
                 message_id,
                 idempotent,
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            })),
+            Effect::PersistUserInputMessage {
+                content,
+                message_id,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistMessage {
+                content,
+                display_data: None,
+                usage_data: None,
+                message_id,
+                idempotent: false,
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             })),
             Effect::PersistAuthoritativeUserMessage {
                 payload,
@@ -5854,6 +5867,7 @@ where
                 usage_data,
                 message_id,
                 idempotent,
+                origin,
             } => {
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
@@ -5878,13 +5892,14 @@ where
                 ) {
                     let message = self
                         .storage
-                        .add_message_and_clear_provider_replay(
+                        .add_message_and_clear_provider_replay_with_origin(
                             &message_id,
                             &self.context.conversation_id,
                             seq,
                             &content,
                             display_data.as_ref(),
                             usage_data.as_ref(),
+                            &origin,
                             &self.state,
                             self.state_updated_at,
                         )
@@ -5893,13 +5908,14 @@ where
                     message
                 } else {
                     self.storage
-                        .add_message_with_seq(
+                        .add_message_with_seq_and_origin(
                             &message_id,
                             &self.context.conversation_id,
                             seq,
                             &content,
                             display_data.as_ref(),
                             usage_data.as_ref(),
+                            &origin,
                         )
                         .await?
                 };
@@ -20094,6 +20110,36 @@ mod steer_drain_detector_tests {
                 .expect("unchanged durable recovery state"),
             initial_state
         );
+    }
+
+    #[tokio::test]
+    async fn user_input_effect_preserves_api_origin_and_generic_effect_is_generated() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-input-origin",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.execute_effect(Effect::PersistUserInputMessage {
+            content: MessageContent::user("answer"),
+            message_id: "answer-1".to_string(),
+        })
+        .await
+        .unwrap();
+        rt.execute_effect(Effect::PersistMessage {
+            content: MessageContent::user("generated"),
+            display_data: None,
+            usage_data: None,
+            message_id: "generated-1".to_string(),
+            idempotent: false,
+        })
+        .await
+        .unwrap();
+        let messages = storage.get_all_messages("conv-input-origin");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].origin, InputOrigin::UserApi);
+        assert_eq!(messages[1].origin, InputOrigin::SystemGenerated);
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

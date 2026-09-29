@@ -12062,8 +12062,37 @@ impl Database {
         conversation_id: &str,
         sequence_id: i64,
         content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+    ) -> DbResult<Message> {
+        self.add_message_with_seq_and_origin(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            &phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+        )
+        .await
+    }
+    /// Persists the message and its source in the same transaction.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if serialization, insertion, attachments, or indexing fails.
+    ///
+    /// # Panics
+    /// Panics if persisted JSON columns cannot be serialized.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
     ) -> DbResult<Message> {
         let now = Utc::now();
         let msg_type = content.message_type();
@@ -12074,8 +12103,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'system_generated')",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -12084,7 +12113,11 @@ impl Database {
         .bind(&content_str)
         .bind(&display_str)
         .bind(&usage_str)
-        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339()).bind(origin.db_parts().0)
+        .bind(origin.db_parts().0)
+        .bind(origin.db_parts().1)
+        .bind(origin.db_parts().2)
+        .bind(origin.db_parts().3)
         .execute(&mut *tx)
         .await?;
         message_attachments::insert(&mut tx, message_id, content).await?;
@@ -12096,7 +12129,7 @@ impl Database {
         tx.commit().await?;
 
         let message = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            origin: origin.clone(),
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -21552,6 +21585,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((parent_count, file_count, image_count), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn user_input_with_seq_persists_origin_with_message() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-user", "origin-user", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let message = db
+            .add_message_with_seq_and_origin(
+                "user-answer",
+                "origin-user",
+                1,
+                &MessageContent::user("answer"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.origin, InputOrigin::UserApi);
+        let loaded = db.get_messages("origin-user").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].origin, InputOrigin::UserApi);
+        assert_eq!(loaded[0].message_id, "user-answer");
     }
 
     #[tokio::test]

@@ -1737,6 +1737,7 @@ fn creation_provisioned_transition(
             | Effect::ApproveTaskFreshHandoff { .. }
             | Effect::PersistForkProposal { .. }
             | Effect::ResolveTask { .. }
+            | Effect::PersistUserInputMessage { .. }
             | Effect::CommitSteeringDrain { .. } => {}
         }
     }
@@ -1890,12 +1891,9 @@ pub fn transition_parent(
                     message_id: uuid::Uuid::new_v4().to_string(),
                     idempotent: false,
                 })
-                .with_effect(Effect::PersistMessage {
+                .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
-                    display_data: None,
-                    usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -1988,12 +1986,9 @@ pub fn transition_parent(
                 ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
                     attempt: 1,
                 }))
-                .with_effect(Effect::PersistMessage {
+                .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    display_data: None,
-                    usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -6156,13 +6151,13 @@ mod tests {
             result.new_state
         );
 
-        // Should have PersistMessage (user answers) + PersistState + RequestLlm
+        // User answers are persisted with explicit user-input provenance.
         assert!(
             result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PersistMessage { .. })),
-            "Should have PersistMessage effect for user answers"
+                .any(|e| matches!(e, Effect::PersistUserInputMessage { .. })),
+            "Should have explicit user-input persistence effect for answers"
         );
         assert!(
             result

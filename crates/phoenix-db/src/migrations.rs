@@ -570,11 +570,6 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_conversation_watches",
         sql: MIGRATION_111,
     },
-    Migration {
-        version: 112,
-        name: "steering_execution_watch_source",
-        sql: MIGRATION_112,
-    },
 ];
 
 const MIGRATION_111: &str = r"
