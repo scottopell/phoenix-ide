@@ -705,7 +705,7 @@ fn read_page_paginates_large_transcript() {
     // Page 1: full window + a "more" marker pointing at the next cursor.
     let page1 = read_page(&messages, 0);
     assert!(
-        page1.starts_with("User: x"),
+        page1.starts_with("Unknown input: x"),
         "got: {}",
         page1.chars().take(20).collect::<String>()
     );
