@@ -2291,28 +2291,6 @@ impl StateStore for InMemoryStorage {
         )
         .await
     }
-    #[allow(clippy::too_many_arguments)]
-    async fn add_message_and_clear_provider_replay(
-        &self,
-        message_id: &str,
-        conversation_id: &str,
-        sequence_id: i64,
-        content: &crate::db::MessageContent,
-        display_data: Option<&serde_json::Value>,
-        usage_data: Option<&crate::db::UsageData>,
-        _state: &phoenix_core::domain::sm_state::ConvState,
-        _state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<crate::db::Message, String> {
-        self.add_message_with_seq(
-            message_id,
-            conversation_id,
-            sequence_id,
-            content,
-            display_data,
-            usage_data,
-        )
-        .await
-    }
 
     #[allow(clippy::too_many_arguments)]
     async fn add_message_and_clear_provider_replay_with_origin(
