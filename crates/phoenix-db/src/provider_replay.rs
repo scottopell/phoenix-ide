@@ -74,6 +74,11 @@ impl Database {
     ) -> DbResult<()> {
         use phoenix_core::domain::provider_replay::AnthropicReplayUpdate;
         let mut tx = self.pool().begin().await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let result = sqlx::query(
@@ -88,6 +93,9 @@ impl Database {
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        if previous_kind != crate::conv_state_kind(state) {
+            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
         match update {
             AnthropicReplayUpdate::Append(response) => {

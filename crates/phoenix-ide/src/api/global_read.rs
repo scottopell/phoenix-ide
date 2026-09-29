@@ -336,13 +336,10 @@ async fn format_global_search_hits(
             href.unwrap_or_else(|| format!("@conv:{} msg:{}", hit.conversation_id, hit.message_id));
         let _ = writeln!(
             out,
-            "- [{} · {} · {}]({}) @conv:{} msg:{} — {}",
+            "- [{} · {}{} · {}]({}) @conv:{} msg:{} — {}",
             title,
-            format!(
-                "{}{}",
-                attributed_role(hit.message_type, &hit.origin),
-                attributed_sender(&hit.origin)
-            ),
+            attributed_role(hit.message_type, &hit.origin),
+            attributed_sender(&hit.origin),
             hit.created_at.format("%Y-%m-%d"),
             link,
             hit.conversation_id,

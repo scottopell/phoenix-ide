@@ -7253,6 +7253,12 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let state_json = serde_json::to_string(state).unwrap();
+        let mut tx = self.pool.begin().await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -7262,12 +7268,16 @@ impl Database {
         .bind(state_updated_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        if previous_kind != conv_state_kind(state) {
+            record_initial_execution_outcome_tx(&mut tx, id, state).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -14581,6 +14591,29 @@ fn cleared_creation_intent_json() -> String {
     .to_string()
 }
 
+pub(crate) async fn record_initial_execution_outcome_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+) -> DbResult<()> {
+    let job = sqlx::query("SELECT id, generation FROM conversation_creation_jobs j WHERE j.conversation_id = ?1 AND j.phase = 'ready' AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = j.conversation_id)")
+        .bind(conversation_id).fetch_optional(&mut **tx).await?;
+    if let Some(job) = job {
+        let generation: i64 = job.try_get("generation")?;
+        let generation =
+            u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?;
+        classify_creation_watch_outcome(
+            tx,
+            &job.try_get::<String, _>("id")?,
+            conversation_id,
+            generation,
+            state,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn classify_creation_watch_outcome(
     tx: &mut Transaction<'_, Sqlite>,
     job_id: &str,
@@ -15482,6 +15515,39 @@ mod tests {
                 .unwrap()
                 .state,
             requesting
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_initial_execution_ends_after_creation_has_settled_ready() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let running = ConvState::LlmRequesting { attempt: 0 };
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &running,
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state_at(&source.id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "creation");
+        db.update_conversation_state_at(&source.id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
         );
     }
 
