@@ -1202,12 +1202,14 @@ mod tests {
             require_task_lifecycle_admission(&state, &child).await,
             Err(AppError::BadRequest(message)) if message == "Sub-agents cannot own task lifecycle decisions"
         ));
-        assert!(run_legacy_close_compat(&state, &child.id, "abandon")
+        assert!(run_legacy_close_compat(&state, &child.id, "abandon", false)
             .await
             .is_err());
-        assert!(run_legacy_close_compat(&state, &child.id, "mark as merged")
-            .await
-            .is_err());
+        assert!(
+            run_legacy_close_compat(&state, &child.id, "mark as merged", false)
+                .await
+                .is_err()
+        );
         let retained_parent = state.db.get_conversation(id).await.unwrap();
         assert_eq!(
             retained_parent.attached_work_scope_id,

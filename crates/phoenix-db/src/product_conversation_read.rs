@@ -5,7 +5,7 @@ use phoenix_core::domain::product_conversation::{
 };
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
-use sqlx::{Connection, Executor, Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 use tracing::Instrument;
 
 use crate::{CloseProjection, Database, DbError, DbResult, MessageContent, MessageType};
@@ -800,7 +800,7 @@ impl Database {
             .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
             let close = Self::get_active_close_projection_for_product_on(
-                &mut connection,
+                &mut tx,
                 aggregate.product_conversation.id(),
             )
             .instrument(tracing::info_span!("product_conversation.close"))
