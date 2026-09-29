@@ -7677,10 +7677,10 @@ impl Database {
                  JOIN conversations c ON c.id = t.conversation_id
                  WHERE c.product_conversation_id = ?1 AND t.client_turn_key = ?2
                  UNION
-                 SELECT s.conversation_id AS owner
-                 FROM steering_messages s
-                 JOIN conversations c ON c.id = s.conversation_id
-                 WHERE c.product_conversation_id = ?1 AND s.message_id = ?2
+                 SELECT r.conversation_id AS owner
+                 FROM steering_acceptance_receipts r
+                 JOIN conversations c ON c.id = r.conversation_id
+                 WHERE c.product_conversation_id = ?1 AND r.message_id = ?2
              ) LIMIT 1",
         )
         .bind(product_conversation_id.as_str())

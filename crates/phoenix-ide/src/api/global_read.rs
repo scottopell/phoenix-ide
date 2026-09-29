@@ -626,12 +626,23 @@ async fn resolve_reference_impl(
             .get_ordinary_product_conversation(&typed_id)
             .await
             .map_err(map_db_not_found)?;
-        let conv = service
+        let current = service
             .db
             .get_conversation(&aggregate.latest_transcript_row_id)
             .await
             .map_err(map_db_not_found)?;
-        return Ok(resolve_conversation(conv, false));
+        return Ok(ResolveGlobalReferenceResponse {
+            kind: "product_conversation".to_string(),
+            id: typed_id.to_string(),
+            href: Some(format!("/product-conversations/{typed_id}")),
+            title: current.title.clone().or(current.slug.clone()),
+            summary: format!(
+                "stable ProductConversation @conv:{typed_id}; current transcript @transcript:{}; state {}; updated {}",
+                current.id,
+                current.state.variant_name(),
+                current.updated_at.to_rfc3339()
+            ),
+        });
     }
     if let Some(rest) = reference.strip_prefix("@transcript:") {
         let (id, message_id) = parse_conv_handle(rest);
