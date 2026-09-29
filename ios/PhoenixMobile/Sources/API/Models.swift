@@ -430,7 +430,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case .unknownHistorical: "Unknown input"
         case .userApi: "User API"
         case let .internalConversation(productId, transcriptId):
-            "Conversation from @conv:\(productId) transcript:\(transcriptId)"
+            "Conversation from @conv:\(transcriptId) (conversation ID \(productId))"
         case .systemGenerated: "System input"
         case .subscriptionEvent: "Conversation event"
         }

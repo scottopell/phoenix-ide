@@ -204,7 +204,6 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let _ = ready_tx.send(());
 
         let initial_discovery = self.dispatch_accepted_turns().await;
-        self.deliver_watch_events().await;
         let mut wait = match initial_discovery {
             Ok(wait) => wait,
             Err(error) => match StartupReconciliationError::from(error) {
@@ -215,6 +214,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
             },
         };
+        self.deliver_watch_events().await;
         loop {
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
@@ -227,7 +227,6 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 }
             }
             let discovery = self.run_once().await;
-            self.deliver_watch_events().await;
             wait = match discovery {
                 Ok(wait) => wait,
                 Err(error) => match StartupReconciliationError::from(error) {
@@ -238,6 +237,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             };
+            self.deliver_watch_events().await;
         }
     }
 

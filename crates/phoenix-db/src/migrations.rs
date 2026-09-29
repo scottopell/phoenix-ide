@@ -570,7 +570,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_conversation_watches",
         sql: MIGRATION_111,
     },
+    Migration {
+        version: 112,
+        name: "steering_execution_watch_source",
+        sql: MIGRATION_112,
+    },
 ];
+
+const MIGRATION_112: &str = r"
+CREATE TABLE steering_execution_watch_sources (
+    source_transcript_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL,
+    started_at_us INTEGER NOT NULL CHECK(typeof(started_at_us) = 'integer'),
+    settled_at_us INTEGER CHECK(settled_at_us IS NULL OR typeof(settled_at_us) = 'integer'),
+    terminal_kind TEXT CHECK(terminal_kind IS NULL OR terminal_kind IN ('completed', 'failed', 'cancelled')),
+    CHECK ((settled_at_us IS NULL) = (terminal_kind IS NULL)),
+    PRIMARY KEY(source_transcript_id, source_message_id)
+);
+CREATE UNIQUE INDEX steering_execution_watch_active ON steering_execution_watch_sources(source_transcript_id)
+    WHERE settled_at_us IS NULL;
+";
 
 const MIGRATION_111: &str = r"
 CREATE TABLE coordinator_watches (
@@ -586,10 +605,14 @@ CREATE TRIGGER coordinator_watches_validate BEFORE INSERT ON coordinator_watches
 WHEN NOT EXISTS (SELECT 1 FROM product_conversations WHERE id = NEW.source_product_conversation_id
                  AND kind = 'ordinary' AND ordinary_lifecycle = 'open')
 BEGIN SELECT RAISE(ABORT, 'watch requires open ordinary ProductConversation'); END;
+CREATE TABLE steering_execution_occurrences (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE
+);
 CREATE TABLE coordinator_watch_events (
     event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
     watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
-    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation')),
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering')),
     source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
     source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
     source_transcript_id TEXT NOT NULL,

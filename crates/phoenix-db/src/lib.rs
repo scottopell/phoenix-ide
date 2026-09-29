@@ -7619,6 +7619,11 @@ impl Database {
             }
         }
 
+        if matches!(state, ConvState::LlmRequesting { .. }) {
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+                .bind(id).bind(&messages[0].message_id).execute(&mut *tx).await?;
+        }
+
         let updated = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
@@ -14596,6 +14601,52 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
+    let steering: Option<String> = sqlx::query_scalar(
+        "SELECT message_id FROM steering_execution_occurrences WHERE conversation_id = ?1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(message_id) = steering {
+        let outcome = match state {
+            ConvState::Idle | ConvState::Terminal { .. } => Some(("completed", None)),
+            ConvState::Error { message, .. } => Some(("failed", Some(message.as_str()))),
+            ConvState::ContextExhausted { .. } => Some(("failed", Some("context exhausted"))),
+            ConvState::RecoverableContinuationFailure { .. } => {
+                Some(("failed", Some("continuation failed")))
+            }
+            ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::Failed { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::HandedOff { .. } => None,
+        };
+        if let Some((kind, reason)) = outcome {
+            crate::coordinator_watches::record_steering_event_tx(
+                tx,
+                &message_id,
+                conversation_id,
+                kind,
+                reason,
+            )
+            .await?;
+            sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        return Ok(());
+    }
+
     let job = sqlx::query("SELECT id, generation FROM conversation_creation_jobs j WHERE j.conversation_id = ?1 AND j.status = 'ready' AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = j.conversation_id)")
         .bind(conversation_id).fetch_optional(&mut **tx).await?;
     if let Some(job) = job {
@@ -22033,6 +22084,43 @@ mod tests {
             user_agent: None,
             skill_invocation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn watched_steering_execution_records_its_own_terminal_occurrence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-steer", "watch-steer", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_steering_queue(&source.id, &[steering_entry("watch-steer-input")])
+            .await
+            .unwrap();
+        db.commit_steering_drain(
+            &source.id,
+            &[steering_drain_message(&source.id, "watch-steer-input", 1)],
+            &ConvState::LlmRequesting { attempt: 0 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "steering");
+        assert_eq!(events[0].source_occurrence_id, "watch-steer-input");
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

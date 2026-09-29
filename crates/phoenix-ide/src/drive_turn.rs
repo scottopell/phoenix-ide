@@ -220,6 +220,10 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         credential_helper,
     ));
     manager.start_sub_agent_handler().await;
+    manager
+        .start_direct_turn_worker()
+        .await
+        .map_err(|error| DriveTurnError::Runtime(error.to_string()))?;
 
     let result = drive_conversation(
         &request,

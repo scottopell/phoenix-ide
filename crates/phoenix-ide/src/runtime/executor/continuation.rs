@@ -236,7 +236,10 @@ mod tests {
         )
         .unwrap();
         let handoff = history.handoff.unwrap();
-        assert_eq!(handoff.message.content, user("edited").content);
+        assert_eq!(
+            handoff.message.content,
+            user("[Input of unknown historical origin]\nedited").content
+        );
         assert_eq!(handoff.message_id, "accepted");
     }
 
