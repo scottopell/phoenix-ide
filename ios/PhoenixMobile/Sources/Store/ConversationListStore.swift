@@ -87,6 +87,10 @@ final class ConversationListStore {
             let missingProvisioningShells = await confirmedMissingProvisioningShells(
                 api: api,
                 fresh: fresh + Array(upsertsDuringRefresh.values))
+            guard generation == startedGeneration,
+                  !Task.isCancelled,
+                  refreshToken == token
+            else { return }
             apply(Self.merging(
                 fresh,
                 preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },

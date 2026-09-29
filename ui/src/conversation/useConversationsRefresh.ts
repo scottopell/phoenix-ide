@@ -27,7 +27,20 @@ export function subscribeToAggregateDeletionEvents(): () => void {
     if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
     source = new EventSource('/api/product-conversations/events');
     source.onopen = () => {
-      notifyProductConversationListMayHaveChanged();
+      void api.listProductConversations()
+        .then(({ product_conversations: rows }) => {
+          if (stopped) return;
+          notifyProductConversationsReconciled(new Set(rows.map((row) => (
+            row.product_conversation_id
+          ))));
+          notifyProductConversationListMayHaveChanged();
+        })
+        .catch(() => {
+          source?.close();
+          source = null;
+          retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
+          scheduleReconciliation();
+        });
     };
     source.addEventListener('conversation_hard_deleted', (event) => {
       retryDelayMs = 1_000;
