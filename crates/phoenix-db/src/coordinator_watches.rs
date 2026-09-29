@@ -115,6 +115,15 @@ impl Database {
         Ok(ended)
     }
 
+    /// Suppress a pending occurrence whose source no longer permits delivery.
+    /// # Errors
+    /// Returns a database error if suppression fails.
+    pub async fn suppress_stale_watch_event(&self, event_id: &str) -> DbResult<()> {
+        sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed' WHERE event_id = ?1 AND delivery_state = 'pending' AND NOT EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p ON p.id = w.source_product_conversation_id WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open')")
+            .bind(event_id).execute(self.pool()).await?;
+        Ok(())
+    }
+
     /// List active watches with their current transcript snapshots.
     ///
     /// # Errors
@@ -253,7 +262,18 @@ async fn record_watch_event_tx(
     reason: Option<&str>,
     context_exhausted: bool,
 ) -> DbResult<()> {
-    let category = match terminal_kind {
+    let cancelled =
+        sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
+            .bind(transcript_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+            > 0;
+    let category = match if cancelled {
+        "Cancelled"
+    } else {
+        terminal_kind
+    } {
         "Completed" => "completed",
         "Failed" => "failed",
         "Cancelled" => "cancelled",
@@ -341,6 +361,39 @@ mod tests {
             panic!("turn was not created")
         };
         turn_id.0
+    }
+
+    #[tokio::test]
+    async fn recorded_cancel_overrides_idle_completion_without_inventing_actor() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-cancel", "watch-cancel", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1)")
+            .bind(&source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        record_creation_event_tx(&mut tx, "cancel-source", 0, &source.id, "Completed", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].terminal_kind, "cancelled");
+        assert_eq!(events[0].terminal_reason, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_cancel_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

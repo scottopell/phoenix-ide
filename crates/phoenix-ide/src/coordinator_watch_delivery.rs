@@ -74,6 +74,10 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
             }
             Err(error) => {
                 tracing::warn!(event_id = %event.event_id, %error, "coordinator watch event delivery failed; retrying");
+                if let Err(suppression_error) = db.suppress_stale_watch_event(&event.event_id).await
+                {
+                    tracing::warn!(%suppression_error, "watch stale-event suppression failed");
+                }
             }
         }
     }

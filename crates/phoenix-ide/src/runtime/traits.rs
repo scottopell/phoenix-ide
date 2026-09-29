@@ -437,6 +437,10 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn establish_parent_reconcile_action(
         &self,
         _conversation_id: &str,
@@ -1074,6 +1078,10 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
+        (**self).record_execution_cancel(conversation_id).await
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,
@@ -2192,6 +2200,12 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
+        sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
+            .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> Result<(), String> {
         self.db
             .establish_parent_reconcile_action(conversation_id)

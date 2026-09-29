@@ -586,6 +586,9 @@ CREATE TRIGGER coordinator_watches_validate BEFORE INSERT ON coordinator_watches
 WHEN NOT EXISTS (SELECT 1 FROM product_conversations WHERE id = NEW.source_product_conversation_id
                  AND kind = 'ordinary' AND ordinary_lifecycle = 'open')
 BEGIN SELECT RAISE(ABORT, 'watch requires open ordinary ProductConversation'); END;
+CREATE TABLE execution_cancel_observations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE
+);
 CREATE TABLE steering_execution_occurrences (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE

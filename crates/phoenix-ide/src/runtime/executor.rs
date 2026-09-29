@@ -3181,6 +3181,15 @@ where
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
+        if matches!(event, Event::UserCancel { .. })
+            && self.active_direct_turn.is_none()
+            && !self.state.is_terminal()
+            && !matches!(self.state, ConvState::Idle)
+        {
+            self.storage
+                .record_execution_cancel(&self.context.conversation_id)
+                .await?;
+        }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
             && self.terminal_transition_retry.is_some()
