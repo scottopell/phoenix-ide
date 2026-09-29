@@ -12062,7 +12062,7 @@ impl Database {
         conversation_id: &str,
         sequence_id: i64,
         content: &MessageContent,
-        display_data: Option<&Value>,
+        display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
         self.add_message_with_seq_and_origin(
