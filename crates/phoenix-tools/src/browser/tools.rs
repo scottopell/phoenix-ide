@@ -37,6 +37,10 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn checked_deadline(timeout: Duration) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(timeout)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BrowserOperationPhase {
     Navigation,
@@ -1075,7 +1079,11 @@ impl Tool for BrowserTypeTool {
         };
 
         let guard = session.read().await;
-        let deadline = std::time::Instant::now() + timeout;
+        let Some(deadline) = checked_deadline(timeout) else {
+            return ToolOutput::error(
+                "Invalid timeout: duration exceeds the supported deadline range",
+            );
+        };
 
         let selector = serde_json::to_string(&input.selector).unwrap();
         let element = match focus_element_until(&guard.page, &input.selector, deadline).await {
@@ -1458,6 +1466,12 @@ async fn dispatch_key_cdp(
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+
+    #[test]
+    fn typing_deadline_rejects_unrepresentable_duration() {
+        assert!(checked_deadline(Duration::from_secs(30)).is_some());
+        assert!(checked_deadline(Duration::MAX).is_none());
+    }
 
     #[tokio::test]
     async fn operation_phase_preserves_success_error_and_phase_timeout() {
