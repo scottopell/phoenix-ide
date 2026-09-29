@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
 import { recoveryDiscoveryDelay } from './recoveryPolling';
@@ -53,6 +53,7 @@ vi.mock('../hooks', async () => {
 
 describe('NewConversationPage', () => {
   beforeEach(() => {
+    vi.spyOn(console, 'error');
     localStorage.clear();
     localStorage.setItem('phoenix-last-cwd', '/home/user/projects');
     localStorage.setItem('phoenix-last-model', 'claude-3-5-sonnet');
@@ -64,7 +65,10 @@ describe('NewConversationPage', () => {
 
   afterEach(() => {
     cleanup();
-    vi.clearAllMocks();
+    const actWarnings = vi.mocked(console.error).mock.calls.filter(([message]) =>
+      String(message).includes('not wrapped in act'));
+    expect(actWarnings).toEqual([]);
+    vi.restoreAllMocks();
   });
 
   function renderPage() {
@@ -77,9 +81,36 @@ describe('NewConversationPage', () => {
     );
   }
 
-  it('does not show checking status on initial render when cwd is saved', () => {
+  async function settleInitialPageWork() {
+    await waitFor(() => {
+      expect(apiMock.getEnv).toHaveBeenCalled();
+      expect(apiMock.listRecentManagementRootSuggestions).toHaveBeenCalled();
+      expect(apiMock.listDirectory).toHaveBeenCalled();
+      expect(apiMock.validateCwd).toHaveBeenCalledWith('/home/user/projects');
+      expect(apiMock.listProductConversationCreations).toHaveBeenCalled();
+    });
+
+    const latestResult = (mock: ReturnType<typeof vi.fn>) => mock.mock.results.at(-1)?.value;
+    await act(async () => {
+      await Promise.all([
+        latestResult(apiMock.getEnv),
+        latestResult(apiMock.listRecentManagementRootSuggestions),
+        latestResult(apiMock.listDirectory),
+        latestResult(apiMock.validateCwd),
+        latestResult(apiMock.listProductConversationCreations),
+      ]);
+    });
+    await waitFor(() => {
+      expect(document.querySelectorAll('.status-ok').length).toBeGreaterThan(0);
+      expect(Array.from(document.querySelectorAll<HTMLSelectElement>('.settings-select'))
+        .every((select) => !select.disabled)).toBe(true);
+    });
+  }
+
+  it('does not show checking status on initial render when cwd is saved', async () => {
     const { container } = renderPage();
     expect(container.querySelectorAll('.status-checking').length).toBe(0);
+    await settleInitialPageWork();
   });
 
   it('renders recovery actions and wires retry/cancel/delete', async () => {
@@ -94,13 +125,12 @@ describe('NewConversationPage', () => {
       .mockResolvedValue({ product_creations: [] });
 
     renderPage();
+    await settleInitialPageWork();
 
-    expect((await screen.findAllByText('Recent starts')).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Recent starts').length).toBeGreaterThan(0);
     fireEvent.click(screen.getAllByRole('button', { name: 'Cancel' }).at(0)!);
     await waitFor(() => expect(apiMock.cancelProductConversationCreation).toHaveBeenCalledWith('req-pending'));
-
-    apiMock.listProductConversationCreations.mockResolvedValueOnce({ product_creations: [] });
-    renderPage();
+    await waitFor(() => expect(screen.queryByText('pending objective')).not.toBeInTheDocument());
   });
 
   it('shows a failed recovery action inline and refreshes recovery rows', async () => {
