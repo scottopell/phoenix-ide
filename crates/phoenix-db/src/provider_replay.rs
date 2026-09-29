@@ -291,7 +291,7 @@ impl Database {
         .bind(serde_json::to_string(&content_json).map_err(|error| DbError::Serialization(error.to_string()))?)
         .bind(display_json)
         .bind(usage_json)
-        .bind(now.to_rfc3339()).bind(origin.db_parts().0)
+        .bind(now.to_rfc3339())
         .bind(origin.db_parts().0)
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
