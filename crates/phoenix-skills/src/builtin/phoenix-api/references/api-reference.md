@@ -59,7 +59,7 @@ Omit the `--header` line when auth is disabled or the request is already authent
 }
 ```
 
-Every request field is immutable creation intent: `request_id`, `cwd`, `model`, `effort`, `objective`, `llm_language`, and the ordered `images` collection. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation. This scoped-Bash recipe supports text-only creation and therefore requires exactly `images: []`. Do not embed image data in a Bash command: API-sized image payloads exceed Bash command/output capacity. Image-bearing creation requires a separate bounded upload/transport surface that the public API does not expose.
+Creation intent is immutable for `request_id`, `cwd`, `model`, `effort`, `objective`, and the ordered `images` collection: changing any of those under the same UUID conflicts, while a new UUID risks duplicate creation. `llm_language` is the explicit exception—the first request stores a normalized language, and every replay uses that stored value regardless of the submitted replay field. This scoped-Bash recipe supports text-only creation and therefore requires exactly `images: []`. Do not embed image data in a Bash command: API-sized image payloads exceed Bash command/output capacity. Image-bearing creation requires a separate bounded upload/transport surface that the public API does not expose.
 
 ### 1. Generate and retain the request identity
 
@@ -92,7 +92,7 @@ ORIGIN_B64='base64-of-the-same-server-origin'
 CA_CERT_PATH_B64='' # optional authoritative same-server CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
 ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
-[[ "$ORIGIN" =~ ^https?://[^[:space:]/]+(:[0-9]+)?$ ]] || exit
+[[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
 CURL_TLS=()
 if [[ -n "$CA_CERT_PATH_B64" ]]; then
   CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit

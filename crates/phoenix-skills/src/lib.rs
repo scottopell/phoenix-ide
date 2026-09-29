@@ -1398,6 +1398,7 @@ mod tests {
             "Truncation is inconclusive",
             "HTTP 408, 425, 429",
             "stored normalized language always wins",
+            "`llm_language` is the explicit exception",
             "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
