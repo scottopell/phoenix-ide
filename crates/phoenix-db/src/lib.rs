@@ -103,10 +103,12 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use sqlite_native_statement::install_native_statement_baseline;
 use sqlite_telemetry::{SqliteOperation, SqliteTelemetry};
+use sqlx::sqlite::SqliteTransactionManager;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
+use sqlx_core::transaction::TransactionManager;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use thiserror::Error;
@@ -10685,8 +10687,7 @@ impl Database {
                 match commit {
                     Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())),
                     Err(commit_error) => {
-                        if sqlx::query("ROLLBACK")
-                            .execute(&mut *connection)
+                        if SqliteTransactionManager::rollback(&mut connection)
                             .await
                             .is_err()
                         {
