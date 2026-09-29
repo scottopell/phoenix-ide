@@ -65,7 +65,7 @@ Use the roadmap only for outcomes substantial enough that another agent or harne
 1. Fetch Issue #806 by its known number; do not discover it with GitHub search. If GitHub is unavailable, state that roadmap context could not be verified.
 2. Follow `specs/roadmap/requirements.md` and the examples in `specs/roadmap/executive.md`: post one `phoenix-roadmap` fenced record per comment, declare `actor.role` and `actor.harness`, and post only the kinds your role allows. Check a record with `node scripts/roadmap-issue-reducer.mjs --validate` before posting.
 3. Report runtime and transcript mechanics in your own harness, not on the roadmap. The roadmap sees their effects: evidence, status, gates, and decisions.
-4. After posting, re-read the Issue body. If your comment ID is at or below `phoenix-roadmap:snapshot-through` and at or above `phoenix-roadmap:ack-window-from`, it is accepted unless listed under "Recent rejections"; fix and re-post a rejected record. Below the window the body makes no claim.
+4. After posting, re-read the Issue body. If your comment ID is at or below `phoenix-roadmap:snapshot-through` and at or above `phoenix-roadmap:ack-window-from`, it is accepted only if listed in the `phoenix-roadmap:accepted` marker and rejected if listed under "Recent rejections"; fix and re-post a rejected record. Below the window the body makes no claim.
 
 ## Reasoning about async test completion
 

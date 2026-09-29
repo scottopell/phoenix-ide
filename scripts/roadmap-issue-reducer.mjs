@@ -254,7 +254,7 @@ const VALIDATORS = {
     };
   },
   decision(value, recordActor) {
-    onlyKeys(value, ["kind", "version", "actor", "id", "statement", "scope", "supersedes", "clears", "quote", "source"], "decision");
+    onlyKeys(value, ["kind", "version", "actor", "id", "statement", "scope", "supersedes", "clears", "withdraws", "quote", "source"], "decision");
     const quote = optionalLine(value.quote, "quote", 300);
     if (recordActor.role === "user" && quote === undefined) reject("user decisions must quote the user's words");
     return {
@@ -263,6 +263,11 @@ const VALIDATORS = {
       scope: list(value.scope, "scope", 1, 8, (entry, field) => id(entry, field)),
       supersedes: list(value.supersedes ?? [], "supersedes", 0, 5, (entry, field) => id(entry, field)),
       clears: list(value.clears ?? [], "clears", 0, 5, (entry, field) => id(entry, field)),
+      withdraws: list(value.withdraws ?? [], "withdraws", 0, 5, (entry, field) => {
+        if (!isObject(entry)) reject(`${field} must be an object`);
+        onlyKeys(entry, ["outcome", "pr"], field);
+        return { outcome: id(entry.outcome, `${field}.outcome`), pr: pullNumber(entry.pr, `${field}.pr`) };
+      }),
       quote,
       source: value.source === undefined ? undefined : url(value.source, "source", { httpsOnly: false }),
     };
@@ -347,6 +352,7 @@ function newState() {
     checkins: new Map(),
     conflicts: [],
     mixedResults: new Set(),
+    withdrawals: new Map(),
     rejections: [],
     accepted: new Set(),
     recordIds: [],
@@ -471,8 +477,13 @@ const APPLY = {
       if (gate.clearer === "user" && record.actor.role !== "user") reject(`gate ${gateId} is cleared only by a user decision`);
       return gate;
     });
+    for (const withdrawal of record.withdraws) {
+      liveOutcome(state, withdrawal.outcome);
+      if (!scope.has(withdrawal.outcome)) reject(`withdrawn outcome ${withdrawal.outcome} is outside the decision's scope`);
+    }
     state.ids.set(record.id, "decision");
     state.decisions.set(record.id, { ...record, source, supersededBy: [] });
+    for (const withdrawal of record.withdraws) state.withdrawals.set(`${withdrawal.outcome}|${withdrawal.pr}`, record.id);
     for (const decision of superseded) {
       if (decision.supersededBy.length > 0) {
         state.conflicts.push({
@@ -567,9 +578,12 @@ function isComponentEvidence(entry) {
   return entry.subject.pr !== undefined && !WHOLE_SURFACE_STAGES.has(entry.stage);
 }
 
-function componentDelivery(pr, entries, pull) {
+function componentDelivery(pr, entries, pull, withdrawnBy) {
   const label = `#${pr}`;
-  if (pull?.state === "closed" && !pull.merged) return { live: false, note: `${label} closed without merge` };
+  if (withdrawnBy) return { live: false, note: `${label} withdrawn by ${withdrawnBy}` };
+  if (pull?.state === "closed" && !pull.merged) {
+    return { live: true, unresolved: true, stageIndex: -1, detail: label, notes: [`${label} closed without merge`] };
+  }
   if (pull?.merged) return { live: true, stageIndex: STAGES.indexOf("merged"), detail: `${label}→${short(pull.mergeCommit ?? pull.head)}`, notes: [] };
   if (!pull) return { live: true, stageIndex: STAGES.indexOf("implemented"), detail: label, notes: [`${label} state unverified`] };
   const notes = [];
@@ -613,7 +627,9 @@ export function surfaceDelivery(state, outcomeId, surface, pulls) {
       assertion = { stageIndex, detail, id: entry.source.id };
     }
   }
-  const components = [...componentEntries].sort(([left], [right]) => left - right).map(([pr, entries]) => componentDelivery(pr, entries, pulls.get(pr)));
+  const components = [...componentEntries]
+    .sort(([left], [right]) => left - right)
+    .map(([pr, entries]) => componentDelivery(pr, entries, pulls.get(pr), state.withdrawals.get(`${outcomeId}|${pr}`)));
   for (const component of components) {
     if (!component.live) notes.push(component.note);
     else notes.push(...component.notes);
@@ -626,7 +642,7 @@ export function surfaceDelivery(state, outcomeId, surface, pulls) {
     stageIndex = assertion.stageIndex;
     detail = assertion.detail;
     for (const component of live) {
-      if (component.stageIndex < STAGES.indexOf("merged")) notes.push(`open follow-up ${component.detail} (${STAGES[component.stageIndex]})`);
+      if (!component.unresolved && component.stageIndex < STAGES.indexOf("merged")) notes.push(`open follow-up ${component.detail} (${STAGES[component.stageIndex]})`);
     }
   } else if (componentIndex >= 0) {
     stageIndex = componentIndex;
@@ -635,7 +651,8 @@ export function surfaceDelivery(state, outcomeId, surface, pulls) {
       if (component.stageIndex > componentIndex) notes.push(`${component.detail} ${STAGES[component.stageIndex]}`);
     }
   }
-  return { stageIndex, stage: stageIndex < 0 ? undefined : STAGES[stageIndex], detail, notes };
+  const unresolved = stageIndex === componentIndex ? live.filter((component) => component.unresolved).map((component) => component.detail) : [];
+  return { stageIndex, stage: stageIndex < 0 ? undefined : STAGES[stageIndex], detail, notes, unresolved };
 }
 
 function markdownText(value) {
@@ -762,7 +779,17 @@ export function renderRoadmap(state, { pulls = new Map(), pullsVerified = false,
       .filter((entry) => state.outcomes.get(entry.outcome)?.retired?.reason === "dropped")
       .map((entry) => ({ message: `${milestone.title} requires dropped outcome ${entry.outcome}`, source: milestone.source })),
   );
-  const conflicts = [...state.conflicts, ...orphanedRequirements];
+  const closedComponents = [...state.outcomes.values()]
+    .filter((outcome) => !outcome.retired)
+    .flatMap((outcome) =>
+      outcome.surfaces.flatMap((surface) =>
+        surfaceDelivery(state, outcome.id, surface, pulls).unresolved.map((pr) => ({
+          message: `${outcome.title} (${surface}): PR ${pr} closed without merge; withdraw or replace it by decision, or record whole-surface delivery`,
+          source: outcome.source,
+        })),
+      ),
+    );
+  const conflicts = [...state.conflicts, ...orphanedRequirements, ...closedComponents];
   lines.push("", "## Needs coordinator", "");
   lines.push(conflicts.length ? conflicts.map((conflict) => `- ${markdownText(conflict.message)} (${link("source", conflict.source.url)})`).join("\n") : "_Nothing._");
 
@@ -783,8 +810,9 @@ export function renderRoadmap(state, { pulls = new Map(), pullsVerified = false,
   const rejections = state.rejections.filter((entry) => entry.id >= windowFrom).sort((left, right) => right.id - left.id);
   lines.push("", "## Recent rejections", "");
   lines.push(`<!-- phoenix-roadmap:ack-window-from:${windowFrom} -->`);
+  lines.push(`<!-- phoenix-roadmap:accepted:${window.filter((recordId) => state.accepted.has(recordId)).join(",")} -->`);
   lines.push(
-    `_Covers the last ${window.length} record comments (from comment ${windowFrom}). A record in that range is accepted unless listed here; this body does not say whether older records were accepted._`,
+    `_Covers the last ${window.length} record comments (from comment ${windowFrom}). A record in that range is accepted only if its ID is in the \`phoenix-roadmap:accepted\` marker and rejected if listed here; any other ID was deleted or is no longer a record. This body says nothing about older records._`,
     "",
   );
   lines.push(rejections.length ? rejections.map((entry) => `- ${link(String(entry.id), entry.url)}: ${markdownText(entry.reason)}`).join("\n") : "_None._");

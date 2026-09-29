@@ -179,6 +179,10 @@ THE SYSTEM SHALL require a decision posted with role `user` to quote the user's
 words, so the decision is legible where the conversation it came from is not
 reachable.
 
+THE SYSTEM SHALL let a decision withdraw a PR from an outcome it scopes, so a
+PR closed without merge stops counting as an unmet component of that outcome.
+A withdrawal is permanent.
+
 THE SYSTEM SHALL treat a decision as current until another decision supersedes
 it, SHALL accept a supersession only between decisions sharing at least one
 scope identifier, and SHALL surface a decision superseded by two different
@@ -214,9 +218,12 @@ are shown as follow-ups.
 THE SYSTEM SHALL derive each component's state from GitHub at projection time:
 a merged PR is `merged` regardless of its qualification records; an open PR is
 `qualified` only when its latest qualification at the PR's current head passed;
-a PR closed without merge is shown as such and excluded from readiness; and a
-PR whose state could not be read counts only as `implemented` and is shown as
-unverified.
+a PR closed without merge remains an unmet component, so the surface has no
+component stage, and is surfaced as needing the coordinator until a decision
+withdraws it or a whole-surface assertion covers the surface; a withdrawn PR is
+shown as such and no longer counts; and a PR whose state could not be read
+counts only as `implemented` and is shown as unverified. A closure is not a
+scope decision.
 
 WHEN both pass and fail are recorded for the same PR head
 THE SYSTEM SHALL show the latest result and surface the disagreement as needing
@@ -277,12 +284,14 @@ THE SYSTEM SHALL serialize projection runs.
 ### REQ-ROADMAP-014: The projection is the authoritative acknowledgement
 
 THE SYSTEM SHALL record in the projection the highest trusted comment it
-included and the first comment of a bounded acknowledgement window covering the
-most recent record comments, and SHALL list every rejected record in that
-window with its reason.
+included, the first comment of a bounded acknowledgement window covering the
+most recent record comments, the IDs of the accepted records in that window,
+and every rejected record in that window with its reason.
 
-A record whose comment falls in the window is accepted exactly when it is not
-listed. For a record before the window the projection makes no claim.
+A record whose comment falls in the window is accepted exactly when its ID is
+listed as accepted and rejected exactly when it is listed as rejected; any
+other ID in the window was deleted or is no longer a record. For a comment
+before the window the projection makes no claim.
 
 THE SYSTEM SHALL additionally mark a newly created record with bot reactions
 (processing, accepted, rejected) on a best-effort basis: a reaction failure

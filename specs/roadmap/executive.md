@@ -37,20 +37,20 @@ references that only resolve on one machine.
 | **REQ-ROADMAP-005:** Identifiers are unique and references resolve | Implemented | `claimId` and the `live*` lookups. |
 | **REQ-ROADMAP-006:** Milestones separate required from optional outcomes | Implemented | `APPLY.milestone`, `renderMilestone`. |
 | **REQ-ROADMAP-007:** Gates are single-use and clearing is permanent | Implemented | `APPLY.gate`, `APPLY["gate-clear"]`, `APPLY.decision` (scope-bound clearing). |
-| **REQ-ROADMAP-008:** Decisions are immutable and supersede explicitly | Implemented | `APPLY.decision` (scope-overlapping supersession). |
+| **REQ-ROADMAP-008:** Decisions are immutable and supersede explicitly | Implemented | `APPLY.decision` (scope-overlapping supersession; scope-bound `withdraws`). |
 | **REQ-ROADMAP-009:** Evidence is version-bound and per surface | Implemented | `surfaceDelivery` / `componentDelivery`; PR state from `githubApi().getPull`; URL rules in `githubUrl`. |
 | **REQ-ROADMAP-010:** Status carries next action and execution pointers | Implemented | `APPLY.status`. |
 | **REQ-ROADMAP-011:** Freshness and unknowns are explicit | Implemented | `age`, `deliveryCell`. |
 | **REQ-ROADMAP-012:** Milestone-first projection | Implemented | `renderRoadmap`. |
 | **REQ-ROADMAP-013:** Projection runs without a triggering record | Implemented | `.github/workflows/roadmap-issue-reducer.yml` schedule, dispatch, and concurrency group. |
-| **REQ-ROADMAP-014:** The projection is the authoritative acknowledgement | Implemented | `snapshot-through` and `ack-window-from` markers with the in-window rejection list; best-effort reactions; `--validate`. |
+| **REQ-ROADMAP-014:** The projection is the authoritative acknowledgement | Implemented | `snapshot-through`, `ack-window-from`, and in-window `accepted` markers with the in-window rejection list; best-effort reactions; `--validate`. |
 
 Code: `scripts/roadmap-issue-reducer.mjs`. Tests:
 `scripts/roadmap-issue-reducer.test.mjs`, with fixtures for a cleared user hold,
-a changed PR head, a PR closed without merge, unverified PR state, partial
-multi-PR delivery, continued ownership, split web/native delivery, an optional
-outcome that must not block its milestone, acknowledgement overflow, reaction
-failures, and activation before the Issue switch.
+a changed PR head, a PR closed without merge (alone, beside a merged component,
+withdrawn, and replaced), unverified PR state, partial multi-PR delivery, continued ownership, split web/native delivery, an optional
+outcome that must not block its milestone, acknowledgement overflow, deleted and de-fenced records, reaction failures, and
+activation before the Issue switch.
 
 ### Activation
 
@@ -73,10 +73,11 @@ node scripts/roadmap-issue-reducer.mjs --validate record.json   # or pipe on std
 The validator checks structure and role; references to outcomes, gates, and
 decisions are checked when the Issue is reduced.
 
-After posting, re-read the Issue body. With `S` = `snapshot-through` and `W` =
-`ack-window-from`: a comment ID above `S` is not yet processed; between `W` and
-`S` it is accepted unless listed under "Recent rejections"; below `W` the body
-makes no claim (check the reaction or re-post).
+After posting, re-read the Issue body. With `S` = `snapshot-through`, `W` =
+`ack-window-from`, and `A` = the IDs in the `phoenix-roadmap:accepted` marker:
+a comment ID above `S` is not yet processed; between `W` and `S` it is accepted
+if in `A`, rejected if listed under "Recent rejections", and otherwise deleted
+or no longer a record; below `W` the body makes no claim.
 
 ### Canonical examples
 
@@ -119,6 +120,15 @@ Worker — gate and gate-clear (owner/external gates):
 { "kind": "gate-clear", "version": 2, "actor": { "role": "worker", "harness": "phoenix@devmbp" },
   "gate": "g-797-restart-budget",
   "evidence": "https://github.com/scottopell/phoenix-ide/pull/797#pullrequestreview-1" }
+```
+
+Coordinator — decision withdrawing a PR closed without merge from an outcome
+(or replacing it: withdraw, then post evidence for the replacement PR):
+
+```json
+{ "kind": "decision", "version": 2, "actor": { "role": "coordinator", "harness": "phoenix@primary" },
+  "id": "d-794-withdrawn", "statement": "#794 is closed; its scope moved to #796 and #798",
+  "scope": ["kache-adoption"], "withdraws": [{ "outcome": "kache-adoption", "pr": 794 }] }
 ```
 
 User — decision (any harness may record it; quote the user's exact words):

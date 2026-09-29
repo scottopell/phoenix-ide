@@ -216,6 +216,45 @@ test("closed-without-merge PRs are history, not readiness", () => {
   assert.match(renderRoadmap(state, { pulls: new Map(), now: NOW }), /0\/1 required met/);
 });
 
+test("closing one required component leaves the surface unsatisfied until explicitly resolved", () => {
+  const implemented = (pr) => ({ kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "implemented", result: "pass", subject: { pr }, url: `https://github.com/o/r/pull/${pr}` });
+  const milestone = { kind: "milestone", actor: COORDINATOR, id: "m-1", title: "M", required: [{ outcome: "ios-core-journeys", surface: "ios", stage: "merged" }] };
+  const pulls = new Map([
+    [10, { head: HEAD_A, merged: true, mergeCommit: MERGE, state: "closed" }],
+    [11, { head: HEAD_B, merged: false, state: "closed" }],
+    [12, { head: HEAD_B, merged: false, state: "open" }],
+  ]);
+  const base = [outcome(), milestone, implemented(10), implemented(11)];
+
+  const closed = reduce(base);
+  const delivery = surfaceDelivery(closed, "ios-core-journeys", "ios", pulls);
+  assert.equal(delivery.stage, undefined);
+  assert.deepEqual(delivery.unresolved, ["#11"]);
+  const rendered = renderRoadmap(closed, { pulls, now: NOW });
+  assert.match(rendered, /0\/1 required met/);
+  assert.doesNotMatch(rendered, /All requirements met/);
+  assert.match(rendered, /PR #11 closed without merge; withdraw or replace it/);
+
+  const withdraw = { kind: "decision", actor: COORDINATOR, id: "d-drop-11", statement: "#11 is out of scope", scope: ["ios-core-journeys"], withdraws: [{ outcome: "ios-core-journeys", pr: 11 }] };
+  const withdrawn = reduce([...base, withdraw]);
+  const afterWithdrawal = surfaceDelivery(withdrawn, "ios-core-journeys", "ios", pulls);
+  assert.equal(afterWithdrawal.stage, "merged");
+  assert.deepEqual(afterWithdrawal.notes, ["#11 withdrawn by d-drop-11"]);
+  assert.doesNotMatch(renderRoadmap(withdrawn, { pulls, now: NOW }), /closed without merge; withdraw/);
+
+  const replaced = reduce([...base, withdraw, implemented(12)]);
+  assert.equal(surfaceDelivery(replaced, "ios-core-journeys", "ios", pulls).stage, "implemented");
+
+  const receipt = "https://github.com/o/r/issues/1#issuecomment-9";
+  const whole = reduce([...base, { kind: "evidence", actor: WORKER, outcome: "ios-core-journeys", surface: "ios", stage: "deployed", result: "pass", subject: { target: "prod@primary", commit: MERGE }, url: receipt }]);
+  const asserted = surfaceDelivery(whole, "ios-core-journeys", "ios", pulls);
+  assert.equal(asserted.stage, "deployed");
+  assert.deepEqual(asserted.unresolved, []);
+
+  const outOfScope = reduce([...base, outcome({ id: "other", title: "Other" }), { ...withdraw, scope: ["other"] }]);
+  assert.deepEqual(reasons(outOfScope), ["withdrawn outcome ios-core-journeys is outside the decision's scope"]);
+});
+
 test("merge is derived even when the latest qualification failed or is stale", () => {
   const state = reduce([outcome(), qualified(5, HEAD_A), qualified(5, HEAD_A, "fail")]);
   const merged = new Map([[5, { head: HEAD_B, merged: true, mergeCommit: MERGE, state: "closed" }]]);
@@ -391,9 +430,11 @@ test("rendering shows freshness and escapes table text", () => {
 function acknowledgement(rendered, commentId) {
   const snapshot = Number(rendered.match(/snapshot-through:(\d+)/)[1]);
   const windowFrom = Number(rendered.match(/ack-window-from:(\d+)/)[1]);
+  const accepted = new Set(rendered.match(/phoenix-roadmap:accepted:([\d,]*)/)[1].split(",").filter(Boolean).map(Number));
   if (commentId > snapshot) return "pending";
   if (commentId < windowFrom) return "unknown";
-  return rendered.includes(`- [${commentId}](`) ? "rejected" : "accepted";
+  if (accepted.has(commentId)) return "accepted";
+  return rendered.includes(`- [${commentId}](`) ? "rejected" : "unknown";
 }
 
 test("acknowledgement is unambiguous within a bounded window and unknown before it", () => {
@@ -410,6 +451,18 @@ test("acknowledgement is unambiguous within a bounded window and unknown before 
   assert.equal(acknowledgement(later, 2), "unknown");
   assert.equal(acknowledgement(later, 31), "accepted");
   assert.match(later, /ack-window-from:31/);
+});
+
+test("deleted records and comments edited out of record form are unknown, not accepted", () => {
+  const status = { kind: "status", actor: WORKER, outcome: "ios-core-journeys", next: "x" };
+  const deleted = renderRoadmap(reduceComments([comment(1, outcome()), comment(3, status)]), { now: NOW, snapshotThroughCommentId: 3 });
+  assert.equal(acknowledgement(deleted, 1), "accepted");
+  assert.equal(acknowledgement(deleted, 2), "unknown");
+  assert.equal(acknowledgement(deleted, 3), "accepted");
+
+  const defenced = comment(2, "never mind", { updated_at: "2026-09-28T00:00:00Z" });
+  const rendered = renderRoadmap(reduceComments([comment(1, outcome()), defenced, comment(3, status)]), { now: NOW, snapshotThroughCommentId: 3 });
+  assert.equal(acknowledgement(rendered, 2), "unknown");
 });
 
 test("a record edited after acceptance is reported as rejected on reprocessing", () => {
