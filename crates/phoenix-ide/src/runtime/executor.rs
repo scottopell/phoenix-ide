@@ -20351,7 +20351,7 @@ mod steer_drain_detector_tests {
             ContentBlock::ToolResult { content, .. }
                 if content.starts_with("<trusted_builtin_skill audience=\"global-coordinator\">")
                     && content.contains("POST /api/product-conversations/new")
-                    && content.contains("REQUEST_ID=$(uuidgen")
+                    && content.contains("UUID_HEX=$(od -An -N16 -tx1 /dev/urandom")
                     && content.ends_with("</trusted_builtin_skill>")
         ));
         assert_eq!(count_trusted_envelopes(&messages), 1);

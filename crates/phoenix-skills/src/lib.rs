@@ -1377,7 +1377,7 @@ mod tests {
             "GET /api/models",
             "effort_capabilities",
             "work_scope_id",
-            "REQUEST_ID=$(uuidgen",
+            "UUID_HEX=$(od -An -N16 -tx1 /dev/urandom",
             "INTENT=$(jq -cn",
             "creation_request_id=%s",
             "retrying exact request_id",
@@ -1387,6 +1387,10 @@ mod tests {
             "current_transcript_row_id",
             "canonical_route",
             "agent_working",
+            "MODEL_REQUESTED",
+            "same Phoenix server that owns that WorkScope",
+            "llm_language",
+            "ordered `images` collection",
         ] {
             assert!(
                 trusted.contains(required),

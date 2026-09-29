@@ -33,26 +33,24 @@ Use `curl --fail-with-body --silent --show-error`. Parse JSON structurally.
 }
 ```
 
-`request_id`, `cwd`, `model`, `effort`, and `objective` are immutable creation intent. Generate the UUID once. If the response is ambiguous, retain that UUID and the identical JSON payload: reconcile by `request_id`, then make only an exact retry. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation.
+Every request field is immutable creation intent: `request_id`, `cwd`, `model`, `effort`, `objective`, `llm_language`, and the ordered `images` collection. Generate the UUID once. If the response is ambiguous, retain that UUID and the identical JSON payload: reconcile by `request_id`, then make only an exact retry. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation.
 
 ### Copyable scoped-Bash recipe
 
-Run the whole block in one Bash `op="run"` call with the admitted `work_scope_id`. Set `ORIGIN` to the user-selected Phoenix origin and place the exact opening objective inside the quoted heredoc. Optionally set `EFFORT` to a requested live-supported level; leaving it empty sends `null` and uses the model's native behavior.
+Run the whole block in one Bash `op="run"` call with the admitted `work_scope_id`. `ORIGIN` must identify the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; if same-server identity is not established, stop because the public API exposes no remote-server cwd resolver. Base64-encode the exact UTF-8 objective outside the shell and set `OBJECTIVE_B64` to that safe alphabet. Set `MODEL_REQUESTED` only when the user selected an exact model ID. Optionally set `EFFORT` to a requested live-supported level; leaving it empty sends `null` and uses the model's native behavior.
 
 ```bash
 set -u
-ORIGIN='https://the-user-selected-phoenix-origin'
+ORIGIN='https://the-same-phoenix-server-that-owns-this-workscope'
+OBJECTIVE_B64='base64-of-the-exact-utf8-opening-objective'
+MODEL_REQUESTED='' # optional exact live model id; empty selects the live default
 EFFORT='' # optional exact level; empty means JSON null
-# Put the exact objective between these quoted-heredoc delimiters. Its contents
-# are data, not shell syntax, so quotes, `$`, backticks, and newlines stay literal.
-OBJECTIVE=$(cat <<'PHOENIX_OBJECTIVE'
-the exact opening objective
-PHOENIX_OBJECTIVE
-) || exit
+OBJECTIVE=$(printf '%s' "$OBJECTIVE_B64" | base64 --decode) || exit
+[[ -n "$OBJECTIVE" ]] || { printf '%s\n' 'objective must not be empty' >&2; exit 1; }
 
 AUTH_STATUS=$(curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status") || exit
-AUTH_REQUIRED=$(jq -er '.auth_required' <<<"$AUTH_STATUS") || exit
-AUTHENTICATED=$(jq -er '.authenticated' <<<"$AUTH_STATUS") || exit
+AUTH_REQUIRED=$(jq -r 'if (.auth_required | type) == "boolean" then .auth_required else error("invalid auth_required") end' <<<"$AUTH_STATUS") || exit
+AUTHENTICATED=$(jq -r 'if (.authenticated | type) == "boolean" then .authenticated else error("invalid authenticated") end' <<<"$AUTH_STATUS") || exit
 if [[ "$AUTH_REQUIRED" == true && "$AUTHENTICATED" != true ]]; then
   : "${PHOENIX_PASSWORD:?authenticated deployment requires a user-identified PHOENIX_PASSWORD}"
 fi
@@ -68,8 +66,15 @@ api() {
 }
 
 MODELS=$(api "$ORIGIN/api/models") || exit
-MODEL=$(jq -er '.default as $d | .models[] | select(.id == $d) | .id' <<<"$MODELS") || exit
-MODEL_INFO=$(jq -ec --arg model "$MODEL" '.models[] | select(.id == $model)' <<<"$MODELS") || exit
+if [[ -n "$MODEL_REQUESTED" ]]; then
+  MODEL=$MODEL_REQUESTED
+else
+  MODEL=$(jq -er '.default' <<<"$MODELS") || exit
+fi
+MODEL_INFO=$(jq -ec --arg model "$MODEL" '.models[] | select(.id == $model)' <<<"$MODELS") || {
+  printf 'selected model is not exposed by the live deployment: %s\n' "$MODEL" >&2
+  exit 1
+}
 if [[ -n "$EFFORT" ]]; then
   jq -e --arg effort "$EFFORT" \
     '.effort_capabilities.support == "supported" and (.effort_capabilities.levels | index($effort) != null)' \
@@ -81,7 +86,10 @@ fi
 
 CWD=$PWD
 test -d "$CWD" || exit
-REQUEST_ID=$(uuidgen | tr '[:upper:]' '[:lower:]') || exit
+UUID_HEX=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || exit
+[[ "$UUID_HEX" =~ ^[0-9a-f]{32}$ ]] || exit
+UUID_VARIANT=$(printf '%x' $(( (16#${UUID_HEX:16:1} & 3) | 8 ))) || exit
+REQUEST_ID="${UUID_HEX:0:8}-${UUID_HEX:8:4}-4${UUID_HEX:13:3}-${UUID_VARIANT}${UUID_HEX:17:3}-${UUID_HEX:20:12}"
 INTENT=$(jq -cn \
   --arg request_id "$REQUEST_ID" --arg cwd "$CWD" --arg model "$MODEL" \
   --argjson effort "$EFFORT_JSON" --arg objective "$OBJECTIVE" \

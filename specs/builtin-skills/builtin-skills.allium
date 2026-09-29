@@ -157,12 +157,12 @@ rule DeliverCoordinatorBuiltinToModel {
     ensures: persisted_tool_result(tool_use_id) = authenticated_delivery_receipt
     ensures: next_live_model_request.latest_tool_result(tool_use_id) =
         trusted_envelope(audience: "global-coordinator", content: result.content)
-    ensures: historical_model_requests.exclude(result.content)
 
     @guidance
-        -- The trusted payload stays opaque to transcript/UI surfaces. Its bytes
-        -- exist only in live memory and replace the latest matching tool result
-        -- while the immediately following provider request is assembled.
+        -- The trusted payload stays opaque to transcript/UI surfaces. While the
+        -- live runtime retains it, the bytes replace the latest matching tool
+        -- result for a provider request. Recovery of trusted provenance after
+        -- process loss is governed separately from this delivery rule.
 }
 
 rule PhoenixApiCreationRecipe {
@@ -174,6 +174,7 @@ rule PhoenixApiCreationRecipe {
     ensures: recipe.discovers_auth_at(origin + "/api/auth/status")
     ensures: recipe.discovers_model_and_effort_at(origin + "/api/models")
     ensures: recipe.generates_request_uuid_once()
+    ensures: recipe.requires_origin_owned_by(work_scope_id)
     ensures: recipe.posts_supported_fields_to(origin + "/api/product-conversations/new")
     ensures: recipe.reconciles_ambiguous_response_by_same_request_uuid_and_intent()
     ensures: recipe.verifies_product_creation_separately_from_transcript_activity()
