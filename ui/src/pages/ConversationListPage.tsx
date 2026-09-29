@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ApiResponseError, api } from '../api';
+import { ApiResponseError, ConflictError, api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
 import type { Conversation, CodexLoginPreflight, ProductConversationListRow } from '../api';
 import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
@@ -392,7 +392,7 @@ export function ConversationListPage() {
         current === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
-        if (err instanceof ApiResponseError && err.code === 'close_already_history') {
+        if (err instanceof ConflictError && err.detail.error_type === 'close_already_history') {
           setProductConversations((rows) => projectProductConversationHistory(
             rows,
             productCloseTarget.product_conversation_id,

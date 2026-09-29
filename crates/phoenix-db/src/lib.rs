@@ -10373,7 +10373,7 @@ impl Database {
     async fn delete_product_conversation_if_empty(
         connection: &mut sqlx::SqliteConnection,
         product_conversation_id: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
         sqlx::query(
             "DELETE FROM close_worktree_cleanup_plans
              WHERE attempt_id IN (
@@ -10424,7 +10424,7 @@ impl Database {
         .bind(product_conversation_id)
         .execute(&mut *connection)
         .await?;
-        sqlx::query(
+        let deleted = sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
@@ -10434,8 +10434,9 @@ impl Database {
         )
         .bind(product_conversation_id)
         .execute(connection)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(deleted == 1)
     }
 
     async fn delete_work_scope_if_empty(
@@ -10666,7 +10667,8 @@ impl Database {
             observer,
         )
         .await?;
-        Self::delete_product_conversation_if_empty(connection, &product_conversation_id).await?;
+        let _ = Self::delete_product_conversation_if_empty(connection, &product_conversation_id)
+            .await?;
         Ok(true)
     }
 

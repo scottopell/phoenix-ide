@@ -236,7 +236,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNotNil(model.aggregateReconciliationId)
     }
 
-    func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() {
+    func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() async {
         let model = AppModel()
         model.installAPIForTesting()
         let staleId = model.prepareAggregateReconciliationForTesting()
@@ -244,12 +244,14 @@ final class AppModelProductConversationTests: XCTestCase {
         let current = [conversation(id: "new", aggregateId: "pc-new")]
         let stale = [conversation(id: "old", aggregateId: "pc-old")]
 
-        XCTAssertTrue(model.applyAggregateListForReconciliationForTesting(
+        let currentApplied = await model.applyAggregateListForReconciliationForTesting(
             current,
-            reconciliationId: currentId))
-        XCTAssertFalse(model.applyAggregateListForReconciliationForTesting(
+            reconciliationId: currentId)
+        let staleApplied = await model.applyAggregateListForReconciliationForTesting(
             stale,
-            reconciliationId: staleId))
+            reconciliationId: staleId)
+        XCTAssertTrue(currentApplied)
+        XCTAssertFalse(staleApplied)
         XCTAssertEqual(model.listStore.conversations, current)
     }
 
@@ -260,7 +262,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let stale = [conversation(id: "old", aggregateId: "pc-old")]
         let task = Task { @MainActor in
             while !Task.isCancelled { await Task.yield() }
-            return model.applyAggregateListForReconciliationForTesting(
+            return await model.applyAggregateListForReconciliationForTesting(
                 stale,
                 reconciliationId: reconciliationId)
         }
@@ -326,7 +328,7 @@ final class AppModelProductConversationTests: XCTestCase {
             ["pc-deleted"])
     }
 
-    func testAggregateReconciliationPreservesProvisioningShellOmittedFromProductList() {
+    func testAggregateReconciliationPreservesProvisioningShellOmittedFromProductList() async {
         let model = AppModel()
         model.installAPIForTesting()
         let shell = conversation(
@@ -339,9 +341,10 @@ final class AppModelProductConversationTests: XCTestCase {
         model.listStore.upsert(shell)
         let reconciliationId = model.prepareAggregateReconciliationForTesting()
 
-        XCTAssertTrue(model.applyAggregateListForReconciliationForTesting(
+        let applied = await model.applyAggregateListForReconciliationForTesting(
             [],
-            reconciliationId: reconciliationId))
+            reconciliationId: reconciliationId)
+        XCTAssertTrue(applied)
         XCTAssertEqual(model.listStore.conversations, [shell])
         XCTAssertEqual(
             AppModel.removedAggregateIds(

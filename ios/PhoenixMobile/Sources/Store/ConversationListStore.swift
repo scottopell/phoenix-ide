@@ -84,9 +84,9 @@ final class ConversationListStore {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
             externalMutationGeneration += 1
-            let missingProvisioningShells = Self.preservingMissing(
-                provisioningShells(),
-                in: fresh + Array(upsertsDuringRefresh.values))
+            let missingProvisioningShells = await confirmedMissingProvisioningShells(
+                api: api,
+                fresh: fresh + Array(upsertsDuringRefresh.values))
             apply(Self.merging(
                 fresh,
                 preserving: missingProvisioningShells.merging(upsertsDuringRefresh) { _, upsert in upsert },
@@ -105,6 +105,32 @@ final class ConversationListStore {
             }
             return (conversation.aggregateIdentity, conversation)
         })
+    }
+
+    func confirmedMissingProvisioningShellRows(
+        api: PhoenixAPI,
+        fresh: [Conversation]
+    ) async -> [Conversation] {
+        Array(await confirmedMissingProvisioningShells(api: api, fresh: fresh).values)
+    }
+
+    private func confirmedMissingProvisioningShells(
+        api: PhoenixAPI,
+        fresh: [Conversation]
+    ) async -> [String: Conversation] {
+        let candidates = Self.preservingMissing(provisioningShells(), in: fresh)
+        var confirmed: [String: Conversation] = [:]
+        for (aggregateId, conversation) in candidates {
+            do {
+                _ = try await api.getProductConversation(reference: aggregateId)
+                confirmed[aggregateId] = conversation
+            } catch APIError.http(status: 404, body: _) {
+                continue
+            } catch {
+                confirmed[aggregateId] = conversation
+            }
+        }
+        return confirmed
     }
 
     nonisolated static func preservingMissing(
@@ -257,10 +283,7 @@ final class ConversationListStore {
         let preservedByAggregate = Dictionary(uniqueKeysWithValues: localRows.map {
             ($0.aggregateIdentity, $0)
         })
-        let missingProvisioningShells = Self.preservingMissing(provisioningShells(), in: fresh)
-        apply(Self.merging(
-            fresh,
-            preserving: missingProvisioningShells.merging(preservedByAggregate) { _, local in local }))
+        apply(Self.merging(fresh, preserving: preservedByAggregate))
         lastError = nil
         return true
     }

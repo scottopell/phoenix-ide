@@ -81,7 +81,7 @@ final class ConversationListStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testExternalRefreshPreservesMissingTypedProvisioningShell() throws {
+    func testExternalRefreshRemovesUnconfirmedTypedProvisioningShell() throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
         let store = ConversationListStore()
@@ -98,10 +98,7 @@ final class ConversationListStoreTests: XCTestCase {
 
         XCTAssertEqual(
             Set(store.conversations.map(\.aggregateIdentity)),
-            ["pc-shell", "pc-ready"])
-        XCTAssertTrue(ConversationState.parse(
-            store.conversations.first { $0.aggregateIdentity == "pc-shell" }?.state
-        ).isProvisioningCreationShell)
+            ["pc-ready"])
     }
 
     func testRefreshBoundaryPreservesOnlyProvisioningShellsMissingFromFreshList() throws {

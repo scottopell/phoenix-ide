@@ -1516,8 +1516,8 @@ final class AppModel {
     func applyAggregateListForReconciliationForTesting(
         _ fresh: [Conversation],
         reconciliationId: UUID
-    ) -> Bool {
-        applyAggregateListForReconciliation(
+    ) async -> Bool {
+        await applyAggregateListForReconciliation(
             fresh,
             startedAt: listStore.externalRefreshToken(),
             startedGeneration: apiGeneration,
@@ -1849,16 +1849,17 @@ final class AppModel {
         startedAt token: ConversationListStore.ExternalRefreshToken,
         startedGeneration: Int,
         reconciliationId: UUID
-    ) -> Bool {
+    ) async -> Bool {
         guard !Task.isCancelled,
               aggregateReconciliationId == reconciliationId,
               apiGeneration == startedGeneration,
               connectivity.isOnline,
               isForeground
         else { return false }
-        let provisioningShells = listStore.conversations.filter {
-            ConversationState.parse($0.state).isProvisioningCreationShell
-        }
+        guard let api else { return false }
+        let provisioningShells = await listStore.confirmedMissingProvisioningShellRows(
+            api: api,
+            fresh: fresh)
         return listStore.applyExternal(
             fresh,
             preserving: provisioningShells,
@@ -1882,7 +1883,7 @@ final class AppModel {
                 guard let self else { return nil }
                 let token = self.listStore.externalRefreshToken()
                 let fresh = try await api.listConversations()
-                guard self.applyAggregateListForReconciliation(
+                guard await self.applyAggregateListForReconciliation(
                     fresh,
                     startedAt: token,
                     startedGeneration: startedGeneration,

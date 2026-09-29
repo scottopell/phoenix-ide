@@ -1,6 +1,6 @@
 import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { ApiResponseError, api, getConvDisplayState } from '../api';
+import { ApiResponseError, ConflictError, api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
 import { productConversationPresentationIndicator } from './ConversationList.presentation';
@@ -399,7 +399,7 @@ export function Sidebar({
         current === productCloseTarget.product_conversation_id ? null : current);
     } catch (err) {
       if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
-        if (err instanceof ApiResponseError && err.code === 'close_already_history') {
+        if (err instanceof ConflictError && err.detail.error_type === 'close_already_history') {
           setProductConversations((rows) => projectProductConversationHistory(
             rows,
             productCloseTarget.product_conversation_id,
