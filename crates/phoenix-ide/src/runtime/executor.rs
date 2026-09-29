@@ -3326,12 +3326,9 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            if matches!(terminal_event, Event::UserCancel { .. })
+            let clears_pending_trusted_results = matches!(terminal_event, Event::UserCancel { .. })
                 || (matches!(self.state, ConvState::AwaitingRecovery { .. })
-                    && !matches!(terminal_event, Event::CredentialBecameAvailable))
-            {
-                self.pending_trusted_tool_results.clear();
-            }
+                    && !matches!(terminal_event, Event::CredentialBecameAvailable));
             self.pending_sub_agent_acceptance
                 .clone_from(&accepted_sub_agent);
             let generated = match self.apply_transition_result(result).await {
@@ -3354,6 +3351,9 @@ where
                     return Err(error);
                 }
             };
+            if clears_pending_trusted_results {
+                self.pending_trusted_tool_results.clear();
+            }
             if settles_handoff {
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
@@ -4001,6 +4001,7 @@ where
                         return Err(error);
                     }
                     Err(error) if is_llm_dispatch => {
+                        self.pending_trusted_tool_results.clear();
                         generated_events.push(self.llm_dispatch_failure_event(error));
                         None
                     }

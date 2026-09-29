@@ -28,7 +28,13 @@ external entity TrustedBuiltinSkillResult {
     content: String
 }
 
+value TrustedDelivery {
+    audience_is_global_coordinator: Boolean
+    content_matches_result: Boolean
+}
+
 value PhoenixApiRecipe {
+    requested_objective_is_nonblank: Boolean
     discovers_auth: Boolean
     discovers_model_and_effort: Boolean
     generates_request_uuid_once: Boolean
@@ -38,7 +44,6 @@ value PhoenixApiRecipe {
     verifies_creation_separately_from_activity: Boolean
     distinguishes_product_root_and_current_transcript: Boolean
     performs_no_database_lifecycle_write: Boolean
-    objective_is_nonblank: Boolean
 }
 
 ------------------------------------------------------------
@@ -168,8 +173,11 @@ rule DeliverCoordinatorBuiltinToModel {
 
     ensures: visible_tool_result(tool_use_id) = authenticated_delivery_receipt
     ensures: persisted_tool_result(tool_use_id) = authenticated_delivery_receipt
-    ensures: next_live_model_request.latest_tool_result(tool_use_id) =
-        trusted_envelope(audience: "global-coordinator", content: result.content)
+    ensures: next_live_model_request.latest_tool_result(tool_use_id).trusted_delivery =
+        TrustedDelivery(
+            audience_is_global_coordinator: true,
+            content_matches_result: true
+        )
 
     @guidance
         -- The trusted payload stays opaque to transcript/UI surfaces. The live
@@ -183,6 +191,7 @@ rule PhoenixApiCreationRecipe {
     when: CoordinatorCreationAuthorized(recipe, origin, work_scope_id, objective)
 
     requires: ActiveWorkScope(work_scope_id)
+    requires: recipe.requested_objective_is_nonblank = true
 
     ensures: recipe.discovers_auth = true
     ensures: recipe.discovers_model_and_effort = true
@@ -193,7 +202,6 @@ rule PhoenixApiCreationRecipe {
     ensures: recipe.verifies_creation_separately_from_activity = true
     ensures: recipe.distinguishes_product_root_and_current_transcript = true
     ensures: recipe.performs_no_database_lifecycle_write = true
-    ensures: recipe.objective_is_nonblank = true
 
     @guidance
         -- Global retains the immutable request identity and exact intent across
