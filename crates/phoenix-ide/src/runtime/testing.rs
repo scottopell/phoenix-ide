@@ -621,6 +621,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_tool_round_persist: Mutex<bool>,
     fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -691,6 +692,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_tool_round_persist: Mutex::new(false),
             fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
@@ -737,6 +739,10 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_tool_round_persist(&self, fail: bool) {
+        *self.fail_tool_round_persist.lock().unwrap() = fail;
     }
 
     pub fn fail_sub_agent_acceptance_once(&self) {
@@ -1813,6 +1819,9 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
     ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());

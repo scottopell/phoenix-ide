@@ -623,36 +623,73 @@ fn tool_result_message_content(result: &ToolResult) -> MessageContent {
     )
 }
 
-fn trusted_tool_results(results: &[ToolResult]) -> Vec<(String, String)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTrustedToolResult {
+    tool_result_message_id: String,
+    output: String,
+}
+
+fn trusted_tool_results(
+    assistant_message_id: &str,
+    results: &[ToolResult],
+) -> Vec<PendingTrustedToolResult> {
     results
         .iter()
         .filter_map(|result| match &result.outcome {
-            ToolOutcome::TrustedInstructions { output } => {
-                Some((result.tool_use_id.clone(), output.clone()))
-            }
+            ToolOutcome::TrustedInstructions { output } => Some(PendingTrustedToolResult {
+                tool_result_message_id: tool_result_message_id(
+                    assistant_message_id,
+                    &result.tool_use_id,
+                ),
+                output: output.clone(),
+            }),
             _ => None,
         })
         .collect()
 }
 
-fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[(String, String)]) {
-    for (trusted_id, trusted) in trusted_results {
-        if let Some(content) = messages.iter_mut().rev().find_map(|message| {
-            message
-                .content
-                .iter_mut()
-                .rev()
-                .find_map(|block| match block {
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } if tool_use_id == trusted_id => Some(content),
-                    _ => None,
+fn merge_trusted_tool_results(
+    pending: &mut Vec<PendingTrustedToolResult>,
+    new_results: Vec<PendingTrustedToolResult>,
+) {
+    for result in new_results {
+        pending.retain(|pending| pending.tool_result_message_id != result.tool_result_message_id);
+        pending.push(result);
+    }
+}
+
+fn trusted_request_continues(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+    )
+}
+
+fn overlay_trusted_tool_results(
+    messages: &mut [LlmMessage],
+    trusted_results: &[PendingTrustedToolResult],
+) {
+    for trusted in trusted_results {
+        if let Some(content) = messages.iter_mut().find_map(|message| {
+            (message.source_message_id.as_deref() == Some(trusted.tool_result_message_id.as_str()))
+                .then(|| {
+                    message.content.iter_mut().find_map(|block| match block {
+                        ContentBlock::ToolResult { content, .. } => Some(content),
+                        _ => None,
+                    })
                 })
+                .flatten()
         }) {
             *content = format!(
-                "<trusted_builtin_skill audience=\"global-coordinator\">{trusted}</trusted_builtin_skill>"
+                "<trusted_builtin_skill audience=\"global-coordinator\">{}</trusted_builtin_skill>",
+                trusted.output
             );
         }
     }
@@ -1793,7 +1830,7 @@ where
     /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
-    pending_trusted_tool_results: Vec<(String, String)>,
+    pending_trusted_tool_results: Vec<PendingTrustedToolResult>,
     /// Accepted provider-private replay mutation waiting for the reducer's
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
@@ -3021,6 +3058,7 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
+            && !trusted_request_continues(&result.new_state)
         {
             self.pending_trusted_tool_results.clear();
         }
@@ -3488,6 +3526,18 @@ where
             None
         };
         let old_state = self.state.clone();
+        let clears_pending_trusted_after_commit =
+            matches!(
+                old_state,
+                ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. }
+            ) || (matches!(old_state, ConvState::LlmRequesting { .. })
+                && result
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::AbortLlm)))
+                || (matches!(old_state, ConvState::AwaitingRecovery { .. })
+                    && !matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let mut pending_trusted_cleared = false;
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
@@ -3675,6 +3725,8 @@ where
                 result.effects,
                 drain_event,
                 projection_guard,
+                clears_pending_trusted_after_commit,
+                (&old_state, old_state_updated_at),
                 &mut generated_events,
             ))
             .await?;
@@ -3687,6 +3739,8 @@ where
                     effect,
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
+                            || (clears_pending_trusted_after_commit
+                                && !terminal_direct_turn_transition)
                 );
                 let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
                     && task_approval_execution.is_some();
@@ -3949,9 +4003,20 @@ where
                     )
                     .await
                 };
+                if state_committed
+                    && clears_pending_trusted_after_commit
+                    && !pending_trusted_cleared
+                {
+                    self.pending_trusted_tool_results.clear();
+                    pending_trusted_cleared = true;
+                }
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
                         state_committed |= is_state_persist;
+                        if is_state_persist && clears_pending_trusted_after_commit {
+                            self.pending_trusted_tool_results.clear();
+                            pending_trusted_cleared = true;
+                        }
                         effect_result
                     }
                     Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
@@ -3994,6 +4059,7 @@ where
                         return Err(error);
                     }
                     Err(error) if is_llm_dispatch => {
+                        self.pending_trusted_tool_results.clear();
                         generated_events.push(self.llm_dispatch_failure_event(error));
                         None
                     }
@@ -4090,9 +4156,16 @@ where
         original_effects: Vec<Effect>,
         drain_event: Event,
         projection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        clears_pending_trusted_after_commit: bool,
+        rollback_state: (&ConvState, DateTime<Utc>),
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
+        let (old_state, old_state_updated_at) = rollback_state;
         let mut deferred_request_llm: Option<Effect> = None;
+        let drained_entries = match &drain_event {
+            Event::SteerDrainedUserMessages { entries } => entries.clone(),
+            _ => Vec::new(),
+        };
         // Cosmetic (task 60004): when the inline drain enters from Idle, the
         // original transition's Idle state-change SSE would briefly render the
         // conversation as Idle before the drain's Idle->LlmRequesting notify.
@@ -4111,6 +4184,9 @@ where
                     Effect::PersistState => {
                         let mut admitted = self.admit_authoritative_effect()?;
                         self.persist_state_effect(false, &mut admitted).await?;
+                        if clears_pending_trusted_after_commit {
+                            self.pending_trusted_tool_results.clear();
+                        }
                         continue;
                     }
                     Effect::NotifyStateChange => {
@@ -4121,7 +4197,18 @@ where
             }
             let is_authoritative_persist =
                 matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
+            let effect_result = Box::pin(self.execute_effect(effect)).await;
+            let effect_result = match effect_result {
+                Ok(effect_result) => effect_result,
+                Err(error) => {
+                    let failed_state = self.state.clone();
+                    self.install_live_state(old_state.clone(), old_state_updated_at, true)?;
+                    self.manage_deadline(&failed_state);
+                    self.steering_queue = drained_entries;
+                    return Err(error);
+                }
+            };
+            if let Some(gen_event) = effect_result {
                 generated_events.push(gen_event);
             }
             if is_authoritative_persist && self.direct_turn_materialization_aborted {
@@ -4172,6 +4259,7 @@ where
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
+                    self.pending_trusted_tool_results.clear();
                     generated_events.push(self.llm_dispatch_failure_event(error));
                 }
             }
@@ -6531,7 +6619,14 @@ where
             }
 
             AuthoritativeEffect::PersistToolResults { results } => {
-                self.pending_trusted_tool_results = trusted_tool_results(&results);
+                if results
+                    .iter()
+                    .any(|result| matches!(result.outcome, ToolOutcome::TrustedInstructions { .. }))
+                {
+                    tracing::debug!(
+                        "not retaining trusted tool result without an owning assistant round"
+                    );
+                }
                 for result in results {
                     let content = tool_result_message_content(&result);
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
@@ -7211,7 +7306,7 @@ where
         let trusted_results = self.pending_trusted_tool_results.clone();
         let trusted_token_reserve = trusted_results
             .iter()
-            .map(|(_, content)| estimate_text_tokens(content))
+            .map(|result| estimate_text_tokens(&result.output))
             .sum::<usize>();
         let mut frozen_messages = assemble_cleared_messages(
             &self.storage,
@@ -7972,7 +8067,8 @@ where
             assistant_message,
             tool_results,
         } = data;
-        self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
+        let new_trusted_results =
+            trusted_tool_results(&assistant_message.message_id, &tool_results);
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -8032,6 +8128,7 @@ where
                 return Err(error);
             }
         }
+        merge_trusted_tool_results(&mut self.pending_trusted_tool_results, new_trusted_results);
         let _ = self
             .broadcast_tx
             .admitted_publication(admitted)
@@ -8056,7 +8153,8 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
+                let new_trusted_results =
+                    trusted_tool_results(&assistant_message.message_id, &tool_results);
                 let conv_id = self.context.conversation_id.clone();
 
                 // Build the assistant message row.
@@ -8137,6 +8235,11 @@ where
                         .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                         .await?;
                 }
+
+                merge_trusted_tool_results(
+                    &mut self.pending_trusted_tool_results,
+                    new_trusted_results,
+                );
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
@@ -20257,26 +20360,28 @@ mod steer_drain_detector_tests {
     }
 
     #[test]
-    fn trusted_overlay_targets_only_latest_reused_tool_id() {
+    fn trusted_overlay_targets_exact_owning_result_when_provider_id_is_reused() {
         use phoenix_llm::ContentBlock;
 
+        let trusted_result_id = tool_result_message_id("trusted-round", "reused");
+        let ordinary_result_id = tool_result_message_id("ordinary-round", "reused");
         let mut messages = vec![
             LlmMessage {
-                source_message_id: None,
+                source_message_id: Some(trusted_result_id.clone()),
                 role: phoenix_llm::MessageRole::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "reused".to_string(),
-                    content: "historical ordinary output".to_string(),
+                    content: "persisted trusted receipt".to_string(),
                     is_error: false,
                     images: vec![],
                 }],
             },
             LlmMessage {
-                source_message_id: None,
+                source_message_id: Some(ordinary_result_id),
                 role: phoenix_llm::MessageRole::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "reused".to_string(),
-                    content: "current persisted placeholder".to_string(),
+                    content: "later ordinary output".to_string(),
                     is_error: false,
                     images: vec![],
                 }],
@@ -20285,23 +20390,554 @@ mod steer_drain_detector_tests {
 
         overlay_trusted_tool_results(
             &mut messages,
-            &[(
-                "reused".to_string(),
-                "authenticated current output".to_string(),
-            )],
+            &[PendingTrustedToolResult {
+                tool_result_message_id: trusted_result_id,
+                output: "authenticated output".to_string(),
+            }],
         );
 
         assert_eq!(count_trusted_envelopes(&messages), 1);
         assert!(matches!(
             &messages[0].content[0],
             ContentBlock::ToolResult { content, .. }
-                if content == "historical ordinary output"
+                if content.contains("authenticated output")
         ));
         assert!(matches!(
             &messages[1].content[0],
             ContentBlock::ToolResult { content, .. }
-                if content.contains("authenticated current output")
+                if content == "later ordinary output"
         ));
+    }
+
+    #[tokio::test]
+    async fn trusted_ownership_survives_later_round_reusing_provider_tool_id() {
+        use crate::db::ToolOutcome;
+
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-reused-id",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let trusted_round = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "trusted-round".into(),
+                vec![ContentBlock::tool_use(
+                    "reused",
+                    "skill",
+                    serde_json::json!({"skill_name": "phoenix-api"}),
+                )],
+                None,
+                None,
+            ),
+            vec![ToolResult {
+                tool_use_id: "reused".into(),
+                outcome: ToolOutcome::TrustedInstructions {
+                    output: "authenticated payload".into(),
+                },
+                duration_ms: None,
+            }],
+        )
+        .expect("trusted checkpoint");
+        rt.execute_effect(Effect::PersistCheckpoint {
+            data: trusted_round,
+        })
+        .await
+        .expect("persist trusted round");
+
+        let ordinary_round = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "ordinary-round".into(),
+                vec![ContentBlock::tool_use(
+                    "reused",
+                    "bash",
+                    serde_json::json!({"cmd": "echo ordinary"}),
+                )],
+                None,
+                None,
+            ),
+            vec![ToolResult::success(
+                "reused".into(),
+                "ordinary output".into(),
+            )],
+        )
+        .expect("ordinary checkpoint");
+        rt.execute_effect(Effect::PersistCheckpoint {
+            data: ordinary_round,
+        })
+        .await
+        .expect("persist ordinary round");
+
+        rt.tool_executor = Arc::new(Arc::new(
+            MockToolExecutor::new()
+                .with_tool("skill", crate::tools::ToolOutput::success("unused"))
+                .with_tool("bash", crate::tools::ToolOutput::success("unused")),
+        ));
+
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
+            content: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        rt.execute_effect(Effect::RequestLlm)
+            .await
+            .expect("assemble live request");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rt.llm_client.recorded_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "request not recorded"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+        let request = rt.llm_client.recorded_requests().remove(0);
+        assert_eq!(count_trusted_envelopes(&request.messages), 1);
+        let ordinary_id = tool_result_message_id("ordinary-round", "reused");
+        assert!(request.messages.iter().any(|message| {
+            message.source_message_id.as_deref() == Some(ordinary_id.as_str())
+                && matches!(
+                    message.content.first(),
+                    Some(ContentBlock::ToolResult { content, .. }) if content == "ordinary output"
+                )
+        }));
+        if let Some(task) = rt.llm_task_handle.take() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_cancellation_checkpoint_clears_trusted_payload_before_queued_request() {
+        use crate::db::ToolOutcome;
+
+        let cancellation_assistant = AssistantMessage::new(
+            "cancel-round".into(),
+            vec![ContentBlock::tool_use(
+                "cancelled-tool",
+                "bash",
+                serde_json::json!({"cmd": "sleep 10"}),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "cancelled-tool",
+                ToolInput::from(crate::tools::BashToolInput::run("sleep 10")),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: cancellation_assistant,
+        };
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-tool-cancel",
+            state,
+            vec![mk_entry("queued-next", "unrelated next request")],
+        );
+        let trusted_round = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "trusted-round".into(),
+                vec![ContentBlock::tool_use(
+                    "phoenix-api-call",
+                    "skill",
+                    serde_json::json!({"skill_name": "phoenix-api"}),
+                )],
+                None,
+                None,
+            ),
+            vec![ToolResult {
+                tool_use_id: "phoenix-api-call".into(),
+                outcome: ToolOutcome::TrustedInstructions {
+                    output: "authenticated payload".into(),
+                },
+                duration_ms: None,
+            }],
+        )
+        .expect("trusted checkpoint");
+        rt.execute_effect(Effect::PersistCheckpoint {
+            data: trusted_round,
+        })
+        .await
+        .expect("persist trusted round");
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
+            content: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("enter CancellingTool");
+        assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+
+        rt.process_event(Event::ToolAborted {
+            tool_use_id: "cancelled-tool".into(),
+        })
+        .await
+        .expect("commit cancellation checkpoint and drain queued request");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.pending_trusted_tool_results.is_empty());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rt.llm_client.recorded_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "request not recorded"
+            );
+            tokio::task::yield_now().await;
+        }
+        let requests = rt.llm_client.recorded_requests();
+        assert_eq!(count_trusted_envelopes(&requests[0].messages), 0);
+        if let Some(task) = rt.llm_task_handle.take() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tool_cancellation_checkpoint_retains_trusted_payload_and_owner_state() {
+        let cancellation_assistant = AssistantMessage::new(
+            "cancel-round".into(),
+            vec![ContentBlock::tool_use(
+                "cancelled-tool",
+                "bash",
+                serde_json::json!({"cmd": "sleep 10"}),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "cancelled-tool",
+                ToolInput::from(crate::tools::BashToolInput::run("sleep 10")),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: cancellation_assistant,
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-tool-cancel-failure",
+            state,
+            vec![mk_entry("queued-next", "must remain queued")],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".into(),
+        }];
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("enter CancellingTool");
+        storage.set_fail_tool_round_persist(true);
+
+        let error = rt
+            .process_event(Event::ToolAborted {
+                tool_use_id: "cancelled-tool".into(),
+            })
+            .await
+            .expect_err("checkpoint failure must roll back cancellation settlement");
+
+        assert!(error.contains("injected tool round persist failure"));
+        assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert_eq!(rt.steering_queue.len(), 1);
+    }
+
+    #[test]
+    fn trusted_request_lifetime_state_table_covers_owned_continuations() {
+        let continuation_states = [
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::ToolExecuting {
+                assistant_message: AssistantMessage::new("a".into(), vec![], None, None),
+                current_tool: ToolCall::new(
+                    "tool",
+                    crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                        "echo staged",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+            },
+            ConvState::CancellingTool {
+                tool_use_id: "tool".into(),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+                skipped_tools: vec![],
+                completed_results: vec![],
+                assistant_message: AssistantMessage::new("a".into(), vec![], None, None),
+                pending_sub_agents: vec![],
+            },
+            ConvState::AwaitingRecovery {
+                message: "recovering".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+            },
+            ConvState::AwaitingTaskApproval {
+                task_file: "tasks/1.md".into(),
+                title: "task".into(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "plan".into(),
+            },
+            ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "question".into(),
+            },
+        ];
+        assert!(continuation_states.iter().all(trusted_request_continues));
+
+        let disposal_states = [
+            ConvState::Idle,
+            ConvState::Error {
+                message: "error".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                resets_at: None,
+            },
+            ConvState::ContextExhausted {
+                summary: "done".into(),
+            },
+            ConvState::Terminal,
+        ];
+        assert!(disposal_states
+            .iter()
+            .all(|state| !trusted_request_continues(state)));
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_staged_tool_round() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-tool-round",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            content: vec![ContentBlock::ToolUse {
+                id: "bash-round".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }],
+            provider_replay: None,
+            tool_calls: vec![ToolCall::new(
+                "bash-round",
+                crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                    "echo staged",
+                )),
+            )],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "staged-request".into(),
+        }))
+        .await
+        .expect("enter staged tool round");
+
+        assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_ordinary_tool_checkpoint() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-checkpoint",
+            ConvState::ToolExecuting {
+                assistant_message: AssistantMessage::new(
+                    "assistant-round".into(),
+                    vec![ContentBlock::ToolUse {
+                        id: "bash-round".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    None,
+                    None,
+                ),
+                current_tool: ToolCall::new(
+                    "bash-round",
+                    crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                        "echo staged",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+            },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        let mut admitted = rt.admit_authoritative_effect().expect("authority");
+        rt.persist_checkpoint(
+            CheckpointData::tool_round(
+                AssistantMessage::new(
+                    "assistant-round".into(),
+                    vec![ContentBlock::ToolUse {
+                        id: "bash-round".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    None,
+                    None,
+                ),
+                vec![ToolResult::success("bash-round".into(), "staged".into())],
+            )
+            .expect("checkpoint"),
+            &mut admitted,
+        )
+        .await
+        .expect("persist ordinary checkpoint");
+
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_live_credential_recovery() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-auth-recovery",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::AuthError {
+            message: "credential helper active".to_string(),
+            recovery_in_progress: true,
+        }))
+        .await
+        .expect("enter credential recovery");
+
+        assert!(matches!(rt.state, ConvState::AwaitingRecovery { .. }));
+        assert_eq!(
+            rt.pending_trusted_tool_results,
+            vec![PendingTrustedToolResult {
+                tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+                output: "authenticated payload".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_clears_when_active_llm_request_is_cancelled() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-llm-cancel",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel active LLM request");
+
+        assert!(rt.pending_trusted_tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_clears_when_credential_recovery_is_cancelled() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-auth-cancel",
+            ConvState::AwaitingRecovery {
+                message: "credential helper active".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+            },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: tool_result_message_id("trusted-round", "phoenix-api-call"),
+            output: "authenticated payload".to_string(),
+        }];
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel credential recovery");
+
+        assert!(rt.pending_trusted_tool_results.is_empty());
+    }
+
+    #[test]
+    fn authenticated_phoenix_api_payload_is_hidden_then_overlaid_for_live_model_request() {
+        use crate::db::{MessageContent, ToolOutcome, ToolResult};
+        use phoenix_llm::ContentBlock;
+
+        let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None)
+            .expect("authenticated coordinator catalog");
+        let payload = phoenix_skills::invoke_trusted_coordinator_builtin("phoenix-api", &catalog)
+            .expect("embedded phoenix-api payload");
+        let result = ToolResult {
+            tool_use_id: "phoenix-api-call".to_string(),
+            outcome: ToolOutcome::TrustedInstructions {
+                output: payload.clone(),
+            },
+            duration_ms: None,
+        };
+
+        let persisted = tool_result_message_content(&result);
+        let MessageContent::Tool(persisted) = persisted else {
+            panic!("trusted instructions must persist as a tool result receipt");
+        };
+        assert_eq!(
+            persisted.content,
+            "Authenticated built-in skill instructions were delivered for this live request."
+        );
+        assert!(!persisted
+            .content
+            .contains("POST /api/product-conversations/new"));
+
+        let trusted_results = trusted_tool_results("trusted-round", &[result]);
+        let mut messages = vec![LlmMessage {
+            source_message_id: Some(tool_result_message_id("trusted-round", "phoenix-api-call")),
+            role: phoenix_llm::MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "phoenix-api-call".to_string(),
+                content: persisted.content,
+                is_error: false,
+                images: vec![],
+            }],
+        }];
+        overlay_trusted_tool_results(&mut messages, &trusted_results);
+
+        assert!(matches!(
+            &messages[0].content[0],
+            ContentBlock::ToolResult { content, .. }
+                if content.starts_with("<trusted_builtin_skill audience=\"global-coordinator\">")
+                    && content.contains("POST /api/product-conversations/new")
+                    && content.contains("UUID_BYTES <<<\"$(od -An -N16 -tx1 /dev/urandom)")
+                    && content.ends_with("</trusted_builtin_skill>")
+        ));
+        assert_eq!(count_trusted_envelopes(&messages), 1);
+        assert!(payload.contains("GET /api/models"));
     }
 
     #[tokio::test]
