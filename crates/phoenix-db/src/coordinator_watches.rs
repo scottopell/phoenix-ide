@@ -222,6 +222,7 @@ pub(crate) async fn record_creation_event_tx(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // One transaction binds the complete source occurrence and terminal fact.
 async fn record_watch_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     occurrence_kind: &str,
@@ -606,6 +607,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises request, cancellation, and subsequent execution in one lifecycle.
     async fn requested_close_fences_delivery_but_cancel_keeps_watch_open() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db

@@ -1668,7 +1668,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
-            .bind(req.origin.kind())
+            .bind(req.origin.db_parts().0)
             .bind(&req.message_id)
             .execute(db.pool())
             .await
@@ -1753,7 +1753,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
-            .bind(req.origin.kind())
+            .bind(req.origin.db_parts().0)
             .bind(&req.message_id)
             .execute(db.pool())
             .await

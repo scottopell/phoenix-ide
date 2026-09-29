@@ -14594,7 +14594,21 @@ async fn classify_creation_watch_outcome(
         ConvState::CreationFailed { error, .. } | ConvState::Error { message: error, .. } => {
             ("Failed", Some(error.as_str()))
         }
-        _ => return Ok(()),
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. } => return Ok(()),
     };
     crate::coordinator_watches::record_creation_event_tx(
         tx,
