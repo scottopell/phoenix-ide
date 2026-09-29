@@ -84,7 +84,7 @@ printf '\n'
 
 ### 2. Prepare the exact intent as data
 
-Global now has the retained UUID, encoded scoped cwd, exact live model/effort, explicit-or-default language selection, and a non-whitespace objective (`objective.trim()` must not be empty). Construct the complete text-only JSON object exactly once, validate that it has only the fields shown above and exactly `images: []`, and base64-encode those UTF-8 JSON bytes. Keep that base64 value unchanged through reconciliation and retry. Base64 carries arbitrary quotes, shell characters, and trailing newlines as data rather than shell syntax. Reject an encoded intent that approaches the Bash tool's command limit; do not split, write, or reconstruct it through the filesystem.
+Global now has the retained UUID, encoded scoped cwd, exact live model/effort, explicit-or-default language selection, and a non-whitespace objective (`objective.trim()` must not be empty). Construct the complete text-only JSON object exactly once, validate that it has only the fields shown above and exactly `images: []`, and base64-encode those UTF-8 JSON bytes. Keep that base64 value unchanged through reconciliation and retry. Base64 carries arbitrary quotes, shell characters, and trailing newlines as data rather than shell syntax. This recipe supports only intents whose complete `INTENT_B64` fits comfortably inside Bash's 60k-token command-input limit. Reject larger text objectives before UUID generation; the public API has no bounded non-command upload transport for larger supported route bodies. Do not split, write, or reconstruct intent through the filesystem.
 
 ### 3. Copyable POST transport
 

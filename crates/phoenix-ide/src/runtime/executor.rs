@@ -8086,7 +8086,8 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
+                self.pending_trusted_tool_results
+                    .extend(trusted_tool_results(&tool_results));
                 let conv_id = self.context.conversation_id.clone();
 
                 // Build the assistant message row.
@@ -20367,6 +20368,62 @@ mod steer_drain_detector_tests {
         .expect("enter staged tool round");
 
         assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
+        assert_eq!(rt.pending_trusted_tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_payload_survives_ordinary_tool_checkpoint() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-trusted-checkpoint",
+            ConvState::ToolExecuting {
+                assistant_message: AssistantMessage::new(
+                    "assistant-round".into(),
+                    vec![ContentBlock::ToolUse {
+                        id: "bash-round".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    None,
+                    None,
+                ),
+                current_tool: ToolCall::new(
+                    "bash-round",
+                    crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                        "echo staged",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+            },
+            vec![],
+        );
+        rt.pending_trusted_tool_results = vec![(
+            "phoenix-api-call".to_string(),
+            "authenticated payload".to_string(),
+        )];
+
+        let mut admitted = rt.admit_authoritative_effect().expect("authority");
+        rt.persist_checkpoint(
+            CheckpointData::tool_round(
+                AssistantMessage::new(
+                    "assistant-round".into(),
+                    vec![ContentBlock::ToolUse {
+                        id: "bash-round".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    None,
+                    None,
+                ),
+                vec![ToolResult::success("bash-round".into(), "staged".into())],
+            )
+            .expect("checkpoint"),
+            &mut admitted,
+        )
+        .await
+        .expect("persist ordinary checkpoint");
+
         assert_eq!(rt.pending_trusted_tool_results.len(), 1);
     }
 

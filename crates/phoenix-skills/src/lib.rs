@@ -1384,6 +1384,7 @@ mod tests {
             "creation_cwd_b64=",
             "leading/trailing-whitespace WorkScope path is unsupported",
             "objective.trim()",
+            "Reject larger text objectives before UUID generation",
             "INTENT_B64",
             "repeat the step-3 POST at most once",
             "GET /api/product-conversations/creation",

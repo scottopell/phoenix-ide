@@ -37,6 +37,7 @@ value TrustedDelivery {
 
 value PhoenixApiRecipe {
     requested_objective_is_nonblank: Boolean
+    requested_objective_fits_scoped_bash: Boolean
     discovers_auth: Boolean
     discovers_model_and_effort: Boolean
     generates_request_uuid_once: Boolean
@@ -191,6 +192,7 @@ rule PhoenixApiCreationRecipe {
 
     requires: ActiveWorkScope(work_scope_id)
     requires: recipe.requested_objective_is_nonblank = true
+    requires: recipe.requested_objective_fits_scoped_bash = true
 
     ensures: recipe.discovers_auth = true
     ensures: recipe.discovers_model_and_effort = true
