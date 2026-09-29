@@ -10414,6 +10414,17 @@ impl Database {
         .execute(&mut *connection)
         .await?;
         sqlx::query(
+            "DELETE FROM product_conversation_sources
+             WHERE (target_product_conversation_id = ?1 OR source_product_conversation_id = ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
