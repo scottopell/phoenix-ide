@@ -14596,7 +14596,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
-    let job = sqlx::query("SELECT id, generation FROM conversation_creation_jobs j WHERE j.conversation_id = ?1 AND j.phase = 'ready' AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = j.conversation_id)")
+    let job = sqlx::query("SELECT id, generation FROM conversation_creation_jobs j WHERE j.conversation_id = ?1 AND j.status = 'ready' AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = j.conversation_id)")
         .bind(conversation_id).fetch_optional(&mut **tx).await?;
     if let Some(job) = job {
         let generation: i64 = job.try_get("generation")?;
