@@ -1351,6 +1351,9 @@ final class AppModel {
                         transcriptIds: reconciledTranscriptIds,
                         startedGeneration: startedGeneration,
                         api: api)
+                    if pendingProductCloseConfirmation == nil {
+                        await rehydratePendingProductCloseConfirmation(api: api)
+                    }
                     return
                 } else {
                     pendingProductCloseConfirmation = PendingProductCloseConfirmation(snapshot: snapshot)

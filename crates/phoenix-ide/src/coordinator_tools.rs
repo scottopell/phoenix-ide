@@ -320,13 +320,13 @@ impl Tool for SendConversationMessage {
             crate::api::global_read::GlobalMessageTarget::StableProductConversation {
                 product_conversation_id,
             } => {
-                if self
+                match self
                     .service
                     .product_conversation_id_for_transcript(&ctx.conversation_id)
                     .await
-                    .is_ok_and(|origin| origin == product_conversation_id)
                 {
-                    return encode_message_output(&SendConversationMessageOutput::Rejected {
+                    Ok(origin) if origin == product_conversation_id => {
+                        return encode_message_output(&SendConversationMessageOutput::Rejected {
                             target: Some(parsed.target),
                             conversation_id: Some(ctx.conversation_id),
                             message_id: parsed.message_id,
@@ -334,6 +334,17 @@ impl Tool for SendConversationMessage {
                             message: "send_conversation_message cannot target its originating ProductConversation"
                                 .to_string(),
                         });
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return encode_message_output(&SendConversationMessageOutput::Rejected {
+                            target: Some(parsed.target),
+                            conversation_id: None,
+                            message_id: parsed.message_id,
+                            reason_code: "target_resolution_failed",
+                            message: error,
+                        });
+                    }
                 }
                 SendChatTarget::StableProductConversation(product_conversation_id)
             }

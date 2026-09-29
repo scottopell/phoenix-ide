@@ -632,6 +632,9 @@ async fn resolve_reference_impl(
             .read_ordinary_product_conversation_snapshot(id, None, None, 1)
             .await
             .map_err(map_db_not_found)?;
+        if snapshot.aggregate.product_conversation.id().as_str() != id {
+            return Err(AppError::NotFound(id.to_string()));
+        }
         let aggregate = snapshot.aggregate;
         let current = aggregate
             .segments
