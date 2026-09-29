@@ -1766,9 +1766,13 @@ mod tests {
             .unwrap()
             .iter()
             .flat_map(|segment| segment["messages"].as_array().unwrap())
-            .all(
-                |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
-            ));
+            .all(|message| message["message_id"] != "handoff"));
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .any(|message| message["message_id"] == "opening"));
         assert!(snapshot["writable_transcript_row_id"].is_null());
         assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
         assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
