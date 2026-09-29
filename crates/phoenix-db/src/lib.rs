@@ -14609,7 +14609,10 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     .await?;
     if let Some(message_id) = steering {
         let outcome = match state {
-            ConvState::Idle | ConvState::Terminal { .. } => Some(("completed", None)),
+            ConvState::Idle | ConvState::Terminal { .. } | ConvState::Completed { .. } => {
+                Some(("completed", None))
+            }
+            ConvState::CreationCancelled { .. } => Some(("cancelled", None)),
             ConvState::Error { message, .. } => Some(("failed", Some(message.as_str()))),
             ConvState::ContextExhausted { .. } => Some(("failed", Some("context exhausted"))),
             ConvState::RecoverableContinuationFailure { .. } => {
