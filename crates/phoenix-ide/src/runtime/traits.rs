@@ -574,18 +574,6 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
     ) -> Result<(), String>;
-    #[allow(clippy::too_many_arguments)]
-    async fn add_message_and_clear_provider_replay(
-        &self,
-        message_id: &str,
-        conversation_id: &str,
-        sequence_id: i64,
-        content: &MessageContent,
-        display_data: Option<&Value>,
-        usage_data: Option<&UsageData>,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<Message, String>;
 
     #[allow(clippy::too_many_arguments)]
     async fn add_message_and_clear_provider_replay_with_origin(
@@ -1285,31 +1273,6 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 state,
                 state_updated_at,
                 update,
-            )
-            .await
-    }
-    #[allow(clippy::too_many_arguments)]
-    async fn add_message_and_clear_provider_replay(
-        &self,
-        message_id: &str,
-        conversation_id: &str,
-        sequence_id: i64,
-        content: &MessageContent,
-        display_data: Option<&Value>,
-        usage_data: Option<&UsageData>,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<Message, String> {
-        (**self)
-            .add_message_and_clear_provider_replay(
-                message_id,
-                conversation_id,
-                sequence_id,
-                content,
-                display_data,
-                usage_data,
-                state,
-                state_updated_at,
             )
             .await
     }
@@ -2518,32 +2481,6 @@ impl StateStore for DatabaseStorage {
                 state,
                 state_updated_at,
                 update,
-            )
-            .await
-            .map_err(|error| error.to_string())
-    }
-    #[allow(clippy::too_many_arguments)]
-    async fn add_message_and_clear_provider_replay(
-        &self,
-        message_id: &str,
-        conversation_id: &str,
-        sequence_id: i64,
-        content: &MessageContent,
-        display_data: Option<&Value>,
-        usage_data: Option<&UsageData>,
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> Result<Message, String> {
-        self.db
-            .add_message_and_clear_provider_replay(
-                message_id,
-                conversation_id,
-                sequence_id,
-                content,
-                display_data,
-                usage_data,
-                state,
-                state_updated_at,
             )
             .await
             .map_err(|error| error.to_string())
