@@ -107,6 +107,7 @@ async fn trajectory_export_handler(
 const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/stream",
     "/api/chains/:rootId/stream",
+    "/api/product-conversations/events",
     "/api/share/:token/events",
     "/api/conversations/:id/terminal",
     "/api/terminal/global",

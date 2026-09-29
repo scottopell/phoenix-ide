@@ -295,16 +295,16 @@ async fn resolve_conversation_read_target(
                 "ProductConversation reference must be @conv:<product_conversation_id>".to_string(),
             );
         }
-        let product_conversation_id =
-            phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
-                .expect("non-empty typed reference");
-        let aggregate = service
+        let snapshot = service
             .db
-            .get_ordinary_product_conversation(&product_conversation_id)
+            .read_ordinary_product_conversation_snapshot(id, None, None, 1)
             .await
             .map_err(|_| "ProductConversation reference not found".to_string())?;
+        if snapshot.aggregate.product_conversation.id().as_str() != id {
+            return Err("ProductConversation reference not found".to_string());
+        }
         return Ok(ConversationReadTarget {
-            conversation_id: aggregate.latest_transcript_row_id,
+            conversation_id: snapshot.aggregate.latest_transcript_row_id,
             message_id: None,
         });
     }
