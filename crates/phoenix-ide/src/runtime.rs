@@ -2078,6 +2078,25 @@ pub enum SseEvent {
     },
 }
 
+fn approved_managed_registry(
+    mode: &ConvMode,
+    authority: crate::work_scope::ResourceAuthority,
+    approved_objective: Option<&phoenix_core::task_handoff::ApprovedTaskSnapshot>,
+    agents: Vec<phoenix_agents::AgentDefinition>,
+    writing_tools: crate::tools::WritingConversationTools,
+) -> Result<Option<ToolRegistry>, String> {
+    if authority != crate::work_scope::ResourceAuthority::Work
+        || approved_objective.is_none()
+        || !matches!(
+            mode,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+        )
+    {
+        return Ok(None);
+    }
+    ToolRegistry::git_backed_writing_parent(agents, writing_tools).map(Some)
+}
+
 fn sub_agent_registry_for_authority(
     authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
@@ -2143,6 +2162,15 @@ fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<Resourc
     }
 }
 
+async fn accepts_browser_scope_event(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> bool {
+    crate::resource_authority::resolve_resource_authority(db, conv)
+        .await
+        .is_ok_and(|authority| authority.authority == crate::work_scope::ResourceAuthority::Work)
+}
+
 fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
     let owner_id = worktree_path.file_name()?.to_str()?;
     let id_prefix: String = owner_id.chars().take(8).collect();
@@ -2159,6 +2187,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
+        | ConvMode::AttachedWorkChild
         | ConvMode::Direct
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
@@ -2642,7 +2671,7 @@ impl RuntimeManager {
                         continue;
                     }
                     if matches!(audience, BrowserSessionAudience::Scope)
-                        && matches!(conv.conv_mode, ConvMode::Explore { .. })
+                        && !accepts_browser_scope_event(&manager.db, &conv).await
                     {
                         continue;
                     }
@@ -3871,6 +3900,17 @@ impl RuntimeManager {
         }
     }
 
+    fn sub_agent_child_mode(spec: &SubAgentSpec, parent_mode: &ConvMode) -> ConvMode {
+        match spec.mode {
+            SubAgentMode::Explore => ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            SubAgentMode::Work if matches!(parent_mode, ConvMode::Direct) => ConvMode::Direct,
+            SubAgentMode::Work => ConvMode::AttachedWorkChild,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn admit_sub_agent_batch(
         self: &Arc<Self>,
@@ -3888,16 +3928,40 @@ impl RuntimeManager {
         if parent.attached_work_scope_id != parent_scope {
             return Err("Parent WorkScope changed before sub-agent admission".to_string());
         }
+        let has_work = specs.iter().any(|spec| spec.mode == SubAgentMode::Work);
+        let parent_authority =
+            crate::resource_authority::resolve_resource_authority(&self.db, &parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        if has_work && parent_authority.authority != crate::work_scope::ResourceAuthority::Work {
+            return Err("Work sub-agents require parent Work authority".to_string());
+        }
+        if has_work
+            && matches!(
+                parent.conv_mode,
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }
+            )
+            && self
+                .db
+                .get_approved_task_objective(parent_conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(
+                "Work sub-agents require an approved objective for this managed scope".to_string(),
+            );
+        }
+        if has_work
+            && !matches!(parent.conv_mode, ConvMode::Direct)
+            && parent_authority.worktree_path().is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         let children = specs
             .iter()
             .map(|spec| {
-                let conv_mode = match spec.mode {
-                    SubAgentMode::Explore => ConvMode::Explore {
-                        worktree_path: None,
-                        next_taskmd_id_hint: None,
-                    },
-                    SubAgentMode::Work => parent.conv_mode.clone(),
-                };
+                let conv_mode = Self::sub_agent_child_mode(spec, &parent.conv_mode);
                 Ok(phoenix_db::SubAgentChildAdmission {
                     run: phoenix_db::SubAgentRunAdmission {
                         child_conversation_id: spec.agent_id.clone(),
@@ -4952,6 +5016,7 @@ impl RuntimeManager {
             .get_approved_task_objective(conversation_id)
             .await
             .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
+
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -4988,11 +5053,11 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority =
+        let authority_resolution =
             crate::resource_authority::resolve_resource_authority(self.db(), &conv)
                 .await
-                .map_err(|error| format!("Failed to load resource authority: {error}"))?
-                .authority;
+                .map_err(|error| format!("Failed to load resource authority: {error}"))?;
+        context.resource_authority = authority_resolution.authority;
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
         context.service_tier = self
@@ -5005,12 +5070,18 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
+        context.work_scope_worktree = authority_resolution.worktree_path().map(PathBuf::from);
+        if matches!(conv.conv_mode, ConvMode::AttachedWorkChild)
+            && context.work_scope_worktree.is_none()
+        {
+            return Err("Attached Work child requires an allocated WorkScope worktree".to_string());
+        }
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -5139,30 +5210,41 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-                let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::git_backed_writing_parent(
-                            agent_catalog.to_vec(),
-                            writing_tools,
-                        )?,
-                        None,
-                    ),
-                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
-                        ToolRegistry::explore(
-                            &context.tasks_dir_name,
-                            agent_catalog.to_vec(),
-                            ExploreToolPolicy::from_platform(&self.platform),
-                        ),
-                        Some(writing_tools),
-                    ),
-                    ConvMode::Direct => (
+                let approved_registry = approved_managed_registry(
+                    &conv.conv_mode,
+                    context.resource_authority,
+                    approved_task_objective.as_ref(),
+                    agent_catalog.to_vec(),
+                    writing_tools.clone(),
+                )?;
+                let (registry, upgrade_writing_tools) = match (approved_registry, conv.conv_mode) {
+                    (Some(registry), _) => (registry, None),
+                    (None, ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. }) => {
+                        (
+                            ToolRegistry::explore(
+                                &context.tasks_dir_name,
+                                agent_catalog.to_vec(),
+                                ExploreToolPolicy::from_platform(&self.platform),
+                            ),
+                            Some(writing_tools),
+                        )
+                    }
+                    (None, ConvMode::AttachedWorkChild) => {
+                        return Err(
+                            "Attached Work child requires sub-agent runtime role".to_string()
+                        );
+                    }
+                    (None, ConvMode::Direct) => (
                         ToolRegistry::direct(agent_catalog.to_vec())
                             .try_with_writing_conversation_tools(writing_tools)?,
                         None,
                     ),
-                    ConvMode::Work { .. }
-                    | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => (
+                    (
+                        None,
+                        ConvMode::Work { .. }
+                        | ConvMode::Branch { .. }
+                        | ConvMode::DetachedApprovedTask { .. },
+                    ) => (
                         ToolRegistry::git_backed_writing_parent(
                             agent_catalog.to_vec(),
                             writing_tools,
@@ -5443,13 +5525,23 @@ impl RuntimeManager {
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
             // not evict that replacement.
+            let mut recreation_broadcaster = None;
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
                 if runtimes
                     .get(&conv_id)
                     .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
                 {
-                    runtimes.remove(&conv_id);
+                    let retired = runtimes.remove(&conv_id).expect("identity-checked runtime");
+                    if disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
+                        let broadcaster = retired.broadcast_tx;
+                        manager_for_cleanup
+                            .evicted_broadcasters
+                            .write()
+                            .await
+                            .insert(conv_id.clone(), broadcaster.clone());
+                        recreation_broadcaster = Some(broadcaster);
+                    }
                     true
                 } else {
                     false
@@ -5470,14 +5562,31 @@ impl RuntimeManager {
                     tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
                 }
             }
-            if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                manager_for_cleanup.kick_direct_turn_worker();
+            if let Some(broadcaster) = recreation_broadcaster {
+                manager_for_cleanup.schedule_runtime_recreation(conv_id, broadcaster);
             }
         });
 
         drop(steering_projection_guard);
 
         Ok(handle)
+    }
+
+    fn schedule_runtime_recreation(
+        self: &Arc<Self>,
+        conversation_id: String,
+        stale_broadcaster: SseBroadcaster,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = manager.get_or_create(&conversation_id).await {
+                tracing::warn!(%error, conversation_id,
+                    "Runtime reconstruction failed; scheduling one bounded retry");
+                let _ = manager
+                    .schedule_runtime_reconstruction_retry(conversation_id, stale_broadcaster)
+                    .await;
+            }
+        })
     }
 
     /// Inject a fake live handle carrying a specific `ConvState` into the
@@ -5825,7 +5934,7 @@ impl RuntimeManager {
                         %reconstruction_error,
                         "Steering runtime reconstruction failed after durable admission; scheduling one bounded retry"
                     );
-                    self.schedule_steering_reconstruction_retry(
+                    self.schedule_runtime_reconstruction_retry(
                         conversation_id.to_string(),
                         stale_broadcaster,
                     );
@@ -5843,32 +5952,29 @@ impl RuntimeManager {
         Ok(())
     }
 
-    fn schedule_steering_reconstruction_retry(
+    fn schedule_runtime_reconstruction_retry(
         self: &Arc<Self>,
         conversation_id: String,
         stale_broadcaster: SseBroadcaster,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if let Err(error) = manager.get_or_create(&conversation_id).await {
                 let released = manager
-                    .release_failed_steering_reconstruction_broadcaster(
-                        &conversation_id,
-                        &stale_broadcaster,
-                    )
+                    .release_failed_reconstruction_broadcaster(&conversation_id, &stale_broadcaster)
                     .await;
                 tracing::warn!(
                     conversation_id,
                     %error,
                     released_stale_broadcaster = released,
-                    "Bounded steering runtime reconstruction retry failed"
+                    "Bounded runtime reconstruction retry failed"
                 );
             }
-        });
+        })
     }
 
-    async fn release_failed_steering_reconstruction_broadcaster(
+    async fn release_failed_reconstruction_broadcaster(
         &self,
         conversation_id: &str,
         expected: &SseBroadcaster,
@@ -6215,6 +6321,15 @@ impl RuntimeManager {
 
         if self
             .db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
+
+        if self
+            .db
             .has_committed_steering_turn(conversation_id)
             .await
             .map_err(|e| e.to_string())?
@@ -6326,6 +6441,7 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
+        ConvMode::AttachedWorkChild => ModeContext::AttachedWorkChild,
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -6416,6 +6532,213 @@ mod bash_lifecycle_bridge_tests {
             }),
             BashLifecycleBridgeAction::Broadcast
         );
+    }
+}
+
+#[cfg(test)]
+mod approved_objective_registry_tests {
+    use super::approved_managed_registry;
+    use crate::tools::{ToolContext, ToolOutput};
+    use crate::work_scope::ResourceAuthority;
+    use async_trait::async_trait;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    struct WritingMarker(&'static str);
+
+    fn approved_objective() -> phoenix_core::task_handoff::ApprovedTaskSnapshot {
+        phoenix_core::task_handoff::ApprovedTaskSnapshot {
+            task_id: "06009".to_string(),
+            task_title: "Approved objective".to_string(),
+            title: "Approved objective".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Execute the approved objective".to_string(),
+            task_file: "tasks/06009-p1-ready--approved-objective.md".to_string(),
+            artifact_body: "# Approved objective\n".to_string(),
+        }
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for WritingMarker {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            "marker".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    #[test]
+    fn detached_product_creation_with_approved_objective_rematerializes_as_work() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = crate::tools::WritingConversationTools::new(
+            Arc::new(WritingMarker("search_conversations")),
+            Arc::new(WritingMarker("read_conversation")),
+            Arc::new(WritingMarker("query_database")),
+            Arc::new(WritingMarker("send_conversation_message")),
+        )
+        .unwrap();
+        assert!(approved_managed_registry(
+            &mode,
+            ResourceAuthority::Work,
+            Some(&approved_objective()),
+            vec![],
+            writing_tools,
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn detached_product_creation_restart_projects_work_filesystem_and_network_capability() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let registry = approved_managed_registry(
+            &mode,
+            ResourceAuthority::Work,
+            Some(&approved_objective()),
+            vec![],
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .expect("approved persisted authority projects a Work registry");
+        let names: std::collections::HashSet<_> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(names.contains("patch"));
+        assert!(names.contains("bash"));
+        assert!(!names.contains("sandboxed_bash"));
+        assert!(names.contains("send_conversation_message"));
+        assert_eq!(mode.worktree_path(), Some("/tmp/product-worktree"));
+    }
+
+    #[test]
+    fn detached_product_creation_without_objective_remains_restricted() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = crate::tools::WritingConversationTools::new(
+            Arc::new(WritingMarker("search_conversations")),
+            Arc::new(WritingMarker("read_conversation")),
+            Arc::new(WritingMarker("query_database")),
+            Arc::new(WritingMarker("send_conversation_message")),
+        )
+        .unwrap();
+
+        assert!(approved_managed_registry(
+            &mode,
+            ResourceAuthority::Work,
+            None,
+            vec![],
+            writing_tools,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn detached_product_creation_requires_work_authority() {
+        let mode = ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new("/tmp/product-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+        let writing_tools = || {
+            crate::tools::WritingConversationTools::new(
+                Arc::new(WritingMarker("search_conversations")),
+                Arc::new(WritingMarker("read_conversation")),
+                Arc::new(WritingMarker("query_database")),
+                Arc::new(WritingMarker("send_conversation_message")),
+            )
+            .unwrap()
+        };
+        assert!(approved_managed_registry(
+            &mode,
+            ResourceAuthority::Restricted,
+            Some(&approved_objective()),
+            vec![],
+            writing_tools(),
+        )
+        .unwrap()
+        .is_none());
+    }
+}
+
+#[cfg(test)]
+mod browser_scope_event_authority_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approved_explore_accepts_scope_event_but_restricted_explore_does_not() {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let restricted = db
+            .create_conversation(
+                "restricted-browser",
+                "restricted",
+                "/tmp",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("restricted conversation");
+        assert!(!accepts_browser_scope_event(&db, &restricted).await);
+
+        let worktree = tempfile::TempDir::new().expect("worktree");
+        let approved = db
+            .create_conversation_with_project(
+                "approved-browser",
+                "approved",
+                worktree.path().to_str().unwrap(),
+                false,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Explore {
+                    worktree_path: Some(
+                        phoenix_core::domain::db_schema::NonEmptyString::new(
+                            worktree.path().to_str().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("approved conversation");
+        sqlx::query("UPDATE work_scopes SET authority_kind = 'work' WHERE id = ?1")
+            .bind(approved.attached_work_scope_id.as_ref().unwrap().as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(accepts_browser_scope_event(&db, &approved).await);
     }
 }
 
@@ -8585,6 +8908,157 @@ mod scope_liveness_tests {
         assert!(drain.await.expect("bounded drain task joins").is_none());
     }
 
+    #[test]
+    fn direct_work_subagent_preserves_unscoped_direct_mode() {
+        let mut spec = SubAgentSpec {
+            agent_id: "direct-work-child".to_string(),
+            task: "inherit the unowned cwd".to_string(),
+            cwd: "/tmp/direct-cwd".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Work,
+            model_id: "gpt-5.6-sol".to_string(),
+            connection: "openai_responses".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        assert_eq!(
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
+            ConvMode::Direct
+        );
+        let managed = ConvMode::Explore {
+            worktree_path: Some(
+                phoenix_core::domain::db_schema::NonEmptyString::new("/tmp/owned-worktree")
+                    .unwrap(),
+            ),
+            next_taskmd_id_hint: None,
+        };
+        let child = RuntimeManager::sub_agent_child_mode(&spec, &managed);
+        assert!(matches!(child, ConvMode::AttachedWorkChild));
+        assert!(child.worktree_path().is_none());
+        spec.mode = SubAgentMode::Explore;
+        assert!(matches!(
+            RuntimeManager::sub_agent_child_mode(&spec, &ConvMode::Direct),
+            ConvMode::Explore { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn trusted_work_child_admission_roundtrips_without_sandbox_and_preserves_parent() {
+        use phoenix_core::domain::db_schema::NonEmptyString;
+        let manager = Arc::new(test_manager().await);
+        let worktree = tempfile::TempDir::new().unwrap();
+        let root = worktree.path().to_str().unwrap();
+        let subdir = worktree.path().join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(worktree.path().join("parent.txt"), "parent").unwrap();
+        let parent = manager
+            .db()
+            .create_conversation_with_project(
+                "trusted-parent",
+                "trusted-parent",
+                root,
+                false,
+                None,
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: Some(NonEmptyString::new(root).unwrap()),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let spec = SubAgentSpec {
+            agent_id: "trusted-work-child".into(),
+            task: "implement assigned work".into(),
+            cwd: subdir.to_str().unwrap().into(),
+            timeout: std::time::Duration::from_secs(60),
+            mode: SubAgentMode::Work,
+            model_id: "gpt-6-astra".into(),
+            connection: "mock".into(),
+            effort: None,
+            max_turns: 1,
+            agent_name: None,
+            persona: None,
+        };
+        let admit = || {
+            manager.admit_sub_agent_batch(
+                "trusted-batch",
+                std::slice::from_ref(&spec),
+                &parent.id,
+                parent.attached_work_scope_id.clone(),
+                true,
+            )
+        };
+        assert!(admit().await.unwrap_err().contains("Work authority"));
+        assert!(manager.db().get_conversation(&spec.agent_id).await.is_err());
+        manager
+            .db()
+            .persist_approved_task_authority(
+                &parent.id,
+                &crate::resource_authority::tests::approval(),
+            )
+            .await
+            .unwrap();
+        admit().await.unwrap();
+        let child = manager.db().get_conversation(&spec.agent_id).await.unwrap();
+        assert!(matches!(child.conv_mode, ConvMode::AttachedWorkChild));
+        assert_eq!(child.attached_work_scope_id, parent.attached_work_scope_id);
+        assert!(child.conv_mode.worktree_path().is_none());
+        assert!(child.conv_mode.worktree_config().is_none());
+        assert!(child.conv_mode.task_id().is_none());
+        assert_eq!(child.cwd, subdir.to_str().unwrap());
+        let authority = crate::resource_authority::resolve_resource_authority(manager.db(), &child)
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(authority.worktree_path(), Some(root));
+        let registry = sub_agent_registry_for_authority(
+            authority.authority,
+            ExploreToolPolicy::from_platform(&manager.platform),
+        );
+        let names: Vec<_> = registry.definitions().into_iter().map(|d| d.name).collect();
+        for name in ["bash", "patch", "submit_result"] {
+            assert!(names.iter().any(|n| n == name), "missing {name}");
+        }
+        for name in ["propose_task", "spawn_agents", "ask_user_question"] {
+            assert!(!names.iter().any(|n| n == name), "unexpected {name}");
+        }
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("parent.txt")).unwrap(),
+            "parent"
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(&parent.id)
+                .await
+                .unwrap()
+                .attached_work_scope_id,
+            parent.attached_work_scope_id
+        );
+        assert!(manager
+            .bash_handles()
+            .reserve_spawn(&ResourceScopeKey::Work(
+                parent.attached_work_scope_id.unwrap()
+            ))
+            .await
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn subagent_batch_admission_persists_all_semantic_writes_atomically() {
         let mut manager = test_manager().await;
@@ -9804,10 +10278,7 @@ mod scope_liveness_tests {
             let stale_broadcaster = stale_broadcaster.clone();
             tokio::spawn(async move {
                 manager
-                    .release_failed_steering_reconstruction_broadcaster(
-                        conversation_id,
-                        &stale_broadcaster,
-                    )
+                    .release_failed_reconstruction_broadcaster(conversation_id, &stale_broadcaster)
                     .await
             })
         };
@@ -9834,6 +10305,57 @@ mod scope_liveness_tests {
             stale_events.recv().await,
             Err(tokio::sync::broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn approval_reconstruction_failure_releases_reserved_stream() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "missing-approval-reconstruction";
+        let reserved = manager.conversation_broadcaster(conversation_id).await;
+        let mut events = reserved.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.schedule_runtime_recreation(conversation_id.to_string(), reserved),
+        )
+        .await
+        .expect("bounded reconstruction must finish")
+        .expect("reconstruction task joins");
+        assert!(!manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
+        while events.try_recv().is_ok() {}
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_reconstruction_preserves_reserved_stream_on_success() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "successful-approval-reconstruction";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let reserved = manager.conversation_broadcaster(conversation_id).await;
+        manager
+            .schedule_runtime_recreation(conversation_id.to_string(), reserved.clone())
+            .await
+            .unwrap();
+        let live = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("rebuilt runtime");
+        assert!(reserved.same_channel(&live.broadcast_tx));
+        assert!(!manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
     }
 
     #[tokio::test]

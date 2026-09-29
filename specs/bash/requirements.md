@@ -776,10 +776,10 @@ AND SHALL include the process in the owning WorkScope's inventory, lifecycle bro
 AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
 AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
-WHEN conversation bash is authorized with write capability
+WHEN conversation bash, including Work-subagent bash, is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
-AND bash commands SHALL retain their writable behavior inside the attached
-  `WorkScope` or chat-only working directory, as applicable
+AND bash commands SHALL retain normal host filesystem write access
+AND the attached `WorkScope` or chat-only working directory SHALL identify the execution environment without constituting a filesystem confinement boundary
 
 **Rationale:** Explore bash is useful for local code investigation (`git log`,
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
@@ -817,6 +817,18 @@ fails closed by withholding bash rather than presenting a writable shell with an
 advisory label.
 
 ---
+
+### REQ-BASH-013a: WorkScope Authority Selects Bash Isolation
+
+WHEN a conversation's attached `WorkScope` has Restricted authority
+THE SYSTEM SHALL execute Bash through the Explore OS sandbox
+AND SHALL isolate writes from source, task, Git metadata, build output, and user cache paths
+
+WHEN the same `WorkScope` has Work authority
+THE SYSTEM SHALL execute Bash without the Explore OS sandbox
+AND SHALL permit repository-owned task, Git common-directory, build/codegen, and normal tool-cache writes subject to operating-system permissions and command safety checks
+
+THE SYSTEM SHALL select Bash isolation from `WorkScope` authority rather than conversation mode provenance alone
 
 ### REQ-BASH-014: Stateless Tool with Per-WorkScope Handle Registry
 

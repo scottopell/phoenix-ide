@@ -1,4 +1,4 @@
-# ADR-067: Roadmap records are typed facts projected milestone-first
+# ADR-069: Roadmap records are typed facts projected milestone-first
 
 - **Status:** Accepted
 - **Date:** 2026-09-27

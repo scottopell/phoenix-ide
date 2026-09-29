@@ -78,7 +78,9 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
 | [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
 | [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
-| [067](067_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
+| [067](067_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
+| [068](068_work-children-share-parent-development-trust.md) | Work children share parent development trust | Accepted | REQ-PROJ-008, REQ-BED-018; unsandboxed Work children and parent lifecycle ownership |
+| [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
 
 ## For agents: which decisions bind your task
 
@@ -108,6 +110,8 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying Work-subagent trust, sandboxing, or inherited worktree ownership | 068, then 067 |
+| Specifying approval-time or restart-time runtime capability projection from WorkScope authority | 067, then 049, 026, and 039 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -177,6 +181,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
+          ├── ADR-067 (WorkScope authority projects one runtime capability)
           ├── ADR-028 (iOS companion adds read-only project context and prose review)
           │   └── ADR-029 (iOS companion uses session-scoped prose feedback)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
