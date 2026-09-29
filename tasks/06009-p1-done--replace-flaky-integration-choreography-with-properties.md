@@ -38,3 +38,18 @@ Preserve deterministic deployment write-failure tests that prove preparation fai
 - Update affected normative/executive documentation only where verification coverage changes; requirements remain unchanged unless implementation evidence reveals a real contract conflict.
 - Publish for review, address accepted findings, but do not merge or deploy without authorization.
 - Preserve unrelated work and retained evidence. Do not edit the former #808 worktree or expand into global slots, blanket timeout inflation, retries-until-green, universal process frameworks, cache purges, or production operations.
+
+
+## Completion receipts
+
+- PR: https://github.com/scottopell/phoenix-ide/pull/812
+- Qualified source head: `f255391807645c98d21fd7977c9fa68ccb0d6be0`
+- Local macOS 26.5.2 arm64: `./dev.py check --all` passed all 20 lanes in 504.2s; Rust tests passed in 280.4s and e2e passed in 50.1s.
+- Hosted CI: https://github.com/scottopell/phoenix-ide/actions/runs/36568416588 passed planning plus rust, clippy, e2e, ui/specs, and task-validation lanes; hosted Rust checks passed all 5 checks in 707.2s.
+- Rust inventory at qualification: 4,259 non-codegen tests across 20 suites, including 4 ignored fixtures.
+- Tmux focused qualification: 79 active tests passed, 1 subprocess fixture ignored; ordinary owner-backed coverage is four lifecycle smokes plus one forced-parent-death smoke.
+- Browser focused qualification: typing fixture and screencast attach smoke each passed; screencast lifecycle policy, typed phase/deadline policy, trace threshold policy, hermetic loopback navigation, and page-anchored observer delivery have deterministic coverage.
+- React deferred-work coverage waits for explicit mount-time producers and fails its owning suite on `act(...)` warnings.
+- Mid-stream cancellation and first-turn completion use exact SSE/persisted-state witnesses already present in the qualified tree.
+- Exact-head Codex review reported no major issues; all live review threads were resolved.
+- No merge or deployment was performed by this workstream.
