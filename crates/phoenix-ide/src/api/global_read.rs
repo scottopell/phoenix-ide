@@ -627,16 +627,19 @@ async fn resolve_reference_impl(
         }
         let typed_id = phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
             .expect("non-empty typed reference");
-        let aggregate = service
+        let snapshot = service
             .db
-            .get_ordinary_product_conversation(&typed_id)
+            .read_ordinary_product_conversation_snapshot(id, None, None, 1)
             .await
             .map_err(map_db_not_found)?;
-        let current = service
-            .db
-            .get_conversation(&aggregate.latest_transcript_row_id)
-            .await
-            .map_err(map_db_not_found)?;
+        let aggregate = snapshot.aggregate;
+        let current = aggregate
+            .segments
+            .last()
+            .expect("ordinary aggregate contains a segment")
+            .transcript_row
+            .conversation
+            .clone();
         return Ok(ResolveGlobalReferenceResponse {
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
@@ -732,7 +735,13 @@ async fn resolve_global_message_target(
         .db
         .get_conversation(conversation_id)
         .await
-        .map_err(|_| GlobalMessageTargetError::ConversationNotFound(conversation_id.to_string()))?;
+        .map_err(|error| {
+            if matches!(error, crate::db::DbError::ConversationNotFound(_)) {
+                GlobalMessageTargetError::ConversationNotFound(conversation_id.to_string())
+            } else {
+                GlobalMessageTargetError::ResolutionFailed(error.to_string())
+            }
+        })?;
     if conversation.parent_conversation_id.is_some() {
         return Err(GlobalMessageTargetError::SubAgentRejected);
     }

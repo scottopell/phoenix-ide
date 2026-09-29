@@ -374,6 +374,11 @@ export function Sidebar({
     setProductCloseSubmittingId(productCloseTarget.product_conversation_id);
     try {
       await api.closeProductConversation(productCloseTarget.product_conversation_id);
+      setProductConversations((rows) => rows.map((row) => (
+        row.product_conversation_id === productCloseTarget.product_conversation_id
+          ? { ...row, lifecycle: { state: 'history' }, close_action: null }
+          : row
+      )));
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       onConversationCreated();
