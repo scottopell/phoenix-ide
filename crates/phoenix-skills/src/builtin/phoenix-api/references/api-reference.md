@@ -25,7 +25,8 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
      [[ "$CA_CERT_PATH" == /* && -r "$CA_CERT_PATH" ]] || exit
      CURL_TLS=(--cacert "$CA_CERT_PATH")
    fi
-   curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
+   HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
+     curl --disable --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
    ```
 
    This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode a user-identified or authoritative same-server readable CA certificate path. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
@@ -37,7 +38,8 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
 For authenticated raw reads, repeat the same origin/CA initialization and then use:
 
 ```bash
-curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
+HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
+  curl --disable --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
   --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
   -- "$ORIGIN/api/models"
 ```
@@ -101,7 +103,8 @@ if [[ -n "$CA_CERT_PATH_B64" ]]; then
   CURL_TLS=(--cacert "$CA_CERT_PATH")
 fi
 printf '%s' "$INTENT_B64" | base64 -d |
-  curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
+  HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
+  curl --disable --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
     --header 'Content-Type: application/json' \
     --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
     --data-binary @- --write-out $'\ncreation_http_status=%{http_code}\n' \

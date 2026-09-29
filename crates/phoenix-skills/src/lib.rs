@@ -1394,6 +1394,8 @@ mod tests {
             "ORIGIN_B64",
             "CA_CERT_PATH_B64",
             "--cacert",
+            "curl --disable",
+            "NO_PROXY='*'",
             "same Phoenix server that owns that WorkScope",
             "llm_language",
             "ordered `images` collection",

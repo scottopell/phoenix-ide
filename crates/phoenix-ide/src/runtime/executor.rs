@@ -3326,9 +3326,6 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            let clears_pending_trusted_results = matches!(terminal_event, Event::UserCancel { .. })
-                || (matches!(self.state, ConvState::AwaitingRecovery { .. })
-                    && !matches!(terminal_event, Event::CredentialBecameAvailable));
             self.pending_sub_agent_acceptance
                 .clone_from(&accepted_sub_agent);
             let generated = match self.apply_transition_result(result).await {
@@ -3351,9 +3348,6 @@ where
                     return Err(error);
                 }
             };
-            if clears_pending_trusted_results {
-                self.pending_trusted_tool_results.clear();
-            }
             if settles_handoff {
                 self.handoff_completion_authority = None;
                 self.handoff_completion_timestamp = None;
@@ -3495,6 +3489,14 @@ where
             None
         };
         let old_state = self.state.clone();
+        let clears_pending_trusted_after_commit =
+            (matches!(old_state, ConvState::LlmRequesting { .. })
+                && result
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::AbortLlm)))
+                || (matches!(old_state, ConvState::AwaitingRecovery { .. })
+                    && !matches!(result.new_state, ConvState::LlmRequesting { .. }));
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
@@ -3959,6 +3961,9 @@ where
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
                         state_committed |= is_state_persist;
+                        if is_state_persist && clears_pending_trusted_after_commit {
+                            self.pending_trusted_tool_results.clear();
+                        }
                         effect_result
                     }
                     Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
