@@ -1397,7 +1397,7 @@ mod tests {
             "requires exactly `images: []`",
             "Truncation is inconclusive",
             "HTTP 408, 425, 429",
-            "normalized language only for a recovery replay",
+            "stored normalized language always wins",
             "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
