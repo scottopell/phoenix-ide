@@ -616,6 +616,7 @@ pub struct RuntimeManager {
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
+    product_message_admission: ConversationMutexGates,
     /// Serializes the final durable queue snapshot and executor publication
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
@@ -2350,6 +2351,7 @@ impl RuntimeManager {
             #[cfg(test)]
             fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
+            product_message_admission: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
@@ -5709,6 +5711,15 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.message_acceptance.lock(conversation_id).await
+    }
+
+    pub(crate) async fn lock_product_message_admission(
+        &self,
+        product_conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.product_message_admission
+            .lock(product_conversation_id)
+            .await
     }
 
     pub(crate) async fn lock_steering_projection(

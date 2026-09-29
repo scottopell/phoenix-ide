@@ -5586,6 +5586,16 @@ async fn continue_conversation(
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
 
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
+
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
