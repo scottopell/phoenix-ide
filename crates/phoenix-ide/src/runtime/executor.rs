@@ -13853,12 +13853,16 @@ mod authoritative_user_message_effect_tests {
             let requests = rt.llm_client.recorded_requests();
             let request = requests.last().unwrap();
             assert!(request.tools.is_empty());
-            assert_eq!(request.messages[0].content[0].render_text(), seed);
+            let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
+            assert_eq!(
+                request.messages[0].content[0].render_text(),
+                attributed_seed
+            );
             assert_eq!(
                 request
                     .messages
                     .iter()
-                    .filter(|m| m.content[0].render_text() == seed)
+                    .filter(|m| m.content[0].render_text() == attributed_seed)
                     .count(),
                 1
             );
