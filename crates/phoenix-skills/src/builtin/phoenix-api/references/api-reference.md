@@ -33,10 +33,10 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
 3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
 4. Call authenticated `GET /api/models`. Its `models` array and `default` field are the live authority. Select an exact model `id`: preserve a user-selected ID when present, otherwise use `default`. The selected model's `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Use JSON `null` for no override, or only a level listed for that exact model.
 
-For authenticated raw reads, use:
+For authenticated raw reads, repeat the same origin/CA initialization and then use:
 
 ```bash
-curl --fail-with-body --silent --show-error \
+curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
   --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
   -- "$ORIGIN/api/models"
 ```
@@ -63,7 +63,7 @@ Every request field is immutable creation intent: `request_id`, `cwd`, `model`, 
 
 ### 1. Generate and retain the request identity
 
-Run this in the admitted WorkScope. Its output is non-secret durable conversation evidence; retain it before dispatch.
+Run this in the admitted WorkScope. Its base64 output safely represents arbitrary server paths and is non-secret durable conversation evidence; retain it before dispatch.
 
 ```bash
 set -u
@@ -73,7 +73,9 @@ for byte in "${UUID_BYTES[@]}"; do UUID_HEX+=$byte; done
 [[ "$UUID_HEX" =~ ^[0-9a-f]{32}$ ]] || exit
 UUID_VARIANT=$(printf '%x' $(( (16#${UUID_HEX:16:1} & 3) | 8 ))) || exit
 REQUEST_ID="${UUID_HEX:0:8}-${UUID_HEX:8:4}-4${UUID_HEX:13:3}-${UUID_VARIANT}${UUID_HEX:17:3}-${UUID_HEX:20:12}"
-printf 'creation_request_id=%s\ncreation_cwd=%s\n' "$REQUEST_ID" "$PWD"
+printf 'creation_request_id=%s\ncreation_cwd_b64=' "$REQUEST_ID"
+printf '%s' "$PWD" | base64
+printf '\n'
 ```
 
 ### 2. Prepare the exact intent as data
@@ -117,11 +119,11 @@ It does **not** prove opening-turn dispatch or model activity completed.
 
 ## Ambiguous-response reconciliation
 
-A definitive 4xx rejects the request; correct the request rather than retrying unchanged. A transport failure or 5xx after dispatch is ambiguous.
+A semantic 4xx such as 400, 401, 403, 404, or 409 rejects the request; correct or authorize it rather than retrying unchanged. HTTP 408, 425, 429, any 5xx, or a transport failure after dispatch is ambiguous/transient: preserve the exact UUID and intent for bounded same-ID replay, honoring `Retry-After` for 429.
 
 For ambiguity, retain the same request UUID and `INTENT_B64`, then repeat the step-3 POST at most once with those exact bytes. Server idempotency returns the existing result for the same intent or a conflict for changed intent; never mint another UUID.
 
-`GET /api/product-conversations/creation` can supplement recovery when its complete JSON is observable. Its rows echo `cwd`, `objective`, `model`, `effort`, normalized `llm_language`, and ordered `images`; compare every field before accepting a match and follow `next_cursor` when present. However, image-bearing pages can exceed scoped Bash's output ring. Truncated or invalid JSON is inconclusive and must never be interpreted as absence. The public API has no bounded request-ID lookup, so report that observability gap rather than adding polling, filesystem output, database access, or unsafe text filtering.
+`GET /api/product-conversations/creation` can supplement recovery when its complete JSON is observable. Its rows echo `cwd`, `objective`, `model`, `effort`, normalized `llm_language`, and ordered `images`; compare every field before accepting a match and follow `next_cursor` when present. The handler stores `llm_language:null` as the configured default before idempotency comparison, so an exact null-bearing replay can conflict. After observing a matching row, use its normalized language only for a recovery replay; all other intent stays unchanged. However, image-bearing pages can exceed scoped Bash's output ring. Truncated or invalid JSON is inconclusive and must never be interpreted as absence. The public API has no bounded request-ID lookup, so report that observability gap rather than adding polling, filesystem output, database access, or unsafe text filtering.
 
 Creation recovery routes are scoped to that request identity:
 

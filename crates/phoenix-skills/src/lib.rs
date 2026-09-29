@@ -1379,6 +1379,7 @@ mod tests {
             "work_scope_id",
             "UUID_BYTES <<<\"$(od -An -N16 -tx1 /dev/urandom)",
             "creation_request_id=%s",
+            "creation_cwd_b64=",
             "INTENT_B64",
             "repeat the step-3 POST at most once",
             "GET /api/product-conversations/creation",
@@ -1395,6 +1396,8 @@ mod tests {
             "ordered `images` collection",
             "requires exactly `images: []`",
             "Truncation is inconclusive",
+            "HTTP 408, 425, 429",
+            "normalized language only for a recovery replay",
             "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
