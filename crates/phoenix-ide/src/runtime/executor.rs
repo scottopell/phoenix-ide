@@ -635,6 +635,20 @@ fn trusted_tool_results(results: &[ToolResult]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn trusted_request_continues(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+    )
+}
+
 fn overlay_trusted_tool_results(messages: &mut [LlmMessage], trusted_results: &[(String, String)]) {
     for (trusted_id, trusted) in trusted_results {
         if let Some(content) = messages.iter_mut().rev().find_map(|message| {
@@ -3021,10 +3035,7 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ScheduleRetry { .. }))
-            && !matches!(
-                result.new_state,
-                ConvState::AwaitingRecovery { .. } | ConvState::ToolExecuting { .. }
-            )
+            && !trusted_request_continues(&result.new_state)
         {
             self.pending_trusted_tool_results.clear();
         }
@@ -20333,6 +20344,66 @@ mod steer_drain_detector_tests {
             ContentBlock::ToolResult { content, .. }
                 if content.contains("authenticated current output")
         ));
+    }
+
+    #[test]
+    fn trusted_request_lifetime_state_table_covers_owned_continuations() {
+        let continuation_states = [
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::ToolExecuting {
+                assistant_message: AssistantMessage::new("a".into(), vec![], None, None),
+                current_tool: ToolCall::new(
+                    "tool",
+                    crate::state_machine::state::ToolInput::from(crate::tools::BashToolInput::run(
+                        "echo staged",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+            },
+            ConvState::CancellingTool {
+                tool_use_id: "tool".into(),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+                skipped_tools: vec![],
+                completed_results: vec![],
+                assistant_message: AssistantMessage::new("a".into(), vec![], None, None),
+                pending_sub_agents: vec![],
+            },
+            ConvState::AwaitingRecovery {
+                message: "recovering".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+            },
+            ConvState::AwaitingTaskApproval {
+                task_file: "tasks/1.md".into(),
+                title: "task".into(),
+                priority: phoenix_core::task_source::Priority::P1,
+                plan: "plan".into(),
+            },
+            ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "question".into(),
+            },
+        ];
+        assert!(continuation_states.iter().all(trusted_request_continues));
+
+        let disposal_states = [
+            ConvState::Idle,
+            ConvState::Error {
+                message: "error".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                resets_at: None,
+            },
+            ConvState::ContextExhausted {
+                summary: "done".into(),
+            },
+            ConvState::Terminal,
+        ];
+        assert!(disposal_states
+            .iter()
+            .all(|state| !trusted_request_continues(state)));
     }
 
     #[tokio::test]
