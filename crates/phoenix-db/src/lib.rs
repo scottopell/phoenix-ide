@@ -14610,13 +14610,13 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     if let Some(message_id) = steering {
         let outcome = match state {
             ConvState::Idle | ConvState::Terminal { .. } | ConvState::Completed { .. } => {
-                Some(("completed", None))
+                Some(("Completed", None))
             }
-            ConvState::CreationCancelled { .. } => Some(("cancelled", None)),
-            ConvState::Error { message, .. } => Some(("failed", Some(message.as_str()))),
-            ConvState::ContextExhausted { .. } => Some(("failed", Some("context exhausted"))),
+            ConvState::CreationCancelled { .. } => Some(("Cancelled", None)),
+            ConvState::Error { message, .. } => Some(("Failed", Some(message.as_str()))),
+            ConvState::ContextExhausted { .. } => Some(("Failed", Some("context exhausted"))),
             ConvState::RecoverableContinuationFailure { .. } => {
-                Some(("failed", Some("continuation failed")))
+                Some(("Failed", Some("continuation failed")))
             }
             ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }

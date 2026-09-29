@@ -216,7 +216,7 @@ pub(crate) async fn record_steering_event_tx(
         transcript_id,
         category,
         reason,
-        false,
+        reason == Some("context exhausted"),
     )
     .await
 }
