@@ -1089,8 +1089,8 @@ mod tests {
         message.origin = source;
         let rendered = render_global_message_line(&conv, &message);
         assert!(rendered.contains(&format!(
-            "Conversation from @conv:{} transcript:{}",
-            sender.product_conversation_id, sender.id
+            "Conversation from @conv:{} (conversation ID {})",
+            sender.id, sender.product_conversation_id
         )));
         assert!(!rendered.contains("User API"));
 
