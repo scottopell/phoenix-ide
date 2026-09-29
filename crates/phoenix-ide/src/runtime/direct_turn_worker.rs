@@ -312,7 +312,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         loop {
             let page = self
                 .terminal_discovery
-                .list_accepted(cursor.clone(), DISCOVERY_BATCH_LIMIT)
+                .list_accepted(cursor, DISCOVERY_BATCH_LIMIT)
                 .await
                 .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?;
             for candidate in page.candidates {
