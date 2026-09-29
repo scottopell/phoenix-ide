@@ -16,11 +16,19 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
 
    ```bash
    ORIGIN_B64='base64-of-the-same-server-origin'
-   ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 --decode) || exit
-   curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status"
+   CA_CERT_PATH_B64='' # optional base64 of authoritative same-server CA path
+   ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
+   [[ "$ORIGIN" =~ ^https?://[^[:space:]/]+(:[0-9]+)?$ ]] || exit
+   CURL_TLS=()
+   if [[ -n "$CA_CERT_PATH_B64" ]]; then
+     CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit
+     [[ "$CA_CERT_PATH" == /* && -r "$CA_CERT_PATH" ]] || exit
+     CURL_TLS=(--cacert "$CA_CERT_PATH")
+   fi
+   curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
    ```
 
-   This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls.
+   This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode a user-identified or authoritative same-server readable CA certificate path. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
 2. If auth is disabled, send no credential. If auth is required and this request is not authenticated, use only a credential already supplied or explicitly identified by the user for this deployment. A configured password is accepted as `Authorization: Bearer …`; a `phoenix-auth` cookie is an opaque session token, not the password.
 3. Keep secrets out of command arguments, tracing, files, logs, summaries, and tool output. With an already-populated `PHOENIX_PASSWORD`, stream the header through process substitution: `--header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD")`. Never print the variable or inspect databases/process environments to find a credential. Stop on `401` or `403`.
 4. Call authenticated `GET /api/models`. Its `models` array and `default` field are the live authority. Select an exact model `id`: preserve a user-selected ID when present, otherwise use `default`. The selected model's `effort_capabilities` is one of `{"support":"unsupported"}`, `{"support":"unknown"}`, or `{"support":"supported","levels":[...],"native_default":...}`. Use JSON `null` for no override, or only a level listed for that exact model.
@@ -30,7 +38,7 @@ For authenticated raw reads, use:
 ```bash
 curl --fail-with-body --silent --show-error \
   --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
-  "$ORIGIN/api/models"
+  -- "$ORIGIN/api/models"
 ```
 
 Omit the `--header` line when auth is disabled or the request is already authenticated.
@@ -79,14 +87,22 @@ Set only base64-alphabet literals in this scoped Bash command. `ORIGIN_B64` is t
 ```bash
 set -u
 ORIGIN_B64='base64-of-the-same-server-origin'
+CA_CERT_PATH_B64='' # optional authoritative same-server CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
-ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 --decode) || exit
-printf '%s' "$INTENT_B64" | base64 --decode |
-  curl --fail-with-body --silent --show-error \
+ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
+[[ "$ORIGIN" =~ ^https?://[^[:space:]/]+(:[0-9]+)?$ ]] || exit
+CURL_TLS=()
+if [[ -n "$CA_CERT_PATH_B64" ]]; then
+  CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit
+  [[ "$CA_CERT_PATH" == /* && -r "$CA_CERT_PATH" ]] || exit
+  CURL_TLS=(--cacert "$CA_CERT_PATH")
+fi
+printf '%s' "$INTENT_B64" | base64 -d |
+  curl --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
     --header 'Content-Type: application/json' \
     --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
     --data-binary @- --write-out $'\ncreation_http_status=%{http_code}\n' \
-    "$ORIGIN/api/product-conversations/new"
+    -- "$ORIGIN/api/product-conversations/new"
 ```
 
 Omit the bearer-header line when auth is disabled or already satisfied. Keep `INTENT_B64` out of command output because it contains the objective.
@@ -103,11 +119,9 @@ It does **not** prove opening-turn dispatch or model activity completed.
 
 A definitive 4xx rejects the request; correct the request rather than retrying unchanged. A transport failure or 5xx after dispatch is ambiguous.
 
-For ambiguity, retain the same request UUID and `INTENT_B64`. Read `GET /api/product-conversations/creation` in scoped Bash and let Global inspect `product_creations` for that exact `request_id`. If the raw response has `next_cursor`, call the same route with URL-encoded `?cursor={next_cursor}` until found or pagination ends. Never claim absence from one page.
+For ambiguity, retain the same request UUID and `INTENT_B64`, then repeat the step-3 POST at most once with those exact bytes. Server idempotency returns the existing result for the same intent or a conflict for changed intent; never mint another UUID.
 
-When found, compare every echoed creation field to the retained intent: `cwd`, `objective`, `model`, `effort`, `llm_language`, and the ordered `images` collection. Account for the server's `llm_language:null` normalization to its configured default before deciding equivalence. A matching recovery row proves the request is durable but may not yet expose a published ProductConversation; report its status and use only its `allowed_actions`.
-
-If pagination ends without the UUID after a transport/5xx ambiguity, repeat the step-3 POST at most once with the exact same `INTENT_B64`. Never mint another UUID.
+`GET /api/product-conversations/creation` can supplement recovery when its complete JSON is observable. Its rows echo `cwd`, `objective`, `model`, `effort`, normalized `llm_language`, and ordered `images`; compare every field before accepting a match and follow `next_cursor` when present. However, image-bearing pages can exceed scoped Bash's output ring. Truncated or invalid JSON is inconclusive and must never be interpreted as absence. The public API has no bounded request-ID lookup, so report that observability gap rather than adding polling, filesystem output, database access, or unsafe text filtering.
 
 Creation recovery routes are scoped to that request identity:
 
@@ -144,4 +158,4 @@ For user-authorized continuation only, require `ordinary_lifecycle == "open"` an
 
 ## Honest gaps
 
-Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
+Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded creation lookup by request ID, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.

@@ -1388,6 +1388,8 @@ mod tests {
             "canonical_route",
             "agent_working",
             "ORIGIN_B64",
+            "CA_CERT_PATH_B64",
+            "--cacert",
             "same Phoenix server that owns that WorkScope",
             "llm_language",
             "ordered `images` collection",
@@ -1398,6 +1400,14 @@ mod tests {
                 "missing operational contract: {required}"
             );
         }
+        assert!(
+            !trusted.contains("--decode"),
+            "base64 flags must support macOS"
+        );
+        assert!(
+            !trusted.contains("--insecure"),
+            "TLS verification must remain enabled"
+        );
         assert!(
             !trusted.contains("tr -d"),
             "UUID recipe must use Bash plus od"
