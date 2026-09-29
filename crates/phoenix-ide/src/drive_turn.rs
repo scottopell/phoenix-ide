@@ -220,10 +220,6 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         credential_helper,
     ));
     manager.start_sub_agent_handler().await;
-    manager
-        .start_direct_turn_worker()
-        .await
-        .map_err(|error| DriveTurnError::Runtime(error.to_string()))?;
 
     let result = drive_conversation(
         &request,
@@ -317,6 +313,10 @@ async fn drive_conversation(
     if let crate::send_chat_service::SendChatOutcome::Rejected { message, .. } = outcome {
         return Err(DriveTurnError::Runtime(message));
     }
+    manager
+        .dispatch_standalone_turn(conversation_id)
+        .await
+        .map_err(DriveTurnError::Runtime)?;
 
     let outcome = if let Ok(result) = tokio::time::timeout(
         request.timeout,

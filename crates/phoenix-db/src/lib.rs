@@ -14609,7 +14609,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     .await?;
     if let Some(message_id) = steering {
         let outcome = match state {
-            ConvState::Idle | ConvState::Terminal { .. } | ConvState::Completed { .. } => {
+            ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
                 Some(("Completed", None))
             }
             ConvState::CreationCancelled { .. } => Some(("Cancelled", None)),
@@ -14681,6 +14681,9 @@ async fn classify_creation_watch_outcome(
         ConvState::CreationFailed { error, .. } | ConvState::Error { message: error, .. } => {
             ("Failed", Some(error.as_str()))
         }
+        ConvState::RecoverableContinuationFailure { .. } => {
+            ("Failed", Some("continuation summary failed"))
+        }
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::Provisioning { .. }
@@ -14691,7 +14694,6 @@ async fn classify_creation_watch_outcome(
         | ConvState::Failed { .. }
         | ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. }
-        | ConvState::RecoverableContinuationFailure { .. }
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::ContextExhausted { .. }

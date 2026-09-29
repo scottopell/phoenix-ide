@@ -577,20 +577,6 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const MIGRATION_112: &str = r"
-CREATE TABLE steering_execution_watch_sources (
-    source_transcript_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    source_message_id TEXT NOT NULL,
-    started_at_us INTEGER NOT NULL CHECK(typeof(started_at_us) = 'integer'),
-    settled_at_us INTEGER CHECK(settled_at_us IS NULL OR typeof(settled_at_us) = 'integer'),
-    terminal_kind TEXT CHECK(terminal_kind IS NULL OR terminal_kind IN ('completed', 'failed', 'cancelled')),
-    CHECK ((settled_at_us IS NULL) = (terminal_kind IS NULL)),
-    PRIMARY KEY(source_transcript_id, source_message_id)
-);
-CREATE UNIQUE INDEX steering_execution_watch_active ON steering_execution_watch_sources(source_transcript_id)
-    WHERE settled_at_us IS NULL;
-";
-
 const MIGRATION_111: &str = r"
 CREATE TABLE coordinator_watches (
     id INTEGER PRIMARY KEY,

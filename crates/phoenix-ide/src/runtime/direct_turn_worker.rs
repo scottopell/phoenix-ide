@@ -287,6 +287,30 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         self.dispatch_accepted_turns().await
     }
 
+    pub(crate) async fn dispatch_conversation_once(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .terminal_discovery
+                .list_accepted(cursor.clone(), DISCOVERY_BATCH_LIMIT)
+                .await
+                .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?;
+            for candidate in page.candidates {
+                if candidate.conversation.0 == conversation_id {
+                    self.dispatch_candidate(candidate, self.clock.now()).await?;
+                }
+            }
+            if page.next_cursor.is_none() || page.next_cursor == cursor {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        Ok(())
+    }
+
     async fn dispatch_accepted_turns(
         &self,
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {

@@ -3655,6 +3655,21 @@ impl RuntimeManager {
         let _ = self.wake_kick_tx.send(next);
     }
 
+    pub(crate) async fn dispatch_standalone_turn(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        DirectTurnWorker::new(
+            self.db.direct_turn_repository(),
+            self.clone(),
+            Arc::new(SystemClock),
+            self.db.close_repository(),
+        )
+        .dispatch_conversation_once(conversation_id)
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     pub fn kick_direct_turn_worker(&self) {
         let next = self.direct_turn_kick_tx.borrow().wrapping_add(1);
         let _ = self.direct_turn_kick_tx.send(next);
