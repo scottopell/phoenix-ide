@@ -3685,6 +3685,7 @@ where
                 result.effects,
                 drain_event,
                 projection_guard,
+                clears_pending_trusted_after_commit,
                 &mut generated_events,
             ))
             .await?;
@@ -4112,6 +4113,7 @@ where
         original_effects: Vec<Effect>,
         drain_event: Event,
         projection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        clears_pending_trusted_after_commit: bool,
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
         let mut deferred_request_llm: Option<Effect> = None;
@@ -4133,6 +4135,9 @@ where
                     Effect::PersistState => {
                         let mut admitted = self.admit_authoritative_effect()?;
                         self.persist_state_effect(false, &mut admitted).await?;
+                        if clears_pending_trusted_after_commit {
+                            self.pending_trusted_tool_results.clear();
+                        }
                         continue;
                     }
                     Effect::NotifyStateChange => {

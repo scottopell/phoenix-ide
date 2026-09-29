@@ -26,7 +26,7 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
      CURL_TLS=(--cacert "$CA_CERT_PATH")
    fi
    https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
-     curl -q --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
+     curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
    ```
 
    This public route returns only `auth_required` and `authenticated`. Repeat the same `ORIGIN_B64` decode in each later scoped Bash call; shell variables do not persist across calls. For private-CA HTTPS, `CA_CERT_PATH_B64` must encode a user-identified or authoritative same-server readable CA certificate path. Browser trust is not sufficient for server-side curl. Do not disable TLS verification; stop if the CA path is unavailable. Repeat the same origin/CA initialization in each later scoped Bash call because shell variables do not persist.
@@ -39,7 +39,7 @@ For authenticated raw reads, repeat the same origin/CA initialization and then u
 
 ```bash
 https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
-  curl -q --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
+  curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
   --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
   -- "$ORIGIN/api/models"
 ```
@@ -66,10 +66,11 @@ Creation intent is immutable for `request_id`, `cwd`, `model`, `effort`, `object
 
 ### 1. Generate and retain the request identity
 
-Run this in the admitted WorkScope. Its base64 output safely represents arbitrary server paths and is non-secret durable conversation evidence; retain it before dispatch.
+Run this in the admitted WorkScope. Its base64 output safely represents arbitrary server paths and is non-secret durable conversation evidence; retain it before dispatch. Before generating an ID, require that trimming `$PWD` would not change it: `[[ "$PWD" != [[:space:]]* && "$PWD" != *[[:space:]] ]] || exit`. Phoenix normalizes creation cwd with `trim()`, so a leading/trailing-whitespace WorkScope path is unsupported and must stop rather than target another path.
 
 ```bash
 set -u
+[[ "$PWD" != [[:space:]]* && "$PWD" != *[[:space:]] ]] || exit
 read -r -a UUID_BYTES <<<"$(od -An -N16 -tx1 /dev/urandom)" || exit
 UUID_HEX=''
 for byte in "${UUID_BYTES[@]}"; do UUID_HEX+=$byte; done
@@ -104,14 +105,14 @@ if [[ -n "$CA_CERT_PATH_B64" ]]; then
 fi
 printf '%s' "$INTENT_B64" | base64 -d |
   https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
-  curl -q --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
+  curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
     --header 'Content-Type: application/json' \
     --header @<(printf '%s%s\n' 'Authorization: Bearer ' "$PHOENIX_PASSWORD") \
     --data-binary @- --write-out $'\ncreation_http_status=%{http_code}\n' \
     -- "$ORIGIN/api/product-conversations/new"
 ```
 
-Omit the bearer-header line when auth is disabled or already satisfied. Keep `INTENT_B64` out of command output because it contains the objective.
+Omit the bearer-header line when auth is disabled or already satisfied. Keep `INTENT_B64` out of command output because it contains the objective. The 10-second connect and 30-second transfer deadlines bound every request. A POST deadline after connection may mean the server accepted the intent, so treat curl timeout as ambiguous and follow same-ID reconciliation; do not leave the handle running or mint another UUID.
 
 A successful response proves durable creation/publication and returns:
 
