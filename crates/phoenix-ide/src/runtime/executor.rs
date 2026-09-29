@@ -3712,6 +3712,7 @@ where
                     effect,
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
+                            || clears_pending_trusted_after_commit
                 );
                 let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
                     && task_approval_execution.is_some();
