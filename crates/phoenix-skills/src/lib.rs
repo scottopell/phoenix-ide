@@ -1393,6 +1393,8 @@ mod tests {
             "same Phoenix server that owns that WorkScope",
             "llm_language",
             "ordered `images` collection",
+            "requires exactly `images: []`",
+            "Truncation is inconclusive",
             "only runtime commands required are `curl`, `base64`, and `od`",
         ] {
             assert!(
@@ -1400,6 +1402,10 @@ mod tests {
                 "missing operational contract: {required}"
             );
         }
+        assert!(
+            !trusted.contains("(?:"),
+            "Bash ERE must avoid non-capturing groups"
+        );
         assert!(
             !trusted.contains("--decode"),
             "base64 flags must support macOS"

@@ -18,7 +18,7 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    ORIGIN_B64='base64-of-the-same-server-origin'
    CA_CERT_PATH_B64='' # optional base64 of authoritative same-server CA path
    ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
-   [[ "$ORIGIN" =~ ^https?://[^[:space:]/]+(:[0-9]+)?$ ]] || exit
+   [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
    CURL_TLS=()
    if [[ -n "$CA_CERT_PATH_B64" ]]; then
      CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit
@@ -59,7 +59,7 @@ Omit the `--header` line when auth is disabled or the request is already authent
 }
 ```
 
-Every request field is immutable creation intent: `request_id`, `cwd`, `model`, `effort`, `objective`, `llm_language`, and the ordered `images` collection. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation.
+Every request field is immutable creation intent: `request_id`, `cwd`, `model`, `effort`, `objective`, `llm_language`, and the ordered `images` collection. A changed payload with the same UUID conflicts; a new UUID risks duplicate creation. This scoped-Bash recipe supports text-only creation and therefore requires exactly `images: []`. Do not embed image data in a Bash command: API-sized image payloads exceed Bash command/output capacity. Image-bearing creation requires a separate bounded upload/transport surface that the public API does not expose.
 
 ### 1. Generate and retain the request identity
 
@@ -78,7 +78,7 @@ printf 'creation_request_id=%s\ncreation_cwd=%s\n' "$REQUEST_ID" "$PWD"
 
 ### 2. Prepare the exact intent as data
 
-Global now has the retained UUID, scoped `$PWD`, exact live model/effort, and objective. Construct the complete JSON object exactly once, validate that it has only the fields shown above, and base64-encode those UTF-8 JSON bytes. Keep that base64 value unchanged through reconciliation and retry. Base64 carries arbitrary quotes, shell characters, and trailing newlines as data rather than shell syntax.
+Global now has the retained UUID, scoped `$PWD`, exact live model/effort, and objective. Construct the complete text-only JSON object exactly once, validate that it has only the fields shown above and exactly `images: []`, and base64-encode those UTF-8 JSON bytes. Keep that base64 value unchanged through reconciliation and retry. Base64 carries arbitrary quotes, shell characters, and trailing newlines as data rather than shell syntax. Reject an encoded intent that approaches the Bash tool's command limit; do not split, write, or reconstruct it through the filesystem.
 
 ### 3. Copyable POST transport
 
@@ -135,9 +135,11 @@ These are not general conversation retry APIs. Deletion acceptance is not observ
 
 After a successful POST:
 
-1. Read `GET /api/product-conversations/{product_conversation_id}`. This independently verifies stable product identity/publication and returns `latest_transcript_row_id`, `writable_transcript_row_id`, lifecycle, and route data.
-2. Read `GET /api/conversations/{latest_transcript_row_id}`. This separately exposes exact transcript state, messages, and `agent_working`.
+1. Read `GET /api/product-conversations/{product_conversation_id}`. When its complete JSON is observable, this independently verifies stable product identity/publication and returns `latest_transcript_row_id`, `writable_transcript_row_id`, lifecycle, and route data.
+2. Read `GET /api/conversations/{latest_transcript_row_id}`. When complete, this separately exposes exact transcript state, messages, and `agent_working`.
 3. Report `request_id`, `product_conversation_id`, root `transcript_row_id`, current `latest_transcript_row_id`, `canonical_route`, `conversation.state.type`, and `agent_working` without conflating them.
+
+Both reads can exceed Bash's result cap after large model output or message history. Validate the response as complete JSON before using it. Truncation is inconclusive: report that creation succeeded but activity/state verification is unavailable through the current unbounded read APIs. Never infer state from a partial body.
 
 The root transcript returned by creation is identity/history. After continuation it can differ from the current transcript. Creation success does not imply dispatch success, active generation, or turn completion.
 
@@ -158,4 +160,4 @@ For user-authorized continuation only, require `ordinary_lifecycle == "open"` an
 
 ## Honest gaps
 
-Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded creation lookup by request ID, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
+Current APIs do not provide a general Coordinator lifecycle endpoint, unified mutation receipt, existing-turn retry route, cancel idempotency key, accepted-response proof of asynchronous completion, remote-server cwd resolver, bounded image upload/creation transport, bounded creation lookup by request ID, bounded state-only conversation projection, or observable completion for accepted creation-recovery deletion. Do not manufacture these with local receipt files, database writes, polling loops, background monitors, unsupported fields, or unsupported routes. Report the exact gap and scope a server change separately.
