@@ -4213,6 +4213,7 @@ where
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
+                    self.pending_trusted_tool_results.clear();
                     generated_events.push(self.llm_dispatch_failure_event(error));
                 }
             }
@@ -8013,7 +8014,8 @@ where
             assistant_message,
             tool_results,
         } = data;
-        self.pending_trusted_tool_results = trusted_tool_results(&tool_results);
+        self.pending_trusted_tool_results
+            .extend(trusted_tool_results(&tool_results));
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -8072,6 +8074,12 @@ where
                 self.local_terminal_authority = LocalTerminalAuthority::Fatal;
                 return Err(error);
             }
+        }
+        if matches!(
+            self.state,
+            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. }
+        ) {
+            self.pending_trusted_tool_results.clear();
         }
         let _ = self
             .broadcast_tx
@@ -8178,6 +8186,13 @@ where
                     self.storage
                         .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                         .await?;
+                }
+
+                if matches!(
+                    self.state,
+                    ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. }
+                ) {
+                    self.pending_trusted_tool_results.clear();
                 }
 
                 // Broadcast the now-durable rows so connected clients render

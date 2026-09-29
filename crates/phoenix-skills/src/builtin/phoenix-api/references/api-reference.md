@@ -17,13 +17,14 @@ Prefer the live API contract. Inspect source only when `/api/version` proves a t
    ```bash
    ORIGIN_B64='base64-of-the-same-server-origin'
    CA_CERT_PATH_B64='' # optional base64 of authoritative same-server CA path
-   ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
+   if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
+   ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
    [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
-   CURL_TLS=()
+   CURL_TLS=(--globoff)
    if [[ -n "$CA_CERT_PATH_B64" ]]; then
-     CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit
+     CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
      [[ "$CA_CERT_PATH" == /* && -r "$CA_CERT_PATH" ]] || exit
-     CURL_TLS=(--cacert "$CA_CERT_PATH")
+     CURL_TLS=("${CURL_TLS[@]}" --cacert "$CA_CERT_PATH")
    fi
    https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
      curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" -- "$ORIGIN/api/auth/status"
@@ -95,15 +96,16 @@ set -u
 ORIGIN_B64='base64-of-the-same-server-origin'
 CA_CERT_PATH_B64='' # optional authoritative same-server CA path
 INTENT_B64='base64-of-the-complete-exact-json-intent'
-ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 -d) || exit
+if printf '' | base64 -d >/dev/null 2>&1; then B64_DEC=(-d); else B64_DEC=(-D); fi
+ORIGIN=$(printf '%s' "$ORIGIN_B64" | base64 "${B64_DEC[@]}") || exit
 [[ "$ORIGIN" =~ ^https?://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]] || exit
-CURL_TLS=()
+CURL_TLS=(--globoff)
 if [[ -n "$CA_CERT_PATH_B64" ]]; then
-  CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 -d) || exit
+  CA_CERT_PATH=$(printf '%s' "$CA_CERT_PATH_B64" | base64 "${B64_DEC[@]}") || exit
   [[ "$CA_CERT_PATH" == /* && -r "$CA_CERT_PATH" ]] || exit
-  CURL_TLS=(--cacert "$CA_CERT_PATH")
+  CURL_TLS=("${CURL_TLS[@]}" --cacert "$CA_CERT_PATH")
 fi
-printf '%s' "$INTENT_B64" | base64 -d |
+printf '%s' "$INTENT_B64" | base64 "${B64_DEC[@]}" |
   https_proxy= http_proxy= all_proxy= no_proxy='*' HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
   curl -q --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error "${CURL_TLS[@]}" \
     --header 'Content-Type: application/json' \
