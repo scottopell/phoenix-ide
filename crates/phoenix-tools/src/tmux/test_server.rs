@@ -1616,6 +1616,7 @@ impl TestTmuxServerOwner {
         TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf()).with_test_spawn_handoff()
     }
 
+    #[cfg(test)]
     pub(crate) fn control_root_path(&self) -> &Path {
         self.control_root
             .as_ref()
@@ -1737,10 +1738,12 @@ fn parse_process_ids(output: &str) -> io::Result<(&str, &str)> {
     Ok((server_pid, pane_pid))
 }
 
+#[cfg(test)]
 struct RegistrationArtifacts {
     paths: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 impl Drop for RegistrationArtifacts {
     fn drop(&mut self) {
         for path in &self.paths {
@@ -1749,6 +1752,7 @@ impl Drop for RegistrationArtifacts {
     }
 }
 
+#[cfg(test)]
 fn parse_acknowledged_processes(value: &str) -> io::Result<TestServerProcesses> {
     let fields = value.split('\t').collect::<Vec<_>>();
     if fields.len() < 4 || fields.len() % 2 != 0 {
@@ -1782,6 +1786,7 @@ fn parse_acknowledged_processes(value: &str) -> io::Result<TestServerProcesses> 
     })
 }
 
+#[cfg(test)]
 pub(crate) fn register_owned_server(
     socket: &Path,
     control_socket: &Path,
@@ -1837,6 +1842,7 @@ pub(crate) fn register_owned_server(
                 "tmux watchdog did not acknowledge process ownership",
             ));
         }
+        // test-timing-allow: polling observes the watchdog's acknowledged/rejected file protocol; the deadline is only a liveness ceiling.
         thread::sleep(Duration::from_millis(20));
     }
 }

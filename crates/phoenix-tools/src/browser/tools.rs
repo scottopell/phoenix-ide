@@ -1067,7 +1067,6 @@ impl Tool for BrowserTypeTool {
             .as_deref()
             .and_then(parse_duration)
             .unwrap_or(Duration::from_secs(30));
-        let deadline = std::time::Instant::now() + timeout;
 
         // Get browser session
         let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
@@ -1076,6 +1075,7 @@ impl Tool for BrowserTypeTool {
         };
 
         let guard = session.read().await;
+        let deadline = std::time::Instant::now() + timeout;
 
         let selector = serde_json::to_string(&input.selector).unwrap();
         let element = match focus_element_until(&guard.page, &input.selector, deadline).await {

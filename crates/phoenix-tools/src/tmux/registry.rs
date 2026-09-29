@@ -3409,7 +3409,7 @@ pub async fn spawn_session(
     spawn_session_owned(socket_path, config_path, cwd, false).await
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) async fn spawn_test_session_with_handoff(
     socket_path: &Path,
     config_path: &Path,
