@@ -17,7 +17,7 @@
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
     ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageRetriever,
-    MessageType, NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
+    NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
 };
 use chrono::Utc;
 use phoenix_llm::{

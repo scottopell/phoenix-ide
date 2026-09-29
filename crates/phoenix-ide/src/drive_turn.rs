@@ -305,7 +305,8 @@ async fn drive_conversation(
                 images: Vec::new(),
                 files: Vec::new(),
                 user_agent: Some("drive-turn".into()),
-                expansion_policy: crate::chat_message::MessageExpansionPolicy::ExpandUserReferences,
+                expansion_policy:
+                    crate::send_chat_service::MessageExpansionPolicy::ExpandUserReferences,
             })
             .await
             .map_err(|error| DriveTurnError::Runtime(error.to_string()))?;
