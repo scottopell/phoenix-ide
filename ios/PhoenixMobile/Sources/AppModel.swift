@@ -921,13 +921,19 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations(),
-              !Task.isCancelled,
+        guard let fresh = try? await api.listConversations() else { return false }
+        let provisioningShells = await listStore.confirmedMissingProvisioningShellRows(
+            api: api,
+            fresh: fresh)
+        guard !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration,
               nudgePreferenceGeneration == startedNudgeGeneration,
               attentionEvidenceGeneration == startedEvidenceGeneration,
-              listStore.applyExternal(fresh, startedAt: listToken)
+              listStore.applyExternal(
+                fresh,
+                preserving: provisioningShells,
+                startedAt: listToken)
         else { return false }
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
@@ -1860,6 +1866,12 @@ final class AppModel {
         let provisioningShells = await listStore.confirmedMissingProvisioningShellRows(
             api: api,
             fresh: fresh)
+        guard !Task.isCancelled,
+              aggregateReconciliationId == reconciliationId,
+              apiGeneration == startedGeneration,
+              connectivity.isOnline,
+              isForeground
+        else { return false }
         return listStore.applyExternal(
             fresh,
             preserving: provisioningShells,

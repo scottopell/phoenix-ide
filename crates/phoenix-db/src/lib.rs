@@ -5893,7 +5893,7 @@ impl Database {
                 Some((cleanup, generation, &now_str)),
             )
             .await?;
-            if !deleted {
+            if !deleted.0 {
                 tx.rollback().await?;
                 return Err(DbError::Serialization(
                     "creation cleanup claim was lost".to_string(),
@@ -10649,7 +10649,7 @@ impl Database {
         conversation_id: &str,
         observer: sqlite_telemetry::ParentSqliteObserver<'_>,
         creation_cleanup_claim: Option<(&CreationCleanupJob, i64, &str)>,
-    ) -> DbResult<bool> {
+    ) -> DbResult<(bool, bool)> {
         let Some(product_conversation_id) = Self::delete_conversation_row_with_dependents(
             connection,
             conversation_id,
@@ -10658,7 +10658,7 @@ impl Database {
         )
         .await?
         else {
-            return Ok(false);
+            return Ok((false, false));
         };
         Self::delete_subordinates_if_last_parent(
             connection,
@@ -10667,16 +10667,17 @@ impl Database {
             observer,
         )
         .await?;
-        let _ = Self::delete_product_conversation_if_empty(connection, &product_conversation_id)
-            .await?;
-        Ok(true)
+        let aggregate_deleted =
+            Self::delete_product_conversation_if_empty(connection, &product_conversation_id)
+                .await?;
+        Ok((true, aggregate_deleted))
     }
 
     #[allow(clippy::too_many_lines)]
     async fn delete_conversations_in_transaction(
         &self,
         ids: &[String],
-    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
         let telemetry = self.sqlite_telemetry(
             SqliteOperation::ConversationDelete,
             SqliteWorkloadCategory::MessagePersistence,
@@ -10706,29 +10707,33 @@ impl Database {
         };
 
         let body = async {
+            let mut aggregate_deleted = false;
             for id in ids {
-                if !Self::hard_delete_conversation_tx(
+                let deleted = Self::hard_delete_conversation_tx(
                     &mut tx,
                     id,
                     telemetry.parent_observer(),
                     None,
                 )
-                .await?
-                {
+                .await?;
+                if !deleted.0 {
                     return Err(DbError::ConversationNotFound(id.clone()));
                 }
+                aggregate_deleted |= deleted.1;
             }
-            Ok(())
+            Ok(aggregate_deleted)
         }
         .await;
 
         match body {
-            Ok(()) => {
+            Ok(aggregate_deleted) => {
                 let commit = telemetry
                     .observe_commit_db(timing, async { Ok(tx.commit().await?) })
                     .await;
                 match commit {
-                    Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())),
+                    Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                        aggregate_deleted,
+                    )),
                     Err(commit_error) => {
                         if SqliteTransactionManager::rollback(&mut connection)
                             .await
@@ -10758,7 +10763,9 @@ impl Database {
                                 commit_error,
                             ))
                         } else if present == 0 {
-                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                                aggregate_deleted,
+                            ))
                         } else {
                             crate::workflow::LocalAuthorityResult::DurableFactUnclassified
                         }
@@ -10779,6 +10786,19 @@ impl Database {
         }
     }
 
+    /// Delete one conversation and report whether its `ProductConversation` row was also removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if deletion fails.
+    pub async fn delete_conversation_with_aggregate_result(
+        &self,
+        id: &str,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        self.delete_conversations_in_transaction(&[id.to_string()])
+            .await
+    }
+
     /// Delete conversations and all their dependent rows in one transaction.
     ///
     /// The caller supplies deletion order. Any missing row or database failure
@@ -10792,7 +10812,14 @@ impl Database {
         &self,
         ids: &[String],
     ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
-        self.delete_conversations_in_transaction(ids).await
+        match self.delete_conversations_in_transaction(ids).await {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(result.map(|_| ()))
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
     }
 
     /// Delete conversations while collapsing an unclassifiable commit outcome
@@ -10803,7 +10830,9 @@ impl Database {
     /// Returns a [`DbError`] if deletion fails or its commit cannot be classified.
     pub async fn delete_conversations_atomically(&self, ids: &[String]) -> DbResult<()> {
         match self.delete_conversations_in_transaction(ids).await {
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
+            }
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                 Err(DbError::Serialization(
                     "conversation deletion commit outcome is unclassified".into(),
@@ -10822,7 +10851,9 @@ impl Database {
             .delete_conversations_in_transaction(&[id.to_string()])
             .await
         {
-            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
+            }
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
                 Err(DbError::Serialization(
                     "conversation deletion commit outcome is unclassified".into(),

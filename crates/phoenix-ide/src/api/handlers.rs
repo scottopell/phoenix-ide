@@ -6631,11 +6631,15 @@ pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &Pre
     }
 }
 
-pub(super) async fn finish_prepared_hard_delete(state: &AppState, prepared: PreparedHardDelete) {
+pub(super) async fn finish_prepared_hard_delete(
+    state: &AppState,
+    prepared: PreparedHardDelete,
+    aggregate_deleted: bool,
+) {
     let Some(conversation) = prepared.release_authority() else {
         return;
     };
-    finish_hard_deleted_conversation(state, conversation).await;
+    finish_hard_deleted_conversation(state, conversation, aggregate_deleted).await;
 }
 
 pub(super) async fn finalize_hard_deleted_conversation_resources(
@@ -6649,17 +6653,12 @@ pub(super) async fn finalize_hard_deleted_conversation_resources(
 pub(super) async fn finish_hard_deleted_conversation(
     state: &AppState,
     conversation: Box<crate::db::Conversation>,
+    aggregate_deleted: bool,
 ) {
     let id = conversation.id.clone();
     finalize_hard_deleted_conversation_resources(state, &conversation).await;
     broadcast_conversation_hard_deleted(state, &id).await;
-    if matches!(
-        state
-            .db
-            .get_ordinary_product_conversation(&conversation.product_conversation_id)
-            .await,
-        Err(crate::db::DbError::ConversationNotFound(_))
-    ) {
+    if aggregate_deleted {
         state.runtime.publish_aggregate_hard_deleted(
             conversation.product_conversation_id.to_string(),
             vec![id.clone()],
@@ -6673,13 +6672,15 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
         return Ok(());
     }
-    match state
+    let aggregate_deleted = match state
         .runtime
         .db()
-        .delete_conversations_atomically_with_authority(&[id.to_string()])
+        .delete_conversation_with_aggregate_result(id)
         .await
     {
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+            aggregate_deleted,
+        )) => aggregate_deleted,
         phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
             reopen_prepared_hard_delete(state, &prepared).await;
             return Err(AppError::Internal(format!(
@@ -6694,8 +6695,8 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
                 "conversation deletion lost local commit authority".to_string(),
             ));
         }
-    }
-    finish_prepared_hard_delete(state, prepared).await;
+    };
+    finish_prepared_hard_delete(state, prepared, aggregate_deleted).await;
     Ok(())
 }
 

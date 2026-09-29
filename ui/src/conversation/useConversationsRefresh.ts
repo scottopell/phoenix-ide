@@ -26,6 +26,9 @@ export function subscribeToAggregateDeletionEvents(): () => void {
   const connect = () => {
     if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
     source = new EventSource('/api/product-conversations/events');
+    source.onopen = () => {
+      notifyProductConversationListMayHaveChanged();
+    };
     source.addEventListener('conversation_hard_deleted', (event) => {
       retryDelayMs = 1_000;
       let payload: unknown;
