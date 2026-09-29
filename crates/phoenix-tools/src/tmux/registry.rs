@@ -732,9 +732,9 @@ struct EnsureLiveLockTestHook {
 #[cfg(test)]
 #[derive(Debug)]
 struct CompleteRetirementLockTestHook {
-    entry_lock_reached: Arc<tokio::sync::Notify>,
     socket_identity_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     final_authority_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    final_map_lock_reached: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
@@ -935,28 +935,30 @@ impl TmuxRegistry {
     }
 
     #[cfg(test)]
-    fn with_complete_retirement_lock_test_hook(
-        mut self,
-        before_entry_lock: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
-            entry_lock_reached: before_entry_lock,
-            socket_identity_gate: None,
-            final_authority_gate: None,
-        }));
-        self
-    }
-
-    #[cfg(test)]
     fn with_final_authority_test_hook(
         mut self,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
-            entry_lock_reached: Arc::new(tokio::sync::Notify::new()),
             socket_identity_gate: None,
             final_authority_gate: Some((entered, release)),
+            final_map_lock_reached: None,
+        }));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_final_map_lock_test_hook(
+        mut self,
+        final_authority_reached: Arc<tokio::sync::Notify>,
+        release_final_authority: Arc<tokio::sync::Notify>,
+        final_map_lock_reached: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
+            socket_identity_gate: None,
+            final_authority_gate: Some((final_authority_reached, release_final_authority)),
+            final_map_lock_reached: Some(final_map_lock_reached),
         }));
         self
     }
@@ -2443,10 +2445,6 @@ impl TmuxRegistry {
             return self.verify_exact_absence(permit).await;
         };
 
-        #[cfg(test)]
-        if let Some(hook) = &self.complete_retirement_lock_test_hook {
-            hook.entry_lock_reached.notify_one();
-        }
         let Ok(server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await else {
             return Ok(TmuxRetirementOutcome::RemovalFailed {
                 reason: "tmux exact teardown write lock exceeded the Close deadline".to_string(),
@@ -2593,6 +2591,14 @@ impl TmuxRegistry {
                 {
                     entered.notify_one();
                     release.notified().await;
+                }
+                #[cfg(test)]
+                if let Some(lock_reached) = self
+                    .complete_retirement_lock_test_hook
+                    .as_ref()
+                    .and_then(|hook| hook.final_map_lock_reached.as_ref())
+                {
+                    lock_reached.notify_one();
                 }
                 let mut map = match deadline
                     .write_map(self, "retirement complete final authority")
@@ -4303,51 +4309,52 @@ mod tests {
         assert!(map_guard.get(&work_scope.stable_key()).is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_deadline_bounds_complete_final_registry_map_lock() {
         let tmp = TempDir::new().unwrap();
-        let before_entry_lock = Arc::new(tokio::sync::Notify::new());
+        let final_authority_reached = Arc::new(tokio::sync::Notify::new());
+        let release_final_authority = Arc::new(tokio::sync::Notify::new());
+        let final_map_lock_reached = Arc::new(tokio::sync::Notify::new());
         let registry = Arc::new(
             TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
-                .with_complete_retirement_lock_test_hook(Arc::clone(&before_entry_lock)),
+                .with_final_map_lock_test_hook(
+                    Arc::clone(&final_authority_reached),
+                    Arc::clone(&release_final_authority),
+                    Arc::clone(&final_map_lock_reached),
+                ),
         );
         let work_scope = scope("deadline-complete-final-map");
         let socket_path = registry.derived_socket_path(&work_scope);
         registry.get_or_insert(&work_scope, socket_path).await;
+        let expires = tokio::time::Instant::now() + Duration::from_millis(100);
         let permit = registry
-            .begin_retirement(
-                &work_scope,
-                None,
-                None,
-                tokio::time::Instant::now() + Duration::from_millis(100),
-            )
+            .begin_retirement(&work_scope, None, None, expires)
             .await
             .expect("retirement fence");
-        let entry = registry
-            .inner
-            .read()
-            .await
-            .get(&work_scope.stable_key())
-            .cloned()
-            .unwrap();
-        let entry_guard = entry.server.write().await;
         let completing = {
             let registry = Arc::clone(&registry);
             tokio::spawn(async move { registry.complete_retirement(&permit).await.unwrap() })
         };
-        tokio::time::timeout(Duration::from_secs(1), before_entry_lock.notified())
+        tokio::time::timeout(Duration::from_secs(1), final_authority_reached.notified())
             .await
-            .expect("completion must reach the entry lock");
+            .expect("completion must reach final authority validation");
         let map_guard = registry.inner.write().await;
-        drop(entry_guard);
+        release_final_authority.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), final_map_lock_reached.notified())
+            .await
+            .expect("completion must attempt the final registry map lock");
 
+        tokio::time::advance(Duration::from_millis(100)).await;
         let outcome = completing.await.unwrap();
-        assert!(matches!(
-            outcome,
-            TmuxRetirementOutcome::RemovalFailed { reason }
-                if reason.contains("retirement complete final authority registry write lock")
-                    && reason.contains("Close deadline")
-        ));
+        assert!(
+            matches!(
+                &outcome,
+                TmuxRetirementOutcome::RemovalFailed { reason }
+                    if reason.contains("retirement complete final authority registry write lock")
+                        && reason.contains("Close deadline")
+            ),
+            "expected the final registry map lock deadline residual, got {outcome:?}"
+        );
         assert!(map_guard.get(&work_scope.stable_key()).is_some());
     }
 
