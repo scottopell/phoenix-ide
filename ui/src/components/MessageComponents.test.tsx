@@ -240,16 +240,16 @@ describe('user message provenance rendering', () => {
     expect(screen.getAllByText('You')).toHaveLength(1);
   });
 
-  it('keeps regular user messages authored as you', () => {
+  it('labels user-facing API input by channel', () => {
     render(
       <MemoryRouter>
         <UserMessage message={userMessage('plain-user', 'Hello there')} />
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('You')).toBeInTheDocument();
+    expect(screen.getByText('User · API')).toBeInTheDocument();
     expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy your message' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
   });
 });
 
@@ -1088,7 +1088,7 @@ describe('message copy affordances', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Copy your message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy input message' }));
 
     await waitFor(() => {
       expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
@@ -1169,7 +1169,7 @@ describe('message copy affordances', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole('button', { name: 'Copy your message' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy input message' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Copy Phoenix message' })).not.toBeInTheDocument();
   });
 

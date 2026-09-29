@@ -391,7 +391,7 @@ function InputSender({ origin }: { origin: InputOrigin | undefined }) {
   if (!origin) return <span className="message-sender">Unknown input</span>;
   switch (origin.kind) {
     case 'user_api':
-      return <span className="message-sender">You</span>;
+      return <span className="message-sender">User · API</span>;
     case 'internal_conversation':
       return (
         <span className="message-sender">
@@ -446,7 +446,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
         </span>
         <span className="message-header-actions">
-          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : message.origin?.kind === 'user_api' ? 'Copy your message' : 'Copy input message'} />
+          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
       <div className="message-content">
