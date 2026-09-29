@@ -247,7 +247,9 @@ async fn record_watch_event_tx(
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
          occurred_at_us, continuation_state)
         SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
-          CASE WHEN ?9 AND ?5 = 'failed' AND p.auto_continue_on_context_exhaustion = 1
+          CASE WHEN ?9 AND ?5 = 'failed' AND EXISTS
+               (SELECT 1 FROM automatic_continuation_admissions a WHERE a.predecessor_conversation_id = c.id
+                AND a.phase NOT IN ('failed', 'superseded'))
                THEN 'awaiting' ELSE 'none' END
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at_us IS NULL
@@ -261,7 +263,7 @@ async fn record_watch_event_tx(
         .bind(occurrence_kind)
         .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
-        .bind(category).bind(reason.or((category == "failed").then_some("turn failed")))
+        .bind(category).bind(if context_exhausted && category == "failed" { Some("context exhausted") } else { reason.or((category == "failed").then_some("turn failed")) })
         .bind(Utc::now().timestamp_micros())
         .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
     Ok(())
@@ -412,18 +414,17 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        assert!(db
-            .pending_coordinator_watch_events(16)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
         let (id, kind, state): (String, String, String) = sqlx::query_as(
             "SELECT event_id, terminal_kind, continuation_state FROM coordinator_watch_events",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!((kind.as_str(), state.as_str()), ("failed", "awaiting"));
+        assert_eq!((kind.as_str(), state.as_str()), ("failed", "none"));
         db.update_conversation_state(
             &source.id,
             &phoenix_core::domain::sm_state::ConvState::ContextExhausted {

@@ -679,6 +679,13 @@ BEGIN
                   WHERE c.id = NEW.conversation_id AND p.kind = 'coordinator');
     SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
 END;
+CREATE TRIGGER watch_auto_continuation_admitted AFTER INSERT ON automatic_continuation_admissions
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'awaiting'
+    WHERE source_transcript_id = NEW.predecessor_conversation_id
+      AND terminal_kind = 'failed' AND terminal_reason = 'context exhausted'
+      AND delivery_state = 'pending';
+END;
 CREATE TRIGGER watch_auto_continuation_failed AFTER UPDATE OF phase ON automatic_continuation_admissions
 WHEN NEW.phase = 'failed' AND OLD.phase != 'failed'
 BEGIN
