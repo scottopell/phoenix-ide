@@ -293,7 +293,7 @@ const VALIDATORS = {
     onlyKeys(value, ["kind", "version", "actor", "outcome", "next", "pointers", "note"], "status");
     return {
       outcome: id(value.outcome, "outcome"),
-      next: line(value.next),
+      next: line(value.next, "next"),
       pointers: list(value.pointers ?? [], "pointers", 0, 5, (entry, field) => {
         if (!isObject(entry)) reject(`${field} must be an object`);
         onlyKeys(entry, ["label", "url", "harness"], field);

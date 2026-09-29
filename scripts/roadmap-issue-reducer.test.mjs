@@ -494,6 +494,12 @@ test("evidence must be GitHub-checkable and deployment claims need a receipt", (
   assert.equal(validateRecord(deployed("https://github.com/o/r/actions/runs/123")).stage, "deployed");
 });
 
+test("length errors name the offending field", () => {
+  const status = { version: 2, kind: "status", actor: WORKER, outcome: "x", next: "y".repeat(201) };
+  assert.throws(() => validateRecord(status), /^Error: next must be at most 200 characters$|next must be at most 200 characters/);
+  assert.doesNotThrow(() => validateRecord({ ...status, next: "y".repeat(200) }));
+});
+
 test("records can be validated standalone before posting", () => {
   assert.equal(validateRecordText(body(outcome())).ok, true);
   assert.equal(validateRecordText(JSON.stringify({ version: 2, ...outcome() })).ok, true);
