@@ -298,6 +298,13 @@ impl Database {
         .bind(origin.db_parts().3)
         .execute(&mut *tx)
         .await?;
+        if matches!(
+            origin,
+            phoenix_core::domain::db_schema::InputOrigin::UserApi
+        ) {
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+                .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
+        }
         crate::message_attachments::insert(&mut tx, message_id, content).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())

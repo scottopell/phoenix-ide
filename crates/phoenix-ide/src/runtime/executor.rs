@@ -3400,7 +3400,8 @@ where
             if matches!(
                 terminal_event,
                 Event::UserCancel {
-                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    reason: _,
                 }
             ) && self.active_direct_turn.is_none()
                 && !matches!(self.state, ConvState::Idle)

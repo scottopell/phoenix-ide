@@ -3471,6 +3471,13 @@ impl WakeRepository {
             }
         }
 
+        if auto_resume {
+            if let Some(link) = links.first() {
+                sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+                    .bind(conversation_id).bind(&link.linked_message.message.message_id).execute(&mut *tx.tx).await?;
+            }
+        }
+
         for link in &links {
             let mut display_data = link
                 .linked_message
