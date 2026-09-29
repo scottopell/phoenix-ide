@@ -25,7 +25,7 @@ Separate facts from interpretation: a completed turn does not imply completed wo
 5. Compare the smallest event-production seams: persisted turn terminal outcomes and committed conversation state transitions. Identify coverage gaps, including errors outside an ordinary accepted turn, continuation, cancellation, and recovery. Do not treat SSE delivery or transient in-memory notifications as durable event truth.
 6. Design the minimum subscription and notification persistence. Identify one authority for enrollment, source occurrence identity, owed delivery, and accepted execution. Show the transaction/crash boundary that prevents lost or duplicate semantic notifications. Use existing terminal truth rather than creating a competing result store.
 7. Walk through busy Coordinator, duplicate delivery, restart, already-resumed target, subscription cancellation, continuation, and Close races. Keep source lifecycle separate from recipient admission.
-8. Discuss feedback-loop and cost controls: no blind re-drive, explicit cancellation respected, current-state recheck, and bounded intervention. Ask the user to choose policy where preference matters.
+8. Discuss feedback-loop and cost implications without embedding intervention policy in notification packets. Notifications carry factual outcomes and attribution; the Coordinator infers appropriate action from its existing context. Do not introduce retry budgets or persistent pause modes without a separately justified requirement.
 9. Produce a concise agreed architecture, interaction diagram, settled decisions, remaining code-verification work, and one smallest implementation slice with testable acceptance criteria. Propose implementation separately; do not silently expand this task into building it.
 
 ## Questions to present incrementally
@@ -63,3 +63,23 @@ Present concrete options with a recommendation and explain the consequence of ea
 General event infrastructure, arbitrary event filters, external-process subscriptions, universal exactly-once execution claims, redesigning direct-turn execution, or background monitoring of every conversation by default.
 
 *Historical footnote: earlier wake-contract work contains lessons about duplicate semantic delivery and overlapping admission authorities. It is not the proposed API, implementation program, or a prerequisite for this feature.*
+
+## Agreed design decisions
+
+- Subscriptions persist across turns and transcript continuation until explicitly removed or the watched ProductConversation closes.
+- The Global Coordinator has a trusted ability to choose, add, and remove watched conversations without per-target user authorization. This capability is not granted to ordinary conversations or subagents.
+- Infrastructure reports execution facts; the Coordinator judges whether the underlying work is complete. Normal execution endings are relevant, not just errors.
+- Notifications may enter ongoing Coordinator execution at existing safe steering boundaries. A separate notification-only run is not required.
+- Stopping the Coordinator cancels current execution but does not pause subscriptions or future notification-triggered execution. Cancellation must not re-deliver the same already-accepted notification automatically.
+- Successful continuation handoff is not an unexplained-stop event. Consume the automatic-continuation workstream's authoritative outcome rather than using timing to infer handoff success.
+- Trusted input boundaries assign typed provenance. Distinguish user-facing API input, internal conversation-sent messages with sender identity, and subscription notifications. Preserve provenance through admission, steering, persistence, history retrieval, UI, and model input. Existing system-generated input must remain correctly represented; do not fabricate historical attribution.
+- Ending a subscription suppresses notifications not yet accepted into Coordinator input. Already-accepted input is not retracted from the queue or transcript; the Coordinator checks current target state before acting.
+- Enrollment observes future occurrences only, with no catch-up or historical replay. Registration returns current state from a consistent database boundary so the Coordinator can inspect existing idle/error conditions in its current turn. Repeated enrollment is idempotent; removing and re-adding a watch does not revive prior notifications.
+- Use a fixed initial event set: normal execution ending, execution failure, and explicit cancellation. Successful continuation handoff is excluded. Waiting for a user question response or approval does not notify initially; Close ends the subscription.
+- Notification delivery contains factual information only, not behavioral instructions, recovery recommendations, or embedded prompt guidance. Natural-language derived facts are allowed. Communicate cancellation initiator when authoritative evidence supports it; do not infer human initiation merely from a broadly named internal event. Distinguish notification delivery origin from the actor that caused the source event. The Coordinator infers what action, if any, is appropriate from facts and its existing context.
+
+## Design verification still owed
+
+- Verify automatic continuation's actual durable outcome and transaction ordering with its active owner/current branch. The roadmap-cited commit was unavailable locally, and the abbreviated owner reference did not resolve through local messaging.
+- Trace existing is_meta consumers before choosing the exact provenance representation and migration. Avoid overlapping origin authorities while preserving existing system-message behavior.
+- Verify source event coverage outside active direct-turn settlement and the exact handoff transaction/replay identity across Coordinator continuation.
