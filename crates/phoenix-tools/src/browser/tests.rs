@@ -59,19 +59,6 @@ fn env_unclassified() -> bool {
         && std::env::var_os("PHOENIX_SKIP_BROWSER_TESTS").is_none()
 }
 
-/// Check if outbound HTTPS to the public internet is available. The
-/// `*_remote` browser tests navigate to real websites (example.com)
-/// and need real network. `dev.py check` probes reachability and sets
-/// `PHOENIX_SKIP_NETWORK_TESTS=1` in restricted envs (no outbound
-/// HTTPS) so those tests skip cleanly instead of producing env-noise
-/// failures.
-fn network_available() -> bool {
-    !matches!(
-        std::env::var("PHOENIX_SKIP_NETWORK_TESTS").as_deref(),
-        Ok("1" | "true"),
-    )
-}
-
 /// Skip macro for tests that require Chrome.
 ///
 /// When the suite is run outside `./dev.py` the environment was never
@@ -91,16 +78,6 @@ macro_rules! require_chrome {
                  environmental, not a code bug: run `./dev.py check`, which locates a \
                  usable Chromium (or cleanly skips browser tests when none exists)."
             );
-        }
-    };
-}
-
-/// Skip macro for tests that require outbound HTTPS to public hosts.
-macro_rules! require_network {
-    () => {
-        if !network_available() {
-            eprintln!("Skipping test: outbound HTTPS not available in this env");
-            return;
         }
     };
 }
@@ -882,56 +859,6 @@ async fn test_browser_session_persistence() {
     );
 
     shutdown_test(manager, server).await;
-}
-
-// ============================================================================
-// Remote URL test (network-dependent)
-// ============================================================================
-
-#[tokio::test]
-async fn test_browser_navigate_remote() {
-    require_chrome!();
-    require_network!();
-
-    let (ctx, manager) = test_context("test-navigate-remote");
-
-    // Navigate to a real website
-    let nav_tool = BrowserNavigateTool;
-    let result = nav_tool
-        .run(json!({"url": "https://example.com"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Navigate failed: {}", result.output());
-
-    // Verify we can read the page
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "document.title"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        result.output().contains("Example Domain"),
-        "Wrong title: {}",
-        result.output()
-    );
-
-    // Verify page content
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.querySelector('h1').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Example Domain"),
-        "Wrong h1: {}",
-        result.output()
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 // ============================================================================

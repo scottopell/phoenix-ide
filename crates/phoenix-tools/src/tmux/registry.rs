@@ -2269,19 +2269,6 @@ impl TmuxRegistry {
         }
     }
 
-    fn observe_dead_socket_shutdown(
-        socket_path: &Path,
-        killed_socket: SocketFileIdentity,
-    ) -> Result<ExactShutdownObservation, TmuxError> {
-        let observed =
-            socket_file_identity(socket_path).map_err(|source| TmuxError::ProbeFailed {
-                socket_path: socket_path.to_path_buf(),
-                source,
-            })?;
-        // A replacement or missing path proves the killed incarnation is gone; never unlink by pathname.
-        Ok(Self::dead_socket_shutdown_decision(killed_socket, observed))
-    }
-
     async fn observe_exact_shutdown(
         permit: &TmuxRetirementPermit,
         killed_socket: SocketFileIdentity,
@@ -4532,44 +4519,6 @@ mod tests {
                 "probe={probe:?}, socket={socket:?}"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dead_socket_shutdown_observation_never_unlinks_path_or_replacement() {
-        use std::os::unix::net::UnixListener;
-
-        let tmp = TempDir::new().unwrap();
-        let socket_path = tmp.path().join("shutdown.sock");
-        let stale = UnixListener::bind(&socket_path).unwrap();
-        let stale_identity = socket_file_identity(&socket_path).unwrap().unwrap();
-
-        assert!(matches!(
-            TmuxRegistry::observe_dead_socket_shutdown(&socket_path, stale_identity).unwrap(),
-            ExactShutdownObservation::Outstanding { .. }
-        ));
-        assert_eq!(
-            socket_file_identity(&socket_path).unwrap(),
-            Some(stale_identity),
-            "observing the exact stale incarnation must not unlink it by pathname"
-        );
-
-        std::fs::remove_file(&socket_path).unwrap();
-        let replacement = UnixListener::bind(&socket_path).unwrap();
-        let replacement_identity = socket_file_identity(&socket_path).unwrap().unwrap();
-        assert_ne!(replacement_identity, stale_identity);
-
-        assert_eq!(
-            TmuxRegistry::observe_dead_socket_shutdown(&socket_path, stale_identity).unwrap(),
-            ExactShutdownObservation::Complete
-        );
-        assert_eq!(
-            socket_file_identity(&socket_path).unwrap(),
-            Some(replacement_identity),
-            "a replacement at the checked pathname must remain"
-        );
-        drop(replacement);
-        drop(stale);
     }
 
     #[cfg(unix)]

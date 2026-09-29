@@ -819,6 +819,10 @@ mod tests {
         ctx
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one combined real tmux smoke replaces eleven independent process fixtures"
+    )]
     #[tokio::test]
     async fn real_lifecycle_smoke_covers_run_and_explicit_cleanup() {
         if skip_unless_tmux() {

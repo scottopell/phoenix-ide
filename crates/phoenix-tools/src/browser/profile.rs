@@ -2286,7 +2286,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(summary.long_task_total_ms(), 125.001);
+        assert!((summary.long_task_total_ms() - 125.001).abs() < f64::EPSILON);
     }
 
     #[test]

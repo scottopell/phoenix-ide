@@ -982,6 +982,45 @@ struct TypeInput {
 
 pub struct BrowserTypeTool;
 
+async fn focus_element_until(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    deadline: std::time::Instant,
+) -> Result<chromiumoxide::element::Element, String> {
+    let selector_json = serde_json::to_string(selector).unwrap();
+    match operation_phase(
+        BrowserOperationPhase::TypeFocus,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        async {
+            let element = page
+                .find_element(selector)
+                .await
+                .map_err(|error| format!("Could not find element '{selector}': {error}"))?;
+            element
+                .click()
+                .await
+                .map_err(|error| format!("Failed to focus element: {error}"))?;
+            loop {
+                let result = page
+                    .evaluate(format!(
+                        "document.activeElement === document.querySelector({selector_json})"
+                    ))
+                    .await
+                    .map_err(|error| format!("Failed to verify element focus: {error}"))?;
+                if result.into_value::<bool>().unwrap_or(false) {
+                    return Ok::<_, String>(element);
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => Err(message),
+    }
+}
+
 #[async_trait]
 impl Tool for BrowserTypeTool {
     fn name(&self) -> &'static str {
@@ -1039,40 +1078,9 @@ impl Tool for BrowserTypeTool {
         let guard = session.read().await;
 
         let selector = serde_json::to_string(&input.selector).unwrap();
-        let element = match operation_phase(
-            BrowserOperationPhase::TypeFocus,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            async {
-                let element = guard
-                    .page
-                    .find_element(&input.selector)
-                    .await
-                    .map_err(|error| {
-                        format!("Could not find element '{}': {error}", input.selector)
-                    })?;
-                element
-                    .click()
-                    .await
-                    .map_err(|error| format!("Failed to focus element: {error}"))?;
-                loop {
-                    let result = guard
-                        .page
-                        .evaluate(format!(
-                            "document.activeElement === document.querySelector({selector})"
-                        ))
-                        .await
-                        .map_err(|error| format!("Failed to verify element focus: {error}"))?;
-                    if result.into_value::<bool>().unwrap_or(false) {
-                        return Ok::<_, String>(element);
-                    }
-                    tokio::task::yield_now().await;
-                }
-            },
-        )
-        .await
-        {
-            Ok(Ok(element)) => element,
-            Ok(Err(message)) | Err(message) => return ToolOutput::error(message),
+        let element = match focus_element_until(&guard.page, &input.selector, deadline).await {
+            Ok(element) => element,
+            Err(message) => return ToolOutput::error(message),
         };
 
         // Clear existing text if requested
@@ -1082,7 +1090,7 @@ impl Tool for BrowserTypeTool {
                 deadline.saturating_duration_since(std::time::Instant::now()),
                 guard
                     .page
-                    .evaluate(format!("document.querySelector({}).select()", selector)),
+                    .evaluate(format!("document.querySelector({selector}).select()")),
             )
             .await
             {
