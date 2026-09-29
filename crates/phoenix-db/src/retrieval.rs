@@ -1964,7 +1964,7 @@ mod tests {
         db.watch_product_conversation(&sender.product_conversation_id)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO coordinator_watch_events(event_id, watch_id, source_occurrence_kind, source_occurrence_id, source_generation, source_transcript_id, terminal_kind, occurred_at) SELECT 'event-1', id, 'creation', 'test-creation', 0, 'c-a', 'completed', '2026-09-29T00:00:00Z' FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at IS NULL")
+        sqlx::query("INSERT INTO coordinator_watch_events(event_id, watch_id, source_occurrence_kind, source_occurrence_id, source_generation, source_transcript_id, terminal_kind, occurred_at_us) SELECT 'event-1', id, 'creation', 'test-creation', 0, 'c-a', 'completed', 1790640000000000 FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at_us IS NULL")
             .bind(sender.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
         sqlx::query(
             "UPDATE messages SET origin_kind = 'subscription_event', \

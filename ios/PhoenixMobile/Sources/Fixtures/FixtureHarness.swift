@@ -611,7 +611,7 @@ private extension FixtureScenario {
                     ]),
                 ]),
                 display_data: nil,
-                created_at: "2025-01-02T03:04:05Z"),
+                created_at: "2025-01-02T03:04:05Z", origin: .userApi),
             .init(
                 message_id: "m-skill",
                 conversation_id: "fixture-conv",

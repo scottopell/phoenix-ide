@@ -526,7 +526,7 @@ fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> S
         InputOrigin::InternalConversation {
             product_conversation_id,
             transcript_id,
-        } => format!(" from @conv:{product_conversation_id} transcript:{transcript_id}"),
+        } => format!(" from @conv:{transcript_id} (conversation ID {product_conversation_id})"),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SystemGenerated
@@ -859,8 +859,9 @@ async fn resolve_message(
         href,
         title,
         summary: format!(
-            "{} message {} in @conv:{} at {}: {}",
-            message.message_type,
+            "{}{} message {} in @conv:{} at {}: {}",
+            attributed_role(message.message_type, &message.origin),
+            attributed_sender(&message.origin),
             message.message_id,
             conv.id,
             message.created_at,

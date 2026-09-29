@@ -10,7 +10,7 @@ use crate::send_chat_service::{
 
 fn notification(event: &PendingWatchEvent) -> String {
     let mut text = format!(
-        "Watched conversation terminal event. Event ID: {}. Stable ProductConversation: {}. Source transcript: {}. Source occurrence: {} {}. Source generation: {}. Outcome: {}. Occurred at: {}.",
+        "Watched conversation terminal event. Event ID: {}. Stable ProductConversation: {}. Source transcript: {}. Source occurrence: {} {}. Source generation: {}. Outcome: {}. Occurred at (Unix microseconds): {}.",
         event.event_id,
         event.product_conversation_id.as_str(),
         event.source_transcript_id,
@@ -18,7 +18,7 @@ fn notification(event: &PendingWatchEvent) -> String {
         event.source_occurrence_id,
         event.source_generation,
         event.terminal_kind,
-        event.occurred_at,
+        event.occurred_at_us,
     );
     if let Some(reason) = &event.terminal_reason {
         text.push_str(" Reason: ");

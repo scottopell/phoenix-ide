@@ -54,7 +54,7 @@ Coverage verifies operator-level application-data reads, read-only SQLite author
 
 The scope is on-demand relational orientation, one durable chat-only Coordinator conversation, bounded global reads, explicitly WorkScope-targeted local operation through unsandboxed Bash, singular text-message delivery to existing non-Coordinator conversations, and a compact read-only briefing action.
 
-The Coordinator runs only on user turns. It does not monitor work in the background, manage a global objective, retain attention history, or infer execution or recipient understanding from request acceptance.
+The Coordinator runs on user turns and explicit watch notifications. Watches follow ordinary stable conversations across continuation and report future facts through ordinary admission; no ambient activity snapshot is restored. Notification acceptance does not establish execution or recipient understanding. The watch implementation is under qualification in PR #815.
 
 ## Out of Scope
 
@@ -63,5 +63,11 @@ The Coordinator runs only on user turns. It does not monitor work in the backgro
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
 - Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; user-authorized supported HTTP APIs remain available only through explicitly targeted Bash. Current APIs do not provide one aggregate-targeted lifecycle contract, uniform operation receipts, a general conversation retry, or caller-idempotent cancel.
-- Background monitoring or proactive intervention without a user turn.
+- Ambient monitoring outside explicitly enrolled conversation watches.
 - A separate transcript/composer runtime for the Coordinator.
+
+## Input provenance and explicit watches qualification
+
+REQ-GR-014 is implemented across trusted admission, steering, persisted history, search/resolve output, web and iOS attribution, and model-bound text. Historical unrecorded input remains unknown. Focused provenance tests and web checks pass; final exact-head CI/review remains the release gate.
+
+REQ-GR-015 has explicit Global watch tools, normalized obligations, source-transaction production for direct and initial creation execution, continuation suppression, ordinary durable admission, and Close/unsubscribe ordering. Focused DB coverage includes future-only enrollment, accepted-input deduplication, continuation outcomes, cancelled Close, and creation execution. No subscription scheduler or pause-on-Stop mode is added. Cancellation packets report cancellation without fabricating a human actor where the persisted source lacks that attribution. End-to-end live idle/busy model execution and the full failure-path coverage remain qualification obligations, not implied by focused DB tests.

@@ -10,7 +10,7 @@ pub struct WatchSnapshot {
     pub product_conversation_id: ProductConversationId,
     pub current_transcript_id: String,
     pub current_state: phoenix_core::domain::sm_state::ConvState,
-    pub enrolled_at: String,
+    pub enrolled_at_us: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct PendingWatchEvent {
     pub source_generation: i64,
     pub terminal_kind: String,
     pub terminal_reason: Option<String>,
-    pub occurred_at: String,
+    pub occurred_at_us: i64,
 }
 
 fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
@@ -35,19 +35,19 @@ fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
         current_transcript_id: row.try_get("transcript_id")?,
         current_state: serde_json::from_str(&state)
             .map_err(|error| DbError::Serialization(error.to_string()))?,
-        enrolled_at: row.try_get("enrolled_at")?,
+        enrolled_at_us: row.try_get("enrolled_at_us")?,
     })
 }
 
-const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolled_at,
+const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolled_at_us,
     c.id AS transcript_id, c.state
     FROM coordinator_watches w
     JOIN product_conversations p ON p.id = w.source_product_conversation_id
     JOIN conversations c ON c.product_conversation_id = p.id
       AND c.parent_conversation_id IS NULL AND c.continued_in_conv_id IS NULL
-    WHERE w.ended_at IS NULL AND p.ordinary_lifecycle = 'open'
+    WHERE w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open'
       AND (?1 IS NULL OR w.source_product_conversation_id = ?1)
-    ORDER BY w.enrolled_at, w.id";
+    ORDER BY w.enrolled_at_us, w.id";
 
 impl Database {
     /// Enroll an open ordinary product conversation and return its current snapshot.
@@ -72,11 +72,11 @@ impl Database {
             return Err(DbError::ProductConversationUnavailable(product_id.clone()));
         }
         sqlx::query(
-            "INSERT INTO coordinator_watches(source_product_conversation_id, enrolled_at)
+            "INSERT INTO coordinator_watches(source_product_conversation_id, enrolled_at_us)
                      VALUES (?1, ?2) ON CONFLICT DO NOTHING",
         )
         .bind(product_id.as_str())
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().timestamp_micros())
         .execute(&mut *tx)
         .await?;
         let row = sqlx::query(WATCH_SNAPSHOT)
@@ -98,18 +98,18 @@ impl Database {
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ended = sqlx::query(
-            "UPDATE coordinator_watches SET ended_at = ?2
-                                   WHERE source_product_conversation_id = ?1 AND ended_at IS NULL",
+            "UPDATE coordinator_watches SET ended_at_us = ?2
+                                   WHERE source_product_conversation_id = ?1 AND ended_at_us IS NULL",
         )
         .bind(product_id.as_str())
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().timestamp_micros())
         .execute(&mut *tx)
         .await?
         .rows_affected()
             != 0;
         sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
                      WHERE delivery_state = 'pending' AND watch_id IN
-                       (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at IS NOT NULL)")
+                       (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at_us IS NOT NULL)")
             .bind(product_id.as_str()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ended)
@@ -137,14 +137,14 @@ impl Database {
     ) -> DbResult<Vec<PendingWatchEvent>> {
         let rows = sqlx::query("SELECT e.event_id, w.source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
-                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at
+                  e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us
              FROM coordinator_watch_events e JOIN coordinator_watches w ON w.id = e.watch_id
              JOIN product_conversations p ON p.id = w.source_product_conversation_id
-             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at IS NULL
+             WHERE e.delivery_state = 'pending' AND e.continuation_state = 'none' AND w.ended_at_us IS NULL
                AND p.ordinary_lifecycle = 'open'
                AND NOT EXISTS (SELECT 1 FROM close_obligations o
                                WHERE o.product_conversation_id = p.id AND o.phase != 'completed')
-             ORDER BY e.occurred_at, e.event_id LIMIT ?1")
+             ORDER BY e.occurred_at_us, e.event_id LIMIT ?1")
             .bind(limit).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -159,7 +159,7 @@ impl Database {
                     source_generation: row.try_get("source_generation")?,
                     terminal_kind: row.try_get("terminal_kind")?,
                     terminal_reason: row.try_get("terminal_reason")?,
-                    occurred_at: row.try_get("occurred_at")?,
+                    occurred_at_us: row.try_get("occurred_at_us")?,
                 })
             })
             .collect()
@@ -245,12 +245,12 @@ async fn record_watch_event_tx(
     sqlx::query("INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
-         occurred_at, continuation_state)
+         occurred_at_us, continuation_state)
         SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
           CASE WHEN ?9 AND ?5 = 'failed' AND p.auto_continue_on_context_exhaustion = 1
                THEN 'awaiting' ELSE 'none' END
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
-          JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at IS NULL
+          JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at_us IS NULL
         WHERE c.id = ?8 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
           AND p.ordinary_lifecycle = 'open'
           AND (?5 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
@@ -262,7 +262,7 @@ async fn record_watch_event_tx(
         .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
         .bind(category).bind(reason.or((category == "failed").then_some("turn failed")))
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().timestamp_micros())
         .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
     Ok(())
 }
