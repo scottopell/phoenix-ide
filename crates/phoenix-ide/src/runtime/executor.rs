@@ -3181,15 +3181,6 @@ where
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
-        if matches!(event, Event::UserCancel { .. })
-            && self.active_direct_turn.is_none()
-            && !self.state.is_terminal()
-            && !matches!(self.state, ConvState::Idle)
-        {
-            self.storage
-                .record_execution_cancel(&self.context.conversation_id)
-                .await?;
-        }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
             && self.terminal_transition_retry.is_some()
@@ -3405,6 +3396,24 @@ where
 
             if authoritative_event {
                 self.parent_tool_cycle_count = 0;
+            }
+            if matches!(
+                terminal_event,
+                Event::UserCancel {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested
+                }
+            ) && self.active_direct_turn.is_none()
+                && !matches!(self.state, ConvState::Idle)
+                && matches!(
+                    result.new_state,
+                    ConvState::Idle
+                        | ConvState::CancellingTool { .. }
+                        | ConvState::CancellingSubAgents { .. }
+                )
+            {
+                self.storage
+                    .record_execution_cancel(&self.context.conversation_id)
+                    .await?;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
