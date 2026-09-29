@@ -37,16 +37,25 @@ Every request field is immutable creation intent: `request_id`, `cwd`, `model`, 
 
 ### Copyable scoped-Bash recipe
 
-Run the whole block in one Bash `op="run"` call with the admitted `work_scope_id`. `ORIGIN` must identify the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; if same-server identity is not established, stop because the public API exposes no remote-server cwd resolver. Base64-encode the exact UTF-8 objective outside the shell and set `OBJECTIVE_B64` to that safe alphabet. Set `MODEL_REQUESTED` only when the user selected an exact model ID. Optionally set `EFFORT` to a requested live-supported level; leaving it empty sends `null` and uses the model's native behavior.
+Run the whole block in one Bash `op="run"` call with the admitted `work_scope_id`. The origin must identify the same Phoenix server that owns that WorkScope and resolves its scoped `$PWD`; if same-server identity is not established, stop because the public API exposes no remote-server cwd resolver. Base64-encode the exact UTF-8 origin and objective outside the shell into `ORIGIN_B64` and `OBJECTIVE_B64`. When the user selected an exact model ID or effort, base64-encode those into `MODEL_REQUESTED_B64` and `EFFORT_B64`; empty selects the live default/native behavior. This recipe requires `curl`, `jq`, `base64`, and `od`; it checks them before making a request and stops rather than installing software or degrading to unsafe text parsing.
 
 ```bash
 set -u
-ORIGIN='https://the-same-phoenix-server-that-owns-this-workscope'
+ORIGIN_B64='base64-of-the-same-phoenix-server-origin'
 OBJECTIVE_B64='base64-of-the-exact-utf8-opening-objective'
-MODEL_REQUESTED='' # optional exact live model id; empty selects the live default
-EFFORT='' # optional exact level; empty means JSON null
-OBJECTIVE=$(printf '%s' "$OBJECTIVE_B64" | base64 --decode) || exit
-[[ -n "$OBJECTIVE" ]] || { printf '%s\n' 'objective must not be empty' >&2; exit 1; }
+MODEL_REQUESTED_B64='' # optional base64 of exact model id; empty selects live default
+EFFORT_B64='' # optional base64 of exact effort; empty means JSON null
+for dependency in curl jq base64 od; do
+  command -v "$dependency" >/dev/null || { printf 'missing required command: %s\n' "$dependency" >&2; exit 1; }
+done
+ORIGIN=$(jq -er --arg value "$ORIGIN_B64" '$value | @base64d | select(test("^https?://[^[:space:]]+$"))' <<<null) || {
+  printf '%s\n' 'origin must be valid base64 of an HTTP(S) origin' >&2
+  exit 1
+}
+jq -en --arg value "$OBJECTIVE_B64" '($value | @base64d) | length > 0' >/dev/null || {
+  printf '%s\n' 'objective must be valid base64 of non-empty UTF-8 text' >&2
+  exit 1
+}
 
 AUTH_STATUS=$(curl --fail-with-body --silent --show-error "$ORIGIN/api/auth/status") || exit
 AUTH_REQUIRED=$(jq -r 'if (.auth_required | type) == "boolean" then .auth_required else error("invalid auth_required") end' <<<"$AUTH_STATUS") || exit
@@ -66,20 +75,22 @@ api() {
 }
 
 MODELS=$(api "$ORIGIN/api/models") || exit
-if [[ -n "$MODEL_REQUESTED" ]]; then
-  MODEL=$MODEL_REQUESTED
-else
-  MODEL=$(jq -er '.default' <<<"$MODELS") || exit
-fi
-MODEL_INFO=$(jq -ec --arg model "$MODEL" '.models[] | select(.id == $model)' <<<"$MODELS") || {
-  printf 'selected model is not exposed by the live deployment: %s\n' "$MODEL" >&2
+MODEL_INFO=$(jq -ec --arg requested_b64 "$MODEL_REQUESTED_B64" '
+  if $requested_b64 == "" then
+    .default as $default | .models[] | select(.id == $default)
+  else
+    ($requested_b64 | @base64d) as $requested | .models[] | select(.id == $requested)
+  end
+' <<<"$MODELS") || {
+  printf '%s\n' 'selected/default model is not exposed by the live deployment' >&2
   exit 1
 }
-if [[ -n "$EFFORT" ]]; then
-  jq -e --arg effort "$EFFORT" \
+MODEL=$(jq -er '.id' <<<"$MODEL_INFO") || exit
+if [[ -n "$EFFORT_B64" ]]; then
+  EFFORT_JSON=$(jq -ecn --arg value "$EFFORT_B64" '$value | @base64d') || exit
+  jq -e --argjson effort "$EFFORT_JSON" \
     '.effort_capabilities.support == "supported" and (.effort_capabilities.levels | index($effort) != null)' \
     <<<"$MODEL_INFO" >/dev/null || { printf '%s\n' 'requested effort is not supported by the selected live model' >&2; exit 1; }
-  EFFORT_JSON=$(jq -Rn --arg value "$EFFORT" '$value')
 else
   EFFORT_JSON=null
 fi
@@ -92,8 +103,8 @@ UUID_VARIANT=$(printf '%x' $(( (16#${UUID_HEX:16:1} & 3) | 8 ))) || exit
 REQUEST_ID="${UUID_HEX:0:8}-${UUID_HEX:8:4}-4${UUID_HEX:13:3}-${UUID_VARIANT}${UUID_HEX:17:3}-${UUID_HEX:20:12}"
 INTENT=$(jq -cn \
   --arg request_id "$REQUEST_ID" --arg cwd "$CWD" --arg model "$MODEL" \
-  --argjson effort "$EFFORT_JSON" --arg objective "$OBJECTIVE" \
-  '{request_id:$request_id,cwd:$cwd,model:$model,effort:$effort,objective:$objective,llm_language:null,images:[]}') || exit
+  --argjson effort "$EFFORT_JSON" --arg objective_b64 "$OBJECTIVE_B64" \
+  '{request_id:$request_id,cwd:$cwd,model:$model,effort:$effort,objective:($objective_b64|@base64d),llm_language:null,images:[]}') || exit
 
 # Persist the non-secret request identity in Bash output before dispatch. Keep
 # REQUEST_ID and INTENT unchanged until creation is reconciled.
@@ -127,8 +138,8 @@ if [[ $POST_EXIT -ne 0 ]]; then
   fi
   printf 'ambiguous creation response (HTTP %s); reconciling request_id=%s\n' "$HTTP_STATUS" "$REQUEST_ID" >&2
   if find_creation; then
-    jq -e --arg cwd "$CWD" --arg model "$MODEL" --arg objective "$OBJECTIVE" --argjson effort "$EFFORT_JSON" \
-      '.cwd == $cwd and .model == $model and .objective == $objective and .effort == $effort' \
+    jq -e --arg cwd "$CWD" --arg model "$MODEL" --arg objective_b64 "$OBJECTIVE_B64" --argjson effort "$EFFORT_JSON" \
+      '.cwd == $cwd and .model == $model and .objective == ($objective_b64|@base64d) and .effort == $effort' \
       <<<"$RECONCILED" >/dev/null || { printf '%s\n' 'reconciled creation intent mismatch' >&2; exit 1; }
     printf '%s\n' "$RECONCILED"
     exit 0

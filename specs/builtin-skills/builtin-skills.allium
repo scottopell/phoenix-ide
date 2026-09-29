@@ -28,6 +28,18 @@ external entity TrustedBuiltinSkillResult {
     content: String
 }
 
+value PhoenixApiRecipe {
+    discovers_auth: Boolean
+    discovers_model_and_effort: Boolean
+    generates_request_uuid_once: Boolean
+    requires_work_scope_origin: Boolean
+    posts_supported_creation_fields: Boolean
+    reconciles_ambiguity_by_same_intent: Boolean
+    verifies_creation_separately_from_activity: Boolean
+    distinguishes_product_root_and_current_transcript: Boolean
+    performs_no_database_lifecycle_write: Boolean
+}
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -166,20 +178,20 @@ rule DeliverCoordinatorBuiltinToModel {
 }
 
 rule PhoenixApiCreationRecipe {
-    when: CoordinatorCreationAuthorized(origin, work_scope_id, objective)
+    when: CoordinatorCreationAuthorized(recipe, origin, work_scope_id, objective)
 
     requires: ActiveWorkScope(work_scope_id)
     requires: objective != ""
 
-    ensures: recipe.discovers_auth_at(origin + "/api/auth/status")
-    ensures: recipe.discovers_model_and_effort_at(origin + "/api/models")
-    ensures: recipe.generates_request_uuid_once()
-    ensures: recipe.requires_origin_owned_by(work_scope_id)
-    ensures: recipe.posts_supported_fields_to(origin + "/api/product-conversations/new")
-    ensures: recipe.reconciles_ambiguous_response_by_same_request_uuid_and_intent()
-    ensures: recipe.verifies_product_creation_separately_from_transcript_activity()
-    ensures: recipe.distinguishes_product_identity_from_root_and_current_transcripts()
-    ensures: recipe.performs_no_database_lifecycle_write()
+    ensures: recipe.discovers_auth = true
+    ensures: recipe.discovers_model_and_effort = true
+    ensures: recipe.generates_request_uuid_once = true
+    ensures: recipe.requires_work_scope_origin = true
+    ensures: recipe.posts_supported_creation_fields = true
+    ensures: recipe.reconciles_ambiguity_by_same_intent = true
+    ensures: recipe.verifies_creation_separately_from_activity = true
+    ensures: recipe.distinguishes_product_root_and_current_transcript = true
+    ensures: recipe.performs_no_database_lifecycle_write = true
 
     @guidance
         -- The operational recipe runs as one active scoped Bash command. It
