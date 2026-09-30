@@ -21780,6 +21780,9 @@ mod tests {
         db.watch_product_conversation(&conv.product_conversation_id)
             .await
             .unwrap();
+        db.update_conversation_state("origin-user", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .unwrap();
         db.update_conversation_state("origin-user", &ConvState::Idle)
             .await
             .unwrap();

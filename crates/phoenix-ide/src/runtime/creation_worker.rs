@@ -3120,6 +3120,8 @@ mod product_creation_delivery_replay_tests {
             accepted_product_id.to_string()
         );
         assert_eq!(published.transcript_row_id, conversation_id);
+        let origin: String = sqlx::query_scalar("SELECT origin_kind FROM steering_messages WHERE message_id = ?1 UNION ALL SELECT origin_kind FROM messages WHERE message_id = ?1 LIMIT 1").bind(request_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(origin, "user_api");
 
         let completed = db
             .get_product_creation_job(request_id)

@@ -602,6 +602,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(returned.origin, InputOrigin::UserApi);
+        let source_kind: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'conv-user-clear'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(source_kind, "interaction_response");
         assert_eq!(
             db.get_messages("conv-user-clear").await.unwrap()[0].origin,
             InputOrigin::UserApi
