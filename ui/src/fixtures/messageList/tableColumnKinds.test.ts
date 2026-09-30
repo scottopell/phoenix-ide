@@ -94,6 +94,9 @@ describe('mobile table preview column sizing', () => {
     expect(atomicRule).toContain('white-space: nowrap');
     expect(css).toContain("code[data-token-kind='short-atomic']");
     expect(css).toContain("code[data-token-kind='breakable']");
+    expect(css).toContain('height: max(36rem, 72vh)');
+    expect(css).toContain('.fixture-page.mobile-table-preview');
+    expect(css).toContain('overflow: visible');
     expect(css).toContain("[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {\n  width: 100%");
   });
 });

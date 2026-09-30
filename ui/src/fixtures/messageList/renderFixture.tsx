@@ -326,10 +326,9 @@ export function MessageListFixture({ scenario }: Props) {
             data-message-list-fixture={scenario.id}
           >
             <div className="fixture-toolbar">
-              <strong>Message list fixture</strong>
-              <span>scenario={scenario.id}</span>
-              <span>density=compact</span>
-
+              <strong>{isMobileTablePreview ? 'Table preview' : 'Message list fixture'}</strong>
+              {!isMobileTablePreview && <span>scenario={scenario.id}</span>}
+              {!isMobileTablePreview && <span>density=compact</span>}
               {isMobileTablePreview && (
                 <nav className="mobile-table-preview-controls" aria-label="Preview controls">
                   <button
@@ -408,9 +407,12 @@ export function MessageListFixture({ scenario }: Props) {
             </div>
             {isMobileTablePreview && (
               <details className="mobile-table-preview-metadata" data-preview-case={mobilePreviewCase.id}>
-                <summary>Fixture details</summary>
-                <p>Deployed table CSS 838439341 · fixture source 7a42b66db</p>
-                <p>{mobilePreviewCase.caption}</p>
+                <summary>Details</summary>
+                <div>
+                  <p>Scenario: {scenario.id} · density: compact</p>
+                  <p>Deployed table CSS 838439341 · fixture source 7a42b66db</p>
+                  <p>{mobilePreviewCase.caption}</p>
+                </div>
               </details>
             )}
             <div className="fixture-message-list-stage">

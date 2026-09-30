@@ -1,6 +1,14 @@
+.fixture-page.mobile-table-preview {
+  min-height: 100vh;
+  height: auto;
+  overflow: visible;
+}
+
 .mobile-table-preview .fixture-message-list-stage {
   display: flex;
-  min-height: 0;
+  flex: 0 0 auto;
+  height: max(36rem, 72vh);
+  min-height: 36rem;
   padding: 8px;
   overflow: hidden;
 }
@@ -13,8 +21,10 @@
 }
 
 .mobile-table-preview .fixture-toolbar {
+  position: static;
   height: auto;
   min-height: 40px;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   min-width: 0;
   padding-block: 6px;
@@ -76,6 +86,14 @@
 
 .mobile-table-preview-metadata summary {
   cursor: pointer;
+}
+
+.mobile-table-preview-metadata:not([open]) {
+  padding-block: 3px;
+}
+
+.mobile-table-preview-metadata[open] {
+  max-height: none;
 }
 
 .mobile-table-preview-metadata p {
@@ -204,12 +222,6 @@
 }
 
 @media (max-width: 600px) {
-  .mobile-table-preview .fixture-toolbar {
-    position: sticky;
-    inset-block-start: 0;
-    z-index: 1;
-  }
-
   .mobile-table-preview-controls {
     width: 100%;
     margin-inline-start: 0;
