@@ -32,7 +32,7 @@ For every rendered table:
 - Two-column Wrap tables fit the local table viewport at phone widths when the compact label plus prose minima fit; they do not inherit Overflow's max-content width.
 - Prose columns have a computed minimum width greater than 0 and retain useful multiword wrapping.
 - No prose body cell with eight or more words renders narrower than `min(10rem, 44vw)` in Wrap or `min(18rem, 68vw)` in Overflow.
-- Atomic short IDs/model names remain on one line. Compact short labels remain on one line. Long categorical labels may wrap at word boundaries.
+- Atomic short IDs/model names remain on one line. Compact phrase labels wrap only at normal spaces within `min(5.5rem, 26vw)` to `min(11rem, 42vw)`. Long categorical labels may also wrap at word boundaries.
 - Page-level horizontal overflow is zero; unavoidable overflow belongs only to `.markdown-table-scroll`.
 - Controls wrap as whole items; no label splits inside a word.
 

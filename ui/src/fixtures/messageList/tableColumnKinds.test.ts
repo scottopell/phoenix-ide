@@ -78,6 +78,11 @@ describe('mobile table preview column sizing', () => {
     expect(css).toContain("[data-column-kind='prose']");
     expect(css).toContain("[data-column-kind='atomic']");
     expect(css).toContain("[data-column-kind='compact']");
+    const compactRule = css.match(/\[data-column-kind='compact'\][^{]*\{([^}]*)\}/)?.[1] ?? '';
+    expect(compactRule).toContain('white-space: normal');
+    expect(compactRule).not.toContain('white-space: nowrap');
+    const atomicRule = css.match(/\[data-column-kind='atomic'\][^{]*\{([^}]*)\}/)?.[1] ?? '';
+    expect(atomicRule).toContain('white-space: nowrap');
     expect(css).toContain("[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {\n  width: 100%");
   });
 });

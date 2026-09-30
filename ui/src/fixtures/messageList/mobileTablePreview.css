@@ -138,7 +138,9 @@
   [data-message-list-fixture='mobile-table-preview-readable-overflow']
 ) .markdown-table-scroll :where(th, td)[data-column-kind='compact'] {
   width: 1%;
-  white-space: nowrap;
+  min-width: min(5.5rem, 26vw);
+  max-width: min(11rem, 42vw);
+  white-space: normal;
 }
 
 :is(
