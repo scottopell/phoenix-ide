@@ -10663,6 +10663,22 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Conversation runtimes whose persisted state still requests an LLM call
+    /// after startup recovery has reset ownerless transient states.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn llm_requesting_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT id FROM conversations
+             WHERE state_kind = 'llm_requesting'
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Reset transient conversation states after restart.
     ///
     /// # Errors

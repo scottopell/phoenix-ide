@@ -15849,6 +15849,26 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn process_shutdown_rejects_never_admitted_provider_dispatch() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        fence.close_for_process_shutdown();
+
+        let error = rt
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .expect_err("shutdown rejects new provider dispatch");
+
+        assert!(error.contains("runtime persistence closed"));
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.active_llm_attempt.is_none());
+    }
+
+    #[tokio::test]
     async fn external_effect_dispatch_holds_owner_until_task_is_registered() {
         let (mut rt, _storage, _broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,

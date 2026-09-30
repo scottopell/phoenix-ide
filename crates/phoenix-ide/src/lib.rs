@@ -1103,8 +1103,16 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // The server task ends on its own only via a fatal accept error.
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
+                runtime_for_fatal.begin_process_shutdown();
                 let _ = drain_tx.send(());
-                match tls::bounded_post_shutdown_drain(&mut server, "HTTP").await {
+                let deadline = runtime_for_fatal
+                    .fatal_local_authority_deadline()
+                    .expect("process shutdown deadline must be set before HTTP drain");
+                let shutdown = tls::drain_concurrently(
+                    runtime_for_fatal.drain_process_shutdown(),
+                    &mut server,
+                );
+                match tls::bounded_post_shutdown_drain_until(deadline, shutdown, "HTTP").await {
                     Some(joined) => joined??,
                     None => server_abort.abort(),
                 }
@@ -1116,7 +1124,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .fatal_local_authority_deadline()
                     .expect("fatal authority deadline must be set before HTTP drain");
                 let fatal_tail = async {
-                    tls::drain_concurrently(
+                    let _ = tls::drain_concurrently(
                         runtime_for_fatal.fence_fatal_local_authority(),
                         &mut server,
                     )

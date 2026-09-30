@@ -210,6 +210,11 @@ impl AppState {
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
         runtime.require_startup_local_authority()?;
+        runtime
+            .resume_persisted_llm_requests()
+            .await
+            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and

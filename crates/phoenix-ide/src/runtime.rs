@@ -416,6 +416,14 @@ impl FatalLocalAuthorityFence {
     }
 
     pub(crate) fn close(&self, boundary: &'static str) {
+        self.close_inner(boundary, true);
+    }
+
+    fn close_for_process_shutdown(&self) {
+        self.close_inner("process_shutdown", false);
+    }
+
+    fn close_inner(&self, boundary: &'static str, signal_fatal_authority_loss: bool) {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
         let boundary = *state.boundary.get_or_insert(boundary);
@@ -429,7 +437,9 @@ impl FatalLocalAuthorityFence {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.tx.send_replace(Some(boundary));
+        if signal_fatal_authority_loss {
+            self.tx.send_replace(Some(boundary));
+        }
         self.external_effect_cancellation.cancel();
         drop(state);
     }
@@ -2432,6 +2442,21 @@ impl RuntimeManager {
     pub(crate) async fn fence_fatal_local_authority(&self) {
         self.fatal_local_authority_fence
             .close("fatal_local_authority_fence");
+        self.drain_closed_runtime_authority("fatal authority fence")
+            .await;
+    }
+
+    pub(crate) fn begin_process_shutdown(&self) {
+        self.fatal_local_authority_fence
+            .close_for_process_shutdown();
+    }
+
+    pub(crate) async fn drain_process_shutdown(&self) {
+        self.drain_closed_runtime_authority("process shutdown")
+            .await;
+    }
+
+    async fn drain_closed_runtime_authority(&self, label: &'static str) {
         let shutdown = async {
             self.fatal_local_authority_fence.wait_for_owners().await;
             let reserved: Vec<_> = self
@@ -2460,19 +2485,14 @@ impl RuntimeManager {
             for handle in handles {
                 handle.broadcast_tx.close_publication();
                 if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
-                    tracing::debug!(?error, "fatal shutdown event delivery skipped");
+                    tracing::debug!(?error, %label, "shutdown event delivery skipped");
                 }
             }
         };
         let deadline = self
             .fatal_local_authority_deadline()
-            .expect("fatal authority deadline must be set before fence drain");
-        let _ = crate::tls::bounded_post_shutdown_drain_until(
-            deadline,
-            shutdown,
-            "fatal authority fence",
-        )
-        .await;
+            .expect("shutdown deadline must be set before runtime authority drain");
+        let _ = crate::tls::bounded_post_shutdown_drain_until(deadline, shutdown, label).await;
     }
 
     pub fn fatal_local_authority_receiver(
@@ -3662,6 +3682,18 @@ impl RuntimeManager {
 
     pub async fn set_startup_obligated_conversations(&self, conversation_ids: HashSet<String>) {
         *self.startup_obligated_conversations.write().await = conversation_ids;
+    }
+
+    pub async fn resume_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
+        let conversation_ids = self
+            .db
+            .llm_requesting_conversation_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        for conversation_id in conversation_ids {
+            self.get_or_create(&conversation_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn start_direct_turn_worker(
@@ -9864,6 +9896,25 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn process_shutdown_closes_effect_admission_without_signalling_fatal_authority_loss() {
+        let manager = test_manager().await;
+        let existing = manager
+            .acquire_local_authority_pass()
+            .expect("admit work before shutdown");
+        let fatal = manager.fatal_local_authority_receiver();
+
+        manager.begin_process_shutdown();
+
+        assert!(manager.acquire_local_authority_pass().is_err());
+        assert!(manager.local_authority_is_closed());
+        assert_eq!(*fatal.borrow(), None);
+        assert_eq!(manager.fatal_authority_owners_at_first_close(), Some(1));
+        drop(existing);
+        manager.drain_process_shutdown().await;
+        assert_eq!(*fatal.borrow(), None);
+    }
+
+    #[tokio::test]
     async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
         let manager = test_manager().await;
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -11630,6 +11681,147 @@ mod scope_liveness_tests {
                 .expect("load settled conversation")
                 .state,
             ConvState::Idle
+        );
+    }
+
+    async fn materialize_restart_direct_turn(manager: &RuntimeManager, conversation_id: &str) {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+
+        manager
+            .db()
+            .create_conversation(conversation_id, "restart", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let identity = SubmittedDirectTurnIdentity {
+            text: "resume exactly this turn".to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "restart-user-message".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        };
+        let delivery = PreparedDirectTurnDelivery {
+            text: "resume exactly this turn".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let payload = PreparedDirectTurnPayload::from_parts(identity, delivery);
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        let repo = manager.db().workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("restart-user-message").expect("client key"),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().expect("encode payload"),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .expect("accept direct turn");
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected newly accepted turn")
+        };
+        let workflow_id = repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .expect("load workflow id")
+            .expect("workflow exists");
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(30),
+            })
+            .await
+            .expect("claim direct turn");
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority: claim.authority.expect("claim authority"),
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .established()
+        .expect("materialize direct turn");
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_materialized_direct_turn_without_another_user_message() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-materialized-direct-turn";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .resume_persisted_llm_requests()
+            .await
+            .expect("resume durable owner");
+        let handle = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("startup proactively materializes runtime");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while llm.requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup dispatches the resumed provider request");
+        let mut states = handle.state_rx.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if *states.borrow_and_update() == ConvState::Idle {
+                    break;
+                }
+                states
+                    .changed()
+                    .await
+                    .expect("runtime stays live until completion");
+            }
+        })
+        .await
+        .expect("resumed provider request completes");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .expect("load transcript")
+                .iter()
+                .filter(|message| message.message_id.ends_with(":restart-user-message"))
+                .count(),
+            1
         );
     }
 
