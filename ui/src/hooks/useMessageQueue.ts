@@ -84,7 +84,7 @@ export function deriveDisplayedPendingMessages(
   );
   const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
     localId: message.message_id,
-    origin: message.origin,
+    origin: message.origin ?? { kind: 'unknown_historical' },
     text: message.text,
     images: message.images,
     files: message.files,
