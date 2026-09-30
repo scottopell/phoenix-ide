@@ -19,6 +19,7 @@ import {
 } from './scenarios';
 import { StreamingBlocks } from '../../components/StreamingMessage';
 import './mobileTablePreview.css';
+import { annotateTableColumnKinds } from './tableColumnKinds';
 
 interface Props {
   scenario: MessageListScenario;
@@ -184,6 +185,7 @@ export function MessageListFixture({ scenario }: Props) {
         && headers[1] === mobilePreviewCase.headers[1];
     });
     const verify = () => {
+      annotateTableColumnKinds(stage);
       const viewport = mobilePreviewState === 'streaming'
         ? stage
         : stage.querySelector<HTMLElement>('.virtual-transcript.message-virtual-transcript');
