@@ -37,6 +37,15 @@ describe('mobile table preview column sizing', () => {
     const tables = root.querySelectorAll('table');
     expect(tables[0]?.rows[0]?.cells[2]?.dataset['columnKind']).toBe('numeric');
     expect(tables[1]?.rows[0]?.cells[1]?.dataset['columnKind']).toBe('prose');
+    const shortCode = document.createElement('code');
+    shortCode.textContent = '4fd574ee';
+    root.append(shortCode);
+    const longCode = document.createElement('code');
+    longCode.textContent = '0123456789abcdef0123456789abcdef01234567';
+    root.append(longCode);
+    annotateTableColumnKinds(root);
+    expect(shortCode.dataset['tokenKind']).toBe('short-atomic');
+    expect(longCode.dataset['tokenKind']).toBe('breakable');
   });
 
   it('classifies every historical case without inflating numeric columns', () => {
@@ -83,6 +92,8 @@ describe('mobile table preview column sizing', () => {
     expect(compactRule).not.toContain('white-space: nowrap');
     const atomicRule = css.match(/\[data-column-kind='atomic'\][^{]*\{([^}]*)\}/)?.[1] ?? '';
     expect(atomicRule).toContain('white-space: nowrap');
+    expect(css).toContain("code[data-token-kind='short-atomic']");
+    expect(css).toContain("code[data-token-kind='breakable']");
     expect(css).toContain("[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {\n  width: 100%");
   });
 });

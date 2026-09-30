@@ -329,7 +329,7 @@ export function MessageListFixture({ scenario }: Props) {
               <strong>Message list fixture</strong>
               <span>scenario={scenario.id}</span>
               <span>density=compact</span>
-              {isMobileTablePreview && <span>deployed table CSS=838439341 · fixture source=7a42b66db</span>}
+
               {isMobileTablePreview && (
                 <nav className="mobile-table-preview-controls" aria-label="Preview controls">
                   <button
@@ -407,9 +407,11 @@ export function MessageListFixture({ scenario }: Props) {
               ))}
             </div>
             {isMobileTablePreview && (
-              <p className="mobile-table-preview-provenance" data-preview-case={mobilePreviewCase.id}>
-                {mobilePreviewCase.caption}
-              </p>
+              <details className="mobile-table-preview-metadata" data-preview-case={mobilePreviewCase.id}>
+                <summary>Fixture details</summary>
+                <p>Deployed table CSS 838439341 · fixture source 7a42b66db</p>
+                <p>{mobilePreviewCase.caption}</p>
+              </details>
             )}
             <div className="fixture-message-list-stage">
               {isMobileTablePreview && mobilePreviewState === 'streaming' ? (

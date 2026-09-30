@@ -66,13 +66,20 @@
   color: var(--text-primary);
 }
 
-.mobile-table-preview-provenance {
+.mobile-table-preview-metadata {
   flex: 0 0 auto;
-  margin: 0;
-  padding: 6px 10px;
+  padding: 4px 10px;
   border-block-end: 1px solid var(--border-color);
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+.mobile-table-preview-metadata summary {
+  cursor: pointer;
+}
+
+.mobile-table-preview-metadata p {
+  margin: 4px 0 0;
   overflow-wrap: anywhere;
 }
 
@@ -177,6 +184,23 @@
 ) .markdown-table-scroll [data-column-kind='atomic'] :where(code, a) {
   overflow-wrap: normal;
   word-break: normal;
+}
+
+:is(
+  [data-message-list-fixture='mobile-table-preview-content-wrap'],
+  [data-message-list-fixture='mobile-table-preview-readable-overflow']
+) .markdown-table-scroll code[data-token-kind='short-atomic'] {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+:is(
+  [data-message-list-fixture='mobile-table-preview-content-wrap'],
+  [data-message-list-fixture='mobile-table-preview-readable-overflow']
+) .markdown-table-scroll code[data-token-kind='breakable'] {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @media (max-width: 600px) {

@@ -1,4 +1,5 @@
 export type TableColumnKind = 'numeric' | 'atomic' | 'compact' | 'prose' | 'label';
+const SHORT_ATOMIC_CODE = /^\S{1,12}$/;
 
 const NUMERIC_VALUE = /^[+−-]?(?:\d[\d,.]*)(?:\s*[–—-]\s*\d[\d,.]*)?\s*(?:%|ms|s|KiB|MiB|GiB|rows?)?$/i;
 
@@ -26,6 +27,14 @@ export function classifyTableColumn(values: string[]): TableColumnKind {
 }
 
 export function annotateTableColumnKinds(root: ParentNode): void {
+  for (const code of root.querySelectorAll('code')) {
+    const value = code.textContent?.trim() ?? '';
+    if (SHORT_ATOMIC_CODE.test(value)) {
+      code.dataset['tokenKind'] = 'short-atomic';
+    } else {
+      code.dataset['tokenKind'] = 'breakable';
+    }
+  }
   for (const table of root.querySelectorAll('table')) {
     const rows = [...table.rows];
     const columnCount = Math.max(0, ...rows.map((row) => row.cells.length));
