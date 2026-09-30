@@ -1,7 +1,15 @@
 .mobile-table-preview .fixture-message-list-stage {
-  display: block;
+  display: flex;
+  min-height: 0;
   padding: 8px;
-  overflow: auto;
+  overflow: hidden;
+}
+
+.mobile-table-preview .message-list-fixture-shell,
+.mobile-table-preview .mobile-table-preview-streaming {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
 }
 
 .mobile-table-preview .fixture-toolbar {
@@ -37,7 +45,6 @@
 }
 
 .mobile-table-preview-streaming {
-  min-width: 0;
   padding: 10px;
   overflow: auto;
   border: 1px solid var(--border-color);

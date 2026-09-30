@@ -112,26 +112,64 @@ export function MessageListFixture({ scenario }: Props) {
     const timer = window.setTimeout(() => {
       if (cancelled) return;
       setReady(true);
-      document.documentElement.dataset['messageListFixtureReady'] = scenario.id;
+      if (!isMobileTablePreview) {
+        document.documentElement.dataset['messageListFixtureReady'] = scenario.id;
+      }
     }, 50);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
       delete document.documentElement.dataset['messageListFixtureReady'];
     };
-  }, [data.theme, scenario.id]);
+  }, [data.theme, isMobileTablePreview, scenario.id]);
 
   useEffect(() => {
     setMessages(data.messages);
   }, [data.messages]);
 
-  useEffect(() => {
-    if (!isMobileTablePreview || mobilePreviewState !== 'final' || !ready) return;
-    const frame = window.requestAnimationFrame(() => {
-      messageListRef.current?.scrollToMessageId('assistant-wide-table-1');
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [isMobileTablePreview, mobilePreviewState, ready]);
+  useLayoutEffect(() => {
+    if (!isMobileTablePreview || !ready) return;
+    delete document.documentElement.dataset['messageListFixtureReady'];
+    const stage = document.querySelector<HTMLElement>('.mobile-table-preview .fixture-message-list-stage');
+    if (!stage) return;
+
+    let navigationRequested = false;
+    const verify = () => {
+      if (mobilePreviewState === 'streaming') {
+        const table = stage.querySelector('table');
+        if (stage.clientHeight > 200 && table) {
+          document.documentElement.dataset['messageListFixtureReady'] = scenario.id;
+        }
+        return;
+      }
+      const viewport = stage.querySelector<HTMLElement>('.chat-main-area');
+      if (!viewport || viewport.clientHeight <= 200) return;
+      if (!navigationRequested) {
+        navigationRequested = true;
+        messageListRef.current?.scrollToMessageId('assistant-wide-table-1');
+      }
+      const table = viewport.querySelector('table');
+      if (!table) return;
+      const viewportRect = viewport.getBoundingClientRect();
+      const tableRect = table.getBoundingClientRect();
+      if (tableRect.bottom > viewportRect.top && tableRect.top < viewportRect.bottom) {
+        document.documentElement.dataset['messageListFixtureReady'] = scenario.id;
+      }
+    };
+
+    const resizeObserver = new ResizeObserver(verify);
+    resizeObserver.observe(stage);
+    const mutationObserver = new MutationObserver(verify);
+    mutationObserver.observe(stage, { childList: true, subtree: true });
+    stage.addEventListener('scroll', verify, true);
+    verify();
+    return () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      stage.removeEventListener('scroll', verify, true);
+      delete document.documentElement.dataset['messageListFixtureReady'];
+    };
+  }, [isMobileTablePreview, mobilePreviewState, ready, scenario.id]);
 
   const reproduceContinuityJump = () => {
     const messageList = messageListRef.current;
