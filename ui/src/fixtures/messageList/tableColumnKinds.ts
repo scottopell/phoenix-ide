@@ -1,4 +1,4 @@
-export type TableColumnKind = 'numeric' | 'prose' | 'label';
+export type TableColumnKind = 'numeric' | 'atomic' | 'compact' | 'prose' | 'label';
 
 const NUMERIC_VALUE = /^[+−-]?(?:\d[\d,.]*)(?:\s*[–—-]\s*\d[\d,.]*)?\s*(?:%|ms|s|KiB|MiB|GiB|rows?)?$/i;
 
@@ -6,6 +6,15 @@ export function classifyTableColumn(values: string[]): TableColumnKind {
   const normalized = values.map((value) => value.trim()).filter(Boolean);
   if (normalized.length > 0 && normalized.every((value) => NUMERIC_VALUE.test(value))) {
     return 'numeric';
+  }
+  if (normalized.every((value) => !/\s/.test(value) && value.length <= 24)) {
+    return 'atomic';
+  }
+  if (normalized.every((value) => {
+    const words = value.split(/\s+/).filter(Boolean);
+    return words.length <= 4 && value.length <= 28;
+  })) {
+    return 'compact';
   }
   if (normalized.some((value) => {
     const words = value.split(/\s+/).filter(Boolean);

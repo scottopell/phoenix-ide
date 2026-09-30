@@ -13,7 +13,8 @@ describe('mobile table preview column sizing', () => {
     expect(classifyTableColumn(['43.1 s', '84.4 s', '55.2 s', '30.2 s'])).toBe('numeric');
     expect(classifyTableColumn(['159', '138', '578', '5'])).toBe('numeric');
     expect(classifyTableColumn(['A qualified candidate needs merge/deploy, or a concrete intervention is needed'])).toBe('prose');
-    expect(classifyTableColumn(['gpt-5.4-mini', 'gpt-5.6-sol'])).toBe('label');
+    expect(classifyTableColumn(['gpt-5.4-mini', 'gpt-5.6-sol'])).toBe('atomic');
+    expect(classifyTableColumn(['Phoenix registry', 'Provider catalog'])).toBe('compact');
   });
 
   it.each(['streaming', 'final'])('annotates numeric-last and prose columns in %s rendering', () => {
@@ -40,15 +41,15 @@ describe('mobile table preview column sizing', () => {
 
   it('classifies every historical case without inflating numeric columns', () => {
     const expected: Record<string, TableColumnKind[]> = {
-      'global-status': ['label', 'prose'],
-      'source-roles': ['label', 'prose'],
-      'candidate-ranking': ['numeric', 'label', 'prose'],
+      'global-status': ['compact', 'prose'],
+      'source-roles': ['compact', 'prose'],
+      'candidate-ranking': ['numeric', 'compact', 'prose'],
       'landed-changes': ['label', 'prose'],
-      'message-matrix': ['label', 'prose', 'prose'],
+      'message-matrix': ['compact', 'prose', 'prose'],
       'latency-measurements': ['label', 'numeric', 'numeric'],
       'failure-policy': ['label', 'prose'],
-      'store-size': ['label', 'label'],
-      'model-performance': ['label', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric'],
+      'store-size': ['compact', 'compact'],
+      'model-performance': ['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric'],
     };
 
     for (const previewCase of mobileTablePreviewCases) {
@@ -75,5 +76,8 @@ describe('mobile table preview column sizing', () => {
     expect(css).not.toContain(':nth-child');
     expect(css).toContain("[data-column-kind='numeric']");
     expect(css).toContain("[data-column-kind='prose']");
+    expect(css).toContain("[data-column-kind='atomic']");
+    expect(css).toContain("[data-column-kind='compact']");
+    expect(css).toContain("[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {\n  width: 100%");
   });
 });

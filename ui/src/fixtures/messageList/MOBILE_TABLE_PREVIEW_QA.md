@@ -26,11 +26,13 @@ Run in Chromium and the available Playwright WebKit engine. For each combination
 
 For every rendered table:
 
-- Cells in a column have one consistent `data-column-kind`: `numeric`, `label`, or `prose`.
+- Cells in a column have one consistent `data-column-kind`: `numeric`, `atomic`, `compact`, `label`, or `prose`.
 - Numeric columns use intrinsic width (`width: 1%`, `white-space: nowrap`) and no minimum width.
 - A numeric rightmost column must not exceed `max(header scrollWidth, body cell scrollWidth) + 32px` by more than 8px of rounding.
-- Prose columns have a computed minimum width greater than 0 and at least 60% of the viewport in Wrap at phone widths, capped by the local table scroll container.
-- No prose body cell with eight or more words renders narrower than 15rem in Wrap or 18rem in Overflow, subject to the CSS viewport-relative cap.
+- Two-column Wrap tables fit the local table viewport at phone widths when the compact label plus prose minima fit; they do not inherit Overflow's max-content width.
+- Prose columns have a computed minimum width greater than 0 and retain useful multiword wrapping.
+- No prose body cell with eight or more words renders narrower than `min(10rem, 44vw)` in Wrap or `min(18rem, 68vw)` in Overflow.
+- Atomic short IDs/model names remain on one line. Compact short labels remain on one line. Long categorical labels may wrap at word boundaries.
 - Page-level horizontal overflow is zero; unavoidable overflow belongs only to `.markdown-table-scroll`.
 - Controls wrap as whole items; no label splits inside a word.
 
@@ -38,12 +40,12 @@ For every rendered table:
 
 | Case | Expected kinds |
 |---|---|
-| 11:01 status | label, prose |
-| Source roles | label, prose |
-| Ranking | numeric, label, prose |
+| 11:01 status | compact, prose |
+| Source roles | compact, prose |
+| Ranking | numeric, compact, prose |
 | Links + SHAs | label, prose |
-| Message matrix | label, prose, prose |
+| Message matrix | compact, prose, prose |
 | Latency | label, numeric, numeric |
 | Failure policy | label, prose |
-| Store size | label, label |
-| 6-column models | label, numeric, numeric, numeric, numeric, numeric |
+| Store size | compact, compact |
+| 6-column models | atomic, numeric, numeric, numeric, numeric, numeric |

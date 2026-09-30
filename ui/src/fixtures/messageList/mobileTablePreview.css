@@ -96,10 +96,13 @@
 }
 
 /* Fixture-only alternatives. Production table CSS remains unchanged. */
-:is(
-  [data-message-list-fixture='mobile-table-preview-content-wrap'],
-  [data-message-list-fixture='mobile-table-preview-readable-overflow']
-) .markdown-table-scroll table {
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {
+  width: 100%;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+[data-message-list-fixture='mobile-table-preview-readable-overflow'] .markdown-table-scroll table {
   width: max-content;
   min-width: 100%;
   table-layout: auto;
@@ -125,14 +128,30 @@
 :is(
   [data-message-list-fixture='mobile-table-preview-content-wrap'],
   [data-message-list-fixture='mobile-table-preview-readable-overflow']
-) .markdown-table-scroll :where(th, td)[data-column-kind='label'] {
+) .markdown-table-scroll :where(th, td)[data-column-kind='atomic'] {
   width: 1%;
-  max-width: min(14rem, 44vw);
+  white-space: nowrap;
+}
+
+:is(
+  [data-message-list-fixture='mobile-table-preview-content-wrap'],
+  [data-message-list-fixture='mobile-table-preview-readable-overflow']
+) .markdown-table-scroll :where(th, td)[data-column-kind='compact'] {
+  width: 1%;
+  white-space: nowrap;
+}
+
+:is(
+  [data-message-list-fixture='mobile-table-preview-content-wrap'],
+  [data-message-list-fixture='mobile-table-preview-readable-overflow']
+) .markdown-table-scroll :where(th, td)[data-column-kind='label'] {
+  min-width: min(5.5rem, 24vw);
+  max-width: min(16rem, 48vw);
 }
 
 [data-message-list-fixture='mobile-table-preview-content-wrap']
   .markdown-table-scroll :where(th, td)[data-column-kind='prose'] {
-  min-width: min(15rem, 62vw);
+  min-width: min(10rem, 44vw);
   max-width: min(30rem, 76vw);
 }
 
@@ -148,6 +167,14 @@
 ) .markdown-table-scroll :where(code, a) {
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+:is(
+  [data-message-list-fixture='mobile-table-preview-content-wrap'],
+  [data-message-list-fixture='mobile-table-preview-readable-overflow']
+) .markdown-table-scroll [data-column-kind='atomic'] :where(code, a) {
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 @media (max-width: 600px) {
