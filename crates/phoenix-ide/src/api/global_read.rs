@@ -1108,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_hit_uses_same_recorded_attribution_as_full_read() {
-        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent, MessageType};
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let conv = db
             .create_conversation("search-origin", "search-origin", "/tmp", true, None, None)

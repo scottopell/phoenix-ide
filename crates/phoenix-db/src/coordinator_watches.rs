@@ -288,8 +288,13 @@ async fn record_watch_event_tx(
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
          occurred_at_us, continuation_state)
         SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
-          CASE WHEN ?9 AND ?5 = 'failed' AND EXISTS
-               (SELECT 1
+          CASE WHEN ?9 AND ?5 = 'failed' AND (
+               EXISTS (SELECT 1 FROM automatic_continuation_admissions a
+                       WHERE a.predecessor_conversation_id = c.id
+                         AND a.phase NOT IN ('failed', 'superseded'))
+               OR (NOT EXISTS (SELECT 1 FROM automatic_continuation_admissions a
+                               WHERE a.predecessor_conversation_id = c.id)
+                   AND EXISTS (SELECT 1
                 FROM product_conversations continuation_product
                 WHERE continuation_product.id = c.product_conversation_id
                   AND continuation_product.auto_continue_on_context_exhaustion = 1
@@ -303,7 +308,7 @@ async fn record_watch_event_tx(
                       SELECT 1 FROM close_obligations obligation
                       WHERE obligation.product_conversation_id = continuation_product.id
                         AND obligation.phase <> 'completed'
-                  ))
+                  ))))
                THEN 'awaiting' ELSE 'none' END
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at_us IS NULL
@@ -570,6 +575,23 @@ mod tests {
         assert_eq!(
             delivered[0].terminal_reason.as_deref(),
             Some("context exhausted")
+        );
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            turn,
+            1,
+            &source.id,
+            "Failed",
+            Some("context exhausted"),
+            true,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            2
         );
         assert_eq!(delivered[0].source_transcript_id, source.id);
     }
