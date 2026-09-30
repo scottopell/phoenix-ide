@@ -45,7 +45,7 @@ final class FixtureHarnessTests: XCTestCase {
             .internalConversation(productConversationId: "pc-parent", transcriptId: "parent-row"))
         XCTAssertEqual(byId["m-historical-input"]?.inputOrigin, .unknownHistorical)
         XCTAssertEqual(byId["m-skill"]?.inputOrigin, byId["m-internal-input"]?.inputOrigin)
-        XCTAssertFalse(byId["m-skill"]?.inputOrigin.isHumanInput ?? true)
+        XCTAssertFalse(byId["m-skill"]?.inputOrigin.isUserApiInput ?? true)
         XCTAssertEqual(byId["m-skill"]?.content["trigger"]?.stringValue, "/phoenix-development")
     }
 

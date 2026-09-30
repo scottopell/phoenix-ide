@@ -436,7 +436,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
         </span>
         <span className="message-header-actions">
-          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : 'Copy input message'} />
+          <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
       <div className="message-content">

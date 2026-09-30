@@ -576,7 +576,7 @@ private extension FixtureScenario {
                 accessibilityID: "fixture.footer.readOnly"))
     }
 
-    static var outboxEntries: [OutboxEntry] {
+    internal static var outboxEntries: [OutboxEntry] {
         let fixedDate = Date(timeIntervalSince1970: 1_735_786_800)
         return [
             .init(localId: "outbox-pending", conversationId: "fixture-conv", text: "Queued offline", images: [], status: .pending, acceptedByServer: false, createdAt: fixedDate, acceptedAt: nil, lastError: nil, attemptCount: 0),

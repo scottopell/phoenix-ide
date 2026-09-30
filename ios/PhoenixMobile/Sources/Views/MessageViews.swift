@@ -85,13 +85,11 @@ struct SkillRow: View {
 
     var body: some View {
         HStack {
-            if origin.isHumanInput { Spacer(minLength: 40) }
-            VStack(alignment: origin.isHumanInput ? .trailing : .leading, spacing: 4) {
-                if !origin.isHumanInput {
-                    Text(origin.label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            if origin.isUserApiInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
+                Text(origin.label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Label(trigger, systemImage: "wand.and.stars")
                     .font(.callout.monospaced())
                     .padding(.horizontal, 10)
@@ -109,7 +107,7 @@ struct SkillRow: View {
                     }
                 }
             }
-            if !origin.isHumanInput { Spacer(minLength: 40) }
+            if !origin.isUserApiInput { Spacer(minLength: 40) }
         }
     }
 
@@ -126,18 +124,16 @@ struct UserMessageView: View {
 
     var body: some View {
         HStack {
-            if origin.isHumanInput { Spacer(minLength: 40) }
-            VStack(alignment: origin.isHumanInput ? .trailing : .leading, spacing: 4) {
-                if !origin.isHumanInput {
-                    Text(origin.label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            if origin.isUserApiInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
+                Text(origin.label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)
-                    .background(origin.isHumanInput ? Color.accentColor : Color.secondary.opacity(0.12))
-                    .foregroundStyle(origin.isHumanInput ? Color.white : Color.primary)
+                    .background(origin.isUserApiInput ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(origin.isUserApiInput ? Color.white : Color.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 if let images = content["images"]?.arrayValue, !images.isEmpty {
                     ImageStrip(images: images, maxHeight: 140)
@@ -156,10 +152,10 @@ struct UserMessageView: View {
                     }
                 }
             }
-            if !origin.isHumanInput { Spacer(minLength: 40) }
+            if !origin.isUserApiInput { Spacer(minLength: 40) }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier(origin.isHumanInput ? "message.user" : "message.input")
+        .accessibilityIdentifier(origin.isUserApiInput ? "message.user" : "message.input")
     }
 }
 

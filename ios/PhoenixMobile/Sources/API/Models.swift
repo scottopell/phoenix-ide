@@ -425,7 +425,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         }
     }
 
-    var isHumanInput: Bool {
+    var isUserApiInput: Bool {
         self == .userApi
     }
 

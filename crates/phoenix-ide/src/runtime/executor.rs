@@ -1552,7 +1552,14 @@ fn render_messages<'a>(
 
             // Skill messages are delivered as user-role messages (REQ-SK-002)
             MessageContent::Skill(skill_content) => {
-                let mut body = skill_content.body.clone();
+                let source = match &msg.origin {
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "[Input of unknown historical origin]".to_string(),
+                };
+                let mut body = format!("{source}\n{}", skill_content.body);
                 for file in &skill_content.files {
                     body.push('\n');
                     body.push_str(&file.llm_context_tag());

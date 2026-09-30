@@ -58,14 +58,14 @@ final class RenderingReducerTests: XCTestCase {
             (.subscriptionEvent(eventId: "event-1"), false),
         ]
         for (origin, isHuman) in origins {
-            XCTAssertEqual(origin.isHumanInput, isHuman)
+            XCTAssertEqual(origin.isUserApiInput, isHuman)
             for type in ["user", "skill", "agent"] {
                 let message = Message(
                     message_id: "m-\(type)", conversation_id: "c1", sequence_id: 1,
                     message_type: type, content: .object(["text": .string("same text")]),
                     display_data: nil, created_at: nil, origin: origin)
                 let restored = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(message))
-                XCTAssertEqual(restored.inputOrigin.isHumanInput, isHuman, type)
+                XCTAssertEqual(restored.inputOrigin.isUserApiInput, isHuman, type)
             }
         }
     }
