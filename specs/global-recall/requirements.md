@@ -294,6 +294,11 @@ THE SYSTEM SHALL NOT accept a model-supplied origin as authority or infer human 
 
 THE SYSTEM SHALL treat user-facing API origin as a channel classification, not proof that a biological human authored the input.
 
+WHEN an API retry addresses an accepted pre-provenance input with otherwise matching identity and payload
+THE SYSTEM SHALL preserve the original acceptance and unknown historical origin rather than create new input or reattribute the stored input.
+
+THE SYSTEM SHALL continue to reject changed payloads and conflicts with recorded origins on retries.
+
 ### REQ-GR-015: Watch Explicit Stable Conversations
 
 THE Global Coordinator SHALL have a trusted capability to enroll, inspect, and remove watches of open ordinary ProductConversations without per-target user approval.

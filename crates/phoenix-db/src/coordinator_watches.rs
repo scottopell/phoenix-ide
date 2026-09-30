@@ -210,9 +210,27 @@ pub(crate) async fn record_terminal_event_tx(
     .await
 }
 
+#[derive(Debug, Clone, Copy, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
+pub(crate) enum MessageExecutionSource {
+    Steering,
+    Wake,
+    SeededFork,
+}
+
+impl MessageExecutionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steering => "steering",
+            Self::Wake => "wake",
+            Self::SeededFork => "seeded_fork",
+        }
+    }
+}
+
 pub(crate) async fn record_steering_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    source_kind: &str,
+    source_kind: MessageExecutionSource,
     message_id: &str,
     transcript_id: &str,
     category: &str,
@@ -220,7 +238,7 @@ pub(crate) async fn record_steering_event_tx(
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
-        source_kind,
+        source_kind.as_str(),
         message_id,
         0,
         transcript_id,
