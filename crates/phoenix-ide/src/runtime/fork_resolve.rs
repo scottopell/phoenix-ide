@@ -1956,6 +1956,7 @@ mod tests {
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_transcript_id, fork_id);
+        assert_eq!(events[0].source_occurrence_kind, "seeded_fork");
         db.update_conversation_state(&fork_id, &ConvState::Idle)
             .await
             .unwrap();

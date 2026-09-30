@@ -275,7 +275,12 @@ impl PreparedDirectTurnPayload {
 
     #[must_use]
     pub fn submitted_identity_matches(&self, other: &SubmittedDirectTurnIdentity) -> bool {
-        &self.submitted == other
+        if !self.submitted.origin.accepts_retry_origin(&other.origin) {
+            return false;
+        }
+        let mut retry = other.clone();
+        retry.origin = self.submitted.origin.clone();
+        self.submitted == retry
     }
 
     /// Encodes the complete versioned envelope.
@@ -1410,6 +1415,29 @@ mod direct_turn_payload_tests {
             payload.exact_fingerprint().unwrap(),
             super::exact_payload_fingerprint(&bytes)
         );
+    }
+
+    #[test]
+    fn historical_admission_retry_preserves_unknown_origin_and_payload_identity() {
+        use crate::domain::db_schema::InputOrigin;
+        let identity = submitted(
+            "legacy",
+            SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+        );
+        let payload =
+            PreparedDirectTurnPayload::from_parts(identity.clone(), delivery("body", None));
+        let mut retry = identity;
+        retry.origin = InputOrigin::UserApi;
+        assert!(payload.submitted_identity_matches(&retry));
+        assert_eq!(payload.submitted.origin, InputOrigin::UnknownHistorical);
+        retry.text.push_str(" changed");
+        assert!(!payload.submitted_identity_matches(&retry));
+        retry.text = payload.submitted.text.clone();
+        retry.origin = InputOrigin::SystemGenerated;
+        assert!(!payload.submitted_identity_matches(&retry));
+        let mut attributed = payload;
+        attributed.submitted.origin = InputOrigin::UserApi;
+        assert!(!attributed.submitted_identity_matches(&retry));
     }
 
     #[test]

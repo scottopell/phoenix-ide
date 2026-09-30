@@ -1556,6 +1556,12 @@ pub enum InputOrigin {
 }
 
 impl InputOrigin {
+    /// Compare a stored admission with a retry without reattributing historical data.
+    #[must_use]
+    pub fn accepts_retry_origin(&self, retry: &Self) -> bool {
+        self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi))
+    }
+
     #[must_use]
     pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
         match self {

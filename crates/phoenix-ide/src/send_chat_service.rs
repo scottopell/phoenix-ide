@@ -954,7 +954,7 @@ async fn lookup_durable_steering_replay(
                 )
             })?;
         if matches!(receipt, SteeringAcceptanceFingerprint::Exact(_)) {
-            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+            validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
         }
         if matches!(receipt, SteeringAcceptanceFingerprint::LegacyUnknown)
             && req.expansion_policy != MessageExpansionPolicy::ExpandReferences
@@ -971,7 +971,7 @@ async fn lookup_durable_steering_replay(
         {
             match receipt {
                 SteeringAcceptanceFingerprint::Exact(_) => {
-                    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+                    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
                 }
                 SteeringAcceptanceFingerprint::LegacyUnknown => {
                     if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {
@@ -989,7 +989,7 @@ async fn lookup_durable_steering_replay(
     else {
         return Ok(None);
     };
-    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
     Ok(Some(SendChatOutcome::Rejected {
         message: "The accepted message was cancelled or failed before delivery.".to_string(),
         code: "turn_terminal",
@@ -1022,7 +1022,7 @@ async fn lookup_persisted_message_replay(
         | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
     };
     if message.conversation_id != req.conversation_id
-        || message.origin != req.origin
+        || !message.origin.accepts_retry_origin(&req.origin)
         || !persisted_matches
     {
         return Err(SendChatServiceError::IdempotencyConflict);
@@ -1035,7 +1035,7 @@ fn queued_retry_matches(
     req: &SendChatRequest,
 ) -> bool {
     entry.text == req.text
-        && entry.origin == req.origin
+        && entry.origin.accepts_retry_origin(&req.origin)
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -1106,9 +1106,16 @@ fn persisted_skill_matches(
 }
 
 fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceError> {
+    request_fingerprint_version(req, true)
+}
+
+fn request_fingerprint_version(
+    req: &SendChatRequest,
+    with_origin: bool,
+) -> Result<String, SendChatServiceError> {
     use sha2::Digest as _;
 
-    let canonical = serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "conversation_id": req.conversation_id,
         "text": req.text,
         "origin": req.origin,
@@ -1123,8 +1130,15 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
             MessageExpansionPolicy::LiteralText => "literal_text",
             MessageExpansionPolicy::GeneratedPredecessorContext => "generated_predecessor_context",
         },
-    }))
-    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    });
+    if !with_origin {
+        value
+            .as_object_mut()
+            .expect("object literal")
+            .remove("origin");
+    }
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
     Ok(sha2::Sha256::digest(canonical).iter().fold(
         String::with_capacity(64),
         |mut output, byte| {
@@ -1137,9 +1151,16 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
 fn validate_steering_fingerprint(
     receipt: &SteeringAcceptanceFingerprint,
     request_fingerprint: &str,
+    req: &SendChatRequest,
 ) -> Result<(), SendChatServiceError> {
     match receipt {
         SteeringAcceptanceFingerprint::Exact(exact) if exact == request_fingerprint => Ok(()),
+        SteeringAcceptanceFingerprint::Exact(exact)
+            if req.origin == phoenix_core::domain::db_schema::InputOrigin::UserApi
+                && *exact == request_fingerprint_version(req, false)? =>
+        {
+            Ok(())
+        }
         SteeringAcceptanceFingerprint::Exact(_) | SteeringAcceptanceFingerprint::LegacyUnknown => {
             Err(SendChatServiceError::IdempotencyConflict)
         }
@@ -1698,8 +1719,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_provenance_api_retry_keeps_unknown_queued_and_persisted_origin() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let mut req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+        req.origin = InputOrigin::UserApi;
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &fingerprint)
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::AlreadyPersisted)
+        );
+        assert_eq!(
+            db.get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
+                .await
+                .unwrap()
+                .origin,
+            InputOrigin::UnknownHistorical
+        );
+        let legacy = SteeringAcceptanceFingerprint::Exact(
+            super::request_fingerprint_version(&req, false).unwrap(),
+        );
+        super::validate_steering_fingerprint(&legacy, &fingerprint, &req).unwrap();
+        req.text.push_str(" changed");
+        assert!(super::validate_steering_fingerprint(
+            &legacy,
+            &super::request_fingerprint(&req).unwrap(),
+            &req
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn legacy_queued_steering_identity_replays_when_payload_matches() {
-        let req = request();
+        let mut req = request();
+        req.origin = phoenix_core::domain::db_schema::InputOrigin::UserApi;
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,

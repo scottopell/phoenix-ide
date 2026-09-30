@@ -231,6 +231,24 @@ pub(crate) async fn record_steering_event_tx(
     .await
 }
 
+pub(crate) async fn record_summary_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    failure: &phoenix_core::domain::sm_state::RecoverableContinuationFailure,
+) -> DbResult<()> {
+    record_watch_event_tx(
+        tx,
+        "continuation_summary",
+        &failure.request.operation_id,
+        u64::from(failure.request.attempt),
+        transcript_id,
+        "Failed",
+        Some("continuation summary failed"),
+        false,
+    )
+    .await
+}
+
 pub(crate) async fn record_creation_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     job_id: &str,

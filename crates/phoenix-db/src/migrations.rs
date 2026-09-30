@@ -592,12 +592,12 @@ CREATE TABLE execution_cancel_observations (
 CREATE TABLE steering_execution_occurrences (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-    source_kind TEXT NOT NULL DEFAULT 'steering' CHECK(source_kind IN ('steering', 'wake'))
+    source_kind TEXT NOT NULL DEFAULT 'steering' CHECK(source_kind IN ('steering', 'wake', 'seeded_fork'))
 );
 CREATE TABLE coordinator_watch_events (
     event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
     watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
-    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake')),
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'continuation_summary')),
     source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
     source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
     source_transcript_id TEXT NOT NULL,

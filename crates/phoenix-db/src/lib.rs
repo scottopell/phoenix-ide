@@ -9891,7 +9891,7 @@ impl Database {
                 })?;
             sqlx::query(
                 "INSERT INTO steering_execution_occurrences(conversation_id, message_id, source_kind)
-                 VALUES (?1, ?2, 'steering')
+                 VALUES (?1, ?2, 'seeded_fork')
                  ON CONFLICT(conversation_id) DO UPDATE SET
                      message_id = excluded.message_id,
                      source_kind = excluded.source_kind",
@@ -14689,6 +14689,10 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
+    if let ConvState::RecoverableContinuationFailure { failure } = state {
+        return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
+            .await;
+    }
     let steering: Option<(String, String)> = sqlx::query_as(
         "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
     )
@@ -15727,6 +15731,74 @@ mod tests {
         assert_eq!(
             events[0].terminal_reason.as_deref(),
             Some("context exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_summary_attempt_has_distinct_occurrence_after_creation() {
+        use phoenix_core::domain::sm_state::{
+            ContinuationSummaryRequest, RecoverableContinuationFailure,
+        };
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &ConvState::LlmRequesting { attempt: 0 },
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::ContextExhausted {
+                summary: "private".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = ContinuationSummaryRequest {
+            operation_id: "summary-operation".into(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::AwaitingContinuation {
+                request: request.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let failed = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request,
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Network,
+                message: "private error".into(),
+            },
+        };
+        db.update_conversation_state(&source.id, &failed)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &failed)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let summary = events
+            .iter()
+            .find(|event| event.source_occurrence_kind == "continuation_summary")
+            .unwrap();
+        assert_eq!(summary.source_occurrence_id, "summary-operation");
+        assert_eq!(summary.source_generation, 1);
+        assert_eq!(
+            summary.terminal_reason.as_deref(),
+            Some("continuation summary failed")
         );
     }
 
