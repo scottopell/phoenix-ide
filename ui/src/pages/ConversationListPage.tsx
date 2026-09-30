@@ -32,6 +32,7 @@ import { effectiveVisibleConversationCount } from './conversationListCount';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
+  notifyProductConversationHardDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
   subscribeProductConversationListRevision,
@@ -157,12 +158,7 @@ export function ConversationListPage() {
     deletedProductConversationId: string,
     deletedConversationIds: string[],
   ) => {
-    window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
-      detail: {
-        conversationId: deletedProductConversationId,
-        deletedConversationIds,
-      },
-    }));
+    notifyProductConversationHardDeleted(deletedProductConversationId, deletedConversationIds);
     setProductConversations((rows) => rows.filter(
       (row) => row.product_conversation_id !== deletedProductConversationId,
     ));
@@ -179,7 +175,10 @@ export function ConversationListPage() {
     try {
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
       const result = await api.deleteChain(rootId);
-      finishProductDelete(deletingProductConversationId, result.deleted_conversation_ids);
+      const deletedIds = result.outcome.type === 'deleted'
+        ? result.outcome.deleted_conversation_ids
+        : deletedConversationIds;
+      finishProductDelete(deletingProductConversationId, deletedIds);
     } catch (error) {
       if (error instanceof ApiResponseError && error.status === 404) {
         finishProductDelete(deletingProductConversationId, deletedConversationIds);

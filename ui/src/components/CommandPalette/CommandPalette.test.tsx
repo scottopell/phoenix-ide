@@ -178,11 +178,14 @@ describe('CommandPalette lifecycle availability', () => {
       </MemoryRouter>,
     );
 
+    const closed = vi.fn();
+    window.addEventListener('phoenix:product-conversation-closed', closed, { once: true });
     fireEvent.keyDown(window, { key: 'p', metaKey: true });
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
     await waitFor(() => expect(mocks.closeProductConversation).toHaveBeenCalledWith('product-1'));
+    expect(closed).toHaveBeenCalledWith(expect.objectContaining({ detail: 'product-1' }));
   });
 
   it('uses the canonical chain root when drift hides continuation members', async () => {

@@ -2762,7 +2762,10 @@ export const api = {
 
   /** DELETE /api/chains/:rootId — hard-delete every member of the chain.
    *  Refused atomically (no partial wipe) if any member is busy. */
-  async deleteChain(rootId: string): Promise<{ success: boolean; deleted_conversation_ids: string[] }> {
+  async deleteChain(rootId: string): Promise<{
+    success: boolean;
+    outcome: { type: 'deleted'; deleted_conversation_ids: string[] } | { type: 'already_absent' };
+  }> {
     const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}`, {
       method: 'DELETE',
     });

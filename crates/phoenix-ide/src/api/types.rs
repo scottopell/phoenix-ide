@@ -692,7 +692,16 @@ pub struct SuccessResponse {
 #[derive(Debug, Serialize)]
 pub struct ChainDeleteResponse {
     pub success: bool,
-    pub deleted_conversation_ids: Vec<String>,
+    pub outcome: ChainDeleteOutcome,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChainDeleteOutcome {
+    Deleted {
+        deleted_conversation_ids: Vec<String>,
+    },
+    AlreadyAbsent,
 }
 
 /// Exact server-observed inspection snapshot required to confirm destructive

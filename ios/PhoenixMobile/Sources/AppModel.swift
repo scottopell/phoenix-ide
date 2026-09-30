@@ -497,11 +497,17 @@ final class AppModel {
         aggregateEventTask = nil
         aggregateEventTaskId = nil
         guard let api else { return }
-        startAggregateEventStream(api: api, generation: apiGeneration)
-        startAggregateReconciliation()
+        startAggregateEventStream(
+            api: api,
+            generation: apiGeneration,
+            reconcileOnOpen: true)
     }
 
-    private func startAggregateEventStream(api: PhoenixAPI, generation: Int) {
+    private func startAggregateEventStream(
+        api: PhoenixAPI,
+        generation: Int,
+        reconcileOnOpen: Bool = false
+    ) {
         guard aggregateEventTask == nil else { return }
         let taskId = UUID()
         aggregateEventTaskId = taskId
@@ -513,7 +519,7 @@ final class AppModel {
                 }
             }
             var backoff = AggregateEventStreamBackoff()
-            var reconciliationRequired = false
+            var reconciliationRequired = reconcileOnOpen
             while !Task.isCancelled {
                 guard let self, self.apiGeneration == generation, self.isForeground else { return }
                 if !self.connectivity.isOnline {
@@ -523,12 +529,6 @@ final class AppModel {
                 var streamWasHealthy = false
                 do {
                     let bytes = try await api.openProductConversationEventStream()
-                    if reconciliationRequired {
-                        guard await self.reconcileAfterAggregateStreamDisconnect(
-                            generation: generation)
-                        else { return }
-                        reconciliationRequired = false
-                    }
                     var parser = SSEParser()
                     var previousByteWasNewline = false
                     for try await byte in bytes {
@@ -541,10 +541,18 @@ final class AppModel {
                         } else if byte != 0x0D {
                             previousByteWasNewline = false
                         }
-                        if let frame = parser.consume(byte),
-                           let deletion = ProductConversationDeletionEvent.decode(frame: frame)
-                        {
-                            await self.handleAggregateHardDeleted(deletion, generation: generation)
+                        if let frame = parser.consume(byte) {
+                            if reconciliationRequired {
+                                guard await self.reconcileAfterAggregateStreamDisconnect(
+                                    generation: generation)
+                                else { return }
+                                reconciliationRequired = false
+                            }
+                            if let deletion = ProductConversationDeletionEvent.decode(frame: frame) {
+                                await self.handleAggregateHardDeleted(
+                                    deletion,
+                                    generation: generation)
+                            }
                         }
                     }
                     reconciliationRequired = true

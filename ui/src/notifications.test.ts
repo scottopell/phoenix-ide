@@ -7,11 +7,14 @@ import {
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
   getProductConversationListRevision,
+  getProductConversationDeleteSequence,
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
   notifyArchiveCloseConflict,
   notifyProductConversationListMayHaveChanged,
+  notifyProductConversationDeleted,
+  productConversationDeletedSince,
   notifyProductConversationSnapshotChanged,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
@@ -80,6 +83,16 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+describe('product conversation deletion replay', () => {
+  it('records aliases for events emitted before a subscriber resolves them', () => {
+    const sequence = getProductConversationDeleteSequence();
+    notifyProductConversationDeleted('pc-1', ['root-1', 'agent-1']);
+
+    expect(productConversationDeletedSince(['agent-1'], sequence)).toBe(true);
+    expect(productConversationDeletedSince(['other'], sequence)).toBe(false);
+  });
 });
 
 describe('Coordinator notification routing', () => {

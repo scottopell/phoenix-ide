@@ -14229,8 +14229,15 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .expect("chain delete");
         assert_eq!(
-            response.0.deleted_conversation_ids,
-            vec!["cd-agent", "cd-a", "cd-b", "cd-c"]
+            response.0.outcome,
+            crate::api::types::ChainDeleteOutcome::Deleted {
+                deleted_conversation_ids: vec![
+                    "cd-agent".to_string(),
+                    "cd-a".to_string(),
+                    "cd-b".to_string(),
+                    "cd-c".to_string(),
+                ],
+            }
         );
 
         for id in ["cd-a", "cd-b", "cd-c", "cd-agent"] {
@@ -14279,7 +14286,10 @@ pub(crate) mod hard_delete_cascade_tests {
         .expect("missing aggregate is an idempotent success");
 
         assert!(retry.0.success);
-        assert!(retry.0.deleted_conversation_ids.is_empty());
+        assert_eq!(
+            retry.0.outcome,
+            crate::api::types::ChainDeleteOutcome::AlreadyAbsent
+        );
     }
 
     #[tokio::test]

@@ -42,7 +42,9 @@ use super::handlers::{
     prepare_hard_delete_cascade, reopen_prepared_hard_delete, require_hard_delete_admission,
     AppError, PreparedHardDelete,
 };
-use super::types::{ChainDeleteResponse, ConflictErrorResponse, SuccessResponse};
+use super::types::{
+    ChainDeleteOutcome, ChainDeleteResponse, ConflictErrorResponse, SuccessResponse,
+};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
@@ -478,10 +480,10 @@ async fn refuse_busy_chain_members(
 /// External cleanup runs for every member before any conversation row is
 /// removed. The rows are then deleted root-first in one immediate transaction
 /// so any member failure rolls the whole aggregate back.
-fn chain_delete_response(deleted_conversation_ids: Vec<String>) -> Json<ChainDeleteResponse> {
+fn chain_delete_response(outcome: ChainDeleteOutcome) -> Json<ChainDeleteResponse> {
     Json(ChainDeleteResponse {
         success: true,
-        deleted_conversation_ids,
+        outcome,
     })
 }
 
@@ -490,7 +492,7 @@ pub async fn delete_chain_handler(
     Path(root_id): Path<String>,
 ) -> Result<Json<ChainDeleteResponse>, AppError> {
     let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
-        return Ok(chain_delete_response(Vec::new()));
+        return Ok(chain_delete_response(ChainDeleteOutcome::AlreadyAbsent));
     };
     let product_conversation_id = root.product_conversation_id.to_string();
     let member_ids = state
@@ -501,7 +503,7 @@ pub async fn delete_chain_handler(
     let _admission_guards =
         lock_aggregate_admissions(&state, root.product_conversation_id.as_str(), &member_ids).await;
     if aggregate_is_absent_after_delete_serialization(&state, &root_id).await? {
-        return Ok(chain_delete_response(Vec::new()));
+        return Ok(chain_delete_response(ChainDeleteOutcome::AlreadyAbsent));
     }
     require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
@@ -588,7 +590,9 @@ pub async fn delete_chain_handler(
     )
     .await;
 
-    Ok(chain_delete_response(member_ids))
+    Ok(chain_delete_response(ChainDeleteOutcome::Deleted {
+        deleted_conversation_ids: member_ids,
+    }))
 }
 
 /// `GET /api/chains/:rootId/stream`

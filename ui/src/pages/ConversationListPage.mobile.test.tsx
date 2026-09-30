@@ -129,7 +129,10 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
-      deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+      outcome: {
+        type: 'deleted',
+        deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+      },
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
@@ -171,7 +174,10 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       .mockRejectedValueOnce(new Error('refresh failed'));
     vi.mocked(api.deleteChain).mockResolvedValue({
       success: true,
-      deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+      outcome: {
+        type: 'deleted',
+        deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+      },
     });
     const hardDeleted = vi.fn();
     window.addEventListener('phoenix:conversation-hard-deleted', hardDeleted, { once: true });

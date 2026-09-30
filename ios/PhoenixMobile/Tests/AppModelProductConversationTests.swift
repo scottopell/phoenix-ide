@@ -223,7 +223,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(model.aggregateReconciliationId)
     }
 
-    func testConnectivityRestoreReleasesOfflineStreamBeforeReconciliation() {
+    func testConnectivityRestoreDefersReconciliationUntilStreamIsOpen() {
         let model = AppModel()
         model.installAPIForTesting()
         model.connectivity.setOnlineForTesting(false)
@@ -233,7 +233,7 @@ final class AppModelProductConversationTests: XCTestCase {
         model.connectivity.setOnlineForTesting(true)
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
-        XCTAssertNotNil(model.aggregateReconciliationId)
+        XCTAssertNil(model.aggregateReconciliationId)
     }
 
     func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() async {

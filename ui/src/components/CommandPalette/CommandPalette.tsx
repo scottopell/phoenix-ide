@@ -14,7 +14,11 @@ import { createCodeSource } from './sources/CodeSource';
 import { createConversationContentSource } from './sources/ConversationContentSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import { notifyArchiveCloseConflict, notifyProductConversationListMayHaveChanged } from '../../notifications';
+import {
+  notifyArchiveCloseConflict,
+  notifyProductConversationClosed,
+  notifyProductConversationListMayHaveChanged,
+} from '../../notifications';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
@@ -156,6 +160,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
                     try {
                       await api.closeProductConversation(productId);
                       notifyProductConversationListMayHaveChanged();
+                      notifyProductConversationClosed(productId);
                     } finally {
                       closingProductIdsRef.current.delete(productId);
                     }

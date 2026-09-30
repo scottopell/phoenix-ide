@@ -235,6 +235,8 @@ export function subscribeProductConversationSnapshotChanged(
 }
 
 const PRODUCT_CONVERSATION_DELETED_EVENT = 'phoenix:product-conversation-deleted';
+let productConversationDeleteSequence = 0;
+const productConversationDeleteSequencesById = new Map<string, number>();
 
 type ProductConversationDeletedDetail = {
   productConversationId: string;
@@ -245,10 +247,59 @@ export function notifyProductConversationDeleted(
   productConversationId: string,
   deletedConversationIds: string[],
 ): void {
+  productConversationDeleteSequence += 1;
+  for (const identity of [productConversationId, ...deletedConversationIds]) {
+    productConversationDeleteSequencesById.set(identity, productConversationDeleteSequence);
+  }
   window.dispatchEvent(new CustomEvent<ProductConversationDeletedDetail>(
     PRODUCT_CONVERSATION_DELETED_EVENT,
     { detail: { productConversationId, deletedConversationIds } },
   ));
+}
+
+export function notifyProductConversationHardDeleted(
+  productConversationId: string,
+  deletedConversationIds: string[],
+): void {
+  notifyProductConversationDeleted(productConversationId, deletedConversationIds);
+  window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+    detail: {
+      conversationId: productConversationId,
+      deletedConversationIds,
+    },
+  }));
+}
+
+export function getProductConversationDeleteSequence(): number {
+  return productConversationDeleteSequence;
+}
+
+export function productConversationDeletedSince(
+  identities: Iterable<string>,
+  sequence: number,
+): boolean {
+  return [...identities].some(
+    (identity) => (productConversationDeleteSequencesById.get(identity) ?? 0) > sequence,
+  );
+}
+
+const PRODUCT_CONVERSATION_CLOSED_EVENT = 'phoenix:product-conversation-closed';
+
+export function notifyProductConversationClosed(productConversationId: string): void {
+  window.dispatchEvent(new CustomEvent<string>(PRODUCT_CONVERSATION_CLOSED_EVENT, {
+    detail: productConversationId,
+  }));
+}
+
+export function subscribeProductConversationClosed(
+  listener: (productConversationId: string) => void,
+): () => void {
+  const handler = (event: Event) => {
+    const productConversationId = (event as CustomEvent<string>).detail;
+    if (productConversationId) listener(productConversationId);
+  };
+  window.addEventListener(PRODUCT_CONVERSATION_CLOSED_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_CLOSED_EVENT, handler);
 }
 
 export function subscribeProductConversationDeleted(

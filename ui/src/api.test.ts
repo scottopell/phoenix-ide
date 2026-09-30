@@ -368,13 +368,19 @@ describe('conversation message history clients', () => {
       status: 200,
       json: async () => ({
         success: true,
-        deleted_conversation_ids: ['root-1', 'agent-1'],
+        outcome: {
+          type: 'deleted',
+          deleted_conversation_ids: ['root-1', 'agent-1'],
+        },
       }),
     } as unknown as Response);
 
     await expect(api.deleteChain('root/1')).resolves.toEqual({
       success: true,
-      deleted_conversation_ids: ['root-1', 'agent-1'],
+      outcome: {
+        type: 'deleted',
+        deleted_conversation_ids: ['root-1', 'agent-1'],
+      },
     });
     expect(fetchMock).toHaveBeenCalledWith('/api/chains/root%2F1', { method: 'DELETE' });
   });

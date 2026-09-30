@@ -310,7 +310,10 @@ describe('Sidebar — ProductConversation navigation', () => {
   });
 
   it('uses aggregate deletion for History with one parent transcript', async () => {
-    apiMock.deleteChain.mockResolvedValueOnce({ ok: true });
+    apiMock.deleteChain.mockResolvedValueOnce({
+      success: true,
+      outcome: { type: 'deleted', deleted_conversation_ids: ['root-1'] },
+    });
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [makeProductConversation('pc-history', {
         lifecycle: { state: 'history' },
@@ -339,7 +342,10 @@ describe('Sidebar — ProductConversation navigation', () => {
       canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
       latest_transcript_row_id: 'history-latest',
     });
-    apiMock.deleteChain.mockResolvedValueOnce({ ok: true });
+    apiMock.deleteChain.mockResolvedValueOnce({
+      success: true,
+      outcome: { type: 'deleted', deleted_conversation_ids: ['root-1'] },
+    });
     apiMock.listProductConversations
       .mockResolvedValueOnce({ product_conversations: [row] })
       .mockRejectedValueOnce(new Error('refresh failed'));
@@ -421,6 +427,13 @@ describe('Sidebar — ProductConversation navigation', () => {
       latest_transcript_row_id: 'history-latest',
     });
     apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
+    apiMock.deleteChain.mockResolvedValueOnce({
+      success: true,
+      outcome: {
+        type: 'deleted',
+        deleted_conversation_ids: ['history-root', 'middle-id', 'history-latest'],
+      },
+    });
     apiMock.getProductConversationSnapshot.mockResolvedValue({
       product_conversation_id: 'pc-history',
       segments: [{ transcript_row_id: 'history-root', slug: 'history-root' }, { transcript_row_id: 'middle-id', slug: 'middle-slug' }, { transcript_row_id: 'history-latest', slug: 'latest-slug' }],

@@ -15,10 +15,12 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
   notifyArchiveCloseConflict,
-  notifyProductConversationDeleted,
+  notifyProductConversationClosed,
+  notifyProductConversationHardDeleted,
   notifyProductConversationListMayHaveChanged,
   notifyProductConversationSnapshotChanged,
   subscribeProductConversationDeleted,
+  subscribeProductConversationClosed,
   subscribeProductConversationListRevision,
 } from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
@@ -210,7 +212,7 @@ export function Sidebar({
       window.removeEventListener('online', handleOnline);
     };
   }, [scheduleProductRefresh]);
-  const lastArchiveRevealSlugRef = useRef<string | null>(null);
+  const lastArchiveRevealKeyRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.lifecycle.state === 'open');
   const archivedProductConversations = productConversations.filter((row) => row.lifecycle.state === 'history');
   useEffect(() => {
@@ -228,12 +230,16 @@ export function Sidebar({
     });
     return () => { unsubscribes.forEach((unsubscribe) => unsubscribe()); };
   }, [productConversations]);
+  useEffect(() => subscribeProductConversationClosed((productConversationId) => {
+    setProductConversations((rows) => projectProductConversationHistory(rows, productConversationId));
+  }), []);
   useEffect(() => {
     if (!activeSlug || !location.pathname.startsWith('/product-conversations/')) {
       setActiveProductSnapshot(null);
       return;
     }
     let cancelled = false;
+    setActiveProductSnapshot(null);
     api.getProductConversationSnapshot(activeSlug, { message_limit: 1 })
       .then((snapshot) => { if (!cancelled) setActiveProductSnapshot(snapshot); })
       .catch(() => { if (!cancelled) setActiveProductSnapshot(null); });
@@ -246,23 +252,30 @@ export function Sidebar({
 
   useEffect(() => {
     if (!activeSlug) {
-      lastArchiveRevealSlugRef.current = null;
+      lastArchiveRevealKeyRef.current = null;
       return;
     }
-    if (lastArchiveRevealSlugRef.current === activeSlug) return;
-
-    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || openProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
-    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug))
-      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeProductRouteIdentity));
+    const inOpenProductList = openProductConversations.some(
+      (row) => productRowMatchesRoute(row, activeProductRouteIdentity),
+    );
+    const inHistoryProductList = archivedProductConversations.some(
+      (row) => productRowMatchesRoute(row, activeProductRouteIdentity),
+    );
+    const productRouteResolved = inOpenProductList || inHistoryProductList;
+    const inActiveList = inOpenProductList
+      || (!productRouteResolved && conversations.some((c) => matchesRouteSegment(c, activeSlug)));
+    const inArchivedList = inHistoryProductList
+      || (!productRouteResolved && archivedConversations.some((c) => matchesRouteSegment(c, activeSlug)));
     if (!inActiveList && !inArchivedList) return;
+    const revealKey = `${activeSlug}:${inActiveList ? 'open' : 'history'}`;
+    if (lastArchiveRevealKeyRef.current === revealKey) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
       setShowArchived(true);
     } else if (inActiveList && showArchived) {
       setShowArchived(false);
     }
-    lastArchiveRevealSlugRef.current = activeSlug;
+    lastArchiveRevealKeyRef.current = revealKey;
   }, [activeSlug, activeProductRouteIdentity, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
@@ -387,6 +400,7 @@ export function Sidebar({
         rows,
         productCloseTarget.product_conversation_id,
       ));
+      notifyProductConversationClosed(productCloseTarget.product_conversation_id);
       setProductCloseTarget((current) =>
         current?.product_conversation_id === productCloseTarget.product_conversation_id ? null : current);
       onConversationCreated();
@@ -430,10 +444,13 @@ export function Sidebar({
     setProductDeleteSubmittingId(productId);
     setProductDeleteError(null);
     try {
-      await api.deleteChain(rootId);
+      const result = await api.deleteChain(rootId);
       setProductDeleteTarget((current) =>
         current?.product_conversation_id === productId ? null : current);
-      notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
+      const deletedConversationIds = result.outcome.type === 'deleted'
+        ? result.outcome.deleted_conversation_ids
+        : [rootId, productDeleteTarget.latest_transcript_row_id];
+      notifyProductConversationHardDeleted(productId, deletedConversationIds);
       notifyProductConversationListMayHaveChanged();
       const activeSnapshotMatches = activeProductSnapshot?.product_conversation_id === productId
         && activeProductSnapshot.segments.some((segment) => (
@@ -446,10 +463,9 @@ export function Sidebar({
       if (error instanceof ApiResponseError && error.status === 404) {
         setProductDeleteTarget((current) =>
           current?.product_conversation_id === productId ? null : current);
-        notifyProductConversationDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
+        notifyProductConversationHardDeleted(productId, [rootId, productDeleteTarget.latest_transcript_row_id]);
         notifyProductConversationListMayHaveChanged();
-        if (productRowMatchesRoute(productDeleteTarget, activeSlug)
-          || activeProductSnapshot?.product_conversation_id === productId) {
+        if (productRowMatchesRoute(productDeleteTarget, activeSlug)) {
           navigate('/');
         }
         return;

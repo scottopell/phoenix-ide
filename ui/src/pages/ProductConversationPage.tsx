@@ -28,7 +28,9 @@ import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import {
   getProductConversationSnapshotChangeSequence,
+  getProductConversationDeleteSequence,
   productConversationSnapshotChangedSince,
+  productConversationDeletedSince,
   subscribeCloseSnapshotChanged,
   subscribeProductConversationDeleted,
   subscribeProductConversationSnapshotChanged,
@@ -831,6 +833,7 @@ function ProductConversationPageInner() {
     setError(null);
     setOlderError(null);
     const snapshotChangeSequence = getProductConversationSnapshotChangeSequence();
+    const deleteSequence = getProductConversationDeleteSequence();
     snapshotChangeSequenceRef.current = snapshotChangeSequence;
 
     const candidateMeasurement = openMeasurementRef.current;
@@ -847,6 +850,17 @@ function ProductConversationPageInner() {
     request
       .then((next) => {
         if (cancelled || aggregateDeletedRef.current) return;
+        if (productConversationDeletedSince([
+          productConversationId,
+          next.product_conversation_id,
+          ...next.segments.map((segment) => segment.transcript_row_id),
+        ], deleteSequence)) {
+          aggregateDeletedRef.current = true;
+          setOwnedSnapshot(null);
+          setLatestProjection(null);
+          setError('This product conversation was deleted.');
+          return;
+        }
         if (measurement) measurement.snapshotReceivedAt = performance.now();
         if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
