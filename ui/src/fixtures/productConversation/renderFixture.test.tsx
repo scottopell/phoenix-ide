@@ -35,7 +35,7 @@ describe('ProductConversationFixture', () => {
       await waitFor(() => expect(fixture.container.querySelector('[data-product-conversation-fixture-ready="input-provenance-continuation"]')).not.toBeNull());
       expect(screen.getByRole('button', { name: 'User · API: API request in original transcript' })).toHaveClass('user');
       expect(screen.getByRole('button', { name: /From conversation ID source-product.*Forwarded into continued transcript/ })).toHaveClass('meta');
-      expect(screen.getByRole('button', { name: /From conversation ID source-product.*Queued from source conversation/ })).toHaveClass('meta');
+      expect(await screen.findByRole('button', { name: /From conversation ID source-product.*Queued from source conversation/ })).toHaveClass('meta');
       expect(screen.queryByTitle('Your message')).not.toBeInTheDocument();
       fixture.unmount();
     }
