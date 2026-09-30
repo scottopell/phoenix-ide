@@ -21,6 +21,7 @@ vi.mock('../api', async () => {
       closeProductConversation: vi.fn(),
       codexLoginPreflight: vi.fn(),
       listProductConversations: vi.fn(),
+      getProductConversationSnapshot: vi.fn(),
       renameProductConversation: vi.fn(),
       deleteChain: vi.fn(),
       deleteConversation: vi.fn(),
@@ -93,6 +94,12 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
     });
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      segments: [
+        { transcript_row_id: 'root-mobile' },
+        { transcript_row_id: 'successor-mobile' },
+      ],
+    } as never);
   });
 
   it('renames through the production mobile list touch target', async () => {
@@ -167,6 +174,8 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       .mockResolvedValueOnce({ product_conversations: [history] })
       .mockRejectedValueOnce(new Error('refresh failed'));
     vi.mocked(api.deleteChain).mockResolvedValue(undefined);
+    const hardDeleted = vi.fn();
+    window.addEventListener('phoenix:conversation-hard-deleted', hardDeleted, { once: true });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
@@ -175,6 +184,13 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
 
     await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
     await waitFor(() => expect(screen.queryByText('Mobile Product')).toBeNull());
+    expect(hardDeleted).toHaveBeenCalledWith(expect.objectContaining({
+      detail: {
+        conversationId: 'pc-mobile',
+        deletedConversationIds: ['root-mobile', 'successor-mobile'],
+      },
+    }));
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('pc-mobile');
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {

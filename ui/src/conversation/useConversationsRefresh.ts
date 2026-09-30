@@ -25,8 +25,9 @@ export function subscribeToAggregateDeletionEvents(): () => void {
 
   const connect = () => {
     if (stopped || !navigator.onLine || typeof EventSource === 'undefined') return;
-    source = new EventSource('/api/product-conversations/events');
-    source.onopen = () => {
+    const openedSource = new EventSource('/api/product-conversations/events');
+    source = openedSource;
+    openedSource.onopen = () => {
       void api.listProductConversations()
         .then(({ product_conversations: rows }) => {
           if (stopped) return;
@@ -36,13 +37,14 @@ export function subscribeToAggregateDeletionEvents(): () => void {
           notifyProductConversationListMayHaveChanged();
         })
         .catch(() => {
-          source?.close();
+          if (source !== openedSource) return;
+          openedSource.close();
           source = null;
           retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
           scheduleReconciliation();
         });
     };
-    source.addEventListener('conversation_hard_deleted', (event) => {
+    openedSource.addEventListener('conversation_hard_deleted', (event) => {
       retryDelayMs = 1_000;
       let payload: unknown;
       try {
@@ -66,8 +68,9 @@ export function subscribeToAggregateDeletionEvents(): () => void {
         },
       }));
     });
-    source.onerror = () => {
-      source?.close();
+    openedSource.onerror = () => {
+      openedSource.close();
+      if (source !== openedSource) return;
       source = null;
       retryDelayMs = Math.min(retryDelayMs * 2, AGGREGATE_EVENT_RETRY_MAX_MS);
       scheduleReconciliation();

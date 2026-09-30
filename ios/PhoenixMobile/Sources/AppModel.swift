@@ -511,6 +511,7 @@ final class AppModel {
                 }
             }
             var backoff = AggregateEventStreamBackoff()
+            var reconciliationRequired = false
             while !Task.isCancelled {
                 guard let self, self.apiGeneration == generation, self.isForeground else { return }
                 if !self.connectivity.isOnline {
@@ -520,6 +521,12 @@ final class AppModel {
                 var streamWasHealthy = false
                 do {
                     let bytes = try await api.openProductConversationEventStream()
+                    if reconciliationRequired {
+                        guard await self.reconcileAfterAggregateStreamDisconnect(
+                            generation: generation)
+                        else { return }
+                        reconciliationRequired = false
+                    }
                     var parser = SSEParser()
                     var previousByteWasNewline = false
                     for try await byte in bytes {
@@ -538,20 +545,17 @@ final class AppModel {
                             await self.handleAggregateHardDeleted(deletion, generation: generation)
                         }
                     }
-                    guard await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
-                    else { return }
+                    reconciliationRequired = true
                 } catch let error as APIError where error.isPermanentStreamAuthenticationFailure {
                     return
                 } catch is CancellationError {
                     return
                 } catch let error as APIError {
-                    guard error.isRetryableAggregateReconciliationFailure,
-                          await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
-                    else { return }
+                    guard error.isRetryableAggregateReconciliationFailure else { return }
+                    reconciliationRequired = true
                 } catch {
-                    guard !Task.isCancelled,
-                          await self.reconcileAfterAggregateStreamDisconnect(generation: generation)
-                    else { return }
+                    guard !Task.isCancelled else { return }
+                    reconciliationRequired = true
                 }
                 let retryDelay = backoff.delayAfterDisconnect(
                     streamWasHealthy: streamWasHealthy,

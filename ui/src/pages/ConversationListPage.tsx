@@ -153,7 +153,16 @@ export function ConversationListPage() {
   const [productRenameTarget, setProductRenameTarget] = useState<ProductConversationListRow | null>(null);
   const [productRenameError, setProductRenameError] = useState<string | undefined>();
 
-  const finishProductDelete = (deletedProductConversationId: string) => {
+  const finishProductDelete = (
+    deletedProductConversationId: string,
+    deletedConversationIds: string[],
+  ) => {
+    window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+      detail: {
+        conversationId: deletedProductConversationId,
+        deletedConversationIds,
+      },
+    }));
     setProductConversations((rows) => rows.filter(
       (row) => row.product_conversation_id !== deletedProductConversationId,
     ));
@@ -166,13 +175,16 @@ export function ConversationListPage() {
     if (!productDeleteTarget || productDeleteSubmitting) return;
     setProductDeleteSubmitting(true);
     const deletingProductConversationId = productDeleteTarget.product_conversation_id;
+    let deletedConversationIds = [productDeleteTarget.canonical_root.transcript_row_id];
     try {
+      const snapshot = await api.getProductConversationSnapshot(deletingProductConversationId);
+      deletedConversationIds = snapshot.segments.map((segment) => segment.transcript_row_id);
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
       await api.deleteChain(rootId);
-      finishProductDelete(deletingProductConversationId);
+      finishProductDelete(deletingProductConversationId, deletedConversationIds);
     } catch (error) {
       if (error instanceof ApiResponseError && error.status === 404) {
-        finishProductDelete(deletingProductConversationId);
+        finishProductDelete(deletingProductConversationId, deletedConversationIds);
       } else {
         setProductDeleteError(error instanceof Error ? error.message : 'Failed to delete product conversation');
       }
