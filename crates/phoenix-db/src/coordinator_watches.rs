@@ -246,7 +246,7 @@ pub(crate) async fn record_creation_event_tx(
         transcript_id,
         terminal_kind,
         reason,
-        false,
+        reason == Some("context exhausted"),
     )
     .await
 }

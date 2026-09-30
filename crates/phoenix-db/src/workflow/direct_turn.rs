@@ -2505,6 +2505,10 @@ impl WorkflowRepository {
         if let Some(projection) = &input.projection {
             update_conversation_projection_tx(tx, &turn.conversation, projection).await?;
         }
+        sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
+            .bind(&turn.conversation.0)
+            .execute(&mut *tx.tx)
+            .await?;
         crate::coordinator_watches::record_terminal_event_tx(
             &mut tx.tx,
             turn_id.0,

@@ -14724,6 +14724,7 @@ async fn classify_creation_watch_outcome(
         ConvState::RecoverableContinuationFailure { .. } => {
             ("Failed", Some("continuation summary failed"))
         }
+        ConvState::ContextExhausted { .. } => ("Failed", Some("context exhausted")),
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::Provisioning { .. }
@@ -14736,7 +14737,6 @@ async fn classify_creation_watch_outcome(
         | ConvState::AwaitingContinuation { .. }
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
-        | ConvState::ContextExhausted { .. }
         | ConvState::HandedOff { .. } => return Ok(()),
     };
     crate::coordinator_watches::record_creation_event_tx(
@@ -15644,6 +15644,40 @@ mod tests {
         assert_eq!(
             db.pending_coordinator_watch_events(16).await.unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_initial_context_exhaustion_reports_fact_without_summary() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &ConvState::LlmRequesting { attempt: 0 },
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::ContextExhausted {
+                summary: "private summary".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].terminal_kind, "failed");
+        assert_eq!(
+            events[0].terminal_reason.as_deref(),
+            Some("context exhausted")
         );
     }
 
