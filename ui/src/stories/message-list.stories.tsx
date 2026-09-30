@@ -23,6 +23,15 @@ ScrollPolicyLong.storyName = 'scroll-policy-long';
 export const PrefixContinuityOffsetBug = storyFor('prefix-continuity-offset-bug');
 PrefixContinuityOffsetBug.storyName = 'prefix-continuity-offset-bug';
 
+export const MobileTablePreviewBaseline = storyFor('mobile-table-preview-baseline');
+MobileTablePreviewBaseline.storyName = 'mobile-table-preview-baseline';
+
+export const MobileTablePreviewContentWrap = storyFor('mobile-table-preview-content-wrap');
+MobileTablePreviewContentWrap.storyName = 'mobile-table-preview-content-wrap';
+
+export const MobileTablePreviewReadableOverflow = storyFor('mobile-table-preview-readable-overflow');
+MobileTablePreviewReadableOverflow.storyName = 'mobile-table-preview-readable-overflow';
+
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 

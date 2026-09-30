@@ -295,6 +295,42 @@ const markdownImageMessages: Message[] = [
   },
 ];
 
+export const mobileTablePreviewMarkdown = [
+  '**Historical fixture — Global status at 11:01 UTC.**',
+  '',
+  '**Good—review capacity is no longer the gate.** I’ve instructed the coordinator to request one fresh exact-head review where needed, without duplicate requests.',
+  '',
+  '### Fresh status at 11:01 UTC',
+  '',
+  '| Stream | Current position |',
+  '|---|---|',
+  '| **Polish #777** | `b502c97`: **all 7 hosted checks green, 279 threads / 0 unresolved**. Seven-fix batch published; needs refreshed final review. **17008 starts immediately after merge.** |',
+  '| **Restart RCA #817** | `bcaae33`: **all applicable hosted checks green**. A causal restart-recovery fix and regressions are published—not provider-blocked anymore. Final review is next. |',
+  '| **Provenance #815** | `51b9cd3`: **all 8 hosted checks green**, but three new findings plus one disputed finding still need source-based resolution. Sender-visible message and breadcrumb requirements remain essential. |',
+  '',
+  '### The coordination problem',
+  '**The foreground loop had dropped again.** Its successor went idle around **03:10** after summarizing the handoff instead of continuing execution. Provenance also parked with findings outstanding.',
+  '',
+  'I explicitly restarted the driving mandate. This time I verified **actual coordinator tools at 11:01**, including delivery of the provenance resume instruction—not merely an active-state flag.',
+  '',
+  '**Recommended landing order:** qualify the restart fix first to protect upcoming deployments, land #777 and start 17008, and keep provenance fixing its remaining findings in parallel. No new permission is needed for those fixes.',
+  '',
+  '[Polish #777](https://github.com/scottopell/phoenix-ide/pull/777) · [Restart #817](https://github.com/scottopell/phoenix-ide/pull/817) · [Provenance #815](https://github.com/scottopell/phoenix-ide/pull/815)',
+  '',
+  '### Stress matrix',
+  '',
+  '| Label | Long prose at word boundaries |',
+  '|---|---|',
+  '| **Compact label** | This intentionally long prose should wrap at ordinary word boundaries without collapsing into one-word-per-line text or shrinking the production font. |',
+  '| `sha` | `0123456789abcdef0123456789abcdef01234567` remains copyable and may break only as an atomic fallback. |',
+  '| URL | https://example.com/releases/mobile-table-preview/very-long-unbroken-path-with-query?revision=0123456789abcdef |',
+  '',
+  '| ID | State | Detailed outcome |',
+  '|---|---|---|',
+  '| `#777` | **Green** | Three-column content keeps narrow labels compact while prose receives the available readable width. |',
+  '| `#817` | **Review** | Local overflow is acceptable only when readable minimum widths genuinely exceed the viewport. |',
+].join('\n');
+
 const wideMarkdownTableMessages: Message[] = [
   {
     message_id: 'user-wide-table-1',
@@ -315,18 +351,7 @@ const wideMarkdownTableMessages: Message[] = [
     created_at: '2025-01-01T10:01:00.000Z',
     content: [{
       type: 'text',
-      text: [
-        'The prose remains in the readable conversation column while the comparison uses the available pane width.',
-        '',
-        '| Operating model | Test world | Scarce expertise | Operational coupling | Primary consumers | Success horizon |',
-        '| --- | --- | --- | --- | --- | --- |',
-        '| Shared platform | `kernels`, fuzzing, workload replay | `Linux`, eBPF, security | release and fleet teams | infrastructure product groups | performance and correctness |',
-        '| Specialist program | device fixtures and adversarial testing | `GPU` and runtime integration | artifact owners | feature delivery teams | durable expertise transfer |',
-        '| Temporary initiative | large-cluster chaos and rollout tests | `Kubernetes` controllers | onboarding teams | service owners | convergence and safe migration |',
-        '| Embedded partnership | production traces, shadow traffic, and replay | `distributed_systems` and data integrity | platform and application owners | cross-functional migration groups | independently operated steady state |',
-        '',
-        'The paragraph after the table returns to the same readable prose width.',
-      ].join('\n'),
+      text: mobileTablePreviewMarkdown,
     }],
     display_data: {},
   },
@@ -415,6 +440,24 @@ export const messageListScenarios = [
     theme: 'dark',
   },
   {
+    id: 'mobile-table-preview-baseline',
+    title: 'Mobile table / current baseline',
+    description: 'Current production CSS at 7a42b66db; historical Global 11:01 fixture, final and streaming.',
+    theme: 'dark',
+  },
+  {
+    id: 'mobile-table-preview-content-wrap',
+    title: 'Mobile table / content-aware wrap',
+    description: 'Alternative A: compact labels, wide prose, word-boundary wrapping.',
+    theme: 'dark',
+  },
+  {
+    id: 'mobile-table-preview-readable-overflow',
+    title: 'Mobile table / readable minimum + local overflow',
+    description: 'Alternative B: readable minimum columns with local overflow fallback.',
+    theme: 'dark',
+  },
+  {
     id: 'wide-markdown-table',
     title: 'Wide Markdown table / dark',
     description: 'Wide assistant tables keep continuous row surfaces beyond the prose card in dark theme.',
@@ -449,7 +492,9 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
       ? compactChronologyInitialMessages
       : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
+      : scenario.id.startsWith('mobile-table-preview-')
+        || scenario.id === 'wide-markdown-table'
+        || scenario.id === 'wide-markdown-table-light'
         ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages

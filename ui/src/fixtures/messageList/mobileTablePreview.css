@@ -1,0 +1,104 @@
+.mobile-table-preview .fixture-message-list-stage {
+  display: grid;
+  grid-template-rows: minmax(18rem, 42vh) minmax(22rem, 1fr);
+  gap: 12px;
+  padding: 8px;
+  overflow: auto;
+}
+
+.mobile-table-preview .fixture-toolbar {
+  height: auto;
+  min-height: 40px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding-block: 6px;
+  overflow-wrap: anywhere;
+}
+
+.mobile-table-preview-streaming {
+  min-width: 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary);
+}
+
+.mobile-table-preview-streaming > strong {
+  display: block;
+  margin-block-end: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.mobile-table-preview-streaming .message-content {
+  max-width: none;
+}
+
+/* Fixture-only alternatives. Production table CSS remains unchanged. */
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table {
+  width: 100%;
+  min-width: 0;
+  table-layout: auto;
+}
+
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll :where(th, td) {
+  min-width: 5.5rem;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll :where(th, td):first-child {
+  width: 1%;
+  min-width: 6.5rem;
+  white-space: normal;
+}
+
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll :where(code, a) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table:has(th:nth-child(3)) {
+  width: max-content;
+  min-width: 100%;
+}
+
+[data-message-list-fixture='mobile-table-preview-content-wrap'] .markdown-table-scroll table:has(th:nth-child(3)) :where(th, td):last-child {
+  min-width: 16rem;
+  max-width: min(28rem, 72vw);
+}
+
+[data-message-list-fixture='mobile-table-preview-readable-overflow'] .markdown-table-scroll table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+[data-message-list-fixture='mobile-table-preview-readable-overflow'] .markdown-table-scroll :where(th, td) {
+  min-width: 8rem;
+  max-width: min(26rem, 72vw);
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+[data-message-list-fixture='mobile-table-preview-readable-overflow'] .markdown-table-scroll :where(th, td):first-child {
+  min-width: 7rem;
+}
+
+[data-message-list-fixture='mobile-table-preview-readable-overflow'] .markdown-table-scroll :where(code, a) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (max-width: 600px) {
+  .mobile-table-preview .fixture-toolbar {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 1;
+  }
+
+  .mobile-table-preview .fixture-message-list-stage {
+    grid-template-rows: minmax(20rem, 48vh) minmax(28rem, 1fr);
+  }
+}

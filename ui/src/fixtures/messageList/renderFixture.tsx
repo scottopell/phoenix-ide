@@ -15,7 +15,10 @@ import {
   compactChronologyFinalMessages,
   messageListFixtureData,
   prefixContinuityEarlierMessages,
+  mobileTablePreviewMarkdown,
 } from './scenarios';
+import { StreamingBlocks } from '../../components/StreamingMessage';
+import './mobileTablePreview.css';
 
 interface Props {
   scenario: MessageListScenario;
@@ -47,6 +50,7 @@ export function MessageListFixture({ scenario }: Props) {
   const [continuityTrace, setContinuityTrace] = useState<ContinuityMilestone[]>([]);
   const isContinuityScenario = scenario.id === 'prefix-continuity-offset-bug';
   const isChronologyScenario = scenario.id === 'compact-expanded-tool-chronology';
+  const isMobileTablePreview = scenario.id.startsWith('mobile-table-preview-');
 
   const recordChronologyMetrics = useCallback((phase: string) => {
     const scroller = document.querySelector<HTMLElement>('.message-list-fixture-shell #messages');
@@ -212,11 +216,15 @@ export function MessageListFixture({ scenario }: Props) {
     <ConversationContext.Provider value={store}>
       <DensityContext.Provider value={{ density: 'compact', setDensity: () => {} }}>
         <MemoryRouter initialEntries={[`/c/${data.slug}`]}>
-          <main className="fixture-page" data-message-list-fixture={scenario.id}>
+          <main
+            className={`fixture-page ${isMobileTablePreview ? 'mobile-table-preview' : ''}`}
+            data-message-list-fixture={scenario.id}
+          >
             <div className="fixture-toolbar">
               <strong>Message list fixture</strong>
               <span>scenario={scenario.id}</span>
               <span>density=compact</span>
+              {isMobileTablePreview && <span>baseline=7a42b66db · production component/CSS</span>}
               {scenario.id === 'scroll-policy-long' && (
                 <button type="button" data-testid="append-tail" onClick={appendTail}>
                   Append tail
@@ -254,6 +262,18 @@ export function MessageListFixture({ scenario }: Props) {
               ))}
             </div>
             <div className="fixture-message-list-stage">
+            {isMobileTablePreview && (
+              <section className="mobile-table-preview-streaming" aria-label="Streaming state">
+                <strong>Streaming state — same production Markdown renderer</strong>
+                <div className="message agent">
+                  <div className="message-content">
+                    <div className="agent-text-block streaming">
+                      <StreamingBlocks text={mobileTablePreviewMarkdown} />
+                    </div>
+                  </div>
+                </div>
+              </section>
+            )}
               <div className="message-list-fixture-shell">
                 <MessageList
                   ref={messageListRef}
