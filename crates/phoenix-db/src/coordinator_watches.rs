@@ -478,6 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises event creation before admission, admission, and failure settlement.
     async fn context_exhaustion_releases_original_failure_or_suppresses_on_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
