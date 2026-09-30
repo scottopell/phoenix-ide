@@ -243,6 +243,22 @@ describe('user message provenance rendering', () => {
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
 
+  it('shows the origin of generated meta input instead of suppressing its sender', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage
+          message={userMessage('generated-meta', 'Generated seed', {
+            isMeta: true,
+            origin: { kind: 'system_generated' },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('System input')).toBeInTheDocument();
+    expect(screen.getByText('Generated seed')).toBeInTheDocument();
+  });
+
   it('labels user-facing API input by channel', () => {
     render(
       <MemoryRouter>

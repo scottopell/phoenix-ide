@@ -516,7 +516,13 @@ pub(crate) fn attributed_role(
         MessageType::System => "System",
         MessageType::Error => "Error",
         MessageType::Continuation => "Continuation",
-        MessageType::Skill => "Skill",
+        MessageType::Skill => match origin {
+            InputOrigin::UserApi => "Skill · User API",
+            InputOrigin::InternalConversation { .. } => "Skill · Conversation",
+            InputOrigin::SystemGenerated => "Skill · System input",
+            InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
+            InputOrigin::UnknownHistorical => "Skill · Unknown input",
+        },
     }
 }
 
@@ -1157,6 +1163,15 @@ mod tests {
             if expected != "User API" {
                 assert!(!search.contains("User API"), "{search}");
             }
+            message.message_type = MessageType::Skill;
+            hit.message_type = MessageType::Skill;
+            let search = format_global_search_hits(&service, &[hit.clone()]).await;
+            let full = render_global_message_line(&conv, &message);
+            let skill_label = format!("Skill · {expected}");
+            assert!(search.contains(&skill_label), "{search}");
+            assert!(full.contains(&skill_label), "{full}");
+            message.message_type = MessageType::User;
+            hit.message_type = MessageType::User;
         }
     }
 

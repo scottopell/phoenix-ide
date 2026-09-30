@@ -427,7 +427,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
-          {content.is_meta !== true && <InputSender origin={message.origin} />}
+          <InputSender origin={message.origin} />
           {timestamp && (
             <span className="message-time" title={new Date(timestamp).toLocaleString()}>
               {formatMessageTime(timestamp)}

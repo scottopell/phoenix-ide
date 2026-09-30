@@ -35,7 +35,23 @@ describe('deriveDisplayedPendingMessages', () => {
     expect(displayed.map((message) => message.origin)).toEqual([
       { kind: 'user_api' },
       { kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row' },
-      undefined,
+      { kind: 'user_api' },
+    ]);
+  });
+
+  it('assigns API origin at the local boundary for steering optimism but preserves server unknown origin', () => {
+    const local = queued('local-steer', { status: 'steering_queued' });
+    const displayed = deriveDisplayedPendingMessages([local], [{
+      message_id: 'server-unknown',
+      origin: { kind: 'unknown_historical' },
+      text: 'historical queue entry',
+      images: [],
+      files: [],
+    }], false);
+
+    expect(displayed.map((message) => message.origin)).toEqual([
+      { kind: 'unknown_historical' },
+      { kind: 'user_api' },
     ]);
   });
 

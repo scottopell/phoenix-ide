@@ -416,7 +416,7 @@ pub(crate) async fn commit_continuation_tx(
     }
     sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed', continuation_state = 'suppressed' WHERE source_transcript_id = ?1 AND delivery_state = 'pending' AND terminal_kind = 'failed' AND terminal_reason = 'continuation summary failed'")
         .bind(conversation_id).execute(&mut **tx).await?;
-    admit_automatic_continuation_tx(
+    let admitted = admit_automatic_continuation_tx(
         tx,
         conversation_id,
         operation_id,
@@ -424,6 +424,20 @@ pub(crate) async fn commit_continuation_tx(
         state_updated_at.timestamp_micros(),
     )
     .await?;
+    if !admitted {
+        sqlx::query(
+            "UPDATE coordinator_watch_events
+             SET continuation_state = 'none'
+             WHERE source_transcript_id = ?1
+               AND delivery_state = 'pending'
+               AND continuation_state = 'awaiting'
+               AND terminal_kind = 'failed'
+               AND terminal_reason = 'context exhausted'",
+        )
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(ContinuationCommitOutcome::Applied)
 }
 
@@ -433,7 +447,7 @@ async fn admit_automatic_continuation_tx(
     operation_id: &str,
     summary_message_id: &str,
     admitted_at_unix_micros: i64,
-) -> DbResult<()> {
+) -> DbResult<bool> {
     let first_message_id = format!("automatic-continuation-{conversation_id}-{operation_id}");
     sqlx::query(
         "INSERT INTO automatic_continuation_admissions (
@@ -471,7 +485,15 @@ async fn admit_automatic_continuation_tx(
     .bind(admitted_at_unix_micros)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM automatic_continuation_admissions
+         WHERE predecessor_conversation_id = ?1
+           AND phase NOT IN ('failed', 'superseded'))",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **tx)
+    .await?
+        != 0)
 }
 
 pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
@@ -9878,6 +9900,28 @@ impl Database {
 
         for msg in seed_messages {
             insert_message_tx(&mut tx, msg).await?;
+        }
+        if let ConvState::SeededLlmRequesting {
+            seed_message_id, ..
+        } = &child.state
+        {
+            let seed = seed_messages
+                .iter()
+                .find(|message| message.message_id == *seed_message_id.as_str())
+                .ok_or_else(|| {
+                    DbError::Serialization("seeded fork seed message is missing".to_string())
+                })?;
+            sqlx::query(
+                "INSERT INTO steering_execution_occurrences(conversation_id, message_id, source_kind)
+                 VALUES (?1, ?2, 'steering')
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     source_kind = excluded.source_kind",
+            )
+            .bind(&child.id)
+            .bind(&seed.message_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Guard the resolution on the pending state so a concurrent resolver

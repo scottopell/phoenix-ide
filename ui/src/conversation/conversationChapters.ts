@@ -93,7 +93,10 @@ export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Ch
           kind: 'prompt',
           label: truncateLabel(text),
           sequenceId: unit.kind === 'user' ? unit.message.sequence_id : undefined,
-          origin: unit.message.origin ?? { kind: unit.kind === 'pending_user' && unit.message.status !== 'steering_queued' ? 'user_api' : 'unknown_historical' },
+          // Pending units are local optimistic admissions; server-authored
+          // messages carry their own authoritative origin and never use this
+          // fallback. Steering status does not change the local API channel.
+          origin: unit.message.origin ?? (unit.kind === 'pending_user' ? { kind: 'user_api' } : { kind: 'unknown_historical' }),
         });
         break;
       }

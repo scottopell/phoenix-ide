@@ -576,8 +576,8 @@ const MIGRATION_111: &str = r"
 CREATE TABLE coordinator_watches (
     id INTEGER PRIMARY KEY,
     source_product_conversation_id TEXT NOT NULL,
-    enrolled_at_us INTEGER NOT NULL CHECK(typeof(enrolled_at_us) = 'integer'),
-    ended_at_us INTEGER CHECK(ended_at_us IS NULL OR typeof(ended_at_us) = 'integer'),
+    enrolled_at_us INTEGER NOT NULL CHECK(typeof(enrolled_at_us) = 'integer' AND enrolled_at_us >= 0),
+    ended_at_us INTEGER CHECK(ended_at_us IS NULL OR (typeof(ended_at_us) = 'integer' AND ended_at_us >= 0)),
     UNIQUE(source_product_conversation_id, enrolled_at_us)
 );
 CREATE UNIQUE INDEX coordinator_watches_active ON coordinator_watches(source_product_conversation_id)
@@ -603,7 +603,7 @@ CREATE TABLE coordinator_watch_events (
     source_transcript_id TEXT NOT NULL,
     terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('completed', 'failed', 'cancelled')),
     terminal_reason TEXT,
-    occurred_at_us INTEGER NOT NULL CHECK(typeof(occurred_at_us) = 'integer'),
+    occurred_at_us INTEGER NOT NULL CHECK(typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
     continuation_state TEXT NOT NULL DEFAULT 'none'
         CHECK(continuation_state IN ('none', 'awaiting', 'suppressed')),
     delivery_state TEXT NOT NULL DEFAULT 'pending'
@@ -692,7 +692,7 @@ BEGIN
     UPDATE coordinator_watch_events SET continuation_state = 'awaiting'
     WHERE source_transcript_id = NEW.predecessor_conversation_id
       AND terminal_kind = 'failed' AND terminal_reason = 'context exhausted'
-      AND delivery_state = 'pending';
+      AND delivery_state = 'pending' AND continuation_state = 'none';
 END;
 CREATE TRIGGER watch_auto_continuation_failed AFTER UPDATE OF phase ON automatic_continuation_admissions
 WHEN NEW.phase = 'failed' AND OLD.phase != 'failed'
@@ -700,6 +700,21 @@ BEGIN
     UPDATE coordinator_watch_events SET continuation_state = 'none'
     WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
       AND source_transcript_id = NEW.predecessor_conversation_id;
+END;
+CREATE TRIGGER watch_auto_continuation_disabled AFTER UPDATE OF auto_continue_on_context_exhaustion ON product_conversations
+WHEN OLD.auto_continue_on_context_exhaustion != 0 AND NEW.auto_continue_on_context_exhaustion = 0
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'none'
+    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
+      AND watch_id IN (
+          SELECT id FROM coordinator_watches
+          WHERE source_product_conversation_id = NEW.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM automatic_continuation_admissions admission
+          WHERE admission.predecessor_conversation_id = coordinator_watch_events.source_transcript_id
+            AND admission.phase NOT IN ('failed', 'superseded', 'message_settled')
+      );
 END;
 CREATE TRIGGER watch_auto_continuation_succeeded AFTER INSERT ON completed_continuation_handoffs
 BEGIN

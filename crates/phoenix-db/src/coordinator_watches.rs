@@ -289,8 +289,21 @@ async fn record_watch_event_tx(
          occurred_at_us, continuation_state)
         SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
           CASE WHEN ?9 AND ?5 = 'failed' AND EXISTS
-               (SELECT 1 FROM automatic_continuation_admissions a WHERE a.predecessor_conversation_id = c.id
-                AND a.phase NOT IN ('failed', 'superseded'))
+               (SELECT 1
+                FROM product_conversations continuation_product
+                WHERE continuation_product.id = c.product_conversation_id
+                  AND continuation_product.auto_continue_on_context_exhaustion = 1
+                  AND continuation_product.kind = 'ordinary'
+                  AND continuation_product.ordinary_lifecycle = 'open'
+                  AND c.parent_conversation_id IS NULL
+                  AND c.runtime_role IN ('user', 'coordinator')
+                  AND c.state_kind = 'context_exhausted'
+                  AND c.continued_in_conv_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM close_obligations obligation
+                      WHERE obligation.product_conversation_id = continuation_product.id
+                        AND obligation.phase <> 'completed'
+                  ))
                THEN 'awaiting' ELSE 'none' END
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at_us IS NULL
@@ -475,6 +488,14 @@ mod tests {
         .unwrap();
         db.watch_product_conversation(&product).await.unwrap();
         let turn = source_turn(&db, &source.id, "exhausted").await;
+        db.update_conversation_state(
+            &source.id,
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "source summary".into(),
+            },
+        )
+        .await
+        .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
@@ -488,17 +509,18 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(
-            db.pending_coordinator_watch_events(16).await.unwrap().len(),
-            1
-        );
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
         let (id, kind, state): (String, String, String) = sqlx::query_as(
             "SELECT event_id, terminal_kind, continuation_state FROM coordinator_watch_events",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!((kind.as_str(), state.as_str()), ("failed", "none"));
+        assert_eq!((kind.as_str(), state.as_str()), ("failed", "awaiting"));
         db.update_conversation_state(
             &source.id,
             &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
@@ -550,6 +572,120 @@ mod tests {
             Some("context exhausted")
         );
         assert_eq!(delivered[0].source_transcript_id, source.id);
+    }
+
+    #[tokio::test]
+    async fn watch_timestamps_reject_negative_values() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-timestamp-check", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product = source.product_conversation_id.clone();
+        assert!(sqlx::query(
+            "INSERT INTO coordinator_watches(source_product_conversation_id, enrolled_at_us)
+             VALUES (?1, -1)",
+        )
+        .bind(product.as_str())
+        .execute(db.pool())
+        .await
+        .is_err());
+        db.watch_product_conversation(&product).await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE coordinator_watches SET ended_at_us = -1
+             WHERE source_product_conversation_id = ?1",
+        )
+        .bind(product.as_str())
+        .execute(db.pool())
+        .await
+        .is_err());
+        let turn = source_turn(&db, &source.id, "timestamp-check-turn").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            turn,
+            0,
+            &source.id,
+            "Failed",
+            Some("failed"),
+            false,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE coordinator_watch_events SET occurred_at_us = -1
+             WHERE source_occurrence_id = ?1",
+        )
+        .bind(turn.to_string())
+        .execute(db.pool())
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn disabling_auto_continuation_releases_unadmitted_watch_event() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-disable", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product = source.product_conversation_id.clone();
+        db.watch_product_conversation(&product).await.unwrap();
+        db.set_auto_continue_on_context_exhaustion(
+            &product,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "summary".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let turn = source_turn(&db, &source.id, "disable-turn").await;
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            turn,
+            0,
+            &source.id,
+            "Failed",
+            Some("context exhausted"),
+            true,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let state: String = sqlx::query_scalar(
+            "SELECT continuation_state FROM coordinator_watch_events WHERE source_occurrence_id = ?1",
+        )
+        .bind(turn.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "awaiting");
+        db.set_auto_continue_on_context_exhaustion(
+            &product,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Disabled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT continuation_state FROM coordinator_watch_events WHERE source_occurrence_id = ?1",
+        )
+        .bind(turn.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "none");
     }
 
     #[tokio::test]
