@@ -215,6 +215,7 @@ pub(crate) enum MessageExecutionSource {
     Steering,
     Wake,
     SeededFork,
+    InteractionResponse,
 }
 
 impl MessageExecutionSource {
@@ -223,6 +224,7 @@ impl MessageExecutionSource {
             "steering" => Ok(Self::Steering),
             "wake" => Ok(Self::Wake),
             "seeded_fork" => Ok(Self::SeededFork),
+            "interaction_response" => Ok(Self::InteractionResponse),
             _ => Err(DbError::Serialization(format!(
                 "invalid message execution source: {value}"
             ))),
@@ -234,6 +236,7 @@ impl MessageExecutionSource {
             Self::Steering => "steering",
             Self::Wake => "wake",
             Self::SeededFork => "seeded_fork",
+            Self::InteractionResponse => "interaction_response",
         }
     }
 }

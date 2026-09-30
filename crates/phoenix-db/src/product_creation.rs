@@ -31,14 +31,62 @@ pub struct ProductCreationImage {
     pub data: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductCreationOrigin {
+    UnknownHistorical,
+    UserApi,
+}
+impl ProductCreationOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownHistorical => "unknown_historical",
+            Self::UserApi => "user_api",
+        }
+    }
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        match row.try_get::<String, _>("objective_origin")?.as_str() {
+            "unknown_historical" => Ok(Self::UnknownHistorical),
+            "user_api" => Ok(Self::UserApi),
+            value => Err(sqlx::Error::Decode(
+                format!("invalid creation origin: {value}").into(),
+            )),
+        }
+    }
+    #[must_use]
+    pub fn input_origin(self) -> phoenix_core::domain::db_schema::InputOrigin {
+        match self {
+            Self::UnknownHistorical => {
+                phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+            }
+            Self::UserApi => phoenix_core::domain::db_schema::InputOrigin::UserApi,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductCreationIntent {
     pub cwd: String,
     pub objective: String,
+    pub origin: ProductCreationOrigin,
     pub model: Option<String>,
     pub effort: Option<ModelEffort>,
     pub llm_language: LlmLanguage,
     pub images: Vec<ProductCreationImage>,
+}
+
+impl ProductCreationIntent {
+    fn matches_retry(&self, retry: &Self) -> bool {
+        if !self
+            .origin
+            .input_origin()
+            .accepts_retry_origin(&retry.origin.input_origin())
+        {
+            return false;
+        }
+        let mut normalized = retry.clone();
+        normalized.origin = self.origin;
+        self == &normalized
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +263,7 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
         intent: ProductCreationIntent {
             cwd: row.try_get("cwd")?,
             objective: row.try_get("objective")?,
+            origin: ProductCreationOrigin::from_row(&row)?,
             model: row.try_get("model")?,
             effort: row
                 .try_get::<Option<String>, _>("effort")?
@@ -295,7 +344,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.llm_language, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.model, j.effort, j.llm_language, j.status,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
                     j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
@@ -353,7 +402,7 @@ impl Database {
         let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
                     claim_lease_until_unix_micros, retry_at_unix_micros,
@@ -380,7 +429,7 @@ impl Database {
         .await?;
         if let Some(existing) = existing {
             tx.rollback().await?;
-            return Ok(if existing.intent == *intent {
+            return Ok(if existing.intent.matches_retry(intent) {
                 ProductCreationAcceptOutcome::Replayed(existing)
             } else {
                 ProductCreationAcceptOutcome::Conflict(existing)
@@ -388,9 +437,9 @@ impl Database {
         }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
-                request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
+                request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
                 accepted_at_unix_micros, updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?9, ?5, ?6, ?7, 'accepted', ?8, ?8)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
@@ -400,6 +449,7 @@ impl Database {
         .bind(intent.effort.map(ModelEffort::as_wire_name))
         .bind(intent.llm_language.as_str())
         .bind(now)
+        .bind(intent.origin.as_str())
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -410,7 +460,7 @@ impl Database {
                 .ok_or_else(|| {
                     DbError::Serialization("raced product creation disappeared".to_string())
                 })?;
-            return Ok(if existing.intent == *intent {
+            return Ok(if existing.intent.matches_retry(intent) {
                 ProductCreationAcceptOutcome::Replayed(existing)
             } else {
                 ProductCreationAcceptOutcome::Conflict(existing)
@@ -460,7 +510,7 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ) RETURNING request_id, product_conversation_id, cwd, objective, model, effort,
+             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
                  llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
                  claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
@@ -527,7 +577,7 @@ impl Database {
                           accepted_at_unix_micros ASC, request_id ASC
                  LIMIT 1
              )
-             RETURNING request_id, product_conversation_id, cwd, objective, model, effort,
+             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
                  llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
                  claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
@@ -1074,7 +1124,7 @@ impl Database {
         cursor: Option<(i64, String)>,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
-            "SELECT request_id, cwd, objective, model, effort, llm_language, status,
+            "SELECT request_id, cwd, objective, objective_origin, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
                     CASE WHEN j.status = 'delivery_failed' AND EXISTS (
                       SELECT 1 FROM product_conversations product
@@ -1120,6 +1170,7 @@ impl Database {
                 intent: ProductCreationIntent {
                     cwd: row.try_get("cwd")?,
                     objective: row.try_get("objective")?,
+            origin: ProductCreationOrigin::from_row(&row)?,
                     model: row.try_get("model")?,
                     effort: row
                         .try_get::<Option<String>, _>("effort")?
@@ -1548,7 +1599,7 @@ impl Database {
         let lease_until = now + lease_duration;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
                     retry_at_unix_micros, cleanup_worker_id, cleanup_token, cleanup_lease_until_unix_micros,
@@ -1856,6 +1907,7 @@ mod product_creation_tests {
 
     fn intent(request_cwd: &str, objective: &str) -> ProductCreationIntent {
         ProductCreationIntent {
+            origin: ProductCreationOrigin::UserApi,
             cwd: request_cwd.to_string(),
             objective: objective.to_string(),
             model: Some("gpt-5".to_string()),
@@ -1907,6 +1959,37 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn creation_origin_survives_storage_and_historical_replay() {
+        let db = Database::open_in_memory().await.unwrap();
+        let api = intent("/repo/origin", "objective");
+        db.accept_product_creation("origin-request", &api)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_product_creation_job("origin-request")
+                .await
+                .unwrap()
+                .unwrap()
+                .intent
+                .origin,
+            ProductCreationOrigin::UserApi
+        );
+        sqlx::query("UPDATE product_creation_jobs SET objective_origin = 'unknown_historical' WHERE request_id = 'origin-request'").execute(db.pool()).await.unwrap();
+        let replay = db
+            .accept_product_creation("origin-request", &api)
+            .await
+            .unwrap();
+        let ProductCreationAcceptOutcome::Replayed(job) = replay else {
+            panic!("expected historical replay")
+        };
+        assert_eq!(job.intent.origin, ProductCreationOrigin::UnknownHistorical);
+        assert_eq!(
+            job.intent.origin.input_origin(),
+            phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+        );
+    }
+
+    #[tokio::test]
     async fn product_creation_accept_replay_and_conflict() {
         let db = Database::open_in_memory().await.unwrap();
         let first = db
@@ -1933,6 +2016,7 @@ mod product_creation_tests {
     async fn product_creation_accept_allocates_server_owned_product_id_and_allows_image_only() {
         let db = Database::open_in_memory().await.unwrap();
         let image_only = ProductCreationIntent {
+            origin: ProductCreationOrigin::UserApi,
             cwd: "/repo/img".to_string(),
             objective: "   ".to_string(),
             model: None,
@@ -1978,6 +2062,7 @@ mod product_creation_tests {
             .accept_product_creation(
                 "req-empty",
                 &ProductCreationIntent {
+                    origin: ProductCreationOrigin::UserApi,
                     cwd: "/repo/empty".to_string(),
                     objective: " ".to_string(),
                     model: None,

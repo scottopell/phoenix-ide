@@ -12172,7 +12172,7 @@ impl Database {
             origin,
             phoenix_core::domain::db_schema::InputOrigin::UserApi
         ) {
-            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'steering'")
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
                 .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
         }
         message_attachments::insert(&mut tx, message_id, content).await?;
@@ -21776,6 +21776,17 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].origin, InputOrigin::UserApi);
         assert_eq!(loaded[0].message_id, "user-answer");
+        let conv = db.get_conversation("origin-user").await.unwrap();
+        db.watch_product_conversation(&conv.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state("origin-user", &ConvState::Idle)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "interaction_response");
+        assert_eq!(events[0].source_occurrence_id, "user-answer");
     }
 
     #[tokio::test]

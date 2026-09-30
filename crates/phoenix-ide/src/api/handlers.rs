@@ -2143,6 +2143,7 @@ async fn create_product_conversation(
         },
     };
     let intent = crate::db::ProductCreationIntent {
+        origin: phoenix_db::ProductCreationOrigin::UserApi,
         cwd: canonical_cwd,
         objective: req.objective,
         model: Some(req.model),

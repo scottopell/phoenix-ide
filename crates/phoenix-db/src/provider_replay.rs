@@ -302,7 +302,7 @@ impl Database {
             origin,
             phoenix_core::domain::db_schema::InputOrigin::UserApi
         ) {
-            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'steering'")
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
                 .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
         }
         crate::message_attachments::insert(&mut tx, message_id, content).await?;

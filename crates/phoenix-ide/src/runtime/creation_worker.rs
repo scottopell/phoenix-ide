@@ -619,7 +619,7 @@ async fn deliver_product_creation_objective(
             manager,
             &conversation_id,
             Event::SteerMessage {
-                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                origin: job.intent.origin.input_origin(),
                 text: expanded.display_text,
                 llm_text: expanded.llm_text,
                 images,
@@ -2827,6 +2827,7 @@ mod product_creation_delivery_replay_tests {
         chrono::DateTime<chrono::Utc>,
     ) {
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: cwd.to_string(),
             objective: "deliver objective".to_string(),
             model: None,
@@ -3188,6 +3189,7 @@ mod product_creation_delivery_replay_tests {
     async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
         let db = Database::open_in_memory().await.unwrap();
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: "/repo/a".to_string(),
             objective: "deliver objective".to_string(),
             model: None,

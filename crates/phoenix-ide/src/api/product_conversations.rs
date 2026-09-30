@@ -1194,6 +1194,7 @@ mod tests {
             .accept_product_creation(
                 "req-accepted",
                 &crate::db::ProductCreationIntent {
+                    origin: phoenix_db::ProductCreationOrigin::UserApi,
                     cwd: "/repo/accepted".to_string(),
                     objective: "accepted objective".to_string(),
                     model: Some("claude".to_string()),
@@ -1209,6 +1210,7 @@ mod tests {
             .accept_product_creation(
                 "req-failed",
                 &crate::db::ProductCreationIntent {
+                    origin: phoenix_db::ProductCreationOrigin::UserApi,
                     cwd: "/repo/failed".to_string(),
                     objective: "failed objective".to_string(),
                     model: Some("claude".to_string()),
