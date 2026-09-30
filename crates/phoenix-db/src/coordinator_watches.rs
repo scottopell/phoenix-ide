@@ -210,8 +210,7 @@ pub(crate) async fn record_terminal_event_tx(
     .await
 }
 
-#[derive(Debug, Clone, Copy, sqlx::Type)]
-#[sqlx(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageExecutionSource {
     Steering,
     Wake,
@@ -219,6 +218,17 @@ pub(crate) enum MessageExecutionSource {
 }
 
 impl MessageExecutionSource {
+    pub(crate) fn from_db(value: &str) -> DbResult<Self> {
+        match value {
+            "steering" => Ok(Self::Steering),
+            "wake" => Ok(Self::Wake),
+            "seeded_fork" => Ok(Self::SeededFork),
+            _ => Err(DbError::Serialization(format!(
+                "invalid message execution source: {value}"
+            ))),
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Steering => "steering",

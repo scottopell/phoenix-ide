@@ -7778,7 +7778,7 @@ mod tests {
     async fn scoped_replay_historical_api_retry_retains_accepted_origin() {
         use phoenix_core::domain::db_schema::InputOrigin;
         let repo = repo().await;
-        let input = input("conv-legacy-replay", "legacy-client", 31);
+        let input = input("conv-replay", "legacy-client", 31);
         repo.accept_authoritative_turn(&input).await.unwrap();
         let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
             .unwrap()

@@ -14693,13 +14693,15 @@ pub(crate) async fn record_initial_execution_outcome_tx(
         return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
             .await;
     }
-    let steering: Option<(String, crate::coordinator_watches::MessageExecutionSource)> = sqlx::query_as(
+    let steering: Option<(String, String)> = sqlx::query_as(
         "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some((message_id, source_kind)) = steering {
+        let source_kind =
+            crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
         let outcome = match state {
             ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
                 Some(("Completed", None))
