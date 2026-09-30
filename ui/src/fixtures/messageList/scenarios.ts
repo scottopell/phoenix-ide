@@ -442,7 +442,7 @@ export const messageListScenarios = [
   {
     id: 'mobile-table-preview-baseline',
     title: 'Mobile table / current baseline',
-    description: 'Current production CSS at 7a42b66db; historical Global 11:01 fixture, final and streaming.',
+    description: 'Deployed table CSS 838439341 (unchanged at fixture baseline 7a42b66db); historical Global 11:01 fixture, final and streaming.',
     theme: 'dark',
   },
   {

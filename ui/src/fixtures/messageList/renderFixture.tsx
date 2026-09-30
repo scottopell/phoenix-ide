@@ -224,7 +224,7 @@ export function MessageListFixture({ scenario }: Props) {
               <strong>Message list fixture</strong>
               <span>scenario={scenario.id}</span>
               <span>density=compact</span>
-              {isMobileTablePreview && <span>baseline=7a42b66db · production component/CSS</span>}
+              {isMobileTablePreview && <span>deployed table CSS=838439341 · fixture source=7a42b66db</span>}
               {scenario.id === 'scroll-policy-long' && (
                 <button type="button" data-testid="append-tail" onClick={appendTail}>
                   Append tail
