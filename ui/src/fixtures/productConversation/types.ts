@@ -61,6 +61,12 @@ export const productConversationScenarioDefinitions = [
     viewport: 'desktop',
     state: 'ready',
   },
+  {
+    id: 'input-provenance-continuation',
+    title: 'API and internal input across a continued transcript with queued steering',
+    viewport: 'desktop',
+    state: 'ready',
+  },
 ] as const satisfies readonly {
   id: string;
   title: string;
@@ -79,6 +85,7 @@ export interface ProductConversationScenario {
   snapshot?: ProductConversationSnapshotView;
   /** Complete aligned latest-row projection emitted by the embedded ordinary SSE init. */
   alignedLatestMessages?: import('../../api').Message[];
+  steeringMessages?: import('../../api').QueuedSteeringMessage[];
   latestConversationState?: import('../../api').ConversationState;
   /** A real cursor page returned only when the page requests snapshot.before. */
   olderSnapshot?: ProductConversationSnapshotView;

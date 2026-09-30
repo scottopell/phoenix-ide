@@ -693,6 +693,7 @@ describe('MessageList', () => {
   it('renders skill invocations as inline slash-command user messages with attachments', () => {
     const skillMessage = {
       ...makeMessage(7, 'skill'),
+      origin: { kind: 'user_api' },
       content: {
         name: 'dogfood',
         trigger: '/dogfood http://localhost:8042',
@@ -722,7 +723,7 @@ describe('MessageList', () => {
 
     const message = container.querySelector('.message.user[data-sequence-id="7"]');
     expect(message).not.toBeNull();
-    expect(message).toHaveTextContent('You');
+    expect(message).toHaveTextContent('User · API');
     expect(message).toHaveTextContent('/dogfood http://localhost:8042');
     expect(message).toHaveTextContent('notes.txt');
     expect(message).toHaveTextContent('512 B');

@@ -41,8 +41,8 @@ struct MessageView: View {
             SystemNote(text: noteText, style: .red)
         case "skill":
             // Payload is {trigger, name, body} where body is the expanded
-            // prompt — show what the user typed, not the expansion.
-            SkillRow(content: message.content)
+            // prompt — show the trigger, not the expansion.
+            SkillRow(content: message.content, origin: message.inputOrigin)
         case "system", "continuation":
             SystemNote(text: noteText, style: .secondary)
         default:
@@ -78,15 +78,20 @@ struct MessageView: View {
     }
 }
 
-/// A skill invocation, shown as the user's command (`/verify …`), with the
-/// expanded prompt body deliberately hidden.
+/// A skill invocation shows its trigger without exposing the expanded prompt.
 struct SkillRow: View {
     let content: JSONValue
+    let origin: InputOrigin
 
     var body: some View {
         HStack {
-            Spacer(minLength: 40)
-            VStack(alignment: .trailing, spacing: 4) {
+            if origin.isHumanInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isHumanInput ? .trailing : .leading, spacing: 4) {
+                if !origin.isHumanInput {
+                    Text(origin.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Label(trigger, systemImage: "wand.and.stars")
                     .font(.callout.monospaced())
                     .padding(.horizontal, 10)
@@ -104,6 +109,7 @@ struct SkillRow: View {
                     }
                 }
             }
+            if !origin.isHumanInput { Spacer(minLength: 40) }
         }
     }
 
@@ -120,9 +126,9 @@ struct UserMessageView: View {
 
     var body: some View {
         HStack {
-            if origin == .userApi { Spacer(minLength: 40) }
-            VStack(alignment: origin == .userApi ? .trailing : .leading, spacing: 4) {
-                if origin != .userApi {
+            if origin.isHumanInput { Spacer(minLength: 40) }
+            VStack(alignment: origin.isHumanInput ? .trailing : .leading, spacing: 4) {
+                if !origin.isHumanInput {
                     Text(origin.label)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -130,8 +136,8 @@ struct UserMessageView: View {
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)
-                    .background(origin == .userApi ? Color.accentColor : Color.secondary.opacity(0.12))
-                    .foregroundStyle(origin == .userApi ? Color.white : Color.primary)
+                    .background(origin.isHumanInput ? Color.accentColor : Color.secondary.opacity(0.12))
+                    .foregroundStyle(origin.isHumanInput ? Color.white : Color.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 if let images = content["images"]?.arrayValue, !images.isEmpty {
                     ImageStrip(images: images, maxHeight: 140)
@@ -150,10 +156,10 @@ struct UserMessageView: View {
                     }
                 }
             }
-            if origin != .userApi { Spacer(minLength: 40) }
+            if !origin.isHumanInput { Spacer(minLength: 40) }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier(origin == .userApi ? "message.user" : "message.input")
+        .accessibilityIdentifier(origin.isHumanInput ? "message.user" : "message.input")
     }
 }
 

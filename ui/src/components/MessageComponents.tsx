@@ -26,6 +26,7 @@ import { api } from '../api';
 import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
 import { agentTurnsInHistoricalUnit, buildHistoricalUnits, type AgentTurnUnit } from '../conversation/renderUnits';
+import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -388,25 +389,14 @@ function FileChips({
 }
 
 function InputSender({ origin }: { origin: InputOrigin | undefined }) {
-  if (!origin) return <span className="message-sender">Unknown input</span>;
-  switch (origin.kind) {
-    case 'user_api':
-      return <span className="message-sender">User · API</span>;
-    case 'internal_conversation':
-      return (
-        <span className="message-sender">
-          From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}`}>transcript ID {origin.transcript_id}</ConversationMarkdownAnchor>
-        </span>
-      );
-    case 'subscription_event':
-      return <span className="message-sender">Conversation event</span>;
-    case 'system_generated':
-      return <span className="message-sender">System input</span>;
-    case 'unknown_historical':
-      return <span className="message-sender">Unknown input</span>;
-    default:
-      return origin satisfies never;
+  if (origin?.kind !== 'internal_conversation') {
+    return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
   }
+  return (
+    <span className="message-sender">
+      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}`}>transcript ID {origin.transcript_id}</ConversationMarkdownAnchor>
+    </span>
+  );
 }
 
 export const UserMessage = memo(UserMessageImpl);
@@ -418,7 +408,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const files = content.files || [];
   const displayData = message.display_data as { type?: string } | null;
   const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
-  const isMeta = content.is_meta === true || message.origin?.kind === 'system_generated';
+  const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
   if (isWakeMeta) {
@@ -489,11 +479,11 @@ function QueuedUserMessageImpl({
   activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
-  const isMeta = message.origin?.kind === 'system_generated';
+  const isMeta = message.origin ? inputOriginPresentation(message.origin).className === 'meta' : false;
   return (
     <div className={`message ${isMeta ? 'meta' : 'user'}${isSteeringQueued ? ' steering-queued' : ''}`}>
       <div className="message-header">
-        {message.origin ? <InputSender origin={message.origin} /> : <span className="message-sender">You</span>}
+        {message.origin ? <InputSender origin={message.origin} /> : <span className="message-sender">User · API</span>}
         {isSteeringQueued ? (
           <span className="message-status queued" title="Queued — will send when conversation is free">
             <span className="queued-label">⏳ Queued</span>

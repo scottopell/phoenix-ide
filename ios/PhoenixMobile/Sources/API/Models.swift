@@ -425,6 +425,10 @@ enum InputOrigin: Codable, Equatable, Sendable {
         }
     }
 
+    var isHumanInput: Bool {
+        self == .userApi
+    }
+
     var label: String {
         switch self {
         case .unknownHistorical: "Unknown input"

@@ -204,9 +204,9 @@ describe('user message provenance rendering', () => {
       const message = userMessage('old-input', 'Old text', { origin: { kind: 'unknown_historical' } });
       if (!origin) delete message.origin;
       const { unmount } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
-      expect(screen.getByText('Unknown input')).toBeInTheDocument();
+      expect(screen.getByText('Unknown input').closest('.message')).toHaveClass('meta');
       expect(screen.queryByText('You')).not.toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
       unmount();
     }
   });
@@ -216,7 +216,7 @@ describe('user message provenance rendering', () => {
       origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
     })} /></MemoryRouter>);
     expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
-    expect(screen.getByText(/From conversation ID source-product/)).toBeInTheDocument();
+    expect(screen.getByText(/From conversation ID source-product/).closest('.message')).toHaveClass('meta');
     expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
@@ -238,7 +238,9 @@ describe('user message provenance rendering', () => {
       <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
     </></MemoryRouter>);
     expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
-    expect(screen.getAllByText('You')).toHaveLength(1);
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' }).closest('.message')).toHaveClass('meta', 'steering-queued');
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
 
   it('labels user-facing API input by channel', () => {
@@ -248,7 +250,7 @@ describe('user message provenance rendering', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('User · API')).toBeInTheDocument();
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
     expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
   });
@@ -1105,6 +1107,7 @@ describe('message copy affordances', () => {
           conversation_id: 'agent-1',
           message_type: 'user',
           content: { text: 'Great, push and open a PR please' },
+          origin: { kind: 'user_api' },
           display_data: null,
           created_at: '2026-01-01T00:00:00Z',
         }}

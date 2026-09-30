@@ -23,6 +23,24 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
 
 describe('ProductConversationFixture', () => {
+  it('preserves origin-aware navigation after mounting a continued transcript again', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.id === 'messages' || this.classList.contains('render-unit')) return { x: 0, y: 0, top: 0, left: 0, right: 900, bottom: 1000, width: 900, height: 1000, toJSON: () => ({}) };
+      return originalRect.call(this);
+    });
+    for (let mount = 0; mount < 2; mount += 1) {
+      const fixture = render(<ProductConversationFixture scenario={getProductConversationScenario('input-provenance-continuation')} />);
+      await waitFor(() => expect(fixture.container.querySelector('[data-product-conversation-fixture-ready="input-provenance-continuation"]')).not.toBeNull());
+      expect(screen.getByRole('button', { name: 'User · API: API request in original transcript' })).toHaveClass('user');
+      expect(screen.getByRole('button', { name: /From conversation ID source-product.*Forwarded into continued transcript/ })).toHaveClass('meta');
+      expect(screen.getByRole('button', { name: /From conversation ID source-product.*Queued from source conversation/ })).toHaveClass('meta');
+      expect(screen.queryByTitle('Your message')).not.toBeInTheDocument();
+      fixture.unmount();
+    }
+  });
+
   it('appends two source-bound reactions to the actual latest composer without submitting and opens the older reviewer', async () => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
       return this.id === 'messages' ? 800 : 0;
