@@ -701,21 +701,6 @@ BEGIN
     WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
       AND source_transcript_id = NEW.predecessor_conversation_id;
 END;
-CREATE TRIGGER watch_auto_continuation_disabled AFTER UPDATE OF auto_continue_on_context_exhaustion ON product_conversations
-WHEN OLD.auto_continue_on_context_exhaustion != 0 AND NEW.auto_continue_on_context_exhaustion = 0
-BEGIN
-    UPDATE coordinator_watch_events SET continuation_state = 'none'
-    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
-      AND watch_id IN (
-          SELECT id FROM coordinator_watches
-          WHERE source_product_conversation_id = NEW.id
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM automatic_continuation_admissions admission
-          WHERE admission.predecessor_conversation_id = coordinator_watch_events.source_transcript_id
-            AND admission.phase NOT IN ('failed', 'superseded', 'message_settled')
-      );
-END;
 CREATE TRIGGER watch_auto_continuation_succeeded AFTER INSERT ON completed_continuation_handoffs
 BEGIN
     UPDATE coordinator_watch_events SET continuation_state = 'suppressed', delivery_state = 'suppressed'
