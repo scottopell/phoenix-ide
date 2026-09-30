@@ -130,7 +130,7 @@ export function MessageListFixture({ scenario }: Props) {
 
   const scrollFinalStatusTable = useCallback(() => {
     const viewport = document.querySelector<HTMLElement>(
-      '.mobile-table-preview .fixture-message-list-stage .chat-main-area',
+      '.mobile-table-preview .fixture-message-list-stage .virtual-transcript.message-virtual-transcript',
     );
     if (!viewport || viewport.clientHeight <= 200) return false;
     const table = [...viewport.querySelectorAll('table')].find((candidate) => {
@@ -171,7 +171,7 @@ export function MessageListFixture({ scenario }: Props) {
     const verify = () => {
       const viewport = mobilePreviewState === 'streaming'
         ? stage
-        : stage.querySelector<HTMLElement>('.chat-main-area');
+        : stage.querySelector<HTMLElement>('.virtual-transcript.message-virtual-transcript');
       if (!viewport || viewport.clientHeight <= 200) return;
       const table = findStatusTable(viewport);
       if (!table) return;
