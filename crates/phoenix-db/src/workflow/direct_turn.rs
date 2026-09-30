@@ -7775,6 +7775,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_replay_historical_api_retry_retains_accepted_origin() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let repo = repo().await;
+        let input = input("conv-legacy-replay", "legacy-client", 31);
+        repo.accept_authoritative_turn(&input).await.unwrap();
+        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
+            .unwrap()
+            .submitted;
+        assert_eq!(submitted.origin, InputOrigin::UnknownHistorical);
+        submitted.origin = InputOrigin::UserApi;
+        let replay = repo
+            .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
+            .await
+            .unwrap();
+        let ScopedDirectTurnReplayLookup::Exact { prepared, .. } = replay else {
+            panic!("expected replay")
+        };
+        assert_eq!(prepared.submitted.origin, InputOrigin::UnknownHistorical);
+        submitted.text.push_str(" changed");
+        assert!(repo
+            .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn scoped_replay_reports_submitted_identity_changed() {
         let repo = repo().await;
         let input = input("conv-replay", "conflict", 32);
