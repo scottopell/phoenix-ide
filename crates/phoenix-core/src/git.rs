@@ -17,6 +17,10 @@ const NONINTERACTIVE_GIT_CONFIG: &[(&str, &str)] = &[
     ("tag.gpgSign", "false"),
     ("core.editor", "true"),
     ("core.pager", "cat"),
+    // A host-configured fsmonitor daemon persists past this command's exit and
+    // holds an open descriptor on the worktree, which Close retirement's external-
+    // writer scan cannot distinguish from a genuine conflicting writer.
+    ("core.fsmonitor", "false"),
 ];
 
 const NONINTERACTIVE_GIT_ENV: &[(&str, &str)] = &[
@@ -528,6 +532,57 @@ mod command_tests {
             "signing-program-must-never-run",
         ]);
         run(&["commit", "--allow-empty", "--quiet", "-m", "unsigned"]);
+    }
+
+    /// A host-configured `core.fsmonitor` daemon outlives the Git subprocess that
+    /// spawned it and holds an open descriptor on the worktree. Close retirement's
+    /// external-writer scan cannot distinguish that descriptor from a genuine
+    /// conflicting writer, so `command()` must disable fsmonitor unconditionally
+    /// rather than leave a background watcher for every repository it touches.
+    #[cfg(unix)]
+    #[test]
+    fn command_disables_hostile_fsmonitor_configuration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let hook = repo.path().join("blocking-fsmonitor.sh");
+        let marker = repo.path().join("fsmonitor-started");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho $$ > '{}'\n", marker.display()),
+        )
+        .expect("write hook");
+        let mut permissions = std::fs::metadata(&hook)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).expect("set hook mode");
+
+        let run = |args: &[&str]| {
+            let output = command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init", "--quiet"]);
+        run(&[
+            "config",
+            "core.fsmonitor",
+            hook.to_str().expect("hook path is utf8"),
+        ]);
+        run(&["status", "--porcelain"]);
+
+        assert!(
+            !marker.exists(),
+            "git invoked the configured fsmonitor hook despite command()'s override"
+        );
     }
 }
 
