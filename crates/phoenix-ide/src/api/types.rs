@@ -689,6 +689,12 @@ pub struct SuccessResponse {
     pub success: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ChainDeleteResponse {
+    pub success: bool,
+    pub deleted_conversation_ids: Vec<String>,
+}
+
 /// Exact server-observed inspection snapshot required to confirm destructive
 /// loss retirement. The request intentionally carries no filesystem path.
 #[derive(Debug, Deserialize)]

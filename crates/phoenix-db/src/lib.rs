@@ -9047,6 +9047,44 @@ impl Database {
         Ok(rows)
     }
 
+    /// Return exactly the rows removed by the legacy single-conversation delete.
+    /// The final parent owns every remaining subordinate participant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database query fails.
+    pub async fn conversation_delete_member_ids(&self, id: &str) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT member.id
+             FROM conversations AS requested
+             JOIN conversations AS member
+               ON member.product_conversation_id = requested.product_conversation_id
+             WHERE requested.id = ?1
+               AND (
+                 member.id = requested.id
+                 OR (
+                   member.runtime_role = 'sub_agent'
+                   AND requested.runtime_role IN ('user', 'coordinator')
+                   AND requested.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM conversations AS remaining_parent
+                     WHERE remaining_parent.product_conversation_id = requested.product_conversation_id
+                       AND remaining_parent.id <> requested.id
+                       AND remaining_parent.runtime_role IN ('user', 'coordinator')
+                       AND remaining_parent.parent_conversation_id IS NULL
+                   )
+                 )
+               )
+             ORDER BY CASE WHEN member.id = requested.id THEN 1 ELSE 0 END,
+                      member.created_at,
+                      member.id",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Forward chain members as fully-hydrated [`Conversation`] rows, ordered
     /// root-first by continuation depth.
     ///
@@ -26709,6 +26747,94 @@ mod tests {
         let members = db.product_conversation_member_ids(&root.id).await.unwrap();
 
         assert_eq!(members, vec![child.id, root.id, continuation.id]);
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_members_include_subordinates_only_for_last_parent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("delete-root", "delete-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let continuation = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        let child = db
+            .create_conversation_with_project(
+                "delete-agent",
+                "delete-agent",
+                "/tmp",
+                false,
+                Some(&root.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.conversation_delete_member_ids(&root.id).await.unwrap(),
+            vec![root.id.clone()]
+        );
+        assert_eq!(
+            db.conversation_delete_member_ids(&child.id).await.unwrap(),
+            vec![child.id]
+        );
+        assert_eq!(
+            db.conversation_delete_member_ids(&continuation.id)
+                .await
+                .unwrap(),
+            vec![continuation.id]
+        );
+
+        let solo = db
+            .create_conversation("delete-solo", "delete-solo", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let solo_child = db
+            .create_conversation_with_project(
+                "delete-solo-agent",
+                "delete-solo-agent",
+                "/tmp",
+                false,
+                Some(&solo.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.conversation_delete_member_ids(&solo.id).await.unwrap(),
+            vec![solo_child.id, solo.id]
+        );
     }
 
     #[tokio::test]

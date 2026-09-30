@@ -496,6 +496,8 @@ final class AppModel {
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
         aggregateEventTaskId = nil
+        guard let api else { return }
+        startAggregateEventStream(api: api, generation: apiGeneration)
         startAggregateReconciliation()
     }
 

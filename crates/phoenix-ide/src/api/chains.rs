@@ -42,7 +42,7 @@ use super::handlers::{
     prepare_hard_delete_cascade, reopen_prepared_hard_delete, require_hard_delete_admission,
     AppError, PreparedHardDelete,
 };
-use super::types::{ConflictErrorResponse, SuccessResponse};
+use super::types::{ChainDeleteResponse, ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
@@ -478,12 +478,19 @@ async fn refuse_busy_chain_members(
 /// External cleanup runs for every member before any conversation row is
 /// removed. The rows are then deleted root-first in one immediate transaction
 /// so any member failure rolls the whole aggregate back.
+fn chain_delete_response(deleted_conversation_ids: Vec<String>) -> Json<ChainDeleteResponse> {
+    Json(ChainDeleteResponse {
+        success: true,
+        deleted_conversation_ids,
+    })
+}
+
 pub async fn delete_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
+) -> Result<Json<ChainDeleteResponse>, AppError> {
     let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
-        return Ok(Json(SuccessResponse { success: true }));
+        return Ok(chain_delete_response(Vec::new()));
     };
     let product_conversation_id = root.product_conversation_id.to_string();
     let member_ids = state
@@ -494,7 +501,7 @@ pub async fn delete_chain_handler(
     let _admission_guards =
         lock_aggregate_admissions(&state, root.product_conversation_id.as_str(), &member_ids).await;
     if aggregate_is_absent_after_delete_serialization(&state, &root_id).await? {
-        return Ok(Json(SuccessResponse { success: true }));
+        return Ok(chain_delete_response(Vec::new()));
     }
     require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
@@ -573,9 +580,15 @@ pub async fn delete_chain_handler(
     for conversation in &conversations {
         finalize_hard_deleted_conversation_resources(&state, conversation).await;
     }
-    broadcast_aggregate_hard_deleted(&state, &root_id, &product_conversation_id, member_ids).await;
+    broadcast_aggregate_hard_deleted(
+        &state,
+        &root_id,
+        &product_conversation_id,
+        member_ids.clone(),
+    )
+    .await;
 
-    Ok(Json(SuccessResponse { success: true }))
+    Ok(chain_delete_response(member_ids))
 }
 
 /// `GET /api/chains/:rootId/stream`

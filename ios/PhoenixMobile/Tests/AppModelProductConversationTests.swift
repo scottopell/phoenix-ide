@@ -232,7 +232,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
         model.connectivity.setOnlineForTesting(true)
 
-        XCTAssertFalse(model.aggregateEventStreamOwnedForTesting)
+        XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
         XCTAssertNotNil(model.aggregateReconciliationId)
     }
 

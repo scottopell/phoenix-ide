@@ -175,13 +175,11 @@ export function ConversationListPage() {
     if (!productDeleteTarget || productDeleteSubmitting) return;
     setProductDeleteSubmitting(true);
     const deletingProductConversationId = productDeleteTarget.product_conversation_id;
-    let deletedConversationIds = [productDeleteTarget.canonical_root.transcript_row_id];
+    const deletedConversationIds = [productDeleteTarget.canonical_root.transcript_row_id];
     try {
-      const snapshot = await api.getProductConversationSnapshot(deletingProductConversationId);
-      deletedConversationIds = snapshot.segments.map((segment) => segment.transcript_row_id);
       const rootId = productDeleteTarget.canonical_root.transcript_row_id;
-      await api.deleteChain(rootId);
-      finishProductDelete(deletingProductConversationId, deletedConversationIds);
+      const result = await api.deleteChain(rootId);
+      finishProductDelete(deletingProductConversationId, result.deleted_conversation_ids);
     } catch (error) {
       if (error instanceof ApiResponseError && error.status === 404) {
         finishProductDelete(deletingProductConversationId, deletedConversationIds);

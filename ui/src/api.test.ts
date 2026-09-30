@@ -361,6 +361,24 @@ describe('conversation message history clients', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation');
   });
 
+  it('returns the authoritative member set from aggregate deletion', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        deleted_conversation_ids: ['root-1', 'agent-1'],
+      }),
+    } as unknown as Response);
+
+    await expect(api.deleteChain('root/1')).resolves.toEqual({
+      success: true,
+      deleted_conversation_ids: ['root-1', 'agent-1'],
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/chains/root%2F1', { method: 'DELETE' });
+  });
+
   it('POSTs cancel product creation', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as Response);

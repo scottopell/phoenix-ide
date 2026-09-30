@@ -21,7 +21,6 @@ vi.mock('../api', async () => {
       closeProductConversation: vi.fn(),
       codexLoginPreflight: vi.fn(),
       listProductConversations: vi.fn(),
-      getProductConversationSnapshot: vi.fn(),
       renameProductConversation: vi.fn(),
       deleteChain: vi.fn(),
       deleteConversation: vi.fn(),
@@ -94,12 +93,6 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.listProductConversations).mockResolvedValue({
       product_conversations: [productConversation()],
     });
-    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
-      segments: [
-        { transcript_row_id: 'root-mobile' },
-        { transcript_row_id: 'successor-mobile' },
-      ],
-    } as never);
   });
 
   it('renames through the production mobile list touch target', async () => {
@@ -134,7 +127,10 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
       latest_transcript_row_id: 'root-mobile',
     };
     vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history] });
-    vi.mocked(api.deleteChain).mockResolvedValue(undefined);
+    vi.mocked(api.deleteChain).mockResolvedValue({
+      success: true,
+      deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+    });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
@@ -173,7 +169,10 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.listProductConversations)
       .mockResolvedValueOnce({ product_conversations: [history] })
       .mockRejectedValueOnce(new Error('refresh failed'));
-    vi.mocked(api.deleteChain).mockResolvedValue(undefined);
+    vi.mocked(api.deleteChain).mockResolvedValue({
+      success: true,
+      deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
+    });
     const hardDeleted = vi.fn();
     window.addEventListener('phoenix:conversation-hard-deleted', hardDeleted, { once: true });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
@@ -187,10 +186,9 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(hardDeleted).toHaveBeenCalledWith(expect.objectContaining({
       detail: {
         conversationId: 'pc-mobile',
-        deletedConversationIds: ['root-mobile', 'successor-mobile'],
+        deletedConversationIds: ['root-mobile', 'agent-mobile'],
       },
     }));
-    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('pc-mobile');
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {

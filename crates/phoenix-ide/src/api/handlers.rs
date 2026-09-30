@@ -6631,17 +6631,6 @@ pub(super) async fn reopen_prepared_hard_delete(state: &AppState, prepared: &Pre
     }
 }
 
-pub(super) async fn finish_prepared_hard_delete(
-    state: &AppState,
-    prepared: PreparedHardDelete,
-    aggregate_deleted: bool,
-) {
-    let Some(conversation) = prepared.release_authority() else {
-        return;
-    };
-    finish_hard_deleted_conversation(state, conversation, aggregate_deleted).await;
-}
-
 pub(super) async fn finalize_hard_deleted_conversation_resources(
     state: &AppState,
     conversation: &crate::db::Conversation,
@@ -6650,27 +6639,47 @@ pub(super) async fn finalize_hard_deleted_conversation_resources(
     delete_conversation_attachments(&conversation.id).await;
 }
 
-pub(super) async fn finish_hard_deleted_conversation(
-    state: &AppState,
-    conversation: Box<crate::db::Conversation>,
-    aggregate_deleted: bool,
-) {
-    let id = conversation.id.clone();
-    finalize_hard_deleted_conversation_resources(state, &conversation).await;
-    broadcast_conversation_hard_deleted(state, &id).await;
-    if aggregate_deleted {
-        state.runtime.publish_aggregate_hard_deleted(
-            conversation.product_conversation_id.to_string(),
-            vec![id.clone()],
-        );
-    }
-}
-
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    let deleting_conversation_ids = std::collections::HashSet::from([id.to_string()]);
-    let prepared = prepare_hard_delete_cascade(state, id, &deleting_conversation_ids).await?;
-    if matches!(prepared, PreparedHardDelete::AlreadyDeleted) {
+    let member_ids = state
+        .db
+        .conversation_delete_member_ids(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if member_ids.is_empty() {
+        let deleting_conversation_ids = std::collections::HashSet::new();
+        prepare_hard_delete_cascade(state, id, &deleting_conversation_ids).await?;
         return Ok(());
+    }
+    let deleting_conversation_ids = member_ids.iter().cloned().collect();
+    let mut prepared = Vec::with_capacity(member_ids.len());
+    for member_id in &member_ids {
+        match prepare_hard_delete_cascade(state, member_id, &deleting_conversation_ids).await {
+            Ok(member) => prepared.push(member),
+            Err(error) => {
+                for member in &prepared {
+                    reopen_prepared_hard_delete(state, member).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    if !prepared.is_empty()
+        && prepared
+            .iter()
+            .all(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        return Ok(());
+    }
+    if prepared
+        .iter()
+        .any(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
+    {
+        for member in &prepared {
+            reopen_prepared_hard_delete(state, member).await;
+        }
+        return Err(AppError::Internal(
+            "aggregate members disagreed on creation cleanup state".to_string(),
+        ));
     }
     let aggregate_deleted = match state
         .runtime
@@ -6682,7 +6691,9 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             aggregate_deleted,
         )) => aggregate_deleted,
         phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
-            reopen_prepared_hard_delete(state, &prepared).await;
+            for member in &prepared {
+                reopen_prepared_hard_delete(state, member).await;
+            }
             return Err(AppError::Internal(format!(
                 "Failed to delete conversation row: {error}"
             )));
@@ -6696,7 +6707,23 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             ));
         }
     };
-    finish_prepared_hard_delete(state, prepared, aggregate_deleted).await;
+    let conversations = prepared
+        .into_iter()
+        .filter_map(PreparedHardDelete::release_authority)
+        .collect::<Vec<_>>();
+    for conversation in &conversations {
+        finalize_hard_deleted_conversation_resources(state, conversation).await;
+    }
+    broadcast_conversation_hard_deleted(state, id).await;
+    if aggregate_deleted {
+        let product_conversation_id = conversations
+            .first()
+            .map(|conversation| conversation.product_conversation_id.to_string())
+            .ok_or_else(|| {
+                AppError::Internal("deleted aggregate had no prepared members".to_string())
+            })?;
+        broadcast_aggregate_hard_deleted(state, id, &product_conversation_id, member_ids).await;
+    }
     Ok(())
 }
 
@@ -14195,12 +14222,16 @@ pub(crate) mod hard_delete_cascade_tests {
         mark_chain_history(&state, "cd-a").await;
         let mut events = state.runtime.subscribe_aggregate_events();
 
-        let _ = crate::api::chains::delete_chain_handler(
+        let response = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path("cd-a".to_string()),
         )
         .await
         .expect("chain delete");
+        assert_eq!(
+            response.0.deleted_conversation_ids,
+            vec!["cd-agent", "cd-a", "cd-b", "cd-c"]
+        );
 
         for id in ["cd-a", "cd-b", "cd-c", "cd-agent"] {
             assert!(
@@ -14248,6 +14279,7 @@ pub(crate) mod hard_delete_cascade_tests {
         .expect("missing aggregate is an idempotent success");
 
         assert!(retry.0.success);
+        assert!(retry.0.deleted_conversation_ids.is_empty());
     }
 
     #[tokio::test]
