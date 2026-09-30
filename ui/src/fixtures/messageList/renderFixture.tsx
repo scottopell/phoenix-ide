@@ -51,7 +51,7 @@ export function MessageListFixture({ scenario }: Props) {
   const isContinuityScenario = scenario.id === 'prefix-continuity-offset-bug';
   const isChronologyScenario = scenario.id === 'compact-expanded-tool-chronology';
   const isMobileTablePreview = scenario.id.startsWith('mobile-table-preview-');
-  const [mobilePreviewState, setMobilePreviewState] = useState<'final' | 'streaming'>('final');
+  const [mobilePreviewState, setMobilePreviewState] = useState<'final' | 'streaming'>('streaming');
   const mobileStatusJumpPendingRef = useRef(true);
 
   const recordChronologyMetrics = useCallback((phase: string) => {
@@ -128,18 +128,33 @@ export function MessageListFixture({ scenario }: Props) {
     setMessages(data.messages);
   }, [data.messages]);
 
-  const jumpToMobileStatus = useCallback(() => {
-    mobileStatusJumpPendingRef.current = true;
-    setMobilePreviewState('final');
+  const scrollFinalStatusTable = useCallback(() => {
+    const viewport = document.querySelector<HTMLElement>(
+      '.mobile-table-preview .fixture-message-list-stage .chat-main-area',
+    );
+    if (!viewport || viewport.clientHeight <= 200) return false;
+    const table = [...viewport.querySelectorAll('table')].find((candidate) => {
+      const headers = [...candidate.querySelectorAll('th')].map(
+        (header) => header.textContent?.trim(),
+      );
+      return headers[0] === 'Stream' && headers[1] === 'Current position';
+    });
+    if (!table) return false;
+    const viewportRect = viewport.getBoundingClientRect();
+    const tableRect = table.getBoundingClientRect();
+    viewport.scrollTo({
+      top: viewport.scrollTop + tableRect.top - viewportRect.top,
+      behavior: 'auto',
+    });
+    mobileStatusJumpPendingRef.current = false;
+    return true;
   }, []);
 
-  const handleMobileVisibleRange = useCallback(() => {
-    if (!isMobileTablePreview || mobilePreviewState !== 'final') return;
-    if (!mobileStatusJumpPendingRef.current) return;
-    if (messageListRef.current?.scrollToMessageId('assistant-wide-table-1')) {
-      mobileStatusJumpPendingRef.current = false;
-    }
-  }, [isMobileTablePreview, mobilePreviewState]);
+  const jumpToMobileStatus = useCallback(() => {
+    mobileStatusJumpPendingRef.current = true;
+    if (mobilePreviewState === 'final' && scrollFinalStatusTable()) return;
+    setMobilePreviewState('final');
+  }, [mobilePreviewState, scrollFinalStatusTable]);
 
   useLayoutEffect(() => {
     if (!isMobileTablePreview || !ready) return;
@@ -147,24 +162,22 @@ export function MessageListFixture({ scenario }: Props) {
     const stage = document.querySelector<HTMLElement>('.mobile-table-preview .fixture-message-list-stage');
     if (!stage) return;
 
+    const findStatusTable = (root: ParentNode) => [...root.querySelectorAll('table')].find((candidate) => {
+      const headers = [...candidate.querySelectorAll('th')].map(
+        (header) => header.textContent?.trim(),
+      );
+      return headers[0] === 'Stream' && headers[1] === 'Current position';
+    });
     const verify = () => {
-      if (mobilePreviewState === 'streaming') {
-        const table = stage.querySelector('table');
-        if (stage.clientHeight > 200 && table) {
-          document.documentElement.dataset['messageListFixtureViewportHeight'] = String(stage.clientHeight);
-          document.documentElement.dataset['messageListFixtureReady'] = scenario.id;
-        }
-        return;
-      }
-      const viewport = stage.querySelector<HTMLElement>('.chat-main-area');
+      const viewport = mobilePreviewState === 'streaming'
+        ? stage
+        : stage.querySelector<HTMLElement>('.chat-main-area');
       if (!viewport || viewport.clientHeight <= 200) return;
-      const table = [...viewport.querySelectorAll('table')].find((candidate) => {
-        const headers = [...candidate.querySelectorAll('th')].map(
-          (header) => header.textContent?.trim(),
-        );
-        return headers[0] === 'Stream' && headers[1] === 'Current position';
-      });
+      const table = findStatusTable(viewport);
       if (!table) return;
+      if (mobilePreviewState === 'final' && mobileStatusJumpPendingRef.current) {
+        scrollFinalStatusTable();
+      }
       const viewportRect = viewport.getBoundingClientRect();
       const tableRect = table.getBoundingClientRect();
       if (tableRect.bottom > viewportRect.top && tableRect.top < viewportRect.bottom) {
@@ -190,7 +203,7 @@ export function MessageListFixture({ scenario }: Props) {
       delete document.documentElement.dataset['messageListFixtureViewportHeight'];
       delete document.documentElement.dataset['messageListFixtureStatusTableTop'];
     };
-  }, [isMobileTablePreview, mobilePreviewState, ready, scenario.id]);
+  }, [isMobileTablePreview, mobilePreviewState, ready, scenario.id, scrollFinalStatusTable]);
 
   const reproduceContinuityJump = () => {
     const messageList = messageListRef.current;
@@ -377,7 +390,6 @@ export function MessageListFixture({ scenario }: Props) {
                     conversationId={data.conversationId}
                     slug={data.slug}
                     transcriptPositioning={transcriptPositioning}
-                    onVisibleRangeChange={isMobileTablePreview ? handleMobileVisibleRange : undefined}
                     onHistoryScrollCommandHandled={handleHistoryCommand}
                   />
                 </div>
