@@ -206,7 +206,7 @@ describe('user message provenance rendering', () => {
       const { unmount } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
       expect(screen.getByText('Unknown input').closest('.message')).toHaveClass('meta');
       expect(screen.queryByText('You')).not.toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
       unmount();
     }
   });
