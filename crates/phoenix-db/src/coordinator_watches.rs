@@ -212,6 +212,7 @@ pub(crate) async fn record_terminal_event_tx(
 
 pub(crate) async fn record_steering_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
+    source_kind: &str,
     message_id: &str,
     transcript_id: &str,
     category: &str,
@@ -219,7 +220,7 @@ pub(crate) async fn record_steering_event_tx(
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
-        "steering",
+        source_kind,
         message_id,
         0,
         transcript_id,

@@ -3472,8 +3472,8 @@ impl WakeRepository {
         }
 
         if auto_resume {
-            if let Some(link) = links.first() {
-                sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+            if let Some(link) = links.iter().find(|link| link.auto_resume) {
+                sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'wake') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = excluded.source_kind")
                     .bind(conversation_id).bind(&link.linked_message.message.message_id).execute(&mut *tx.tx).await?;
             }
         }

@@ -5510,9 +5510,18 @@ impl Database {
              WHERE job_id = ?2 AND status IN ('reserved', 'present')",
         )
         .bind(now)
-        .bind(job_id)
+        .bind(&job_id)
         .bind(generation + 1)
         .execute(&mut *tx)
+        .await?;
+        crate::coordinator_watches::record_creation_event_tx(
+            &mut tx,
+            &job_id,
+            u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?,
+            conversation_id,
+            "Cancelled",
+            None,
+        )
         .await?;
         tx.commit().await?;
         Ok(())
@@ -5589,7 +5598,7 @@ impl Database {
              WHERE job_id = ?2 AND status IN ('reserved', 'present')",
         )
         .bind(now)
-        .bind(job_id)
+        .bind(&job_id)
         .bind(generation + 1)
         .execute(&mut *tx)
         .await?;
@@ -6228,6 +6237,21 @@ impl Database {
                 tx.rollback().await?;
                 return Err(DbError::ConversationNotFound(job_id.to_string()));
             }
+            let source: String = sqlx::query_scalar(
+                "SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::coordinator_watches::record_creation_event_tx(
+                &mut tx,
+                job_id,
+                claim.generation,
+                &source,
+                "Failed",
+                Some(error),
+            )
+            .await?;
             tx.commit().await?;
             Ok(CreationCasOutcome::Applied)
         } else {
@@ -7620,7 +7644,7 @@ impl Database {
         }
 
         if matches!(state, ConvState::LlmRequesting { .. }) {
-            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'steering'")
                 .bind(id).bind(&messages[0].message_id).execute(&mut *tx).await?;
         }
 
@@ -12124,7 +12148,7 @@ impl Database {
             origin,
             phoenix_core::domain::db_schema::InputOrigin::UserApi
         ) {
-            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id")
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'steering'")
                 .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
         }
         message_attachments::insert(&mut tx, message_id, content).await?;
@@ -14641,13 +14665,13 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     conversation_id: &str,
     state: &ConvState,
 ) -> DbResult<()> {
-    let steering: Option<String> = sqlx::query_scalar(
-        "SELECT message_id FROM steering_execution_occurrences WHERE conversation_id = ?1",
+    let steering: Option<(String, String)> = sqlx::query_as(
+        "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(message_id) = steering {
+    if let Some((message_id, source_kind)) = steering {
         let outcome = match state {
             ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
                 Some(("Completed", None))
@@ -14676,6 +14700,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
         if let Some((kind, reason)) = outcome {
             crate::coordinator_watches::record_steering_event_tx(
                 tx,
+                &source_kind,
                 &message_id,
                 conversation_id,
                 kind,

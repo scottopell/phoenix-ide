@@ -215,8 +215,9 @@ describe('user message provenance rendering', () => {
     render(<MemoryRouter><UserMessage message={userMessage('received', 'From another conversation', {
       origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
     })} /></MemoryRouter>);
-    expect(screen.getByText('From conversation ID source-product · transcript ID source-row')).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /source-product|source-row/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByText(/From conversation ID source-product/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
 
@@ -236,7 +237,7 @@ describe('user message provenance rendering', () => {
       } }} onRetry={() => {}} />
       <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
     </></MemoryRouter>);
-    expect(screen.getByText('From conversation ID source · transcript ID source-row')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
     expect(screen.getAllByText('You')).toHaveLength(1);
   });
 

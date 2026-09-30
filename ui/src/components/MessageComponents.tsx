@@ -395,7 +395,7 @@ function InputSender({ origin }: { origin: InputOrigin | undefined }) {
     case 'internal_conversation':
       return (
         <span className="message-sender">
-          From conversation ID {origin.product_conversation_id} · transcript ID {origin.transcript_id}
+          From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}`}>transcript ID {origin.transcript_id}</ConversationMarkdownAnchor>
         </span>
       );
     case 'subscription_event':
