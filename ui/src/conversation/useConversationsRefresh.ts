@@ -287,8 +287,16 @@ export function useConversationsRefreshDriver(): void {
       if (!detail?.conversationId) return;
       notifyProductConversationListMayHaveChanged();
       notifyProductConversationSnapshotChanged(detail.conversationId);
-      const deletedConversationIds = detail.deletedConversationIds ?? [detail.conversationId];
-      notifyProductConversationDeleted(detail.conversationId, deletedConversationIds);
+      const deletedConversationIds = new Set(
+        detail.deletedConversationIds ?? [detail.conversationId],
+      );
+      for (const conversation of store.listSnapshots()) {
+        if (conversation.product_conversation_id === detail.conversationId) {
+          deletedConversationIds.add(conversation.id);
+        }
+      }
+      notifyProductConversationDeleted(detail.conversationId, [...deletedConversationIds]);
+      localStorage.removeItem(`phoenix:product-conversation-draft:${detail.conversationId}`);
       for (const conversationId of deletedConversationIds) {
         const removedSlugs = store.removeByConversationId(conversationId);
         for (const slug of removedSlugs) {

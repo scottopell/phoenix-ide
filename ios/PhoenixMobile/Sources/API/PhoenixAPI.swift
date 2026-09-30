@@ -467,11 +467,46 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
-    func deleteProductConversation(rootTranscriptRowId: String) async throws {
+    enum ProductConversationDeleteOutcome: Decodable, Equatable {
+        case deleted(conversationIds: [String])
+        case alreadyAbsent
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case deletedConversationIds = "deleted_conversation_ids"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(String.self, forKey: .type) {
+            case "deleted":
+                self = .deleted(conversationIds: try container.decode(
+                    [String].self,
+                    forKey: .deletedConversationIds))
+            case "already_absent":
+                self = .alreadyAbsent
+            default:
+                throw DecodingError.dataCorruptedError(
+                    forKey: .type,
+                    in: container,
+                    debugDescription: "unknown product conversation delete outcome")
+            }
+        }
+    }
+
+    struct ProductConversationDeleteResponse: Decodable, Equatable {
+        let success: Bool
+        let outcome: ProductConversationDeleteOutcome
+    }
+
+    func deleteProductConversation(
+        rootTranscriptRowId: String
+    ) async throws -> ProductConversationDeleteOutcome {
         var request = try request(path: "api/chains/\(rootTranscriptRowId)")
         request.httpMethod = "DELETE"
         let (data, response) = try await session.data(for: request)
         try validateStatus(response, data: data)
+        return try JSONDecoder().decode(ProductConversationDeleteResponse.self, from: data).outcome
     }
 
     func archive(conversationId: String) async throws {

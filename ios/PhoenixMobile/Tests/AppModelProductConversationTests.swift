@@ -236,6 +236,29 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertNil(model.aggregateReconciliationId)
     }
 
+    func testProductConversationDeleteOutcomeCarriesEveryAuthoritativeMember() throws {
+        let response = try JSONDecoder().decode(
+            PhoenixAPI.ProductConversationDeleteResponse.self,
+            from: Data("""
+            {"success":true,"outcome":{"type":"deleted","deleted_conversation_ids":["root","agent"]}}
+            """.utf8))
+
+        XCTAssertEqual(
+            response.outcome,
+            .deleted(conversationIds: ["root", "agent"]))
+    }
+
+    func testForegroundRestoreDefersReconciliationUntilStreamIsReady() {
+        let model = AppModel()
+        model.installAPIForTesting()
+        model.backgrounded()
+
+        model.foregrounded()
+
+        XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
+        XCTAssertNil(model.aggregateReconciliationId)
+    }
+
     func testStaleAggregateReconciliationCannotOverwriteNewerAppliedList() async {
         let model = AppModel()
         model.installAPIForTesting()

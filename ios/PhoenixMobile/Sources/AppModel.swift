@@ -1418,11 +1418,16 @@ final class AppModel {
                 conversation: conversation,
                 fetch: { try await api.getProductConversation(reference: $0) })
             guard apiGeneration == startedGeneration else { return false }
-            try await api.deleteProductConversation(rootTranscriptRowId: rootTranscriptRowId)
+            let outcome = try await api.deleteProductConversation(
+                rootTranscriptRowId: rootTranscriptRowId)
             guard apiGeneration == startedGeneration else { return false }
+            let authoritativeIds = switch outcome {
+            case let .deleted(conversationIds): Set(conversationIds)
+            case .alreadyAbsent: Set<String>()
+            }
             return await removeProductHistoryLocally(
                 productConversationId: conversation.aggregateIdentity,
-                transcriptIds: transcriptIds,
+                transcriptIds: transcriptIds.union(authoritativeIds),
                 startedGeneration: startedGeneration)
         } catch let error as APIError where error.isNotFound {
             return await removeProductHistoryLocally(
@@ -1739,8 +1744,12 @@ final class AppModel {
 
     func foregrounded() {
         isForeground = true
-        if let api { startAggregateEventStream(api: api, generation: apiGeneration) }
-        startAggregateReconciliation()
+        if let api {
+            startAggregateEventStream(
+                api: api,
+                generation: apiGeneration,
+                reconcileOnOpen: true)
+        }
     }
 
     private func locallyOwnedOrdinaryAggregates() -> [String: Set<String>] {

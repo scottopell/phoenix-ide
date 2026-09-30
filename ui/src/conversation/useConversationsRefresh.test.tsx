@@ -418,6 +418,43 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
     });
   });
 
+  it('expands an already-absent aggregate delete through cached member ownership', async () => {
+    let store: ConversationStore | undefined;
+    function CaptureBoth() {
+      store = useContext(ConversationContext) ?? undefined;
+      return null;
+    }
+    render(
+      <ConversationProvider>
+        <CaptureBoth />
+      </ConversationProvider>,
+    );
+    act(() => {
+      store!.upsertSnapshot('root-slug', {
+        ...makeConv('root-slug', 'root-id'),
+        product_conversation_id: 'product-id',
+      });
+      store!.upsertSnapshot('agent-slug', {
+        ...makeConv('agent-slug', 'agent-id'),
+        product_conversation_id: 'product-id',
+      });
+    });
+    localStorage.setItem('phoenix:draft:agent-id', 'agent draft');
+    localStorage.setItem('phoenix:product-conversation-draft:product-id', 'product draft');
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
+        detail: { conversationId: 'product-id', deletedConversationIds: ['root-id'] },
+      }));
+    });
+
+    await waitFor(() => {
+      expect(store!.listSnapshots()).toEqual([]);
+      expect(localStorage.getItem('phoenix:draft:agent-id')).toBeNull();
+      expect(localStorage.getItem('phoenix:product-conversation-draft:product-id')).toBeNull();
+    });
+  });
+
   it('does not throw when the deleted id is unknown to the store', () => {
     render(
       <ConversationProvider>

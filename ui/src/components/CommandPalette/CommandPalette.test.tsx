@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { ConversationSearchWarmingError } from '../../api';
+import { ConflictError, ConversationSearchWarmingError } from '../../api';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { CommandPalette } from './CommandPalette';
@@ -188,7 +188,65 @@ describe('CommandPalette lifecycle availability', () => {
     expect(closed).toHaveBeenCalledWith(expect.objectContaining({ detail: 'product-1' }));
   });
 
+  it('offers Close through a supported product alias after snapshot resolution', () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest' });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/legacy-root']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[]}
+            productConversations={[{
+              product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'legacy-root', title: null },
+              lifecycle: { state: 'open', close_action: { availability: 'available' } },
+              latest_transcript_row_id: 'latest-id', updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
+  });
+
+  it('projects already-History aggregate Close conflicts as local success', async () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest' });
+    mocks.closeProductConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'already History',
+      error_type: 'close_already_history',
+    }));
+    const closed = vi.fn();
+    window.addEventListener('phoenix:product-conversation-closed', closed, { once: true });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-1']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[]}
+            productConversations={[{
+              product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              lifecycle: { state: 'open', close_action: { availability: 'available' } },
+              latest_transcript_row_id: 'latest-id', updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    fireEvent.click(screen.getByText('Close Current Conversation'));
+    await waitFor(() => expect(closed).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: 'product-1' }),
+    ));
+  });
+
   it('uses the canonical chain root when drift hides continuation members', async () => {
+
     const active = makeConversation({ id: 'latest-id', slug: 'latest' });
     render(
       <MemoryRouter initialEntries={['/product-conversations/product-id']}>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../../api';
-import { api } from '../../api';
+import { api, ConflictError } from '../../api';
 import { ConversationSearchWarmingError } from '../../api';
 import './CommandPalette.css';
 import type { PaletteState, PaletteSource, PaletteAction } from './types';
@@ -48,7 +48,12 @@ export function CommandPalette({ conversations, productConversations = [], activ
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/]+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
   const activeProduct = productMatch
-    ? productConversations.find(row => row.product_conversation_id === productMatch[1])
+    ? productConversations.find((row) => (
+        row.product_conversation_id === productMatch[1]
+        || row.canonical_root.slug === productMatch[1]
+        || row.canonical_root.transcript_row_id === productMatch[1]
+        || row.latest_transcript_row_id === activeConversation?.id
+      ))
     : undefined;
 
   const activeConvId = activeConversation?.id ?? null;
@@ -171,7 +176,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
                   }
                   navigate('/');
                 } catch (error) {
-                  if (!notifyArchiveCloseConflict(targetId, error)) throw error;
+                  if (activeProduct
+                    && error instanceof ConflictError
+                    && error.detail.error_type === 'close_already_history') {
+                    notifyProductConversationClosed(activeProduct.product_conversation_id);
+                    notifyProductConversationListMayHaveChanged();
+                    navigate('/');
+                  } else if (!notifyArchiveCloseConflict(targetId, error)) {
+                    throw error;
+                  }
                 }
               };
             })()
