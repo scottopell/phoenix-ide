@@ -15,7 +15,7 @@ import {
   compactChronologyFinalMessages,
   messageListFixtureData,
   prefixContinuityEarlierMessages,
-  mobileTablePreviewMarkdown,
+  mobileTablePreviewCases,
 } from './scenarios';
 import { StreamingBlocks } from '../../components/StreamingMessage';
 import './mobileTablePreview.css';
@@ -53,6 +53,10 @@ export function MessageListFixture({ scenario }: Props) {
   const isMobileTablePreview = scenario.id.startsWith('mobile-table-preview-');
   const [mobilePreviewState, setMobilePreviewState] = useState<'final' | 'streaming'>('streaming');
   const mobileStatusJumpPendingRef = useRef(true);
+  const [mobilePreviewCaseId, setMobilePreviewCaseId] = useState('global-status');
+  const mobilePreviewCase = mobileTablePreviewCases.find(
+    (previewCase) => previewCase.id === mobilePreviewCaseId,
+  ) ?? mobileTablePreviewCases[0]!;
 
   const recordChronologyMetrics = useCallback((phase: string) => {
     const scroller = document.querySelector<HTMLElement>('.message-list-fixture-shell #messages');
@@ -125,8 +129,17 @@ export function MessageListFixture({ scenario }: Props) {
   }, [data.theme, isMobileTablePreview, scenario.id]);
 
   useEffect(() => {
-    setMessages(data.messages);
-  }, [data.messages]);
+    if (!isMobileTablePreview) {
+      setMessages(data.messages);
+      return;
+    }
+    setMessages(data.messages.map((message) => (
+      message.message_id === 'agent-wide-table-1'
+        ? { ...message, content: [{ type: 'text' as const, text: mobilePreviewCase.markdown }] }
+        : message
+    )));
+    mobileStatusJumpPendingRef.current = true;
+  }, [data.messages, isMobileTablePreview, mobilePreviewCase]);
 
   const scrollFinalStatusTable = useCallback(() => {
     const viewport = document.querySelector<HTMLElement>(
@@ -137,7 +150,8 @@ export function MessageListFixture({ scenario }: Props) {
       const headers = [...candidate.querySelectorAll('th')].map(
         (header) => header.textContent?.trim(),
       );
-      return headers[0] === 'Stream' && headers[1] === 'Current position';
+      return headers[0] === mobilePreviewCase.headers[0]
+        && headers[1] === mobilePreviewCase.headers[1];
     });
     if (!table) return false;
     const viewportRect = viewport.getBoundingClientRect();
@@ -148,7 +162,7 @@ export function MessageListFixture({ scenario }: Props) {
     });
     mobileStatusJumpPendingRef.current = false;
     return true;
-  }, []);
+  }, [mobilePreviewCase.headers]);
 
   const jumpToMobileStatus = useCallback(() => {
     mobileStatusJumpPendingRef.current = true;
@@ -166,7 +180,8 @@ export function MessageListFixture({ scenario }: Props) {
       const headers = [...candidate.querySelectorAll('th')].map(
         (header) => header.textContent?.trim(),
       );
-      return headers[0] === 'Stream' && headers[1] === 'Current position';
+      return headers[0] === mobilePreviewCase.headers[0]
+        && headers[1] === mobilePreviewCase.headers[1];
     });
     const verify = () => {
       const viewport = mobilePreviewState === 'streaming'
@@ -203,7 +218,14 @@ export function MessageListFixture({ scenario }: Props) {
       delete document.documentElement.dataset['messageListFixtureViewportHeight'];
       delete document.documentElement.dataset['messageListFixtureStatusTableTop'];
     };
-  }, [isMobileTablePreview, mobilePreviewState, ready, scenario.id, scrollFinalStatusTable]);
+  }, [
+    isMobileTablePreview,
+    mobilePreviewCase.headers,
+    mobilePreviewState,
+    ready,
+    scenario.id,
+    scrollFinalStatusTable,
+  ]);
 
   const reproduceContinuityJump = () => {
     const messageList = messageListRef.current;
@@ -325,8 +347,24 @@ export function MessageListFixture({ scenario }: Props) {
                   <button type="button" onClick={jumpToMobileStatus}>
                     Status
                   </button>
-                  <a href="?story=message-list--mobile-table-preview-baseline">Baseline</a>
+                  <label className="mobile-table-preview-case-picker">
+                    <span>Case</span>
+                    <select
+                      value={mobilePreviewCase.id}
+                      onChange={(event) => {
+                        setMobilePreviewCaseId(event.target.value);
+                        mobileStatusJumpPendingRef.current = true;
+                      }}
+                    >
+                      {mobileTablePreviewCases.map((previewCase) => (
+                        <option key={previewCase.id} value={previewCase.id}>
+                          {previewCase.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <a href="?story=message-list--mobile-table-preview-content-wrap">Wrap</a>
+                  <a href="?story=message-list--mobile-table-preview-baseline">Baseline</a>
                   <a href="?story=message-list--mobile-table-preview-readable-overflow">Overflow</a>
                 </nav>
               )}
@@ -366,6 +404,11 @@ export function MessageListFixture({ scenario }: Props) {
                 </span>
               ))}
             </div>
+            {isMobileTablePreview && (
+              <p className="mobile-table-preview-provenance" data-preview-case={mobilePreviewCase.id}>
+                {mobilePreviewCase.caption}
+              </p>
+            )}
             <div className="fixture-message-list-stage">
               {isMobileTablePreview && mobilePreviewState === 'streaming' ? (
                 <section className="mobile-table-preview-streaming" aria-label="Streaming state">
@@ -373,7 +416,7 @@ export function MessageListFixture({ scenario }: Props) {
                   <div className="message agent">
                     <div className="message-content">
                       <div className="agent-text-block streaming">
-                        <StreamingBlocks text={mobileTablePreviewMarkdown} />
+                        <StreamingBlocks text={mobilePreviewCase.markdown} />
                       </div>
                     </div>
                   </div>

@@ -2,8 +2,25 @@ import { describe, expect, it } from 'vitest';
 import {
   getMessageListScenario,
   messageListFixtureData,
+  mobileTablePreviewCases,
   prefixContinuityEarlierMessages,
 } from './scenarios';
+
+describe('mobile table preview cases', () => {
+  it('preserves the original fixture plus eight historical excerpts and provenance', () => {
+    expect(mobileTablePreviewCases).toHaveLength(9);
+    expect(mobileTablePreviewCases[0]?.id).toBe('global-status');
+    expect(mobileTablePreviewCases.slice(1).every((previewCase) => (
+      previewCase.caption.startsWith('Historical conversation excerpt ·')
+      && previewCase.caption.includes('conversation ')
+      && previewCase.caption.includes('message ')
+    ))).toBe(true);
+    expect(mobileTablePreviewCases.find((previewCase) => previewCase.id === 'latency-measurements')?.markdown)
+      .toContain('|---|---:|---:|');
+    expect(mobileTablePreviewCases.find((previewCase) => previewCase.id === 'model-performance')?.markdown)
+      .toContain('| Model | Completed | Failed | p50 total | p95 total | Max |');
+  });
+});
 
 describe('message-list continuity fixture', () => {
   it('provides a deterministic tall anchor and an earlier prefix', () => {

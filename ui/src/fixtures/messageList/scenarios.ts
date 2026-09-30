@@ -331,6 +331,80 @@ export const mobileTablePreviewMarkdown = [
   '| `#817` | **Review** | Local overflow is acceptable only when readable minimum widths genuinely exceed the viewport. |',
 ].join('\n');
 
+export interface MobileTablePreviewCase {
+  id: string;
+  label: string;
+  caption: string;
+  markdown: string;
+  headers: [string, string];
+}
+
+export const mobileTablePreviewCases: MobileTablePreviewCase[] = [
+  {
+    id: 'global-status',
+    label: '11:01 status',
+    caption: 'Historical fixture — Global status at 11:01 UTC.',
+    markdown: mobileTablePreviewMarkdown,
+    headers: ['Stream', 'Current position'],
+  },
+  {
+    id: 'source-roles',
+    label: 'Source roles',
+    caption: 'Historical conversation excerpt · 2026-09-27T19:19:20.898691Z · conversation b2892006-e955-4c27-bfa2-aaab5518222f · message 9993654c-7884-401c-a0d5-6322ab02eb35',
+    markdown: '| Source | Appropriate role |\n|---|---|\n| **Phoenix registry** | Models we support, their protocols, capabilities, and orchestration qualification |\n| **Provider catalog** | Discovery and advisory availability information—not an authoritative denial |\n| **Execution response** | Whether that exact model/request is accepted for the current account |',
+    headers: ['Source', 'Appropriate role'],
+  },
+  {
+    id: 'candidate-ranking',
+    label: 'Ranking',
+    caption: 'Historical conversation excerpt · 2026-09-27T20:51:07.621260Z · conversation b2892006-e955-4c27-bfa2-aaab5518222f · message 5e5a3e1d-aa9e-43ed-8775-3d28b868f09b',
+    markdown: '| Rank | Candidate | Why / proposed split |\n|---|---|---|\n| **1** | **Deflaking Stage 1** | Already approved; separable work. **Writer A:** bounded-Git and SQLite tests. **Writer B:** scrollback reducer and small UI wiring test. Parent owns integration; keep tmux/browser restructuring out of the first pilot. **Gate:** real write authority must work. |\n| **2** | **Sender identity/provenance** | Highest immediate product payoff after today’s confusing handoffs. Backend persistence/transport and UI presentation can split after agreeing one server-owned contract. Higher integration risk; capability dependency must clear first. |\n| **3** | **API-skill repair** | Smaller, lower-risk pilot: delivered recipe/content versus delivery/contract tests, with parent integration. Useful and overdue, though less substantial as a parallel-efficiency demonstration. |',
+    headers: ['Rank', 'Candidate'],
+  },
+  {
+    id: 'landed-changes',
+    label: 'Links + SHAs',
+    caption: 'Historical conversation excerpt · 2026-09-28T14:36:10.180080Z · conversation b2892006-e955-4c27-bfa2-aaab5518222f · message b9c5efd6-1a2d-4a95-928d-a659c0fdc934',
+    markdown: '| Change | What landed |\n|---|---|\n| [#810](https://github.com/scottopell/phoenix-ide/pull/810) — `4fd574ee` | Removed automatic coordinator snapshots to preserve caching; activity is queried on demand. |\n| [#765](https://github.com/scottopell/phoenix-ide/pull/765) — `d6052dbe` | Fixed parent approval capabilities and durable recovery, initially deferring confined Work children. |\n| [#811](https://github.com/scottopell/phoenix-ide/pull/811) — `b487252e` | Restored Work delegation under the **trusted-worker model**, without filesystem sandboxing. |',
+    headers: ['Change', 'What landed'],
+  },
+  {
+    id: 'message-matrix',
+    label: 'Message matrix',
+    caption: 'Historical conversation excerpt · 2026-09-30T02:51:15.332510Z · conversation b2892006-e955-4c27-bfa2-aaab5518222f · message 8121465c-f078-426f-b4c0-c3fc0aab078f',
+    markdown: '| Message type | Send to Global when… | Expected response |\n|---|---|---|\n| **Action ready** | A qualified candidate needs merge/deploy, or a concrete intervention is needed | Act, or explain the remaining gate |\n| **Decision needed** | A real scope, authority, risk, or product choice exceeds the owner’s mandate | Decide within delegated authority; ask you only when necessary |\n| **Material change** | Delivery completes, an important assumption becomes false, or a significant blocker appears/disappears | Update the working picture; acknowledge only if useful |\n| **Routine progress** | Tests run, steering is consumed, a normal continuation succeeds, a worker starts another slice | **Roadmap/owner transcript—not a message here** |',
+    headers: ['Message type', 'Send to Global when…'],
+  },
+  {
+    id: 'latency-measurements',
+    label: 'Latency',
+    caption: 'Historical conversation excerpt · 2026-08-06T14:03:10.850474Z · conversation ee7674b6-f572-422b-9eab-2c42a0c29c6b · message 0f213112-67f7-4209-9b84-57fbba6bf7ff',
+    markdown: '| Measurement | Median | Range |\n|---|---:|---:|\n| Browser EventSource→init complete | 219 ms | 39–260 ms |\n| Browser init handler | 5 ms | 0.6–6.3 ms |\n| Server init generation | 3 ms | 2–20 ms |',
+    headers: ['Measurement', 'Median'],
+  },
+  {
+    id: 'failure-policy',
+    label: 'Failure policy',
+    caption: 'Historical conversation excerpt · 2026-08-06T14:12:23.403199Z · conversation ee7674b6-f572-422b-9eab-2c42a0c29c6b · message 281f3708-8d8d-424b-97ec-c3ecefbef6e6',
+    markdown: '| Data | Failure policy |\n|---|---|\n| Cached conversation list | Ignore failure; fetch server |\n| Cached transcript | Ignore failure; fetch server |\n| Replica metadata | Ignore failure; perform authoritative/full fetch |\n| Cache cleanup after server delete | Ignore/log cache failure; server delete remains successful |\n| Cached sub-agent slug | Ignore failure; use REST fallback |\n| Pending user-message write | Surface failure; never claim it was safely queued |\n| Pending-operation replay | Retry and expose delivery state |',
+    headers: ['Data', 'Failure policy'],
+  },
+  {
+    id: 'store-size',
+    label: 'Store size',
+    caption: 'Historical conversation excerpt · 2026-08-06T15:30:31.990375Z · conversation ee7674b6-f572-422b-9eab-2c42a0c29c6b · message 34b89e6b-1dad-493b-ae8b-f2066e2ff0e8',
+    markdown: '| Store | Rows / size |\n|---|---:|\n| Conversation metadata | 382 rows |\n| Cached messages | 132 rows, 729 KiB |\n| Replica metadata | 3 rows |',
+    headers: ['Store', 'Rows / size'],
+  },
+  {
+    id: 'model-performance',
+    label: '6-column models',
+    caption: 'Historical conversation excerpt · 2026-07-19T14:48:33.323993Z · conversation 7d9521ca-160d-40c3-bf95-5c3967f91720 · message aa9fd66e-7dc7-4c0c-b99f-da94b7b42d51',
+    markdown: '| Model | Completed | Failed | p50 total | p95 total | Max |\n|---|---:|---:|---:|---:|---:|\n| `gpt-5.4-mini` | 159 | 5 | 2.5 s | 8.9 s | 43.1 s |\n| `gpt-5.4` | 138 | 0 | 4.3 s | 21.1 s | 84.4 s |\n| `gpt-5.6-sol` | 578 | 0 | 5.2 s | 16.2 s | 55.2 s |\n| `gpt-5.6-luna` | 5 | 2 | 19.4 s | 30.2 s | 30.2 s |',
+    headers: ['Model', 'Completed'],
+  },
+];
+
 const wideMarkdownTableMessages: Message[] = [
   {
     message_id: 'user-wide-table-1',
