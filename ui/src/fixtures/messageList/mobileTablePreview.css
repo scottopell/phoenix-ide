@@ -1,7 +1,5 @@
 .mobile-table-preview .fixture-message-list-stage {
-  display: grid;
-  grid-template-rows: minmax(18rem, 42vh) minmax(22rem, 1fr);
-  gap: 12px;
+  display: block;
   padding: 8px;
   overflow: auto;
 }
@@ -13,6 +11,29 @@
   min-width: 0;
   padding-block: 6px;
   overflow-wrap: anywhere;
+}
+
+.mobile-table-preview-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-inline-start: auto;
+}
+
+.mobile-table-preview-controls :where(button, a) {
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  text-decoration: none;
+}
+
+.mobile-table-preview-controls button[aria-pressed='true'] {
+  border-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 18%, var(--bg-primary));
 }
 
 .mobile-table-preview-streaming {
@@ -98,7 +119,9 @@
     z-index: 1;
   }
 
-  .mobile-table-preview .fixture-message-list-stage {
-    grid-template-rows: minmax(20rem, 48vh) minmax(28rem, 1fr);
+  .mobile-table-preview-controls {
+    width: 100%;
+    margin-inline-start: 0;
+    overflow-x: auto;
   }
 }

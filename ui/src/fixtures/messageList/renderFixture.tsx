@@ -51,6 +51,7 @@ export function MessageListFixture({ scenario }: Props) {
   const isContinuityScenario = scenario.id === 'prefix-continuity-offset-bug';
   const isChronologyScenario = scenario.id === 'compact-expanded-tool-chronology';
   const isMobileTablePreview = scenario.id.startsWith('mobile-table-preview-');
+  const [mobilePreviewState, setMobilePreviewState] = useState<'final' | 'streaming'>('final');
 
   const recordChronologyMetrics = useCallback((phase: string) => {
     const scroller = document.querySelector<HTMLElement>('.message-list-fixture-shell #messages');
@@ -123,6 +124,14 @@ export function MessageListFixture({ scenario }: Props) {
   useEffect(() => {
     setMessages(data.messages);
   }, [data.messages]);
+
+  useEffect(() => {
+    if (!isMobileTablePreview || mobilePreviewState !== 'final' || !ready) return;
+    const frame = window.requestAnimationFrame(() => {
+      messageListRef.current?.scrollToMessageId('assistant-wide-table-1');
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isMobileTablePreview, mobilePreviewState, ready]);
 
   const reproduceContinuityJump = () => {
     const messageList = messageListRef.current;
@@ -225,6 +234,27 @@ export function MessageListFixture({ scenario }: Props) {
               <span>scenario={scenario.id}</span>
               <span>density=compact</span>
               {isMobileTablePreview && <span>deployed table CSS=838439341 · fixture source=7a42b66db</span>}
+              {isMobileTablePreview && (
+                <nav className="mobile-table-preview-controls" aria-label="Preview controls">
+                  <button
+                    type="button"
+                    aria-pressed={mobilePreviewState === 'final'}
+                    onClick={() => setMobilePreviewState('final')}
+                  >
+                    Final
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={mobilePreviewState === 'streaming'}
+                    onClick={() => setMobilePreviewState('streaming')}
+                  >
+                    Streaming
+                  </button>
+                  <a href="?story=message-list--mobile-table-preview-baseline">Baseline</a>
+                  <a href="?story=message-list--mobile-table-preview-content-wrap">Wrap</a>
+                  <a href="?story=message-list--mobile-table-preview-readable-overflow">Overflow</a>
+                </nav>
+              )}
               {scenario.id === 'scroll-policy-long' && (
                 <button type="button" data-testid="append-tail" onClick={appendTail}>
                   Append tail
@@ -262,32 +292,33 @@ export function MessageListFixture({ scenario }: Props) {
               ))}
             </div>
             <div className="fixture-message-list-stage">
-            {isMobileTablePreview && (
-              <section className="mobile-table-preview-streaming" aria-label="Streaming state">
-                <strong>Streaming state — same production Markdown renderer</strong>
-                <div className="message agent">
-                  <div className="message-content">
-                    <div className="agent-text-block streaming">
-                      <StreamingBlocks text={mobileTablePreviewMarkdown} />
+              {isMobileTablePreview && mobilePreviewState === 'streaming' ? (
+                <section className="mobile-table-preview-streaming" aria-label="Streaming state">
+                  <strong>Streaming state — same production Markdown renderer</strong>
+                  <div className="message agent">
+                    <div className="message-content">
+                      <div className="agent-text-block streaming">
+                        <StreamingBlocks text={mobileTablePreviewMarkdown} />
+                      </div>
                     </div>
                   </div>
+                </section>
+              ) : (
+                <div className="message-list-fixture-shell">
+                  <MessageList
+                    ref={messageListRef}
+                    messages={messages}
+                    pendingMessages={data.pendingMessages}
+                    convState={data.convState}
+                    onRetry={() => {}}
+                    onOpenFile={() => {}}
+                    conversationId={data.conversationId}
+                    slug={data.slug}
+                    transcriptPositioning={transcriptPositioning}
+                    onHistoryScrollCommandHandled={handleHistoryCommand}
+                  />
                 </div>
-              </section>
-            )}
-              <div className="message-list-fixture-shell">
-                <MessageList
-                  ref={messageListRef}
-                  messages={messages}
-                  pendingMessages={data.pendingMessages}
-                  convState={data.convState}
-                  onRetry={() => {}}
-                  onOpenFile={() => {}}
-                  conversationId={data.conversationId}
-                  slug={data.slug}
-                  transcriptPositioning={transcriptPositioning}
-                  onHistoryScrollCommandHandled={handleHistoryCommand}
-                />
-              </div>
+              )}
             </div>
           </main>
         </MemoryRouter>
