@@ -50,6 +50,7 @@ runSurfaceCapture({
       };
     });
     if (metrics.metaDisplay !== 'flex'
+      || metrics.mainBackground !== 'rgba(0, 0, 0, 0)'
       || metrics.mainBorderWidth !== '0px'
       || metrics.mainBorderRadius !== '0px'
       || metrics.mainTextAlign !== 'left'
