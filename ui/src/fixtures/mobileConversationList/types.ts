@@ -11,6 +11,8 @@ export const mobileConversationListScenarioDefinitions = [
   { id: 'naming-context-dark', title: 'Mobile naming and context fallbacks / dark', kind: 'active', theme: 'dark', dataset: 'naming-context' },
   { id: 'product-conversations-dark', title: 'Product conversations / Open and History / dark', kind: 'active', theme: 'dark', dataset: 'product-conversations' },
   { id: 'product-conversations-light', title: 'Product conversations / Open and History / light', kind: 'active', theme: 'light', dataset: 'product-conversations' },
+  { id: 'product-conversations-history-dark', title: 'Product conversations / History / dark', kind: 'archived', theme: 'dark', dataset: 'product-conversations' },
+  { id: 'product-conversations-history-light', title: 'Product conversations / History / light', kind: 'archived', theme: 'light', dataset: 'product-conversations' },
   { id: 'archived-dark', title: 'Archived mobile list / dark', kind: 'archived', theme: 'dark', dataset: 'archived' },
 ] as const satisfies readonly {
   id: string;

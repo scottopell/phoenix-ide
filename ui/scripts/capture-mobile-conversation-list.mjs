@@ -11,7 +11,9 @@ runSurfaceCapture({
   ],
   captureStory: async ({ page, id, outDir, viewport }) => {
     if (!id.startsWith('product-conversations-')) return false;
-    const row = page.locator('[data-product-conversation-id="mobile-product-open"]');
+    const isHistory = id.includes('-history-');
+    const productConversationId = isHistory ? 'mobile-product-history' : 'mobile-product-open';
+    const row = page.locator(`[data-product-conversation-id="${productConversationId}"]`);
     await row.waitFor();
     const main = row.locator('.conv-item-main');
     const title = row.locator('.conv-item-title');
@@ -60,7 +62,10 @@ runSurfaceCapture({
     if (viewport.name === 'mobile' && metrics.rowHeight > 80) {
       throw new Error(`Product aggregate row lost compact mobile density: ${JSON.stringify(metrics)}`);
     }
-    if ((await actionButtons.count()) !== 2) throw new Error('Open aggregate must expose Rename and Close');
+    const expectedActionCount = isHistory ? 1 : 2;
+    if ((await actionButtons.count()) !== expectedActionCount) {
+      throw new Error(`${isHistory ? 'History' : 'Open'} aggregate must expose ${expectedActionCount} action target(s)`);
+    }
     for (const button of await actionButtons.all()) {
       const box = await button.boundingBox();
       if (!box || box.width < 44 || box.height < 44) throw new Error(`Product action target is smaller than 44px: ${JSON.stringify(box)}`);
