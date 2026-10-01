@@ -3725,6 +3725,22 @@ impl RuntimeManager {
                     .await?;
                 continue;
             }
+            if conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator {
+                if let Err(error) = crate::conversation_cwd::validate_conversation_cwd_for_runtime(
+                    &conversation_id,
+                    &conversation.cwd,
+                ) {
+                    let _owner = self.acquire_local_authority_pass().map_err(|()| {
+                        "local authority closed before startup recovery fallback".to_string()
+                    })?;
+                    self.persist_startup_llm_initialization_failure(
+                        &conversation_id,
+                        &error.to_string(),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             self.settle_persisted_llm_request(&conversation_id).await?;
         }
         Ok(())
@@ -11951,7 +11967,7 @@ mod scope_liveness_tests {
             .try_get_handle(conversation_id)
             .await
             .expect("startup proactively materializes runtime");
-        assert!(matches!(*handle.state_rx.borrow(), ConvState::Error { .. }));
+        assert_eq!(*handle.state_rx.borrow(), ConvState::Idle);
         assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(matches!(
             manager
@@ -11960,7 +11976,7 @@ mod scope_liveness_tests {
                 .await
                 .expect("load settled conversation")
                 .state,
-            ConvState::Error { .. }
+            ConvState::Idle
         ));
         assert_eq!(
             manager
@@ -11982,17 +11998,14 @@ mod scope_liveness_tests {
         let good_id = "restart-good-model";
         materialize_restart_direct_turn(&manager, bad_id).await;
         materialize_restart_direct_turn(&manager, good_id).await;
-        manager
-            .db()
-            .update_conversation_model_and_effort(
-                bad_id,
-                "gpt-5.4-mini",
-                None,
-                phoenix_core::domain::llm_types::ServiceTier::Standard,
-                "default",
-            )
-            .await
-            .expect("corrupt one persisted model reference");
+        sqlx::query(
+            "UPDATE work_scopes SET cwd = '/'
+             WHERE id = (SELECT work_scope_id FROM conversations WHERE id = ?1)",
+        )
+        .bind(bad_id)
+        .execute(manager.db().pool())
+        .await
+        .expect("corrupt one persisted cwd");
         manager
             .db()
             .reset_all_to_idle()
@@ -12011,7 +12024,7 @@ mod scope_liveness_tests {
                 .await
                 .expect("load settled good row")
                 .state,
-            ConvState::Error { .. }
+            ConvState::Idle
         ));
         assert!(matches!(
             manager

@@ -7120,6 +7120,35 @@ where
             attempt,
             "Settling provider request interrupted by server restart"
         );
+        if let Some(turn) = self.active_direct_turn.take() {
+            let state = ConvState::Idle;
+            let state_updated_at = Utc::now();
+            self.storage
+                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                    conversation_id: self.context.conversation_id.clone(),
+                    turn: *turn,
+                    terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                        reason: "server restarted during provider request".to_string(),
+                    },
+                    state: state.clone(),
+                    state_updated_at,
+                })
+                .await?;
+            self.state = state.clone();
+            self.state_updated_at = state_updated_at;
+            if let Some(tx) = &self.state_watcher {
+                tx.send_replace(state.clone());
+            }
+            let _ = self
+                .broadcast_tx
+                .send_seq(|sequence_id| SseEvent::StateChange {
+                    sequence_id,
+                    state,
+                    presentation_mode: "normal".to_string(),
+                    state_updated_at,
+                });
+            return Ok(());
+        }
         self.process_event(Event::LlmError {
             message: "The server restarted while this model request was in progress. Send a new message to continue.".to_string(),
             error_kind: crate::db::ErrorKind::InvalidRequest,
@@ -20042,7 +20071,7 @@ mod steer_drain_detector_tests {
         rt.settle_interrupted_llm_request()
             .await
             .expect("existing accepted turn is durably settled");
-        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(storage.get_all_messages(conversation_id).len(), 0);
         assert!(rt.llm_task_handle.is_none());
     }
