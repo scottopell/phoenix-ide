@@ -8,7 +8,7 @@ const journeys = [];
 async function assertSourceCall(page, id, viewport, outDir) {
   await page.evaluate(() => { window.__sourcePulseSeen = false; const observer = new MutationObserver(() => { if (document.querySelector('[data-tool-id="source-send-call"].jump-highlight')) window.__sourcePulseSeen = true; }); observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] }); });
   const expectedPath = id === 'source-call-global' ? '/global/source-member' : '/product-conversations/source-product';
-  await page.getByRole('link', { name: 'source call', exact: true }).click();
+  await page.getByRole('link', { name: /transcript ID .* · source call$/ }).click();
   await page.waitForFunction(path => document.documentElement.dataset.sourceFixtureLocation?.startsWith(path), expectedPath);
   const target = page.locator('[data-tool-id="source-send-call"]');
   await target.waitFor({ state: 'visible' });

@@ -18,7 +18,7 @@ Conversation provenance identified the sender transcript but could not identify 
 
 Tool execution supplies the owning assistant message and tool-use identifier. Internal input carries an optional typed pair, stored as paired nullable columns in message, steering, and durable-turn rows. Migration 112 adds the columns without fabricating old locators. Historical absence remains unavailable, including decoded pre-feature admission payloads. No downgrade or mixed-version runtime guarantee is added.
 
-Web navigation classifies Global before ordinary product snapshots, pins the historical member, and uses its message anchor plus source-tool navigation parameter to expand and highlight the invocation. These browser coordinates do not extend the model-facing conversation-reference grammar. Native decoding retains the pair without claiming native source-jump UI coverage.
+Web navigation classifies Global before ordinary product snapshots, pins the historical member, and uses its message anchor plus source-tool navigation parameter to expand and highlight the invocation. These browser coordinates do not extend the model-facing conversation-reference grammar. Native message headers retain both source identities and offer the exact source-call web link when recorded, or the explicit unavailable notice otherwise. The destination browser remains subject to its normal authentication.
 
 ## Consequences
 

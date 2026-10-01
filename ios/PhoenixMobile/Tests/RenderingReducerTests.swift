@@ -2,6 +2,18 @@ import XCTest
 @testable import PhoenixMobile
 
 final class RenderingReducerTests: XCTestCase {
+    func testSourceCallLinkPinsOriginalToolAndHistoricalAbsenceStaysUnavailable() throws {
+        let origin = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member", sourceCall: SourceToolCall(message_id: "assistant-message", tool_use_id: "send-tool"))
+        let url = try XCTUnwrap(origin.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertEqual(url.path, "/c/original-member")
+        XCTAssertEqual(url.fragment, "message-assistant-message")
+        XCTAssertTrue(url.query?.contains("source_tool=send-tool") == true)
+        XCTAssertFalse(origin.sourceCallUnavailable)
+        let historical = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member")
+        XCTAssertNil(historical.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertTrue(historical.sourceCallUnavailable)
+    }
+
     func testKnownNoteShapesUseUserFacingFields() {
         XCTAssertEqual(
             MessageView.noteText(

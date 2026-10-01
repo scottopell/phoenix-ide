@@ -309,7 +309,7 @@ const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(i
             json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
             json_extract(value, '$.tail_message_id') AS tail_message_id
      FROM json_each(?2)
- ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, transcript.ordinal
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
  FROM transcript
  CROSS JOIN messages INDEXED BY messages_conversation_sequence
    ON messages.conversation_id = transcript.id
@@ -1200,7 +1200,7 @@ impl Database {
                    AND successor.parent_conversation_id IS NULL
              )
              SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, transcript.ordinal
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript.ordinal
              FROM transcript
              JOIN messages ON messages.conversation_id = transcript.id
              WHERE (?2 IS NULL
@@ -1300,6 +1300,52 @@ mod tests {
     use phoenix_core::domain::close::TranscriptConversationId;
     use phoenix_workflow::ClientTurnKey;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn source_call_survives_real_snapshot_and_message_page() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "source-projection",
+                "source-projection",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: conversation.product_conversation_id.clone(),
+            transcript_id: conversation.id.clone(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "source-assistant".into(),
+                tool_use_id: "source-call".into(),
+            })),
+        };
+        db.add_message_with_seq_and_origin(
+            "received",
+            &conversation.id,
+            1,
+            &MessageContent::user("forwarded"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        let snapshot = db
+            .read_ordinary_product_conversation_snapshot(&conversation.id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.messages[0].1.origin, origin);
+        let page = db
+            .get_product_conversation_messages_page(&conversation.product_conversation_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page[0].1.origin, origin);
+    }
 
     #[tokio::test]
     async fn cancelled_snapshot_returns_a_clean_connection() {

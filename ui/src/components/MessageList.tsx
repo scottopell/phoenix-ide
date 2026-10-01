@@ -674,11 +674,13 @@ function MessageListImpl({
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
   const sourceToolId = sourceCallTarget?.toolUseId ?? null;
   const sourceMessageId = sourceCallTarget?.messageId ?? null;
-  const sourceUnit = sourceMessageId ? findHistoricalUnitLocationByMessageId(historicalUnits, sourceMessageId) : null;
-  const sourceRevealRequest: AgentTextRevealRequest | null = sourceUnit && sourceToolId ? {
-    unitKey: historicalUnits[sourceUnit.unitIndex]!.key,
-    fragmentId: 'tool-use-input', revealTarget: { kind: 'tool-use-input', toolUseId: sourceToolId, fragmentId: 'tool-use-input' }, nonce: 0,
-  } : null;
+  const sourceRevealRequest = useMemo<AgentTextRevealRequest | null>(() => {
+    const sourceUnit = sourceMessageId ? findHistoricalUnitLocationByMessageId(historicalUnits, sourceMessageId) : null;
+    return sourceUnit && sourceToolId ? {
+      unitKey: historicalUnits[sourceUnit.unitIndex]!.key, fragmentId: 'tool-use-input',
+      revealTarget: { kind: 'tool-use-input', toolUseId: sourceToolId, fragmentId: 'tool-use-input' }, nonce: 0,
+    } : null;
+  }, [historicalUnits, sourceMessageId, sourceToolId]);
 
   const [findRevealVersion, setFindRevealVersion] = useState(0);
   const handleFindCommands = useCallback((commands: readonly FindSessionCommand<ConversationSearchMatchTarget, HTMLElement | null>[]) => {

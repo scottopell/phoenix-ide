@@ -500,6 +500,21 @@ enum InputOrigin: Codable, Equatable, Sendable {
         }
     }
 
+    func sourceCallURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, sourceCall) = self,
+              let sourceCall, var components = URLComponents(string: serverURL),
+              components.scheme == "https" || components.scheme == "http", components.host != nil else { return nil }
+        components.path = "/c/\(transcriptId)"
+        components.queryItems = [URLQueryItem(name: "source_transcript", value: transcriptId), URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id)]
+        components.fragment = "message-\(sourceCall.message_id)"
+        return components.url
+    }
+
+    var sourceCallUnavailable: Bool {
+        if case .internalConversation(_, _, nil) = self { return true }
+        return false
+    }
+
     var isUserApiInput: Bool {
         self == .userApi
     }

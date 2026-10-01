@@ -78,6 +78,21 @@ struct MessageView: View {
     }
 }
 
+struct InputOriginHeader: View {
+    @Environment(AppModel.self) private var model
+    let origin: InputOrigin
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(origin.label).textSelection(.enabled)
+            if let url = origin.sourceCallURL(serverURL: model.serverURLString) {
+                Link("Open originating send call", destination: url)
+            } else if origin.sourceCallUnavailable {
+                Text("Original send call unavailable (not recorded)")
+            }
+        }.font(.caption).foregroundStyle(.secondary)
+    }
+}
+
 /// A skill invocation shows its trigger without exposing the expanded prompt.
 struct SkillRow: View {
     let content: JSONValue
@@ -87,9 +102,7 @@ struct SkillRow: View {
         HStack {
             if origin.isUserApiInput { Spacer(minLength: 40) }
             VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
-                Text(origin.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                InputOriginHeader(origin: origin)
                 Label(trigger, systemImage: "wand.and.stars")
                     .font(.callout.monospaced())
                     .padding(.horizontal, 10)
@@ -126,9 +139,7 @@ struct UserMessageView: View {
         HStack {
             if origin.isUserApiInput { Spacer(minLength: 40) }
             VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
-                Text(origin.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                InputOriginHeader(origin: origin)
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)
