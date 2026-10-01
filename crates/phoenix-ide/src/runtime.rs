@@ -3770,13 +3770,6 @@ impl RuntimeManager {
         conversation_id: &str,
         initialization_error: &str,
     ) -> Result<(), String> {
-        let state = ConvState::Error {
-            message: format!(
-                "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
-            ),
-            error_kind: crate::db::ErrorKind::InvalidRequest,
-            resets_at: None,
-        };
         let state_updated_at = Utc::now();
         let storage = DatabaseStorage::new(self.db.clone());
         if let Some(turn) = storage.load_active_direct_turn(conversation_id).await? {
@@ -3787,11 +3780,18 @@ impl RuntimeManager {
                     terminal: ActiveDirectTurnTerminal::Failed {
                         reason: initialization_error.to_string(),
                     },
-                    state,
+                    state: ConvState::Idle,
                     state_updated_at,
                 })
                 .await
         } else {
+            let state = ConvState::Error {
+                message: format!(
+                    "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
+                ),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            };
             storage
                 .update_state(conversation_id, &state, state_updated_at)
                 .await
@@ -12033,7 +12033,7 @@ mod scope_liveness_tests {
                 .await
                 .expect("load isolated bad row")
                 .state,
-            ConvState::Error { .. }
+            ConvState::Idle
         ));
         let bad_turn = manager
             .db()
