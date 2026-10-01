@@ -963,7 +963,7 @@ describe('MessageList', () => {
 
   it('positions an admitted source call even when ordinary history positioning is idle', () => {
     const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
-    render(withConvContext(<MessageList messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    render(withConvContext(<MessageList messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', 0, '[data-tool-id="source-tool"]');
   });
 
