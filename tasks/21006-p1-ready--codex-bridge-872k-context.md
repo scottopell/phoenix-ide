@@ -1,5 +1,7 @@
 # Support opt-in 872K context on the Codex bridge
 
+This supersedes task 60007, whose GPT-5.4-era 1M claim and conditional automatic enablement conflict with the model-specific 872K opt-in policy below. Task 60007 is `wont-do`; this task is the sole ready implementation authority.
+
 Phoenix currently caps every Codex-bridge model at 272,000 tokens in `ModelSpec::context_window_for` (`crates/phoenix-llm/src/models.rs`), with `CODEX_BRIDGE_CONTEXT_WINDOW` as the shared authority. This affects registry metadata (`/api/models`), input/output headroom, context indicators and continuation/compaction decisions. Direct OpenAI API model context remains independent. Add a deliberate opt-in way to use the larger Codex context where the account/model backend supports it, without raising the default or falsely expanding older/other models. Implement this task in its **own PR**, separate from model registration PR #801.
 
 ## Upstream evidence and terminology
