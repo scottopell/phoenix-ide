@@ -749,6 +749,9 @@ enum BashLifecycleBridgeAction {
     Reconcile,
 }
 
+type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
+type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryReceipt>>>;
+
 /// Handle to interact with a running conversation
 #[derive(Clone)]
 pub struct ConversationHandle {
@@ -777,6 +780,7 @@ pub struct ConversationHandle {
     /// transient in-flight state; the DB row is the safe rest-state fallback
     /// when no handle is present (see `effective_conversation_state`).
     pub(crate) state_rx: watch::Receiver<ConvState>,
+    startup_llm_recovery_ack: SharedStartupLlmRecoveryReceipt,
 }
 
 /// Capacity of the per-conversation SSE broadcast channel.
@@ -3706,6 +3710,16 @@ impl RuntimeManager {
                     %error,
                     "Startup could not settle one interrupted LLM request"
                 );
+                if let Err(fallback_error) = self
+                    .persist_startup_llm_initialization_failure(&conversation_id, &error)
+                    .await
+                {
+                    tracing::error!(
+                        conv_id = %conversation_id,
+                        %fallback_error,
+                        "Startup could not persist interrupted LLM fallback"
+                    );
+                }
             }
         }
         Ok(())
@@ -3716,17 +3730,47 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
-        let mut state_rx = handle.state_rx.clone();
-        loop {
-            if !matches!(
-                *state_rx.borrow_and_update(),
-                ConvState::LlmRequesting { .. }
-            ) {
-                return Ok(());
-            }
-            state_rx.changed().await.map_err(|_| {
-                "runtime exited before persisting interrupted request settlement".to_string()
-            })?;
+        let receipt = handle
+            .startup_llm_recovery_ack
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| "startup LLM recovery receipt was already consumed".to_string())?;
+        receipt
+            .await
+            .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
+    }
+
+    async fn persist_startup_llm_initialization_failure(
+        &self,
+        conversation_id: &str,
+        initialization_error: &str,
+    ) -> Result<(), String> {
+        let state = ConvState::Error {
+            message: format!(
+                "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
+            ),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        let state_updated_at = Utc::now();
+        let storage = DatabaseStorage::new(self.db.clone());
+        if let Some(turn) = storage.load_active_direct_turn(conversation_id).await? {
+            storage
+                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                    conversation_id: conversation_id.to_string(),
+                    turn: turn.into_active(),
+                    terminal: ActiveDirectTurnTerminal::Failed {
+                        reason: initialization_error.to_string(),
+                    },
+                    state,
+                    state_updated_at,
+                })
+                .await
+        } else {
+            storage
+                .update_state(conversation_id, &state, state_updated_at)
+                .await
         }
     }
 
@@ -5366,6 +5410,8 @@ impl RuntimeManager {
             });
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
+        let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
+        let startup_llm_recovery_ack = Arc::new(AsyncMutex::new(Some(startup_llm_recovery_ack_rx)));
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             if let Some(obligation) = &recovered_terminal_obligation {
                 (
@@ -5380,6 +5426,17 @@ impl RuntimeManager {
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
+        let startup_llm_recovery = if matches!(initial_state, ConvState::LlmRequesting { .. })
+            && self
+                .db
+                .has_committed_steering_turn(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+        } else {
+            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+        };
         let startup_creation_completion =
             if matches!(initial_state, ConvState::LlmRequesting { .. }) {
                 self.db
@@ -5447,6 +5504,8 @@ impl RuntimeManager {
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
+            .with_startup_llm_recovery(startup_llm_recovery)
+            .with_startup_llm_recovery_ack(startup_llm_recovery_ack_tx)
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
@@ -5560,6 +5619,7 @@ impl RuntimeManager {
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
             state_rx: state_rx.clone(),
+            startup_llm_recovery_ack: Arc::clone(&startup_llm_recovery_ack),
         };
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
@@ -5597,6 +5657,7 @@ impl RuntimeManager {
                     broadcast_tx: broadcaster,
                     identity,
                     state_rx,
+                    startup_llm_recovery_ack: Arc::clone(&startup_llm_recovery_ack),
                 },
             );
             // The live handle and reservation hand-off change atomically under
@@ -5701,6 +5762,7 @@ impl RuntimeManager {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
     }
@@ -5725,6 +5787,7 @@ impl RuntimeManager {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         event_rx
@@ -6130,6 +6193,7 @@ impl RuntimeManager {
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
             state_rx: h.state_rx.clone(),
+            startup_llm_recovery_ack: Arc::clone(&h.startup_llm_recovery_ack),
         })
     }
 
@@ -9730,6 +9794,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         acknowledged_event_rx
@@ -10010,6 +10075,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
 
@@ -10159,6 +10225,7 @@ mod scope_liveness_tests {
                     )),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -10985,6 +11052,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
     }
@@ -11938,8 +12006,18 @@ mod scope_liveness_tests {
                 .await
                 .expect("load isolated bad row")
                 .state,
-            ConvState::LlmRequesting { .. }
+            ConvState::Error { .. }
         ));
+        let bad_turn = manager
+            .db()
+            .workflow_repository()
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(bad_id.to_string()))
+            .await
+            .expect("load failed turn");
+        assert!(
+            bad_turn.is_none(),
+            "fallback releases durable turn ownership"
+        );
     }
 
     #[tokio::test]
@@ -12034,6 +12112,71 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn startup_replays_committed_steering_turn_once() {
+        use phoenix_core::domain::db_schema::MessageContent;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "committed-steering-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "resume accepted steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "committed-steer-fingerprint",
+            )
+            .await
+            .expect("accept steer");
+        let content = MessageContent::user("resume accepted steer");
+        manager
+            .db()
+            .commit_steering_drain(
+                conversation_id,
+                &[crate::db::Message {
+                    message_id: "committed-steer".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("commit steering drain");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("replay committed steering owner");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
