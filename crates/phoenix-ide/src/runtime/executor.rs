@@ -7121,6 +7121,7 @@ where
             "Settling provider request interrupted by server restart"
         );
         if let Some(turn) = self.active_direct_turn.take() {
+            let _owner = self.live_state_owner()?;
             let state = ConvState::Idle;
             let state_updated_at = Utc::now();
             self.storage
