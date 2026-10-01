@@ -11981,6 +11981,7 @@ mod scope_liveness_tests {
             .await
             .expect("create conversation");
         let identity = SubmittedDirectTurnIdentity {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: "resume exactly this turn".to_string(),
             images: Vec::new(),
             files: Vec::new(),
@@ -12354,6 +12355,7 @@ mod scope_liveness_tests {
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
                     text: "resume accepted steer".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -12372,6 +12374,7 @@ mod scope_liveness_tests {
             .commit_steering_drain(
                 conversation_id,
                 &[crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
                     message_id: "committed-steer".to_string(),
                     conversation_id: conversation_id.to_string(),
                     sequence_id: 1,
