@@ -3709,6 +3709,18 @@ impl RuntimeManager {
                 .get_conversation(&conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            let resumable_owner =
+                matches!(conversation.state, ConvState::SeededLlmRequesting { .. })
+                    || self
+                        .db
+                        .has_pending_approval_request(&conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    || self
+                        .db
+                        .has_committed_steering_turn(&conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
             let stored_model_id = conversation
                 .model
                 .unwrap_or_else(|| self.llm_registry.default_model_id());
@@ -3721,8 +3733,12 @@ impl RuntimeManager {
                 let _owner = self.acquire_local_authority_pass().map_err(|()| {
                     "local authority closed before startup recovery fallback".to_string()
                 })?;
-                self.persist_startup_llm_initialization_failure(&conversation_id, &error)
-                    .await?;
+                self.persist_startup_llm_initialization_failure(
+                    &conversation_id,
+                    &error,
+                    resumable_owner,
+                )
+                .await?;
                 continue;
             }
             if conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator {
@@ -3736,6 +3752,7 @@ impl RuntimeManager {
                     self.persist_startup_llm_initialization_failure(
                         &conversation_id,
                         &error.to_string(),
+                        resumable_owner,
                     )
                     .await?;
                     continue;
@@ -3769,6 +3786,7 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
         initialization_error: &str,
+        resumable_owner: bool,
     ) -> Result<(), String> {
         let state_updated_at = Utc::now();
         let storage = DatabaseStorage::new(self.db.clone());
@@ -3780,7 +3798,17 @@ impl RuntimeManager {
                     terminal: ActiveDirectTurnTerminal::Failed {
                         reason: initialization_error.to_string(),
                     },
-                    state: ConvState::Idle,
+                    state: if resumable_owner {
+                        ConvState::Error {
+                            message: format!(
+                                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
+                            ),
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
+                            resets_at: None,
+                        }
+                    } else {
+                        ConvState::Idle
+                    },
                     state_updated_at,
                 })
                 .await
