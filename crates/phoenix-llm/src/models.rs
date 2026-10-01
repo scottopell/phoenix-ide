@@ -415,7 +415,7 @@ impl ModelSpec {
         let openai_fast = service.uses_codex_bridge()
             || (matches!(
                 self.api_name.as_str(),
-                "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+                "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna"
             ) && service.uses_official_openai_responses());
         // Anthropic Fast mode is a research-preview capability of the official
         // direct Claude API only. A compatible/proxy base URL or a cloud route
@@ -763,6 +763,23 @@ pub fn all_models() -> Vec<ModelSpec> {
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
+            id: "gpt-6.1-sol".into(),
+            api_name: "gpt-6.1-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6.1 Sol (balanced speed and intelligence, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::supported_known(
+                EFFORT_LEVELS_GPT_6_ASTRA,
+                ModelEffort::Medium,
+            ),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
             id: "gpt-6-sol".into(),
             api_name: "gpt-6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
@@ -970,10 +987,31 @@ mod tests {
                 "gpt-5.6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-6-luna",
                 "gpt-6-sol",
             ])
+        );
+    }
+
+    #[test]
+    fn gpt_61_sol_model_contract() {
+        let sol_61 = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-6.1-sol")
+            .unwrap();
+        assert_eq!(sol_61.api_name, "gpt-6.1-sol");
+        assert_eq!(sol_61.context_window, 1_050_000);
+        assert_eq!(sol_61.output_token_limit(), Some(128_000));
+        assert_eq!(
+            sol_61.effort_capabilities,
+            EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Medium)
+        );
+        assert!(!sol_61.effort_capabilities.supports(ModelEffort::None));
+        assert_eq!(
+            sol_61.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
         );
     }
 

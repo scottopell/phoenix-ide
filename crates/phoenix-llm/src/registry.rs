@@ -1824,7 +1824,7 @@ mod tests {
             ModelRegistry::new_with_codex_catalog(&config, None),
             ModelRegistry::new_with_codex_catalog(&config, Some(&unrelated)),
         ] {
-            for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
                 assert!(
                     registry.get(id).is_some(),
                     "missing supported built-in {id}"
@@ -1963,6 +1963,56 @@ mod tests {
             assert_eq!(
                 info.service_tier_capabilities,
                 ServiceTierCapabilities::Supported
+            );
+        }
+    }
+
+    #[test]
+    fn gpt_61_sol_uses_route_native_effort_and_context() {
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".into()),
+            ..Default::default()
+        });
+        let info = direct
+            .available_model_info()
+            .into_iter()
+            .find(|m| m.id == "gpt-6.1-sol")
+            .unwrap();
+        assert_eq!(info.context_window, 1_050_000);
+        assert_eq!(
+            info.service_tier_capabilities,
+            ServiceTierCapabilities::Supported
+        );
+        assert!(
+            matches!(&info.effort_capabilities, EffortCapabilities::Supported(caps)
+            if caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+                && !caps.levels().contains(&ModelEffort::None)
+                && caps.levels().contains(&ModelEffort::Max))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        for catalog in [None, Some(HashSet::new())] {
+            let codex = ModelRegistry::new_with_codex_catalog(&config, catalog.as_ref());
+            let info = codex
+                .available_model_info()
+                .into_iter()
+                .find(|m| m.id == "gpt-6.1-sol")
+                .unwrap();
+            assert_eq!(info.context_window, 272_000);
+            assert_eq!(
+                info.service_tier_capabilities,
+                ServiceTierCapabilities::Supported
+            );
+            assert!(
+                matches!(&info.effort_capabilities, EffortCapabilities::Supported(caps)
+                if caps.native_default() == NativeDefault::Known(ModelEffort::Medium)
+                    && !caps.levels().contains(&ModelEffort::None)
+                    && caps.levels().contains(&ModelEffort::Max))
             );
         }
     }
@@ -2727,7 +2777,13 @@ mod tests {
                 .as_deref(),
             Some("acc-1")
         );
-        for id in ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for id in [
+            "gpt-5.6-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
             assert!(
                 registry.get(id).is_some(),
                 "reload must register supported Codex built-in {id} without catalog discovery"
@@ -2762,7 +2818,7 @@ mod tests {
         );
 
         assert!(outcome.credential_loaded);
-        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for id in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
             assert!(
                 registry.get(id).is_some(),
                 "missing supported built-in {id}"

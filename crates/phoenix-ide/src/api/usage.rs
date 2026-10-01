@@ -1115,6 +1115,17 @@ mod tests {
     }
 
     #[test]
+    fn gpt_61_sol_pricing_is_unknown_without_per_request_long_context_data() {
+        use phoenix_core::domain::llm_types::ServiceTier;
+        for tier in [ServiceTier::Standard, ServiceTier::Fast] {
+            let cost =
+                calculate_turn_cost_for_tier("gpt-6.1-sol", tier, 300_000, 100_000, 20_000, 50_000);
+            assert!(!cost.pricing_known);
+            assert_eq!(cost.total_usd, None);
+        }
+    }
+
+    #[test]
     fn gpt_6_sol_luna_pricing_is_unknown_without_per_request_long_context_data() {
         use phoenix_core::domain::llm_types::ServiceTier;
         for model in ["gpt-6-sol", "gpt-6-luna"] {

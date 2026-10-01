@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn gpt6_sol_luna_codex_use_websocket_and_responses_lite_limits() {
-        for model in ["gpt-6-sol", "gpt-6-luna"] {
+        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
             let spec = all_models()
                 .into_iter()
                 .find(|spec| spec.id == model)
