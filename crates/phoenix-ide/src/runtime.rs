@@ -701,6 +701,8 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     wake_kick_tx: tokio::sync::watch::Sender<u64>,
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    #[cfg(test)]
+    wake_worker_exit: AsyncMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
@@ -2374,6 +2376,8 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             wake_kick_tx,
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
+            #[cfg(test)]
+            wake_worker_exit: AsyncMutex::new(None),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             fatal_local_authority_fence,
@@ -3544,6 +3548,11 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.is_closed()
     }
 
+    pub(crate) fn local_authority_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.fatal_local_authority_fence
+            .external_effect_cancellation()
+    }
+
     pub(crate) fn acquire_local_authority_pass(&self) -> Result<AdmittedOperation, ()> {
         self.fatal_local_authority_fence.try_acquire()
     }
@@ -3684,16 +3693,41 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
-    pub async fn resume_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
+    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
         let conversation_ids = self
             .db
             .llm_requesting_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
         for conversation_id in conversation_ids {
-            self.get_or_create(&conversation_id).await?;
+            if let Err(error) = self.settle_persisted_llm_request(&conversation_id).await {
+                tracing::error!(
+                    conv_id = %conversation_id,
+                    %error,
+                    "Startup could not settle one interrupted LLM request"
+                );
+            }
         }
         Ok(())
+    }
+
+    async fn settle_persisted_llm_request(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        let mut state_rx = handle.state_rx.clone();
+        loop {
+            if !matches!(
+                *state_rx.borrow_and_update(),
+                ConvState::LlmRequesting { .. }
+            ) {
+                return Ok(());
+            }
+            state_rx.changed().await.map_err(|_| {
+                "runtime exited before persisting interrupted request settlement".to_string()
+            })?;
+        }
     }
 
     pub async fn start_direct_turn_worker(
@@ -3761,20 +3795,42 @@ impl RuntimeManager {
             }
         };
         let manager = Arc::clone(self);
+        #[cfg(test)]
+        let wake_worker_exit = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *self.wake_worker_exit.lock().await = Some(rx);
+            Some(tx)
+        };
         tokio::spawn(async move {
-            let detail = Self::describe_wake_worker_exit(worker.await);
-            tracing::error!(%detail, "wake worker lost local authority");
-            manager.signal_fatal_local_authority("wake_worker_exit");
+            match worker.await {
+                Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
+                    tracing::info!("wake worker stopped for coordinated shutdown");
+                }
+                result => {
+                    let detail = Self::describe_wake_worker_exit(result);
+                    tracing::error!(%detail, "wake worker lost local authority");
+                    manager.signal_fatal_local_authority("wake_worker_exit");
+                }
+            }
+            #[cfg(test)]
+            if let Some(exit) = wake_worker_exit {
+                let _ = exit.send(());
+            }
         });
         self.kick_wake_worker();
         Ok(())
     }
 
     fn describe_wake_worker_exit(
-        result: Result<Result<(), String>, tokio::task::JoinError>,
+        result: Result<
+            Result<crate::runtime::wake::WakeWorkerExit, String>,
+            tokio::task::JoinError,
+        >,
     ) -> String {
         match result {
-            Ok(Ok(())) => "wake worker exited unexpectedly".to_string(),
+            Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
+                "wake worker exited for coordinated shutdown".to_string()
+            }
             Ok(Err(error)) => format!("wake worker exited: {error}"),
             Err(error) => format!("wake worker join failure: {error}"),
         }
@@ -9915,6 +9971,30 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn production_wake_worker_exit_is_coordinated_during_process_shutdown() {
+        let manager = Arc::new(test_manager().await);
+        manager
+            .start_wake_worker()
+            .await
+            .expect("start production wake supervisor");
+        let fatal = manager.fatal_local_authority_receiver();
+
+        manager.begin_process_shutdown();
+        manager.kick_wake_worker();
+        manager
+            .wake_worker_exit
+            .lock()
+            .await
+            .take()
+            .expect("wake worker exit observer")
+            .await
+            .expect("wake supervisor publishes exit");
+
+        assert_eq!(*fatal.borrow(), None);
+        manager.drain_process_shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
         let manager = test_manager().await;
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -11768,7 +11848,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn startup_resumes_materialized_direct_turn_without_another_user_message() {
+    async fn startup_settles_materialized_direct_turn_without_redispatch() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -11782,36 +11862,24 @@ mod scope_liveness_tests {
             .expect("run startup reset");
 
         manager
-            .resume_persisted_llm_requests()
+            .settle_persisted_llm_requests()
             .await
-            .expect("resume durable owner");
+            .expect("settle durable owner");
         let handle = manager
             .try_get_handle(conversation_id)
             .await
             .expect("startup proactively materializes runtime");
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while llm.requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup dispatches the resumed provider request");
-        let mut states = handle.state_rx.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if *states.borrow_and_update() == ConvState::Idle {
-                    break;
-                }
-                states
-                    .changed()
-                    .await
-                    .expect("runtime stays live until completion");
-            }
-        })
-        .await
-        .expect("resumed provider request completes");
-
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(*handle.state_rx.borrow(), ConvState::Error { .. }));
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load settled conversation")
+                .state,
+            ConvState::Error { .. }
+        ));
         assert_eq!(
             manager
                 .db()
@@ -11823,6 +11891,55 @@ mod scope_liveness_tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn startup_settlement_isolates_one_uninitializable_conversation() {
+        let manager = Arc::new(test_manager().await);
+        let bad_id = "restart-bad-model";
+        let good_id = "restart-good-model";
+        materialize_restart_direct_turn(&manager, bad_id).await;
+        materialize_restart_direct_turn(&manager, good_id).await;
+        manager
+            .db()
+            .update_conversation_model_and_effort(
+                bad_id,
+                "gpt-5.4-mini",
+                None,
+                phoenix_core::domain::llm_types::ServiceTier::Standard,
+                "default",
+            )
+            .await
+            .expect("corrupt one persisted model reference");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("one bad row does not abort startup settlement");
+
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(good_id)
+                .await
+                .expect("load settled good row")
+                .state,
+            ConvState::Error { .. }
+        ));
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(bad_id)
+                .await
+                .expect("load isolated bad row")
+                .state,
+            ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[tokio::test]

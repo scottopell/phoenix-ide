@@ -211,7 +211,7 @@ impl AppState {
         runtime.start_creation_worker().await?;
         runtime.require_startup_local_authority()?;
         runtime
-            .resume_persisted_llm_requests()
+            .settle_persisted_llm_requests()
             .await
             .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
