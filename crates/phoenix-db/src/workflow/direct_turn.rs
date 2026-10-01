@@ -5437,6 +5437,8 @@ mod tests {
     #[tokio::test]
     async fn continuation_message_projection_and_owner_release_commit_atomically() {
         let repo = repo().await;
+        sqlx::query("UPDATE product_conversations SET auto_continue_on_context_exhaustion = 1 WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'conv-a')").execute(&repo.pool).await.unwrap();
+        sqlx::query("INSERT INTO coordinator_watches(source_product_conversation_id,enrolled_at_us) SELECT product_conversation_id,0 FROM conversations WHERE id = 'conv-a'").execute(&repo.pool).await.unwrap();
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "continuation-terminal", 8))
             .await
@@ -5479,9 +5481,10 @@ mod tests {
             message,
             completed_state: completed.clone(),
             state_updated_at: Utc::now(),
-            command: TurnCommand::Complete {
+            command: TurnCommand::Fail {
                 turn_id,
                 expected_generation: 0,
+                reason: "context exhausted".into(),
             },
         };
 
@@ -5507,6 +5510,13 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_json).unwrap(),
             completed
         );
+        let fence: (String, String) = sqlx::query_as("SELECT continuation_state, delivery_state FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a'").fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(fence, ("awaiting".into(), "pending".into()));
+        let claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events WHERE delivery_state = 'pending' AND continuation_state = 'none'").fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(claimable, 0);
+        sqlx::query("UPDATE automatic_continuation_admissions SET phase = 'failed', last_error = 'continuation failed' WHERE predecessor_conversation_id = 'conv-a'").execute(&repo.pool).await.unwrap();
+        let claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events WHERE delivery_state = 'pending' AND continuation_state = 'none'").fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(claimable, 1);
         assert_eq!(state_kind, "context_exhausted");
         let message_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-a'")
