@@ -12,6 +12,8 @@ final class RenderingReducerTests: XCTestCase {
         let historical = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member")
         XCTAssertNil(historical.sourceCallURL(serverURL: "https://example.test"))
         XCTAssertTrue(historical.sourceCallUnavailable)
+        XCTAssertEqual(historical.sourceTranscriptURL(serverURL: "https://example.test/phoenix")?.path, "/phoenix/c/original-member")
+        XCTAssertEqual(origin.sourceCallURL(serverURL: "https://example.test/phoenix/")?.path, "/phoenix/c/original-member")
     }
 
     func testKnownNoteShapesUseUserFacingFields() {

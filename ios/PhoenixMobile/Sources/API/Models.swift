@@ -500,11 +500,17 @@ enum InputOrigin: Codable, Equatable, Sendable {
         }
     }
 
+    func sourceTranscriptURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, _) = self,
+              let base = URL(string: serverURL),
+              base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
+        return base.appendingPathComponent("c").appendingPathComponent(transcriptId)
+    }
+
     func sourceCallURL(serverURL: String) -> URL? {
         guard case let .internalConversation(_, transcriptId, sourceCall) = self,
-              let sourceCall, var components = URLComponents(string: serverURL),
-              components.scheme == "https" || components.scheme == "http", components.host != nil else { return nil }
-        components.path = "/c/\(transcriptId)"
+              let sourceCall, let base = sourceTranscriptURL(serverURL: serverURL),
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
         components.queryItems = [URLQueryItem(name: "source_transcript", value: transcriptId), URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id)]
         components.fragment = "message-\(sourceCall.message_id)"
         return components.url

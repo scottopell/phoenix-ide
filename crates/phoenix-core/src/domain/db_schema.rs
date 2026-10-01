@@ -1569,7 +1569,21 @@ impl InputOrigin {
     /// Compare a stored admission with a retry without reattributing historical data.
     #[must_use]
     pub fn accepts_retry_origin(&self, retry: &Self) -> bool {
-        self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi))
+        match (self, retry) {
+            (
+                Self::InternalConversation {
+                    product_conversation_id: a,
+                    transcript_id: b,
+                    ..
+                },
+                Self::InternalConversation {
+                    product_conversation_id: c,
+                    transcript_id: d,
+                    ..
+                },
+            ) => a == c && b == d,
+            _ => self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi)),
+        }
     }
 
     #[must_use]

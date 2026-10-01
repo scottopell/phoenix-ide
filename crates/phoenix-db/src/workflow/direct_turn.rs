@@ -7532,6 +7532,29 @@ mod tests {
             panic!("expected created turn")
         };
 
+        let mut retry = payload.submitted.clone();
+        if let phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            source_call,
+            ..
+        } = &mut retry.origin
+        {
+            *source_call = Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                message_id: "retry-message".into(),
+                tool_use_id: "retry-call".into(),
+            }));
+        }
+        let replay = repo
+            .lookup_scoped_direct_turn_replay(&conversation, &input.client_key, &retry)
+            .await
+            .unwrap();
+        let ScopedDirectTurnReplayLookup::Exact {
+            prepared: replayed, ..
+        } = replay
+        else {
+            panic!("expected original admission")
+        };
+        assert_eq!(replayed.submitted.origin, payload.submitted.origin);
+
         let stored_payload: Vec<u8> =
             sqlx::query_scalar("SELECT prepared_payload FROM durable_turns WHERE turn_id = ?1")
                 .bind(i64::try_from(turn_id.0).unwrap())
