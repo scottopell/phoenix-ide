@@ -1121,6 +1121,16 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                         tracing::error!(?boundary, "fatal local SQLite authority loss during HTTP drain");
+                        let fatal_tail = async {
+                            runtime_for_fatal.fence_fatal_local_authority().await;
+                            crate::tools::bash::shutdown_kill_tree_until(deadline, &bash_handles_for_shutdown).await;
+                        };
+                        let _ = tls::bounded_post_shutdown_drain_until(
+                            deadline,
+                            fatal_tail,
+                            "HTTP fatal authority during drain",
+                        ).await;
+                        tracing_handles.shutdown_tracer_until(deadline);
                         return Err(FatalLocalAuthorityExit.into());
                     }
                 }

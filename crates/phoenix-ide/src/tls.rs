@@ -224,6 +224,23 @@ where
     connection_result
 }
 
+async fn finish_fatal_https_drain(
+    runtime: &crate::runtime::RuntimeManager,
+    deadline: tokio::time::Instant,
+    bash_handles: &crate::tools::bash::BashHandleRegistry,
+) {
+    let fatal_tail = async {
+        runtime.fence_fatal_local_authority().await;
+        crate::tools::bash::shutdown_kill_tree_until(deadline, bash_handles).await;
+    };
+    let _ = bounded_post_shutdown_drain_until(
+        deadline,
+        fatal_tail,
+        "HTTPS fatal authority during drain",
+    )
+    .await;
+}
+
 pub async fn serve_https(
     listener: TcpListener,
     app: Router,
@@ -339,6 +356,7 @@ pub async fn serve_https(
         _ = &mut drain => Ok(()),
         boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
             tracing::error!(?boundary, "fatal local SQLite authority loss during HTTPS drain");
+            finish_fatal_https_drain(runtime, deadline, bash_handles).await;
             Err(crate::FatalLocalAuthorityExit.into())
         }
     }

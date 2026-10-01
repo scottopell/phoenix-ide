@@ -5449,7 +5449,8 @@ impl RuntimeManager {
             } else {
                 None
             };
-        let resumable_owner = matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+        let resumable_owner = startup_creation_completion.is_some()
+            || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
             || self
                 .db
                 .has_pending_approval_request(conversation_id)
