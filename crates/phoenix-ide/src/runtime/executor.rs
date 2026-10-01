@@ -365,7 +365,13 @@ struct AbortTaskOnDrop(tokio::task::AbortHandle);
 enum StartupSteeringDrainOutcome {
     NotNeeded,
     StartedLlm,
-    ResumeLlm,
+    ResumeCommittedSteering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupLlmRecovery {
+    SettleInterrupted,
+    ResumeCommittedSteering,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1813,6 +1819,8 @@ where
         String,
         phoenix_core::domain::creation_protocol::CreationClaim,
     )>,
+    startup_llm_recovery: StartupLlmRecovery,
+    startup_llm_recovery_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     creation_settlement_disposition: CreationSettlementDisposition,
     storage: S,
     llm_client: Arc<L>,
@@ -2132,6 +2140,8 @@ where
             state,
             state_updated_at: Utc::now(),
             startup_creation_completion: None,
+            startup_llm_recovery: StartupLlmRecovery::SettleInterrupted,
+            startup_llm_recovery_ack: None,
             creation_settlement_disposition: CreationSettlementDisposition::Continue,
             storage,
             llm_client: Arc::new(llm_client),
@@ -2233,6 +2243,19 @@ where
         claim: phoenix_core::domain::creation_protocol::CreationClaim,
     ) -> Self {
         self.startup_creation_completion = Some((job_id, claim));
+        self
+    }
+
+    pub(crate) fn with_startup_llm_recovery(mut self, recovery: StartupLlmRecovery) -> Self {
+        self.startup_llm_recovery = recovery;
+        self
+    }
+
+    pub(crate) fn with_startup_llm_recovery_ack(
+        mut self,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> Self {
+        self.startup_llm_recovery_ack = Some(ack);
         self
     }
 
@@ -2491,8 +2514,6 @@ where
             }
         };
 
-        // Check if we need to resume an interrupted operation
-        // This handles crash recovery for in-flight LLM requests
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
             if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
@@ -2500,20 +2521,35 @@ where
                     conv_id = %self.context.conversation_id,
                     "Startup steering drain started the LLM request"
                 );
+                if let Some(ack) = self.startup_llm_recovery_ack.take() {
+                    let _ = ack.send(Ok(()));
+                }
             } else {
-                tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            }
-            if startup_drain != StartupSteeringDrainOutcome::StartedLlm {
-                if let Err(settlement_error) = Box::pin(self.resume_interrupted_llm_request()).await
-                {
+                let recovery =
+                    if startup_drain == StartupSteeringDrainOutcome::ResumeCommittedSteering {
+                        self.resume_committed_steering_request().await
+                    } else {
+                        match self.startup_llm_recovery {
+                            StartupLlmRecovery::ResumeCommittedSteering => {
+                                self.resume_committed_steering_request().await
+                            }
+                            StartupLlmRecovery::SettleInterrupted => {
+                                Box::pin(self.settle_interrupted_llm_request()).await
+                            }
+                        }
+                    };
+                if let Some(ack) = self.startup_llm_recovery_ack.take() {
+                    let _ = ack.send(recovery.clone());
+                }
+                if let Err(settlement_error) = recovery {
                     tracing::error!(
                         %settlement_error,
-                        "Failed to settle resumed LLM dispatch error; retiring runtime for reconstruction"
+                        "Failed to durably settle interrupted LLM request"
                     );
                     let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                         sequence_id: seq,
                         error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                            "resume the LLM request",
+                            "settle the interrupted LLM request",
                         ),
                     });
                     return RuntimeExitDisposition::Interrupted;
@@ -4427,7 +4463,7 @@ where
         }) {
             StartupSteeringDrainOutcome::StartedLlm
         } else {
-            StartupSteeringDrainOutcome::ResumeLlm
+            StartupSteeringDrainOutcome::ResumeCommittedSteering
         };
         let generated_events = self.apply_transition_result(result).await?;
         for generated_event in generated_events {
@@ -7064,16 +7100,64 @@ where
         }
     }
 
-    async fn resume_interrupted_llm_request(&mut self) -> Result<bool, String> {
+    async fn resume_committed_steering_request(&mut self) -> Result<(), String> {
         match self.execute_effect(Effect::RequestLlm).await {
-            Ok(_) => Ok(false),
+            Ok(_) => Ok(()),
             Err(error) => {
-                tracing::error!(%error, "Failed to resume LLM request");
                 let failure = self.llm_dispatch_failure_event(error);
-                self.process_event(failure).await?;
-                Ok(true)
+                self.process_event(failure).await
             }
         }
+    }
+
+    async fn settle_interrupted_llm_request(&mut self) -> Result<(), String> {
+        let attempt = match self.state {
+            ConvState::LlmRequesting { attempt } => attempt,
+            _ => 1,
+        };
+        tracing::warn!(
+            conv_id = %self.context.conversation_id,
+            attempt,
+            "Settling provider request interrupted by server restart"
+        );
+        if let Some(turn) = self.active_direct_turn.take() {
+            let _owner = self.live_state_owner()?;
+            let state = ConvState::Idle;
+            let state_updated_at = Utc::now();
+            self.storage
+                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                    conversation_id: self.context.conversation_id.clone(),
+                    turn: *turn,
+                    terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                        reason: "server restarted during provider request".to_string(),
+                    },
+                    state: state.clone(),
+                    state_updated_at,
+                })
+                .await?;
+            self.state = state.clone();
+            self.state_updated_at = state_updated_at;
+            if let Some(tx) = &self.state_watcher {
+                tx.send_replace(state.clone());
+            }
+            let _ = self
+                .broadcast_tx
+                .send_seq(|sequence_id| SseEvent::StateChange {
+                    sequence_id,
+                    state,
+                    presentation_mode: "normal".to_string(),
+                    state_updated_at,
+                });
+            return Ok(());
+        }
+        self.process_event(Event::LlmError {
+            message: "The server restarted while this model request was in progress. Send a new message to continue.".to_string(),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            attempt,
+            recovery_in_progress: false,
+            resets_at: None,
+        })
+        .await
     }
 
     /// The executor's turn-trigger slot, for sharing with the
@@ -15849,6 +15933,26 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn process_shutdown_rejects_never_admitted_provider_dispatch() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        fence.close_for_process_shutdown();
+
+        let error = rt
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .expect_err("shutdown rejects new provider dispatch");
+
+        assert!(error.contains("runtime persistence closed"));
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.active_llm_attempt.is_none());
+    }
+
+    #[tokio::test]
     async fn external_effect_dispatch_holds_owner_until_task_is_registered() {
         let (mut rt, _storage, _broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
@@ -18755,7 +18859,10 @@ mod steer_drain_detector_tests {
             .await
             .expect("startup legacy drain");
 
-        assert_eq!(outcome, StartupSteeringDrainOutcome::ResumeLlm);
+        assert_eq!(
+            outcome,
+            StartupSteeringDrainOutcome::ResumeCommittedSteering
+        );
         assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
         assert!(storage.get_steering_queue(conversation_id).is_empty());
         assert!(
@@ -19948,7 +20055,7 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
-    async fn crash_before_llm_commit_recovers_the_existing_direct_turn() {
+    async fn restart_settles_the_existing_direct_turn_without_redispatch() {
         let conversation_id = "conv-timeout-crash-recovery";
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             conversation_id,
@@ -19962,22 +20069,16 @@ mod steer_drain_detector_tests {
         storage.set_active_direct_turn(Some(turn.clone()));
         rt.active_direct_turn = Some(Box::new(turn));
 
-        assert!(!rt
-            .resume_interrupted_llm_request()
+        rt.settle_interrupted_llm_request()
             .await
-            .expect("existing accepted turn is redispatched"));
-        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }));
-        assert_eq!(
-            rt.active_direct_turn.as_deref().map(|turn| turn.turn_id),
-            Some(phoenix_workflow::TurnAuthorityId(404))
-        );
+            .expect("existing accepted turn is durably settled");
+        assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(storage.get_all_messages(conversation_id).len(), 0);
-        assert!(rt.llm_task_handle.is_some());
-        rt.llm_task_handle.take().unwrap().abort();
+        assert!(rt.llm_task_handle.is_none());
     }
 
     #[tokio::test]
-    async fn committed_steering_recovery_dispatch_failure_persists_error() {
+    async fn committed_steering_dispatch_failure_persists_visible_error() {
         let conversation_id = "conv-steering-recovery-dispatch-failure";
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             conversation_id,
@@ -19985,13 +20086,9 @@ mod steer_drain_detector_tests {
             Vec::new(),
         );
         rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
-
-        assert!(
-            rt.resume_interrupted_llm_request()
-                .await
-                .expect("dispatch failure settles"),
-            "synchronous recovery dispatch failure must be reported"
-        );
+        rt.resume_committed_steering_request()
+            .await
+            .expect("synchronous dispatch failure settles");
 
         let expected = ConvState::Error {
             message: "Persisted effort 'high' is not supported by model 'test-model'".to_string(),
@@ -20013,14 +20110,13 @@ mod steer_drain_detector_tests {
     async fn committed_steering_recovery_settlement_failure_retires_runtime() {
         let conversation_id = "conv-steering-recovery-settlement-failure";
         let initial_state = ConvState::LlmRequesting { attempt: 1 };
-        let (mut rt, storage) =
+        let (rt, storage) =
             build_runtime_with_state_and_queue(conversation_id, initial_state.clone(), Vec::new());
         storage
             .update_state(conversation_id, &initial_state, Utc::now())
             .await
             .expect("seed durable recovery state");
         storage.set_fail_state_update(true);
-        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), rt.run())
             .await

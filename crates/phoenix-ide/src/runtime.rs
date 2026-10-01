@@ -416,6 +416,14 @@ impl FatalLocalAuthorityFence {
     }
 
     pub(crate) fn close(&self, boundary: &'static str) {
+        self.close_inner(boundary, true);
+    }
+
+    fn close_for_process_shutdown(&self) {
+        self.close_inner("process_shutdown", false);
+    }
+
+    fn close_inner(&self, boundary: &'static str, signal_fatal_authority_loss: bool) {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
         let boundary = *state.boundary.get_or_insert(boundary);
@@ -429,7 +437,9 @@ impl FatalLocalAuthorityFence {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.tx.send_replace(Some(boundary));
+        if signal_fatal_authority_loss {
+            self.tx.send_replace(Some(boundary));
+        }
         self.external_effect_cancellation.cancel();
         drop(state);
     }
@@ -693,6 +703,8 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     wake_kick_tx: tokio::sync::watch::Sender<u64>,
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    #[cfg(test)]
+    wake_worker_exit: AsyncMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
@@ -739,6 +751,9 @@ enum BashLifecycleBridgeAction {
     Reconcile,
 }
 
+type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
+type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryReceipt>>>;
+
 /// Handle to interact with a running conversation
 #[derive(Clone)]
 pub struct ConversationHandle {
@@ -767,6 +782,7 @@ pub struct ConversationHandle {
     /// transient in-flight state; the DB row is the safe rest-state fallback
     /// when no handle is present (see `effective_conversation_state`).
     pub(crate) state_rx: watch::Receiver<ConvState>,
+    startup_llm_recovery_ack: SharedStartupLlmRecoveryReceipt,
 }
 
 /// Capacity of the per-conversation SSE broadcast channel.
@@ -2375,6 +2391,8 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             wake_kick_tx,
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
+            #[cfg(test)]
+            wake_worker_exit: AsyncMutex::new(None),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             fatal_local_authority_fence,
@@ -2443,6 +2461,21 @@ impl RuntimeManager {
     pub(crate) async fn fence_fatal_local_authority(&self) {
         self.fatal_local_authority_fence
             .close("fatal_local_authority_fence");
+        self.drain_closed_runtime_authority("fatal authority fence")
+            .await;
+    }
+
+    pub(crate) fn begin_process_shutdown(&self) {
+        self.fatal_local_authority_fence
+            .close_for_process_shutdown();
+    }
+
+    pub(crate) async fn drain_process_shutdown(&self) {
+        self.drain_closed_runtime_authority("process shutdown")
+            .await;
+    }
+
+    async fn drain_closed_runtime_authority(&self, label: &'static str) {
         let shutdown = async {
             self.fatal_local_authority_fence.wait_for_owners().await;
             let reserved: Vec<_> = self
@@ -2471,19 +2504,14 @@ impl RuntimeManager {
             for handle in handles {
                 handle.broadcast_tx.close_publication();
                 if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
-                    tracing::debug!(?error, "fatal shutdown event delivery skipped");
+                    tracing::debug!(?error, %label, "shutdown event delivery skipped");
                 }
             }
         };
         let deadline = self
             .fatal_local_authority_deadline()
-            .expect("fatal authority deadline must be set before fence drain");
-        let _ = crate::tls::bounded_post_shutdown_drain_until(
-            deadline,
-            shutdown,
-            "fatal authority fence",
-        )
-        .await;
+            .expect("shutdown deadline must be set before runtime authority drain");
+        let _ = crate::tls::bounded_post_shutdown_drain_until(deadline, shutdown, label).await;
     }
 
     pub fn fatal_local_authority_receiver(
@@ -3535,6 +3563,11 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.is_closed()
     }
 
+    pub(crate) fn local_authority_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.fatal_local_authority_fence
+            .external_effect_cancellation()
+    }
+
     pub(crate) fn acquire_local_authority_pass(&self) -> Result<AdmittedOperation, ()> {
         self.fatal_local_authority_fence.try_acquire()
     }
@@ -3675,6 +3708,135 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
+    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
+        let conversation_ids = self
+            .db
+            .llm_requesting_conversation_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        for conversation_id in conversation_ids {
+            let conversation = self
+                .db
+                .get_conversation(&conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let resumable_owner =
+                matches!(conversation.state, ConvState::SeededLlmRequesting { .. })
+                    || self
+                        .db
+                        .has_pending_approval_request(&conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    || self
+                        .db
+                        .has_committed_steering_turn(&conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+            let stored_model_id = conversation
+                .model
+                .unwrap_or_else(|| self.llm_registry.default_model_id());
+            if let Err(error) = self.llm_registry.resolve_model_id(&stored_model_id) {
+                tracing::error!(
+                    conv_id = %conversation_id,
+                    %error,
+                    "Startup cannot initialize the persisted model"
+                );
+                let _owner = self.acquire_local_authority_pass().map_err(|()| {
+                    "local authority closed before startup recovery fallback".to_string()
+                })?;
+                self.persist_startup_llm_initialization_failure(
+                    &conversation_id,
+                    &error,
+                    resumable_owner,
+                )
+                .await?;
+                continue;
+            }
+            if conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator {
+                if let Err(error) = crate::conversation_cwd::validate_conversation_cwd_for_runtime(
+                    &conversation_id,
+                    &conversation.cwd,
+                ) {
+                    let _owner = self.acquire_local_authority_pass().map_err(|()| {
+                        "local authority closed before startup recovery fallback".to_string()
+                    })?;
+                    self.persist_startup_llm_initialization_failure(
+                        &conversation_id,
+                        &error.to_string(),
+                        resumable_owner,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            self.settle_persisted_llm_request(&conversation_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn settle_persisted_llm_request(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        if self.try_get_handle(conversation_id).await.is_some() {
+            return Ok(());
+        }
+        let handle = self.get_or_create(conversation_id).await?;
+        let receipt = handle
+            .startup_llm_recovery_ack
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| "startup LLM recovery receipt was already consumed".to_string())?;
+        receipt
+            .await
+            .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
+    }
+
+    async fn persist_startup_llm_initialization_failure(
+        &self,
+        conversation_id: &str,
+        initialization_error: &str,
+        resumable_owner: bool,
+    ) -> Result<(), String> {
+        let state_updated_at = Utc::now();
+        let storage = DatabaseStorage::new(self.db.clone());
+        if let Some(turn) = storage.load_active_direct_turn(conversation_id).await? {
+            storage
+                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                    conversation_id: conversation_id.to_string(),
+                    turn: turn.into_active(),
+                    terminal: ActiveDirectTurnTerminal::Failed {
+                        reason: initialization_error.to_string(),
+                    },
+                    state: if resumable_owner {
+                        ConvState::Error {
+                            message: format!(
+                                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
+                            ),
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
+                            resets_at: None,
+                        }
+                    } else {
+                        ConvState::Idle
+                    },
+                    state_updated_at,
+                })
+                .await
+        } else {
+            let state = ConvState::Error {
+                message: format!(
+                    "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
+                ),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            };
+            storage
+                .update_state(conversation_id, &state, state_updated_at)
+                .await
+        }
+    }
+
     pub async fn start_direct_turn_worker(
         self: &Arc<Self>,
     ) -> Result<(), crate::FatalLocalAuthorityExit> {
@@ -3740,20 +3902,42 @@ impl RuntimeManager {
             }
         };
         let manager = Arc::clone(self);
+        #[cfg(test)]
+        let wake_worker_exit = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *self.wake_worker_exit.lock().await = Some(rx);
+            Some(tx)
+        };
         tokio::spawn(async move {
-            let detail = Self::describe_wake_worker_exit(worker.await);
-            tracing::error!(%detail, "wake worker lost local authority");
-            manager.signal_fatal_local_authority("wake_worker_exit");
+            match worker.await {
+                Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
+                    tracing::info!("wake worker stopped for coordinated shutdown");
+                }
+                result => {
+                    let detail = Self::describe_wake_worker_exit(result);
+                    tracing::error!(%detail, "wake worker lost local authority");
+                    manager.signal_fatal_local_authority("wake_worker_exit");
+                }
+            }
+            #[cfg(test)]
+            if let Some(exit) = wake_worker_exit {
+                let _ = exit.send(());
+            }
         });
         self.kick_wake_worker();
         Ok(())
     }
 
     fn describe_wake_worker_exit(
-        result: Result<Result<(), String>, tokio::task::JoinError>,
+        result: Result<
+            Result<crate::runtime::wake::WakeWorkerExit, String>,
+            tokio::task::JoinError,
+        >,
     ) -> String {
         match result {
-            Ok(Ok(())) => "wake worker exited unexpectedly".to_string(),
+            Ok(Ok(crate::runtime::wake::WakeWorkerExit::CoordinatedShutdown)) => {
+                "wake worker exited for coordinated shutdown".to_string()
+            }
             Ok(Err(error)) => format!("wake worker exited: {error}"),
             Err(error) => format!("wake worker join failure: {error}"),
         }
@@ -5294,6 +5478,8 @@ impl RuntimeManager {
             });
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
+        let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
+        let startup_llm_recovery_ack = Arc::new(AsyncMutex::new(Some(startup_llm_recovery_ack_rx)));
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             if let Some(obligation) = &recovered_terminal_obligation {
                 (
@@ -5323,6 +5509,23 @@ impl RuntimeManager {
             } else {
                 None
             };
+        let resumable_owner = startup_creation_completion.is_some()
+            || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+            || self
+                .db
+                .has_pending_approval_request(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            || self
+                .db
+                .has_committed_steering_turn(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        let startup_llm_recovery = if resumable_owner {
+            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+        } else {
+            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+        };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
             let active = loaded.into_active();
@@ -5375,6 +5578,8 @@ impl RuntimeManager {
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
+            .with_startup_llm_recovery(startup_llm_recovery)
+            .with_startup_llm_recovery_ack(startup_llm_recovery_ack_tx)
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
@@ -5488,6 +5693,7 @@ impl RuntimeManager {
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
             state_rx: state_rx.clone(),
+            startup_llm_recovery_ack: Arc::clone(&startup_llm_recovery_ack),
         };
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
@@ -5525,6 +5731,7 @@ impl RuntimeManager {
                     broadcast_tx: broadcaster,
                     identity,
                     state_rx,
+                    startup_llm_recovery_ack: Arc::clone(&startup_llm_recovery_ack),
                 },
             );
             // The live handle and reservation hand-off change atomically under
@@ -5629,6 +5836,7 @@ impl RuntimeManager {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
     }
@@ -5653,6 +5861,7 @@ impl RuntimeManager {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         event_rx
@@ -6067,6 +6276,7 @@ impl RuntimeManager {
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
             state_rx: h.state_rx.clone(),
+            startup_llm_recovery_ack: Arc::clone(&h.startup_llm_recovery_ack),
         })
     }
 
@@ -9691,6 +9901,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         acknowledged_event_rx
@@ -9913,6 +10124,49 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn process_shutdown_closes_effect_admission_without_signalling_fatal_authority_loss() {
+        let manager = test_manager().await;
+        let existing = manager
+            .acquire_local_authority_pass()
+            .expect("admit work before shutdown");
+        let fatal = manager.fatal_local_authority_receiver();
+
+        manager.begin_process_shutdown();
+
+        assert!(manager.acquire_local_authority_pass().is_err());
+        assert!(manager.local_authority_is_closed());
+        assert_eq!(*fatal.borrow(), None);
+        assert_eq!(manager.fatal_authority_owners_at_first_close(), Some(1));
+        drop(existing);
+        manager.drain_process_shutdown().await;
+        assert_eq!(*fatal.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn production_wake_worker_exit_is_coordinated_during_process_shutdown() {
+        let manager = Arc::new(test_manager().await);
+        manager
+            .start_wake_worker()
+            .await
+            .expect("start production wake supervisor");
+        let fatal = manager.fatal_local_authority_receiver();
+
+        manager.begin_process_shutdown();
+        manager.kick_wake_worker();
+        manager
+            .wake_worker_exit
+            .lock()
+            .await
+            .take()
+            .expect("wake worker exit observer")
+            .await
+            .expect("wake supervisor publishes exit");
+
+        assert_eq!(*fatal.borrow(), None);
+        manager.drain_process_shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
         let manager = test_manager().await;
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -9928,6 +10182,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
 
@@ -10077,6 +10332,7 @@ mod scope_liveness_tests {
                     )),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -10903,6 +11159,7 @@ mod scope_liveness_tests {
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
+                startup_llm_recovery_ack: Arc::new(AsyncMutex::new(None)),
             },
         );
     }
@@ -11682,6 +11939,191 @@ mod scope_liveness_tests {
         );
     }
 
+    async fn materialize_restart_direct_turn(manager: &RuntimeManager, conversation_id: &str) {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+
+        manager
+            .db()
+            .create_conversation(conversation_id, "restart", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let identity = SubmittedDirectTurnIdentity {
+            text: "resume exactly this turn".to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "restart-user-message".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        };
+        let delivery = PreparedDirectTurnDelivery {
+            text: "resume exactly this turn".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let payload = PreparedDirectTurnPayload::from_parts(identity, delivery);
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        let repo = manager.db().workflow_repository();
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("restart-user-message").expect("client key"),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().expect("encode payload"),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .expect("accept direct turn");
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected newly accepted turn")
+        };
+        let workflow_id = repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .expect("load workflow id")
+            .expect("workflow exists");
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(30),
+            })
+            .await
+            .expect("claim direct turn");
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority: claim.authority.expect("claim authority"),
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .established()
+        .expect("materialize direct turn");
+    }
+
+    #[tokio::test]
+    async fn startup_settles_materialized_direct_turn_without_redispatch() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-materialized-direct-turn";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("settle durable owner");
+        let handle = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("startup proactively materializes runtime");
+        assert_eq!(*handle.state_rx.borrow(), ConvState::Idle);
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load settled conversation")
+                .state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .expect("load transcript")
+                .iter()
+                .filter(|message| message.message_id.ends_with(":restart-user-message"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_settlement_isolates_one_uninitializable_conversation() {
+        let manager = Arc::new(test_manager().await);
+        let bad_id = "restart-bad-model";
+        let good_id = "restart-good-model";
+        materialize_restart_direct_turn(&manager, bad_id).await;
+        materialize_restart_direct_turn(&manager, good_id).await;
+        sqlx::query(
+            "UPDATE work_scopes SET cwd = '/'
+             WHERE id = (SELECT work_scope_id FROM conversations WHERE id = ?1)",
+        )
+        .bind(bad_id)
+        .execute(manager.db().pool())
+        .await
+        .expect("corrupt one persisted cwd");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("one bad row does not abort startup settlement");
+
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(good_id)
+                .await
+                .expect("load settled good row")
+                .state,
+            ConvState::Idle
+        ));
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(bad_id)
+                .await
+                .expect("load isolated bad row")
+                .state,
+            ConvState::Idle
+        ));
+        let bad_turn = manager
+            .db()
+            .workflow_repository()
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(bad_id.to_string()))
+            .await
+            .expect("load failed turn");
+        assert!(
+            bad_turn.is_none(),
+            "fallback releases durable turn ownership"
+        );
+    }
+
     #[tokio::test]
     async fn determine_resume_state_preserves_committed_steering_turn_until_first_response() {
         use phoenix_core::domain::db_schema::MessageContent;
@@ -11774,6 +12216,163 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn startup_replays_pending_approval_owner_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "pending-approval-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_state_at(
+                conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("persist requesting state");
+        manager
+            .db()
+            .add_message(
+                "approval-message",
+                conversation_id,
+                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("approval pending"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .expect("persist approval message");
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(conversation_id)
+        .bind("approval-message")
+        .bind(Utc::now().timestamp_micros())
+        .execute(manager.db().pool())
+        .await
+        .expect("persist approval owner");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("resume pending approval owner");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_replays_seeded_successor_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "seeded-successor-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_state_at(
+                conversation_id,
+                &ConvState::SeededLlmRequesting {
+                    seed_message_id: "seed-message".to_string(),
+                    attempt: 1,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("persist seeded state");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("resume seeded successor");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_replays_committed_steering_turn_once() {
+        use phoenix_core::domain::db_schema::MessageContent;
+
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "committed-steering-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "resume accepted steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "committed-steer-fingerprint",
+            )
+            .await
+            .expect("accept steer");
+        let content = MessageContent::user("resume accepted steer");
+        manager
+            .db()
+            .commit_steering_drain(
+                conversation_id,
+                &[crate::db::Message {
+                    message_id: "committed-steer".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("commit steering drain");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("replay committed steering owner");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

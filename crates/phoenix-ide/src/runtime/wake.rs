@@ -50,6 +50,11 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
     ProcessIncarnation(u64::from_le_bytes(bytes))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeWorkerExit {
+    CoordinatedShutdown,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProductionWakeRegistrar {
     repo: WakeRepository,
@@ -129,7 +134,7 @@ pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
-) -> Result<(), String> {
+) -> Result<WakeWorkerExit, String> {
     let worker = WakeWorker::new(
         manager.db().wake_repository(),
         Arc::new(RuntimeRegistryInspector::new(
@@ -139,7 +144,8 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await
+    Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await?;
+    Ok(WakeWorkerExit::CoordinatedShutdown)
 }
 
 #[derive(Clone)]
@@ -203,9 +209,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Option<Arc<RuntimeManager>>,
     ) -> Result<(), String> {
         let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
-        let mut fatal_local_authority_rx = manager
+        let local_authority_cancellation = manager
             .as_ref()
-            .map(|manager| manager.fatal_local_authority_receiver());
+            .map(|manager| manager.local_authority_cancellation());
         loop {
             let pass = async {
                 let wait = self.run_once_with_manager(manager.as_ref()).await?;
@@ -232,10 +238,10 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             };
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
-            if let Some(fatal) = fatal_local_authority_rx.as_mut() {
+            if let Some(cancellation) = local_authority_cancellation.as_ref() {
                 tokio::select! {
                     biased;
-                    _ = crate::tls::wait_for_fatal_local_authority(fatal) => return Ok(()),
+                    () = cancellation.cancelled() => return Ok(()),
                     () = &mut sleep => {}
                     changed = kick_rx.changed() => {
                         if changed.is_err() {
