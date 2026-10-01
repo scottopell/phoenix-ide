@@ -1443,6 +1443,15 @@ function MessageListImpl({
     return true;
   }, [historicalUnits, scrollToUnitIndex, sourceToolId]);
 
+  const revealedSourceRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = sourceMessageId && sourceToolId ? `${sourceMessageId}:${sourceToolId}` : null;
+    if (!key) { revealedSourceRef.current = null; return; }
+    if (revealedSourceRef.current !== key && sourceMessageId && scrollToMessageId(sourceMessageId)) {
+      revealedSourceRef.current = key;
+    }
+  }, [sourceMessageId, sourceToolId, scrollToMessageId]);
+
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
     // Same question as the acquisition guard, and it must be answered the same
