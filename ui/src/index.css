@@ -1233,9 +1233,10 @@ body.app-viewport-active #root {
 }
 
 .markdown-table-scroll table {
+  width: 100%;
   min-width: 100%;
-  width: max-content;
   margin: 0;
+  table-layout: auto;
 }
 
 .agent-text-block table {
@@ -1246,8 +1247,8 @@ body.app-viewport-active #root {
 }
 
 .agent-text-block .markdown-table-scroll table {
+  width: 100%;
   min-width: 100%;
-  width: max-content;
   margin: 0;
   background: var(--bg-secondary);
 }
@@ -1257,6 +1258,52 @@ body.app-viewport-active #root {
   border: 1px solid var(--border-color);
   padding: 8px 12px;
   text-align: left;
+}
+
+.markdown-table-scroll :where(th, td) {
+  min-width: 0;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.markdown-table-scroll :where(th, td)[data-column-kind='numeric'],
+.markdown-table-scroll :where(th, td)[data-column-kind='atomic'] {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.markdown-table-scroll :where(th, td)[data-column-kind='compact'] {
+  width: 1%;
+  min-width: min(5.5rem, 26vw);
+  max-width: min(11rem, 42vw);
+  white-space: normal;
+}
+
+.markdown-table-scroll :where(th, td)[data-column-kind='label'] {
+  min-width: min(5.5rem, 24vw);
+  max-width: min(16rem, 48vw);
+}
+
+.markdown-table-scroll :where(th, td)[data-column-kind='prose'] {
+  min-width: min(10rem, 44vw);
+  max-width: min(30rem, 76vw);
+}
+
+.markdown-table-scroll :where(code, a) {
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.markdown-table-scroll [data-column-kind='atomic'] :where(code, a),
+.markdown-table-scroll code[data-token-kind='short-atomic'] {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.markdown-table-scroll code[data-token-kind='breakable'] {
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 /* stylelint-disable no-descending-specificity --

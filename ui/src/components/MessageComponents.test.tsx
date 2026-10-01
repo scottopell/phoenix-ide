@@ -2074,6 +2074,32 @@ describe('markdown table rendering', () => {
     '| one | `direct_turn_id` | three | four | five | six |',
   ].join('\n');
 
+  const semanticTableMarkdown = [
+    '| Model | Completed | Failed | Min | Median | Max |',
+    '| --- | ---: | ---: | ---: | ---: | ---: |',
+    '| gpt-5.4-mini | 159 | 0 | 5 s | 30.2 s | 43.1 s |',
+    '| gpt-5.6-sol | 138 | 2 | 8 s | 55.2 s | 84.4 s |',
+    '',
+    '| Status | Detail |',
+    '| --- | --- |',
+    '| Restart RCA #817 | A qualified candidate needs merge or a concrete intervention before deployment proceeds |',
+    '',
+    '| Revision | Destination |',
+    '| --- | --- |',
+    '| `4fd574ee` | `0123456789abcdef0123456789abcdef01234567` |',
+  ].join('\n');
+
+  function expectSemanticTableAnnotations(container: HTMLElement) {
+    const tables = container.querySelectorAll('.markdown-table-scroll table');
+    expect(tables).toHaveLength(3);
+    expect([...tables[0]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
+      .toEqual(['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric']);
+    expect([...tables[1]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
+      .toEqual(['compact', 'prose']);
+    expect(tables[2]!.querySelector('code')?.dataset['tokenKind']).toBe('short-atomic');
+    expect(tables[2]!.querySelectorAll('code')[1]?.dataset['tokenKind']).toBe('breakable');
+  }
+
   it('wraps finalized agent message tables in a local horizontal scroll container', () => {
     render(
       <MemoryRouter>
@@ -2092,6 +2118,19 @@ describe('markdown table rendering', () => {
     const inlineCode = screen.getByText('direct_turn_id');
     expect(inlineCode.tagName).toBe('CODE');
     expect(inlineCode.closest('td')).not.toBeNull();
+  });
+
+  it('classifies finalized table columns and inline code at the renderer boundary', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-semantic-table', [{ type: 'text', text: semanticTableMarkdown }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expectSemanticTableAnnotations(container);
   });
 
   it('keeps finalized agent message task lists enabled for plus and ordered markers', () => {
@@ -2145,6 +2184,19 @@ describe('markdown table rendering', () => {
 
     expect(screen.getByText('Footnotes')).toBeInTheDocument();
     expect(screen.getByText('Footnote content')).toBeInTheDocument();
+  });
+
+  it('classifies streaming table columns and inline code at the renderer boundary', async () => {
+    const { container } = render(
+      <MemoryRouter>
+        <StreamingMessageView
+          buffer={{ text: semanticTableMarkdown, lastSequence: 1, startedAt: Date.now(), requestId: 'semantic-table' }}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(3));
+    expectSemanticTableAnnotations(container);
   });
 
   it('wraps streaming message tables in a local horizontal scroll container', async () => {

@@ -44,6 +44,8 @@ import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkd
 import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { ConversationMarkdownTable } from './conversationMarkdownTable';
+import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
@@ -120,17 +122,6 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
     >
       {code}
     </SyntaxHighlighter>
-  );
-}
-
-type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
-
-function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
-  void node;
-  return (
-    <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
-    </div>
   );
 }
 
@@ -1196,7 +1187,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           return <>{linkified}</>;
         }
         return (
-          <code className={className} {...props}>
+          <code className={className} data-token-kind={inlineCodeTokenKind(children)} {...props}>
             {children}
           </code>
         );
@@ -1212,7 +1203,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           filePathCopyContext={filePathCopyContext}
         />
       ),
-      table: MarkdownTable,
+      table: ConversationMarkdownTable,
       img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
         <ConversationMarkdownImage
           {...props}
