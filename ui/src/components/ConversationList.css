@@ -209,6 +209,30 @@
   gap: 4px;
 }
 
+/* stylelint-disable no-descending-specificity -- Product aggregate buttons intentionally
+   override the earlier compact chain-member row without changing legacy rows. */
+.product-conversation-list-row > .conv-item-main {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.mobile-list-density .conv-item.product-conversation-list-row {
+  padding: 4px 4px 4px 10px;
+  gap: 2px;
+}
+
+.mobile-list-density .product-conversation-list-row > .conv-item-main {
+  padding: 4px 0;
+}
+/* stylelint-enable no-descending-specificity */
+
 .conv-actions {
   display: inline-flex;
   align-items: center;

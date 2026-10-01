@@ -13138,7 +13138,7 @@ button.keyword-search-filepath:hover {
   white-space: nowrap;
 }
 
-.mobile-list-density .conv-item-main > .conv-item-meta:not(.secondary),
+.mobile-list-density .conv-item-main > .conv-item-meta:not(.secondary, .product-conversation-list-row__meta),
 .mobile-list-density .conv-item-messages,
 .mobile-list-density .conv-item-model,
 .mobile-list-density .conv-item-cwd {
