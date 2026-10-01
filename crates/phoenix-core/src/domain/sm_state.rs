@@ -140,6 +140,97 @@ pub struct AskUserQuestionInput {
     pub metadata: Option<QuestionMetadata>,
 }
 
+impl AskUserQuestionInput {
+    /// Validates the `ask_user_question` ambiguity constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable tool error when the question count is outside
+    /// 1-4, question/header text is empty, a header exceeds 12 characters, a
+    /// question has outside 2-4 options,
+    /// question text is duplicated, an option label is empty, too long, or
+    /// duplicated within a question, an option description is blank, or an option
+    /// uses a UI-reserved label.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.questions.is_empty() || self.questions.len() > 4 {
+            return Err(format!(
+                "ask_user_question requires 1-4 questions; got {}",
+                self.questions.len()
+            ));
+        }
+
+        let mut question_texts = std::collections::HashSet::new();
+        for (question_index, question) in self.questions.iter().enumerate() {
+            let question_number = question_index + 1;
+            let question_text = question.question.trim();
+            if question_text.is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty question text"
+                ));
+            }
+            if question.header.trim().is_empty() {
+                return Err(format!(
+                    "ask_user_question question {question_number} has empty header"
+                ));
+            }
+            if question.header.chars().count() > 12 {
+                return Err(format!(
+                    "ask_user_question question {question_number} header exceeds 12 characters"
+                ));
+            }
+            if !question_texts.insert(question_text) {
+                return Err(format!(
+                    "ask_user_question question {question_number} duplicates question text `{question_text}`"
+                ));
+            }
+            if question.options.len() < 2 || question.options.len() > 4 {
+                return Err(format!(
+                    "ask_user_question question {question_number} requires 2-4 options; got {}",
+                    question.options.len()
+                ));
+            }
+
+            let mut option_labels = std::collections::HashSet::new();
+            for option in &question.options {
+                let label = option.label.trim();
+                if label.is_empty() {
+                    return Err(format!(
+                        "ask_user_question question {question_number} has an empty option label"
+                    ));
+                }
+                let label_word_count = label.split_whitespace().count();
+                if label_word_count > 5 {
+                    return Err(format!(
+                        "ask_user_question question {question_number} option label `{label}` exceeds 5 words"
+                    ));
+                }
+                if matches!(label.to_ascii_lowercase().as_str(), "other" | "__other__") {
+                    return Err(format!(
+                        "ask_user_question question {question_number} uses reserved option label `{label}`"
+                    ));
+                }
+                if option
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.trim().is_empty())
+                {
+                    return Err(format!(
+                        "ask_user_question question {question_number} option label `{label}` has empty description"
+                    ));
+                }
+                if !option_labels.insert(label) {
+                    return Err(format!(
+                        "ask_user_question question {question_number} duplicates option label `{}`",
+                        option.label
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Optional metadata for an `ask_user_question` invocation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionMetadata {

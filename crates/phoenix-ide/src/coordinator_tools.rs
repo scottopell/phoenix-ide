@@ -8,8 +8,10 @@ use crate::send_chat_service::{
     SendChatApplicationService, SendChatRequest, SendChatServiceError, SendChatTarget,
 };
 use crate::tools::{
-    BashTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget, WritingConversationTools,
+    AskUserQuestionTool, BashTool, Tool, ToolContext, ToolOutput, ValidatedBashSpawnTarget,
+    WritingConversationTools,
 };
+
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
 pub(crate) fn writing_tools(
@@ -33,6 +35,7 @@ pub(crate) fn tools(
         .into_tools()
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
+    tools.push(Arc::new(AskUserQuestionTool));
     tools.push(Arc::new(WorkScopeCoordinatorBash(service)));
     tools
 }
@@ -580,6 +583,7 @@ mod tests {
                 "query_database",
                 "resolve_reference",
                 "send_conversation_message",
+                "ask_user_question",
                 "bash"
             ]
         );

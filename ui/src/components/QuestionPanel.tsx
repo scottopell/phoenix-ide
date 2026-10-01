@@ -27,6 +27,7 @@ import './QuestionPanel.css';
 export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
+  toolUseId: string;
   showToast: (message: string, duration?: number) => void;
   /** Called after a successful respond/dismiss POST. The parent uses this to
    *  optimistically advance the local phase out of awaiting_user_response so
@@ -53,6 +54,7 @@ function optionCount(q: UserQuestion): number {
 export function QuestionPanel({
   questions,
   conversationId,
+  toolUseId,
   showToast,
   onAnswered,
   onDismissed,
@@ -240,6 +242,7 @@ export function QuestionPanel({
     try {
       await api.respondToQuestion(
         conversationId,
+        toolUseId,
         buildAnswerMap(),
         buildAnnotations()
       );
@@ -257,6 +260,7 @@ export function QuestionPanel({
     allAnswered,
     submitting,
     conversationId,
+    toolUseId,
     buildAnswerMap,
     buildAnnotations,
     onAnswered,
@@ -274,7 +278,7 @@ export function QuestionPanel({
     setSubmitting(true);
     setFeedback(null);
     try {
-      await api.dismissQuestion(conversationId);
+      await api.dismissQuestion(conversationId, toolUseId);
       onDismissed();
       showToast('Question dismissed. Type a message to continue.', 3000);
     } catch (err) {
@@ -283,7 +287,7 @@ export function QuestionPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [readOnly, submitting, conversationId, onDismissed, showToast]);
+  }, [readOnly, submitting, conversationId, toolUseId, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(

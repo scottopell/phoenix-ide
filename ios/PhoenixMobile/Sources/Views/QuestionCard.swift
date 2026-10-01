@@ -6,22 +6,6 @@ import SwiftUI
 /// state_change unmounts the card; a concurrent answer from another client
 /// wins cleanly and this one surfaces the 409), drafts never cleared
 /// before success, controls disabled while offline or in flight.
-struct QuestionCard: View {
-    @Environment(AppModel.self) private var model
-    let session: ConversationSession
-    let questions: [UserQuestion]
-
-    var body: some View {
-        QuestionCardBody(
-            questions: questions,
-            isOnline: model.connectivity.isOnline,
-            acceptsActions: session.acceptsConversationActions,
-            busy: session.actionInFlight != nil,
-            onAnswer: { session.perform(.respondToQuestions(answers: $0)) },
-            onDismiss: { session.perform(.dismissQuestion) })
-    }
-}
-
 struct QuestionCardBody: View {
     let questions: [UserQuestion]
     let isOnline: Bool

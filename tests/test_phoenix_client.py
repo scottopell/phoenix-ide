@@ -63,6 +63,50 @@ class PhoenixClientStateTests(unittest.TestCase):
             "provider unavailable",
         )
 
+    def test_question_response_posts_pending_tool_use_id(self):
+        client = phoenix_client.PhoenixClient("http://localhost:1")
+        self.addCleanup(client.http.close)
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {"success": True}
+        client.http.post = Mock(return_value=response)
+
+        client.respond_to_question("conv-1", "tool-1", {"Question?": "Answer"})
+
+        client.http.post.assert_called_once_with(
+            "http://localhost:1/api/conversations/conv-1/respond",
+            json={"tool_use_id": "tool-1", "answers": {"Question?": "Answer"}},
+        )
+
+    def test_question_dismissal_posts_pending_tool_use_id(self):
+        client = phoenix_client.PhoenixClient("http://localhost:1")
+        self.addCleanup(client.http.close)
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {"success": True}
+        client.http.post = Mock(return_value=response)
+
+        client.dismiss_question("conv-1", "tool-1")
+
+        client.http.post.assert_called_once_with(
+            "http://localhost:1/api/conversations/conv-1/dismiss-question",
+            json={"tool_use_id": "tool-1"},
+        )
+
+    def test_pending_question_tool_use_id_requires_awaiting_state_identity(self):
+        self.assertEqual(
+            phoenix_client._pending_question_tool_use_id(
+                {"type": "awaiting_user_response", "tool_use_id": "tool-1"}
+            ),
+            "tool-1",
+        )
+        with self.assertRaisesRegex(phoenix_client.click.UsageError, "missing tool_use_id"):
+            phoenix_client._pending_question_tool_use_id(
+                {"type": "awaiting_user_response", "questions": []}
+            )
+        with self.assertRaisesRegex(phoenix_client.click.UsageError, "not awaiting"):
+            phoenix_client._pending_question_tool_use_id({"type": "idle"})
+
 
 if __name__ == "__main__":
     unittest.main()
