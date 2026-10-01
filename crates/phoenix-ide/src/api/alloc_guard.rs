@@ -148,6 +148,7 @@ mod tests {
             .map(|i| json!({ "tool_use_id": format!("tool-{i}"), "display": format!("./run.sh --step {i}") }))
             .collect();
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "msg-guard".to_string(),
             conversation_id: "conv-guard".to_string(),
             sequence_id: 7,

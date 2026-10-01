@@ -619,6 +619,7 @@ async fn deliver_product_creation_objective(
             manager,
             &conversation_id,
             Event::SteerMessage {
+                origin: job.intent.origin.input_origin(),
                 text: expanded.display_text,
                 llm_text: expanded.llm_text,
                 images,
@@ -2407,6 +2408,7 @@ async fn provision_conversation(
         job_id: job.id.clone(),
         claim: claim.clone(),
         initial_message: phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: display_text,
             llm_text,
             images,
@@ -2825,6 +2827,7 @@ mod product_creation_delivery_replay_tests {
         chrono::DateTime<chrono::Utc>,
     ) {
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: cwd.to_string(),
             objective: "deliver objective".to_string(),
             model: None,
@@ -3075,6 +3078,7 @@ mod product_creation_delivery_replay_tests {
             .enqueue_steer_message(
                 other_conversation_id,
                 Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     text: "non-target".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -3116,6 +3120,8 @@ mod product_creation_delivery_replay_tests {
             accepted_product_id.to_string()
         );
         assert_eq!(published.transcript_row_id, conversation_id);
+        let origin: String = sqlx::query_scalar("SELECT origin_kind FROM steering_messages WHERE message_id = ?1 UNION ALL SELECT origin_kind FROM messages WHERE message_id = ?1 LIMIT 1").bind(request_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(origin, "user_api");
 
         let completed = db
             .get_product_creation_job(request_id)
@@ -3185,6 +3191,7 @@ mod product_creation_delivery_replay_tests {
     async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
         let db = Database::open_in_memory().await.unwrap();
         let intent = ProductCreationIntent {
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
             cwd: "/repo/a".to_string(),
             objective: "deliver objective".to_string(),
             model: None,
@@ -3231,6 +3238,7 @@ mod product_creation_delivery_replay_tests {
         db.append_steering_entry(
             conversation_id,
             &phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: intent.objective.clone(),
                 llm_text: None,
                 images: Vec::new(),

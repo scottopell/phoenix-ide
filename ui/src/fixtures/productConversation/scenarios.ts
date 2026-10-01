@@ -29,6 +29,7 @@ function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agen
     conversation_id: ALIGNED_PREFIX_TRANSCRIPT_ROW_ID,
     sequence_id: sequenceId,
     message_type: messageType,
+    origin: { kind: 'unknown_historical' },
     content: messageType === 'agent' ? [{ type: 'text' as const, text }] : { text },
     display_data: conversationState ? { conversation_state: conversationState } : null,
     usage_data: null,
@@ -472,6 +473,32 @@ export const productConversationScenarios = [
         ], null),
       ],
     }),
+  },
+  {
+    ...productConversationScenarioDefinitions.at(-1)!,
+    snapshot: makeSnapshot({
+      product_conversation_id: 'pc-input-provenance',
+      latest_transcript_row_id: 'row-provenance-continued',
+      writable_transcript_row_id: 'row-provenance-continued',
+      work_identity: null,
+      source: null,
+      chain_qa_compatibility: null,
+      presentation: { kind: 'state', display_name: 'Input provenance', presentation_mode: 'idle' },
+      segments: [
+        segment(1, 'row-provenance-first', 'Original transcript', [
+          { ...textMessage('api-first', 1, 'user', 'API request in original transcript'), origin: { kind: 'user_api' } },
+          textMessage('reply-first', 2, 'agent', 'The first transcript keeps the API channel visible.'),
+        ], 'Continue in the next transcript.'),
+        segment(2, 'row-provenance-continued', 'Continued transcript', [
+          { ...textMessage('internal-continued', 3, 'user', 'Forwarded into continued transcript'),
+            origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' } },
+          textMessage('reply-continued', 4, 'agent', 'The continued transcript preserves source attribution.', state('idle')),
+        ], null),
+      ],
+    }),
+    steeringMessages: [{ message_id: 'queued-source',
+      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
+      text: 'Queued from source conversation', images: [], files: [] }],
   },
 ] as const satisfies readonly ProductConversationScenario[];
 

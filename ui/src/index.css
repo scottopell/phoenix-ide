@@ -490,6 +490,10 @@ body.app-viewport-active #root {
   color: var(--accent-purple);
 }
 
+.conversation-nav-item.meta {
+  border: 1px dashed var(--border-color);
+}
+
 .conversation-nav-item.active {
   color: var(--accent-blue);
   background: rgb(88 166 255 / 15%);
@@ -3136,7 +3140,7 @@ pre:hover .copy-btn {
 }
 
 /* Steering-queued message bubble: muted appearance */
-.message.user.steering-queued {
+.message.steering-queued {
   opacity: 0.65;
 }
 

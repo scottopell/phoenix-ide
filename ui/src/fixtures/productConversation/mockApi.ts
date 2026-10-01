@@ -152,7 +152,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (url.endsWith('/api/telemetry/conversation-open')) {
+    if (url.endsWith('/api/telemetry/conversation-open') || url.endsWith('/api/telemetry/product-conversation-open')) {
       return new Response(null, { status: 204 });
     }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
@@ -245,7 +245,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
             transcript_generation: 1,
             transcript_coverage: 'complete',
             messages,
-            steering_messages: [],
+            steering_messages: scenario.steeringMessages ?? [],
             agent_working: false,
             last_sequence_id: 1,
             stream_incarnation: `fixture-stream-${this.instanceId}`,

@@ -1269,6 +1269,7 @@ impl RuntimeManager {
 fn seed_message(conv_id: &str, text: String) -> Message {
     let now = Utc::now();
     Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
         message_id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conv_id.to_string(),
         sequence_id: 1,
@@ -1928,6 +1929,41 @@ mod tests {
                 .fork_conversation_id
                 .as_deref(),
             Some(fork_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_fork_resolution_watch_records_terminal_outcome_once() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let proposal = insert_pending(
+            &db,
+            &origin,
+            "tasks/12345-p1-ready--watch-fork.md",
+            "# Watch fork\n",
+        )
+        .await;
+        let rt = make_runtime(db.clone()).await;
+        let fork_id = rt.approve_fork_proposal(&proposal).await.unwrap();
+        let fork = db.get_conversation(&fork_id).await.unwrap();
+        assert!(matches!(fork.state, ConvState::SeededLlmRequesting { .. }));
+        db.watch_product_conversation(&fork.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(&fork_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_transcript_id, fork_id);
+        assert_eq!(events[0].source_occurrence_kind, "seeded_fork");
+        db.update_conversation_state(&fork_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
         );
     }
 

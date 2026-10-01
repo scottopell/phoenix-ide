@@ -133,6 +133,7 @@ function toMessage(message: EnrichedMessage, occurrenceToken?: string): Message 
     sequence_id: message.sequence_id,
     message_type: message.message_type,
     content: message.content as Message['content'],
+    origin: message.origin,
     display_data: occurrenceToken
       ? {
         ...(((message.display_data ?? null) as Exclude<Message['display_data'], undefined>) ?? {}),

@@ -31,6 +31,7 @@ pub(crate) enum MessageExpansionPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub text: String,
     pub message_id: String,
     pub images: Vec<ImageAttachment>,
@@ -96,6 +97,16 @@ impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
     }
+    pub(crate) fn db(&self) -> &crate::db::Database {
+        &self.db
+    }
+
+    pub(crate) async fn source_conversation(
+        &self,
+        id: &str,
+    ) -> Result<crate::db::Conversation, crate::db::DbError> {
+        self.db.get_conversation(id).await
+    }
 
     pub(crate) async fn rearm_exact_terminal_turn(
         &self,
@@ -121,6 +132,7 @@ impl SendChatApplicationService {
         .await?;
         let submitted = SubmittedDirectTurnIdentity {
             message_id: message_id.as_str().to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             text: expanded.display_text,
             images: Vec::new(),
             files: Vec::new(),
@@ -297,6 +309,10 @@ impl SendChatApplicationService {
                         == req.message_id
             })
         {
+            req.origin = match intent.opening_authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            };
             req.text = intent.handoff;
             req.user_agent = intent.user_agent;
         }
@@ -494,6 +510,7 @@ impl SendChatApplicationService {
 
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
+                origin: req.origin.clone(),
                 llm_text: expanded.llm_text,
                 images: map_images(req.images.clone()),
                 files: validated_files.clone(),
@@ -845,6 +862,7 @@ fn submitted_expansion_policy(
 fn submitted_identity_from_request(req: &SendChatRequest) -> SubmittedDirectTurnIdentity {
     SubmittedDirectTurnIdentity {
         text: req.text.clone(),
+        origin: req.origin.clone(),
         images: req
             .images
             .iter()
@@ -1027,7 +1045,7 @@ async fn lookup_durable_steering_replay(
                 )
             })?;
         if matches!(receipt, SteeringAcceptanceFingerprint::Exact(_)) {
-            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+            validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
         }
         if matches!(receipt, SteeringAcceptanceFingerprint::LegacyUnknown)
             && req.expansion_policy != MessageExpansionPolicy::ExpandReferences
@@ -1044,7 +1062,7 @@ async fn lookup_durable_steering_replay(
         {
             match receipt {
                 SteeringAcceptanceFingerprint::Exact(_) => {
-                    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+                    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
                 }
                 SteeringAcceptanceFingerprint::LegacyUnknown => {
                     if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {
@@ -1062,7 +1080,7 @@ async fn lookup_durable_steering_replay(
     else {
         return Ok(None);
     };
-    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+    validate_steering_fingerprint(&receipt, request_fingerprint, req)?;
     Ok(Some(SendChatOutcome::Rejected {
         message: "The accepted message was cancelled or failed before delivery.".to_string(),
         code: "turn_terminal",
@@ -1094,7 +1112,10 @@ async fn lookup_persisted_message_replay(
         | phoenix_core::domain::db_schema::MessageContent::Error(_)
         | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
     };
-    if message.conversation_id != req.conversation_id || !persisted_matches {
+    if message.conversation_id != req.conversation_id
+        || !message.origin.accepts_retry_origin(&req.origin)
+        || !persisted_matches
+    {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
     Ok(Some(SendChatOutcome::AlreadyPersisted))
@@ -1105,6 +1126,7 @@ fn queued_retry_matches(
     req: &SendChatRequest,
 ) -> bool {
     entry.text == req.text
+        && entry.origin.accepts_retry_origin(&req.origin)
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -1175,11 +1197,19 @@ fn persisted_skill_matches(
 }
 
 fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceError> {
+    request_fingerprint_version(req, true)
+}
+
+fn request_fingerprint_version(
+    req: &SendChatRequest,
+    with_origin: bool,
+) -> Result<String, SendChatServiceError> {
     use sha2::Digest as _;
 
-    let canonical = serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "conversation_id": req.conversation_id,
         "text": req.text,
+        "origin": req.origin,
         "images": req.images.iter().map(|image| serde_json::json!({
             "data": image.data,
             "media_type": image.media_type,
@@ -1191,8 +1221,15 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
             MessageExpansionPolicy::LiteralText => "literal_text",
             MessageExpansionPolicy::GeneratedPredecessorContext => "generated_predecessor_context",
         },
-    }))
-    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    });
+    if !with_origin {
+        value
+            .as_object_mut()
+            .expect("object literal")
+            .remove("origin");
+    }
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
     Ok(sha2::Sha256::digest(canonical).iter().fold(
         String::with_capacity(64),
         |mut output, byte| {
@@ -1205,9 +1242,16 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
 fn validate_steering_fingerprint(
     receipt: &SteeringAcceptanceFingerprint,
     request_fingerprint: &str,
+    req: &SendChatRequest,
 ) -> Result<(), SendChatServiceError> {
     match receipt {
         SteeringAcceptanceFingerprint::Exact(exact) if exact == request_fingerprint => Ok(()),
+        SteeringAcceptanceFingerprint::Exact(exact)
+            if req.origin == phoenix_core::domain::db_schema::InputOrigin::UserApi
+                && *exact == request_fingerprint_version(req, false)? =>
+        {
+            Ok(())
+        }
         SteeringAcceptanceFingerprint::Exact(_) | SteeringAcceptanceFingerprint::LegacyUnknown => {
             Err(SendChatServiceError::IdempotencyConflict)
         }
@@ -1264,6 +1308,7 @@ mod tests {
 
     fn request() -> SendChatRequest {
         SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "hello".to_string(),
             message_id: "message-1".to_string(),
@@ -1425,6 +1470,7 @@ mod tests {
     #[test]
     fn submitted_identity_tracks_submitted_fields_not_mutable_expansion() {
         let base = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1638,6 +1684,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1679,6 +1726,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1710,6 +1758,7 @@ mod tests {
         let db = db_with_conversation(&req.conversation_id).await;
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1730,6 +1779,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.db_parts().0)
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1755,10 +1810,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_provenance_api_retry_keeps_unknown_queued_and_persisted_origin() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let mut req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+        req.origin = InputOrigin::UserApi;
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &fingerprint)
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::AlreadyPersisted)
+        );
+        assert_eq!(
+            db.get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
+                .await
+                .unwrap()
+                .origin,
+            InputOrigin::UnknownHistorical
+        );
+        let legacy = SteeringAcceptanceFingerprint::Exact(
+            super::request_fingerprint_version(&req, false).unwrap(),
+        );
+        super::validate_steering_fingerprint(&legacy, &fingerprint, &req).unwrap();
+        req.text.push_str(" changed");
+        assert!(super::validate_steering_fingerprint(
+            &legacy,
+            &super::request_fingerprint(&req).unwrap(),
+            &req
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn legacy_queued_steering_identity_replays_when_payload_matches() {
-        let req = request();
+        let mut req = request();
+        req.origin = phoenix_core::domain::db_schema::InputOrigin::UserApi;
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1781,6 +1872,7 @@ mod tests {
 
     async fn persist_drained_legacy_steering(db: &crate::db::Database, req: &SendChatRequest) {
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: req.text.clone(),
             llm_text: None,
             images: Vec::new(),
@@ -1807,6 +1899,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = ?1 WHERE message_id = ?2")
+            .bind(req.origin.db_parts().0)
+            .bind(&req.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db
             .remove_steering_entry(&req.conversation_id, &req.message_id)
             .await
@@ -1917,6 +2015,7 @@ mod tests {
     #[test]
     fn queued_retry_compares_submitted_payload_not_mutable_expansion() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
             message_id: "message-1".to_string(),
@@ -1926,6 +2025,7 @@ mod tests {
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         };
         let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: request.text.clone(),
             llm_text: Some("old expanded file contents".to_string()),
             images: vec![],
@@ -1944,6 +2044,7 @@ mod tests {
     #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {
         let request = SendChatRequest {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             conversation_id: "conv-1".to_string(),
             text: "/build now".to_string(),
             message_id: "message-1".to_string(),

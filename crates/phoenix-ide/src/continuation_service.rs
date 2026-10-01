@@ -248,6 +248,7 @@ impl ContinuationApplicationService {
             let outcome =
                 SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
                     .send(SendChatRequest {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         conversation_id: successor.id,
                         text: intent.handoff,
                         message_id: intent.message_id.as_str().to_string(),
@@ -274,6 +275,7 @@ impl ContinuationApplicationService {
             let outcome =
                 SendChatApplicationService::new(self.runtime.db().clone(), self.runtime.clone())
                     .send(SendChatRequest {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         conversation_id: successor.id,
                         text: intent.handoff,
                         message_id: intent.message_id.as_str().to_string(),

@@ -233,6 +233,7 @@ mod tests {
     // Helper to create a user message
     fn user_msg(seq: i64, text: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("user-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -278,6 +279,7 @@ mod tests {
             .collect();
 
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("agent-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -292,6 +294,7 @@ mod tests {
     // Helper to create an agent message with text
     fn agent_with_text(seq: i64, text: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("agent-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -319,6 +322,7 @@ mod tests {
         }
 
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("agent-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -333,6 +337,7 @@ mod tests {
     // Helper to create a tool result message
     fn tool_result(seq: i64, tool_use_id: &str, output: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("tool-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -588,6 +593,7 @@ mod tests {
         let messages = vec![
             user_msg(1, "Hello"),
             Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "agent-2".to_string(),
                 conversation_id: "test-conv".to_string(),
                 sequence_id: 2,
@@ -671,6 +677,7 @@ mod tests {
 
     fn system_question_dismissed_msg(seq: i64) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: format!("sys-auq-dismissed-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -701,6 +708,7 @@ mod tests {
 
     fn system_error_dismissed_msg(seq: i64) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: format!("sys-err-dismissed-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -738,6 +746,7 @@ mod tests {
 
     fn system_restart_msg(seq: i64) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: format!("sys-{seq}"),
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
@@ -869,6 +878,7 @@ mod proptests {
         };
 
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("msg-{seq}"),
             conversation_id: "test".to_string(),
             sequence_id: seq,

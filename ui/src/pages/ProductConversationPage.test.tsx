@@ -200,6 +200,7 @@ function makeMessage(message_id: string, sequence_id: number, conversation_id = 
     conversation_id,
     sequence_id,
     message_type: sequence_id % 2 === 0 ? 'agent' as const : 'user' as const,
+    origin: { kind: 'unknown_historical' as const },
     content: { text: message_id },
     display_data: null,
     usage_data: null,

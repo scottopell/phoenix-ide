@@ -18,7 +18,7 @@ import type { Dispatch } from 'react';
 import { parseEvent } from './hooks/useConnection';
 import type { SSEAction } from './conversation/atom';
 import type { MessageType } from './generated/MessageType';
-import { MESSAGE_TYPE_OPTIONS } from './sseSchemas';
+import { InputOriginSchema, MESSAGE_TYPE_OPTIONS, QueuedSteeringMessageSchema } from './sseSchemas';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -235,6 +235,7 @@ describe('parseEvent', () => {
       conversation_id: 'conv-1',
       message_type: 'agent',
       content: { text: 'hello' },
+      origin: { kind: 'unknown_historical' },
       created_at: '2024-01-01T00:00:00Z',
     };
 
@@ -248,6 +249,22 @@ describe('parseEvent', () => {
       );
       expect(res.ok).toBe(true);
       expect(actions).toHaveLength(0);
+    });
+
+    it('requires origin even for historical messages rather than assuming user input', () => {
+      const { origin: _origin, ...withoutOrigin } = goodMsg;
+      expect(_origin).toEqual({ kind: 'unknown_historical' });
+      inProdMode(() => {
+        const { dispatch } = mockDispatch();
+        expect(parseEvent(SseMessageDataSchema, makeEvent({ sequence_id: 5, message: withoutOrigin }), 'message', dispatch).ok).toBe(false);
+      });
+    });
+
+    it('validates both internal source identities', () => {
+      const source = { kind: 'internal_conversation', product_conversation_id: 'product-1', transcript_id: 'row-1' };
+      expect(v.parse(InputOriginSchema, source)).toEqual(source);
+      expect(v.safeParse(InputOriginSchema, { kind: 'internal_conversation', product_conversation_id: 'product-1' }).success).toBe(false);
+      expect(v.safeParse(InputOriginSchema, { kind: 'human' }).success).toBe(false);
     });
 
     it('rejects a message whose sequence_id arrives as a string', () => {
@@ -314,6 +331,16 @@ describe('parseEvent', () => {
         expect(actions).toHaveLength(1);
       });
     });
+  });
+
+  it('requires provenance on authoritative queued steering projections', () => {
+    const queued = { message_id: 'steer-1', text: 'hello', images: [], files: [], origin: {
+      kind: 'internal_conversation', product_conversation_id: 'product-1', transcript_id: 'row-1',
+    } };
+    expect(v.parse(QueuedSteeringMessageSchema, queued).origin).toEqual(queued.origin);
+    const { origin: _origin, ...withoutOrigin } = queued;
+    expect(_origin.kind).toBe('internal_conversation');
+    expect(v.safeParse(QueuedSteeringMessageSchema, withoutOrigin).success).toBe(false);
   });
 
   describe('message_updated schema', () => {

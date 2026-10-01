@@ -136,7 +136,7 @@ AND SHALL preserve normal API authorization
 AND SHALL verify both the HTTP response and the resulting Phoenix state
 AND SHALL distinguish request acceptance from observed execution
 
-THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
+THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior except for explicit Global Coordinator subscriptions governed by REQ-GR-015
 
 THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
 
@@ -146,7 +146,9 @@ AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or c
 AND SHALL NOT infer a default repository or cwd
 AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
-THE SYSTEM MAY provide exactly one dedicated cross-conversation mutation tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
+THE SYSTEM MAY provide a dedicated cross-conversation message tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative input acceptance path
+
+THE SYSTEM SHALL additionally provide explicit subscription management only to the Global Coordinator as governed by REQ-GR-015
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
@@ -280,3 +282,45 @@ THE coordination policy SHALL NOT change the Coordinator's capabilities, lifecyc
 AND SHALL NOT infer a coordination role for ordinary conversations
 
 **Rationale:** Cross-conversation coordination depends on remembering ownership and unfinished obligations through interruptions. Historical memory guides the next inspection; it does not establish current state or new authorization. Prompt instructions guide generated content but do not guarantee lossless retention of unlimited obligations.
+
+### REQ-GR-014: Preserve Trusted Input Attribution
+
+THE SYSTEM SHALL assign input origin at trusted server boundaries and SHALL distinguish user-facing API input, internal conversation messages, system-generated input, and subscription events.
+
+WHEN a conversation sends a message
+THE SYSTEM SHALL preserve the sender's stable ProductConversation identity and exact transcript identity through durable admission, steering, persisted history, transport, UI attribution, and model-bound rendering.
+
+THE SYSTEM SHALL NOT accept a model-supplied origin as authority or infer human authorship for historical input whose origin was not recorded.
+
+THE SYSTEM SHALL treat user-facing API origin as a channel classification, not proof that a biological human authored the input.
+
+WHEN an API retry addresses an accepted pre-provenance input with otherwise matching identity and payload
+THE SYSTEM SHALL preserve the original acceptance and unknown historical origin rather than create new input or reattribute the stored input.
+
+THE SYSTEM SHALL continue to reject changed payloads and conflicts with recorded origins on retries.
+
+### REQ-GR-015: Watch Explicit Stable Conversations
+
+THE Global Coordinator SHALL have a trusted capability to enroll, inspect, and remove watches of open ordinary ProductConversations without per-target user approval.
+
+THE SYSTEM SHALL retain a watch across transcript continuation until removal or source Close, SHALL make repeated enrollment idempotent, and SHALL return source current state consistently with enrollment.
+
+THE SYSTEM SHALL deliver only relevant occurrences committed after enrollment and SHALL NOT replay historical events or revive suppressed events on re-enrollment.
+
+WHEN watched execution ends normally, fails, or is explicitly cancelled
+THE SYSTEM SHALL durably record a factual notification obligation with its source occurrence.
+
+THE SYSTEM SHALL exclude successful continuation handoff and awaiting-question or awaiting-approval states from stop notifications.
+
+THE SYSTEM SHALL deliver factual packets with source identity, occurrence identity, outcome, time, and supported cause information, without behavioral instructions or recovery recommendations. Natural-language derived facts are permitted.
+
+THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.
+
+WHEN removal or source Close precedes notification acceptance
+THE SYSTEM SHALL suppress the unaccepted notification.
+
+WHEN notification acceptance precedes removal or source Close
+THE SYSTEM SHALL retain accepted input without retraction.
+
+WHEN the Coordinator's execution is stopped
+THE SYSTEM SHALL retain subscriptions and permit future notifications, and SHALL NOT redeliver already-accepted input merely because execution was cancelled.

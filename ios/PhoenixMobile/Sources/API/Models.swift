@@ -448,6 +448,67 @@ struct ProductConversationCloseResidual: Codable, Equatable, Sendable {
     var detail: String?
 }
 
+enum InputOrigin: Codable, Equatable, Sendable {
+    case unknownHistorical
+    case userApi
+    case internalConversation(productConversationId: String, transcriptId: String)
+    case systemGenerated
+    case subscriptionEvent(eventId: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, product_conversation_id, transcript_id, event_id
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .kind) {
+        case "unknown_historical": self = .unknownHistorical
+        case "user_api": self = .userApi
+        case "internal_conversation":
+            self = .internalConversation(
+                productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
+                transcriptId: try container.decode(String.self, forKey: .transcript_id))
+        case "system_generated": self = .systemGenerated
+        case "subscription_event":
+            self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind, in: container, debugDescription: "Unrecognized input origin")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unknownHistorical: try container.encode("unknown_historical", forKey: .kind)
+        case .userApi: try container.encode("user_api", forKey: .kind)
+        case let .internalConversation(productId, transcriptId):
+            try container.encode("internal_conversation", forKey: .kind)
+            try container.encode(productId, forKey: .product_conversation_id)
+            try container.encode(transcriptId, forKey: .transcript_id)
+        case .systemGenerated: try container.encode("system_generated", forKey: .kind)
+        case let .subscriptionEvent(eventId):
+            try container.encode("subscription_event", forKey: .kind)
+            try container.encode(eventId, forKey: .event_id)
+        }
+    }
+
+    var isUserApiInput: Bool {
+        self == .userApi
+    }
+
+    var label: String {
+        switch self {
+        case .unknownHistorical: "Unknown input"
+        case .userApi: "User API"
+        case let .internalConversation(productId, transcriptId):
+            "Conversation from @transcript:\(transcriptId) (conversation ID \(productId))"
+        case .systemGenerated: "System input"
+        case .subscriptionEvent: "Conversation event"
+        }
+    }
+}
+
 struct Message: Codable, Identifiable, Equatable, Sendable {
     var message_id: String
     var conversation_id: String?
@@ -457,7 +518,11 @@ struct Message: Codable, Identifiable, Equatable, Sendable {
     var display_data: JSONValue?
     var created_at: String?
 
+    // nil is a cached pre-provenance message, never evidence of a user API send.
+    var origin: InputOrigin? = nil
+
     var id: String { message_id }
+    var inputOrigin: InputOrigin { origin ?? .unknownHistorical }
 
     var createdAtDate: Date? {
         created_at.flatMap { Conversation.parseDate($0) }

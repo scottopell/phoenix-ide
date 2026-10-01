@@ -405,7 +405,7 @@ mod tests {
         assert!(prompt.contains(
             "mutate the selected WorkScope only through unsandboxed Bash with its explicit active work_scope_id"
         ));
-        assert!(prompt.contains("never monitor in the background."));
+        assert!(prompt.contains("factual events from your explicit conversation watches"));
 
         assert!(!prompt.contains("cannot mutate files, repositories"));
         assert!(!prompt.contains("cannot mutate projects, tasks, workspaces"));

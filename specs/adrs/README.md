@@ -81,6 +81,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [067](067_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
 | [068](068_work-children-share-parent-development-trust.md) | Work children share parent development trust | Accepted | REQ-PROJ-008, REQ-BED-018; unsandboxed Work children and parent lifecycle ownership |
 | [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
+| [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
+| [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
 
 ## For agents: which decisions bind your task
 

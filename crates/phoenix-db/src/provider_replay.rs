@@ -73,7 +73,12 @@ impl Database {
         update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
     ) -> DbResult<()> {
         use phoenix_core::domain::provider_replay::AnthropicReplayUpdate;
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let result = sqlx::query(
@@ -88,6 +93,9 @@ impl Database {
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        if previous_kind != crate::conv_state_kind(state) {
+            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
         match update {
             AnthropicReplayUpdate::Append(response) => {
@@ -232,6 +240,36 @@ impl Database {
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> DbResult<phoenix_core::domain::db_schema::Message> {
+        self.add_message_and_clear_provider_replay_with_origin(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            &phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            state,
+            state_updated_at,
+        )
+        .await
+    }
+    /// Commits the message, source, state, and replay deletion in one transaction.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if serialization, attachment insertion, or the transaction fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_message_and_clear_provider_replay_with_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &phoenix_core::domain::db_schema::MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&phoenix_core::domain::db_schema::UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<phoenix_core::domain::db_schema::Message> {
         let mut tx = self.pool().begin().await?;
         let now = chrono::Utc::now();
         let content_json = content.to_stored_json();
@@ -244,7 +282,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -254,8 +292,19 @@ impl Database {
         .bind(display_json)
         .bind(usage_json)
         .bind(now.to_rfc3339())
+        .bind(origin.db_parts().0)
+        .bind(origin.db_parts().1)
+        .bind(origin.db_parts().2)
+        .bind(origin.db_parts().3)
         .execute(&mut *tx)
         .await?;
+        if matches!(
+            origin,
+            phoenix_core::domain::db_schema::InputOrigin::UserApi
+        ) {
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
+                .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
+        }
         crate::message_attachments::insert(&mut tx, message_id, content).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
@@ -277,6 +326,7 @@ impl Database {
             .await?;
         tx.commit().await?;
         let message = phoenix_core::domain::db_schema::Message {
+            origin: origin.clone(),
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -519,6 +569,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_input_origin_and_replay_clear_commit_together() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "conv-user-clear",
+            "conv-user-clear",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.store_provider_replay_state("conv-user-clear", &sample_payload())
+            .await
+            .unwrap();
+        let state = phoenix_core::domain::sm_state::ConvState::Idle;
+        let returned = db
+            .add_message_and_clear_provider_replay_with_origin(
+                "user-clear",
+                "conv-user-clear",
+                1,
+                &MessageContent::user("answer"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+                &state,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned.origin, InputOrigin::UserApi);
+        let source_kind: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'conv-user-clear'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(source_kind, "interaction_response");
+        assert_eq!(
+            db.get_messages("conv-user-clear").await.unwrap()[0].origin,
+            InputOrigin::UserApi
+        );
+        assert!(db
+            .load_provider_replay_state("conv-user-clear")
+            .await
+            .unwrap()
+            .is_none());
+
+        db.store_provider_replay_state("conv-user-clear", &sample_payload())
+            .await
+            .unwrap();
+        assert!(db
+            .add_message_and_clear_provider_replay_with_origin(
+                "user-clear",
+                "conv-user-clear",
+                2,
+                &MessageContent::user("duplicate"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+                &state,
+                chrono::Utc::now(),
+            )
+            .await
+            .is_err());
+        assert!(db
+            .load_provider_replay_state("conv-user-clear")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(db.get_messages("conv-user-clear").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn terminal_message_state_and_replay_clear_commit_atomically() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(
@@ -535,20 +656,21 @@ mod tests {
             .await
             .unwrap();
         let state = phoenix_core::domain::sm_state::ConvState::Idle;
-        db.add_message_and_clear_provider_replay(
-            "message-final",
-            "conv-atomic-close",
-            1,
-            &phoenix_core::domain::db_schema::MessageContent::agent(vec![
-                phoenix_core::domain::llm_types::ContentBlock::text("done"),
-            ]),
-            None,
-            None,
-            &state,
-            chrono::Utc::now(),
-        )
-        .await
-        .unwrap();
+        let returned = db
+            .add_message_and_clear_provider_replay(
+                "message-final",
+                "conv-atomic-close",
+                1,
+                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("done"),
+                ]),
+                None,
+                None,
+                &state,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
         assert!(db
             .load_provider_replay_state("conv-atomic-close")
             .await
@@ -560,6 +682,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(message_count, 1);
+        let persisted: String =
+            sqlx::query_scalar("SELECT origin_kind FROM messages WHERE message_id='message-final'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(returned.origin.db_parts().0, persisted);
+        assert_eq!(
+            returned.origin,
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        );
+        let loaded = db.get_messages("conv-atomic-close").await.unwrap();
+        assert_eq!(loaded[0].origin, returned.origin);
         let persisted: String =
             sqlx::query_scalar("SELECT state FROM conversations WHERE id='conv-atomic-close'")
                 .fetch_one(db.pool())

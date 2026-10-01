@@ -366,9 +366,10 @@ async fn format_global_search_hits(
         });
         let _ = writeln!(
             out,
-            "- [{} · {} · {}]({}) @transcript:{}#message-{} — {}",
+            "- [{} · {}{} · {}]({}) @transcript:{}#message-{} — {}",
             title,
-            hit.message_type,
+            attributed_role(hit.message_type, &hit.origin),
+            attributed_sender(&hit.origin),
             hit.created_at.format("%Y-%m-%d"),
             link,
             hit.conversation_id,
@@ -527,20 +528,58 @@ fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     )
 }
 
-fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
-    let role = match message.message_type {
-        MessageType::User => "User",
+pub(crate) fn attributed_role(
+    message_type: MessageType,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> &'static str {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    match message_type {
+        MessageType::User => match origin {
+            InputOrigin::UserApi => "User API",
+            InputOrigin::InternalConversation { .. } => "Conversation",
+            InputOrigin::SystemGenerated => "System input",
+            InputOrigin::SubscriptionEvent { .. } => "Conversation event",
+            InputOrigin::UnknownHistorical => "Unknown input",
+        },
         MessageType::Agent => "Agent",
         MessageType::Tool => "Tool",
         MessageType::System => "System",
         MessageType::Error => "Error",
         MessageType::Continuation => "Continuation",
-        MessageType::Skill => "Skill",
-    };
+        MessageType::Skill => match origin {
+            InputOrigin::UserApi => "Skill · User API",
+            InputOrigin::InternalConversation { .. } => "Skill · Conversation",
+            InputOrigin::SystemGenerated => "Skill · System input",
+            InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
+            InputOrigin::UnknownHistorical => "Skill · Unknown input",
+        },
+    }
+}
+
+pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    match origin {
+        InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+        } => {
+            format!(" from @transcript:{transcript_id} (conversation ID {product_conversation_id})")
+        }
+        InputOrigin::UnknownHistorical
+        | InputOrigin::UserApi
+        | InputOrigin::SystemGenerated
+        | InputOrigin::SubscriptionEvent { .. } => String::new(),
+    }
+}
+
+fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
+    let role = attributed_role(message.message_type, &message.origin);
     let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+    let sender = attributed_sender(&message.origin);
     format!(
-        "[{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
+        "[{}{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
         role,
+        sender,
         message.created_at.format("%Y-%m-%d %H:%M"),
         message.message_id,
         href,
@@ -874,8 +913,9 @@ async fn resolve_message(
         href,
         title,
         summary: format!(
-            "{} message {} in @transcript:{} at {}: {}",
-            message.message_type,
+            "{}{} message {} in @transcript:{} at {}: {}",
+            attributed_role(message.message_type, &message.origin),
+            attributed_sender(&message.origin),
             message.message_id,
             conv.id,
             message.created_at,
@@ -1054,10 +1094,13 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        message_id_fragment, render_full_message_text, resolve_conversation_read_target,
-        split_fragment, GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService,
+        format_global_search_hits, message_id_fragment, render_full_message_text,
+        render_global_message_line, resolve_conversation_read_target, split_fragment,
+        GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService,
     };
     use std::sync::Arc;
+
+    use crate::db::MessageRetriever;
 
     #[test]
     fn message_target_rejections_are_caller_neutral() {
@@ -1071,6 +1114,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn global_message_line_attributes_server_recorded_sender_not_user_role() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("origin-reader", "origin-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let sender = db
+            .create_conversation("origin-sender", "origin-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "origin-reader-message",
+                &conv.id,
+                &MessageContent::user("message body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let source = InputOrigin::InternalConversation {
+            product_conversation_id: sender.product_conversation_id.clone(),
+            transcript_id: sender.id.clone(),
+        };
+        message.origin = source;
+        let rendered = render_global_message_line(&conv, &message);
+        assert!(rendered.contains(&format!(
+            "Conversation from @transcript:{} (conversation ID {})",
+            sender.id, sender.product_conversation_id
+        )));
+        assert!(!rendered.contains("User API"));
+
+        message.origin = InputOrigin::UnknownHistorical;
+        let rendered = render_global_message_line(&conv, &message);
+        assert!(rendered.contains("Unknown input"));
+        assert!(!rendered.contains("User API"));
+    }
+
+    #[tokio::test]
+    async fn search_hit_uses_same_recorded_attribution_as_full_read() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent, MessageType};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("search-origin", "search-origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "search-origin-message",
+                &conv.id,
+                &MessageContent::user("search origin body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = Arc::new(db.fts_retriever());
+        let mut hit = retriever
+            .retrieve(crate::db::RetrievalRequest::natural_language(
+                "search origin",
+                crate::db::RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap()
+            .remove(0);
+        let service = GlobalReadService::new(db, retriever);
+        let cases = [
+            (InputOrigin::UnknownHistorical, "Unknown input"),
+            (InputOrigin::UserApi, "User API"),
+            (InputOrigin::SystemGenerated, "System input"),
+            (
+                InputOrigin::SubscriptionEvent {
+                    event_id: "event-1".into(),
+                },
+                "Conversation event",
+            ),
+            (
+                InputOrigin::InternalConversation {
+                    product_conversation_id: conv.product_conversation_id.clone(),
+                    transcript_id: conv.id.clone(),
+                },
+                "Conversation from @transcript:",
+            ),
+        ];
+        for (origin, expected) in cases {
+            message.origin = origin.clone();
+            hit.origin = origin;
+            let search = format_global_search_hits(&service, &[hit.clone()]).await;
+            let full = render_global_message_line(&conv, &message);
+            assert!(search.contains(expected), "{search}");
+            assert!(full.contains(expected), "{full}");
+            if expected != "User API" {
+                assert!(!search.contains("User API"), "{search}");
+            }
+            message.message_type = MessageType::Skill;
+            hit.message_type = MessageType::Skill;
+            let search = format_global_search_hits(&service, &[hit.clone()]).await;
+            let full = render_global_message_line(&conv, &message);
+            let skill_label = format!("Skill · {expected}");
+            assert!(search.contains(&skill_label), "{search}");
+            assert!(full.contains(&skill_label), "{full}");
+            message.message_type = MessageType::User;
+            hit.message_type = MessageType::User;
+        }
+    }
+
     #[test]
     fn transcript_image_placeholder_is_caller_neutral() {
         let mut content = phoenix_core::domain::db_schema::UserContent::new("text");
@@ -1081,6 +1234,7 @@ mod tests {
                 media_type: "image/png".to_string(),
             });
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "message".to_string(),
             conversation_id: "conversation".to_string(),
             sequence_id: 1,

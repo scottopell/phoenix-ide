@@ -2157,6 +2157,7 @@ async fn create_product_conversation(
         },
     };
     let intent = crate::db::ProductCreationIntent {
+        origin: phoenix_db::ProductCreationOrigin::UserApi,
         cwd: canonical_cwd,
         objective: req.objective,
         model: Some(req.model),
@@ -4625,6 +4626,7 @@ async fn send_chat(
     let outcome = service
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: id,
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             text: req.text,
             message_id: req.message_id,
             images: req.images,
@@ -5494,6 +5496,7 @@ async fn dispatch_continuation_handoff(
     )
     .send(crate::send_chat_service::SendChatRequest {
         conversation_id: conversation_id.clone(),
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
         text: intent.handoff,
         message_id: intent.message_id.as_str().to_string(),
         images: Vec::new(),
@@ -9890,6 +9893,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_steering_queue(
                 "conv-reconcile",
                 &[crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "queued".to_string(),
                     llm_text: None,
                     images: Vec::new(),
@@ -10525,6 +10529,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let now = chrono::Utc::now();
         let messages = vec![
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 1,
                 message_id: "u1".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10535,6 +10540,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 sequence_id: 2,
                 message_id: "a1".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10547,6 +10553,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 sequence_id: 3,
                 message_id: "sys".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10557,6 +10564,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 4,
                 message_id: "a2".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10569,6 +10577,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 5,
                 message_id: "skill".to_string(),
                 conversation_id: "conv".to_string(),
@@ -10584,6 +10593,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 created_at: now,
             },
             crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 sequence_id: 6,
                 message_id: "a3".to_string(),
                 conversation_id: "conv".to_string(),
@@ -11664,6 +11674,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let exact = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m1".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 1,
@@ -11683,6 +11694,7 @@ pub(crate) mod hard_delete_cascade_tests {
     fn transcript_coverage_reports_tail_for_short_long_and_oversized_fallback_snapshots() {
         let short = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m1".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 2,
@@ -11699,6 +11711,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let long = latest_stream_transcript_coverage(
             &[crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "m2".to_string(),
                 conversation_id: "c".to_string(),
                 sequence_id: 99,
@@ -12821,6 +12834,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let payload = PreparedDirectTurnPayload::from_parts(
             SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "pending".to_string(),
                 images: vec![],
                 files: vec![],
@@ -13108,6 +13122,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("materialize idle runtime");
         let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "run after cancellation".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -13127,6 +13142,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .acknowledged_event_tx
             .send(crate::runtime::AcknowledgedEventRequest {
                 event: Event::SteerMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: entry.text.clone(),
                     llm_text: entry.llm_text.clone(),
                     images: entry.images.clone(),
@@ -13198,6 +13214,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("create");
         accept_unmaterialized_direct_turn(&state, conversation_id).await;
         let entry = crate::state_machine::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "survive failed wake".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -17086,6 +17103,7 @@ mod attachment_storage_tests {
         let payload = PreparedDirectTurnPayload {
             v: PreparedDirectTurnPayload::VERSION,
             submitted: SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: "msg-direct-turn-files".to_string(),
                 text: "with attachments".to_string(),
                 images: vec![],

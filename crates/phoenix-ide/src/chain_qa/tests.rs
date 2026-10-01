@@ -1,7 +1,7 @@
 //! Tests for the chain Q&A backend (REQ-CHN-001 / 004 / 005 / 006).
 
 use super::*;
-use crate::db::{ChainQaStatus, Database, MessageContent};
+use crate::db::{ChainQaStatus, Database, MessageContent, MessageType};
 use async_trait::async_trait;
 use phoenix_llm::{LlmError, LlmResponse, TokenChunk, Usage};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -691,6 +691,7 @@ async fn read_conversation_accepts_hash_prefixed_id() {
 fn read_page_paginates_large_transcript() {
     let big = "x".repeat(READ_PAGE_CHARS + 500);
     let messages = vec![crate::db::Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
         message_id: "m0".into(),
         conversation_id: "c".into(),
         sequence_id: 0,
@@ -704,7 +705,7 @@ fn read_page_paginates_large_transcript() {
     // Page 1: full window + a "more" marker pointing at the next cursor.
     let page1 = read_page(&messages, 0);
     assert!(
-        page1.starts_with("User: x"),
+        page1.starts_with("Unknown input: x"),
         "got: {}",
         page1.chars().take(20).collect::<String>()
     );
@@ -725,6 +726,7 @@ fn read_page_paginates_large_transcript() {
 #[test]
 fn render_full_transcript_surfaces_skill_body_images_and_server_tools() {
     let mk = |seq: i64, mt: MessageType, content: MessageContent| crate::db::Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
         message_id: format!("m{seq}"),
         conversation_id: "c".to_string(),
         sequence_id: seq,

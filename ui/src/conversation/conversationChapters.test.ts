@@ -124,8 +124,8 @@ describe('buildConversationChapters', () => {
     const units = [userUnit('u1', 'first question', 5), userUnit('u2', 'second', 7)];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5 },
-      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7 },
+      { unitIndex: 0, kind: 'prompt', label: 'first question', sequenceId: 5, origin: { kind: 'unknown_historical' } },
+      { unitIndex: 1, kind: 'prompt', label: 'second', sequenceId: 7, origin: { kind: 'unknown_historical' } },
     ]);
   });
 
@@ -186,11 +186,28 @@ describe('buildConversationChapters', () => {
     expect(chapters.map((c) => c.kind)).toEqual(['prompt', 'prose', 'prompt']);
   });
 
+  it('carries channel provenance through persisted and authoritative queued prompts without changing indexes', () => {
+    const api = userUnit('api', 'API request', 1);
+    if (api.kind !== 'user') throw new Error('expected user');
+    api.message.origin = { kind: 'user_api' };
+    const internal = userUnit('internal', 'Forwarded request', 3);
+    if (internal.kind !== 'user') throw new Error('expected user');
+    internal.message.origin = { kind: 'internal_conversation', product_conversation_id: 'source-pc', transcript_id: 'source-row' };
+    const queued = pendingUserUnit('queued', 'Queued internal request');
+    if (queued.kind !== 'pending_user') throw new Error('expected pending user');
+    queued.message.origin = internal.message.origin;
+    const chapters = buildConversationChapters([api, agentTurnUnit('reply', [{ type: 'text', text: LONG_PROSE }]), internal, queued]);
+    expect(chapters.map(({ unitIndex, sequenceId }) => [unitIndex, sequenceId])).toEqual([[0, 1], [1, 2], [2, 3], [3, undefined]]);
+    expect(chapters.map((chapter) => chapter.origin)).toEqual([
+      { kind: 'user_api' }, undefined, internal.message.origin, internal.message.origin,
+    ]);
+  });
+
   it('includes pending user messages with an undefined sequenceId', () => {
     const units = [pendingUserUnit('local-1', 'queued prompt')];
     const chapters = buildConversationChapters(units);
     expect(chapters).toEqual([
-      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined },
+      { unitIndex: 0, kind: 'prompt', label: 'queued prompt', sequenceId: undefined, origin: { kind: 'user_api' } },
     ]);
   });
 });

@@ -58,6 +58,7 @@ enum AuthoritativeEffect {
         usage_data: Option<crate::db::UsageData>,
         message_id: String,
         idempotent: bool,
+        origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
         payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
@@ -205,6 +206,18 @@ impl ClassifiedEffect {
                 usage_data,
                 message_id,
                 idempotent,
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            })),
+            Effect::PersistUserInputMessage {
+                content,
+                message_id,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistMessage {
+                content,
+                display_data: None,
+                usage_data: None,
+                message_id,
+                idempotent: false,
+                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             })),
             Effect::PersistAuthoritativeUserMessage {
                 payload,
@@ -1456,7 +1469,27 @@ fn render_messages<'a>(
                 }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
-                let mut text_for_llm = user_content.llm_text().to_string();
+                let mut text_for_llm = match &msg.origin {
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                        product_conversation_id,
+                        transcript_id,
+                    } => format!(
+                        "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
+                        format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
+                        format!("[System-generated input]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => {
+                        format!("[Input of unknown historical origin]\n{}", user_content.llm_text())
+                    }
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi => {
+                        user_content.llm_text().to_string()
+                    }
+                };
                 if !user_content.files.is_empty() {
                     for file in &user_content.files {
                         text_for_llm.push('\n');
@@ -1525,7 +1558,14 @@ fn render_messages<'a>(
 
             // Skill messages are delivered as user-role messages (REQ-SK-002)
             MessageContent::Skill(skill_content) => {
-                let mut body = skill_content.body.clone();
+                let source = match &msg.origin {
+                    phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "[Input of unknown historical origin]".to_string(),
+                };
+                let mut body = format!("{source}\n{}", skill_content.body);
                 for file in &skill_content.files {
                     body.push('\n');
                     body.push_str(&file.llm_context_tag());
@@ -3264,6 +3304,7 @@ where
         let event = match event {
             Event::SteerMessage {
                 text,
+                origin,
                 llm_text,
                 images,
                 files,
@@ -3274,6 +3315,7 @@ where
                 self.steering_queue
                     .push(crate::state_machine::event::SteerEntry {
                         text,
+                        origin,
                         llm_text,
                         images,
                         files,
@@ -3397,6 +3439,25 @@ where
 
             if authoritative_event {
                 self.parent_tool_cycle_count = 0;
+            }
+            if matches!(
+                terminal_event,
+                Event::UserCancel {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    reason: _,
+                }
+            ) && self.active_direct_turn.is_none()
+                && !matches!(self.state, ConvState::Idle)
+                && matches!(
+                    result.new_state,
+                    ConvState::Idle
+                        | ConvState::CancellingTool { .. }
+                        | ConvState::CancellingSubAgents { .. }
+                )
+            {
+                self.storage
+                    .record_execution_cancel(&self.context.conversation_id)
+                    .await?;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
@@ -5868,6 +5929,7 @@ where
                 usage_data,
                 message_id,
                 idempotent,
+                origin,
             } => {
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
@@ -5892,13 +5954,14 @@ where
                 ) {
                     let message = self
                         .storage
-                        .add_message_and_clear_provider_replay(
+                        .add_message_and_clear_provider_replay_with_origin(
                             &message_id,
                             &self.context.conversation_id,
                             seq,
                             &content,
                             display_data.as_ref(),
                             usage_data.as_ref(),
+                            &origin,
                             &self.state,
                             self.state_updated_at,
                         )
@@ -5907,13 +5970,14 @@ where
                     message
                 } else {
                     self.storage
-                        .add_message_with_seq(
+                        .add_message_with_seq_and_origin(
                             &message_id,
                             &self.context.conversation_id,
                             seq,
                             &content,
                             display_data.as_ref(),
                             usage_data.as_ref(),
+                            &origin,
                         )
                         .await?
                 };
@@ -5948,6 +6012,7 @@ where
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let sequence_id = reserved_sequences[0];
                 let message = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id,
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id,
@@ -6153,6 +6218,7 @@ where
                 let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: format!(
                         "continuation-{}-{operation_id}",
                         self.context.conversation_id
@@ -6837,6 +6903,7 @@ where
                 let seq = self.broadcast_tx.next_seq();
                 let agent_content = MessageContent::agent(message.content);
                 let db_msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: message.message_id,
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id: seq,
@@ -6979,6 +7046,7 @@ where
             .zip(sequences)
             .map(|(message, sequence_id)| crate::db::Message {
                 message_id: message.message_id,
+                origin: message.origin,
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id,
                 message_type: message.content.message_type(),
@@ -8163,6 +8231,7 @@ where
         let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: assistant_message.message_id,
             conversation_id: conv_id.clone(),
             sequence_id: reserved_seqs[0],
@@ -8178,6 +8247,7 @@ where
             .map(|(result, sequence_id)| {
                 let content = tool_result_message_content(&result);
                 crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                     conversation_id: conv_id.clone(),
                     sequence_id,
@@ -8258,6 +8328,7 @@ where
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = reserved_seqs[0];
                 let agent_msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: assistant_message.message_id.clone(),
                     conversation_id: conv_id.clone(),
                     sequence_id: agent_seq,
@@ -8275,6 +8346,7 @@ where
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     tool_msgs.push(crate::db::Message {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                         message_id: tool_result_message_id(
                             &agent_msg.message_id,
                             &result.tool_use_id,
@@ -8394,6 +8466,7 @@ where
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_seq = reserved_seqs[0];
         let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: assistant_message.message_id.clone(),
             conversation_id: conv_id.clone(),
             sequence_id: agent_seq,
@@ -8418,6 +8491,7 @@ where
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             tool_msgs.push(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
                 conversation_id: conv_id.clone(),
                 sequence_id: *tool_seq,
@@ -8629,6 +8703,7 @@ where
         } else {
             let content = MessageContent::User(crate::db::UserContent::meta(&llm_content));
             TerminalSubAgentEvidence::Insert(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: summary_message_id,
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id: self.broadcast_tx.next_seq(),
@@ -9129,6 +9204,7 @@ where
         let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
         let seq = self.broadcast_tx.next_seq();
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: msg_id,
             conversation_id: self.context.conversation_id.clone(),
             sequence_id: seq,
@@ -9297,6 +9373,7 @@ where
             let approved_state = ConvState::LlmRequesting { attempt: 1 };
             let state_updated_at = Utc::now();
             let message = crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: self.context.conversation_id.clone(),
                 sequence_id: self.broadcast_tx.next_seq(),
@@ -9388,6 +9465,7 @@ where
                     plan_backup,
                 );
                 let msg = crate::db::Message {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                     message_id: uuid::Uuid::new_v4().to_string(),
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id: self.broadcast_tx.next_seq(),
@@ -12681,8 +12759,32 @@ mod dispatch_context_budget_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
+    #[test]
+    fn provider_context_attributes_internal_sender_without_changing_user_role() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, product_conversation::ProductConversationId,
+        };
+        let mut internal = message("recipient", 1, "please inspect this");
+        internal.origin = InputOrigin::InternalConversation {
+            product_conversation_id: ProductConversationId::parse("source-product").unwrap(),
+            transcript_id: "source-transcript".to_string(),
+        };
+        let mut api = message("recipient", 2, "user request");
+        api.origin = InputOrigin::UserApi;
+        let rendered = render_messages(&[internal, api], &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].role, phoenix_llm::MessageRole::User);
+        assert!(
+            matches!(&rendered[0].content[0], ContentBlock::Text { text } if text == "[Message from conversation source-product, transcript source-transcript]\nplease inspect this")
+        );
+        assert!(
+            matches!(&rendered[1].content[0], ContentBlock::Text { text } if text == "user request")
+        );
+    }
+
     fn message(conv_id: &str, sequence_id: i64, text: &str) -> crate::db::Message {
         crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("{conv_id}-{sequence_id}"),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -12812,8 +12914,17 @@ mod dispatch_context_budget_tests {
         runtime.llm_task_handle.take().unwrap().await.unwrap();
         assert_eq!(storage.prompt_projection_load_counts(), (1, 2));
         let requests = llm.recorded_requests();
-        assert_eq!(user_texts(&requests[0]), vec!["initial"]);
-        assert_eq!(user_texts(&requests[1]), vec!["initial", "appended"]);
+        assert_eq!(
+            user_texts(&requests[0]),
+            vec!["[Input of unknown historical origin]\ninitial"]
+        );
+        assert_eq!(
+            user_texts(&requests[1]),
+            vec![
+                "[Input of unknown historical origin]\ninitial",
+                "[Input of unknown historical origin]\nappended"
+            ]
+        );
 
         storage.replace_message_content(
             conv_id,
@@ -12830,7 +12941,10 @@ mod dispatch_context_budget_tests {
         assert_eq!(llm.recorded_requests().len(), 3);
         assert_eq!(
             user_texts(&llm.recorded_requests()[2]),
-            vec!["initial edited provider-visible", "appended"]
+            vec![
+                "[Input of unknown historical origin]\ninitial edited provider-visible",
+                "[Input of unknown historical origin]\nappended"
+            ]
         );
     }
 
@@ -12859,18 +12973,17 @@ mod dispatch_context_budget_tests {
             SseBroadcaster::new(16, 0),
         );
 
-        runtime
-            .process_event(Event::UserMessage {
-                text: "dispatch me".into(),
-                llm_text: None,
-                images: Vec::new(),
-                files: Vec::new(),
-                message_id: "projection-liveness-user".into(),
-                user_agent: None,
-                skill_invocation: None,
-            })
-            .await
-            .expect("projection failure is a state-machine outcome");
+        Box::pin(runtime.process_event(Event::UserMessage {
+            text: "dispatch me".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "projection-liveness-user".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }))
+        .await
+        .expect("projection failure is a state-machine outcome");
 
         assert!(runtime.llm_task_handle.is_none());
         assert!(matches!(
@@ -12937,10 +13050,16 @@ mod dispatch_context_budget_tests {
             assert_eq!(request.system[0].text, expected);
             assert_eq!(request.cache_key.as_str(), conv_id);
         }
-        assert_eq!(user_texts(&requests[0]), vec!["Check the release"]);
+        assert_eq!(
+            user_texts(&requests[0]),
+            vec!["[Input of unknown historical origin]\nCheck the release"]
+        );
         assert_eq!(
             user_texts(&requests[1]),
-            vec!["Check the release", "The release owner reports completion"]
+            vec![
+                "[Input of unknown historical origin]\nCheck the release",
+                "[Input of unknown historical origin]\nThe release owner reports completion"
+            ]
         );
     }
 
@@ -13192,6 +13311,7 @@ mod creation_completion_lifecycle_tests {
             job_id: "job".to_string(),
             claim: creation_claim(),
             initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "start".to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -13227,9 +13347,7 @@ mod creation_completion_lifecycle_tests {
         ));
         let mut failed_attempt = runtime_with_storage(provisioning.clone(), Arc::clone(&storage));
 
-        let error = failed_attempt
-            .runtime
-            .process_event(creation_event())
+        let error = Box::pin(failed_attempt.runtime.process_event(creation_event()))
             .await
             .expect_err("completion persistence failure must fail the transition");
 
@@ -13249,9 +13367,7 @@ mod creation_completion_lifecycle_tests {
         storage.queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
         let mut reclaimed = runtime_with_storage(provisioning, storage);
         let mut request_count = reclaimed.llm.subscribe_request_count();
-        reclaimed
-            .runtime
-            .process_event(creation_event())
+        Box::pin(reclaimed.runtime.process_event(creation_event()))
             .await
             .unwrap();
         wait_for_provider_dispatch(&mut request_count).await;
@@ -13312,16 +13428,12 @@ mod creation_completion_lifecycle_tests {
             .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
         let mut request_count = harness.llm.subscribe_request_count();
 
-        harness
-            .runtime
-            .process_event(creation_event())
+        Box::pin(harness.runtime.process_event(creation_event()))
             .await
             .unwrap();
         wait_for_provider_dispatch(&mut request_count).await;
 
-        harness
-            .runtime
-            .process_event(creation_event())
+        Box::pin(harness.runtime.process_event(creation_event()))
             .await
             .expect_err("materialized creation event cannot be replayed");
         assert_eq!(*request_count.borrow(), 1);
@@ -13379,6 +13491,7 @@ mod creation_completion_lifecycle_tests {
             .runtime
             .with_startup_creation_completion("job".to_string(), creation_claim())
             .with_steering_queue(vec![phoenix_core::domain::sm_event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "queued before restart".to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -13421,6 +13534,7 @@ mod authoritative_user_message_effect_tests {
     fn payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "hello".to_string(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -13446,6 +13560,7 @@ mod authoritative_user_message_effect_tests {
 
     fn message(message_id: &str, sequence_id: i64) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: "conv-direct".to_string(),
             sequence_id,
@@ -13882,12 +13997,16 @@ mod authoritative_user_message_effect_tests {
             let requests = rt.llm_client.recorded_requests();
             let request = requests.last().unwrap();
             assert!(request.tools.is_empty());
-            assert_eq!(request.messages[0].content[0].render_text(), seed);
+            let attributed_seed = format!("[Input of unknown historical origin]\n{seed}");
+            assert_eq!(
+                request.messages[0].content[0].render_text(),
+                attributed_seed
+            );
             assert_eq!(
                 request
                     .messages
                     .iter()
-                    .filter(|m| m.content[0].render_text() == seed)
+                    .filter(|m| m.content[0].render_text() == attributed_seed)
                     .count(),
                 1
             );
@@ -17973,11 +18092,11 @@ mod approve_task_failure_effect_tests {
             observed_parent_id
         });
 
-        rt.process_event(Event::TaskApprovalDecided {
+        Box::pin(rt.process_event(Event::TaskApprovalDecided {
             outcome: TaskApprovalOutcome::Approved {
                 handoff: TaskApprovalHandoff::StartFreshWorkConversation,
             },
-        })
+        }))
         .await
         .expect("fresh handoff approval should succeed");
 
@@ -18023,11 +18142,11 @@ mod approve_task_failure_effect_tests {
         )
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
 
-        rt.process_event(Event::TaskApprovalDecided {
+        Box::pin(rt.process_event(Event::TaskApprovalDecided {
             outcome: TaskApprovalOutcome::Approved {
                 handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
             },
-        })
+        }))
         .await
         .expect_err("post-Git persistence failure must retire actor");
 
@@ -18076,13 +18195,12 @@ mod approve_task_failure_effect_tests {
         )
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
 
-        let result = rt
-            .process_event(Event::TaskApprovalDecided {
-                outcome: TaskApprovalOutcome::Approved {
-                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
-                },
-            })
-            .await;
+        let result = Box::pin(rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        }))
+        .await;
 
         assert!(
             result.is_err(),
@@ -18467,6 +18585,7 @@ mod steer_drain_detector_tests {
 
     fn mk_entry(id: &str, text: &str) -> SteerEntry {
         SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.to_string(),
             llm_text: None,
             images: vec![],
@@ -18480,6 +18599,7 @@ mod steer_drain_detector_tests {
     fn mk_steer_event(id: &str, text: &str) -> Event {
         let entry = mk_entry(id, text);
         Event::SteerMessage {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: entry.text,
             llm_text: entry.llm_text,
             images: entry.images,
@@ -19433,6 +19553,7 @@ mod steer_drain_detector_tests {
     fn render_messages_withholds_unadopted_wake_observation() {
         let created_at = chrono::Utc::now();
         let msgs = vec![crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: "wake-msg".to_string(),
             conversation_id: "conv".to_string(),
             sequence_id: 7,
@@ -20129,6 +20250,36 @@ mod steer_drain_detector_tests {
                 .expect("unchanged durable recovery state"),
             initial_state
         );
+    }
+
+    #[tokio::test]
+    async fn user_input_effect_preserves_api_origin_and_generic_effect_is_generated() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-input-origin",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.execute_effect(Effect::PersistUserInputMessage {
+            content: MessageContent::user("answer"),
+            message_id: "answer-1".to_string(),
+        })
+        .await
+        .unwrap();
+        rt.execute_effect(Effect::PersistMessage {
+            content: MessageContent::user("generated"),
+            display_data: None,
+            usage_data: None,
+            message_id: "generated-1".to_string(),
+            idempotent: false,
+        })
+        .await
+        .unwrap();
+        let messages = storage.get_all_messages("conv-input-origin");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].origin, InputOrigin::UserApi);
+        assert_eq!(messages[1].origin, InputOrigin::SystemGenerated);
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the
@@ -23306,8 +23457,14 @@ mod stale_tool_result_clearing_tests {
             )
             .await;
             assert_eq!(messages.len(), 2);
-            assert_eq!(messages[0].content[0].render_text(), "same handoff text");
-            assert_eq!(messages[1].content[0].render_text(), "cancel Crick");
+            assert_eq!(
+                messages[0].content[0].render_text(),
+                "[Input of unknown historical origin]\nsame handoff text"
+            );
+            assert_eq!(
+                messages[1].content[0].render_text(),
+                "[Input of unknown historical origin]\ncancel Crick"
+            );
         }
         assert_eq!(projection.len(), 3);
         assert_eq!(projection[1].message_id, "accepted");

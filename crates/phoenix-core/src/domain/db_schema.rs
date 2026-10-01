@@ -1535,11 +1535,90 @@ impl RecoverySettlementReason {
     }
 }
 
+/// Server-assigned attribution of an input. `UnknownHistorical` means no reliable
+/// attribution was recorded; it does not mean the API user authored the input.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum InputOrigin {
+    #[default]
+    UnknownHistorical,
+    UserApi,
+    InternalConversation {
+        #[ts(type = "string")]
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+    },
+    SystemGenerated,
+    SubscriptionEvent {
+        event_id: String,
+    },
+}
+
+impl InputOrigin {
+    /// Compare a stored admission with a retry without reattributing historical data.
+    #[must_use]
+    pub fn accepts_retry_origin(&self, retry: &Self) -> bool {
+        self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi))
+    }
+
+    #[must_use]
+    pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
+        match self {
+            Self::UnknownHistorical => ("unknown_historical", None, None, None),
+            Self::UserApi => ("user_api", None, None, None),
+            Self::InternalConversation {
+                product_conversation_id,
+                transcript_id,
+            } => (
+                "internal_conversation",
+                Some(product_conversation_id.as_str()),
+                Some(transcript_id),
+                None,
+            ),
+            Self::SystemGenerated => ("system_generated", None, None, None),
+            Self::SubscriptionEvent { event_id } => {
+                ("subscription_event", None, None, Some(event_id))
+            }
+        }
+    }
+
+    /// # Errors
+    /// Returns an error when persisted origin columns do not form a valid origin.
+    pub fn from_db_parts(
+        kind: &str,
+        product_id: Option<String>,
+        transcript_id: Option<String>,
+        event_id: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, product_id, transcript_id, event_id) {
+            ("unknown_historical", None, None, None) => Ok(Self::UnknownHistorical),
+            ("user_api", None, None, None) => Ok(Self::UserApi),
+            ("system_generated", None, None, None) => Ok(Self::SystemGenerated),
+            ("subscription_event", None, None, Some(event_id)) if !event_id.trim().is_empty() => {
+                Ok(Self::SubscriptionEvent { event_id })
+            }
+            ("internal_conversation", Some(product_id), Some(transcript_id), None)
+                if !transcript_id.trim().is_empty() =>
+            {
+                Ok(Self::InternalConversation {
+                    product_conversation_id: ProductConversationId::parse(product_id)
+                        .map_err(|e| e.to_string())?,
+                    transcript_id,
+                })
+            }
+            other => Err(format!("invalid input origin: {other:?}")),
+        }
+    }
+}
+
 /// Message record
 #[derive(Debug, Clone, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Message {
     pub message_id: String,
+    #[serde(default)]
+    pub origin: InputOrigin,
     pub conversation_id: String,
     pub sequence_id: i64,
     pub message_type: MessageType,

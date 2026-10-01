@@ -640,11 +640,16 @@ export interface ToolCall {
   input: { _tool?: string; [key: string]: unknown };
 }
 
+export type { InputOrigin } from './generated/InputOrigin';
+import type { InputOrigin } from './generated/InputOrigin';
+
 export interface Message {
   message_id: string;
   sequence_id: number;
   conversation_id: string;
   message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
+  /** Synthetic UI messages may lack origin; authoritative wire messages require it. */
+  origin?: InputOrigin;
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
@@ -770,6 +775,7 @@ export interface FileAttachment {
 /** Server-authoritative projection of a message awaiting steering delivery. */
 export interface QueuedSteeringMessage {
   message_id: string;
+  origin: InputOrigin;
   text: string;
   images: ImageData[];
   files: FileAttachment[];

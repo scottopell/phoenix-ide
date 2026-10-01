@@ -185,6 +185,7 @@ mod tests {
 
     fn persisted(id: &str, text: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: id.to_string(),
             conversation_id: "current".to_string(),
             sequence_id: 1,
@@ -235,7 +236,10 @@ mod tests {
         )
         .unwrap();
         let handoff = history.handoff.unwrap();
-        assert_eq!(handoff.message.content, user("edited").content);
+        assert_eq!(
+            handoff.message.content,
+            user("[Input of unknown historical origin]\nedited").content
+        );
         assert_eq!(handoff.message_id, "accepted");
     }
 

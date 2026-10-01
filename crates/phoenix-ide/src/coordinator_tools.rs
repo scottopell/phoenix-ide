@@ -29,12 +29,103 @@ pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
 ) -> Vec<Arc<dyn Tool>> {
+    let watch_db = send_chat.db().clone();
     let mut tools = writing_tools(service.clone(), send_chat)
         .into_tools()
         .collect::<Vec<_>>();
     tools.insert(3, Arc::new(ResolveReference(service.clone())));
     tools.push(Arc::new(WorkScopeCoordinatorBash(service)));
+    tools.push(Arc::new(WatchConversation(watch_db.clone())));
+    tools.push(Arc::new(UnwatchConversation(watch_db.clone())));
+    tools.push(Arc::new(ListWatchedConversations(watch_db)));
     tools
+}
+
+struct WatchConversation(crate::db::Database);
+struct UnwatchConversation(crate::db::Database);
+struct ListWatchedConversations(crate::db::Database);
+
+fn watch_id(
+    input: &Value,
+) -> Result<phoenix_core::domain::product_conversation::ProductConversationId, String> {
+    let id = input
+        .get("product_conversation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "product_conversation_id is required".to_string())?;
+    phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
+        .map_err(|error| error.to_string())
+}
+
+fn watch_output(value: impl Serialize) -> ToolOutput {
+    match serde_json::to_string(&value) {
+        Ok(value) => ToolOutput::success(value),
+        Err(error) => ToolOutput::error(error.to_string()),
+    }
+}
+
+#[async_trait]
+impl Tool for WatchConversation {
+    fn name(&self) -> &'static str {
+        "watch_conversation"
+    }
+    fn description(&self) -> String {
+        "Subscribe this Global Coordinator to future terminal facts for an open ordinary stable ProductConversation. Returns its current transcript and state atomically with enrollment. No historical events are replayed.".into()
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1}},"required":["product_conversation_id"],"additionalProperties":false})
+    }
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        let id = match watch_id(&input) {
+            Ok(id) => id,
+            Err(error) => return ToolOutput::error(error),
+        };
+        match self.0.watch_product_conversation(&id).await {
+            Ok(snapshot) => watch_output(snapshot),
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for UnwatchConversation {
+    fn name(&self) -> &'static str {
+        "unwatch_conversation"
+    }
+    fn description(&self) -> String {
+        "End this Global Coordinator's subscription to a stable ProductConversation. Suppress pending but not already accepted notifications.".into()
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"product_conversation_id":{"type":"string","minLength":1}},"required":["product_conversation_id"],"additionalProperties":false})
+    }
+    async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
+        let id = match watch_id(&input) {
+            Ok(id) => id,
+            Err(error) => return ToolOutput::error(error),
+        };
+        match self.0.unwatch_product_conversation(&id).await {
+            Ok(ended) => watch_output(json!({"product_conversation_id": id, "ended": ended})),
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ListWatchedConversations {
+    fn name(&self) -> &'static str {
+        "list_watched_conversations"
+    }
+    fn description(&self) -> String {
+        "List active Global Coordinator stable-conversation subscriptions and their current transcript and state.".into()
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","additionalProperties":false})
+    }
+    async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+        match self.0.list_coordinator_watches().await {
+            Ok(watches) => watch_output(watches),
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
+    }
 }
 
 struct WorkScopeCoordinatorBash(GlobalReadService);
@@ -277,7 +368,7 @@ impl Tool for SendConversationMessage {
     }
 
     fn description(&self) -> String {
-        "Send one user message by typed target: @conv:<product_conversation_id> routes to the current writable transcript at authoritative admission; @transcript:<conversation_id> targets that exact runtime member. Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
+        "Send one conversation-authored message by typed target: @conv:<product_conversation_id> routes to the current writable transcript at authoritative admission; @transcript:<conversation_id> targets that exact runtime member. Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -365,6 +456,16 @@ impl Tool for SendConversationMessage {
         };
         let request = SendChatRequest {
             conversation_id: String::new(),
+            origin: match self
+                .send_chat
+                .source_conversation(&ctx.conversation_id)
+                .await
+            {
+                Ok(source) => sender_origin(source),
+                Err(error) => {
+                    return ToolOutput::error(format!("sender membership unavailable: {error}"))
+                }
+            },
             text: parsed.message,
             message_id: parsed.message_id.clone(),
             images: Vec::new(),
@@ -460,6 +561,13 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Busy => "conversation_busy",
         SendChatServiceError::CloseAdmissionFenced => "close_admission_fenced",
         SendChatServiceError::HistoryUnavailable => "target_unavailable",
+    }
+}
+
+fn sender_origin(source: crate::db::Conversation) -> phoenix_core::domain::db_schema::InputOrigin {
+    phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+        product_conversation_id: source.product_conversation_id,
+        transcript_id: source.id,
     }
 }
 
@@ -580,7 +688,10 @@ mod tests {
                 "query_database",
                 "resolve_reference",
                 "send_conversation_message",
-                "bash"
+                "bash",
+                "watch_conversation",
+                "unwatch_conversation",
+                "list_watched_conversations"
             ]
         );
     }
@@ -596,6 +707,23 @@ mod tests {
         assert!(descriptions["search_conversations"].contains("untrusted stored data"));
         assert!(descriptions["read_conversation"].contains("untrusted stored data"));
         assert!(descriptions["send_conversation_message"].contains("acceptance only"));
+    }
+
+    #[tokio::test]
+    async fn sender_origin_comes_from_persisted_conversation_membership() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("sender-transcript", "sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let actual = db.get_conversation(&source.id).await.unwrap();
+        assert_eq!(
+            sender_origin(actual),
+            phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                product_conversation_id: source.product_conversation_id,
+                transcript_id: source.id,
+            }
+        );
     }
 
     #[tokio::test]

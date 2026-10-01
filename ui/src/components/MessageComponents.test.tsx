@@ -3,11 +3,11 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
-import { api, ConflictError, type ContentBlock, type ConversationState, type Message, type ForkProposalSummary } from '../api';
+import { api, ConflictError, type ContentBlock, type ConversationState, type InputOrigin, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
@@ -98,13 +98,14 @@ function systemMessage(messageId: string, text: string, sequenceId = 2): Message
   };
 }
 
-function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null } = {}): Message {
+function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null; origin?: InputOrigin } = {}): Message {
   return {
     message_id: messageId,
     sequence_id: options.sequenceId ?? 2,
     conversation_id: 'agent-1',
     message_type: 'user',
     content: { text, ...(options.isMeta ? { is_meta: true } : {}) },
+    origin: options.origin ?? { kind: options.isMeta ? 'system_generated' : 'user_api' },
     display_data: options.displayData ?? null,
     created_at: '2026-01-01T00:00:01Z',
   };
@@ -198,16 +199,76 @@ describe('user message provenance rendering', () => {
     expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
   });
 
-  it('keeps regular user messages authored as you', () => {
+  it('does not attribute historical or unattributed input to the user', () => {
+    for (const origin of [{ kind: 'unknown_historical' } as const, undefined]) {
+      const message = userMessage('old-input', 'Old text', { origin: { kind: 'unknown_historical' } });
+      if (!origin) delete message.origin;
+      const { unmount } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
+      expect(screen.getByText('Unknown input').closest('.message')).toHaveClass('meta');
+      expect(screen.queryByText('You')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('shows both source identities without treating an aggregate route as a pinned transcript', () => {
+    render(<MemoryRouter><UserMessage message={userMessage('received', 'From another conversation', {
+      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
+    })} /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByText(/From conversation ID source-product/).closest('.message')).toHaveClass('meta');
+    expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('renders system-generated input as meta without claiming human authorship', () => {
+    const { container } = render(<MemoryRouter><UserMessage message={userMessage('automatic', 'System prompt', {
+      origin: { kind: 'system_generated' },
+    })} /></MemoryRouter>);
+    expect(container.querySelector('.message.meta')).toBeInTheDocument();
+    expect(screen.getByText('System input')).toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('attributes authoritative queued steering separately from optimistic local input', () => {
+    render(<MemoryRouter><>
+      <QueuedUserMessage message={{ localId: 'queued', text: 'queued', images: [], status: 'steering_queued', origin: {
+        kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row',
+      } }} onRetry={() => {}} />
+      <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
+    </></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row' }).closest('.message')).toHaveClass('meta', 'steering-queued');
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('shows the origin of generated meta input instead of suppressing its sender', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage
+          message={userMessage('generated-meta', 'Generated seed', {
+            isMeta: true,
+            origin: { kind: 'system_generated' },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('System input')).toBeInTheDocument();
+    expect(screen.getByText('Generated seed')).toBeInTheDocument();
+  });
+
+  it('labels user-facing API input by channel', () => {
     render(
       <MemoryRouter>
         <UserMessage message={userMessage('plain-user', 'Hello there')} />
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('You')).toBeInTheDocument();
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
     expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy your message' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
   });
 });
 
@@ -1035,6 +1096,7 @@ describe('message copy affordances', () => {
       <UserMessage
         message={{
           message_id: 'user-copy',
+          origin: { kind: 'user_api' },
           sequence_id: 1,
           conversation_id: 'agent-1',
           message_type: 'user',
@@ -1045,7 +1107,7 @@ describe('message copy affordances', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Copy your message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy input message' }));
 
     await waitFor(() => {
       expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
@@ -1061,6 +1123,7 @@ describe('message copy affordances', () => {
           conversation_id: 'agent-1',
           message_type: 'user',
           content: { text: 'Great, push and open a PR please' },
+          origin: { kind: 'user_api' },
           display_data: null,
           created_at: '2026-01-01T00:00:00Z',
         }}
@@ -1126,7 +1189,7 @@ describe('message copy affordances', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole('button', { name: 'Copy your message' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy input message' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Copy Phoenix message' })).not.toBeInTheDocument();
   });
 
@@ -2974,6 +3037,7 @@ describe('SubAgentStatus inline activity', () => {
         sequence_id: 101,
         message: {
           message_id: 'child-live-message',
+          origin: { kind: 'unknown_historical' },
           conversation_id: childConversation.id,
           sequence_id: 101,
           message_type: 'agent',
@@ -3019,10 +3083,10 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => emitInit(FakeEventSource.instances[0]!, [initialMessage], [{
+    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{
       type: 'message',
       sequence_id: pendingTool.sequence_id,
-      message: pendingTool,
+      message: { ...pendingTool, origin: { kind: 'unknown_historical' } },
     }], baseConversation, { anchor: 2, tip: 3 }));
 
     expect(await screen.findByText('bash')).toBeInTheDocument();

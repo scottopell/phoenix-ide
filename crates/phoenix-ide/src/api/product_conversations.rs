@@ -1321,6 +1321,7 @@ mod tests {
             .accept_product_creation(
                 "req-accepted",
                 &crate::db::ProductCreationIntent {
+                    origin: phoenix_db::ProductCreationOrigin::UserApi,
                     cwd: "/repo/accepted".to_string(),
                     objective: "accepted objective".to_string(),
                     model: Some("claude".to_string()),
@@ -1336,6 +1337,7 @@ mod tests {
             .accept_product_creation(
                 "req-failed",
                 &crate::db::ProductCreationIntent {
+                    origin: phoenix_db::ProductCreationOrigin::UserApi,
                     cwd: "/repo/failed".to_string(),
                     objective: "failed objective".to_string(),
                     model: Some("claude".to_string()),
@@ -1506,6 +1508,7 @@ mod tests {
             .unwrap();
         let content = MessageContent::continuation("persisted API handoff");
         let message = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "auto-api-summary".to_string(),
             conversation_id: root.id.clone(),
             sequence_id: 1,

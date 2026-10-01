@@ -24,7 +24,7 @@
 
 import * as v from 'valibot';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
-import type { Conversation, Message, QueuedSteeringMessage } from './api';
+import type { Conversation, InputOrigin, Message, QueuedSteeringMessage } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
 // names for the transform-output types consumers actually want.
 import type {
@@ -111,6 +111,18 @@ export const MESSAGE_TYPE_OPTIONS = [
   'continuation',
 ] as const;
 
+export const InputOriginSchema: v.GenericSchema<InputOrigin> = v.variant('kind', [
+  v.looseObject({ kind: v.literal('unknown_historical') }),
+  v.looseObject({ kind: v.literal('user_api') }),
+  v.looseObject({ kind: v.literal('system_generated') }),
+  v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
+  v.looseObject({
+    kind: v.literal('internal_conversation'),
+    product_conversation_id: v.string(),
+    transcript_id: v.string(),
+  }),
+]);
+
 /** Message block carried in `init.messages` and `message.message`. Validates
  *  the reducer's load-bearing fields (`sequence_id` as number is the main
  *  point — a string would corrupt the dedup guard).
@@ -125,6 +137,7 @@ const MessageSchema = v.pipe(
     sequence_id: v.number(),
     conversation_id: v.string(),
     message_type: v.picklist(MESSAGE_TYPE_OPTIONS),
+    origin: InputOriginSchema,
     content: v.unknown(),
     display_data: v.optional(v.unknown()),
     usage_data: v.optional(v.unknown()),
@@ -133,9 +146,10 @@ const MessageSchema = v.pipe(
   v.transform((obj): Message => obj as unknown as Message),
 );
 
-const QueuedSteeringMessageSchema = v.pipe(
+export const QueuedSteeringMessageSchema = v.pipe(
   v.looseObject({
     message_id: v.string(),
+    origin: InputOriginSchema,
     text: v.string(),
     images: v.array(v.looseObject({
       data: v.string(),

@@ -8,6 +8,8 @@ use phoenix_core::domain::tool_result_identity::{
 
 mod close_foundation;
 mod coordinator_query;
+mod coordinator_watches;
+pub use coordinator_watches::{PendingWatchEvent, WatchSnapshot};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;
@@ -418,6 +420,8 @@ pub(crate) async fn commit_continuation_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed', continuation_state = 'suppressed' WHERE source_transcript_id = ?1 AND delivery_state = 'pending' AND terminal_kind = 'failed' AND terminal_reason = 'continuation summary failed'")
+        .bind(conversation_id).execute(&mut **tx).await?;
     admit_automatic_continuation_tx(
         tx,
         conversation_id,
@@ -1623,12 +1627,12 @@ fn parent_creation_values(
 }
 
 const PROMPT_TAIL_EMPTY_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
      FROM messages
      WHERE conversation_id = ?1
      ORDER BY sequence_id ASC";
 const PROMPT_TAIL_AFTER_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
      FROM messages
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
@@ -5514,9 +5518,18 @@ impl Database {
              WHERE job_id = ?2 AND status IN ('reserved', 'present')",
         )
         .bind(now)
-        .bind(job_id)
+        .bind(&job_id)
         .bind(generation + 1)
         .execute(&mut *tx)
+        .await?;
+        crate::coordinator_watches::record_creation_event_tx(
+            &mut tx,
+            &job_id,
+            u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?,
+            conversation_id,
+            "Cancelled",
+            None,
+        )
         .await?;
         tx.commit().await?;
         Ok(())
@@ -5593,7 +5606,7 @@ impl Database {
              WHERE job_id = ?2 AND status IN ('reserved', 'present')",
         )
         .bind(now)
-        .bind(job_id)
+        .bind(&job_id)
         .bind(generation + 1)
         .execute(&mut *tx)
         .await?;
@@ -6232,6 +6245,21 @@ impl Database {
                 tx.rollback().await?;
                 return Err(DbError::ConversationNotFound(job_id.to_string()));
             }
+            let source: String = sqlx::query_scalar(
+                "SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::coordinator_watches::record_creation_event_tx(
+                &mut tx,
+                job_id,
+                claim.generation,
+                &source,
+                "Failed",
+                Some(error),
+            )
+            .await?;
             tx.commit().await?;
             Ok(CreationCasOutcome::Applied)
         } else {
@@ -6363,8 +6391,8 @@ impl Database {
             ))));
         }
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'user_api')",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -6386,9 +6414,12 @@ impl Database {
             &now_text,
         )
         .await?;
+        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
+            .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -6451,6 +6482,8 @@ impl Database {
             &now,
         )
         .await?;
+        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
+            .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         Ok(CreationCasOutcome::Applied)
@@ -7252,6 +7285,12 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let state_json = serde_json::to_string(state).unwrap();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -7261,12 +7300,16 @@ impl Database {
         .bind(state_updated_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        if previous_kind != conv_state_kind(state) {
+            record_initial_execution_outcome_tx(&mut tx, id, state).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7608,6 +7651,11 @@ impl Database {
             }
         }
 
+        if matches!(state, ConvState::LlmRequesting { .. }) {
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id) VALUES (?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'steering'")
+                .bind(id).bind(&messages[0].message_id).execute(&mut *tx).await?;
+        }
+
         let updated = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
@@ -7726,7 +7774,8 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         let rows = sqlx::query(
-            "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir
+            "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir,
+                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
@@ -7778,6 +7827,13 @@ impl Database {
                     });
             queue.push(SteerEntry {
                 text: row.try_get("text")?,
+                origin: phoenix_core::domain::db_schema::InputOrigin::from_db_parts(
+                    &row.try_get::<String, _>("origin_kind")?,
+                    row.try_get("origin_product_conversation_id")?,
+                    row.try_get("origin_transcript_id")?,
+                    row.try_get("origin_subscription_event_id")?,
+                )
+                .map_err(DbError::Serialization)?,
                 llm_text: row.try_get("llm_text")?,
                 images,
                 files,
@@ -9666,7 +9722,7 @@ impl Database {
                     return Err(DbError::MessageNotFound(message_id.clone()));
                 }
                 let updated_message = sqlx::query(
-                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
                      FROM messages WHERE message_id = ?1",
                 )
                 .bind(message_id)
@@ -9940,6 +9996,28 @@ impl Database {
 
         for msg in seed_messages {
             insert_message_tx(&mut tx, msg).await?;
+        }
+        if let ConvState::SeededLlmRequesting {
+            seed_message_id, ..
+        } = &child.state
+        {
+            let seed = seed_messages
+                .iter()
+                .find(|message| message.message_id == *seed_message_id.as_str())
+                .ok_or_else(|| {
+                    DbError::Serialization("seeded fork seed message is missing".to_string())
+                })?;
+            sqlx::query(
+                "INSERT INTO steering_execution_occurrences(conversation_id, message_id, source_kind)
+                 VALUES (?1, ?2, 'seeded_fork')
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     source_kind = excluded.source_kind",
+            )
+            .bind(&child.id)
+            .bind(&seed.message_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Guard the resolution on the pending state so a concurrent resolver
@@ -11515,7 +11593,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
             let messages = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
                  FROM messages WHERE conversation_id = ?1 AND message_type = 'tool'",
             )
             .bind(conversation_id)
@@ -11553,7 +11631,7 @@ impl Database {
             }
             let updated_message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type,
-                        content, display_data, usage_data, created_at
+                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -11590,6 +11668,7 @@ impl Database {
                         encoded
                     });
             let message = Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: format!("startup-sub-agent-summary:{conversation_id}:{round_id}"),
                 conversation_id: conversation_id.to_string(),
                 sequence_id,
@@ -12166,8 +12245,8 @@ impl Database {
                     serde_json::to_string(&tool_content).unwrap_or_else(|_| "{}".to_string());
 
                 sqlx::query(
-                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
-                     VALUES (?1, ?2, ?3, 'tool', ?4, ?5)",
+                    "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at, origin_kind)
+                     VALUES (?1, ?2, ?3, 'tool', ?4, ?5, 'system_generated')",
                 )
                 .bind(&msg_id)
                 .bind(&conv_id)
@@ -12192,9 +12271,8 @@ impl Database {
 
     /// Add a message to a conversation
     ///
-    /// The `message_id` is the canonical identifier for this message, typically
-    /// generated by the client for user messages (enabling idempotent retries)
-    /// or by the server for agent/tool messages.
+    /// The `message_id` is the canonical identifier for this message. This generic
+    /// path has no sender identity; direct and steering input use origin-aware paths.
     ///
     /// # Errors
     ///
@@ -12226,7 +12304,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -12236,6 +12314,7 @@ impl Database {
         {
             message_attachments::hydrate(&mut tx, std::slice::from_mut(&mut existing)).await?;
             let exact = existing.conversation_id == conversation_id
+                && existing.origin == phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
                 && existing.message_type == msg_type
                 && existing.content == *content
                 && existing.display_data.as_ref() == display_data
@@ -12250,9 +12329,9 @@ impl Database {
         let inserted = sqlx::query(
             "INSERT INTO messages (
                  message_id, conversation_id, sequence_id, message_type, content,
-                 display_data, usage_data, created_at
+                 display_data, usage_data, created_at, origin_kind
              )
-             SELECT ?1, ?2, COALESCE(MAX(sequence_id), 0) + 1, ?3, ?4, ?5, ?6, ?7
+             SELECT ?1, ?2, COALESCE(MAX(sequence_id), 0) + 1, ?3, ?4, ?5, ?6, ?7, 'system_generated'
              FROM messages WHERE conversation_id = ?2
              RETURNING sequence_id",
         )
@@ -12275,6 +12354,7 @@ impl Database {
         tx.commit().await?;
 
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -12327,8 +12407,8 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
-             content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             content, display_data, usage_data, created_at, origin_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'system_generated')",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -12349,6 +12429,7 @@ impl Database {
             .await?;
         tx.commit().await?;
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -12401,6 +12482,35 @@ impl Database {
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
+        self.add_message_with_seq_and_origin(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            &phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+        )
+        .await
+    }
+    /// Persists the message and its source in the same transaction.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if serialization, insertion, attachments, or indexing fails.
+    ///
+    /// # Panics
+    /// Panics if persisted JSON columns cannot be serialized.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> DbResult<Message> {
         let now = Utc::now();
         let msg_type = content.message_type();
 
@@ -12410,8 +12520,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -12421,8 +12531,19 @@ impl Database {
         .bind(&display_str)
         .bind(&usage_str)
         .bind(now.to_rfc3339())
+        .bind(origin.db_parts().0)
+        .bind(origin.db_parts().1)
+        .bind(origin.db_parts().2)
+        .bind(origin.db_parts().3)
         .execute(&mut *tx)
         .await?;
+        if matches!(
+            origin,
+            phoenix_core::domain::db_schema::InputOrigin::UserApi
+        ) {
+            sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
+                .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
+        }
         message_attachments::insert(&mut tx, message_id, content).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
@@ -12432,6 +12553,7 @@ impl Database {
         tx.commit().await?;
 
         let message = Message {
+            origin: origin.clone(),
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -12487,8 +12609,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'system_generated')",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -12515,6 +12637,7 @@ impl Database {
         tx.commit().await?;
 
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -12545,7 +12668,7 @@ impl Database {
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::FullHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -12581,7 +12704,7 @@ impl Database {
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
             .and_then(PromptTranscriptGeneration::from_persisted)?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -12657,7 +12780,7 @@ impl Database {
     pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1
                AND (
@@ -12771,7 +12894,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -12801,7 +12924,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY sequence_id DESC
@@ -12877,7 +13000,7 @@ impl Database {
         limit: i64,
     ) -> DbResult<Vec<Message>> {
         let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -12908,7 +13031,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -12940,7 +13063,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
              ORDER BY sequence_id ASC",
@@ -12974,7 +13097,7 @@ impl Database {
     ) -> DbResult<(Vec<Message>, Vec<Message>)> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut before = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -12989,7 +13112,7 @@ impl Database {
         before.reverse();
 
         let mut after = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -13040,7 +13163,7 @@ impl Database {
         message_id: &str,
     ) -> DbResult<Message> {
         let mut message = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages
              WHERE message_id = ?1 AND (?2 IS NULL OR conversation_id = ?2)",
         )
@@ -13118,7 +13241,7 @@ impl Database {
         let body = async {
             let mut message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                        display_data, usage_data, created_at
+                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -13228,7 +13351,7 @@ impl Database {
         // Re-index the mutated message so the retrieval index reflects the new
         // content (specs/conversation-retrieval/ REQ-RET-003).
         let updated: Option<Message> = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -14249,8 +14372,8 @@ async fn insert_steering_entry_tx(
     sqlx::query(
         "INSERT INTO steering_messages
             (message_id, conversation_id, ordinal, text, llm_text, user_agent,
-             skill_name, skill_body, skill_dir)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )
     .bind(&entry.message_id)
     .bind(conversation_id)
@@ -14261,6 +14384,10 @@ async fn insert_steering_entry_tx(
     .bind(skill_name)
     .bind(skill_body)
     .bind(skill_dir)
+    .bind(entry.origin.db_parts().0)
+    .bind(entry.origin.db_parts().1)
+    .bind(entry.origin.db_parts().2)
+    .bind(entry.origin.db_parts().3)
     .execute(&mut **tx)
     .await?;
     for (file_ordinal, file) in entry.files.iter().enumerate() {
@@ -14684,6 +14811,7 @@ fn build_materialized_tool_round(
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
     let agent_msg = Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
         message_id: assistant_message.message_id.clone(),
         conversation_id: conv_id.to_string(),
         sequence_id: next_seq,
@@ -14727,6 +14855,7 @@ fn build_materialized_tool_round(
             result.images().to_vec(),
         );
         tool_msgs.push(Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: tool_result_message_id(&assistant_message.message_id, &result.tool_use_id),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
@@ -14748,6 +14877,7 @@ fn build_materialized_tool_round(
             true,
         );
         tool_msgs.push(Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             message_id: tool_result_message_id(&assistant_message.message_id, tool_id),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
@@ -14784,8 +14914,8 @@ async fn insert_message_tx(
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
     let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )
     .bind(&msg.message_id)
     .bind(&msg.conversation_id)
@@ -14795,11 +14925,15 @@ async fn insert_message_tx(
     .bind(&display_str)
     .bind(&usage_str)
     .bind(msg.created_at.to_rfc3339())
+    .bind(msg.origin.db_parts().0)
+    .bind(msg.origin.db_parts().1)
+    .bind(msg.origin.db_parts().2)
+    .bind(msg.origin.db_parts().3)
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
         let Some(mut existing) = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
@@ -14818,6 +14952,7 @@ async fn insert_message_tx(
             && existing.sequence_id == msg.sequence_id
             && existing.message_type == msg.message_type
             && existing.content == msg.content
+            && existing.origin == msg.origin
             && existing.display_data == msg.display_data
             && existing.usage_data == msg.usage_data
             && existing.created_at == msg.created_at;
@@ -14855,7 +14990,7 @@ async fn steering_message_matches_tx(
     message: &Message,
 ) -> DbResult<Option<bool>> {
     let row = sqlx::query(
-        "SELECT conversation_id, message_type, content, display_data, usage_data
+        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(&message.message_id)
@@ -14886,6 +15021,7 @@ async fn steering_message_matches_tx(
     if row.get::<String, _>("conversation_id") != message.conversation_id
         || row.get::<String, _>("message_type") != message.message_type.to_string()
         || stored_content != message.content.to_stored_json()
+        || decode_origin(&row).map_err(DbError::Sqlx)? != message.origin
         || stored_display != message.display_data
         || stored_usage != expected_usage
     {
@@ -14915,6 +15051,127 @@ fn cleared_creation_intent_json() -> String {
         "seed_label": null
     })
     .to_string()
+}
+
+pub(crate) async fn record_initial_execution_outcome_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+) -> DbResult<()> {
+    if let ConvState::RecoverableContinuationFailure { failure } = state {
+        return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
+            .await;
+    }
+    let steering: Option<(String, String)> = sqlx::query_as(
+        "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((message_id, source_kind)) = steering {
+        let source_kind =
+            crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+        let outcome = match state {
+            ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
+                Some(("Completed", None))
+            }
+            ConvState::CreationCancelled { .. } => Some(("Cancelled", None)),
+            ConvState::Error { message, .. } => Some(("Failed", Some(message.as_str()))),
+            ConvState::ContextExhausted { .. } => Some(("Failed", Some("context exhausted"))),
+            ConvState::RecoverableContinuationFailure { .. } => {
+                Some(("Failed", Some("continuation failed")))
+            }
+            ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::Failed { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::HandedOff { .. } => None,
+        };
+        if let Some((kind, reason)) = outcome {
+            crate::coordinator_watches::record_steering_event_tx(
+                tx,
+                source_kind,
+                &message_id,
+                conversation_id,
+                kind,
+                reason,
+            )
+            .await?;
+            sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let job = sqlx::query("SELECT id, generation FROM conversation_creation_jobs j WHERE j.conversation_id = ?1 AND j.status = 'ready' AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = j.conversation_id)")
+        .bind(conversation_id).fetch_optional(&mut **tx).await?;
+    if let Some(job) = job {
+        let generation: i64 = job.try_get("generation")?;
+        let generation =
+            u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?;
+        classify_creation_watch_outcome(
+            tx,
+            &job.try_get::<String, _>("id")?,
+            conversation_id,
+            generation,
+            state,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn classify_creation_watch_outcome(
+    tx: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+    conversation_id: &str,
+    generation: u64,
+    state: &ConvState,
+) -> DbResult<()> {
+    let (terminal_kind, reason) = match state {
+        ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => ("Completed", None),
+        ConvState::CreationCancelled { .. } => ("Cancelled", None),
+        ConvState::CreationFailed { error, .. } | ConvState::Error { message: error, .. } => {
+            ("Failed", Some(error.as_str()))
+        }
+        ConvState::RecoverableContinuationFailure { .. } => {
+            ("Failed", Some("continuation summary failed"))
+        }
+        ConvState::ContextExhausted { .. } => ("Failed", Some("context exhausted")),
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::HandedOff { .. } => return Ok(()),
+    };
+    crate::coordinator_watches::record_creation_event_tx(
+        tx,
+        job_id,
+        generation,
+        conversation_id,
+        terminal_kind,
+        reason,
+    )
+    .await
 }
 
 async fn update_claimed_creation_job_ready(
@@ -15058,6 +15315,18 @@ fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
     )))
 }
 
+fn decode_origin(
+    row: &SqliteRow,
+) -> Result<phoenix_core::domain::db_schema::InputOrigin, sqlx::Error> {
+    phoenix_core::domain::db_schema::InputOrigin::from_db_parts(
+        &row.try_get::<String, _>("origin_kind")?,
+        row.try_get("origin_product_conversation_id")?,
+        row.try_get("origin_transcript_id")?,
+        row.try_get("origin_subscription_event_id")?,
+    )
+    .map_err(prompt_decode_error)
+}
+
 /// Strict decoder used only at the provider-authority boundary. UI and recovery
 /// readers retain their tolerant decoder, but malformed provider-visible rows
 /// must prevent dispatch rather than fabricate substitute content or times.
@@ -15094,6 +15363,7 @@ fn parse_prompt_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
 
     Ok(Message {
         message_id: row.try_get("message_id")?,
+        origin: decode_origin(&row)?,
         conversation_id: row.try_get("conversation_id")?,
         sequence_id: row.try_get("sequence_id")?,
         message_type,
@@ -15118,6 +15388,7 @@ fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
 
     Ok(Message {
         message_id: row.try_get("message_id")?,
+        origin: decode_origin(&row)?,
         conversation_id: row.try_get("conversation_id")?,
         sequence_id: row.try_get("sequence_id")?,
         message_type: msg_type,
@@ -15739,6 +16010,14 @@ mod tests {
 
         assert_eq!(message.sequence_id, 43);
         assert_eq!(
+            message.origin,
+            phoenix_core::domain::db_schema::InputOrigin::UserApi
+        );
+        assert_eq!(
+            db.get_messages("conv-runtime-settle").await.unwrap()[0].origin,
+            message.origin
+        );
+        assert_eq!(
             db.get_messages("conv-runtime-settle").await.unwrap()[0].sequence_id,
             43
         );
@@ -15756,6 +16035,190 @@ mod tests {
                 .unwrap()
                 .state,
             requesting
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_initial_execution_ends_after_creation_has_settled_ready() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let running = ConvState::LlmRequesting { attempt: 0 };
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &running,
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state_at(&source.id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "creation");
+        db.update_conversation_state_at(&source.id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_initial_context_exhaustion_reports_fact_without_summary() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &ConvState::LlmRequesting { attempt: 0 },
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::ContextExhausted {
+                summary: "private summary".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].terminal_kind, "failed");
+        assert_eq!(
+            events[0].terminal_reason.as_deref(),
+            Some("context exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_summary_attempt_has_distinct_occurrence_after_creation() {
+        use phoenix_core::domain::sm_state::{
+            ContinuationSummaryRequest, RecoverableContinuationFailure,
+        };
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &ConvState::LlmRequesting { attempt: 0 },
+            now,
+        )
+        .await
+        .unwrap();
+        let source = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::ContextExhausted {
+                summary: "private".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = ContinuationSummaryRequest {
+            operation_id: "summary-operation".into(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        db.update_conversation_state(
+            &source.id,
+            &ConvState::AwaitingContinuation {
+                request: request.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let failed = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request,
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Network,
+                message: "private error".into(),
+            },
+        };
+        db.update_conversation_state(&source.id, &failed)
+            .await
+            .unwrap();
+        db.update_conversation_state(&source.id, &failed)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let summary = events
+            .iter()
+            .find(|event| event.source_occurrence_kind == "continuation_summary")
+            .unwrap();
+        assert_eq!(summary.source_occurrence_id, "summary-operation");
+        assert_eq!(summary.source_generation, 1);
+        assert_eq!(
+            summary.terminal_reason.as_deref(),
+            Some("continuation summary failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_creation_runtime_terminal_outcome_is_recorded_once() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let conversation = db.get_conversation("conv-runtime-settle").await.unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.settle_conversation_creation_runtime(
+                "job-runtime-settle",
+                &claim,
+                "conv-runtime-settle",
+                &ConvState::Idle,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "creation");
+        assert_eq!(events[0].source_occurrence_id, "job-runtime-settle");
+        assert_eq!(
+            events[0].source_generation,
+            i64::try_from(claim.generation).unwrap()
+        );
+        assert_eq!(events[0].terminal_kind, "completed");
+
+        assert_eq!(
+            db.settle_conversation_creation_runtime(
+                "job-runtime-settle",
+                &claim,
+                "conv-runtime-settle",
+                &ConvState::Idle,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
         );
     }
 
@@ -18940,6 +19403,7 @@ mod tests {
                 "threshold response",
             )]);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: request.operation_id.clone(),
             conversation_id: "begin-continuation".to_string(),
             sequence_id: 1,
@@ -19019,6 +19483,7 @@ mod tests {
                 "threshold response",
             )]);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: request.operation_id.clone(),
             conversation_id: "recover-start".to_string(),
             sequence_id: 1,
@@ -19100,6 +19565,7 @@ mod tests {
         };
         let content = MessageContent::continuation("durable summary");
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("continuation-{operation_id}"),
             conversation_id: "continuation-commit".to_string(),
             sequence_id: 1,
@@ -19141,6 +19607,7 @@ mod tests {
 
         let stale_content = MessageContent::continuation("stale summary");
         let stale = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "continuation-operation-2".to_string(),
             conversation_id: "continuation-commit".to_string(),
             sequence_id: 2,
@@ -19210,6 +19677,7 @@ mod tests {
             let summary = format!("exact summary for {conversation_id}  \n");
             let content = MessageContent::continuation(&summary);
             let message = Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: format!("continuation-{conversation_id}"),
                 conversation_id: conversation_id.to_string(),
                 sequence_id: 1,
@@ -19523,6 +19991,7 @@ mod tests {
         let summary = "breaker summary".to_string();
         let content = MessageContent::continuation(&summary);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "breaker-summary".to_string(),
             conversation_id: "breaker-parent".to_string(),
             sequence_id: 1,
@@ -19671,6 +20140,7 @@ mod tests {
         let summary = "coordinator exact summary".to_string();
         let content = MessageContent::continuation(&summary);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "coordinator-continuation-summary".to_string(),
             conversation_id: coordinator.id.clone(),
             sequence_id: 1,
@@ -19758,6 +20228,7 @@ mod tests {
             let summary = format!("summary-{conversation_id}");
             let content = MessageContent::continuation(&summary);
             let message = Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 message_id: format!("summary-{conversation_id}"),
                 conversation_id: conversation_id.to_string(),
                 sequence_id: 1,
@@ -19812,6 +20283,7 @@ mod tests {
                 "threshold response",
             )]);
         let start_message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "raw-start-message".to_string(),
             conversation_id: "raw-continuation".to_string(),
             sequence_id: 1,
@@ -19858,6 +20330,7 @@ mod tests {
         };
         let commit_content = MessageContent::continuation("raw summary");
         let commit_message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "raw-commit-message".to_string(),
             conversation_id: "raw-continuation".to_string(),
             sequence_id: 2,
@@ -20904,7 +21377,7 @@ mod tests {
 
         let mut parents = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
              FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
         )
         .try_map(parse_prompt_message_row)
@@ -21453,6 +21926,7 @@ mod tests {
             vec![file_attachment("replay-file")],
         ));
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "attachment-replay-message".into(),
             conversation_id: "attachment-replay".into(),
             sequence_id: 1,
@@ -21646,6 +22120,196 @@ mod tests {
         assert_eq!((parent_count, file_count, image_count), (0, 0, 0));
     }
 
+    #[tokio::test]
+    async fn user_input_with_seq_persists_origin_with_message() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-user", "origin-user", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let message = db
+            .add_message_with_seq_and_origin(
+                "user-answer",
+                "origin-user",
+                1,
+                &MessageContent::user("answer"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.origin, InputOrigin::UserApi);
+        let loaded = db.get_messages("origin-user").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].origin, InputOrigin::UserApi);
+        assert_eq!(loaded[0].message_id, "user-answer");
+        let conv = db.get_conversation("origin-user").await.unwrap();
+        db.watch_product_conversation(&conv.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_conversation_state("origin-user", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .unwrap();
+        db.update_conversation_state("origin-user", &ConvState::Idle)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "interaction_response");
+        assert_eq!(events[0].source_occurrence_id, "user-answer");
+    }
+
+    #[tokio::test]
+    async fn generated_message_insert_origins_match_returned_messages() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-inserts", "origin-inserts", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let first = db
+            .add_message(
+                "origin-first",
+                "origin-inserts",
+                &MessageContent::user("inherited input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let second = db
+            .add_message_with_seq(
+                "origin-second",
+                "origin-inserts",
+                2,
+                &MessageContent::agent(vec![]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let third = db
+            .add_message_with_seq_at(
+                "origin-third",
+                "origin-inserts",
+                3,
+                &MessageContent::tool("use", "result", false),
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let stored = db.get_messages("origin-inserts").await.unwrap();
+        for (returned, read_back) in [first, second, third].iter().zip(&stored) {
+            assert_eq!(returned.origin, InputOrigin::SystemGenerated);
+            assert_eq!(read_back.origin, returned.origin);
+            assert_eq!(read_back.message_id, returned.message_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn message_replay_with_changed_origin_is_rejected() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-replay", "origin-replay", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let content = MessageContent::user("unchanged content");
+        db.add_message(
+            "origin-replay-message",
+            "origin-replay",
+            &content,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE messages SET origin_kind = 'user_api' WHERE message_id = 'origin-replay-message'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.add_message(
+                "origin-replay-message",
+                "origin-replay",
+                &content,
+                None,
+                None
+            )
+            .await,
+            Err(DbError::MessageConflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn input_origin_round_trips_through_message_and_steering_columns() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, product_conversation::ProductConversationId,
+            sm_event::SteerEntry,
+        };
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-target", "origin-target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: ProductConversationId::parse("sender-product").unwrap(),
+            transcript_id: "sender-transcript".into(),
+        };
+        let message = Message {
+            message_id: "origin-message".into(),
+            origin: origin.clone(),
+            conversation_id: "origin-target".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("hello"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        insert_message_tx(&mut tx, &message).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.get_messages("origin-target").await.unwrap()[0].origin,
+            origin
+        );
+        assert_eq!(
+            db.load_hydrated_prompt_snapshot("origin-target")
+                .await
+                .unwrap()
+                .messages()[0]
+                .origin,
+            origin
+        );
+        assert!(sqlx::query(
+            "UPDATE messages SET origin_transcript_id = NULL WHERE message_id = 'origin-message'"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
+        let entry = SteerEntry {
+            message_id: "origin-steering".into(),
+            origin: origin.clone(),
+            text: "steer".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+        };
+        db.update_steering_queue("origin-target", &[entry])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_steering_queue("origin-target").await.unwrap()[0].origin,
+            origin
+        );
+        assert!(sqlx::query("UPDATE steering_messages SET origin_kind = 'user_api' WHERE message_id = 'origin-steering'")
+            .execute(db.pool()).await.is_err());
+    }
+
     /// Steering queue round-trips through the normalized tables: replace-all
     /// writes entries + attachments + skill trio, `get_steering_queue` rehydrates
     /// them in FIFO order, and `remove_steering_entries` deletes an entry and
@@ -21662,6 +22326,7 @@ mod tests {
             .unwrap();
 
         let entry_a = SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "first".into(),
             llm_text: Some("first-expanded".into()),
             images: vec![ImageData {
@@ -21679,6 +22344,7 @@ mod tests {
             skill_invocation: None,
         };
         let entry_b = SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "second".into(),
             llm_text: None,
             images: vec![],
@@ -21771,6 +22437,7 @@ mod tests {
             .unwrap()
             .product_conversation_id;
         let entry = SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "refused".to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -21821,6 +22488,7 @@ mod tests {
 
         fn entry(message_id: &str) -> SteerEntry {
             SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: message_id.to_string(),
                 llm_text: None,
                 images: Vec::new(),
@@ -22005,6 +22673,7 @@ mod tests {
     ) -> Message {
         let content = MessageContent::User(UserContent::new(message_id));
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -22018,6 +22687,7 @@ mod tests {
 
     fn steering_entry(message_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
         phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: message_id.to_string(),
             llm_text: None,
             images: Vec::new(),
@@ -22026,6 +22696,43 @@ mod tests {
             user_agent: None,
             skill_invocation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn watched_steering_execution_records_its_own_terminal_occurrence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-steer", "watch-steer", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        db.update_steering_queue(&source.id, &[steering_entry("watch-steer-input")])
+            .await
+            .unwrap();
+        db.commit_steering_drain(
+            &source.id,
+            &[steering_drain_message(&source.id, "watch-steer-input", 1)],
+            &ConvState::LlmRequesting { attempt: 0 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_occurrence_kind, "steering");
+        assert_eq!(events[0].source_occurrence_id, "watch-steer-input");
+        db.update_conversation_state(&source.id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -22262,6 +22969,13 @@ mod tests {
             None,
             None,
         )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'unknown_historical' WHERE message_id = 'a'",
+        )
+        .execute(db.pool())
         .await
         .unwrap();
 
@@ -27118,6 +27832,7 @@ mod tests {
 
     fn seed_msg(conv_id: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: format!("seed-{conv_id}"),
             conversation_id: conv_id.to_string(),
             sequence_id: 1,
@@ -27159,6 +27874,7 @@ mod tests {
             .unwrap();
 
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "asst-1".to_string(),
             conversation_id: "origin-tr".to_string(),
             sequence_id: 10,
@@ -27169,6 +27885,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let tool_result = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-1-result".to_string(),
             conversation_id: "origin-tr".to_string(),
             sequence_id: 11,
@@ -27415,6 +28132,7 @@ mod tests {
             .unwrap();
 
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "asst-tr".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
@@ -27425,6 +28143,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let result_a = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-a-result".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
@@ -27435,6 +28154,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let result_b = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-b-result".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 12,
@@ -27472,6 +28192,7 @@ mod tests {
     ) -> phoenix_workflow::TurnAuthorityId {
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: key.to_string(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -27518,6 +28239,7 @@ mod tests {
         let repo = workflow::WorkflowRepository::new(db.pool().clone());
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "checkpoint".to_string(),
                 images: Vec::new(),
                 files: Vec::new(),
@@ -27552,6 +28274,7 @@ mod tests {
             panic!("expected created turn")
         };
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "checkpoint-assistant".to_string(),
             conversation_id: "conv-checkpoint-cuts".to_string(),
             sequence_id: 20,
@@ -27564,6 +28287,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let tool = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "checkpoint-tool".to_string(),
             conversation_id: "conv-checkpoint-cuts".to_string(),
             sequence_id: 21,
@@ -27725,6 +28449,7 @@ mod tests {
                 .await;
         let content = MessageContent::User(UserContent::meta("sub-agent result"));
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "subagent-summary-cut".to_string(),
             conversation_id: "conv-subagent-cuts".to_string(),
             sequence_id: 30,
@@ -27827,6 +28552,7 @@ mod tests {
                 .await;
         let created_at = Utc::now();
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "assistant-terminal-exact".to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id: 20,
@@ -27837,6 +28563,7 @@ mod tests {
             created_at,
         };
         let result = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-terminal-exact".to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id: 21,
@@ -27907,6 +28634,7 @@ mod tests {
             .await
             .unwrap();
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "asst-terminal-round".to_string(),
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 20,
@@ -27917,6 +28645,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let result = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-terminal-result".to_string(),
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 21,
@@ -27967,6 +28696,7 @@ mod tests {
             .unwrap();
 
         let assistant = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "asst-tr".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
@@ -27977,6 +28707,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let good_result = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-a-result".to_string(),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
@@ -27987,6 +28718,7 @@ mod tests {
             created_at: Utc::now(),
         };
         let orphan_fk_result = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "tool-b-result".to_string(),
             // No such conversation: FK violation on insert.
             conversation_id: "conv-does-not-exist".to_string(),

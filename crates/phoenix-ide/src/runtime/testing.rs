@@ -1179,6 +1179,7 @@ impl MessageStore for InMemoryStorage {
         drop(id_guard);
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id: seq_id,
@@ -1208,6 +1209,29 @@ impl MessageStore for InMemoryStorage {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
+        self.add_message_with_seq_and_origin(
+            message_id,
+            conv_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            &phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> Result<Message, String> {
         if *self.fail_message_add.lock().unwrap() {
             return Err("injected message persistence failure".to_string());
         }
@@ -1231,6 +1255,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: origin.clone(),
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1322,6 +1347,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1472,6 +1498,7 @@ impl MessageStore for InMemoryStorage {
             });
         let sequence_id = allocate_sequence(persisted_sequence_max);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2264,8 +2291,9 @@ impl StateStore for InMemoryStorage {
         )
         .await
     }
+
     #[allow(clippy::too_many_arguments)]
-    async fn add_message_and_clear_provider_replay(
+    async fn add_message_and_clear_provider_replay_with_origin(
         &self,
         message_id: &str,
         conversation_id: &str,
@@ -2273,16 +2301,18 @@ impl StateStore for InMemoryStorage {
         content: &crate::db::MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&crate::db::UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
         _state: &phoenix_core::domain::sm_state::ConvState,
         _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::Message, String> {
-        self.add_message_with_seq(
+        self.add_message_with_seq_and_origin(
             message_id,
             conversation_id,
             sequence_id,
             content,
             display_data,
             usage_data,
+            origin,
         )
         .await
     }

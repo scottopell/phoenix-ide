@@ -560,7 +560,233 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_approval_request_obligation",
         sql: MIGRATION_109,
     },
+    Migration {
+        version: 110,
+        name: "trusted_input_origin",
+        sql: MIGRATION_110,
+    },
+    Migration {
+        version: 111,
+        name: "coordinator_conversation_watches",
+        sql: MIGRATION_111,
+    },
 ];
+
+const MIGRATION_111: &str = r"
+ALTER TABLE product_creation_jobs ADD COLUMN objective_origin TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(objective_origin IN ('unknown_historical', 'user_api'));
+CREATE TABLE coordinator_watches (
+    id INTEGER PRIMARY KEY,
+    source_product_conversation_id TEXT NOT NULL,
+    enrolled_at_us INTEGER NOT NULL CHECK(typeof(enrolled_at_us) = 'integer' AND enrolled_at_us >= 0),
+    ended_at_us INTEGER CHECK(ended_at_us IS NULL OR (typeof(ended_at_us) = 'integer' AND ended_at_us >= 0)),
+    UNIQUE(source_product_conversation_id, enrolled_at_us)
+);
+CREATE UNIQUE INDEX coordinator_watches_active ON coordinator_watches(source_product_conversation_id)
+    WHERE ended_at_us IS NULL;
+CREATE TRIGGER coordinator_watches_validate BEFORE INSERT ON coordinator_watches
+WHEN NOT EXISTS (SELECT 1 FROM product_conversations WHERE id = NEW.source_product_conversation_id
+                 AND kind = 'ordinary' AND ordinary_lifecycle = 'open')
+BEGIN SELECT RAISE(ABORT, 'watch requires open ordinary ProductConversation'); END;
+CREATE TABLE execution_cancel_observations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE steering_execution_occurrences (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL DEFAULT 'steering' CHECK(source_kind IN ('steering', 'wake', 'seeded_fork', 'interaction_response'))
+);
+CREATE TABLE coordinator_watch_events (
+    event_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(event_id)) > 0),
+    watch_id INTEGER NOT NULL REFERENCES coordinator_watches(id),
+    source_occurrence_kind TEXT NOT NULL CHECK(source_occurrence_kind IN ('direct_turn', 'creation', 'steering', 'wake', 'seeded_fork', 'interaction_response', 'continuation_summary')),
+    source_occurrence_id TEXT NOT NULL CHECK(length(trim(source_occurrence_id)) > 0),
+    source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
+    source_transcript_id TEXT NOT NULL,
+    terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('completed', 'failed', 'cancelled')),
+    terminal_reason TEXT,
+    occurred_at_us INTEGER NOT NULL CHECK(typeof(occurred_at_us) = 'integer' AND occurred_at_us >= 0),
+    continuation_state TEXT NOT NULL DEFAULT 'none'
+        CHECK(continuation_state IN ('none', 'awaiting', 'suppressed')),
+    delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(delivery_state IN ('pending', 'accepted', 'suppressed')),
+    accepted_transcript_id TEXT,
+    CHECK ((delivery_state = 'accepted') = (accepted_transcript_id IS NOT NULL)),
+    UNIQUE(source_occurrence_kind, source_occurrence_id, source_generation, watch_id),
+    CHECK ((terminal_kind = 'failed') = (terminal_reason IS NOT NULL))
+);
+CREATE INDEX coordinator_watch_events_pending ON coordinator_watch_events(delivery_state, occurred_at_us);
+ALTER TABLE messages ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+ALTER TABLE steering_messages ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+ALTER TABLE durable_turns ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id);
+DROP TRIGGER messages_origin_insert;
+DROP TRIGGER messages_origin_update;
+DROP TRIGGER steering_origin_insert;
+DROP TRIGGER steering_origin_update;
+DROP TRIGGER durable_turn_origin_insert;
+DROP TRIGGER durable_turn_origin_update;
+CREATE TRIGGER messages_origin_insert BEFORE INSERT ON messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER messages_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER steering_origin_insert BEFORE INSERT ON steering_messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER steering_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON steering_messages
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER durable_turn_origin_insert BEFORE INSERT ON durable_turns
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER durable_turn_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id ON durable_turns
+WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+  OR (NEW.origin_kind = 'internal_conversation') != (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0 AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER watch_event_accept_turn AFTER INSERT ON durable_turns
+WHEN NEW.origin_subscription_event_id IS NOT NULL
+BEGIN
+    UPDATE coordinator_watch_events SET delivery_state = 'accepted', accepted_transcript_id = NEW.conversation_id
+    WHERE event_id = NEW.origin_subscription_event_id AND delivery_state = 'pending'
+      AND continuation_state = 'none'
+      AND EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p
+                    ON p.id = w.source_product_conversation_id
+                  WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL
+                    AND p.ordinary_lifecycle = 'open'
+                    AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                    WHERE o.product_conversation_id = p.id AND o.phase != 'completed'))
+      AND EXISTS (SELECT 1 FROM product_conversations p JOIN conversations c
+                    ON c.product_conversation_id = p.id
+                  WHERE c.id = NEW.conversation_id AND p.kind = 'coordinator');
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
+END;
+CREATE TRIGGER watch_event_accept_steering AFTER INSERT ON steering_messages
+WHEN NEW.origin_subscription_event_id IS NOT NULL
+BEGIN
+    UPDATE coordinator_watch_events SET delivery_state = 'accepted', accepted_transcript_id = NEW.conversation_id
+    WHERE event_id = NEW.origin_subscription_event_id AND delivery_state = 'pending'
+      AND continuation_state = 'none'
+      AND EXISTS (SELECT 1 FROM coordinator_watches w JOIN product_conversations p
+                    ON p.id = w.source_product_conversation_id
+                  WHERE w.id = coordinator_watch_events.watch_id AND w.ended_at_us IS NULL
+                    AND p.ordinary_lifecycle = 'open'
+                    AND NOT EXISTS (SELECT 1 FROM close_obligations o
+                                    WHERE o.product_conversation_id = p.id AND o.phase != 'completed'))
+      AND EXISTS (SELECT 1 FROM product_conversations p JOIN conversations c
+                    ON c.product_conversation_id = p.id
+                  WHERE c.id = NEW.conversation_id AND p.kind = 'coordinator');
+    SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'watch event no longer deliverable') END;
+END;
+CREATE TRIGGER watch_auto_continuation_admitted AFTER INSERT ON automatic_continuation_admissions
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'awaiting'
+    WHERE source_transcript_id = NEW.predecessor_conversation_id
+      AND terminal_kind = 'failed' AND terminal_reason = 'context exhausted'
+      AND delivery_state = 'pending' AND continuation_state = 'none';
+END;
+CREATE TRIGGER watch_auto_continuation_failed AFTER UPDATE OF phase ON automatic_continuation_admissions
+WHEN NEW.phase = 'failed' AND OLD.phase != 'failed'
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'none'
+    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
+      AND source_transcript_id = NEW.predecessor_conversation_id;
+END;
+CREATE TRIGGER watch_auto_continuation_succeeded AFTER INSERT ON completed_continuation_handoffs
+BEGIN
+    UPDATE coordinator_watch_events SET continuation_state = 'suppressed', delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND continuation_state = 'awaiting'
+      AND source_transcript_id = NEW.predecessor_conversation_id;
+END;
+CREATE TRIGGER watch_source_deleted BEFORE DELETE ON conversations
+WHEN OLD.parent_conversation_id IS NULL AND OLD.continued_in_conv_id IS NULL
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = OLD.product_conversation_id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+          (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = OLD.product_conversation_id);
+END;
+CREATE TRIGGER watch_product_deleted BEFORE DELETE ON product_conversations
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = OLD.id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+          (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = OLD.id);
+END;
+CREATE TRIGGER watch_close_suppress AFTER UPDATE OF ordinary_lifecycle ON product_conversations
+WHEN NEW.ordinary_lifecycle != 'open'
+BEGIN
+    UPDATE coordinator_watches SET ended_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER)
+    WHERE source_product_conversation_id = NEW.id AND ended_at_us IS NULL;
+    UPDATE coordinator_watch_events SET delivery_state = 'suppressed'
+    WHERE delivery_state = 'pending' AND watch_id IN
+      (SELECT id FROM coordinator_watches WHERE source_product_conversation_id = NEW.id);
+END;
+";
+
+const MIGRATION_110: &str = r"
+ALTER TABLE messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE steering_messages ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_transcript_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'
+    CHECK (origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event'));
+ALTER TABLE durable_turns ADD COLUMN origin_product_conversation_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_transcript_id TEXT;
+CREATE TRIGGER messages_origin_insert BEFORE INSERT ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER messages_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid message origin'); END;
+CREATE TRIGGER steering_origin_insert BEFORE INSERT ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER steering_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON steering_messages
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid steering origin'); END;
+CREATE TRIGGER durable_turn_origin_insert BEFORE INSERT ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE TRIGGER durable_turn_origin_update BEFORE UPDATE OF origin_kind, origin_product_conversation_id, origin_transcript_id ON durable_turns
+WHEN ((NEW.origin_kind = 'internal_conversation') !=
+      (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+       AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0))
+  OR (NEW.origin_kind != 'internal_conversation' AND (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'invalid direct turn origin'); END;
+CREATE INDEX idx_messages_input_origin ON messages(origin_kind, origin_product_conversation_id, origin_transcript_id);
+";
 
 const MIGRATION_106: &str = r"
 CREATE TABLE sub_agent_batches (
@@ -11150,9 +11376,9 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(3).copied().collect::<Vec<_>>(),
             vec![
+                (111, "coordinator_conversation_watches"),
+                (110, "trusted_input_origin"),
                 (109, "persist_approval_request_obligation"),
-                (108, "enforce_authority_timestamp_storage_class"),
-                (107, "repair_direct_execution_authority"),
             ]
         );
     }
@@ -11349,6 +11575,44 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_110_marks_preexisting_inputs_unknown_and_rejects_incomplete_sender() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE steering_messages (message_id TEXT PRIMARY KEY);
+             CREATE TABLE durable_turns (turn_id INTEGER PRIMARY KEY);
+             INSERT INTO messages VALUES ('historical-message');
+             INSERT INTO steering_messages VALUES ('historical-steer');
+             INSERT INTO durable_turns VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 110).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        for (select, invalid_update) in [
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM messages WHERE message_id = 'historical-message'",
+                "UPDATE messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-message'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM steering_messages WHERE message_id = 'historical-steer'",
+                "UPDATE steering_messages SET origin_kind = 'internal_conversation' WHERE message_id = 'historical-steer'",
+            ),
+            (
+                "SELECT origin_kind, origin_product_conversation_id, origin_transcript_id FROM durable_turns WHERE turn_id = 1",
+                "UPDATE durable_turns SET origin_kind = 'internal_conversation' WHERE turn_id = 1",
+            ),
+        ] {
+            let (kind, product_id, transcript_id): (String, Option<String>, Option<String>) =
+                sqlx::query_as(select).fetch_one(&pool).await.unwrap();
+            assert_eq!(kind, "unknown_historical");
+            assert_eq!((product_id, transcript_id), (None, None));
+            assert!(sqlx::query(invalid_update).execute(&pool).await.is_err());
+        }
     }
 
     #[test]
@@ -16057,7 +16321,8 @@ mod tests {
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches')",
         )
         .execute(&pool)
         .await
@@ -16954,7 +17219,8 @@ mod tests {
                     (101, 'temporarily_skip_svg_artifacts'),
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class')",
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches')",
         )
         .execute(pool)
         .await

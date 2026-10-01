@@ -592,8 +592,8 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO messages (
-                     message_id, conversation_id, sequence_id, message_type, content, created_at
-                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+                     message_id, conversation_id, sequence_id, message_type, content, created_at, origin_kind
+                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'system_generated')",
             )
             .bind(&child.initial_message_id)
             .bind(&child.run.child_conversation_id)
@@ -603,6 +603,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             let admitted_message = Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
                 message_id: child.initial_message_id.clone(),
                 conversation_id: child.run.child_conversation_id.clone(),
                 sequence_id: 1,
@@ -1632,6 +1633,33 @@ mod tests {
                 SubAgentAdmissionCommit::Normal => unreachable!(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_admission_persists_initial_message_origin() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_scope = atomic_parent(&db).await;
+        db.admit_sub_agent_batch_atomically(&atomic_batch("origin-batch", parent_scope))
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        let persisted: String =
+            sqlx::query_scalar("SELECT origin_kind FROM messages WHERE message_id = 'initial'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted,
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+                .db_parts()
+                .0
+        );
+        let loaded = db.get_messages("child").await.unwrap();
+        assert_eq!(
+            loaded[0].origin,
+            phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        );
     }
 
     #[tokio::test]
