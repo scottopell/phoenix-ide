@@ -108,7 +108,7 @@ fn parse_canonical_conversation_reference(
 ) -> Result<CanonicalConversationReference, GlobalMessageTargetError> {
     let reference = raw.trim();
     if let Some(id) = reference.strip_prefix("@conv:") {
-        if id.contains('#') {
+        if id.contains('#') || id.chars().any(char::is_whitespace) {
             return Err(GlobalMessageTargetError::UnsupportedSyntax);
         }
         let id = phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
@@ -125,6 +125,9 @@ fn parse_canonical_conversation_reference(
         });
     };
     let (id, fragment) = split_fragment(rest);
+    if rest.chars().any(char::is_whitespace) {
+        return Err(GlobalMessageTargetError::UnsupportedSyntax);
+    }
     let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(id)
         .map_err(|_| GlobalMessageTargetError::MissingId)?;
     let message_id = match fragment {
@@ -398,8 +401,9 @@ async fn ordinary_product_citation(
     let title = aggregate
         .root
         .conversation
-        .title
+        .chain_name
         .clone()
+        .or(aggregate.root.conversation.title.clone())
         .or(aggregate.root.conversation.slug.clone())
         .unwrap_or_else(|| aggregate.root.conversation.id.clone());
     Some((id.to_string(), title))
@@ -410,11 +414,23 @@ async fn format_global_search_hits(
     hits: &[crate::db::RetrievedChunk],
 ) -> String {
     let mut out = String::new();
+    let mut citations = std::collections::HashMap::<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<(String, String)>,
+    >::new();
     for hit in hits {
         let (title, stable_reference, href) =
             match service.db.get_conversation(&hit.conversation_id).await {
                 Ok(conv) => {
-                    let citation = ordinary_product_citation(&service.db, &conv).await;
+                    let citation = if let Some(citation) =
+                        citations.get(&conv.product_conversation_id)
+                    {
+                        citation.clone()
+                    } else {
+                        let citation = ordinary_product_citation(&service.db, &conv).await;
+                        citations.insert(conv.product_conversation_id.clone(), citation.clone());
+                        citation
+                    };
                     let title = citation.as_ref().map_or_else(
                         || {
                             conv.title
@@ -444,7 +460,7 @@ async fn format_global_search_hits(
             "- [{} · {}{} · {}]({}) {}@transcript:{}#message-{} — {}",
             title,
             attributed_role(hit.message_type, &hit.origin),
-            attributed_sender(&hit.origin),
+            attributed_sender_with_stable(&service.db, &hit.origin).await,
             hit.created_at.format("%Y-%m-%d"),
             link,
             stable_reference.map_or_else(String::new, |reference| format!("{reference} · ")),
@@ -476,11 +492,8 @@ async fn read_conversation_page(
         |(_, title)| title.as_str(),
     );
     let mut header = format!(
-        "{stable_header}{evidence_label}: @transcript:{} — {}\ntranscript link: {}\nupdated: {}\n---\n",
-        conv.id,
-        title,
-        conversation_href(conv),
-        conv.updated_at
+        "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
+        conv.id, title, conv.updated_at
     );
     let body = render_message_page(db, conv, cursor).await?;
     header.push_str(&body);
@@ -525,10 +538,9 @@ async fn read_conversation_around_message(
         |(_, title)| title.as_str(),
     );
     let mut out = format!(
-        "{stable_header}exact evidence: @transcript:{} — {}\ntranscript link: {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
+        "{stable_header}exact evidence: @transcript:{} — {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
         conv.id,
         title,
-        conversation_href(conv),
         conv.updated_at,
         message_id,
         has_more_before,
@@ -536,7 +548,7 @@ async fn read_conversation_around_message(
     );
     for message in messages {
         if !message_is_hidden(&message) {
-            out.push_str(&render_global_message_line(conv, &message));
+            out.push_str(&render_global_message_line(db, conv, &message).await);
         }
     }
     Ok(out)
@@ -564,7 +576,7 @@ async fn render_message_page(
             if message_is_hidden(&message) {
                 continue;
             }
-            let line = render_global_message_line(conv, &message);
+            let line = render_global_message_line(db, conv, &message).await;
             for ch in line.chars() {
                 if pos >= end {
                     has_more = true;
@@ -656,12 +668,8 @@ pub(crate) fn attributed_role(
 pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
     use phoenix_core::domain::db_schema::InputOrigin;
     match origin {
-        InputOrigin::InternalConversation {
-            product_conversation_id,
-            transcript_id,
-            ..
-        } => {
-            format!(" from @conv:{product_conversation_id} via @transcript:{transcript_id}")
+        InputOrigin::InternalConversation { transcript_id, .. } => {
+            format!(" from internal transcript @transcript:{transcript_id}")
         }
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
@@ -670,10 +678,41 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
     }
 }
 
-fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
+async fn attributed_sender_with_stable(
+    db: &crate::db::Database,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> String {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    match origin {
+        InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+        } => {
+            if db
+                .get_ordinary_product_conversation(product_conversation_id)
+                .await
+                .is_ok()
+            {
+                format!(" from @conv:{product_conversation_id} via @transcript:{transcript_id}")
+            } else {
+                format!(" from internal transcript @transcript:{transcript_id}")
+            }
+        }
+        InputOrigin::UnknownHistorical
+        | InputOrigin::UserApi
+        | InputOrigin::SystemGenerated
+        | InputOrigin::SubscriptionEvent { .. } => String::new(),
+    }
+}
+
+async fn render_global_message_line(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    message: &crate::db::Message,
+) -> String {
     let role = attributed_role(message.message_type, &message.origin);
     let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
-    let sender = attributed_sender(&message.origin);
+    let sender = attributed_sender_with_stable(db, &message.origin).await;
     format!(
         "[{}{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
         role,
@@ -994,7 +1033,7 @@ async fn resolve_message(
         summary: format!(
             "{}{} message {} in @transcript:{} at {}: {}",
             attributed_role(message.message_type, &message.origin),
-            attributed_sender(&message.origin),
+            attributed_sender_with_stable(&service.db, &message.origin).await,
             message.message_id,
             conv.id,
             message.created_at,
@@ -1239,7 +1278,7 @@ mod tests {
             source_call: None,
         };
         message.origin = source;
-        let rendered = render_global_message_line(&conv, &message);
+        let rendered = render_global_message_line(&db, &conv, &message).await;
         assert!(rendered.contains(&format!(
             "Conversation from @conv:{} via @transcript:{}",
             sender.product_conversation_id, sender.id
@@ -1247,7 +1286,7 @@ mod tests {
         assert!(!rendered.contains("User API"));
 
         message.origin = InputOrigin::UnknownHistorical;
-        let rendered = render_global_message_line(&conv, &message);
+        let rendered = render_global_message_line(&db, &conv, &message).await;
         assert!(rendered.contains("Unknown input"));
         assert!(!rendered.contains("User API"));
     }
@@ -1304,7 +1343,7 @@ mod tests {
             message.origin = origin.clone();
             hit.origin = origin;
             let search = format_global_search_hits(&service, &[hit.clone()]).await;
-            let full = render_global_message_line(&conv, &message);
+            let full = render_global_message_line(&service.db, &conv, &message).await;
             assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
             assert!(search.contains(&format!(
                 "@transcript:{}#message-{}",
@@ -1318,7 +1357,7 @@ mod tests {
             message.message_type = MessageType::Skill;
             hit.message_type = MessageType::Skill;
             let search = format_global_search_hits(&service, &[hit.clone()]).await;
-            let full = render_global_message_line(&conv, &message);
+            let full = render_global_message_line(&service.db, &conv, &message).await;
             let skill_label = format!("Skill · {expected}");
             assert!(search.contains(&skill_label), "{search}");
             assert!(full.contains(&skill_label), "{full}");
@@ -1334,6 +1373,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("UPDATE conversations SET title = 'Aggregate Title', state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = 'root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET chain_name = 'Effective Rename' WHERE id = 'root'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -1370,7 +1413,8 @@ mod tests {
 
         let output = format_global_search_hits(&service, &[hit]).await;
 
-        assert!(output.contains("Aggregate Title"), "{output}");
+        assert!(output.contains("Effective Rename"), "{output}");
+        assert!(!output.contains("Aggregate Title"), "{output}");
         assert!(!output.contains("Successor Local Title"), "{output}");
     }
 
@@ -1513,6 +1557,8 @@ mod tests {
             "@conv:root#message-id",
             "@conv:   ",
             "@transcript:   ",
+            "@conv:root extra",
+            "@transcript:root extra",
         ] {
             assert!(
                 service.resolve_message_target(rejected).await.is_err(),

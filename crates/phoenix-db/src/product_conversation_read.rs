@@ -1868,6 +1868,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_title_uses_effective_aggregate_rename() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "title-authority",
+                "title-authority",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Aggregate Title', chain_name = 'Legacy Override' WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let projections = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap();
+        let projection = projections
+            .iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+
+        assert_eq!(projection.root_title.as_deref(), Some("Legacy Override"));
+    }
+
+    #[tokio::test]
     async fn list_projects_close_availability_from_close_preconditions() {
         let db = Database::open_in_memory().await.unwrap();
         let conversation = db

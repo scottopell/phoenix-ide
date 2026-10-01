@@ -25,8 +25,8 @@ runSurfaceCapture({
     const dotCount = await row.locator('.conv-state-dot').count();
     if (dotCount !== 1) throw new Error(`Expected one product indicator, found ${dotCount}`);
     await page.getByLabel('Working').waitFor();
-    const rename = page.getByRole('button', { name: /Rename product conversation Fixture Product Root/ });
-    const close = page.getByRole('button', { name: /Close product conversation Fixture Product Root/ });
+    const rename = page.getByRole('button', { name: /Rename conversation Fixture Product Root/ });
+    const close = page.getByRole('button', { name: /Close conversation Fixture Product Root/ });
     for (const [name, locator] of [['rename', rename], ['close', close]]) {
       const box = await locator.boundingBox();
       if (!box || box.width < 44 || box.height < 44) {
