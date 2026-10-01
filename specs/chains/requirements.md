@@ -220,14 +220,14 @@ beside the transcript without making that row the attachment owner.
 
 WHEN the user asks a lineage-wide recall question
 THE SYSTEM SHALL answer it by running a read-only agent that is given
-tools to (a) search the conversation content by relevance and (b) read
-the full content of any member row in that conversation's continuation
+tools to (a) search the ProductConversation's transcript content by relevance and (b) read
+the full content of any exact transcript member in that ProductConversation's continuation
 lineage, and that iterates — searching, reading, and reasoning — until
 it can answer, then streams the answer
 
 THE agent's tools SHALL be scope-bound to that one product conversation:
-the search tool retrieves only across that conversation's member rows,
-and the read tool can fetch only the content of rows in that lineage
+the search tool retrieves only across that ProductConversation's transcript rows,
+and the read tool can fetch only exact transcript content from that lineage
 
 THE host SHALL bind the durable ProductConversation identity and resolve
 the member-row set live per tool call rather than freezing it at run
@@ -244,9 +244,9 @@ THE read tool SHALL return the full content of the messages it returns,
 including tool-result bodies, build logs, and sub-agent output, subject
 to bounded paging where needed
 
-WHEN the retrieval index has not caught up to the conversation's
-messages
-THE SYSTEM SHALL NOT present a Q&A answer as if the full conversation
+WHEN the retrieval index has not caught up to the ProductConversation's
+transcript messages
+THE SYSTEM SHALL NOT present a Q&A answer as if the full ProductConversation transcript
 had been searched authoritatively; it SHALL either wait for coverage to
 catch up or surface that recall coverage was partial
 

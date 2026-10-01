@@ -392,7 +392,7 @@ export function ChainPage() {
           <h2>{isNotFound ? 'Not a chain' : 'Could not load chain'}</h2>
           <p>
             {isNotFound
-              ? 'This conversation is not the root of a chain. Chains require at least two conversations linked by continuation.'
+              ? 'This conversation is not the root of a chain. Continuation history requires at least two linked transcripts.'
               : loadError}
           </p>
           <button
@@ -739,7 +739,7 @@ function ChainPageHeader({
         // /regenerate-name concurrently — both write the aggregate title and
         // last-writer wins. Editing must be committed/cancelled first.
         disabled={regenerating || editing}
-        title="Regenerate the chain name from its conversations"
+        title="Regenerate the conversation title from its transcripts"
         aria-label="Regenerate name from chain content"
         aria-busy={regenerating}
       >
@@ -788,7 +788,7 @@ interface ChainMembersColumnProps {
 function ChainMembersColumn({ members, onMemberClick }: ChainMembersColumnProps) {
   return (
     <aside className="chain-members" aria-label="Chain members">
-      <h3 className="chain-members-heading">Conversations</h3>
+      <h3 className="chain-members-heading">Transcripts</h3>
       <ol className="chain-members-list">
         {members.map((m) => {
           const label = positionLabel(m.position);

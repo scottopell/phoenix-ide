@@ -225,7 +225,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         type="button"
         className="conv-item-main"
         onClick={() => onClick(row)}
-        title={`Open product conversation "${displayTitle}"`}
+        title={`Open conversation "${displayTitle}"`}
       >
         <div className="conv-item-slug">
           <span className="conv-item-slug-main">
@@ -255,7 +255,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               type="button"
               className="conv-action-btn"
               onClick={(event) => { event.stopPropagation(); onProductConversationRename(row); }}
-              aria-label={`Rename product conversation ${displayTitle}`}
+              aria-label={`Rename conversation ${displayTitle}`}
               title="Rename"
             >
               ✎
@@ -266,7 +266,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               type="button"
               className="conv-action-btn danger"
               onClick={(event) => { event.stopPropagation(); onProductConversationDelete(row); }}
-              aria-label={`Delete product conversation ${displayTitle}`}
+              aria-label={`Delete conversation ${displayTitle}`}
               title="Delete permanently"
             >
               ×
@@ -277,7 +277,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               type="button"
               className="conv-action-btn danger"
               onClick={(event) => { event.stopPropagation(); onProductConversationClose(row); }}
-              aria-label={`Close product conversation ${displayTitle}`}
+              aria-label={`Close conversation ${displayTitle}`}
               title="Close"
             >
               ×
@@ -288,7 +288,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               type="button"
               className="conv-action-btn danger"
               disabled
-              aria-label={`Close product conversation ${displayTitle}. ${closeUnavailableReason}`}
+              aria-label={`Close conversation ${displayTitle}. ${closeUnavailableReason}`}
               title={closeUnavailableReason}
             >
               ×
@@ -553,7 +553,7 @@ export const ChainBlock = memo(function ChainBlock({
   const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
   const latestContext = latestMember ? getConversationProjectLabel(latestMember) : null;
   const chainDisplayTitle = displayTitleFromChain(item);
-  const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Latest conversation';
+  const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Current transcript';
   return (
     <li
       className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
@@ -588,11 +588,11 @@ export const ChainBlock = memo(function ChainBlock({
         <button
           className="conv-chain-name"
           onClick={() => navigate(`/chains/${item.rootId}`)}
-          title={`Open conversation history "${chainDisplayTitle}"`}
+          title={`Open transcript history "${chainDisplayTitle}"`}
         >
           <span className="conv-chain-name-label">{chainDisplayTitle}</span>
           <span className="conv-chain-count">
-            {listDensity === 'mobile' ? 'Conversation history' : `Conversation history · ${item.members.length} parts`}
+            {listDensity === 'mobile' ? 'Transcript history' : `Transcript history · ${item.members.length} transcripts`}
           </span>
         </button>
       </div>
@@ -601,7 +601,7 @@ export const ChainBlock = memo(function ChainBlock({
           className={`conv-chain-latest-summary ${keyboardSelectedId === latestMember.id ? 'keyboard-selected' : ''}`}
           data-id={latestMember.id}
           onClick={() => onRowClick(latestMember)}
-          title={`Open latest conversation "${latestDisplayTitle}"`}
+          title={`Open current transcript "${latestDisplayTitle}"`}
         >
           <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
           <span className="conv-chain-summary-main">

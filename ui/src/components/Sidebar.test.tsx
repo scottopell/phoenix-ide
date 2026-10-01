@@ -213,7 +213,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Rename product conversation Old Product/ }));
+    fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     const input = getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
@@ -239,7 +239,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Close product conversation Old Product/ }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Old Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-continued'));
@@ -260,7 +260,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-single"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Close product conversation Single Product/ }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Single Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-single'));
@@ -285,7 +285,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-race"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Close product conversation Race Product/ }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Race Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-race'));
@@ -305,8 +305,8 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    expect(queryByRole('button', { name: /Rename product conversation/ })).toBeNull();
-    expect(queryByRole('button', { name: /Close product conversation/ })).toBeNull();
+    expect(queryByRole('button', { name: /Rename conversation/ })).toBeNull();
+    expect(queryByRole('button', { name: /Close conversation/ })).toBeNull();
   });
 
   it('uses aggregate deletion for History with one parent transcript', async () => {
@@ -329,7 +329,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(apiMock.deleteChain).toHaveBeenCalledWith('history-root'));
@@ -357,7 +357,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).toBeNull());
@@ -383,7 +383,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     const confirm = getByRole('button', { name: 'Delete' });
     fireEvent.click(confirm);
     fireEvent.click(confirm);
@@ -393,7 +393,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     rejectDelete(new Error('server refused deletion'));
 
     expect(await findByText('server refused deletion')).toBeInTheDocument();
-    expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).not.toBeNull();
+    expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).not.toBeNull();
     expect(getByRole('button', { name: 'Delete' })).not.toBeDisabled();
   });
 
@@ -413,10 +413,10 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
-    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).toBeNull());
+    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
     expect(queryByText('not found')).toBeNull();
   });
 
@@ -445,10 +445,10 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(apiMock.getProductConversationSnapshot).toHaveBeenCalledWith('middle-slug', { message_limit: 1 }));
-    fireEvent.click(await waitFor(() => getByRole('button', { name: /Delete product conversation History Product/ })));
+    fireEvent.click(await waitFor(() => getByRole('button', { name: /Delete conversation History Product/ })));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
-    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).toBeNull());
+    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
   });
 
   it('publishes the successful authoritative title to the active aggregate snapshot', async () => {
@@ -475,7 +475,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(await findByRole('button', { name: /Rename product conversation Old Product/ }));
+    fireEvent.click(await findByRole('button', { name: /Rename conversation Old Product/ }));
     fireEvent.change(getByRole('textbox'), { target: { value: 'New Product' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
 
@@ -497,7 +497,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-conflict"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Rename product conversation Old Product/ }));
+    fireEvent.click(getByRole('button', { name: /Rename conversation Old Product/ }));
     fireEvent.change(getByRole('textbox'), { target: { value: 'new-product' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
 
@@ -523,11 +523,11 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-close-conflict"]')).not.toBeNull());
-    fireEvent.click(getByRole('button', { name: /Close product conversation Close Product/ }));
+    fireEvent.click(getByRole('button', { name: /Close conversation Close Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(apiMock.closeProductConversation).toHaveBeenCalledWith('pc-close-conflict'));
-    await waitFor(() => expect(queryByRole('dialog', { name: 'Close Product Conversation' })).toBeNull());
+    await waitFor(() => expect(queryByRole('dialog', { name: 'Close Conversation' })).toBeNull());
   });
 
   it('ignores older product-list responses after a newer refresh wins', async () => {

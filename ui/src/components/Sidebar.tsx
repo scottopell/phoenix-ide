@@ -427,7 +427,7 @@ export function Sidebar({
       } else {
         setProductCloseError({
           productId: productCloseTarget.product_conversation_id,
-          message: err instanceof Error ? err.message : 'Failed to close product conversation',
+          message: err instanceof Error ? err.message : 'Failed to close conversation',
         });
       }
       setProductCloseSubmittingId((current) =>
@@ -472,7 +472,7 @@ export function Sidebar({
       }
       setProductDeleteError({
         productId,
-        message: error instanceof Error ? error.message : 'Failed to delete product conversation',
+        message: error instanceof Error ? error.message : 'Failed to delete conversation',
       });
       console.error('Failed to delete product conversation:', error);
     } finally {
@@ -689,8 +689,8 @@ export function Sidebar({
       />
       <ConfirmDialog
         visible={productCloseTarget !== null}
-        title="Close Product Conversation"
-        message={`Close "${productCloseTarget?.presentation.display_name}"? This will move the entire product conversation to read-only History and stop its active work.`}
+        title="Close Conversation"
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This moves the conversation to read-only History and stops its active work.`}
         confirmText="Close"
         danger
         onConfirm={handleProductClose}
@@ -702,8 +702,8 @@ export function Sidebar({
       />
       <ConfirmDialog
         visible={productDeleteTarget !== null}
-        title="Delete Product Conversation"
-        message="Permanently delete this product conversation and its transcript history? This cannot be undone."
+        title="Delete Conversation"
+        message="Permanently delete this conversation and all of its transcripts? This cannot be undone."
         confirmText="Delete"
         danger
         onConfirm={handleProductDelete}

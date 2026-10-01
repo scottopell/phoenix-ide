@@ -116,7 +116,7 @@ THE SYSTEM SHALL reject the entire operation before mutating any chain member
 ### REQ-GR-007: Bound Phoenix-Wide Agent Capabilities
 
 WHILE a write-capable ordinary ProductConversation or the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, and singular cross-conversation messaging
+THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own ProductConversation/transcript/message corpus, bounded transcript reads, bounded read-only database queries, and singular cross-conversation messaging
 
 WHILE a restricted planning conversation or sub-agent is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
@@ -160,9 +160,9 @@ AND SHALL NOT provide browser, MCP, task drafting, task approval, project, works
 ### REQ-GR-008: Answer With Source Citations
 
 WHEN the Coordinator answers a question using conversation history
-THE SYSTEM SHALL instruct the answering agent to cite source conversations or messages using app-local links or stable reference handles
+THE SYSTEM SHALL instruct the answering agent to cite source ProductConversations and exact transcript messages using app-local links or typed reference handles
 
-THE SYSTEM SHALL expose enough source metadata through global read tools for the agent to cite the conversation id, message id when available, role, timestamp, and excerpt or read content that supports the answer
+THE SYSTEM SHALL expose enough source metadata through global read tools for the agent to cite the stable ProductConversation ID, exact transcript ID, message ID when available, role, timestamp, and excerpt or read content that supports the answer
 
 THE SYSTEM SHALL distinguish current relational facts from transcript evidence and SHALL NOT present either as proof of claims belonging to the other source
 
@@ -179,6 +179,10 @@ THE SYSTEM SHALL target its topology-derived latest parent transcript row withou
 
 IF the reference has unsupported or ambiguous syntax
 THE SYSTEM SHALL return a clear error instead of guessing
+
+THE typed read and message tools SHALL accept only `@conv:<product_conversation_id>` for a stable ProductConversation or `@transcript:<conversation_id>` for an exact transcript member
+AND legacy app-local, chain, and work references SHALL remain confined to the compatibility resolver
+AND a WorkScope identifier SHALL NOT be accepted as read or message target syntax
 
 ---
 

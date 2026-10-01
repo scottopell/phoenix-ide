@@ -717,7 +717,7 @@ fn read_page_paginates_large_transcript() {
     assert!(!page2.contains("more content"), "page 2 is the final page");
 
     // A cursor at/after the end yields the terminal marker.
-    assert_eq!(read_page(&messages, 1_000_000), "(end of conversation)");
+    assert_eq!(read_page(&messages, 1_000_000), "(end of transcript)");
 }
 
 /// `read_conversation`'s transcript renderer surfaces content that lives outside
@@ -920,7 +920,10 @@ async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
         )
         .await;
     assert!(is_error, "out-of-scope read must be an error: {out}");
-    assert!(out.contains("not part of this chain"), "got: {out}");
+    assert!(
+        out.contains("not part of this ProductConversation"),
+        "got: {out}"
+    );
 }
 
 #[tokio::test]
@@ -940,7 +943,7 @@ async fn execute_tool_read_conversation_clamps_oversized_cursor() {
         )
         .await;
     assert!(!is_error, "oversized cursor is not an error: {out}");
-    assert_eq!(out, "(end of conversation)");
+    assert_eq!(out, "(end of transcript)");
 }
 
 #[tokio::test]

@@ -244,8 +244,8 @@ describe('ProductConversation row actions', () => {
       </MemoryRouter>,
     );
 
-    const rename = getByRole('button', { name: /Rename product conversation Action Product/ });
-    const close = getByRole('button', { name: /Close product conversation Action Product/ });
+    const rename = getByRole('button', { name: /Rename conversation Action Product/ });
+    const close = getByRole('button', { name: /Close conversation Action Product/ });
     expect(rename).toBeInTheDocument();
     expect(close).toBeInTheDocument();
 
@@ -481,9 +481,9 @@ describe('ConversationList — product conversations', () => {
     );
 
     expect(getByRole('button', {
-      name: /Close product conversation Root pc-blocked\. Resolve the pending task approval before closing/,
+      name: /Close conversation Root pc-blocked\. Resolve the pending task approval before closing/,
     })).toBeDisabled();
-    fireEvent.click(getByRole('button', { name: 'Close product conversation Root pc-available' }));
+    fireEvent.click(getByRole('button', { name: 'Close conversation Root pc-available' }));
     expect(close).toHaveBeenCalledWith(available);
   });
 
