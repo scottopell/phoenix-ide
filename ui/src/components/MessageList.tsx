@@ -1438,10 +1438,10 @@ function MessageListImpl({
     scrollToUnitIndex(
       location.unitIndex,
       grouped ? location.memberMessageId : undefined,
-      grouped ? location.toolUseId : undefined,
+      sourceToolId ?? (grouped ? location.toolUseId : undefined),
     );
     return true;
-  }, [historicalUnits, scrollToUnitIndex]);
+  }, [historicalUnits, scrollToUnitIndex, sourceToolId]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;

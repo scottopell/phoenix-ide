@@ -215,7 +215,7 @@ describe('user message provenance rendering', () => {
     render(<MemoryRouter><UserMessage message={userMessage('recipient-message', 'forwarded', {
       origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-message', tool_use_id: 'source-tool' } },
     })} /></MemoryRouter>);
-    expect(screen.getByRole('link', { name: 'source call' })).toHaveAttribute('href', '/c/source-member?source_tool=source-tool#message-source-message');
+    expect(screen.getByRole('link', { name: 'source call' })).toHaveAttribute('href', '/c/source-member?source_transcript=source-member&source_tool=source-tool#message-source-message');
   });
 
   it('shows both source identities without treating an aggregate route as a pinned transcript', () => {

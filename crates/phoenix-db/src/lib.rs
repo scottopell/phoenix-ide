@@ -22266,6 +22266,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_call_columns_reject_partial_and_noninternal_pairs() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("locator-check", "locator-check", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let message = db
+            .add_message(
+                "locator-message",
+                "locator-check",
+                &MessageContent::user("body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(sqlx::query(
+            "UPDATE messages SET origin_source_message_id = 'source' WHERE message_id = ?1"
+        )
+        .bind(&message.message_id)
+        .execute(db.pool())
+        .await
+        .is_err());
+        assert!(sqlx::query("UPDATE messages SET origin_source_message_id = 'source', origin_source_tool_use_id = 'tool' WHERE message_id = ?1").bind(&message.message_id).execute(db.pool()).await.is_err());
+        assert!(db.get_messages("locator-check").await.unwrap()[0]
+            .origin
+            .source_call()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn input_origin_round_trips_through_message_and_steering_columns() {
         use phoenix_core::domain::{
             db_schema::InputOrigin, product_conversation::ProductConversationId,

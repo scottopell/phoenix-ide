@@ -32,6 +32,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetConversation = api.getConversation;
   const originalResolveCoordinatorRoute = api.resolveCoordinatorRoute;
   const originalEnsureGlobalCoordinator = api.ensureGlobalCoordinator;
+  const originalListProductConversations = api.listProductConversations;
+  const originalGetProductAutomaticContinuation = api.getProductConversationAutomaticContinuation;
   const originalGetCoordinatorAutomaticContinuation = api.getCoordinatorAutomaticContinuation;
   const originalListConversations = api.listConversations;
   const originalListArchivedConversations = api.listArchivedConversations;
@@ -123,6 +125,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     presentation_mode: 'idle',
     context_window_size: 128_000,
   });
+  api.listProductConversations = async () => ({ product_conversations: [] });
+  api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
   api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: id === sourceId && scenario.sourceIsGlobal ? sourceId : null });
@@ -173,6 +177,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       record('LastSentText', body.text ?? '');
       return Response.json({ queued: false, already_persisted: true });
     }
+    if (new URL(url, location.href).pathname.startsWith('/api/')) throw new Error(`Unexpected fixture API request: ${url}`);
     return originalFetch(input, init);
   };
 
@@ -295,6 +300,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getConversation = originalGetConversation;
     api.resolveCoordinatorRoute = originalResolveCoordinatorRoute;
     api.getCoordinatorAutomaticContinuation = originalGetCoordinatorAutomaticContinuation;
+    api.listProductConversations = originalListProductConversations;
+    api.getProductConversationAutomaticContinuation = originalGetProductAutomaticContinuation;
   api.ensureGlobalCoordinator = originalEnsureGlobalCoordinator;
     api.listConversations = originalListConversations;
     api.listArchivedConversations = originalListArchivedConversations;

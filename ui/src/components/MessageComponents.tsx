@@ -385,7 +385,7 @@ function InputSender({ origin }: { origin: InputOrigin | undefined }) {
   }
   return (
     <span className="message-sender">
-      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : ''}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? "source call" : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
+      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_transcript=${encodeURIComponent(origin.transcript_id)}&source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : ''}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? "source call" : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
     </span>
   );
 }
