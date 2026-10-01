@@ -8,6 +8,18 @@ struct SSEFrame: Sendable {
     var data: String
 }
 
+struct ProductConversationDeletionEvent: Decodable, Equatable, Sendable {
+    var conversation_id: String
+    var deleted_conversation_ids: [String]
+
+    static func decode(frame: SSEFrame) -> Self? {
+        guard frame.event == "conversation_hard_deleted",
+              let data = frame.data.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
+    }
+}
+
 /// Incremental SSE frame parser. Byte-based rather than line-convenience
 /// APIs because frame boundaries are *empty* lines, which line sequences
 /// tend to swallow.

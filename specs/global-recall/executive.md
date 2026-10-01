@@ -26,14 +26,14 @@ executive summary.
 | Requirement | Status | Notes |
 |---|---|---|
 | **REQ-GR-001:** Provide Transparent Current Activity Facts | 🟡 Partial | Current facts are requested through bounded SQL; no per-turn snapshot is injected. |
-| **REQ-GR-002:** Expose Continuation Identity Without Collapsing Evidence | 🟡 Partial | Reference resolution exposes root/current transcript IDs; explicit first-class ProductConversation identity remains a migration target. |
+| **REQ-GR-002:** Expose Continuation Identity Without Collapsing Evidence | ✅ Complete | `@conv:<product_conversation_id>` reads the current transcript; `@transcript:<conversation_id>` pins an exact runtime member. |
 | **REQ-GR-003:** Interpret Activity From Explicit Evidence | ✅ Complete | Prompt requires current relational state, timestamps, and recent evidence for status conclusions |
 | **REQ-GR-004:** Provide Bounded Read-Only Relational Queries | ✅ Complete | Engine-authorized one-statement SQLite reads have work, row, and byte budgets |
-| **REQ-GR-005:** Provide Stable References and App-Local Links | 🟡 Partial | Existing work, chain, conversation, and message references remain resolvable; typed ProductConversation/transcript domains and chain-alias normalization remain migration targets. |
+| **REQ-GR-005:** Provide Stable References and App-Local Links | 🟡 Partial | Global read and message tools expose typed ProductConversation and transcript references; open-work references and the legacy HTTP resolver retain their existing compatibility surface. |
 | **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` resolves the singleton through the standard runtime and UI |
 | **REQ-GR-007:** Bound Phoenix-Wide Agent Capabilities | ✅ Complete | Write-capable ordinary ProductConversations and Coordinator share bounded database/history reads and singular messaging; reference resolution and unsandboxed, WorkScope-targeted Bash remain Coordinator-only |
 | **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Transcript reads expose citation metadata and the prompt requires stable citations |
-| **REQ-GR-009:** Resolve Durable Targets Without Guessing | 🟡 Partial | Existing resolution supports work/conversation handles and links; typed ProductConversation/transcript domains and ambiguous-bare-ID rejection remain migration targets. |
+| **REQ-GR-009:** Resolve Durable Targets Without Guessing | ✅ Complete | Global read and message tools accept only `@conv:<product_conversation_id>` or `@transcript:<conversation_id>` and reject bare or unsupported target syntax. |
 | **REQ-GR-010:** Keep the Coordinator Surface Chat-Only | ✅ Complete | `/global` mounts only the shared conversation runtime and inline briefing action |
 | **REQ-GR-011:** Obtain Current Activity on Demand | ✅ Complete | Stable Coordinator request instructions; existing bounded query tool supplies fresh facts and WorkScope discovery. Brief me requests a read-only check-in without polling. |
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
@@ -48,7 +48,7 @@ Compaction runtime, database, and property tests cover full accepted user-edited
 
 A bounded `gpt-5.5` comparison retained the paused workstream, owner succession, cancellation, deployment limit, and evidence distinctions through all three protected handoffs. Both unprotected arms lost earlier obligations when trimming removed their handoffs; Coordinator instructions alone improved next-action routing but could not recover omitted facts. This is one synthetic sample per arm, not a statistical quality guarantee or full runtime replay. Task 45014 records the fixture and interpretation.
 
-Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, stable references, WorkScope target resolution and no-default behavior for Coordinator unsandboxed Bash, current-context app-local citation navigation with a Coordinator return origin, transcript paging, writing-versus-restricted tool boundaries, chat-only responsive layout, shared message acceptance semantics, and self-target rejection without dispatch.
+Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, stable ProductConversation reads through the current transcript, exact transcript pinning, ambiguous target rejection, WorkScope target resolution and no-default behavior for Coordinator unsandboxed Bash, current-context app-local citation navigation with a Coordinator return origin, transcript paging, writing-versus-restricted tool boundaries, chat-only responsive layout, shared message acceptance semantics, and self-target rejection without dispatch.
 
 ## Scope
 

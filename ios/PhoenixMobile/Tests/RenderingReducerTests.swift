@@ -29,7 +29,7 @@ final class RenderingReducerTests: XCTestCase {
             (#"{"kind":"user_api"}"#, .userApi, "User API"),
             (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1"}"#,
              .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1"),
-             "Conversation from @conv:transcript-1 (conversation ID product-1)"),
+             "Conversation from @transcript:transcript-1 (conversation ID product-1)"),
             (#"{"kind":"system_generated"}"#, .systemGenerated, "System input"),
             (#"{"kind":"subscription_event","event_id":"event-1"}"#,
              .subscriptionEvent(eventId: "event-1"), "Conversation event"),

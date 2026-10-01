@@ -41,6 +41,12 @@ pub(crate) struct SendChatRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendChatTarget {
+    ExactTranscript(String),
+    StableProductConversation(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendChatOutcome {
     Delivered,
     AlreadyPersisted,
@@ -201,10 +207,90 @@ impl SendChatApplicationService {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn send_to_target(
+        &self,
+        target: SendChatTarget,
+        mut req: SendChatRequest,
+    ) -> Result<(String, SendChatOutcome), SendChatServiceError> {
+        match target {
+            SendChatTarget::ExactTranscript(conversation_id) => {
+                req.conversation_id = conversation_id.clone();
+                self.send(req)
+                    .await
+                    .map(|outcome| (conversation_id, outcome))
+            }
+            SendChatTarget::StableProductConversation(product_conversation_id) => {
+                let _product_admission = self
+                    .runtime
+                    .lock_product_message_admission(&product_conversation_id)
+                    .await;
+                let typed_product_conversation_id =
+                    phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                        &product_conversation_id,
+                    )
+                    .expect("stable target has a non-empty typed id");
+                if let Some(conversation_id) = self
+                    .db
+                    .product_conversation_client_message_owner(
+                        &typed_product_conversation_id,
+                        &req.message_id,
+                    )
+                    .await
+                    .map_err(map_conversation_load_error)?
+                {
+                    req.conversation_id = conversation_id.clone();
+                    return self
+                        .send(req)
+                        .await
+                        .map(|outcome| (conversation_id, outcome));
+                }
+                let aggregate = self
+                    .db
+                    .get_ordinary_product_conversation(&typed_product_conversation_id)
+                    .await
+                    .map_err(map_conversation_load_error)?;
+                let conversation_id = aggregate.latest_transcript_row_id;
+                let admission_guard = self.runtime.lock_message_acceptance(&conversation_id).await;
+                let admission = self
+                    .db
+                    .message_target_admission(&conversation_id)
+                    .await
+                    .map_err(map_conversation_load_error)?;
+                let crate::db::MessageTargetAdmission::Aggregate(
+                    crate::db::ProductConversationAdmission::Accepted {
+                        product_conversation_id: admitted_product_conversation_id,
+                    },
+                ) = admission
+                else {
+                    return Ok((conversation_id, history_unavailable_outcome()));
+                };
+                if admitted_product_conversation_id.as_str() != product_conversation_id {
+                    return Err(SendChatServiceError::Internal(
+                        "stable ProductConversation target changed identity during admission"
+                            .to_string(),
+                    ));
+                }
+                req.conversation_id = conversation_id.clone();
+                return self
+                    .send_with_admission_guard(req, Some(admission_guard))
+                    .await
+                    .map(|outcome| (conversation_id, outcome));
+            }
+        }
+    }
+
     pub(crate) async fn send(
         &self,
+        req: SendChatRequest,
+    ) -> Result<SendChatOutcome, SendChatServiceError> {
+        self.send_with_admission_guard(req, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn send_with_admission_guard(
+        &self,
         mut req: SendChatRequest,
+        admission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let conversation = self
             .runtime
@@ -254,7 +340,10 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
-        let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
+        let acceptance_guard = match admission_guard {
+            Some(guard) => guard,
+            None => self.runtime.lock_message_acceptance(&conversation.id).await,
+        };
 
         // The pre-lock lookup is only a fast path. A concurrent request with
         // this client identity may commit while this request waits for the
@@ -851,6 +940,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
@@ -902,6 +992,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)

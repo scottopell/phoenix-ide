@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../../api';
-import { api } from '../../api';
+import { api, ConflictError } from '../../api';
 import { ConversationSearchWarmingError } from '../../api';
 import './CommandPalette.css';
 import type { PaletteState, PaletteSource, PaletteAction } from './types';
@@ -14,7 +14,11 @@ import { createCodeSource } from './sources/CodeSource';
 import { createConversationContentSource } from './sources/ConversationContentSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import { notifyArchiveCloseConflict } from '../../notifications';
+import {
+  notifyArchiveCloseConflict,
+  notifyProductConversationClosed,
+  notifyProductConversationListMayHaveChanged,
+} from '../../notifications';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
@@ -44,7 +48,12 @@ export function CommandPalette({ conversations, productConversations = [], activ
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/]+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
   const activeProduct = productMatch
-    ? productConversations.find(row => row.product_conversation_id === productMatch[1])
+    ? productConversations.find((row) => (
+        row.product_conversation_id === productMatch[1]
+        || row.canonical_root.slug === productMatch[1]
+        || row.canonical_root.transcript_row_id === productMatch[1]
+        || row.latest_transcript_row_id === activeConversation?.id
+      ))
     : undefined;
 
   const activeConvId = activeConversation?.id ?? null;
@@ -53,7 +62,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
       ?? (activeConversation?.id === activeProduct.latest_transcript_row_id ? activeConversation : undefined)
     : undefined;
   const activeFileRoot = activeProduct
-    ? (activeProduct.ordinary_lifecycle === 'open'
+    ? (activeProduct.lifecycle.state === 'open'
       ? activeProductConversation?.worktree_path ?? activeProductConversation?.cwd ?? null
       : null)
     : activeConversationFileRoot(activeConversation);
@@ -64,7 +73,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
     [conversations],
   );
   const productConversationIdsKey = useMemo(
-    () => productConversations.map(row => `${row.product_conversation_id}:${row.updated_at}:${row.presentation.display_name}`).join(','),
+    () => productConversations.map(row => `${row.product_conversation_id}:${row.updated_at}:${row.presentation.display_name}:${row.lifecycle.state === 'open' ? row.lifecycle.close_action.availability : 'history'}`).join(','),
     [productConversations],
   );
 
@@ -122,41 +131,60 @@ export function CommandPalette({ conversations, productConversations = [], activ
   // Stable boolean for downstream consumers — true when inside a conversation route.
   const hasActiveConversation = activeConvId !== null;
 
+  const closingProductIdsRef = useRef(new Set<string>());
   const actions: PaletteAction[] = useMemo(
     () =>
       createBuiltInActions({
         navigate,
         currentSlug: currentSlug ?? activeProduct?.canonical_root.slug ?? null,
-        archiveCurrent: currentSlug || activeProduct?.ordinary_lifecycle === 'open'
+        archiveCurrent: currentSlug || (activeProduct?.lifecycle.state === 'open'
+          && activeProduct.lifecycle.close_action.availability === 'available')
           ? (() => {
               const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute)
                 ?? (activeConversation?.id === activeRoute || activeConversation?.slug === activeRoute
                   ? activeConversation
                   : undefined);
-              const targetId = conv?.id ?? activeProduct?.latest_transcript_row_id;
+              const targetId = conv?.id ?? activeProduct?.canonical_root.transcript_row_id;
               const isWritable = activeProduct
-                ? activeProduct.ordinary_lifecycle === 'open'
+                ? activeProduct.lifecycle.state === 'open'
+                  && activeProduct.lifecycle.close_action.availability === 'available'
                 : conv?.archived !== true;
               const chainMembers = conv && !conversations.some(candidate => candidate.id === conv.id)
                 ? [...conversations, conv]
                 : conversations;
               const computedChainRootId = computeChainRoots(chainMembers).get(conv?.id ?? '');
-              const canonicalRootId = activeProduct?.canonical_root.transcript_row_id;
-              const chainRootId = canonicalRootId && canonicalRootId !== targetId
-                ? canonicalRootId
-                : computedChainRootId;
+              const chainRootId = activeProduct?.canonical_root.transcript_row_id ?? computedChainRootId;
               if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
-                  if (chainRootId != null) {
+                  if (activeProduct) {
+                    const productId = activeProduct.product_conversation_id;
+                    if (closingProductIdsRef.current.has(productId)) return;
+                    closingProductIdsRef.current.add(productId);
+                    try {
+                      await api.closeProductConversation(productId);
+                      notifyProductConversationListMayHaveChanged();
+                      notifyProductConversationClosed(productId);
+                    } finally {
+                      closingProductIdsRef.current.delete(productId);
+                    }
+                  } else if (chainRootId != null) {
                     await api.archiveChain(chainRootId);
                   } else {
                     await api.archiveConversation(targetId);
                   }
                   navigate('/');
                 } catch (error) {
-                  if (!notifyArchiveCloseConflict(targetId, error)) throw error;
+                  if (activeProduct
+                    && error instanceof ConflictError
+                    && error.detail.error_type === 'close_already_history') {
+                    notifyProductConversationClosed(activeProduct.product_conversation_id);
+                    notifyProductConversationListMayHaveChanged();
+                    navigate('/');
+                  } else if (!notifyArchiveCloseConflict(targetId, error)) {
+                    throw error;
+                  }
                 }
               };
             })()
