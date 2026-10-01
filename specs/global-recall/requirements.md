@@ -299,6 +299,18 @@ THE SYSTEM SHALL preserve the original acceptance and unknown historical origin 
 
 THE SYSTEM SHALL continue to reject changed payloads and conflicts with recorded origins on retries.
 
+WHEN conversation-delivered input has a recorded originating tool invocation
+THE SYSTEM SHALL retain the server-owned source transcript, assistant message, and tool-call identity through admission, queueing, persistence, and retrieval.
+
+WHEN the user activates that input's source-call link
+THE SYSTEM SHALL open the recorded transcript member, locate the originating tool call, expand its collapsed presentation, and highlight it without substituting a current successor or recipient message.
+
+WHEN historical input has no recorded source-call locator
+THE SYSTEM SHALL state that the original call is unavailable and offer only the recorded source transcript.
+
+WHEN an exact source member cannot be loaded
+THE SYSTEM SHALL display an error within its normal layout without silently navigating to another member.
+
 ### REQ-GR-015: Watch Explicit Stable Conversations
 
 THE Global Coordinator SHALL have a trusted capability to enroll, inspect, and remove watches of open ordinary ProductConversations without per-target user approval.

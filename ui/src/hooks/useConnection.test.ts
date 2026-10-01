@@ -399,7 +399,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
       es.emit('init', makeInitPayload('conv-A', 'slug-A'));
       es.emit('steer_message_queued', {
         sequence_id: 1,
-        message: { message_id: 'external-1', origin: { kind: 'internal_conversation', product_conversation_id: 'coordinator', transcript_id: 'coordinator-transcript' }, text: 'from coordinator', images: [], files: [] },
+        message: { message_id: 'external-1', origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'coordinator', transcript_id: 'coordinator-transcript' }, text: 'from coordinator', images: [], files: [] },
         queue_position: 0,
       });
       es.emit('steer_message_cancelled', { sequence_id: 2, message_id: 'external-1' });

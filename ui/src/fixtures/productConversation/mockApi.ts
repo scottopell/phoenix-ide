@@ -31,6 +31,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
   const originalGetConversation = api.getConversation;
   const originalResolveCoordinatorRoute = api.resolveCoordinatorRoute;
+  const originalEnsureGlobalCoordinator = api.ensureGlobalCoordinator;
+  const originalGetCoordinatorAutomaticContinuation = api.getCoordinatorAutomaticContinuation;
   const originalListConversations = api.listConversations;
   const originalListArchivedConversations = api.listArchivedConversations;
   const originalListModels = api.listModels;
@@ -55,6 +57,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
 
   api.getProductConversationSnapshot = async (_productConversationId, options = {}) => {
+    if (scenario.sourceSnapshot && _productConversationId !== 'fixture-product-conversation') {
+      if (scenario.sourceIsGlobal) throw new Error("Global must not request ordinary snapshot");
+      return scenario.sourceSnapshot;
+    }
     snapshotRequestCount += 1;
     record('SnapshotRequests', snapshotRequestCount);
     if (scenario.state === 'loading') {
@@ -103,18 +109,23 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const conversation = latestConversation(scenario);
   const route = { id: conversation.id, slug: conversation.slug };
   const messages = scenario.alignedLatestMessages
-    ?? (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+    ?? (scenario.sourceSnapshot ? [] : scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
 
-  api.getConversationRoute = async () => route;
-  api.getConversationRouteBySlug = async () => route;
-  api.getConversation = async () => ({
-    conversation,
-    messages,
+  const sourceId = scenario.sourceSnapshot?.segments[0]?.transcript_row_id;
+  const sourceConversation = { ...conversation, id: sourceId ?? conversation.id, slug: sourceId ?? conversation.slug };
+  const sourceMessages = (scenario.sourceSnapshot?.segments[0]?.messages ?? []) as Message[];
+  api.getConversationRoute = async (id) => id === sourceId ? { id, slug: id } : route;
+  api.getConversationRouteBySlug = async (id) => id === sourceId ? { id, slug: id } : route;
+  api.getConversation = async (id) => ({
+    conversation: id === sourceId ? sourceConversation : conversation,
+    messages: id === sourceId ? sourceMessages : messages,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 128_000,
   });
-  api.resolveCoordinatorRoute = async () => ({ coordinator_id: null });
+  api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
+  api.ensureGlobalCoordinator = async () => ({ conversation: { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
+  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: id === sourceId && scenario.sourceIsGlobal ? sourceId : null });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({
@@ -210,8 +221,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     onopen: ((event: Event) => void) | null = null;
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
     private readonly instanceId: number;
+    private readonly isSource: boolean;
 
     constructor(url: string) {
+      this.isSource = Boolean(sourceId && url.includes(sourceId));
       eventSourceOpenCount += 1;
       this.instanceId = eventSourceOpenCount;
       latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
@@ -241,10 +254,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
           record('EventSourceLastInitializedInstance', this.instanceId);
           const init = {
             sequence_id: 1,
-            conversation,
+            conversation: this.isSource ? sourceConversation : conversation,
             transcript_generation: 1,
             transcript_coverage: 'complete',
-            messages,
+            messages: this.isSource ? sourceMessages : messages,
             steering_messages: scenario.steeringMessages ?? [],
             agent_working: false,
             last_sequence_id: 1,
@@ -281,6 +294,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
     api.getConversation = originalGetConversation;
     api.resolveCoordinatorRoute = originalResolveCoordinatorRoute;
+    api.getCoordinatorAutomaticContinuation = originalGetCoordinatorAutomaticContinuation;
+  api.ensureGlobalCoordinator = originalEnsureGlobalCoordinator;
     api.listConversations = originalListConversations;
     api.listArchivedConversations = originalListArchivedConversations;
     api.listModels = originalListModels;

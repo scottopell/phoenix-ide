@@ -1537,6 +1537,13 @@ impl RecoverySettlementReason {
 
 /// Server-assigned attribution of an input. `UnknownHistorical` means no reliable
 /// attribution was recorded; it does not mean the API user authored the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SourceToolCall {
+    pub message_id: String,
+    pub tool_use_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -1548,6 +1555,9 @@ pub enum InputOrigin {
         #[ts(type = "string")]
         product_conversation_id: ProductConversationId,
         transcript_id: String,
+        // owned: pre-locator inputs recorded no source call; absence is truthful.
+        #[serde(default)]
+        source_call: Option<Box<SourceToolCall>>,
     },
     SystemGenerated,
     SubscriptionEvent {
@@ -1563,6 +1573,41 @@ impl InputOrigin {
     }
 
     #[must_use]
+    pub fn source_call(&self) -> Option<&SourceToolCall> {
+        match self {
+            Self::InternalConversation { source_call, .. } => source_call.as_deref(),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::SystemGenerated
+            | Self::SubscriptionEvent { .. } => None,
+        }
+    }
+
+    /// # Errors
+    /// Rejects partial locator pairs and locators on non-conversation origins.
+    pub fn with_source_call_columns(
+        mut self,
+        message_id: Option<String>,
+        tool_use_id: Option<String>,
+    ) -> Result<Self, String> {
+        match (&mut self, message_id, tool_use_id) {
+            (
+                Self::InternalConversation { source_call, .. },
+                Some(message_id),
+                Some(tool_use_id),
+            ) if !message_id.is_empty() && !tool_use_id.is_empty() => {
+                *source_call = Some(Box::new(SourceToolCall {
+                    message_id,
+                    tool_use_id,
+                }));
+            }
+            (_, None, None) => {}
+            _ => return Err("invalid source tool call columns".into()),
+        }
+        Ok(self)
+    }
+
+    #[must_use]
     pub fn db_parts(&self) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
         match self {
             Self::UnknownHistorical => ("unknown_historical", None, None, None),
@@ -1570,6 +1615,7 @@ impl InputOrigin {
             Self::InternalConversation {
                 product_conversation_id,
                 transcript_id,
+                ..
             } => (
                 "internal_conversation",
                 Some(product_conversation_id.as_str()),
@@ -1605,6 +1651,7 @@ impl InputOrigin {
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|e| e.to_string())?,
                     transcript_id,
+                    source_call: None,
                 })
             }
             other => Err(format!("invalid input origin: {other:?}")),

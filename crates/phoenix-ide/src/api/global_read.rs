@@ -562,6 +562,7 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
         InputOrigin::InternalConversation {
             product_conversation_id,
             transcript_id,
+            ..
         } => {
             format!(" from @transcript:{transcript_id} (conversation ID {product_conversation_id})")
         }
@@ -1140,6 +1141,7 @@ mod tests {
         let source = InputOrigin::InternalConversation {
             product_conversation_id: sender.product_conversation_id.clone(),
             transcript_id: sender.id.clone(),
+            source_call: None,
         };
         message.origin = source;
         let rendered = render_global_message_line(&conv, &message);
@@ -1198,6 +1200,7 @@ mod tests {
                 InputOrigin::InternalConversation {
                     product_conversation_id: conv.product_conversation_id.clone(),
                     transcript_id: conv.id.clone(),
+                    source_call: None,
                 },
                 "Conversation from @transcript:",
             ),

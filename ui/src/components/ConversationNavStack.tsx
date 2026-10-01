@@ -1,3 +1,4 @@
+import { useLocation } from 'react-router-dom';
 import { memo, useCallback, useRef, useState } from 'react';
 import type { VirtualTranscriptRange } from './VirtualTranscript';
 import { MessageList, type MessageListHandle } from './MessageList';
@@ -22,6 +23,10 @@ type StackProps = Omit<
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
   const { onLoadOlderMessages } = props;
+  const location = useLocation();
+  const sourceToolId = new URLSearchParams(location.search).get('source_tool');
+  const sourceCallTarget = sourceToolId && location.hash.startsWith('#message-')
+    ? { messageId: decodeURIComponent(location.hash.slice(9)), toolUseId: sourceToolId } : null;
   const listRef = useRef<MessageListHandle>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeUnitIndex, setActiveUnitIndex] = useState<number | null>(null);
@@ -61,6 +66,7 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
       <MessageList
         ref={listRef}
         {...props}
+        sourceCallTarget={sourceCallTarget}
         onLoadOlderMessages={onLoadOlderMessages ? handleLoadOlderMessages : undefined}
         onChaptersChange={handleChaptersChange}
         onVisibleRangeChange={handleVisibleRangeChange}

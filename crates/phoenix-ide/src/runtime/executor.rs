@@ -1472,8 +1472,7 @@ fn render_messages<'a>(
                 let mut text_for_llm = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
                         product_conversation_id,
-                        transcript_id,
-                    } => format!(
+                        transcript_id, .. } => format!(
                         "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
                         user_content.llm_text()
                     ),
@@ -1560,7 +1559,7 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
-                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "[Input of unknown historical origin]".to_string(),
@@ -12768,6 +12767,7 @@ mod dispatch_context_budget_tests {
         internal.origin = InputOrigin::InternalConversation {
             product_conversation_id: ProductConversationId::parse("source-product").unwrap(),
             transcript_id: "source-transcript".to_string(),
+            source_call: None,
         };
         let mut api = message("recipient", 2, "user request");
         api.origin = InputOrigin::UserApi;

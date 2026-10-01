@@ -45,7 +45,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         }));
         const topologyChanged = topologyRevision > consumedTopologyRevision.current;
         consumedTopologyRevision.current = topologyRevision;
-        if (topologyChanged && slug !== coordinator.conversation.id) {
+        const pinnedSource = new URLSearchParams(locationRef.current.search).has('source_tool');
+        if (topologyChanged && !pinnedSource && slug !== coordinator.conversation.id) {
           navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
         } else if (!slug || slug === coordinator.conversation.id) {
           setResolvedCoordinatorId(coordinator.conversation.id);
@@ -56,12 +57,15 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
               if (cancelled) return;
               if (coordinator_id) {
                 setResolvedCoordinatorId(slug);
+              } else if (pinnedSource) {
+                setError("Original source conversation unavailable");
               } else {
                 navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
               }
             })
             .catch(() => {
-              if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+              if (!cancelled && pinnedSource) setError("Original source conversation unavailable");
+              else if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
             });
         }
         setError(null);

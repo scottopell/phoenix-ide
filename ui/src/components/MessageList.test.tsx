@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router-dom';
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, StrictMode, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react';
@@ -23,7 +24,7 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
   const store = new ConversationStore();
   return (
     <ConversationContext.Provider value={store}>
-      <FocusScopeProvider>{ui}</FocusScopeProvider>
+      <MemoryRouter><FocusScopeProvider>{ui}</FocusScopeProvider></MemoryRouter>
     </ConversationContext.Provider>
   );
 }

@@ -192,7 +192,7 @@ describe('buildConversationChapters', () => {
     api.message.origin = { kind: 'user_api' };
     const internal = userUnit('internal', 'Forwarded request', 3);
     if (internal.kind !== 'user') throw new Error('expected user');
-    internal.message.origin = { kind: 'internal_conversation', product_conversation_id: 'source-pc', transcript_id: 'source-row' };
+    internal.message.origin = { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-pc', transcript_id: 'source-row' };
     const queued = pendingUserUnit('queued', 'Queued internal request');
     if (queued.kind !== 'pending_user') throw new Error('expected pending user');
     queued.message.origin = internal.message.origin;

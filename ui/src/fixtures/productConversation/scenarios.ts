@@ -475,7 +475,7 @@ export const productConversationScenarios = [
     }),
   },
   {
-    ...productConversationScenarioDefinitions.at(-1)!,
+    ...productConversationScenarioDefinitions.find(def => def.id === 'input-provenance-continuation')!,
     snapshot: makeSnapshot({
       product_conversation_id: 'pc-input-provenance',
       latest_transcript_row_id: 'row-provenance-continued',
@@ -491,15 +491,24 @@ export const productConversationScenarios = [
         ], 'Continue in the next transcript.'),
         segment(2, 'row-provenance-continued', 'Continued transcript', [
           { ...textMessage('internal-continued', 3, 'user', 'Forwarded into continued transcript'),
-            origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' } },
+            origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' } },
           textMessage('reply-continued', 4, 'agent', 'The continued transcript preserves source attribution.', state('idle')),
         ], null),
       ],
     }),
     steeringMessages: [{ message_id: 'queued-source',
-      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
+      origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' },
       text: 'Queued from source conversation', images: [], files: [] }],
   },
+  ...(['source-call-global', 'source-call-ordinary'] as const).map(id => {
+    const sourceMessage = { ...textMessage('source-assistant', 3, 'agent', 'Forwarding the requested observation.'),
+      content: [{ type: 'text' as const, text: 'Forwarding the requested observation.' }, { type: 'tool_use' as const, id: 'source-send-call', name: 'send_conversation_message', input: { target: '@conv:receiver', message: 'Source jump fixture payload', message_id: 'fixture-send' } }] };
+    const history = Array.from({ length: 36 }, (_, i) => textMessage(`source-history-${i}`, i + 5, i % 2 ? 'agent' : 'user', `Historical context ${i}`));
+    const source = makeSnapshot({ product_conversation_id: 'source-product', canonical_route: '/product-conversations/source-product', latest_transcript_row_id: 'source-successor', writable_transcript_row_id: 'source-successor',
+      segments: [segment(1, 'source-member', 'Original source member', [textMessage('source-request', 1, 'user', 'Send observation'), sourceMessage, ...history], null), segment(2, 'source-successor', 'Continued source', [textMessage('successor-request', 60, 'user', 'Continue work')], 'Continued after source send')] });
+    return { ...productConversationScenarioDefinitions.find(def => def.id === id)!, sourceIsGlobal: id === 'source-call-global', sourceSnapshot: source,
+      snapshot: makeSnapshot({ segments: [segment(1, ALIGNED_PREFIX_TRANSCRIPT_ROW_ID, 'Receiver', [{ ...textMessage('received-send', 1, 'user', 'Source jump fixture payload'), origin: { kind: 'internal_conversation' as const, product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-assistant', tool_use_id: 'source-send-call' } } }], null)] }) };
+  }),
 ] as const satisfies readonly ProductConversationScenario[];
 
 export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario {

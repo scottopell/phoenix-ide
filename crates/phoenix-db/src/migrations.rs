@@ -570,7 +570,45 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_conversation_watches",
         sql: MIGRATION_111,
     },
+    Migration {
+        version: 112,
+        name: "input_source_tool_call",
+        sql: MIGRATION_112,
+    },
 ];
+
+const MIGRATION_112: &str = r"
+ALTER TABLE messages ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE messages ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER messages_source_call_insert BEFORE INSERT ON messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER messages_source_call_update BEFORE UPDATE ON messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+ALTER TABLE steering_messages ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE steering_messages ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER steering_messages_source_call_insert BEFORE INSERT ON steering_messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER steering_messages_source_call_update BEFORE UPDATE ON steering_messages
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+ALTER TABLE durable_turns ADD COLUMN origin_source_message_id TEXT;
+ALTER TABLE durable_turns ADD COLUMN origin_source_tool_use_id TEXT;
+CREATE TRIGGER durable_turns_source_call_insert BEFORE INSERT ON durable_turns
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+CREATE TRIGGER durable_turns_source_call_update BEFORE UPDATE ON durable_turns
+WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+ (NEW.origin_kind <> 'internal_conversation' OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0 OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;
+";
 
 const MIGRATION_111: &str = r"
 ALTER TABLE product_creation_jobs ADD COLUMN objective_origin TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(objective_origin IN ('unknown_historical', 'user_api'));
@@ -11376,9 +11414,9 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(3).copied().collect::<Vec<_>>(),
             vec![
+                (112, "input_source_tool_call"),
                 (111, "coordinator_conversation_watches"),
                 (110, "trusted_input_origin"),
-                (109, "persist_approval_request_obligation"),
             ]
         );
     }

@@ -461,7 +461,12 @@ impl Tool for SendConversationMessage {
                 .source_conversation(&ctx.conversation_id)
                 .await
             {
-                Ok(source) => sender_origin(source),
+                Ok(source) => {
+                    let Some(source_call) = ctx.source_tool_call() else {
+                        return ToolOutput::error("Trusted source tool-call identity unavailable");
+                    };
+                    sender_origin(source, source_call)
+                }
                 Err(error) => {
                     return ToolOutput::error(format!("sender membership unavailable: {error}"))
                 }
@@ -564,10 +569,14 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
     }
 }
 
-fn sender_origin(source: crate::db::Conversation) -> phoenix_core::domain::db_schema::InputOrigin {
+fn sender_origin(
+    source: crate::db::Conversation,
+    source_call: phoenix_core::domain::db_schema::SourceToolCall,
+) -> phoenix_core::domain::db_schema::InputOrigin {
     phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
         product_conversation_id: source.product_conversation_id,
         transcript_id: source.id,
+        source_call: Some(Box::new(source_call)),
     }
 }
 
@@ -718,10 +727,20 @@ mod tests {
             .unwrap();
         let actual = db.get_conversation(&source.id).await.unwrap();
         assert_eq!(
-            sender_origin(actual),
+            sender_origin(
+                actual,
+                phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id: "assistant-source".into(),
+                    tool_use_id: "send-source".into()
+                }
+            ),
             phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
                 product_conversation_id: source.product_conversation_id,
                 transcript_id: source.id,
+                source_call: Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id: "assistant-source".into(),
+                    tool_use_id: "send-source".into()
+                })),
             }
         );
     }
