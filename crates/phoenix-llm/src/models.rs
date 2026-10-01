@@ -687,6 +687,20 @@ pub fn all_models() -> Vec<ModelSpec> {
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
+            id: "claude-sonnet-5-5".into(),
+            api_name: "claude-sonnet-5-5".into(),
+            backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
+            description: "Claude Sonnet 5.5 (balanced performance, adaptive thinking)".into(),
+            context_window: 1_000_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: true,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
+        },
+        ModelSpec {
             id: "claude-sonnet-5".into(),
             api_name: "claude-sonnet-5".into(),
             backend: ModelBackend::Anthropic,
@@ -887,6 +901,17 @@ mod tests {
         assert_eq!(
             opus_55.service_tier_capabilities,
             ServiceTierCapabilities::Supported
+        );
+
+        let sonnet_55 = by_id("claude-sonnet-5-5");
+        assert_eq!(sonnet_55.api_name, "claude-sonnet-5-5");
+        assert_eq!(sonnet_55.context_window, 1_000_000);
+        assert_eq!(sonnet_55.output_token_limit(), Some(128_000));
+        assert_eq!(sonnet_55.effort_capabilities, effort_anthropic_xhigh());
+        assert!(sonnet_55.recommended);
+        assert_eq!(
+            sonnet_55.service_tier_capabilities,
+            ServiceTierCapabilities::Unsupported
         );
 
         assert_eq!(

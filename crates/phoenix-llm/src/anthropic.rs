@@ -481,15 +481,15 @@ const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
 
 fn count_dropped_thinking_blocks(value: &serde_json::Value) -> u64 {
     value
-        .pointer("/message/input_transformations")
+        .pointer("/input_transformations")
+        .or_else(|| value.pointer("/message/input_transformations"))
         .or_else(|| value.pointer("/delta/input_transformations"))
         .and_then(serde_json::Value::as_array)
         .map_or(0, |items| {
             items
                 .iter()
                 .filter(|item| {
-                    item.get("type").and_then(serde_json::Value::as_str)
-                        == Some("thinking_block_dropped")
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("thinking_dropped")
                 })
                 .count() as u64
         })
@@ -512,11 +512,19 @@ pub(crate) fn is_official_anthropic_route(base_url_override: Option<&str>) -> bo
 }
 
 /// True when this request should send Anthropic Fast mode: the resolved
-/// effective service tier is Fast and the route is the official Claude API.
-/// Effort and speed are independent — this reads only the tier.
-fn is_fast_mode(base_url_override: Option<&str>, request: &LlmRequest) -> bool {
-    request.service_tier == super::types::EffectiveServiceTier::Fast
+/// effective service tier is Fast, the model supports Fast, and the route is
+/// the official Claude API. Effort and speed are independent.
+fn is_fast_mode(spec: &ModelSpec, base_url_override: Option<&str>, request: &LlmRequest) -> bool {
+    spec.api_name == "claude-opus-5-5"
+        && request.service_tier == super::types::EffectiveServiceTier::Fast
         && is_official_anthropic_route(base_url_override)
+}
+
+fn supports_thinking_binding(spec: &ModelSpec, base_url_override: Option<&str>) -> bool {
+    matches!(
+        spec.api_name.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5"
+    ) && is_official_anthropic_route(base_url_override)
 }
 
 /// Compose the ordered `anthropic-beta` token list for a request. Tool search
@@ -562,9 +570,8 @@ pub async fn complete_streaming(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let fast_mode = is_fast_mode(base_url_override, request);
-    let thinking_binding =
-        spec.api_name == "claude-opus-5-5" && is_official_anthropic_route(base_url_override);
+    let fast_mode = is_fast_mode(spec, base_url_override, request);
+    let thinking_binding = supports_thinking_binding(spec, base_url_override);
     let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
     anthropic_request.stream = Some(true);
     if !request_tags.is_empty() {
@@ -677,9 +684,8 @@ pub async fn complete(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let fast_mode = is_fast_mode(base_url_override, request);
-    let thinking_binding =
-        spec.api_name == "claude-opus-5-5" && is_official_anthropic_route(base_url_override);
+    let fast_mode = is_fast_mode(spec, base_url_override, request);
+    let thinking_binding = supports_thinking_binding(spec, base_url_override);
     let mut anthropic_request = translate_request(spec, request, fast_mode, thinking_binding)?;
     if !request_tags.is_empty() {
         anthropic_request.tags = Some(request_tags.clone());
@@ -722,11 +728,24 @@ pub async fn complete(
         return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let anthropic_response: AnthropicResponse = serde_json::from_str(&body).map_err(|e| {
+    let response_value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
         LlmError::invalid_response(format!(
             "Failed to parse Anthropic response JSON ({e}); response body withheld"
         ))
     })?;
+    let dropped = count_dropped_thinking_blocks(&response_value);
+    if dropped > 0 {
+        tracing::debug!(
+            dropped_thinking_blocks = dropped,
+            "Anthropic dropped preserved-thinking blocks"
+        );
+    }
+    let anthropic_response: AnthropicResponse =
+        serde_json::from_value(response_value).map_err(|e| {
+            LlmError::invalid_response(format!(
+                "Failed to parse Anthropic response JSON ({e}); response body withheld"
+            ))
+        })?;
 
     normalize_response_with_diagnostics(anthropic_response, None, fast_mode)
 }
@@ -1678,6 +1697,65 @@ mod tests {
     }
 
     #[test]
+    fn sonnet_55_uses_adaptive_binding_without_opus_fast() {
+        let sonnet = crate::models::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "claude-sonnet-5-5")
+            .unwrap();
+        let opus = crate::models::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "claude-opus-5-5")
+            .unwrap();
+        let old = crate::models::all_models()
+            .into_iter()
+            .find(|spec| spec.id == "claude-sonnet-5")
+            .unwrap();
+        let mut request = test_request_with_tools();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+        for spec in [&sonnet, &opus, &old] {
+            for route in [
+                None,
+                Some(OFFICIAL_ANTHROPIC_URL),
+                Some("https://gateway.example/v1/messages"),
+            ] {
+                let binding = supports_thinking_binding(spec, route);
+                let fast = is_fast_mode(spec, route, &request);
+                let wire =
+                    serde_json::to_value(translate_request(spec, &request, fast, binding).unwrap())
+                        .unwrap();
+                let supported = spec.id != "claude-sonnet-5" && is_official_anthropic_route(route);
+                assert_eq!(binding, supported);
+                assert_eq!(
+                    fast,
+                    spec.id == "claude-opus-5-5" && is_official_anthropic_route(route)
+                );
+                assert_eq!(
+                    wire.pointer("/thinking/type").and_then(|v| v.as_str()),
+                    supported.then_some("adaptive")
+                );
+                assert_eq!(
+                    wire.pointer("/thinking/block_binding/prefix_mismatch_behavior")
+                        .and_then(|v| v.as_str()),
+                    supported.then_some("drop_block")
+                );
+                assert_eq!(
+                    wire.get("speed").and_then(|v| v.as_str()),
+                    fast.then_some("fast")
+                );
+                let betas = anthropic_beta_tokens(true, fast, binding);
+                assert_eq!(betas.contains(&THINKING_BINDING_BETA), supported);
+                assert_eq!(betas.contains(&FAST_MODE_BETA), fast);
+            }
+        }
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Standard;
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
+        let wire = serde_json::to_value(translate_request(&sonnet, &request, false, true).unwrap())
+            .unwrap();
+        assert_eq!(wire["output_config"]["effort"], "max");
+    }
+
+    #[test]
     fn private_replay_reconstructs_three_rounds_and_rejects_rewritten_owner() {
         use phoenix_core::domain::provider_replay::{
             AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
@@ -1946,13 +2024,18 @@ mod tests {
         let event = serde_json::json!({
             "message": {
                 "input_transformations": [
-                    { "type": "thinking_block_dropped", "private": "NOT-LOGGED" },
+                    { "type": "thinking_dropped", "private": "NOT-LOGGED" },
                     { "type": "other" },
-                    { "type": "thinking_block_dropped" }
+                    { "type": "thinking_dropped" }
                 ]
             }
         });
         assert_eq!(count_dropped_thinking_blocks(&event), 2);
+        assert_eq!(count_dropped_thinking_blocks(&event["message"]), 2);
+        assert_eq!(
+            count_dropped_thinking_blocks(&serde_json::json!({"delta": event["message"]})),
+            2
+        );
     }
 
     #[test]

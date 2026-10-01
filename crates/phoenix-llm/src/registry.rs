@@ -2990,6 +2990,21 @@ mod tests {
                 if capabilities.native_default() == NativeDefault::Known(ModelEffort::Medium)
         ));
 
+        let sonnet_55 = model_infos
+            .iter()
+            .find(|model| model.id == "claude-sonnet-5-5")
+            .expect("Sonnet 5.5 must be available on direct Anthropic auth");
+        assert_eq!(sonnet_55.context_window, 1_000_000);
+        assert_eq!(
+            sonnet_55.service_tier_capabilities,
+            ServiceTierCapabilities::Unsupported
+        );
+        assert!(matches!(
+            &sonnet_55.effort_capabilities,
+            EffortCapabilities::Supported(capabilities)
+                if capabilities.native_default() == NativeDefault::Known(ModelEffort::High)
+        ));
+
         // Check specific model
         let opus = model_infos
             .iter()
