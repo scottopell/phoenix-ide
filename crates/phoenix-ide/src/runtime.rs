@@ -3704,23 +3704,25 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         for conversation_id in conversation_ids {
-            if let Err(error) = self.settle_persisted_llm_request(&conversation_id).await {
+            let conversation = self
+                .db
+                .get_conversation(&conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let stored_model_id = conversation
+                .model
+                .unwrap_or_else(|| self.llm_registry.default_model_id());
+            if let Err(error) = self.llm_registry.resolve_model_id(&stored_model_id) {
                 tracing::error!(
                     conv_id = %conversation_id,
                     %error,
-                    "Startup could not settle one interrupted LLM request"
+                    "Startup cannot initialize the persisted model"
                 );
-                if let Err(fallback_error) = self
-                    .persist_startup_llm_initialization_failure(&conversation_id, &error)
-                    .await
-                {
-                    tracing::error!(
-                        conv_id = %conversation_id,
-                        %fallback_error,
-                        "Startup could not persist interrupted LLM fallback"
-                    );
-                }
+                self.persist_startup_llm_initialization_failure(&conversation_id, &error)
+                    .await?;
+                continue;
             }
+            self.settle_persisted_llm_request(&conversation_id).await?;
         }
         Ok(())
     }
@@ -3729,6 +3731,9 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<(), String> {
+        if self.try_get_handle(conversation_id).await.is_some() {
+            return Ok(());
+        }
         let handle = self.get_or_create(conversation_id).await?;
         let receipt = handle
             .startup_llm_recovery_ack
@@ -5426,13 +5431,18 @@ impl RuntimeManager {
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
-        let startup_llm_recovery = if matches!(initial_state, ConvState::LlmRequesting { .. })
-            && self
+        let resumable_owner = matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+            || self
+                .db
+                .has_pending_approval_request(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            || self
                 .db
                 .has_committed_steering_turn(conversation_id)
                 .await
-                .map_err(|error| error.to_string())?
-        {
+                .map_err(|error| error.to_string())?;
+        let startup_llm_recovery = if resumable_owner {
             crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
         } else {
             crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
@@ -12112,6 +12122,98 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn startup_replays_pending_approval_owner_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "pending-approval-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_state_at(
+                conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("persist requesting state");
+        manager
+            .db()
+            .add_message(
+                "approval-message",
+                conversation_id,
+                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("approval pending"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .expect("persist approval message");
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(conversation_id)
+        .bind("approval-message")
+        .bind(Utc::now().timestamp_micros())
+        .execute(manager.db().pool())
+        .await
+        .expect("persist approval owner");
+        manager
+            .db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("resume pending approval owner");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_replays_seeded_successor_once() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "seeded-successor-startup-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_state_at(
+                conversation_id,
+                &ConvState::SeededLlmRequesting {
+                    seed_message_id: "seed-message".to_string(),
+                    attempt: 1,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("persist seeded state");
+
+        manager
+            .settle_persisted_llm_requests()
+            .await
+            .expect("resume seeded successor");
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

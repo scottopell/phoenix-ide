@@ -10671,7 +10671,7 @@ impl Database {
     pub async fn llm_requesting_conversation_ids(&self) -> DbResult<Vec<String>> {
         sqlx::query_scalar(
             "SELECT id FROM conversations
-             WHERE state_kind = 'llm_requesting'
+             WHERE state_kind IN ('llm_requesting', 'seeded_llm_requesting')
              ORDER BY created_at, id",
         )
         .fetch_all(&self.pool)
