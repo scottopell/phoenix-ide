@@ -329,14 +329,19 @@ pub async fn serve_https(
     let deadline = runtime
         .fatal_local_authority_deadline()
         .expect("process shutdown deadline must be set before HTTPS drain");
-    let _ = bounded_post_shutdown_drain_until(
+    let drain = bounded_post_shutdown_drain_until(
         deadline,
         drain_concurrently(runtime.drain_process_shutdown(), graceful.shutdown()),
         "HTTPS",
-    )
-    .await;
-
-    Ok(())
+    );
+    tokio::pin!(drain);
+    tokio::select! {
+        _ = &mut drain => Ok(()),
+        boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+            tracing::error!(?boundary, "fatal local SQLite authority loss during HTTPS drain");
+            Err(crate::FatalLocalAuthorityExit.into())
+        }
+    }
 }
 
 fn log_alpn(

@@ -365,7 +365,7 @@ struct AbortTaskOnDrop(tokio::task::AbortHandle);
 enum StartupSteeringDrainOutcome {
     NotNeeded,
     StartedLlm,
-    SettleInterruptedLlm,
+    ResumeCommittedSteering,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2525,14 +2525,19 @@ where
                     let _ = ack.send(Ok(()));
                 }
             } else {
-                let recovery = match self.startup_llm_recovery {
-                    StartupLlmRecovery::ResumeCommittedSteering => {
+                let recovery =
+                    if startup_drain == StartupSteeringDrainOutcome::ResumeCommittedSteering {
                         self.resume_committed_steering_request().await
-                    }
-                    StartupLlmRecovery::SettleInterrupted => {
-                        Box::pin(self.settle_interrupted_llm_request()).await
-                    }
-                };
+                    } else {
+                        match self.startup_llm_recovery {
+                            StartupLlmRecovery::ResumeCommittedSteering => {
+                                self.resume_committed_steering_request().await
+                            }
+                            StartupLlmRecovery::SettleInterrupted => {
+                                Box::pin(self.settle_interrupted_llm_request()).await
+                            }
+                        }
+                    };
                 if let Some(ack) = self.startup_llm_recovery_ack.take() {
                     let _ = ack.send(recovery.clone());
                 }
@@ -4458,7 +4463,7 @@ where
         }) {
             StartupSteeringDrainOutcome::StartedLlm
         } else {
-            StartupSteeringDrainOutcome::SettleInterruptedLlm
+            StartupSteeringDrainOutcome::ResumeCommittedSteering
         };
         let generated_events = self.apply_transition_result(result).await?;
         for generated_event in generated_events {
@@ -18824,7 +18829,10 @@ mod steer_drain_detector_tests {
             .await
             .expect("startup legacy drain");
 
-        assert_eq!(outcome, StartupSteeringDrainOutcome::SettleInterruptedLlm);
+        assert_eq!(
+            outcome,
+            StartupSteeringDrainOutcome::ResumeCommittedSteering
+        );
         assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
         assert!(storage.get_steering_queue(conversation_id).is_empty());
         assert!(

@@ -3718,6 +3718,9 @@ impl RuntimeManager {
                     %error,
                     "Startup cannot initialize the persisted model"
                 );
+                let _owner = self.acquire_local_authority_pass().map_err(|()| {
+                    "local authority closed before startup recovery fallback".to_string()
+                })?;
                 self.persist_startup_llm_initialization_failure(&conversation_id, &error)
                     .await?;
                 continue;
@@ -5446,8 +5449,7 @@ impl RuntimeManager {
             } else {
                 None
             };
-        let resumable_owner = startup_creation_completion.is_some()
-            || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+        let resumable_owner = matches!(initial_state, ConvState::SeededLlmRequesting { .. })
             || self
                 .db
                 .has_pending_approval_request(conversation_id)

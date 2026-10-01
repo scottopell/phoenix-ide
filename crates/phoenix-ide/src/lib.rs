@@ -1108,13 +1108,21 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 let deadline = runtime_for_fatal
                     .fatal_local_authority_deadline()
                     .expect("process shutdown deadline must be set before HTTP drain");
-                let shutdown = tls::drain_concurrently(
-                    runtime_for_fatal.drain_process_shutdown(),
-                    &mut server,
+                let shutdown = tls::bounded_post_shutdown_drain_until(
+                    deadline,
+                    tls::drain_concurrently(runtime_for_fatal.drain_process_shutdown(), &mut server),
+                    "HTTP",
                 );
-                match tls::bounded_post_shutdown_drain_until(deadline, shutdown, "HTTP").await {
-                    Some(joined) => joined??,
-                    None => server_abort.abort(),
+                tokio::pin!(shutdown);
+                tokio::select! {
+                    result = &mut shutdown => match result {
+                        Some(joined) => joined??,
+                        None => server_abort.abort(),
+                    },
+                    boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+                        tracing::error!(?boundary, "fatal local SQLite authority loss during HTTP drain");
+                        return Err(FatalLocalAuthorityExit.into());
+                    }
                 }
             }
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {

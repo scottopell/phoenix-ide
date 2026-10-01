@@ -10672,6 +10672,11 @@ impl Database {
         sqlx::query_scalar(
             "SELECT id FROM conversations
              WHERE state_kind IN ('llm_requesting', 'seeded_llm_requesting')
+               AND NOT EXISTS (
+                 SELECT 1 FROM conversation_creation_jobs job
+                 WHERE job.conversation_id = conversations.id
+                   AND job.status IN ('accepted', 'claimed', 'retry_scheduled')
+               )
              ORDER BY created_at, id",
         )
         .fetch_all(&self.pool)
