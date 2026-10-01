@@ -445,7 +445,7 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(apiMock.getProductConversationSnapshot).toHaveBeenCalledWith('middle-slug', { message_limit: 1 }));
-    fireEvent.click(getByRole('button', { name: /Delete product conversation History Product/ }));
+    fireEvent.click(await waitFor(() => getByRole('button', { name: /Delete product conversation History Product/ })));
     fireEvent.click(getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Product Conversation"]')).toBeNull());
