@@ -369,6 +369,9 @@ async fn resolve_conversation_read_target(
                         format!("ProductConversation read failed: {error}")
                     }
                 })?;
+            if snapshot.aggregate.product_conversation.id() != &id {
+                return Err("ProductConversation reference not found".to_string());
+            }
             Ok(ConversationReadTarget::StableCurrent {
                 transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
                     snapshot.aggregate.latest_transcript_row_id,
@@ -386,6 +389,22 @@ async fn resolve_conversation_read_target(
     }
 }
 
+async fn ordinary_product_citation(
+    db: &crate::db::Database,
+    conv: &Conversation,
+) -> Option<(String, String)> {
+    let id = conv.product_conversation_id.clone();
+    let aggregate = db.get_ordinary_product_conversation(&id).await.ok()?;
+    let title = aggregate
+        .root
+        .conversation
+        .title
+        .clone()
+        .or(aggregate.root.conversation.slug.clone())
+        .unwrap_or_else(|| aggregate.root.conversation.id.clone());
+    Some((id.to_string(), title))
+}
+
 async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
@@ -395,23 +414,24 @@ async fn format_global_search_hits(
         let (title, stable_reference, href) =
             match service.db.get_conversation(&hit.conversation_id).await {
                 Ok(conv) => {
-                    let title = conv
-                        .title
-                        .clone()
-                        .or(conv.slug.clone())
-                        .unwrap_or_else(|| conv.id.clone());
-                    let stable_reference = format!("@conv:{}", conv.product_conversation_id);
+                    let citation = ordinary_product_citation(&service.db, &conv).await;
+                    let title = citation.as_ref().map_or_else(
+                        || {
+                            conv.title
+                                .clone()
+                                .or(conv.slug.clone())
+                                .unwrap_or_else(|| conv.id.clone())
+                        },
+                        |(_, title)| title.clone(),
+                    );
+                    let stable_reference = citation.map(|(id, _)| format!("@conv:{id}"));
                     let href = Some(conversation_message_href(
                         &conv,
                         Some((&hit.message_id, hit.message_type)),
                     ));
                     (title, stable_reference, href)
                 }
-                Err(_) => (
-                    hit.conversation_id.clone(),
-                    "stable ProductConversation unavailable".to_string(),
-                    None,
-                ),
+                Err(_) => (hit.conversation_id.clone(), None, None),
             };
         let link = href.unwrap_or_else(|| {
             format!(
@@ -421,13 +441,13 @@ async fn format_global_search_hits(
         });
         let _ = writeln!(
             out,
-            "- [{} · {}{} · {}]({}) {} · @transcript:{}#message-{} — {}",
+            "- [{} · {}{} · {}]({}) {}@transcript:{}#message-{} — {}",
             title,
             attributed_role(hit.message_type, &hit.origin),
             attributed_sender(&hit.origin),
             hit.created_at.format("%Y-%m-%d"),
             link,
-            stable_reference,
+            stable_reference.map_or_else(String::new, |reference| format!("{reference} · ")),
             hit.conversation_id,
             hit.message_id,
             hit.snippet.trim()
@@ -442,16 +462,23 @@ async fn read_conversation_page(
     cursor: usize,
     evidence_label: &str,
 ) -> Result<String, DbError> {
+    let stable = ordinary_product_citation(db, conv).await;
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
+        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+    });
+    let title = stable.as_ref().map_or_else(
+        || {
+            conv.title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id)
+        },
+        |(_, title)| title.as_str(),
+    );
     let mut header = format!(
-        "Conversation @conv:{}\n{}: @transcript:{} — {}\nconversation link: /product-conversations/{}\ntranscript link: {}\nupdated: {}\n---\n",
-        conv.product_conversation_id,
-        evidence_label,
+        "{stable_header}{evidence_label}: @transcript:{} — {}\ntranscript link: {}\nupdated: {}\n---\n",
         conv.id,
-        conv.title
-            .as_deref()
-            .or(conv.slug.as_deref())
-            .unwrap_or(&conv.id),
-        conv.product_conversation_id,
+        title,
         conversation_href(conv),
         conv.updated_at
     );
@@ -484,15 +511,23 @@ async fn read_conversation_around_message(
     messages.push(target);
     messages.extend(after);
 
+    let stable = ordinary_product_citation(db, conv).await;
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
+        format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
+    });
+    let title = stable.as_ref().map_or_else(
+        || {
+            conv.title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id)
+        },
+        |(_, title)| title.as_str(),
+    );
     let mut out = format!(
-        "Conversation @conv:{}\nexact evidence: @transcript:{} — {}\nconversation link: /product-conversations/{}\ntranscript link: {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
-        conv.product_conversation_id,
+        "{stable_header}exact evidence: @transcript:{} — {}\ntranscript link: {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
         conv.id,
-        conv.title
-            .as_deref()
-            .or(conv.slug.as_deref())
-            .unwrap_or(&conv.id),
-        conv.product_conversation_id,
+        title,
         conversation_href(conv),
         conv.updated_at,
         message_id,
@@ -1292,6 +1327,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn search_citation_uses_aggregate_root_title_not_successor_local_title() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Aggregate Title', state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = 'root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let current = match db.continue_conversation("root").await.unwrap() {
+            crate::db::ContinueOutcome::Created(current) => current,
+            crate::db::ContinueOutcome::AlreadyContinued(current) => {
+                panic!("unexpected existing continuation: {current:?}")
+            }
+            crate::db::ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("parent unexpectedly remained in state {state_variant}")
+            }
+        };
+        sqlx::query("UPDATE conversations SET title = 'Successor Local Title' WHERE id = ?1")
+            .bind(&current.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let hit = crate::db::RetrievedChunk {
+            conversation_id: current.id,
+            message_id: "message".to_string(),
+            chunk: crate::db::ChunkRef {
+                ordinal: 0,
+                char_range: None,
+            },
+            message_type: crate::db::MessageType::User,
+            created_at: chrono::Utc::now(),
+            snippet: "evidence".to_string(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            score: 0.0,
+            transcript_generation: 0,
+            message_count: 1,
+        };
+
+        let output = format_global_search_hits(&service, &[hit]).await;
+
+        assert!(output.contains("Aggregate Title"), "{output}");
+        assert!(!output.contains("Successor Local Title"), "{output}");
+    }
+
     #[test]
     fn transcript_image_placeholder_is_caller_neutral() {
         let mut content = phoenix_core::domain::db_schema::UserContent::new("text");
@@ -1382,6 +1464,10 @@ mod tests {
         assert!(!stable_output.contains("current evidence: @transcript:root"));
         assert!(exact_output.contains("exact evidence: @transcript:root"));
         assert!(!exact_output.contains(&format!("exact evidence: @transcript:{}", current.id)));
+        assert!(resolve_conversation_read_target(&service, "@conv:root")
+            .await
+            .unwrap_err()
+            .contains("not found"));
         assert_eq!(
             resolve_conversation_read_target(&service, "root")
                 .await

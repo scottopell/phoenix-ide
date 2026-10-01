@@ -73,7 +73,7 @@ pub use product_conversation_read::{
     ProductConversationWorkIdentity, ResolvedProductConversation,
 };
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
+    ChunkRef, Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
