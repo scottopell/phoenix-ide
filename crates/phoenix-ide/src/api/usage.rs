@@ -129,7 +129,13 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
             cache_write: 18.75,
             cache_read: 1.50,
         }),
-        "claude-sonnet-5" | "claude-sonnet-4-6" => Some(ModelPricing {
+        "claude-sonnet-5-5" | "claude-sonnet-5" => Some(ModelPricing {
+            input: 2.00,
+            output: 10.00,
+            cache_write: 2.50,
+            cache_read: 0.20,
+        }),
+        "claude-sonnet-4-6" => Some(ModelPricing {
             input: 3.00,
             output: 15.00,
             cache_write: 3.75,
@@ -1006,7 +1012,7 @@ mod tests {
         assert_eq!(t.output_tokens, 500_000.0);
         assert_eq!(t.total_tokens, 2_750_000.0);
         assert_eq!(t.turns, 2.0);
-        assert_eq!(t.cost.estimated_usd, 3.0);
+        assert_eq!(t.cost.estimated_usd, 2.0);
         assert_eq!(t.cost.unknown_turns, 1.0);
         assert!(!t.cost.pricing_known);
     }
@@ -1014,7 +1020,7 @@ mod tests {
     #[test]
     fn cost_calculation_prices_each_token_category() {
         let cost = calculate_turn_cost(
-            "claude-sonnet-5",
+            "claude-sonnet-4-6",
             1_000_000,
             2_000_000,
             3_000_000,
@@ -1026,6 +1032,34 @@ mod tests {
         assert_eq!(cost.cache_write_usd, Some(11.25));
         assert_eq!(cost.cache_read_usd, Some(1.2));
         assert_eq!(cost.total_usd, Some(45.45));
+    }
+
+    #[test]
+    fn sonnet_55_uses_its_own_standard_rates() {
+        let cost = calculate_turn_cost(
+            "claude-sonnet-5-5",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+        assert!(cost.pricing_known);
+        assert_eq!(cost.input_usd, Some(2.0));
+        assert_eq!(cost.output_usd, Some(10.0));
+        assert_eq!(cost.cache_write_usd, Some(2.5));
+        assert_eq!(cost.cache_read_usd, Some(0.2));
+        assert_eq!(
+            cost.total_usd,
+            calculate_turn_cost(
+                "claude-sonnet-5",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000
+            )
+            .total_usd
+        );
+        assert_eq!(cost.total_usd, Some(14.7));
     }
 
     #[test]
@@ -1135,7 +1169,7 @@ mod tests {
         );
         totals.finish_cost();
 
-        assert_eq!(totals.cost.estimated_usd, 7.0);
+        assert_eq!(totals.cost.estimated_usd, 6.0);
         assert_eq!(totals.cost.unknown_turns, 0.0);
         assert!(totals.cost.pricing_known);
     }
