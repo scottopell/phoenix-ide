@@ -5431,22 +5431,6 @@ impl RuntimeManager {
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
-        let resumable_owner = matches!(initial_state, ConvState::SeededLlmRequesting { .. })
-            || self
-                .db
-                .has_pending_approval_request(conversation_id)
-                .await
-                .map_err(|error| error.to_string())?
-            || self
-                .db
-                .has_committed_steering_turn(conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-        let startup_llm_recovery = if resumable_owner {
-            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
-        } else {
-            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
-        };
         let startup_creation_completion =
             if matches!(initial_state, ConvState::LlmRequesting { .. }) {
                 self.db
@@ -5462,6 +5446,23 @@ impl RuntimeManager {
             } else {
                 None
             };
+        let resumable_owner = startup_creation_completion.is_some()
+            || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
+            || self
+                .db
+                .has_pending_approval_request(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            || self
+                .db
+                .has_committed_steering_turn(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        let startup_llm_recovery = if resumable_owner {
+            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+        } else {
+            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+        };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
             let active = loaded.into_active();
