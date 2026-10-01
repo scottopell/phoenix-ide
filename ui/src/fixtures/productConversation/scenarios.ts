@@ -240,6 +240,7 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
 function makeChain(rootConvId = 'chain-root-product-alpha'): ChainView {
   return {
     root_conv_id: rootConvId,
+    product_conversation_id: 'pc-product-alpha',
     chain_name: null,
     display_name: 'Product Alpha',
     archived: false,

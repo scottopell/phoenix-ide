@@ -18,7 +18,16 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if let session = model.session(for: conversationId) {
+                if model.deletedProductHistoryIds.contains(conversationId) {
+                    ContentUnavailableView(
+                        "Conversation deleted",
+                        systemImage: "trash",
+                        description: Text("This Product History is no longer available."))
+                } else if let history = model.listStore.conversations.first(where: {
+                    $0.archived == true && $0.aggregateIdentity == conversationId
+                }) {
+                    ProductHistoryView(productConversationId: history.aggregateIdentity)
+                } else if let session = model.session(for: conversationId) {
                     ConversationView(session: session)
                 } else {
                     Text("Configure a server first")
@@ -74,6 +83,23 @@ struct ConversationListView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .confirmationDialog(
+                closeConfirmationTitle,
+                isPresented: Binding(
+                    get: { model.pendingProductCloseConfirmation?.kind != nil },
+                    set: { _ in })
+            ) {
+                Button(closeConfirmationActionTitle, role: closeConfirmationActionRole) {
+                    Task { await model.resolvePendingProductCloseConfirmation(confirm: true) }
+                }
+                .disabled(closeConfirmationActionDisabled)
+                Button(closeConfirmationCancelTitle, role: .cancel) {
+                    Task { await model.resolvePendingProductCloseConfirmation(confirm: false) }
+                }
+                .disabled(model.isResolvingPendingProductClose)
+            } message: {
+                Text(closeConfirmationMessage)
+            }
             .alert(
                 "Action failed",
                 isPresented: Binding(
@@ -91,6 +117,61 @@ struct ConversationListView: View {
             .onChange(of: model.pendingOpenConversationId) {
                 consumePendingNavigation()
             }
+        }
+    }
+
+    private var closeConfirmationTitle: String {
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork: "Stop work and close?"
+        case .losses: "Confirm Close losses?"
+        case .repair: "Close needs repair"
+        case nil: ""
+        }
+    }
+
+    private var closeConfirmationActionTitle: String {
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork: "Stop Work"
+        case .losses: "Accept Losses"
+        case .repair: "Retry Retirement"
+        case nil: "Close"
+        }
+    }
+
+    private var closeConfirmationActionRole: ButtonRole? {
+        model.pendingProductCloseConfirmation?.kind == .repair ? nil : .destructive
+    }
+
+    private var closeConfirmationCancelTitle: String {
+        model.pendingProductCloseConfirmation?.kind == .repair ? "Not Now" : "Cancel Close"
+    }
+
+    private var closeConfirmationActionDisabled: Bool {
+        guard !model.isResolvingPendingProductClose else { return true }
+        guard let pending = model.pendingProductCloseConfirmation else { return true }
+        if pending.kind == .losses {
+            return !ProductCloseLossInventory.isComplete(pending.close.losses)
+                || pending.close.confirmation_snapshot == nil
+        }
+        return false
+    }
+
+    private var closeConfirmationMessage: String {
+        switch model.pendingProductCloseConfirmation?.kind {
+        case .stopWork:
+            return "This conversation is still working. Stop its active work before Close continues."
+        case .losses:
+            guard let losses = model.pendingProductCloseConfirmation?.close.losses,
+                  ProductCloseLossInventory.isComplete(losses)
+            else {
+                return "The server did not provide the exact loss inventory. Refresh before accepting losses."
+            }
+            return "Close will permanently discard these exact items:\n\n"
+                + ProductCloseLossInventory.message(losses)
+        case .repair:
+            return "Resource retirement did not finish. Retry retirement for this exact Close attempt after repairing the reported resource problem."
+        case nil:
+            return ""
         }
     }
 
@@ -130,7 +211,9 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
-                    let navigationId = model.navigationConversationId(for: conversation)
+                    let navigationId = conversation.archived == true
+                        ? conversation.aggregateIdentity
+                        : model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
                         || transcriptRowId == model.coordinatorConversationId
                     NavigationLink(value: navigationId) {
@@ -140,11 +223,18 @@ struct ConversationListView: View {
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if !isCoordinator {
-                            Button {
-                                Task { await model.archive(conversationId: transcriptRowId) }
+                        if !isCoordinator && conversation.archived == true {
+                            Button(role: .destructive) {
+                                Task { await model.deleteHistoryConversation(conversation) }
                             } label: {
-                                Label("Archive", systemImage: "archivebox")
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .disabled(!model.connectivity.isOnline)
+                        } else if !isCoordinator && conversation.product_close_action == .available {
+                            Button {
+                                Task { await model.closeProductConversation(conversation) }
+                            } label: {
+                                Label("Close", systemImage: "archivebox")
                             }
                             .tint(.orange)
                             .disabled(!model.connectivity.isOnline)
@@ -165,10 +255,7 @@ struct ConversationListView: View {
     private func consumePendingNavigation() {
         guard let id = model.pendingOpenConversationId else { return }
         model.pendingOpenConversationId = nil
-        let aggregateId = model.listStore.aggregateId(forTranscriptRowId: id)
-        navPath = [model.resolvedNavigationConversationId(
-            aggregateId: aggregateId,
-            latestTranscriptRowId: id)]
+        navPath = [model.notificationNavigationId(for: id)]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.
@@ -262,5 +349,141 @@ struct StateDot: View {
         case nil: return .gray
         default: return .orange  // any in-flight state
         }
+    }
+}
+
+extension ProductConversationHandoff {
+    var displaySummary: String {
+        switch self {
+        case .completed(_, _, _, _, let summary),
+             .historical(_, _, _, let summary):
+            summary
+        }
+    }
+}
+
+private struct ProductHistoryHandoffView: View {
+    let handoff: ProductConversationHandoff
+
+    var body: some View {
+        Label {
+            Text(handoff.displaySummary)
+        } icon: {
+            Image(systemName: "arrow.down.right.circle")
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("productHistory.handoff")
+    }
+}
+
+struct ProductHistoryCachePresentation {
+    static func shouldShowAge(
+        isOnline: Bool,
+        onlineRefreshSucceeded: Bool,
+        fetchedAt: Date,
+        now: Date,
+        stalenessThreshold: TimeInterval = 120
+    ) -> Bool {
+        (!isOnline || !onlineRefreshSucceeded)
+            && now.timeIntervalSince(fetchedAt) > stalenessThreshold
+    }
+}
+
+struct ProductHistoryLoadKey: Equatable {
+    var productConversationId: String
+    var isOnline: Bool
+}
+
+private struct ProductHistoryView: View {
+    @Environment(AppModel.self) private var model
+    let productConversationId: String
+    @State private var cached: CachedProductHistory?
+    @State private var error: ProductHistoryLoadError?
+    @State private var onlineRefreshSucceeded = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            OfflineBanner()
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                if let staleness = cacheAgeNote(at: context.date) {
+                    Text(staleness)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
+                }
+            }
+            Group {
+                if let cached {
+                    List(cached.snapshot.segments, id: \.segment_ordinal) { segment in
+                        Section(segment.title ?? segment.slug ?? "Conversation") {
+                            ForEach(segment.messages, id: \.id) { message in
+                                MessageView(message: message)
+                            }
+                            if let handoff = segment.handoff {
+                                ProductHistoryHandoffView(handoff: handoff)
+                            }
+                        }
+                    }
+                } else if error == .notFound {
+                    ContentUnavailableView(
+                        "Conversation deleted",
+                        systemImage: "trash",
+                        description: Text("This Product History is no longer available."))
+                } else if let error {
+                    ContentUnavailableView(
+                        "Unable to load history",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(error.localizedDescription))
+                } else {
+                    ProgressView("Loading history…")
+                }
+            }
+        }
+        .task(id: ProductHistoryLoadKey(
+            productConversationId: productConversationId,
+            isOnline: model.connectivity.isOnline)
+        ) {
+            if cached == nil {
+                cached = model.cachedProductHistory(productConversationId: productConversationId)
+            }
+            error = nil
+            if !model.connectivity.isOnline {
+                onlineRefreshSucceeded = false
+            }
+            do {
+                cached = try await model.loadProductHistory(productConversationId: productConversationId)
+                onlineRefreshSucceeded = model.connectivity.isOnline
+            } catch is CancellationError {
+                return
+            } catch let loadError as ProductHistoryLoadError {
+                onlineRefreshSucceeded = false
+                if loadError == .notFound { cached = nil }
+                if cached == nil {
+                    error = loadError
+                }
+            } catch {
+                onlineRefreshSucceeded = false
+                if cached == nil {
+                    self.error = .emptyResponse
+                }
+            }
+        }
+    }
+
+    private func cacheAgeNote(at now: Date) -> String? {
+        guard let cached,
+              ProductHistoryCachePresentation.shouldShowAge(
+                  isOnline: model.connectivity.isOnline,
+                  onlineRefreshSucceeded: onlineRefreshSucceeded,
+                  fetchedAt: cached.fetchedAt,
+                  now: now)
+        else { return nil }
+        let fetchedAt = cached.fetchedAt
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "Cached \(formatter.localizedString(for: fetchedAt, relativeTo: now))"
     }
 }

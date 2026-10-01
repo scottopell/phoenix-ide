@@ -17,6 +17,10 @@ import {
   getConversationProjectLabel,
   isLowValueIdentifier,
 } from '../utils/conversationIdentity';
+import {
+  productConversationDisplayTitle,
+  productConversationPresentationIndicator,
+} from './ConversationList.presentation';
 import './ConversationList.css';
 
 
@@ -31,9 +35,12 @@ interface ConversationListProps {
   onNewConversation: () => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationClose?: (productConversation: ProductConversationListRow) => void;
+  onProductConversationDelete?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -57,7 +64,7 @@ interface ConversationRowProps {
   onToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onCloseMenu: () => void;
   /** Forwarded only when this row's menu is open; lets the parent install a
    *  click-outside listener scoped to the actual DOM node. */
@@ -169,50 +176,24 @@ function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplay
 
 export const SidebarPrBadge = PrBadge;
 
-function productConversationDisplayTitle(row: ProductConversationListRow): string {
-  return row.canonical_root.title?.trim()
-    || row.presentation.display_name?.trim()
-    || row.canonical_root.slug?.trim()
-    || row.canonical_root.transcript_row_id;
-}
-
-function productConversationStatusLabel(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'Needs action';
-  switch (row.presentation.presentation_mode) {
-    case 'needs_action': return 'Needs action';
-    case 'working': return 'Working';
-    case 'error': return 'Error';
-    case 'done': return 'Completed';
-    default: return row.ordinary_lifecycle === 'history' ? 'History' : 'Open';
-  }
-}
-
-function productConversationStateDotClass(row: ProductConversationListRow): string {
-  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
-  switch (row.presentation.presentation_mode) {
-    case 'working':
-      return 'working';
-    case 'error':
-      return 'error';
-    case 'done':
-      return 'terminal';
-    default:
-      return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
-  }
-}
-
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
   row,
   isActive,
   isKeyboardSelected,
   effectiveCwd,
   onClick,
+  onProductConversationClose,
+  onProductConversationDelete,
+  onProductConversationRename,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
   effectiveCwd?: string | undefined;
   onClick: (row: ProductConversationListRow) => void;
+  onProductConversationClose?: (row: ProductConversationListRow) => void;
+  onProductConversationDelete?: (row: ProductConversationListRow) => void;
+  onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
   const classes = [
     'conv-item',
@@ -221,7 +202,18 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
-  const statusTitle = productConversationStatusLabel(row);
+  const indicator = productConversationPresentationIndicator(row);
+  const statusTitle = indicator.label;
+  const closeAction = row.lifecycle.state === 'open' ? row.lifecycle.close_action : null;
+  const closeUnavailableReason = closeAction?.availability === 'unavailable'
+    ? ({
+        history: 'This conversation is already in History',
+        active_close_attempt: 'Close is already in progress',
+        awaiting_task_approval: 'Resolve the pending task approval before closing',
+        awaiting_continuation: 'Resolve the pending continuation before closing',
+        handed_off_without_continuation: 'Complete the continuation handoff before closing',
+      } as const)[closeAction.reason]
+    : undefined;
   const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
@@ -238,8 +230,10 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
         <div className="conv-item-slug">
           <span className="conv-item-slug-main">
             <span
-              className={`conv-state-dot ${productConversationStateDotClass(row)}`}
+              className={`conv-state-dot ${indicator.dotClass}`}
               title={statusTitle}
+              role="img"
+              aria-label={indicator.ariaLabel}
             />
             <span className="conv-item-title">{displayTitle}</span>
           </span>
@@ -252,6 +246,56 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
+      {(onProductConversationRename || onProductConversationClose || onProductConversationDelete) && (
+        <div className="conv-actions">
+          {onProductConversationRename && row.lifecycle.state === 'open'
+            && !(row.lifecycle.close_action.availability === 'unavailable'
+              && row.lifecycle.close_action.reason === 'active_close_attempt') && (
+            <button
+              type="button"
+              className="conv-action-btn"
+              onClick={(event) => { event.stopPropagation(); onProductConversationRename(row); }}
+              aria-label={`Rename product conversation ${displayTitle}`}
+              title="Rename"
+            >
+              ✎
+            </button>
+          )}
+          {onProductConversationDelete && row.lifecycle.state === 'history' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              onClick={(event) => { event.stopPropagation(); onProductConversationDelete(row); }}
+              aria-label={`Delete product conversation ${displayTitle}`}
+              title="Delete permanently"
+            >
+              ×
+            </button>
+          )}
+          {onProductConversationClose && closeAction?.availability === 'available' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              onClick={(event) => { event.stopPropagation(); onProductConversationClose(row); }}
+              aria-label={`Close product conversation ${displayTitle}`}
+              title="Close"
+            >
+              ×
+            </button>
+          )}
+          {onProductConversationClose && closeAction?.availability === 'unavailable' && (
+            <button
+              type="button"
+              className="conv-action-btn danger"
+              disabled
+              aria-label={`Close product conversation ${displayTitle}. ${closeUnavailableReason}`}
+              title={closeUnavailableReason}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      )}
     </li>
   );
 });
@@ -418,17 +462,19 @@ export const ConversationRow = memo(function ConversationRow({
           </button>
           {isMenuOpen && (
             <div className="conv-item-actions">
-              <button
-                className="action-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseMenu();
-                  onRename(conv);
-                }}
-                title={`Rename conversation "${displayTitle}"`}
-              >
-                Rename
-              </button>
+              {onRename && (
+                <button
+                  className="action-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseMenu();
+                    onRename(conv);
+                  }}
+                  title={`Rename conversation "${displayTitle}"`}
+                >
+                  Rename
+                </button>
+              )}
               {!showArchived && (
                 <button
                   className="action-btn"
@@ -479,7 +525,7 @@ interface ChainBlockProps {
   onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
-  onRename: (conv: Conversation) => void;
+  onRename?: (conv: Conversation) => void;
   onCloseRowMenu: () => void;
   rowMenuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
@@ -587,7 +633,7 @@ export const ChainBlock = memo(function ChainBlock({
               onToggleMenu={onRowToggleMenu}
               onArchive={onArchive}
               onDelete={onDelete}
-              onRename={onRename}
+              {...(onRename ? { onRename } : {})}
               onCloseMenu={onCloseRowMenu}
               menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
             />
@@ -622,7 +668,10 @@ export function ConversationList({
   onRename,
   onConversationClick,
   onProductConversationClick,
+  onProductConversationRename,
+  onProductConversationClose,
   activeSlug,
+  onProductConversationDelete,
   sidebarMode,
   listDensity,
   authChip,
@@ -872,6 +921,9 @@ export function ConversationList({
                 if (onProductConversationClick) onProductConversationClick(productRow);
                 else navigate(productRow.canonical_route);
               }}
+              {...(onProductConversationClose ? { onProductConversationClose } : {})}
+              {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
+              {...(onProductConversationRename ? { onProductConversationRename } : {})}
             />
           ))
         ) : (
@@ -894,7 +946,7 @@ export function ConversationList({
                   onToggleMenu={toggleActions}
                   onArchive={onArchive}
                   onDelete={onDelete}
-                  onRename={onRename}
+                  {...(onRename ? { onRename } : {})}
                   onCloseMenu={closeRowMenu}
                   menuRef={expandedId === conv.id ? menuRef : undefined}
                 />
@@ -928,7 +980,7 @@ export function ConversationList({
                 onRowToggleMenu={toggleActions}
                 onArchive={onArchive}
                 onDelete={onDelete}
-                onRename={onRename}
+                {...(onRename ? { onRename } : {})}
                 onCloseRowMenu={closeRowMenu}
                 rowMenuRef={menuRef}
               />

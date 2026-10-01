@@ -63,7 +63,9 @@ pub(crate) use git_repository_reconciliation::{
 };
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
-    ProductConversationAggregate, ProductConversationHandoff, ProductConversationListProjection,
+    ProductConversationAggregate, ProductConversationCloseAvailability,
+    ProductConversationCloseUnavailableReason, ProductConversationHandoff,
+    ProductConversationListLifecycle, ProductConversationListProjection,
     ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSnapshotRead,
     ProductConversationSource, ProductConversationSourceKind, ProductConversationTranscriptRow,
     ProductConversationWorkIdentity, ResolvedProductConversation,
@@ -101,10 +103,12 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use sqlite_native_statement::install_native_statement_baseline;
 use sqlite_telemetry::{SqliteOperation, SqliteTelemetry};
+use sqlx::sqlite::SqliteTransactionManager;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
+use sqlx_core::transaction::TransactionManager;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use thiserror::Error;
@@ -226,6 +230,8 @@ pub enum DbError {
     SteeringQueueFull,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
+    #[error("Close foundation latest transcript changed: expected {expected}, found {actual}")]
+    CloseFoundationStaleLatest { expected: String, actual: String },
     #[error("Close foundation repair required: {0:?}")]
     CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]
@@ -5887,7 +5893,7 @@ impl Database {
                 Some((cleanup, generation, &now_str)),
             )
             .await?;
-            if !deleted {
+            if !deleted.0 {
                 tx.rollback().await?;
                 return Err(DbError::Serialization(
                     "creation cleanup claim was lost".to_string(),
@@ -7654,6 +7660,36 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Resolve a previously accepted client message identity within one `ProductConversation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying query fails.
+    pub async fn product_conversation_client_message_owner(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        message_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT owner FROM (
+                 SELECT t.conversation_id AS owner
+                 FROM durable_turns t
+                 JOIN conversations c ON c.id = t.conversation_id
+                 WHERE c.product_conversation_id = ?1 AND t.client_turn_key = ?2
+                 UNION
+                 SELECT r.conversation_id AS owner
+                 FROM steering_acceptance_receipts r
+                 JOIN conversations c ON c.id = r.conversation_id
+                 WHERE c.product_conversation_id = ?1 AND r.message_id = ?2
+             ) LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Report whether a conversation has any durable pending steering work.
     ///
     /// # Errors
@@ -8967,6 +9003,88 @@ impl Database {
         Ok(rows)
     }
 
+    /// Return every transcript participant owned by the root's product
+    /// conversation, including subordinate agents that are not continuation
+    /// chain members.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database query fails.
+    pub async fn product_conversation_member_ids(&self, root_id: &str) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE parent_chain(id, next_id, depth) AS (
+                 SELECT root.id, root.continued_in_conv_id, 0
+                 FROM conversations AS requested
+                 JOIN conversations AS root
+                   ON root.product_conversation_id = requested.product_conversation_id
+                 WHERE requested.id = ?1
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations AS predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, successor.continued_in_conv_id, parent_chain.depth + 1
+                 FROM conversations AS successor
+                 JOIN parent_chain ON successor.id = parent_chain.next_id
+             )
+             SELECT member.id
+             FROM conversations AS requested
+             JOIN conversations AS member
+               ON member.product_conversation_id = requested.product_conversation_id
+             LEFT JOIN parent_chain ON parent_chain.id = member.id
+             WHERE requested.id = ?1
+             ORDER BY CASE WHEN member.runtime_role = 'sub_agent' THEN 0 ELSE 1 END,
+                      CASE WHEN member.runtime_role = 'sub_agent' THEN member.created_at END,
+                      CASE WHEN member.runtime_role = 'sub_agent' THEN member.id END,
+                      parent_chain.depth",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Return exactly the rows removed by the legacy single-conversation delete.
+    /// The final parent owns every remaining subordinate participant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database query fails.
+    pub async fn conversation_delete_member_ids(&self, id: &str) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT member.id
+             FROM conversations AS requested
+             JOIN conversations AS member
+               ON member.product_conversation_id = requested.product_conversation_id
+             WHERE requested.id = ?1
+               AND (
+                 member.id = requested.id
+                 OR (
+                   member.runtime_role = 'sub_agent'
+                   AND requested.runtime_role IN ('user', 'coordinator')
+                   AND requested.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM conversations AS remaining_parent
+                     WHERE remaining_parent.product_conversation_id = requested.product_conversation_id
+                       AND remaining_parent.id <> requested.id
+                       AND remaining_parent.runtime_role IN ('user', 'coordinator')
+                       AND remaining_parent.parent_conversation_id IS NULL
+                   )
+                 )
+               )
+             ORDER BY CASE WHEN member.id = requested.id THEN 1 ELSE 0 END,
+                      member.created_at,
+                      member.id",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Forward chain members as fully-hydrated [`Conversation`] rows, ordered
     /// root-first by continuation depth.
     ///
@@ -10147,7 +10265,7 @@ impl Database {
                     if let Some(binding) = approved_binding {
                         let source_conversation_id: String = binding.get("source_conversation_id");
                         sqlx::query(
-                            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+                            "INSERT OR IGNORE INTO work_scope_git_repositories (work_scope_id, repository_id)
                              SELECT ?1, repository_id
                              FROM conversations source
                              JOIN work_scope_git_repositories repository
@@ -10159,7 +10277,7 @@ impl Database {
                         .execute(&mut *tx)
                         .await?;
                         sqlx::query(
-                            "INSERT INTO product_conversation_sources (
+                            "INSERT OR IGNORE INTO product_conversation_sources (
                                  target_product_conversation_id, source_product_conversation_id,
                                  source_conversation_id, relation_kind, relation_key, approved_title,
                                  approved_priority, approved_artifact_body, approved_task_title,
@@ -10293,7 +10411,7 @@ impl Database {
     async fn delete_product_conversation_if_empty(
         connection: &mut sqlx::SqliteConnection,
         product_conversation_id: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
         sqlx::query(
             "DELETE FROM close_worktree_cleanup_plans
              WHERE attempt_id IN (
@@ -10323,6 +10441,28 @@ impl Database {
         .execute(&mut *connection)
         .await?;
         sqlx::query(
+            "DELETE FROM approved_task_creation_bindings
+             WHERE source_product_conversation_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM product_conversation_sources
+             WHERE target_product_conversation_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        let deleted = sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
@@ -10332,8 +10472,9 @@ impl Database {
         )
         .bind(product_conversation_id)
         .execute(connection)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(deleted == 1)
     }
 
     async fn delete_work_scope_if_empty(
@@ -10361,6 +10502,63 @@ impl Database {
         Ok(())
     }
 
+    async fn materialize_approved_task_binding_before_source_deletion(
+        connection: &mut sqlx::SqliteConnection,
+        source_conversation_id: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_scope_git_repositories (work_scope_id, repository_id)
+             SELECT target.work_scope_id, repository.repository_id
+             FROM approved_task_creation_bindings binding
+             JOIN conversation_creation_jobs job ON job.id = binding.job_id
+             JOIN conversations target ON target.id = job.conversation_id
+             JOIN conversations source ON source.id = binding.source_conversation_id
+             JOIN work_scope_git_repositories repository
+               ON repository.work_scope_id = source.work_scope_id
+             WHERE binding.source_conversation_id = ?1",
+        )
+        .bind(source_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO product_conversation_sources (
+                 target_product_conversation_id, source_product_conversation_id,
+                 source_conversation_id, relation_kind, relation_key, approved_title,
+                 approved_priority, approved_artifact_body, approved_task_title,
+                 approved_plan, approved_task_file, created_at_us
+             ) SELECT target.product_conversation_id, binding.source_product_conversation_id,
+                      binding.source_conversation_id, 'approved_task', binding.task_id,
+                      binding.approved_title, binding.approved_priority,
+                      binding.approved_artifact_body, binding.task_title,
+                      binding.approved_plan, binding.approved_task_file, ?2
+               FROM approved_task_creation_bindings binding
+               JOIN conversation_creation_jobs job ON job.id = binding.job_id
+               JOIN conversations target ON target.id = job.conversation_id
+              WHERE binding.source_conversation_id = ?1",
+        )
+        .bind(source_conversation_id)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM approved_task_creation_bindings
+             WHERE source_conversation_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs job
+                   JOIN conversations target ON target.id = job.conversation_id
+                   JOIN product_conversation_sources source
+                     ON source.target_product_conversation_id = target.product_conversation_id
+                   WHERE job.id = approved_task_creation_bindings.job_id
+                     AND source.relation_kind = 'approved_task'
+                     AND source.relation_key = approved_task_creation_bindings.task_id
+               )",
+        )
+        .bind(source_conversation_id)
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_conversation_row_with_dependents(
         connection: &mut sqlx::SqliteConnection,
         conversation_id: &str,
@@ -10375,6 +10573,9 @@ impl Database {
         let Some(membership) = membership else {
             return Ok(None);
         };
+
+        Self::materialize_approved_task_binding_before_source_deletion(connection, conversation_id)
+            .await?;
 
         sqlx::query(
             "DELETE FROM workflows
@@ -10486,7 +10687,7 @@ impl Database {
         conversation_id: &str,
         observer: sqlite_telemetry::ParentSqliteObserver<'_>,
         creation_cleanup_claim: Option<(&CreationCleanupJob, i64, &str)>,
-    ) -> DbResult<bool> {
+    ) -> DbResult<(bool, bool)> {
         let Some(product_conversation_id) = Self::delete_conversation_row_with_dependents(
             connection,
             conversation_id,
@@ -10495,7 +10696,7 @@ impl Database {
         )
         .await?
         else {
-            return Ok(false);
+            return Ok((false, false));
         };
         Self::delete_subordinates_if_last_parent(
             connection,
@@ -10504,8 +10705,178 @@ impl Database {
             observer,
         )
         .await?;
-        Self::delete_product_conversation_if_empty(connection, &product_conversation_id).await?;
-        Ok(true)
+        let aggregate_deleted =
+            Self::delete_product_conversation_if_empty(connection, &product_conversation_id)
+                .await?;
+        Ok((true, aggregate_deleted))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn delete_conversations_in_transaction(
+        &self,
+        ids: &[String],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        let telemetry = self.sqlite_telemetry(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
+        let (mut connection, acquisition) = match telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
+            .await
+        {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                return crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                    DbError::from(error),
+                ));
+            }
+        };
+        let (mut tx, timing) = match telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error));
+            }
+        };
+
+        let body = async {
+            let mut aggregate_deleted = false;
+            for id in ids {
+                let deleted = Self::hard_delete_conversation_tx(
+                    &mut tx,
+                    id,
+                    telemetry.parent_observer(),
+                    None,
+                )
+                .await?;
+                if !deleted.0 {
+                    return Err(DbError::ConversationNotFound(id.clone()));
+                }
+                aggregate_deleted |= deleted.1;
+            }
+            Ok(aggregate_deleted)
+        }
+        .await;
+
+        match body {
+            Ok(aggregate_deleted) => {
+                let commit = telemetry
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
+                    .await;
+                match commit {
+                    Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                        aggregate_deleted,
+                    )),
+                    Err(commit_error) => {
+                        if SqliteTransactionManager::rollback(&mut connection)
+                            .await
+                            .is_err()
+                        {
+                            return crate::workflow::LocalAuthorityResult::DurableFactUnclassified;
+                        }
+
+                        let mut present = 0;
+                        for id in ids {
+                            let exists = sqlx::query_scalar::<_, bool>(
+                                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                            )
+                            .bind(id)
+                            .fetch_one(&mut *connection)
+                            .await;
+                            match exists {
+                                Ok(true) => present += 1,
+                                Ok(false) => {}
+                                Err(_) => {
+                                    return crate::workflow::LocalAuthorityResult::DurableFactUnclassified;
+                                }
+                            }
+                        }
+                        if present == ids.len() {
+                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                                commit_error,
+                            ))
+                        } else if present == 0 {
+                            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                                aggregate_deleted,
+                            ))
+                        } else {
+                            crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let rollback = telemetry
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
+                    .await;
+                match rollback {
+                    Ok(()) => {
+                        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error))
+                    }
+                    Err(_) => crate::workflow::LocalAuthorityResult::DurableFactUnclassified,
+                }
+            }
+        }
+    }
+
+    /// Delete one conversation and report whether its `ProductConversation` row was also removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if deletion fails.
+    pub async fn delete_conversation_with_aggregate_result(
+        &self,
+        id: &str,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        self.delete_conversations_in_transaction(&[id.to_string()])
+            .await
+    }
+
+    /// Delete conversations and all their dependent rows in one transaction.
+    ///
+    /// The caller supplies deletion order. Any missing row or database failure
+    /// rolls back every member deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if any conversation is missing or the underlying
+    /// database operation fails.
+    pub async fn delete_conversations_atomically_with_authority(
+        &self,
+        ids: &[String],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<()>> {
+        match self.delete_conversations_in_transaction(ids).await {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                crate::workflow::LocalAuthorityResult::DurableFactEstablished(result.map(|_| ()))
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
+    }
+
+    /// Delete conversations while collapsing an unclassifiable commit outcome
+    /// into a database error for legacy callers without authority fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if deletion fails or its commit cannot be classified.
+    pub async fn delete_conversations_atomically(&self, ids: &[String]) -> DbResult<()> {
+        match self.delete_conversations_in_transaction(ids).await {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "conversation deletion commit outcome is unclassified".into(),
+                ))
+            }
+        }
     }
 
     /// Delete a conversation and all its messages
@@ -10513,41 +10884,18 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
-    #[allow(clippy::too_many_lines)]
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        let telemetry = self.sqlite_telemetry(
-            SqliteOperation::ConversationDelete,
-            SqliteWorkloadCategory::MessagePersistence,
-            SqliteAccessKind::Write,
-        );
-        let (mut connection, acquisition) = telemetry
-            .observe_pool_acquisition_sqlx(self.pool.acquire())
-            .await?;
-        let (mut tx, timing) = telemetry
-            .observe_transaction_admission_db(acquisition, async {
-                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
-            })
-            .await?;
-        let body =
-            Self::hard_delete_conversation_tx(&mut tx, id, telemetry.parent_observer(), None).await;
-
-        match body {
-            Ok(true) => {
-                telemetry
-                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
-                    .await
+        match self
+            .delete_conversations_in_transaction(&[id.to_string()])
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
             }
-            Ok(false) => {
-                telemetry
-                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
-                    .await?;
-                Err(DbError::ConversationNotFound(id.to_string()))
-            }
-            Err(error) => {
-                telemetry
-                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
-                    .await?;
-                Err(error)
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::Serialization(
+                    "conversation deletion commit outcome is unclassified".into(),
+                ))
             }
         }
     }
@@ -26346,6 +26694,279 @@ mod tests {
         assert_eq!(binding_exists, 0);
         assert_eq!(receipt_exists, 0);
         assert_eq!(link_exists, 0);
+    }
+
+    #[tokio::test]
+    async fn product_conversation_members_put_subordinates_first_and_parents_in_topology_order() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("member-root", "member-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let continuation = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        sqlx::query("UPDATE conversations SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1")
+            .bind(&continuation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation_with_project(
+                "member-agent",
+                "member-agent",
+                "/tmp",
+                false,
+                Some(&root.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        let members = db.product_conversation_member_ids(&root.id).await.unwrap();
+
+        assert_eq!(members, vec![child.id, root.id, continuation.id]);
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_members_include_subordinates_only_for_last_parent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("delete-root", "delete-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let continuation = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        let child = db
+            .create_conversation_with_project(
+                "delete-agent",
+                "delete-agent",
+                "/tmp",
+                false,
+                Some(&root.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.conversation_delete_member_ids(&root.id).await.unwrap(),
+            vec![root.id.clone()]
+        );
+        assert_eq!(
+            db.conversation_delete_member_ids(&child.id).await.unwrap(),
+            vec![child.id]
+        );
+        assert_eq!(
+            db.conversation_delete_member_ids(&continuation.id)
+                .await
+                .unwrap(),
+            vec![continuation.id]
+        );
+
+        let solo = db
+            .create_conversation("delete-solo", "delete-solo", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let solo_child = db
+            .create_conversation_with_project(
+                "delete-solo-agent",
+                "delete-solo-agent",
+                "/tmp",
+                false,
+                Some(&solo.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.conversation_delete_member_ids(&solo.id).await.unwrap(),
+            vec![solo_child.id, solo.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_source_aggregate_removes_creation_binding_and_preserves_target_provenance() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("binding-source", "binding-source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let source_scope = source.attached_work_scope_id.clone().unwrap();
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('binding-repository')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             VALUES (?1, 'binding-repository')",
+        )
+        .bind(source_scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "4056841909".to_string(),
+            task_title: "Preserve provenance".to_string(),
+            title: "Preserve provenance".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "delete only source-owned admission binding".to_string(),
+            task_file: "tasks/4056841909-p1-ready--preserve-provenance.md".to_string(),
+            artifact_body: "# Preserve provenance\n".to_string(),
+        };
+        let target = db
+            .create_task_approval_handoff_creation_job(&source.id, &approval)
+            .await
+            .unwrap();
+        db.delete_conversation(&source.id).await.unwrap();
+
+        let binding_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approved_task_creation_bindings
+             WHERE source_product_conversation_id = ?1",
+        )
+        .bind(source.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let provenance_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_sources
+             WHERE target_product_conversation_id = ?1",
+        )
+        .bind(target.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let target_repository: Option<String> = sqlx::query_scalar(
+            "SELECT repository.repository_id
+             FROM conversations target
+             JOIN work_scope_git_repositories repository
+               ON repository.work_scope_id = target.work_scope_id
+             WHERE target.id = ?1",
+        )
+        .bind(&target.id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(binding_count, 0);
+        assert_eq!(provenance_count, 1);
+        assert_eq!(target_repository.as_deref(), Some("binding-repository"));
+        assert!(db.get_conversation(&target.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_commit_is_rolled_back_before_deleted_rows_are_classified() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("commit-root", "commit-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE commit_blocker (
+                 conversation_id TEXT NOT NULL,
+                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO commit_blocker (conversation_id) VALUES ('commit-root')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let result = db
+            .delete_conversations_atomically_with_authority(&["commit-root".to_string()])
+            .await;
+
+        assert!(matches!(
+            result,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(_))
+        ));
+        assert!(db.get_conversation("commit-root").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_conversations_atomically_rolls_back_all_rows_on_member_failure() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("atomic-root", "atomic-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("atomic-member", "atomic-member", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_atomic_member_delete
+             BEFORE DELETE ON conversations
+             WHEN OLD.id = 'atomic-member'
+             BEGIN SELECT RAISE(ABORT, 'induced member delete failure'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let error = db
+            .delete_conversations_atomically(&[
+                "atomic-root".to_string(),
+                "atomic-member".to_string(),
+            ])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("induced member delete failure"));
+        assert!(db.get_conversation("atomic-root").await.is_ok());
+        assert!(db.get_conversation("atomic-member").await.is_ok());
     }
 
     #[tokio::test]

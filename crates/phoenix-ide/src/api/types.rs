@@ -271,7 +271,7 @@ pub struct ProductConversationListRow {
     pub product_conversation_id: String,
     pub canonical_route: String,
     pub canonical_root: ProductConversationTranscriptRowView,
-    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub lifecycle: ProductConversationLifecycleView,
     pub latest_transcript_row_id: String,
     pub updated_at: String,
     pub presentation: ProductConversationPresentationView,
@@ -329,6 +329,36 @@ pub struct AutomaticContinuationFailureView {
     pub first_message_id: String,
     pub accepted_handoff: String,
     pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationLifecycleView {
+    Open {
+        close_action: ProductConversationCloseActionView,
+    },
+    History,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseActionView {
+    Available,
+    Unavailable {
+        reason: ProductConversationCloseUnavailableReasonView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationCloseUnavailableReasonView {
+    ActiveCloseAttempt,
+    AwaitingTaskApproval,
+    AwaitingContinuation,
+    HandedOffWithoutContinuation,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -657,6 +687,21 @@ pub struct CancelResponse {
 #[derive(Debug, Serialize)]
 pub struct SuccessResponse {
     pub success: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChainDeleteResponse {
+    pub success: bool,
+    pub outcome: ChainDeleteOutcome,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChainDeleteOutcome {
+    Deleted {
+        deleted_conversation_ids: Vec<String>,
+    },
+    AlreadyAbsent,
 }
 
 /// Exact server-observed inspection snapshot required to confirm destructive
