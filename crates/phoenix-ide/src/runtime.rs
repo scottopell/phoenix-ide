@@ -11966,6 +11966,7 @@ mod scope_liveness_tests {
         materialize_restart_direct_turn_encoding(manager, conversation_id, false).await;
     }
 
+    #[allow(clippy::too_many_lines)] // Shared fixture covers acceptance, claiming, and materialization.
     async fn materialize_restart_direct_turn_encoding(
         manager: &RuntimeManager,
         conversation_id: &str,
