@@ -107,6 +107,9 @@ fn parse_canonical_conversation_reference(
     allow_message_fragment: bool,
 ) -> Result<CanonicalConversationReference, GlobalMessageTargetError> {
     let reference = raw.trim();
+    if reference != raw {
+        return Err(GlobalMessageTargetError::UnsupportedSyntax);
+    }
     if let Some(id) = reference.strip_prefix("@conv:") {
         if id.contains('#') || id.chars().any(char::is_whitespace) {
             return Err(GlobalMessageTargetError::UnsupportedSyntax);
@@ -262,7 +265,9 @@ impl GlobalReadService {
         if hits.is_empty() {
             Ok("No matching messages found.".to_string())
         } else {
-            Ok(format_global_search_hits(self, &hits).await)
+            format_global_search_hits(self, &hits)
+                .await
+                .map_err(|error| format!("search citation failed: {error}"))
         }
     }
 
@@ -395,29 +400,28 @@ async fn resolve_conversation_read_target(
 async fn ordinary_product_citation(
     db: &crate::db::Database,
     conv: &Conversation,
-) -> Option<(String, String)> {
-    let id = conv.product_conversation_id.clone();
-    let aggregate = db.get_ordinary_product_conversation(&id).await.ok()?;
-    let title = aggregate
-        .root
-        .conversation
-        .chain_name
-        .clone()
-        .or(aggregate.root.conversation.title.clone())
-        .or(aggregate.root.conversation.slug.clone())
-        .unwrap_or_else(|| aggregate.root.conversation.id.clone());
-    Some((id.to_string(), title))
+) -> Result<Option<(String, String)>, DbError> {
+    Ok(db
+        .ordinary_product_conversation_citation(&conv.product_conversation_id)
+        .await?
+        .map(|citation| {
+            (
+                citation.product_conversation_id.to_string(),
+                citation.root_title,
+            )
+        }))
 }
 
 async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
-) -> String {
+) -> Result<String, DbError> {
     let mut out = String::new();
     let mut citations = std::collections::HashMap::<
         phoenix_core::domain::product_conversation::ProductConversationId,
         Option<(String, String)>,
     >::new();
+    let mut sender_kinds = std::collections::HashMap::new();
     for hit in hits {
         let (title, stable_reference, href) =
             match service.db.get_conversation(&hit.conversation_id).await {
@@ -427,7 +431,7 @@ async fn format_global_search_hits(
                     {
                         citation.clone()
                     } else {
-                        let citation = ordinary_product_citation(&service.db, &conv).await;
+                        let citation = ordinary_product_citation(&service.db, &conv).await?;
                         citations.insert(conv.product_conversation_id.clone(), citation.clone());
                         citation
                     };
@@ -447,7 +451,8 @@ async fn format_global_search_hits(
                     ));
                     (title, stable_reference, href)
                 }
-                Err(_) => (hit.conversation_id.clone(), None, None),
+                Err(DbError::ConversationNotFound(_)) => (hit.conversation_id.clone(), None, None),
+                Err(error) => return Err(error),
             };
         let link = href.unwrap_or_else(|| {
             format!(
@@ -460,7 +465,7 @@ async fn format_global_search_hits(
             "- [{} · {}{} · {}]({}) {}@transcript:{}#message-{} — {}",
             title,
             attributed_role(hit.message_type, &hit.origin),
-            attributed_sender_with_stable(&service.db, &hit.origin).await,
+            attributed_sender_with_cache(&service.db, &hit.origin, &mut sender_kinds).await?,
             hit.created_at.format("%Y-%m-%d"),
             link,
             stable_reference.map_or_else(String::new, |reference| format!("{reference} · ")),
@@ -469,7 +474,7 @@ async fn format_global_search_hits(
             hit.snippet.trim()
         );
     }
-    out
+    Ok(out)
 }
 
 async fn read_conversation_page(
@@ -478,7 +483,7 @@ async fn read_conversation_page(
     cursor: usize,
     evidence_label: &str,
 ) -> Result<String, DbError> {
-    let stable = ordinary_product_citation(db, conv).await;
+    let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
         format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
     });
@@ -524,7 +529,7 @@ async fn read_conversation_around_message(
     messages.push(target);
     messages.extend(after);
 
-    let stable = ordinary_product_citation(db, conv).await;
+    let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, _)| {
         format!("Conversation @conv:{id}\nconversation link: /product-conversations/{id}\n")
     });
@@ -546,9 +551,13 @@ async fn read_conversation_around_message(
         has_more_before,
         has_more_after,
     );
+    let mut sender_kinds = std::collections::HashMap::new();
     for message in messages {
         if !message_is_hidden(&message) {
-            out.push_str(&render_global_message_line(db, conv, &message).await);
+            out.push_str(
+                &render_global_message_line_with_cache(db, conv, &message, &mut sender_kinds)
+                    .await?,
+            );
         }
     }
     Ok(out)
@@ -564,6 +573,7 @@ async fn render_message_page(
     let mut pos = 0usize;
     let mut has_more = false;
     let mut after_sequence = 0;
+    let mut sender_kinds = std::collections::HashMap::new();
     loop {
         let messages = db
             .get_messages_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
@@ -576,7 +586,8 @@ async fn render_message_page(
             if message_is_hidden(&message) {
                 continue;
             }
-            let line = render_global_message_line(db, conv, &message).await;
+            let line = render_global_message_line_with_cache(db, conv, &message, &mut sender_kinds)
+                .await?;
             for ch in line.chars() {
                 if pos >= end {
                     has_more = true;
@@ -668,9 +679,13 @@ pub(crate) fn attributed_role(
 pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
     use phoenix_core::domain::db_schema::InputOrigin;
     match origin {
-        InputOrigin::InternalConversation { transcript_id, .. } => {
-            format!(" from internal transcript @transcript:{transcript_id}")
-        }
+        InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            ..
+        } => format!(
+            " from recorded product conversation {product_conversation_id} via @transcript:{transcript_id}"
+        ),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SystemGenerated
@@ -681,39 +696,76 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
 async fn attributed_sender_with_stable(
     db: &crate::db::Database,
     origin: &phoenix_core::domain::db_schema::InputOrigin,
-) -> String {
+) -> Result<String, DbError> {
+    attributed_sender_with_cache(db, origin, &mut std::collections::HashMap::new()).await
+}
+
+async fn attributed_sender_with_cache(
+    db: &crate::db::Database,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+) -> Result<String, DbError> {
     use phoenix_core::domain::db_schema::InputOrigin;
     match origin {
         InputOrigin::InternalConversation {
             product_conversation_id,
             transcript_id,
+            ..
         } => {
-            if db
-                .get_ordinary_product_conversation(product_conversation_id)
-                .await
-                .is_ok()
-            {
-                format!(" from @conv:{product_conversation_id} via @transcript:{transcript_id}")
+            let kind = if let Some(kind) = sender_kinds.get(product_conversation_id) {
+                *kind
             } else {
-                format!(" from internal transcript @transcript:{transcript_id}")
-            }
+                let kind = db
+                    .product_conversation_kind(product_conversation_id)
+                    .await?;
+                sender_kinds.insert(product_conversation_id.clone(), kind);
+                kind
+            };
+            Ok(match kind {
+                Some(
+                    phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator,
+                ) => format!(" from Global via @transcript:{transcript_id}"),
+                Some(
+                    phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary,
+                )
+                | None => format!(
+                    " from recorded product conversation {product_conversation_id} via @transcript:{transcript_id}"
+                ),
+            })
         }
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SystemGenerated
-        | InputOrigin::SubscriptionEvent { .. } => String::new(),
+        | InputOrigin::SubscriptionEvent { .. } => Ok(String::new()),
     }
 }
 
+#[cfg(test)]
 async fn render_global_message_line(
     db: &crate::db::Database,
     conv: &Conversation,
     message: &crate::db::Message,
-) -> String {
+) -> Result<String, DbError> {
+    render_global_message_line_with_cache(db, conv, message, &mut std::collections::HashMap::new())
+        .await
+}
+
+async fn render_global_message_line_with_cache(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    message: &crate::db::Message,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+) -> Result<String, DbError> {
     let role = attributed_role(message.message_type, &message.origin);
     let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
-    let sender = attributed_sender_with_stable(db, &message.origin).await;
-    format!(
+    let sender = attributed_sender_with_cache(db, &message.origin, sender_kinds).await?;
+    Ok(format!(
         "[{}{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
         role,
         sender,
@@ -723,7 +775,7 @@ async fn render_global_message_line(
         conv.id,
         message.message_id,
         render_full_message_text(message).trim()
-    )
+    ))
 }
 
 fn render_full_message_text(message: &crate::db::Message) -> String {
@@ -951,7 +1003,7 @@ fn first_token(s: &str) -> &str {
 fn message_id_fragment(fragment: &str) -> Option<&str> {
     fragment
         .strip_prefix("message-")
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && !id.contains('#'))
 }
 
 async fn load_conversation_by_slug_or_id(
@@ -1025,6 +1077,9 @@ async fn resolve_message(
         conversation_message_href(&conv, Some((&message.message_id, message.message_type)))
     });
     let title = conv.title.clone().or(conv.slug.clone());
+    let sender = attributed_sender_with_stable(&service.db, &message.origin)
+        .await
+        .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
     Ok(ResolveGlobalReferenceResponse {
         kind: "message".to_string(),
         id: message.message_id.clone(),
@@ -1033,7 +1088,7 @@ async fn resolve_message(
         summary: format!(
             "{}{} message {} in @transcript:{} at {}: {}",
             attributed_role(message.message_type, &message.origin),
-            attributed_sender_with_stable(&service.db, &message.origin).await,
+            sender,
             message.message_id,
             conv.id,
             message.created_at,
@@ -1278,17 +1333,180 @@ mod tests {
             source_call: None,
         };
         message.origin = source;
-        let rendered = render_global_message_line(&db, &conv, &message).await;
+        let rendered = render_global_message_line(&db, &conv, &message)
+            .await
+            .unwrap();
         assert!(rendered.contains(&format!(
-            "Conversation from @conv:{} via @transcript:{}",
+            "Conversation from recorded product conversation {} via @transcript:{}",
             sender.product_conversation_id, sender.id
         )));
         assert!(!rendered.contains("User API"));
 
         message.origin = InputOrigin::UnknownHistorical;
-        let rendered = render_global_message_line(&db, &conv, &message).await;
+        let rendered = render_global_message_line(&db, &conv, &message)
+            .await
+            .unwrap();
         assert!(rendered.contains("Unknown input"));
         assert!(!rendered.contains("User API"));
+    }
+
+    #[tokio::test]
+    async fn sender_kind_cache_reuses_classification_within_one_render() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: coordinator.product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: None,
+        };
+        let mut cache = std::collections::HashMap::new();
+
+        let first = super::attributed_sender_with_cache(&db, &origin, &mut cache)
+            .await
+            .unwrap();
+        db.delete_conversation(&coordinator.id).await.unwrap();
+        let second = super::attributed_sender_with_cache(&db, &origin, &mut cache)
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert!(second.contains("from Global"));
+    }
+
+    #[tokio::test]
+    async fn sender_attribution_propagates_classification_failures() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let sender = db
+            .create_conversation(
+                "sender-error-source",
+                "sender-error-source",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: sender.product_conversation_id,
+            transcript_id: sender.id,
+            source_call: None,
+        };
+        db.pool().close().await;
+
+        let error = super::attributed_sender_with_stable(&db, &origin)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn conversation_read_propagates_citation_database_failures() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("citation-error", "citation-error", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.pool().close().await;
+
+        let error = super::read_conversation_page(&db, &conv, 0, "evidence")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn global_message_line_retains_recorded_stable_sender_after_hard_delete() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation("deleted-reader", "deleted-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let sender = db
+            .create_conversation("deleted-sender", "deleted-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "deleted-sender-message",
+                &reader.id,
+                &MessageContent::user("message body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        message.origin = InputOrigin::InternalConversation {
+            product_conversation_id: sender.product_conversation_id.clone(),
+            transcript_id: sender.id.clone(),
+            source_call: None,
+        };
+
+        let before_delete = render_global_message_line(&db, &reader, &message)
+            .await
+            .unwrap();
+        db.delete_conversation(&sender.id).await.unwrap();
+
+        let rendered = render_global_message_line(&db, &reader, &message)
+            .await
+            .unwrap();
+        assert_eq!(rendered, before_delete);
+        assert!(rendered.contains(&format!(
+            "Conversation from recorded product conversation {} via @transcript:{}",
+            sender.product_conversation_id, sender.id
+        )));
+        assert!(!rendered.contains("from @conv:"));
+        assert!(!rendered.contains("from Global"));
+    }
+
+    #[tokio::test]
+    async fn global_message_line_attributes_live_coordinator_sender_as_global() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation("global-reader", "global-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut message = db
+            .add_message(
+                "global-sender-message",
+                &reader.id,
+                &MessageContent::user("message body"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        message.origin = InputOrigin::InternalConversation {
+            product_conversation_id: coordinator.product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: None,
+        };
+
+        let rendered = render_global_message_line(&db, &reader, &message)
+            .await
+            .unwrap();
+        assert!(rendered.contains(&format!(
+            "Conversation from Global via @transcript:{}",
+            coordinator.id
+        )));
+        assert!(!rendered.contains(&format!("@conv:{}", coordinator.product_conversation_id)));
     }
 
     #[tokio::test]
@@ -1336,14 +1554,18 @@ mod tests {
                     transcript_id: conv.id.clone(),
                     source_call: None,
                 },
-                "Conversation from @conv:",
+                "Conversation from recorded product conversation ",
             ),
         ];
         for (origin, expected) in cases {
             message.origin = origin.clone();
             hit.origin = origin;
-            let search = format_global_search_hits(&service, &[hit.clone()]).await;
-            let full = render_global_message_line(&service.db, &conv, &message).await;
+            let search = format_global_search_hits(&service, &[hit.clone()])
+                .await
+                .unwrap();
+            let full = render_global_message_line(&service.db, &conv, &message)
+                .await
+                .unwrap();
             assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
             assert!(search.contains(&format!(
                 "@transcript:{}#message-{}",
@@ -1356,14 +1578,46 @@ mod tests {
             }
             message.message_type = MessageType::Skill;
             hit.message_type = MessageType::Skill;
-            let search = format_global_search_hits(&service, &[hit.clone()]).await;
-            let full = render_global_message_line(&service.db, &conv, &message).await;
+            let search = format_global_search_hits(&service, &[hit.clone()])
+                .await
+                .unwrap();
+            let full = render_global_message_line(&service.db, &conv, &message)
+                .await
+                .unwrap();
             let skill_label = format!("Skill · {expected}");
             assert!(search.contains(&skill_label), "{search}");
             assert!(full.contains(&skill_label), "{full}");
             message.message_type = MessageType::User;
             hit.message_type = MessageType::User;
         }
+    }
+
+    #[tokio::test]
+    async fn search_formatting_propagates_transcript_lookup_failures() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = super::GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let hit = crate::db::RetrievedChunk {
+            message_id: "lookup-error-message".to_string(),
+            conversation_id: "lookup-error-conversation".to_string(),
+            chunk: crate::db::ChunkRef {
+                ordinal: 0,
+                char_range: None,
+            },
+            message_type: phoenix_core::domain::db_schema::MessageType::User,
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            created_at: chrono::Utc::now(),
+            snippet: "message body".to_string(),
+            score: 0.0,
+            transcript_generation: 0,
+            message_count: 1,
+        };
+        db.pool().close().await;
+
+        let error = super::format_global_search_hits(&service, &[hit])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("closed"), "{error}");
     }
 
     #[tokio::test]
@@ -1411,7 +1665,7 @@ mod tests {
             message_count: 1,
         };
 
-        let output = format_global_search_hits(&service, &[hit]).await;
+        let output = format_global_search_hits(&service, &[hit]).await.unwrap();
 
         assert!(output.contains("Effective Rename"), "{output}");
         assert!(!output.contains("Aggregate Title"), "{output}");
@@ -1452,6 +1706,29 @@ mod tests {
             ("/c/slug", Some("message-id"))
         );
         assert_eq!(message_id_fragment("message-id"), Some("id"));
+        assert_eq!(message_id_fragment("message-id#extra"), None);
+    }
+
+    #[test]
+    fn scoped_attribution_retains_recorded_stable_sender_without_classifying_it() {
+        let origin = phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "sender-product",
+                )
+                .unwrap(),
+            transcript_id: "sender-transcript".to_string(),
+            source_call: None,
+        };
+
+        let rendered = super::attributed_sender(&origin);
+
+        assert_eq!(
+            rendered,
+            " from recorded product conversation sender-product via @transcript:sender-transcript"
+        );
+        assert!(!rendered.contains("@conv:"));
+        assert!(!rendered.contains("Global"));
     }
 
     #[tokio::test]
@@ -1559,6 +1836,11 @@ mod tests {
             "@transcript:   ",
             "@conv:root extra",
             "@transcript:root extra",
+            "@transcript:root#message-id#extra",
+            " @conv:root",
+            "@conv:root ",
+            " @transcript:root",
+            "@transcript:root ",
         ] {
             assert!(
                 service.resolve_message_target(rejected).await.is_err(),

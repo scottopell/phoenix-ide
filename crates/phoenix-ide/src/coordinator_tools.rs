@@ -221,9 +221,29 @@ impl Tool for WorkScopeCoordinatorBash {
 }
 
 struct SearchConversations(GlobalReadService);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchConversationsInput {
+    query: String,
+}
 struct ReadConversation(GlobalReadService);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadConversationInput {
+    conversation_id: String,
+    #[serde(default)]
+    cursor: usize,
+}
 struct QueryDatabase(GlobalReadService);
 struct ResolveReference(GlobalReadService);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveReferenceInput {
+    reference: String,
+}
 struct SendConversationMessage {
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
@@ -274,8 +294,11 @@ impl Tool for SearchConversations {
         true
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-        result(self.0.search(query).await)
+        let parsed = match serde_json::from_value::<SearchConversationsInput>(input) {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
+        };
+        result(self.0.search(&parsed.query).await)
     }
 }
 
@@ -294,16 +317,15 @@ impl Tool for ReadConversation {
         true
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        let conversation = input
-            .get("conversation_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let cursor = input
-            .get("cursor")
-            .and_then(Value::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0);
-        result(self.0.read_conversation(conversation, cursor).await)
+        let parsed = match serde_json::from_value::<ReadConversationInput>(input) {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
+        };
+        result(
+            self.0
+                .read_conversation(&parsed.conversation_id, parsed.cursor)
+                .await,
+        )
     }
 }
 
@@ -351,8 +373,11 @@ impl Tool for ResolveReference {
         true
     }
     async fn run(&self, input: Value, _ctx: ToolContext) -> ToolOutput {
-        let reference = input.get("reference").and_then(Value::as_str).unwrap_or("");
-        match self.0.resolve_reference(reference).await {
+        let parsed = match serde_json::from_value::<ResolveReferenceInput>(input) {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::error(format!("invalid input: {error}")),
+        };
+        match self.0.resolve_reference(&parsed.reference).await {
             Ok(value) => match serde_json::to_string_pretty(&value) {
                 Ok(value) => ToolOutput::success(value),
                 Err(error) => ToolOutput::error(format!("failed to encode reference: {error}")),
@@ -745,6 +770,72 @@ mod tests {
             schemas["read_conversation"]["properties"]["conversation_id"]["oneOf"][1]["pattern"],
             "^@transcript:[^\\s#]+(?:#message-[^\\s#]+)?$"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_reference_rejects_unknown_runtime_fields() {
+        let (_, coordinator) = application_tools().await;
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "resolve_reference")
+            .unwrap();
+
+        let output = tool
+            .run(
+                json!({
+                    "reference": "@transcript:missing",
+                    "selector": "latest"
+                }),
+                context("origin"),
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output.output().contains("unknown field `selector`"));
+    }
+
+    #[tokio::test]
+    async fn search_conversations_rejects_unknown_runtime_fields() {
+        let (writing, _) = application_tools().await;
+        let tool = writing
+            .into_tools()
+            .find(|tool| tool.name() == "search_conversations")
+            .unwrap();
+
+        let output = tool
+            .run(
+                json!({
+                    "query": "release status",
+                    "after": "2026-09-01"
+                }),
+                context("origin"),
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output.output().contains("unknown field `after`"));
+    }
+
+    #[tokio::test]
+    async fn read_conversation_rejects_unknown_runtime_fields() {
+        let (writing, _) = application_tools().await;
+        let tool = writing
+            .into_tools()
+            .find(|tool| tool.name() == "read_conversation")
+            .unwrap();
+
+        let output = tool
+            .run(
+                json!({
+                    "conversation_id": "@transcript:missing",
+                    "curser": 7000
+                }),
+                context("origin"),
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output.output().contains("unknown field `curser`"));
     }
 
     #[tokio::test]
