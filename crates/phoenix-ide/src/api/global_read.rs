@@ -900,8 +900,8 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
 fn resolved_work_scope_from_columns(
     work_scope_id: phoenix_core::work_scope::WorkScopeId,
     raw_id: Option<String>,
-    raw_lifecycle: Option<String>,
-    raw_environment: Option<String>,
+    raw_lifecycle: Option<&str>,
+    raw_environment: Option<&str>,
     cwd: Option<String>,
     worktree_path: Option<String>,
 ) -> ResolvedWorkScope {
@@ -912,12 +912,12 @@ fn resolved_work_scope_from_columns(
         };
     };
     let parsed_id = phoenix_core::work_scope::WorkScopeId::parse(raw_id);
-    let lifecycle = match raw_lifecycle.as_deref() {
+    let lifecycle = match raw_lifecycle {
         Some("active") => Some(phoenix_core::work_scope::WorkScopeLifecycle::Active),
         Some("retired") => Some(phoenix_core::work_scope::WorkScopeLifecycle::Retired),
         _ => None,
     };
-    let environment_kind = match raw_environment.as_deref() {
+    let environment_kind = match raw_environment {
         Some("allocated_worktree") => Some(ResolvedEnvironmentKind::AllocatedWorktree),
         Some("unowned_cwd") => Some(ResolvedEnvironmentKind::UnownedCwd),
         Some("none") => Some(ResolvedEnvironmentKind::None),
@@ -1002,14 +1002,18 @@ async fn resolve_current_member_and_work_scope(
             let id = phoenix_core::work_scope::WorkScopeId::parse(id).map_err(|error| {
                 AppError::Internal(format!("invalid attached WorkScope ID: {error}"))
             })?;
+            let lifecycle: Option<String> = row
+                .try_get("lifecycle")
+                .map_err(|error| map_db_not_found(DbError::from(error)))?;
+            let environment: Option<String> = row
+                .try_get("environment_kind")
+                .map_err(|error| map_db_not_found(DbError::from(error)))?;
             resolved_work_scope_from_columns(
                 id,
                 row.try_get("scope_id")
                     .map_err(|error| map_db_not_found(DbError::from(error)))?,
-                row.try_get("lifecycle")
-                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
-                row.try_get("environment_kind")
-                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+                lifecycle.as_deref(),
+                environment.as_deref(),
                 row.try_get("cwd")
                     .map_err(|error| map_db_not_found(DbError::from(error)))?,
                 row.try_get("worktree_path")
@@ -1074,8 +1078,8 @@ async fn resolve_work_scope(
     resolved_work_scope_from_columns(
         work_scope_id,
         Some(raw_id),
-        Some(raw_lifecycle),
-        Some(raw_environment),
+        Some(raw_lifecycle.as_str()),
+        Some(raw_environment.as_str()),
         cwd,
         worktree_path,
     )
