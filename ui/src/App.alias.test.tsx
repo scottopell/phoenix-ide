@@ -11,7 +11,7 @@ vi.mock('./api', async () => {
   const actual = await vi.importActual<typeof import('./api')>('./api');
   return {
     ...actual,
-    api: { ...actual.api, getProductConversationSnapshot: vi.fn() },
+    api: { ...actual.api, getProductConversationSnapshot: vi.fn(), resolveCoordinatorRoute: vi.fn() },
   };
 });
 
@@ -34,6 +34,7 @@ function renderAlias(reference: string, entry = `/c/${reference}`) {
         <Routes>
           <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference={reference} />} />
           <Route path="/product-conversations/:id" element={<Location />} />
+          <Route path="/global/:slug" element={<Location />} />
         </Routes>
       </Suspense>
     </MemoryRouter>,
@@ -43,6 +44,15 @@ function renderAlias(reference: string, entry = `/c/${reference}`) {
 describe('ProductConversationAliasRedirect', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
+  });
+
+  it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: 'current-global' });
+    renderAlias('historical-global', '/c/historical-global#tool-source-call');
+    expect(await screen.findByTestId('location')).toHaveTextContent('/global/historical-global#tool-source-call');
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+    expect(embeddedSpy).not.toHaveBeenCalled();
   });
 
   it.each([

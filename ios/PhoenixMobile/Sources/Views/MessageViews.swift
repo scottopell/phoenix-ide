@@ -78,6 +78,32 @@ struct MessageView: View {
     }
 }
 
+private struct SourceServerURLKey: EnvironmentKey { static let defaultValue = "" }
+extension EnvironmentValues {
+    var sourceServerURL: String {
+        get { self[SourceServerURLKey.self] }
+        set { self[SourceServerURLKey.self] = newValue }
+    }
+}
+
+struct InputOriginHeader: View {
+    @Environment(\.sourceServerURL) private var serverURL
+    let origin: InputOrigin
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(origin.label).textSelection(.enabled)
+            if let url = origin.sourceCallURL(serverURL: serverURL) {
+                Link("Open originating send call", destination: url)
+            } else if origin.sourceCallUnavailable {
+                Text("Original send call unavailable (not recorded)")
+                if let url = origin.sourceTranscriptURL(serverURL: serverURL) {
+                    Link("Open recorded source transcript", destination: url)
+                }
+            }
+        }.font(.caption).foregroundStyle(.secondary)
+    }
+}
+
 /// A skill invocation shows its trigger without exposing the expanded prompt.
 struct SkillRow: View {
     let content: JSONValue
@@ -87,9 +113,7 @@ struct SkillRow: View {
         HStack {
             if origin.isUserApiInput { Spacer(minLength: 40) }
             VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
-                Text(origin.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                InputOriginHeader(origin: origin)
                 Label(trigger, systemImage: "wand.and.stars")
                     .font(.callout.monospaced())
                     .padding(.horizontal, 10)
@@ -126,9 +150,7 @@ struct UserMessageView: View {
         HStack {
             if origin.isUserApiInput { Spacer(minLength: 40) }
             VStack(alignment: origin.isUserApiInput ? .trailing : .leading, spacing: 4) {
-                Text(origin.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                InputOriginHeader(origin: origin)
                 Text(content["text"]?.stringValue ?? content.compactDescription)
                     .font(.body)
                     .padding(10)

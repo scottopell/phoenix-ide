@@ -708,6 +708,14 @@ impl ToolContext {
     }
 
     #[must_use]
+    pub fn source_tool_call(&self) -> Option<phoenix_core::domain::db_schema::SourceToolCall> {
+        Some(phoenix_core::domain::db_schema::SourceToolCall {
+            message_id: self.svg_assistant_message_id.clone()?,
+            tool_use_id: self.tool_use_id.clone()?,
+        })
+    }
+
+    #[must_use]
     pub fn tool_use_id(&self) -> Option<&str> {
         self.tool_use_id.as_deref()
     }

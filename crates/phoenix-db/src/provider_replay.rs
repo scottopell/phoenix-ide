@@ -282,7 +282,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -296,6 +296,8 @@ impl Database {
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
         .bind(origin.db_parts().3)
+    .bind(origin.source_call().map(|call| call.message_id.as_str()))
+    .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
         .execute(&mut *tx)
         .await?;
         if matches!(
@@ -565,6 +567,44 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<phoenix_core::domain::sm_state::ConvState>(&persisted).unwrap(),
             state
+        );
+    }
+
+    #[tokio::test]
+    async fn source_call_survives_atomic_replay_clear() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent, SourceToolCall};
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("source-replay", "source-replay", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: db
+                .get_conversation("source-replay")
+                .await
+                .unwrap()
+                .product_conversation_id,
+            transcript_id: "sender-transcript".into(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "sender-message".into(),
+                tool_use_id: "sender-tool".into(),
+            })),
+        };
+        db.add_message_and_clear_provider_replay_with_origin(
+            "received",
+            "source-replay",
+            1,
+            &MessageContent::user("forwarded"),
+            None,
+            None,
+            &origin,
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_messages("source-replay").await.unwrap()[0].origin,
+            origin
         );
     }
 

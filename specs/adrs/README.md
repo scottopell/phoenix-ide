@@ -84,6 +84,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
 | [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
 
+| [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
+
 ## For agents: which decisions bind your task
 
 Consult the relevant ADRs before starting work of each kind.

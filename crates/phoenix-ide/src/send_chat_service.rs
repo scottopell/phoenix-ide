@@ -1222,6 +1222,12 @@ fn request_fingerprint_version(
             MessageExpansionPolicy::GeneratedPredecessorContext => "generated_predecessor_context",
         },
     });
+    if let Some(origin) = value
+        .get_mut("origin")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        origin.remove("source_call");
+    }
     if !with_origin {
         value
             .as_object_mut()
@@ -1807,6 +1813,34 @@ mod tests {
             .await,
             Err(SendChatServiceError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn source_call_is_not_retry_payload_identity() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let mut req = request();
+        req.origin = InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse("sender")
+                    .unwrap(),
+            transcript_id: "sender-member".into(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "first-message".into(),
+                tool_use_id: "first-call".into(),
+            })),
+        };
+        let original = req.origin.clone();
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        if let InputOrigin::InternalConversation { source_call, .. } = &mut req.origin {
+            *source_call = Some(Box::new(SourceToolCall {
+                message_id: "retry-message".into(),
+                tool_use_id: "retry-call".into(),
+            }));
+        }
+        assert!(original.accepts_retry_origin(&req.origin));
+        assert_eq!(fingerprint, super::request_fingerprint(&req).unwrap());
+        req.text.push_str(" changed");
+        assert_ne!(fingerprint, super::request_fingerprint(&req).unwrap());
     }
 
     #[tokio::test]

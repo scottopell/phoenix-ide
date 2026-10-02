@@ -2,6 +2,20 @@ import XCTest
 @testable import PhoenixMobile
 
 final class RenderingReducerTests: XCTestCase {
+    func testSourceCallLinkPinsOriginalToolAndHistoricalAbsenceStaysUnavailable() throws {
+        let origin = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member", sourceCall: SourceToolCall(message_id: "assistant-message", tool_use_id: "send-tool"))
+        let url = try XCTUnwrap(origin.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertEqual(url.path, "/c/original-member")
+        XCTAssertEqual(url.fragment, "message-assistant-message")
+        XCTAssertTrue(url.query?.contains("source_tool=send-tool") == true)
+        XCTAssertFalse(origin.sourceCallUnavailable)
+        let historical = InputOrigin.internalConversation(productConversationId: "product", transcriptId: "original-member")
+        XCTAssertNil(historical.sourceCallURL(serverURL: "https://example.test"))
+        XCTAssertTrue(historical.sourceCallUnavailable)
+        XCTAssertEqual(historical.sourceTranscriptURL(serverURL: "https://example.test/phoenix")?.path, "/phoenix/c/original-member")
+        XCTAssertEqual(origin.sourceCallURL(serverURL: "https://example.test/phoenix/")?.path, "/phoenix/c/original-member")
+    }
+
     func testKnownNoteShapesUseUserFacingFields() {
         XCTAssertEqual(
             MessageView.noteText(
@@ -26,6 +40,7 @@ final class RenderingReducerTests: XCTestCase {
 
     func testMessageOriginDecodingAndCachedHistoricalFallback() throws {
         let cases: [(String, InputOrigin, String)] = [
+            (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1","source_call":{"message_id":"source-message","tool_use_id":"source-tool"}}"#, .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1", sourceCall: SourceToolCall(message_id: "source-message", tool_use_id: "source-tool")), "Conversation from @transcript:transcript-1 (conversation ID product-1)"),
             (#"{"kind":"user_api"}"#, .userApi, "User API"),
             (#"{"kind":"internal_conversation","product_conversation_id":"product-1","transcript_id":"transcript-1"}"#,
              .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1"),

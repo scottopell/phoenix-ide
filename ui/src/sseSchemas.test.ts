@@ -261,9 +261,9 @@ describe('parseEvent', () => {
     });
 
     it('validates both internal source identities', () => {
-      const source = { kind: 'internal_conversation', product_conversation_id: 'product-1', transcript_id: 'row-1' };
+      const source = { kind: 'internal_conversation', source_call: null, product_conversation_id: 'product-1', transcript_id: 'row-1' };
       expect(v.parse(InputOriginSchema, source)).toEqual(source);
-      expect(v.safeParse(InputOriginSchema, { kind: 'internal_conversation', product_conversation_id: 'product-1' }).success).toBe(false);
+      expect(v.safeParse(InputOriginSchema, { kind: 'internal_conversation', source_call: null, product_conversation_id: 'product-1' }).success).toBe(false);
       expect(v.safeParse(InputOriginSchema, { kind: 'human' }).success).toBe(false);
     });
 
@@ -335,7 +335,7 @@ describe('parseEvent', () => {
 
   it('requires provenance on authoritative queued steering projections', () => {
     const queued = { message_id: 'steer-1', text: 'hello', images: [], files: [], origin: {
-      kind: 'internal_conversation', product_conversation_id: 'product-1', transcript_id: 'row-1',
+      kind: 'internal_conversation', source_call: null, product_conversation_id: 'product-1', transcript_id: 'row-1',
     } };
     expect(v.parse(QueuedSteeringMessageSchema, queued).origin).toEqual(queued.origin);
     const { origin: _origin, ...withoutOrigin } = queued;

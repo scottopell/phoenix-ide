@@ -2520,7 +2520,7 @@ impl WakeRepository {
                     m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at,
                     m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
-                    m.origin_subscription_event_id
+                    m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
              FROM wake_delivery_messages l
              JOIN workflow_deliveries d
                ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
@@ -4449,7 +4449,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
                 m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
-                m.origin_subscription_event_id
+                m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4514,7 +4514,7 @@ async fn fetch_materialized_pending_deliveries_tx(
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
                 m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
-                m.origin_subscription_event_id
+                m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4996,7 +4996,7 @@ async fn fetch_delivery_message_link_tx(
                 m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
                 m.display_data, m.usage_data, m.created_at,
                 m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id,
-                m.origin_subscription_event_id
+                m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
          FROM wake_delivery_messages l
          JOIN messages m ON m.message_id = l.message_id
          WHERE l.workflow_id = ?1 AND l.delivery_id = ?2",
@@ -5620,12 +5620,46 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn source_call_survives_wake_message_projection() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("wake-source", "wake-source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: conv.product_conversation_id,
+            transcript_id: conv.id.clone(),
+            source_call: Some(Box::new(SourceToolCall {
+                message_id: "source-message".into(),
+                tool_use_id: "source-tool".into(),
+            })),
+        };
+        db.add_message_with_seq_and_origin(
+            "wake-projection",
+            &conv.id,
+            1,
+            &MessageContent::user("forwarded"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        let repo = db.wake_repository();
+        assert_eq!(
+            fetch_conversation_messages(&repo, &conv.id).await[0].origin,
+            origin
+        );
+    }
+
     async fn fetch_conversation_messages(
         repo: &WakeRepository,
         conversation_id: &str,
     ) -> Vec<Message> {
         sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)

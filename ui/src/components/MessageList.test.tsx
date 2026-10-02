@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router-dom';
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, StrictMode, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react';
@@ -23,7 +24,7 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
   const store = new ConversationStore();
   return (
     <ConversationContext.Provider value={store}>
-      <FocusScopeProvider>{ui}</FocusScopeProvider>
+      <MemoryRouter><FocusScopeProvider>{ui}</FocusScopeProvider></MemoryRouter>
     </ConversationContext.Provider>
   );
 }
@@ -958,6 +959,12 @@ describe('MessageList', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('positions an admitted source call even when ordinary history positioning is idle', () => {
+    const source = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'Sending' }, { type: 'tool_use', id: 'source-tool', name: 'send_conversation_message', input: { message: 'payload' } }] } as Message;
+    render(withConvContext(<MessageList messages={[source]} pendingMessages={[]} convState={idleState} onRetry={vi.fn()} onOpenFile={undefined} conversationId="source-member" transcriptPositioning={{ kind: 'idle', view: { conversationId: 'source-member', generation: 1, transcriptGeneration: 1 } }} sourceCallTarget={{ messageId: source.message_id, toolUseId: 'source-tool' }} />));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(0, 'start', 0, '[data-tool-id="source-tool"]');
   });
 
   it('highlights the exact grouped member targeted by message id', () => {

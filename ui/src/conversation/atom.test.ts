@@ -529,7 +529,7 @@ describe('conversationReducer', () => {
   describe('authoritative steering queue', () => {
     const steeringMessage = {
       message_id: 'steer-1',
-      origin: { kind: 'internal_conversation' as const, product_conversation_id: 'source-product', transcript_id: 'source-row' },
+      origin: { kind: 'internal_conversation' as const, source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' },
       text: 'queued elsewhere',
       images: [],
       files: [],

@@ -7,7 +7,7 @@ const chapters: Chapter[] = [
   { unitIndex: 0, kind: 'prompt', label: 'API prompt', sequenceId: 1, origin: { kind: 'user_api' } },
   { unitIndex: 1, kind: 'prose', label: 'Response', sequenceId: 2 },
   { unitIndex: 2, kind: 'prompt', label: 'Forwarded prompt', sequenceId: 3, origin: {
-    kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row',
+    kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row',
   } },
   { unitIndex: 3, kind: 'prompt', label: 'Event prompt', sequenceId: 4, origin: { kind: 'subscription_event', event_id: 'event-1' } },
   { unitIndex: 4, kind: 'prompt', label: 'Automatic prompt', sequenceId: 5, origin: { kind: 'system_generated' } },

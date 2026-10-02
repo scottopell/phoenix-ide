@@ -211,11 +211,18 @@ describe('user message provenance rendering', () => {
     }
   });
 
+  it('opens the pinned source message and tool, not the receiving message', () => {
+    render(<MemoryRouter><UserMessage message={userMessage('recipient-message', 'forwarded', {
+      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-message', tool_use_id: 'source-tool' } },
+    })} /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-member · source call' })).toHaveAttribute('href', '/c/source-member?source_transcript=source-member&source_tool=source-tool#message-source-message');
+  });
+
   it('shows both source identities without treating an aggregate route as a pinned transcript', () => {
     render(<MemoryRouter><UserMessage message={userMessage('received', 'From another conversation', {
-      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-row' },
+      origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' },
     })} /></MemoryRouter>);
-    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
     expect(screen.getByText(/From conversation ID source-product/).closest('.message')).toHaveClass('meta');
     expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
     expect(screen.queryByText('You')).not.toBeInTheDocument();
@@ -233,12 +240,12 @@ describe('user message provenance rendering', () => {
   it('attributes authoritative queued steering separately from optimistic local input', () => {
     render(<MemoryRouter><>
       <QueuedUserMessage message={{ localId: 'queued', text: 'queued', images: [], status: 'steering_queued', origin: {
-        kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row',
+        kind: 'internal_conversation', source_call: null, product_conversation_id: 'source', transcript_id: 'source-row',
       } }} onRetry={() => {}} />
       <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
     </></MemoryRouter>);
-    expect(screen.getByRole('link', { name: 'transcript ID source-row' })).toHaveAttribute('href', '/c/source-row');
-    expect(screen.getByRole('link', { name: 'transcript ID source-row' }).closest('.message')).toHaveClass('meta', 'steering-queued');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' }).closest('.message')).toHaveClass('meta', 'steering-queued');
     expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });

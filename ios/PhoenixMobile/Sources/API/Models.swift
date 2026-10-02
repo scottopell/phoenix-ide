@@ -448,15 +448,20 @@ struct ProductConversationCloseResidual: Codable, Equatable, Sendable {
     var detail: String?
 }
 
+struct SourceToolCall: Codable, Equatable, Sendable {
+    let message_id: String
+    let tool_use_id: String
+}
+
 enum InputOrigin: Codable, Equatable, Sendable {
     case unknownHistorical
     case userApi
-    case internalConversation(productConversationId: String, transcriptId: String)
+    case internalConversation(productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
     case systemGenerated
     case subscriptionEvent(eventId: String)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, product_conversation_id, transcript_id, event_id
+        case kind, product_conversation_id, transcript_id, event_id, source_call
     }
 
     init(from decoder: Decoder) throws {
@@ -467,7 +472,8 @@ enum InputOrigin: Codable, Equatable, Sendable {
         case "internal_conversation":
             self = .internalConversation(
                 productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
-                transcriptId: try container.decode(String.self, forKey: .transcript_id))
+                transcriptId: try container.decode(String.self, forKey: .transcript_id),
+                sourceCall: try container.decodeIfPresent(SourceToolCall.self, forKey: .source_call))
         case "system_generated": self = .systemGenerated
         case "subscription_event":
             self = .subscriptionEvent(eventId: try container.decode(String.self, forKey: .event_id))
@@ -482,15 +488,37 @@ enum InputOrigin: Codable, Equatable, Sendable {
         switch self {
         case .unknownHistorical: try container.encode("unknown_historical", forKey: .kind)
         case .userApi: try container.encode("user_api", forKey: .kind)
-        case let .internalConversation(productId, transcriptId):
+        case let .internalConversation(productId, transcriptId, sourceCall):
             try container.encode("internal_conversation", forKey: .kind)
             try container.encode(productId, forKey: .product_conversation_id)
             try container.encode(transcriptId, forKey: .transcript_id)
+            try container.encode(sourceCall, forKey: .source_call)
         case .systemGenerated: try container.encode("system_generated", forKey: .kind)
         case let .subscriptionEvent(eventId):
             try container.encode("subscription_event", forKey: .kind)
             try container.encode(eventId, forKey: .event_id)
         }
+    }
+
+    func sourceTranscriptURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, _) = self,
+              let base = URL(string: serverURL),
+              base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
+        return base.appendingPathComponent("c").appendingPathComponent(transcriptId)
+    }
+
+    func sourceCallURL(serverURL: String) -> URL? {
+        guard case let .internalConversation(_, transcriptId, sourceCall) = self,
+              let sourceCall, let base = sourceTranscriptURL(serverURL: serverURL),
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        components.queryItems = [URLQueryItem(name: "source_transcript", value: transcriptId), URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id)]
+        components.fragment = "message-\(sourceCall.message_id)"
+        return components.url
+    }
+
+    var sourceCallUnavailable: Bool {
+        if case .internalConversation(_, _, nil) = self { return true }
+        return false
     }
 
     var isUserApiInput: Bool {
@@ -501,7 +529,7 @@ enum InputOrigin: Codable, Equatable, Sendable {
         switch self {
         case .unknownHistorical: "Unknown input"
         case .userApi: "User API"
-        case let .internalConversation(productId, transcriptId):
+        case let .internalConversation(productId, transcriptId, _):
             "Conversation from @transcript:\(transcriptId) (conversation ID \(productId))"
         case .systemGenerated: "System input"
         case .subscriptionEvent: "Conversation event"

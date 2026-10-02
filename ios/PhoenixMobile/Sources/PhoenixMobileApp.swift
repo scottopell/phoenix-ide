@@ -56,11 +56,13 @@ struct PhoenixMobileApp: App {
         } else if let model {
             RootView()
                 .environment(model)
+                .environment(\.sourceServerURL, model.serverURLString)
         }
         #else
         if let model {
             RootView()
                 .environment(model)
+                .environment(\.sourceServerURL, model.serverURLString)
         }
         #endif
     }

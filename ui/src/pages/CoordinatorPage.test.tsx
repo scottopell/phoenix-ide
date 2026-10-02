@@ -164,6 +164,13 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByTestId('automatic-continuation-control')).toBeInTheDocument();
   });
 
+  it('keeps an unavailable exact source member in the Coordinator error layout', async () => {
+    apiMock.resolveCoordinatorRoute.mockResolvedValueOnce({ coordinator_id: null });
+    renderPage('/global/missing-source?source_tool=call#message-source');
+    expect(await screen.findByText('Original source conversation unavailable')).toHaveClass('coordinator-page-status');
+    expect(screen.queryByText('Shared conversation runtime /global')).not.toBeInTheDocument();
+  });
+
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {
     apiMock.resolveCoordinatorRoute.mockResolvedValueOnce({ coordinator_id: null });
     render(

@@ -21,7 +21,7 @@ describe('deriveDisplayedPendingMessages', () => {
       files: [],
     }, {
       message_id: 'external-id',
-      origin: { kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row' },
+      origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source', transcript_id: 'source-row' },
       text: 'from coordinator',
       images: [],
       files: [],
@@ -34,7 +34,7 @@ describe('deriveDisplayedPendingMessages', () => {
     ]);
     expect(displayed.map((message) => message.origin)).toEqual([
       { kind: 'user_api' },
-      { kind: 'internal_conversation', product_conversation_id: 'source', transcript_id: 'source-row' },
+      { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source', transcript_id: 'source-row' },
       { kind: 'user_api' },
     ]);
   });
