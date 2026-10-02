@@ -364,7 +364,7 @@ impl Tool for ResolveReference {
         "resolve_reference"
     }
     fn description(&self) -> String {
-        "Resolve canonical @conv:<product_conversation_id> and @transcript:<conversation_id> references, plus previously issued app-local, @chain, and @work compatibility references. This compatibility resolver is broader than typed read/send targets; bare IDs remain unsupported.".to_string()
+        "Resolve canonical @conv:<product_conversation_id> and @transcript:<conversation_id> references, plus previously issued app-local, @chain, and @work compatibility references. Results include the selected transcript member's attached WorkScope lifecycle, environment, and explicitly server-side paths when available. This compatibility resolver is broader than typed read/send targets; bare IDs remain unsupported.".to_string()
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"reference":{"type":"string","minLength":1}},"required":["reference"],"additionalProperties":false})

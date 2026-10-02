@@ -174,6 +174,18 @@ WHEN a user or the Coordinator provides a supported work reference, typed Produc
 THE SYSTEM SHALL resolve it to one durable target kind, target id, app-local navigation target when available, title when available, and concise summary
 AND SHALL reject a bare identifier whose identity domain is ambiguous rather than resolving it by equal underlying bytes
 
+THE resolved target SHALL include the WorkScope attached to the selected transcript member, its lifecycle and environment kind, authoritative cwd and worktree path, and an effective path that prefers worktree path over cwd
+AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
+
+WHEN a stable ProductConversation reference is resolved
+THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
+
+WHEN an exact transcript-row reference is resolved
+THE SYSTEM SHALL resolve only that historical member's attached WorkScope and SHALL NOT substitute a current or successor member
+
+IF the selected member has no attached WorkScope, its attached WorkScope record cannot be read, or the scope is retired or has no environment path
+THE SYSTEM SHALL represent that fact explicitly without inventing a scope, lifecycle, environment kind, or path
+
 WHEN an open-work reference is used for messaging
 THE SYSTEM SHALL target its topology-derived latest parent transcript row without silently retargeting a terminal latest row to a historical member
 
