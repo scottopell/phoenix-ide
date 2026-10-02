@@ -3047,7 +3047,20 @@ fn rehydrate_prepared_from_parts(
     let exact = payload
         .to_exact_bytes()
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    PreparedTurn::rehydrate(conversation, fingerprint, exact).map_err(conflict)
+    match PreparedTurn::rehydrate(conversation, fingerprint.clone(), exact) {
+        Ok(prepared) => Ok(prepared),
+        Err(original_error) => {
+            let historical = payload
+                .pre_source_call_exact_bytes()
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            match historical {
+                Some(exact) => {
+                    PreparedTurn::rehydrate(conversation, fingerprint, exact).map_err(conflict)
+                }
+                None => Err(conflict(original_error)),
+            }
+        }
+    }
 }
 
 async fn load_prepared_turn_from_row(
@@ -7499,6 +7512,95 @@ mod tests {
             canonical_message_id("conv-b-scope", "message-conv-b-scope-same-key")
         );
         assert_ne!(message_a.message_id, message_b.message_id);
+    }
+
+    #[tokio::test]
+    async fn pre_source_locator_turn_survives_normalized_startup_load_without_rewriting() {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-a".into());
+        let mut payload = prepared_payload_with_attachments("historical-message");
+        payload.submitted.origin = InputOrigin::InternalConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "sender-product",
+                )
+                .unwrap(),
+            transcript_id: "sender-transcript".into(),
+            source_call: None,
+        };
+        let current = payload.to_exact_bytes().unwrap();
+        let historical = String::from_utf8(current.clone())
+            .unwrap()
+            .replace(",\"source_call\":null", "")
+            .into_bytes();
+        assert_ne!(current, historical);
+        let prepared = PreparedTurn::from_exact_payload(&conversation, historical.clone());
+        let original_fingerprint = prepared.fingerprint().to_string();
+        assert!(
+            PreparedTurn::rehydrate(&conversation, original_fingerprint.clone(), current).is_err()
+        );
+        let input = AcceptTurnInput {
+            prepared,
+            workflow_id: WorkflowId(987),
+            client_key: ClientTurnKey("historical-source".into()),
+            accepted_at: Timestamp(77),
+        };
+        let created = repo.accept_authoritative_turn(&input).await.unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected accepted")
+        };
+        let before: (String, Vec<u8>) = sqlx::query_as(
+            "SELECT prepared_fingerprint, prepared_payload FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id").unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert!(!repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let loaded = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.prepared.payload(), historical);
+        assert_eq!(loaded.prepared.fingerprint(), original_fingerprint);
+        let mut retry = payload.submitted.clone();
+        if let InputOrigin::InternalConversation { source_call, .. } = &mut retry.origin {
+            *source_call = Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                message_id: "new-message".into(),
+                tool_use_id: "new-call".into(),
+            }));
+        }
+        let replay = repo
+            .lookup_scoped_direct_turn_replay(&conversation, &input.client_key, &retry)
+            .await
+            .unwrap();
+        let ScopedDirectTurnReplayLookup::Exact {
+            prepared: replayed, ..
+        } = replay
+        else {
+            panic!("expected replay")
+        };
+        assert_eq!(replayed.submitted.origin, payload.submitted.origin);
+        let after: (String, Vec<u8>) = sqlx::query_as(
+            "SELECT prepared_fingerprint, prepared_payload FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id").unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        sqlx::query("UPDATE durable_turns SET prepared_fingerprint = 'corrupt' WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id").unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert!(repo.load_authoritative_turn(turn_id).await.is_err());
     }
 
     #[tokio::test]
