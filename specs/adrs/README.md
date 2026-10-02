@@ -86,6 +86,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 
 | [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
 
+| [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
+
 ## For agents: which decisions bind your task
 
 Consult the relevant ADRs before starting work of each kind.

@@ -334,17 +334,6 @@ impl PreparedDirectTurnPayload {
         &self,
     ) -> Result<Option<Vec<u8>>, PreparedDirectTurnPayloadCodecError> {
         use crate::domain::db_schema::InputOrigin;
-        let InputOrigin::InternalConversation {
-            product_conversation_id,
-            transcript_id,
-            source_call: None,
-        } = &self.submitted.origin
-        else {
-            return Ok(None);
-        };
-        if self.v != 2 {
-            return Ok(None);
-        }
         #[derive(Serialize)]
         struct Origin<'a> {
             kind: &'static str,
@@ -367,6 +356,17 @@ impl PreparedDirectTurnPayload {
             v: u32,
             submitted: Submitted<'a>,
             delivery: &'a PreparedDirectTurnDelivery,
+        }
+        let InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            source_call: None,
+        } = &self.submitted.origin
+        else {
+            return Ok(None);
+        };
+        if self.v != 2 {
+            return Ok(None);
         }
         let submitted = &self.submitted;
         serde_json::to_vec(&Payload {

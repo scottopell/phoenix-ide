@@ -7540,10 +7540,10 @@ mod tests {
         assert!(
             PreparedTurn::rehydrate(&conversation, original_fingerprint.clone(), current).is_err()
         );
-        let input = AcceptTurnInput {
+        let input = AcceptAuthoritativeTurn {
             prepared,
-            workflow_id: WorkflowId(987),
-            client_key: ClientTurnKey("historical-source".into()),
+            disposition: AcceptedDisposition::Runtime,
+            client_key: ClientTurnKey::new("historical-source").unwrap(),
             accepted_at: Timestamp(77),
         };
         let created = repo.accept_authoritative_turn(&input).await.unwrap();
@@ -7561,6 +7561,7 @@ mod tests {
             .list_discoverable_accepted_runtime_direct_turns(None, 10)
             .await
             .unwrap()
+            .candidates
             .is_empty());
         let loaded = repo
             .load_authoritative_turn(turn_id)

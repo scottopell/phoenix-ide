@@ -109,3 +109,12 @@ AND SHALL leave WorkScopes classified as Work unchanged
 AND SHALL NOT infer a downgrade or rollback guarantee from this forward repair
 
 **Rationale:** Direct conversations are write-authorized by contract. Repairing legacy rows restores that contract without expanding project-wide rollback guarantees.
+
+### REQ-COMP-007 — Accepted source-locator upgrade preserves fingerprints
+
+WHEN an accepted version-2 direct-turn payload predates source-call locators
+THE SYSTEM SHALL reconstruct its original locator-absent encoding and verify its original stored fingerprint before recovery or replay.
+
+THE SYSTEM SHALL retain the accepted payload, origin, and fingerprint without rewriting them or substituting a later invocation locator.
+
+THE SYSTEM SHALL reject any payload whose fingerprint matches neither its current encoding nor the specifically supported historical encoding.

@@ -11963,6 +11963,14 @@ mod scope_liveness_tests {
     }
 
     async fn materialize_restart_direct_turn(manager: &RuntimeManager, conversation_id: &str) {
+        materialize_restart_direct_turn_encoding(manager, conversation_id, false).await;
+    }
+
+    async fn materialize_restart_direct_turn_encoding(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+        historical_source: bool,
+    ) {
         use phoenix_core::domain::sm_event::{
             PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
             SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
@@ -11981,7 +11989,20 @@ mod scope_liveness_tests {
             .await
             .expect("create conversation");
         let identity = SubmittedDirectTurnIdentity {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            origin: if historical_source {
+                phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                    product_conversation_id: manager
+                        .db()
+                        .get_conversation(conversation_id)
+                        .await
+                        .unwrap()
+                        .product_conversation_id,
+                    transcript_id: "source-before-upgrade".into(),
+                    source_call: None,
+                }
+            } else {
+                phoenix_core::domain::db_schema::InputOrigin::UserApi
+            },
             text: "resume exactly this turn".to_string(),
             images: Vec::new(),
             files: Vec::new(),
@@ -12006,7 +12027,14 @@ mod scope_liveness_tests {
                 client_key: ClientTurnKey::new("restart-user-message").expect("client key"),
                 prepared: PreparedTurn::from_exact_payload(
                     &conversation,
-                    payload.to_exact_bytes().expect("encode payload"),
+                    if historical_source {
+                        String::from_utf8(payload.to_exact_bytes().unwrap())
+                            .unwrap()
+                            .replace(",\"source_call\":null", "")
+                            .into_bytes()
+                    } else {
+                        payload.to_exact_bytes().expect("encode payload")
+                    },
                 ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
@@ -12044,6 +12072,38 @@ mod scope_liveness_tests {
         .await
         .established()
         .expect("materialize direct turn");
+    }
+
+    #[tokio::test]
+    async fn startup_settles_pre_source_locator_turn_without_redispatch() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let id = "restart-pre-source-locator";
+        materialize_restart_direct_turn_encoding(&manager, id, true).await;
+        manager.db().reset_all_to_idle().await.unwrap();
+        manager.settle_persisted_llm_requests().await.unwrap();
+        assert_eq!(
+            *manager.try_get_handle(id).await.unwrap().state_rx.borrow(),
+            ConvState::Idle
+        );
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let messages = manager.db().get_messages(id).await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.message_id.ends_with(":restart-user-message"))
+                .count(),
+            1
+        );
+        assert!(messages
+            .iter()
+            .find(|m| m.message_id.ends_with(":restart-user-message"))
+            .unwrap()
+            .origin
+            .source_call()
+            .is_none());
     }
 
     #[tokio::test]
