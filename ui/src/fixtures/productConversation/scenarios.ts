@@ -64,7 +64,6 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-product-alpha',
     close: null,
-    project_coordinator_eligible: true,
     project_coordinator_revision: overrides.project_coordinator_revision ?? 0,
     project_coordinator_profile: null,
     canonical_route: '/product-conversations/pc-product-alpha',

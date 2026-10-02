@@ -1,6 +1,6 @@
 # ADR-049: Compaction protects accepted handoffs and Coordinator context
 
-- **Status:** Partially superseded by ADR-072 and ADR-074
+- **Status:** Partially superseded by ADR-074
 - **Date:** 2026-09-13
 - **Affects:** REQ-BED-020, REQ-GR-011, REQ-GR-013
 

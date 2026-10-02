@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -26,7 +27,12 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { subscribeCloseSnapshotChanged } from '../notifications';
+import {
+  subscribeCloseSnapshotChanged,
+  subscribeProductConversationDeleted,
+  subscribeProductConversationSnapshotChanged,
+  subscribeProductConversationsReconciled,
+} from '../notifications';
 import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
@@ -273,7 +279,7 @@ function mergeOlderSegments(
 
   return {
     ...current,
-    ...older,
+    requested_transcript_row_id: older.requested_transcript_row_id,
     segments: Array.from(mergedByRowId.values()).sort((a, b) => a.segment_ordinal - b.segment_ordinal),
     before: older.before,
     has_older: older.has_older,
@@ -700,17 +706,17 @@ function ProjectCoordinatorSettings({
     setDraftEdited(false);
     setError(null);
   }, [snapshotCharter, snapshotEnabled, snapshotRevision]);
-  const dirty = enabled !== snapshotEnabled || charter !== snapshotCharter;
+  const dirty = enabled !== snapshotEnabled || (enabled && charter !== snapshotCharter);
   const charterBytes = new TextEncoder().encode(charter).length;
 
   useEffect(() => {
-    if (editable && draftEdited && dirty) return;
+    if (draftEdited && dirty) return;
     setEnabled(snapshotEnabled);
     setCharter(snapshotCharter);
     setBaseRevision(snapshotRevision);
     setDraftEdited(false);
     setError(null);
-  }, [dirty, draftEdited, editable, snapshotCharter, snapshotEnabled, snapshotRevision]);
+  }, [dirty, draftEdited, snapshotCharter, snapshotEnabled, snapshotRevision]);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -856,14 +862,15 @@ function ProductConversationHeader({
             disabled={recallDisabled}
           />
         )}
-        {(snapshot.project_coordinator_eligible || snapshot.project_coordinator_profile) && (
+        {(snapshot.ordinary_lifecycle === 'open' || snapshot.project_coordinator_profile || snapshot.ordinary_lifecycle === 'history') && (
           <ProjectCoordinatorSettings
             key={`coordinator-${snapshot.product_conversation_id}`}
             snapshot={snapshot}
-            editable={snapshot.project_coordinator_eligible}
+            editable={snapshot.ordinary_lifecycle === 'open'}
             onSaved={onCoordinatorProfileSaved}
           />
         )}
+        <AutomaticContinuationControl scope={{ kind: 'ordinary', reference: productConversationId }} />
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
             <summary>Work</summary>
@@ -984,6 +991,9 @@ function ProductConversationPageInner() {
         if (measurement && openMeasurementRef.current === measurement) {
           measurement.request = undefined;
         }
+        if (err instanceof ApiResponseError && err.status === 404) {
+          setOwnedSnapshot((current) => current?.productConversationId === productConversationId ? null : current);
+        }
         setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
       })
       .finally(() => {
@@ -1008,6 +1018,31 @@ function ProductConversationPageInner() {
     };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot]);
+
+  useEffect(() => {
+    const notificationIds = new Set([
+      productConversationId,
+      snapshot?.product_conversation_id,
+      snapshot?.latest_transcript_row_id,
+      snapshot?.canonical_root.transcript_row_id,
+      ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
+    ].filter((id): id is string => Boolean(id)));
+    if (notificationIds.size === 0) return;
+    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    const clearDeleted = () => {
+      setOwnedSnapshot((current) => current && notificationIds.has(current.value.product_conversation_id) ? null : current);
+      refresh();
+    };
+    const reconciled = (authoritativeIdentities: ReadonlySet<string>) => {
+      if (!authoritativeIdentities.has(snapshot?.product_conversation_id ?? productConversationId)) refresh();
+    };
+    const unsubscribes = [
+      ...[...notificationIds].map((id) => subscribeProductConversationSnapshotChanged(id, refresh)),
+      subscribeProductConversationDeleted(notificationIds, clearDeleted),
+      subscribeProductConversationsReconciled(reconciled),
+    ];
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [productConversationId, snapshot]);
 
@@ -1228,13 +1263,14 @@ function ProductConversationPageInner() {
         recallDisabled={!liveControlsEnabled}
         onCoordinatorProfileSaved={(savedProductConversationId, response) => {
           const currentSnapshot = ownedSnapshotRef.current;
-          const accepted = currentSnapshot?.productConversationId === savedProductConversationId
-            && currentSnapshot.value.project_coordinator_revision <= response.revision;
+          const currentCanonicalId = currentSnapshot?.value.product_conversation_id;
+          const accepted = currentCanonicalId === savedProductConversationId
+            && (currentSnapshot?.value.project_coordinator_revision ?? Number.POSITIVE_INFINITY) <= response.revision;
           snapshotRequestRef.current += 1;
           paginationRequestRef.current += 1;
           setLoadingOlder(false);
           setOwnedSnapshot((current) => {
-            if (!accepted || current?.productConversationId !== savedProductConversationId) return current;
+            if (!accepted || current?.value.product_conversation_id !== savedProductConversationId) return current;
             if (current.value.project_coordinator_revision > response.revision) return current;
             return {
               ...current,

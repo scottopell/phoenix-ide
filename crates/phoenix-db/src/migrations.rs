@@ -1678,7 +1678,22 @@ BEGIN
 END;
 ";
 
-const MIGRATION_119: &str = MIGRATION_118;
+const MIGRATION_119: &str = r"
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = NEW.product_conversation_id;
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM product_conversation_coordinator_profile_revisions
+        WHERE product_conversation_id = NEW.product_conversation_id AND revision > 0
+    );
+END;
+";
 
 const MIGRATION_098: &str = r"
 DELETE FROM continuation_dispatch_intents

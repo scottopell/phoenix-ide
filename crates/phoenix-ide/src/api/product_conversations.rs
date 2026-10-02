@@ -233,7 +233,10 @@ pub async fn put_project_coordinator_profile(
             (None, expected_revision)
         }
     };
-    let outcome = state
+    let _authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
+    let outcome = match state
         .db
         .write_project_coordinator_profile(
             &product_conversation_id,
@@ -241,7 +244,13 @@ pub async fn put_project_coordinator_profile(
             expected_revision,
         )
         .await
-        .map_err(project_coordinator_write_to_app)?;
+    {
+        Ok(outcome) => outcome,
+        Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit) => {
+            return Err(project_coordinator_ambiguous_commit_to_app(&state));
+        }
+        Err(error) => return Err(project_coordinator_write_to_app(error)),
+    };
     let (revision, profile) = match outcome {
         ProjectCoordinatorProfileWriteOutcome::Saved(profile) => (
             profile.revision(),
@@ -256,6 +265,13 @@ pub async fn put_project_coordinator_profile(
         revision,
         profile,
     }))
+}
+
+fn project_coordinator_ambiguous_commit_to_app(state: &AppState) -> AppError {
+    state
+        .runtime
+        .signal_fatal_local_authority("project_coordinator_profile_commit");
+    AppError::Internal(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit.to_string())
 }
 
 fn project_coordinator_write_to_app(error: ProjectCoordinatorProfileWriteDbError) -> AppError {
@@ -769,10 +785,6 @@ async fn snapshot_view(
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
         close,
-        project_coordinator_eligible: matches!(
-            lifecycle,
-            phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::Open
-        ),
         project_coordinator_revision,
         project_coordinator_profile,
 
@@ -1230,6 +1242,17 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[tokio::test]
+    async fn project_coordinator_ambiguous_commit_closes_local_authority() {
+        let state = make_test_state().await;
+        assert!(state.runtime.acquire_local_authority_pass().is_ok());
+
+        let error = project_coordinator_ambiguous_commit_to_app(&state);
+
+        assert!(matches!(error, AppError::Internal(_)));
+        assert!(state.runtime.acquire_local_authority_pass().is_err());
+    }
 
     async fn create_completed_continuation(
         state: &AppState,

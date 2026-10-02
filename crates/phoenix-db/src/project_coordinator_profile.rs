@@ -38,6 +38,25 @@ fn validate_charter(charter: &str) -> Result<(), ProjectCoordinatorProfileWriteE
     Ok(())
 }
 
+async fn ensure_project_coordinator_profile_revision_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    product_conversation_id: &ProductConversationId,
+    write_token: &str,
+) -> Result<(), ProjectCoordinatorProfileWriteDbError> {
+    sqlx::query(
+        "INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(product_conversation_id) DO UPDATE
+             SET last_write_token = excluded.last_write_token",
+    )
+    .bind(product_conversation_id.as_str())
+    .bind(write_token)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn active_profile_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     product_conversation_id: &ProductConversationId,
@@ -51,25 +70,6 @@ async fn active_profile_exists(
     .bind(product_conversation_id.as_str())
     .fetch_one(&mut **tx)
     .await
-}
-
-async fn admit_project_coordinator_profile_insert(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    product_conversation_id: &ProductConversationId,
-    write_token: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO product_conversation_coordinator_profile_insert_admissions
-             (product_conversation_id, write_token)
-         VALUES (?1, ?2)
-         ON CONFLICT(product_conversation_id)
-         DO UPDATE SET write_token = excluded.write_token",
-    )
-    .bind(product_conversation_id.as_str())
-    .bind(write_token)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 async fn retained_revision(
@@ -255,7 +255,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_project_coordinator_profile_writable(&mut tx, product_conversation_id).await?;
 
-        let retained_revision: i64 = sqlx::query_scalar(
+        let expected_retained_revision: i64 = sqlx::query_scalar(
             "SELECT revision FROM product_conversation_coordinator_profile_revisions
              WHERE product_conversation_id = ?1",
         )
@@ -263,26 +263,28 @@ impl Database {
         .fetch_optional(&mut *tx)
         .await?
         .unwrap_or(0);
-        if retained_revision != expected_revision {
+        if expected_retained_revision != expected_revision {
             return Err(ProjectCoordinatorProfileWriteError::RevisionConflict.into());
         }
         let active_exists = active_profile_exists(&mut tx, product_conversation_id).await?;
 
         let new_revision;
         let outcome = if let Some(charter) = charter {
-            new_revision = advance_project_coordinator_profile_revision(
-                &mut tx,
-                product_conversation_id,
-                &write_token,
-                active_exists,
-            )
-            .await?;
-            admit_project_coordinator_profile_insert(
+            ensure_project_coordinator_profile_revision_row(
                 &mut tx,
                 product_conversation_id,
                 &write_token,
             )
             .await?;
+            if active_exists {
+                sqlx::query(
+                    "DELETE FROM product_conversation_coordinator_profiles
+                     WHERE product_conversation_id = ?1",
+                )
+                .bind(product_conversation_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
             sqlx::query(
                 "INSERT INTO product_conversation_coordinator_profiles
                          (product_conversation_id, charter, updated_at_unix_micros)
@@ -293,6 +295,16 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            sqlx::query(
+                "UPDATE product_conversation_coordinator_profile_revisions
+                 SET last_write_token = ?2
+                 WHERE product_conversation_id = ?1",
+            )
+            .bind(product_conversation_id.as_str())
+            .bind(&write_token)
+            .execute(&mut *tx)
+            .await?;
+            new_revision = retained_revision(&mut tx, product_conversation_id).await?;
             ProjectCoordinatorProfileWriteOutcome::Saved(ProjectCoordinatorProfile::new(
                 charter.to_string(),
                 new_revision,
@@ -394,6 +406,18 @@ async fn ensure_project_coordinator_profile_writable(
     if kind != "ordinary" {
         return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
     }
+    let owns_sub_agent_conversation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM conversations
+             WHERE product_conversation_id = ?1 AND runtime_role = 'sub_agent'
+         )",
+    )
+    .bind(product_conversation_id.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    if owns_sub_agent_conversation {
+        return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
+    }
     if ordinary_lifecycle.as_deref() != Some("open") {
         return Err(ProjectCoordinatorProfileWriteError::NotOpen.into());
     }
@@ -467,6 +491,106 @@ mod tests {
                 .charter(),
             "accepted"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_profile_insert_advances_revision_fence() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-direct-insert").await;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                     (product_conversation_id, revision, last_write_token)
+                 VALUES (?1, 0, 'direct-test')",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("seed fence");
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profiles
+                     (product_conversation_id, charter, updated_at_unix_micros)
+                 VALUES (?1, 'manual', 1)",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("direct insert");
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
+             WHERE product_conversation_id = ?1",
+        )
+        .bind(id.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .expect("revision");
+        assert_eq!(revision, 1);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_owned_product_conversation_rejects_profile_writes() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = product_conversation(&db, "pc-project-coordinator-sub-agent", "ordinary").await;
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, created_at, updated_at,
+                 environment_kind, cwd, worktree_path, worktree_id, worktree_fingerprint
+             ) VALUES (
+                 'scope-sub-agent', 'work', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 'allocated_worktree', '/tmp/sub-agent', '/tmp/sub-agent',
+                 'sub-agent-worktree', 'sub-agent-fingerprint'
+             )",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("insert work scope");
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+             VALUES ('scope-sub-agent', ?1)",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("insert scope owner");
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role, work_scope_id,
+                 user_initiated, state, state_kind, state_updated_at, created_at,
+                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
+             ) VALUES ('conv-sub-agent-parent', ?1, 'user', 'scope-sub-agent',
+                       1, ?2, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
+        )
+        .bind(id.as_str())
+        .bind(serde_json::json!({ "type": "idle" }).to_string())
+        .execute(&db.pool)
+        .await
+        .expect("insert sub-agent parent conversation");
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role, work_scope_id,
+                 user_initiated, state, state_kind, state_updated_at, created_at,
+                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
+             ) VALUES ('conv-sub-agent', ?1, 'conv-sub-agent-parent', 'sub_agent', 'scope-sub-agent',
+                       0, ?2, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
+        )
+        .bind(id.as_str())
+        .bind(serde_json::json!({ "type": "idle" }).to_string())
+        .execute(&db.pool)
+        .await
+        .expect("insert sub-agent conversation");
+
+        let error = db
+            .write_project_coordinator_profile(&id, Some("charter"), 0)
+            .await
+            .expect_err("sub-agent aggregate rejects profile");
+
+        assert!(matches!(
+            error,
+            ProjectCoordinatorProfileWriteDbError::Domain(
+                ProjectCoordinatorProfileWriteError::NotOrdinary
+            )
+        ));
     }
 
     #[tokio::test]
@@ -560,7 +684,7 @@ mod tests {
             .expect("lookup")
             .expect("profile");
         assert_eq!(profile.charter(), "current charter");
-        assert_eq!(profile.revision(), 2);
+        assert_eq!(profile.revision(), 3);
     }
 
     #[tokio::test]

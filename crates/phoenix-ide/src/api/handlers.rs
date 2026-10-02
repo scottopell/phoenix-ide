@@ -4164,7 +4164,7 @@ async fn get_system_prompt(
         Some(&mode_context),
         crate::tools::ExploreToolPolicy::from_platform(&state.platform).bash(),
     );
-    let system_prompt = if is_coordinator {
+    let mut system_prompt = if is_coordinator {
         let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None);
         crate::system_prompt::build_coordinator_system_prompt(
             conversation.llm_language,
@@ -4185,6 +4185,26 @@ async fn get_system_prompt(
             explore_bash,
         )
     };
+
+    if !is_coordinator && !is_sub_agent {
+        if let Some(profile) = state
+            .runtime
+            .db()
+            .get_project_coordinator_profile_for_conversation(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            crate::system_prompt::append_project_coordinator_guidance(
+                &mut system_prompt,
+                conversation.llm_language,
+            );
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&crate::system_prompt::project_coordinator_charter_block(
+                profile.charter(),
+                conversation.llm_language,
+            ));
+        }
+    }
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }

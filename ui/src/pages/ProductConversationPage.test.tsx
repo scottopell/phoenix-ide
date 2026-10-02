@@ -16,7 +16,12 @@ import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
-import { notifyCloseSnapshotChanged } from '../notifications';
+import {
+  notifyCloseSnapshotChanged,
+  notifyProductConversationDeleted,
+  notifyProductConversationSnapshotChanged,
+  notifyProductConversationsReconciled,
+} from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -45,6 +50,10 @@ vi.mock('../components/MessageViewer', () => ({
     viewerSpy(props);
     return <div data-testid="aggregate-message-viewer" data-inline={String(props['inline'])} />;
   },
+}));
+
+vi.mock('../components/AutomaticContinuationControl', () => ({
+  AutomaticContinuationControl: () => <div data-testid="automatic-continuation-control" />,
 }));
 
 vi.mock('../components/ConversationNavStack', () => ({
@@ -206,7 +215,6 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   return {
     product_conversation_id: 'pc-1',
     close: null,
-    project_coordinator_eligible: true,
     project_coordinator_revision: overrides.project_coordinator_revision ?? 0,
     project_coordinator_profile: null,
     canonical_route: '/product-conversations/pc-1',
@@ -720,14 +728,68 @@ describe('ProductConversationPage', () => {
     expect(screen.getByLabelText('Charter')).toHaveValue('Saved charter');
   });
 
-  it('hides the settings action for an ineligible ProductConversation', async () => {
+  it('keeps the ordinary automatic continuation control on open aggregates', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({ ordinary_lifecycle: 'open' }));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+
+    expect(screen.getByTestId('automatic-continuation-control')).toBeInTheDocument();
+  });
+
+  it('refreshes aggregate snapshots when the ProductConversation snapshot notification fires', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Before notify', presentation_mode: 'idle' } }))
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'After notify', presentation_mode: 'idle' } }));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => notifyProductConversationSnapshotChanged('pc-1'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('After notify')).toBeInTheDocument();
+  });
+
+  it('refreshes aggregate snapshots when ProductConversation reconciliation omits the aggregate', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Before reconcile', presentation_mode: 'idle' } }))
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'After reconcile', presentation_mode: 'idle' } }));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => notifyProductConversationsReconciled(new Set(['other-pc'])));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('After reconcile')).toBeInTheDocument();
+  });
+
+  it('clears stale aggregate state when a deletion notification arrives', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Before delete', presentation_mode: 'idle' } }))
+      .mockRejectedValueOnce(new ApiResponseError(404, 'Not found'));
+
+    renderPage('/product-conversations/pc-1');
+    await waitForPageReady();
+    act(() => notifyProductConversationDeleted('pc-1', []));
+
+    await waitFor(() => expect(screen.queryByText('Before delete')).not.toBeInTheDocument());
+  });
+
+  it('shows disabled coordinator settings for History aggregates without a profile', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
-      project_coordinator_eligible: false,
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
     }));
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();
-    expect(screen.queryByText(/^Coordinator/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText((_, element) => element?.tagName === 'SUMMARY' && element.textContent?.startsWith('Coordinator') === true));
+    expect(screen.getByLabelText('Use Project Coordinator guidance')).toBeDisabled();
+    expect(api.putProjectCoordinatorProfile).not.toHaveBeenCalled();
   });
 
   it('shows retained Project Coordinator settings read-only for History aggregates', async () => {
@@ -735,7 +797,6 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot({
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
-      project_coordinator_eligible: false,
       project_coordinator_profile: { charter: 'retained charter', updated_at_unix_micros: 7 },
       project_coordinator_revision: 7,
     }));

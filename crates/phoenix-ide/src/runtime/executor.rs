@@ -7459,6 +7459,33 @@ where
             .iter()
             .map(|result| estimate_text_tokens(&result.output))
             .sum::<usize>();
+        let is_sub_agent = self.context.is_sub_agent;
+        let is_coordinator = self.context.is_coordinator;
+        let llm_language = self.context.llm_language;
+        let project_coordinator_profile = if is_coordinator || is_sub_agent {
+            None
+        } else {
+            self.storage
+                .get_project_coordinator_profile(&self.context.conversation_id)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, conversation_id = %self.context.conversation_id, "failed to load Project Coordinator profile");
+                    format!("failed to load Project Coordinator profile: {error}")
+                })?
+        };
+        let project_coordinator_token_reserve =
+            project_coordinator_profile.as_ref().map_or(0, |profile| {
+                estimate_text_tokens("\n\n")
+                    + estimate_text_tokens(crate::system_prompt::project_coordinator_guidance(
+                        llm_language,
+                    ))
+                    + estimate_text_tokens(
+                        &crate::system_prompt::project_coordinator_charter_block(
+                            profile.charter(),
+                            llm_language,
+                        ),
+                    )
+            });
         let mut frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
@@ -7471,7 +7498,8 @@ where
             &self.clearable_names,
             self.context
                 .context_window
-                .saturating_sub(trusted_token_reserve),
+                .saturating_sub(trusted_token_reserve)
+                .saturating_sub(project_coordinator_token_reserve),
             &self.clear_watermark_cache,
         )
         .await;
@@ -7535,7 +7563,6 @@ where
             .working_dir()
             .map(Path::to_path_buf);
         let tasks_dir_name = self.context.tasks_dir_name.clone();
-        let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
         let has_approved_task_write_authority =
             matches!(
@@ -7547,9 +7574,7 @@ where
                     .get_approved_task_objective(&self.context.conversation_id)
                     .await?
                     .is_some();
-        let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
-        let is_coordinator = self.context.is_coordinator;
         let explore_bash = self.context.explore_bash;
         let request_tool_surface = tool_surface;
 
@@ -7636,17 +7661,6 @@ where
                 "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
             );
         }
-        let project_coordinator_profile = if is_coordinator || is_sub_agent {
-            None
-        } else {
-            match self.storage.get_project_coordinator_profile(&conv_id).await {
-                Ok(profile) => profile,
-                Err(error) => {
-                    tracing::warn!(%error, conversation_id = %conv_id, "failed to load Project Coordinator profile");
-                    None
-                }
-            }
-        };
         if project_coordinator_profile.is_some() {
             crate::system_prompt::append_project_coordinator_guidance(
                 &mut system_prompt,
@@ -8894,7 +8908,11 @@ where
                 Ok(profile) => profile.is_some(),
                 Err(error) => {
                     tracing::warn!(%error, conversation_id = %self.context.conversation_id, "failed to load Project Coordinator profile for compaction");
-                    false
+                    return Ok(Some(Event::ContinuationFailed {
+                        operation_id,
+                        error: format!("failed to load Project Coordinator profile: {error}"),
+                        error_kind: crate::db::ErrorKind::ServerError,
+                    }));
                 }
             }
         };
@@ -14070,6 +14088,54 @@ mod authoritative_user_message_effect_tests {
             }
             assert!(request.messages.len() < 63);
         }
+    }
+
+    #[tokio::test]
+    async fn ordinary_project_coordinator_profile_lookup_failure_stops_before_provider_dispatch() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        storage.set_fail_project_coordinator_profile_lookup(true);
+
+        let error = rt
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .expect_err("profile lookup failure must fail closed before dispatch");
+
+        assert!(error.contains("failed to load Project Coordinator profile"));
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn compaction_project_coordinator_profile_lookup_failure_stops_before_provider_dispatch()
+    {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "profile-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage.set_fail_project_coordinator_profile_lookup(true);
+
+        let generated = rt
+            .execute_effect(Effect::RequestContinuation { request })
+            .await
+            .expect("continuation effect should return domain failure event");
+
+        assert!(
+            matches!(generated, Some(Event::ContinuationFailed { operation_id, error, .. }) if operation_id == "profile-failure" && error.contains("failed to load Project Coordinator profile"))
+        );
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.llm_task_handle.is_none());
     }
 
     #[tokio::test]

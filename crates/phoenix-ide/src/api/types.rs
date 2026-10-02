@@ -392,7 +392,6 @@ pub struct ProjectCoordinatorProfileWriteResponse {
 pub struct ProductConversationSnapshotView {
     pub product_conversation_id: String,
     pub close: Option<ProductConversationCloseView>,
-    pub project_coordinator_eligible: bool,
     pub project_coordinator_revision: i64,
     pub canonical_route: String,
     pub requested_transcript_row_id: String,
