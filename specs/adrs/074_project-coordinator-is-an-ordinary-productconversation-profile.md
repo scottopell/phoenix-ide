@@ -1,4 +1,4 @@
-# ADR-073: Project Coordinator is an ordinary ProductConversation profile
+# ADR-074: Project Coordinator is an ordinary ProductConversation profile
 
 - **Status:** Accepted
 - **Date:** 2026-09-17
