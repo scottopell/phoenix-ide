@@ -325,6 +325,72 @@ impl PreparedDirectTurnPayload {
         }
     }
 
+    /// Reconstructs the version-2 encoding emitted before source-call locators.
+    /// Returns no candidate for other versions, origins, or recorded locators.
+    ///
+    /// # Errors
+    /// Returns an encoding error if serialization fails.
+    pub fn pre_source_call_exact_bytes(
+        &self,
+    ) -> Result<Option<Vec<u8>>, PreparedDirectTurnPayloadCodecError> {
+        use crate::domain::db_schema::InputOrigin;
+        #[derive(Serialize)]
+        struct Origin<'a> {
+            kind: &'static str,
+            product_conversation_id: &'a crate::domain::product_conversation::ProductConversationId,
+            transcript_id: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Submitted<'a> {
+            text: &'a str,
+            origin: Origin<'a>,
+            images: &'a [ImageData],
+            files: &'a [SubmittedDirectTurnFileAttachment],
+            message_id: &'a str,
+            user_agent: &'a Option<String>,
+            skill_invocation: &'a Option<SkillInvocation>,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy,
+        }
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            v: u32,
+            submitted: Submitted<'a>,
+            delivery: &'a PreparedDirectTurnDelivery,
+        }
+        let InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            source_call: None,
+        } = &self.submitted.origin
+        else {
+            return Ok(None);
+        };
+        if self.v != 2 {
+            return Ok(None);
+        }
+        let submitted = &self.submitted;
+        serde_json::to_vec(&Payload {
+            v: self.v,
+            submitted: Submitted {
+                text: &submitted.text,
+                origin: Origin {
+                    kind: "internal_conversation",
+                    product_conversation_id,
+                    transcript_id,
+                },
+                images: &submitted.images,
+                files: &submitted.files,
+                message_id: &submitted.message_id,
+                user_agent: &submitted.user_agent,
+                skill_invocation: &submitted.skill_invocation,
+                expansion_policy: submitted.expansion_policy,
+            },
+            delivery: &self.delivery,
+        })
+        .map(Some)
+        .map_err(PreparedDirectTurnPayloadCodecError::Encode)
+    }
+
     /// Decodes and version-checks a complete envelope.
     ///
     /// # Errors
