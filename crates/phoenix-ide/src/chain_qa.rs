@@ -360,7 +360,7 @@ impl ChainQa {
             source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
-                "Chain skeleton (members in order):\n{}\n---\nQuestion: {}{}",
+                "Conversation transcripts (in order):\n{}\n---\nQuestion: {}{}",
                 prep.skeleton, prep.question, coverage_note
             ))],
         }];
@@ -671,7 +671,9 @@ impl ChainQa {
                 }
                 if !member_ids.iter().any(|m| m == conv_id) {
                     return (
-                        format!("error: conversation {conv_id} is not part of this chain"),
+                        format!(
+                            "error: transcript {conv_id} is not part of this ProductConversation"
+                        ),
                         true,
                     );
                 }
@@ -846,9 +848,9 @@ fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
     if search_enabled {
         tools.push(ToolDefinition {
             name: "search_conversations".to_string(),
-            description: "Search this chain's messages by relevance to a natural-language query. \
-                Returns ranked snippets, each tagged with its source conversation id. Use this to \
-                locate where something was discussed, then read that conversation in full."
+            description: "Search this ProductConversation's transcript messages by relevance to a natural-language query. \
+                Returns ranked snippets tagged with their exact source transcript id. Use this to \
+                locate where something was discussed, then read that transcript."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -875,7 +877,7 @@ fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
             "properties": {
                 "conversation_id": {
                     "type": "string",
-                    "description": "A conversation id from the chain skeleton or a search result."
+                    "description": "An exact transcript id from the transcript list or a search result."
                 },
                 "cursor": {
                     "type": "integer",
@@ -935,7 +937,7 @@ fn read_page(messages: &[Message], cursor: usize) -> String {
     }
     // `pos` is now the total transcript length (unless we stopped early).
     if out.is_empty() && !has_more {
-        return "(end of conversation)".to_string();
+        return "(end of transcript)".to_string();
     }
     if has_more {
         format!("{out}\n[… more content; call read_conversation again with cursor={end}]")

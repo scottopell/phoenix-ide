@@ -61,6 +61,12 @@ pub struct ProductConversationListProjection {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrdinaryProductConversationCitation {
+    pub product_conversation_id: ProductConversationId,
+    pub root_title: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationSnapshotRead {
     pub aggregate: ProductConversationAggregate,
@@ -618,6 +624,66 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(list_projection_from_row).collect()
+    }
+
+    /// Reads citation metadata without hydrating the aggregate transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or identity decode error when citation metadata cannot be read.
+    pub async fn ordinary_product_conversation_citation(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<OrdinaryProductConversationCitation>> {
+        let row = sqlx::query(
+            "SELECT product.id AS product_conversation_id, \
+                    COALESCE(root.chain_name, root.title, root.slug, root.id) AS root_title \
+             FROM product_conversations product \
+             JOIN conversations root ON root.product_conversation_id = product.id \
+             WHERE product.id = ?1 AND product.kind = 'ordinary' \
+               AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM conversations predecessor \
+                   WHERE predecessor.product_conversation_id = product.id \
+                     AND predecessor.continued_in_conv_id = root.id \
+               ) \
+             LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(OrdinaryProductConversationCitation {
+                product_conversation_id: ProductConversationId::parse(
+                    row.try_get::<String, _>("product_conversation_id")?,
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                root_title: row.try_get("root_title")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Reads the persisted kind for a live `ProductConversation` identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or decode error when the persisted kind cannot be read.
+    pub async fn product_conversation_kind(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<ProductConversationKind>> {
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT kind FROM product_conversations WHERE id = ?1")
+                .bind(product_conversation_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        kind.map(|kind| {
+            ProductConversationKind::from_db_str(&kind).ok_or_else(|| {
+                DbError::Serialization(format!("unknown product conversation kind: {kind}"))
+            })
+        })
+        .transpose()
     }
 
     /// Reads one ordinary aggregate from its durable product identity.
@@ -1865,6 +1931,40 @@ mod tests {
             projection.lifecycle,
             ProductConversationListLifecycle::History
         );
+    }
+
+    #[tokio::test]
+    async fn list_title_uses_effective_aggregate_rename() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "title-authority",
+                "title-authority",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET title = 'Aggregate Title', chain_name = 'Legacy Override' WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let projections = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap();
+        let projection = projections
+            .iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+
+        assert_eq!(projection.root_title.as_deref(), Some("Legacy Override"));
     }
 
     #[tokio::test]

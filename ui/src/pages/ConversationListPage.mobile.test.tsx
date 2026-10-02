@@ -100,7 +100,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     vi.mocked(api.renameProductConversation).mockResolvedValue(renamed);
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
-    touchActivate(await screen.findByRole('button', { name: 'Rename product conversation Mobile Product' }));
+    touchActivate(await screen.findByRole('button', { name: 'Rename conversation Mobile Product' }));
     const input = screen.getByRole('textbox');
     fireEvent.change(input, { target: { value: 'Renamed on Mobile' } });
     touchActivate(screen.getByRole('button', { name: 'Rename' }));
@@ -117,7 +117,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     expect(await screen.findByText('Mobile Product')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Close product conversation Mobile Product' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Close conversation Mobile Product' })).toBeNull();
   });
 
   it('uses aggregate deletion for History with one parent transcript', async () => {
@@ -137,7 +137,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
@@ -155,7 +155,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
@@ -184,7 +184,7 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
     touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete product conversation Mobile Product' }));
+    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
     touchActivate(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
@@ -204,8 +204,8 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     });
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
 
-    touchActivate(await screen.findByRole('button', { name: 'Close product conversation Mobile Product' }));
-    expect(screen.getByText(/move the entire product conversation to read-only History and stop its active work/)).toBeInTheDocument();
+    touchActivate(await screen.findByRole('button', { name: 'Close conversation Mobile Product' }));
+    expect(screen.getByText(/moves the conversation to read-only History and stops its active work/)).toBeInTheDocument();
     touchActivate(screen.getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(api.closeProductConversation).toHaveBeenCalledWith('pc-mobile'));
