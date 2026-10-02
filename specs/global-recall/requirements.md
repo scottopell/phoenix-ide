@@ -178,7 +178,7 @@ THE resolved target SHALL include the WorkScope attached to the selected transcr
 AND SHALL mark those paths as server-filesystem locations rather than caller-local paths
 
 WHEN a stable ProductConversation reference is resolved
-THE SYSTEM SHALL select the current transcript member before resolving its attached WorkScope
+THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
 
 WHEN an exact transcript-row reference is resolved
 THE SYSTEM SHALL resolve only that historical member's attached WorkScope and SHALL NOT substitute a current or successor member

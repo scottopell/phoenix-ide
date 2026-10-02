@@ -50,7 +50,7 @@ A bounded `gpt-5.5` comparison retained the paused workstream, owner succession,
 
 Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, stable ProductConversation reads through the current transcript, exact transcript pinning, ambiguous target rejection, WorkScope target resolution and no-default behavior for Coordinator unsandboxed Bash, current-context app-local citation navigation with a Coordinator return origin, transcript paging, writing-versus-restricted tool boundaries, chat-only responsive layout, shared message acceptance semantics, and self-target rejection without dispatch.
 
-Reference-resolution coverage verifies current-member WorkScope selection for stable ProductConversation references, historical-member pinning for exact transcript references, active and retired lifecycles, allocated-worktree and unowned-cwd environments, worktree-preferred effective paths, cwd fallback, no-environment scopes, missing attachments, unavailable records, and explicit server-filesystem path semantics.
+Reference-resolution coverage verifies point-in-time current-member and WorkScope selection for stable ProductConversation references during concurrent continuation, historical-member pinning for exact transcript references, active and retired lifecycles, allocated-worktree and unowned-cwd environments, worktree-preferred effective paths, cwd fallback, no-environment scopes, missing attachments, unavailable records, and explicit server-filesystem path semantics.
 
 ## Scope
 

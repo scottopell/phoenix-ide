@@ -4,6 +4,7 @@ use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalS
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -194,12 +195,20 @@ fn parse_canonical_conversation_reference(
 pub(crate) struct GlobalReadService {
     db: crate::db::Database,
     message_retriever: Arc<dyn crate::db::MessageRetriever>,
+    #[cfg(test)]
+    stable_resolution_test_hook: Option<Arc<StableResolutionTestHook>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
+}
+
+#[cfg(test)]
+struct StableResolutionTestHook {
+    snapshot_read: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 impl GlobalReadService {
@@ -210,11 +219,23 @@ impl GlobalReadService {
         Self {
             db,
             message_retriever,
+            #[cfg(test)]
+            stable_resolution_test_hook: None,
         }
     }
 
     fn from_state(state: &AppState) -> Self {
         Self::new(state.db.clone(), state.message_retriever.clone())
+    }
+
+    #[cfg(test)]
+    fn install_stable_resolution_test_hook(&mut self) -> Arc<StableResolutionTestHook> {
+        let hook = Arc::new(StableResolutionTestHook {
+            snapshot_read: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        self.stable_resolution_test_hook = Some(hook.clone());
+        hook
     }
 
     pub(crate) async fn resolve_active_work_scope_bash_target(
@@ -876,6 +897,145 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
     }
 }
 
+fn resolved_work_scope_from_columns(
+    work_scope_id: phoenix_core::work_scope::WorkScopeId,
+    raw_id: Option<String>,
+    raw_lifecycle: Option<String>,
+    raw_environment: Option<String>,
+    cwd: Option<String>,
+    worktree_path: Option<String>,
+) -> ResolvedWorkScope {
+    let Some(raw_id) = raw_id else {
+        return ResolvedWorkScope::Unavailable {
+            work_scope_id,
+            reason: WorkScopeUnavailableReason::RecordNotFound,
+        };
+    };
+    let parsed_id = phoenix_core::work_scope::WorkScopeId::parse(raw_id);
+    let lifecycle = match raw_lifecycle.as_deref() {
+        Some("active") => Some(phoenix_core::work_scope::WorkScopeLifecycle::Active),
+        Some("retired") => Some(phoenix_core::work_scope::WorkScopeLifecycle::Retired),
+        _ => None,
+    };
+    let environment_kind = match raw_environment.as_deref() {
+        Some("allocated_worktree") => Some(ResolvedEnvironmentKind::AllocatedWorktree),
+        Some("unowned_cwd") => Some(ResolvedEnvironmentKind::UnownedCwd),
+        Some("none") => Some(ResolvedEnvironmentKind::None),
+        _ => None,
+    };
+    let (Ok(parsed_id), Some(lifecycle), Some(environment_kind)) =
+        (parsed_id, lifecycle, environment_kind)
+    else {
+        return ResolvedWorkScope::Unavailable {
+            work_scope_id,
+            reason: WorkScopeUnavailableReason::InvalidRecord,
+        };
+    };
+    let effective_path = worktree_path.clone().or_else(|| cwd.clone());
+    ResolvedWorkScope::Available {
+        work_scope_id: parsed_id,
+        lifecycle,
+        environment_kind,
+        cwd,
+        worktree_path,
+        effective_path,
+        path_semantics: ServerPathSemantics::ServerFilesystem,
+    }
+}
+
+struct ResolvedCurrentMember {
+    id: String,
+    state: crate::db::ConvState,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    work_scope: ResolvedWorkScope,
+}
+
+async fn resolve_current_member_and_work_scope(
+    service: &GlobalReadService,
+    product_conversation_id: &str,
+) -> Result<ResolvedCurrentMember, AppError> {
+    let row = sqlx::query(
+        "WITH RECURSIVE transcript(id, work_scope_id, ordinal) AS (
+             SELECT root.id, root.work_scope_id, 0
+             FROM conversations root
+             WHERE root.product_conversation_id = ?1
+               AND root.runtime_role = 'user'
+               AND root.parent_conversation_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations predecessor
+                   WHERE predecessor.product_conversation_id = root.product_conversation_id
+                     AND predecessor.continued_in_conv_id = root.id
+               )
+             UNION ALL
+             SELECT successor.id, successor.work_scope_id, transcript.ordinal + 1
+             FROM transcript
+             JOIN conversations predecessor ON predecessor.id = transcript.id
+             JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+             WHERE successor.product_conversation_id = ?1
+               AND successor.runtime_role = 'user'
+               AND successor.parent_conversation_id IS NULL
+         )
+         SELECT transcript.id AS conversation_id, conversation.state,
+                conversation.updated_at, transcript.work_scope_id,
+                scope.id AS scope_id, scope.lifecycle, scope.environment_kind,
+                scope.cwd, scope.worktree_path
+         FROM transcript
+         JOIN conversations conversation ON conversation.id = transcript.id
+         LEFT JOIN work_scopes scope ON scope.id = transcript.work_scope_id
+         ORDER BY transcript.ordinal DESC
+         LIMIT 1",
+    )
+    .bind(product_conversation_id)
+    .fetch_optional(service.db.pool())
+    .await
+    .map_err(|error| map_db_not_found(DbError::from(error)))?
+    .ok_or_else(|| AppError::NotFound(product_conversation_id.to_string()))?;
+    let conversation_id = row
+        .try_get("conversation_id")
+        .map_err(|error| map_db_not_found(DbError::from(error)))?;
+    let work_scope_id: Option<String> = row
+        .try_get("work_scope_id")
+        .map_err(|error| map_db_not_found(DbError::from(error)))?;
+    let work_scope = match work_scope_id {
+        None => ResolvedWorkScope::Missing,
+        Some(id) => {
+            let id = phoenix_core::work_scope::WorkScopeId::parse(id).map_err(|error| {
+                AppError::Internal(format!("invalid attached WorkScope ID: {error}"))
+            })?;
+            resolved_work_scope_from_columns(
+                id,
+                row.try_get("scope_id")
+                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+                row.try_get("lifecycle")
+                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+                row.try_get("environment_kind")
+                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+                row.try_get("cwd")
+                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+                row.try_get("worktree_path")
+                    .map_err(|error| map_db_not_found(DbError::from(error)))?,
+            )
+        }
+    };
+    let raw_state: String = row
+        .try_get("state")
+        .map_err(|error| map_db_not_found(DbError::from(error)))?;
+    let state = serde_json::from_str(&raw_state)
+        .map_err(|error| AppError::Internal(format!("invalid conversation state: {error}")))?;
+    let raw_updated_at: String = row
+        .try_get("updated_at")
+        .map_err(|error| map_db_not_found(DbError::from(error)))?;
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&raw_updated_at)
+        .map_err(|error| AppError::Internal(format!("invalid conversation timestamp: {error}")))?
+        .with_timezone(&chrono::Utc);
+    Ok(ResolvedCurrentMember {
+        id: conversation_id,
+        state,
+        updated_at,
+        work_scope,
+    })
+}
+
 async fn resolve_work_scope(
     service: &GlobalReadService,
     conversation: &Conversation,
@@ -911,36 +1071,14 @@ async fn resolve_work_scope(
             };
         }
     };
-    let parsed_id = phoenix_core::work_scope::WorkScopeId::parse(raw_id);
-    let lifecycle = match raw_lifecycle.as_str() {
-        "active" => Some(phoenix_core::work_scope::WorkScopeLifecycle::Active),
-        "retired" => Some(phoenix_core::work_scope::WorkScopeLifecycle::Retired),
-        _ => None,
-    };
-    let environment_kind = match raw_environment.as_str() {
-        "allocated_worktree" => Some(ResolvedEnvironmentKind::AllocatedWorktree),
-        "unowned_cwd" => Some(ResolvedEnvironmentKind::UnownedCwd),
-        "none" => Some(ResolvedEnvironmentKind::None),
-        _ => None,
-    };
-    let (Ok(parsed_id), Some(lifecycle), Some(environment_kind)) =
-        (parsed_id, lifecycle, environment_kind)
-    else {
-        return ResolvedWorkScope::Unavailable {
-            work_scope_id,
-            reason: WorkScopeUnavailableReason::InvalidRecord,
-        };
-    };
-    let effective_path = worktree_path.clone().or_else(|| cwd.clone());
-    ResolvedWorkScope::Available {
-        work_scope_id: parsed_id,
-        lifecycle,
-        environment_kind,
+    resolved_work_scope_from_columns(
+        work_scope_id,
+        Some(raw_id),
+        Some(raw_lifecycle),
+        Some(raw_environment),
         cwd,
         worktree_path,
-        effective_path,
-        path_semantics: ServerPathSemantics::ServerFilesystem,
-    }
+    )
 }
 
 async fn resolve_reference_impl(
@@ -986,13 +1124,16 @@ async fn resolve_reference_impl(
             return Err(AppError::NotFound(id.to_string()));
         }
         let aggregate = snapshot.aggregate;
-        let current = aggregate
-            .segments
-            .last()
-            .expect("ordinary aggregate contains a segment")
-            .transcript_row
-            .conversation
-            .clone();
+        #[cfg(test)]
+        if let Some(hook) = &service.stable_resolution_test_hook {
+            hook.snapshot_read.add_permits(1);
+            hook.release
+                .acquire()
+                .await
+                .expect("test hook remains open")
+                .forget();
+        }
+        let current = resolve_current_member_and_work_scope(service, id).await?;
         return Ok(ResolveGlobalReferenceResponse {
             kind: "product_conversation".to_string(),
             id: typed_id.to_string(),
@@ -1004,7 +1145,7 @@ async fn resolve_reference_impl(
                 .clone()
                 .or(aggregate.root.conversation.title.clone())
                 .or(aggregate.root.conversation.slug.clone()),
-            work_scope: resolve_work_scope(service, &current).await,
+            work_scope: current.work_scope,
             summary: format!(
                 "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
                 aggregate.root.conversation.id,
@@ -2016,6 +2157,76 @@ mod tests {
                 cwd: Some("/server/root".to_string()),
                 worktree_path: Some("/server/root/worktree".to_string()),
                 effective_path: Some("/server/root/worktree".to_string()),
+                path_semantics: ServerPathSemantics::ServerFilesystem,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_resolution_keeps_current_member_and_scope_from_one_point_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stable-resolution.sqlite");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("race-root", "race-root", "/tmp/root", true, None, None)
+            .await
+            .unwrap();
+        let root = db.get_conversation("race-root").await.unwrap();
+        let product_id = root.product_conversation_id.clone();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = 'race-root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let hook = service.install_stable_resolution_test_hook();
+        let reference = format!("@conv:{product_id}");
+        let resolving = tokio::spawn(async move { service.resolve_reference(&reference).await });
+        hook.snapshot_read.acquire().await.unwrap().forget();
+
+        let successor = match db.continue_conversation("race-root").await.unwrap() {
+            crate::db::ContinueOutcome::Created(successor) => successor,
+            crate::db::ContinueOutcome::AlreadyContinued(successor) => {
+                panic!("unexpected existing continuation: {successor:?}")
+            }
+            crate::db::ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("unexpected parent state: {state_variant}")
+            }
+        };
+        hook.release.add_permits(1);
+        let response = resolving.await.unwrap().unwrap();
+
+        assert!(response
+            .summary
+            .contains(&format!("@transcript:{}", successor.id)));
+        assert_eq!(
+            response.work_scope,
+            ResolvedWorkScope::Available {
+                work_scope_id: successor.attached_work_scope_id.unwrap(),
+                lifecycle: phoenix_core::work_scope::WorkScopeLifecycle::Active,
+                environment_kind: ResolvedEnvironmentKind::UnownedCwd,
+                cwd: Some("/tmp/root".to_string()),
+                worktree_path: None,
+                effective_path: Some("/tmp/root".to_string()),
+                path_semantics: ServerPathSemantics::ServerFilesystem,
+            }
+        );
+
+        let historical = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()))
+            .resolve_reference("@transcript:race-root")
+            .await
+            .unwrap();
+        assert_eq!(historical.id, "race-root");
+        assert_eq!(
+            historical.work_scope,
+            ResolvedWorkScope::Available {
+                work_scope_id: root.attached_work_scope_id.unwrap(),
+                lifecycle: phoenix_core::work_scope::WorkScopeLifecycle::Active,
+                environment_kind: ResolvedEnvironmentKind::UnownedCwd,
+                cwd: Some("/tmp/root".to_string()),
+                worktree_path: None,
+                effective_path: Some("/tmp/root".to_string()),
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
