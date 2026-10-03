@@ -20,7 +20,7 @@ from pathlib import Path
 DEFAULT_ARTIFACTS = Path("conversation-search-benchmark")
 # Every named slow call is retained; duplicate IDs differing only in case are
 # rejected rather than silently collapsing two production observations.
-CALL_IDS = ["call_w7yaFJY51rJxTjog4DKeE2wo"]
+CALL_IDS = ["call_w7yaFJY51rJxTjog4DKeE2wo", "call_AHuEHesog7J4anh2hSiia6kh"]
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -60,7 +60,7 @@ def observed_call_ids():
     return list(dict.fromkeys(CALL_IDS + [item for item in configured.split(",") if item]))
 
 
-DEFAULT_QUERIES = ['production-observed-slow-query', 'broad-common-term', 'selective-uncommon-term', 'verified-no-hit']
+
 
 def _uri(path: Path) -> str:
     return f"file:{path.resolve()}?mode=ro"

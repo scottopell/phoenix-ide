@@ -724,11 +724,18 @@ mod tests {
                 }
                 hasher.update(&buffer[..read]);
             }
-            format!("{hasher:x}")
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
         }
 
         fn digest_bytes(bytes: &[u8]) -> String {
-            format!("{:x}", Sha256::digest(bytes))
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
         }
 
         let db_path = std::env::var("PHOENIX_SEARCH_BENCH_DB")
@@ -782,7 +789,6 @@ mod tests {
             let retriever = Arc::new(db.fts_retriever());
             retriever.mark_reconciled();
             let service = GlobalReadService::new(db.clone(), retriever.clone());
-            let tool = SearchConversations(service.clone());
             let context = context("benchmark");
             if explain {
                 let request = if is_retriever && is_scoped {
@@ -799,7 +805,7 @@ mod tests {
                                 })
                                 .unwrap_or_default(),
                         ),
-                        20,
+                        10,
                     )
                 } else {
                     service
@@ -829,8 +835,13 @@ mod tests {
                 &["tool", "retriever"]
             };
             for surface in surfaces {
+                let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+                let retriever = Arc::new(db.fts_retriever());
+                retriever.mark_reconciled();
+                let service = GlobalReadService::new(db.clone(), retriever.clone());
+                let tool = SearchConversations(service.clone());
                 for (phase, count) in [
-                    ("first_use_process_pool_cold", 1usize),
+                    ("first_use_fresh_pool_os_cache_uncontrolled", 1usize),
                     ("warmup_discarded", 1usize),
                     ("warm", 10usize),
                 ] {
@@ -888,7 +899,8 @@ mod tests {
                                     .run(serde_json::json!({"query": query}), context.clone())
                                     .await;
                                 let output = result.output().to_string();
-                                (result.is_success(), output, None, None)
+                                let count = (output == "No matching messages found.").then_some(0);
+                                (result.is_success(), output, count, None)
                             };
                             (ok, output, result_count, result_identity)
                         };
@@ -915,7 +927,7 @@ mod tests {
                         if !ok {
                             failures.push(format!("benchmark scenario {case_id} failed: {output}"));
                         }
-                        if expected == "no_hit" && output != "No matching messages found." {
+                        if expected == "no_hit" && result_count != Some(0) {
                             failures
                                 .push(format!("expected no-hit case {case_id}, got tool output"));
                         }
@@ -934,7 +946,7 @@ mod tests {
                        "journal_mode": "fixture-preserved", "read_only": true, "foreign_keys": true},
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
-            "measurement_regimes": ["first_use_process_pool_cold", "warm"],
+            "measurement_regimes": ["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
             "explain_plans": explain_plans, "explain_enabled": explain,
             "samples": samples});
         let output = serde_json::to_vec_pretty(&value).unwrap();
