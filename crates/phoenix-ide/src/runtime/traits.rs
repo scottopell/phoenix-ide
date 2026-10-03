@@ -83,6 +83,7 @@ pub struct ActiveDirectTurnSettlement {
     pub terminal: ActiveDirectTurnTerminal,
     pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
+    pub execution_occurrence_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1921,7 +1922,7 @@ impl MessageStore for DatabaseStorage {
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
         let repo = self.db.workflow_repository();
-        repo.terminalize_authoritative_turn(
+        repo.terminalize_authoritative_turn_with_occurrence(
             &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                 command: direct_turn_terminal_command(
                     &settlement.turn,
@@ -1936,6 +1937,7 @@ impl MessageStore for DatabaseStorage {
                     &settlement.state,
                 ),
             },
+            settlement.execution_occurrence_message_id.as_deref(),
         )
         .await
         .map(|_| ())

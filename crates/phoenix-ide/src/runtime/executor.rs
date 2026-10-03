@@ -3892,6 +3892,7 @@ where
                                     .clone(),
                                 state: self.state.clone(),
                                 state_updated_at: self.state_updated_at,
+                                execution_occurrence_message_id: None,
                             })
                         }
                         _ => None,
@@ -3987,6 +3988,7 @@ where
                             .clone(),
                         state: self.state.clone(),
                         state_updated_at: self.state_updated_at,
+                        execution_occurrence_message_id: None,
                     };
                     match self
                         .storage
@@ -4604,6 +4606,7 @@ where
             terminal: terminal.as_ref().clone(),
             state: self.state.clone(),
             state_updated_at: self.state_updated_at,
+            execution_occurrence_message_id: None,
         };
         let parent = self
             .turn_span
@@ -6421,6 +6424,7 @@ where
                                             },
                                             state: self.state.clone(),
                                             state_updated_at: self.state_updated_at,
+                                            execution_occurrence_message_id: None,
                                         },
                                     )
                                     .instrument(
@@ -6715,6 +6719,7 @@ where
                         terminal: terminal.clone(),
                         state: self.state.clone(),
                         state_updated_at: self.state_updated_at,
+                        execution_occurrence_message_id: None,
                     };
                     self.persist_checkpoint_with_terminal_obligation(data, &settlement, admitted)
                         .await
@@ -7234,6 +7239,7 @@ where
                     },
                     state: state.clone(),
                     state_updated_at,
+                    execution_occurrence_message_id: None,
                 })
                 .await?;
             self.state = state.clone();
@@ -8604,6 +8610,7 @@ where
                 terminal: terminal.clone(),
                 state: self.state.clone(),
                 state_updated_at: self.state_updated_at,
+                execution_occurrence_message_id: None,
             };
             return self
                 .persist_terminal_sub_agent_results(
@@ -21299,6 +21306,7 @@ mod steer_drain_detector_tests {
             terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
             state: ConvState::Idle,
             state_updated_at: Utc::now(),
+            execution_occurrence_message_id: None,
         };
         let mut rx = rt.broadcast_tx.subscribe();
         let data = CheckpointData::tool_round(

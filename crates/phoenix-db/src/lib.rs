@@ -7551,6 +7551,26 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Report whether an accepted interaction response still owns its first model response.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn has_interaction_response_execution_occurrence(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1 AND source_kind = 'interaction_response'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Return the source message for the latest adopted execution occurrence.
     ///
     /// # Errors
@@ -7750,7 +7770,13 @@ impl Database {
                ON occurrence.conversation_id = c.id
              JOIN messages source ON source.message_id = occurrence.message_id
              WHERE occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
-               AND c.state_kind IN ('idle', 'llm_requesting')
+               AND (
+                   c.state_kind IN ('idle', 'llm_requesting')
+                   OR (
+                       occurrence.source_kind = 'interaction_response'
+                       AND c.state_kind = 'awaiting_user_response'
+                   )
+               )
              ORDER BY c.created_at, c.id",
         )
         .fetch_all(&self.pool)

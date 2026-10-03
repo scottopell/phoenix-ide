@@ -1800,8 +1800,25 @@ impl WorkflowRepository {
         &self,
         input: &TerminalizeAuthoritativeTurnInput,
     ) -> DbResult<TurnStep> {
-        self.terminalize_authoritative_turn_at_cut(input, TransactionCut::None)
-            .await
+        self.terminalize_authoritative_turn_with_occurrence_at_cut(
+            input,
+            None,
+            TransactionCut::None,
+        )
+        .await
+    }
+
+    pub async fn terminalize_authoritative_turn_with_occurrence(
+        &self,
+        input: &TerminalizeAuthoritativeTurnInput,
+        execution_occurrence_message_id: Option<&str>,
+    ) -> DbResult<TurnStep> {
+        self.terminalize_authoritative_turn_with_occurrence_at_cut(
+            input,
+            execution_occurrence_message_id,
+            TransactionCut::None,
+        )
+        .await
     }
 
     pub async fn settle_failed_continuation_start_atomically(
@@ -2015,13 +2032,14 @@ impl WorkflowRepository {
         command: TurnCommand,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        self.terminalize_authoritative_turn_at_cut(
+        self.terminalize_authoritative_turn_with_occurrence_at_cut(
             &TerminalizeAuthoritativeTurnInput {
                 command,
                 projection: None,
                 provider_replay_settlement:
                     phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
             },
+            None,
             cut,
         )
         .await
@@ -2349,9 +2367,10 @@ impl WorkflowRepository {
         })
     }
 
-    async fn terminalize_authoritative_turn_at_cut(
+    async fn terminalize_authoritative_turn_with_occurrence_at_cut(
         &self,
         input: &TerminalizeAuthoritativeTurnInput,
+        execution_occurrence_message_id: Option<&str>,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
         let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
@@ -2371,6 +2390,11 @@ impl WorkflowRepository {
                 self.terminalize_authoritative_turn_in_tx(&mut tx, input),
             )
             .await?;
+        if !matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
+            if let Some(message_id) = execution_occurrence_message_id {
+                settle_exact_execution_occurrence_tx(&mut tx.tx, input, message_id).await?;
+            }
+        }
         if cut == TransactionCut::BeforeCommit {
             telemetry
                 .observe_rollback_db(transaction_timing, tx.rollback())
@@ -2937,6 +2961,49 @@ fn terminal_from_sql(
             "unknown direct-turn terminal kind: {other}"
         ))),
     }
+}
+
+async fn settle_exact_execution_occurrence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &TerminalizeAuthoritativeTurnInput,
+    message_id: &str,
+) -> DbResult<()> {
+    let (turn_id, _, terminal) = terminal_command_parts(&input.command)?;
+    let (terminal_kind, terminal_reason) = match &terminal {
+        TurnTerminal::Completed => ("Completed", None),
+        TurnTerminal::Cancelled => ("Cancelled", None),
+        TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+    };
+    let occurrence = sqlx::query_as::<_, (String, String)>(
+        "SELECT occurrence.source_kind, occurrence.conversation_id
+         FROM steering_execution_occurrences occurrence
+         WHERE occurrence.message_id = ?1
+           AND occurrence.conversation_id = (
+               SELECT conversation_id FROM durable_turns WHERE turn_id = ?2
+           )",
+    )
+    .bind(message_id)
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((source_kind, conversation_id)) = occurrence else {
+        return Ok(());
+    };
+    let source_kind = crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+    crate::coordinator_watches::record_steering_event_tx(
+        tx,
+        source_kind,
+        message_id,
+        &conversation_id,
+        terminal_kind,
+        terminal_reason,
+    )
+    .await?;
+    sqlx::query("DELETE FROM steering_execution_occurrences WHERE message_id = ?1")
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
@@ -5200,7 +5267,11 @@ mod tests {
         };
 
         assert!(repo
-            .terminalize_authoritative_turn_at_cut(&input, TransactionCut::BeforeCommit)
+            .terminalize_authoritative_turn_with_occurrence_at_cut(
+                &input,
+                None,
+                TransactionCut::BeforeCommit,
+            )
             .await
             .is_err());
         let after_cut = repo
