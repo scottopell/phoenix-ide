@@ -575,14 +575,18 @@ def snapshot(args) -> int:
             conn.close()
         if not validated:
             tmp.unlink(missing_ok=True)
-    manifest = {'kind':'conversation-search-fixture','source_path':str(source),
-      'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':tmp.stat().st_size,
-      'sha256':_hash(tmp),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
-      'logical_size_bytes':logical_size,'page_size_bytes':page_size,
-      'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
-      'recovered_queries':recovered_queries,'backup_progress':progress,
-      'backup_deadline_seconds':deadline_seconds}
-    _write_atomic_private(outdir / ".capture-pending", "initial capture staged\n")
+    try:
+        manifest = {'kind':'conversation-search-fixture','source_path':str(source),
+          'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':tmp.stat().st_size,
+          'sha256':_hash(tmp),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
+          'logical_size_bytes':logical_size,'page_size_bytes':page_size,
+          'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
+          'recovered_queries':recovered_queries,'backup_progress':progress,
+          'backup_deadline_seconds':deadline_seconds}
+        _write_atomic_private(outdir / ".capture-pending", "initial capture staged\n")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     try:
         os.replace(tmp, dest)
         os.chmod(dest, 0o600)
@@ -846,7 +850,7 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "tool_oracle_regime", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "tool_oracle_regime", "fixture_validation", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
@@ -907,7 +911,7 @@ def compare(args) -> int:
     validated_b = _validate_run(b, "after")
     if a["run_uuid"] == b["run_uuid"]:
         raise SystemExit("refusing comparison: same execution identity")
-    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "measurement_regimes")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "fixture_validation", "measurement_regimes")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
     if validated_a["phases"].keys() != validated_b["phases"].keys() or set(map(tuple, a["expected_case_surface_set"])) != set(map(tuple, validated_a["phases"])):

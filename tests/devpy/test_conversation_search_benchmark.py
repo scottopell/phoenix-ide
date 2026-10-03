@@ -37,7 +37,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
             "explain_plans": [], "samples": samples,
-            "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
+            "fixture_validation":{"index_fresh":True}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
         value.update(overrides)
         return value
