@@ -7576,6 +7576,7 @@ impl Database {
     pub async fn project_execution_occurrence_requesting(
         &self,
         conversation_id: &str,
+        source_message_id: &str,
         state: &ConvState,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -7583,10 +7584,12 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM steering_execution_occurrences
                  WHERE conversation_id = ?1
+                   AND message_id = ?2
                    AND source_kind IN ('wake', 'seeded_fork', 'interaction_response')
              )",
         )
         .bind(conversation_id)
+        .bind(source_message_id)
         .fetch_one(&mut *tx)
         .await?;
         if !exists {
@@ -7619,9 +7622,22 @@ impl Database {
     pub async fn settle_execution_occurrence(
         &self,
         conversation_id: &str,
+        source_message_id: &str,
         state: &ConvState,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let deleted = sqlx::query(
+            "DELETE FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
+        .await?;
+        if deleted.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
@@ -7636,9 +7652,57 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
-        record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Atomically project an exact active direct turn to `LlmRequesting`.
+    ///
+    /// # Errors
+    /// Returns a database error if the projection fails.
+    pub async fn project_active_direct_turn_requesting(
+        &self,
+        conversation_id: &str,
+        turn_id: u64,
+        generation: u64,
+        state: &ConvState,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM durable_turns
+                 WHERE conversation_id = ?1
+                   AND turn_id = ?2
+                   AND generation = ?3
+                   AND owns_conversation = 1
+                   AND terminal_kind IS NULL
+             )",
+        )
+        .bind(conversation_id)
+        .bind(i64::try_from(turn_id).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .bind(i64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// List conversations whose adopted wake, seeded fork, or accepted

@@ -3888,11 +3888,16 @@ impl RuntimeManager {
         if !has_occurrence || needs_resume {
             return Ok(false);
         }
-        self.db
-            .settle_execution_occurrence(conversation_id, &ConvState::Idle)
+        let source_message_id = self
+            .db
+            .latest_execution_occurrence_message_id(conversation_id)
             .await
-            .map_err(|error| error.to_string())?;
-        Ok(true)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "execution occurrence disappeared before settlement".to_string())?;
+        self.db
+            .settle_execution_occurrence(conversation_id, &source_message_id, &ConvState::Idle)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn execution_occurrence_needs_resume(
@@ -4015,10 +4020,9 @@ impl RuntimeManager {
 
     async fn persist_restart_loop_failure(&self, conversation_id: &str) -> Result<(), String> {
         let storage = DatabaseStorage::new(self.db.clone());
-        let turn = storage
-            .load_active_direct_turn(conversation_id)
-            .await?
-            .ok_or_else(|| "restart-loop baton lost its active direct-turn owner".to_string())?;
+        let Some(turn) = storage.load_active_direct_turn(conversation_id).await? else {
+            return Ok(());
+        };
         let message =
             "Automatic restart recovery stopped after repeated crashes in the same user turn."
                 .to_string();
@@ -5736,27 +5740,54 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
+        let occurrence_source_message_id = self
+            .db
+            .latest_execution_occurrence_message_id(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut has_resumable_occurrence = self
             .execution_occurrence_needs_resume(conversation_id)
             .await?;
-        if recovered_terminal_obligation.is_none()
-            && initial_state != conv.state
-            && has_resumable_occurrence
-            && !self
-                .db
-                .project_execution_occurrence_requesting(conversation_id, &initial_state)
-                .await
-                .map_err(|error| error.to_string())?
-        {
-            let committed = self
-                .db
-                .get_conversation(conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            initial_state = committed.state;
-            initial_state_updated_at = committed.state_updated_at;
-            needs_auto_continue = false;
-            has_resumable_occurrence = false;
+        if recovered_terminal_obligation.is_none() && initial_state != conv.state {
+            let projected = if has_resumable_occurrence {
+                self.db
+                    .project_execution_occurrence_requesting(
+                        conversation_id,
+                        occurrence_source_message_id.as_deref().ok_or_else(|| {
+                            "resumable execution occurrence lost its source identity".to_string()
+                        })?,
+                        &initial_state,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else if needs_auto_continue {
+                if let Some(turn) = active_direct_turn.as_ref() {
+                    self.db
+                        .project_active_direct_turn_requesting(
+                            conversation_id,
+                            turn.active().turn_id.0,
+                            turn.active().generation,
+                            &initial_state,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            if !projected {
+                let committed = self
+                    .db
+                    .get_conversation(conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                initial_state = committed.state;
+                initial_state_updated_at = committed.state_updated_at;
+                needs_auto_continue = false;
+                has_resumable_occurrence = false;
+            }
         }
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
@@ -5791,14 +5822,13 @@ impl RuntimeManager {
                 .has_committed_steering_turn(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-        let startup_llm_recovery =
-            if needs_auto_continue && active_direct_turn.is_some() && !has_resumable_occurrence {
-                crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
-            } else if resumable_owner {
-                crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
-            } else {
-                crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
-            };
+        let startup_llm_recovery = if needs_auto_continue && active_direct_turn.is_some() {
+            crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
+        } else if resumable_owner {
+            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+        } else {
+            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+        };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
             let active = loaded.into_active();

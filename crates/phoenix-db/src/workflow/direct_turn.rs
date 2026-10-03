@@ -2518,7 +2518,10 @@ impl WorkflowRepository {
                        JOIN messages source ON source.message_id = occurrence.message_id
                        JOIN messages turn_input ON turn_input.message_id = ?2
                        WHERE occurrence.conversation_id = ?1
-                         AND source.sequence_id <= turn_input.sequence_id
+                         AND (
+                           occurrence.source_kind = 'interaction_response'
+                           OR source.sequence_id <= turn_input.sequence_id
+                         )
                    )",
             )
             .bind(&turn.conversation.0)
