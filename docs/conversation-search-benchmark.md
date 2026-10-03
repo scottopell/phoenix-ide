@@ -143,9 +143,9 @@ and diagnostic run), Rust test-target compilation, formatting, and task
 validation pass. Full workspace tests/clippy are not claimed. SQLite fields
 in raw runs describe configured read-only pool policy, not a complete live
 PRAGMA measurement; `verification.json` labels offline Python PRAGMA reads
-separately. Captured index row counts agree, but a full content-fingerprint
-freshness sweep was not performed and the read-only harness deliberately does
-not rebuild the captured index.
+separately. Older fe2 runs only checked index row counts. Actual063a paired qualification
+performed the full read-only content-fingerprint and physical-mapping sweep;
+current source still validates freshness without rebuilding the captured index.
 
 ## Corrected historical qualification and current source boundary
 
@@ -177,3 +177,8 @@ This dismisses that specific unsupported reproducer claim, not every possible
 workload regression. Schema/provenance constants and corpus content are
 synthetic; no production data or indices were mutated. Residual global
 performance variation and lack of live19s reproduction remain as above.
+
+Current first-sample label explicitly excludes eager pool/connection setup; it is
+a first retrieval after pool setup with uncontrolled OS cache, not cold-start latency.
+Representative broad/selective candidates must have eligible hits under the actual
+service request before their sequences. No additional measurement campaign performed.
