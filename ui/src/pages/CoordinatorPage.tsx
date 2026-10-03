@@ -51,7 +51,7 @@ function GlobalActiveWatches() {
           </div>
           {watch.project_path && <code>{watch.project_path}</code>}
           <div>
-            <Link to={`/c/${watch.transcript_slug || watch.transcript_id}`}>current transcript</Link>
+            <Link to={`/c/${encodeURIComponent(watch.transcript_slug || watch.transcript_id)}`}>current transcript</Link>
             <code title="ProductConversation ID">{watch.product_conversation_id}</code>
           </div>
         </div>

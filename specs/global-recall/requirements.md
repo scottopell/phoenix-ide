@@ -35,7 +35,7 @@ WHEN the Coordinator evaluates current Phoenix activity
 THE SYSTEM SHALL provide bounded relational facts rather than application-inferred open, stalled, or attention classifications
 
 WHEN a user opens the Coordinator surface
-THE surface SHALL present only the normal Coordinator conversation
+THE surface SHALL present the normal Coordinator conversation together with only the bounded subordinate activity surfaces admitted by REQ-GR-010
 
 THE facts SHALL distinguish durable ProductConversation identity, derived root transcript-row identity, and latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 

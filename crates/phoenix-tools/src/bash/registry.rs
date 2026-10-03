@@ -677,6 +677,28 @@ impl BashHandleRegistry {
         self.handles_by_id.read().await.get(handle_id).cloned()
     }
 
+    /// Signals only while the handle remains registered under the same controller scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the incarnation-bound signaling error from the handle.
+    pub async fn signal_exact_registered_handle(
+        &self,
+        handle_id: &HandleId,
+        controller_scope: &ResourceScopeKey,
+        signal: i32,
+    ) -> Result<bool, std::io::Error> {
+        let by_id = self.handles_by_id.read().await;
+        let Some(registered) = by_id.get(handle_id) else {
+            return Ok(false);
+        };
+        if registered.handle.controller_scope != *controller_scope {
+            return Ok(false);
+        }
+        registered.handle.signal_live_incarnation(signal).await?;
+        Ok(true)
+    }
+
     #[doc(hidden)]
     pub async fn register_existing_handle(&self, owner: &ResourceScopeKey, handle: Arc<Handle>) {
         let entry = self.get_or_create(owner).await;

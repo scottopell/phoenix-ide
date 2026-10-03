@@ -1336,24 +1336,13 @@ pub async fn stop_exact_handle_for_scope(
     owner: &phoenix_core::work_scope::ResourceScopeKey,
     handle_id: &str,
 ) -> Result<(), BashError> {
-    let registered = registry
-        .get_by_id(&HandleId::new(handle_id.to_string()))
-        .await
-        .ok_or_else(|| BashError::HandleNotFound {
-            handle_id: handle_id.to_string(),
-        })?;
-    if &registered.handle.controller_scope != owner {
-        return Err(BashError::HandleNotFound {
-            handle_id: handle_id.to_string(),
-        });
-    }
-    registered
-        .handle
-        .signal_live_incarnation(libc::SIGTERM)
+    registry
+        .signal_exact_registered_handle(&HandleId::new(handle_id.to_string()), owner, libc::SIGTERM)
         .await
         .map_err(|error| BashError::SpawnFailed {
             error_message: error.to_string(),
         })?
+        .then_some(())
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
         })?;
