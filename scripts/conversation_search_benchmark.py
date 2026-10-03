@@ -211,7 +211,7 @@ def _write_atomic_private(path: Path, text: str) -> None:
 
 
 
-def _uri(path: Path) -> str:
+def _uri(path: Path, *, immutable: bool = False) -> str:
     return f"{path.resolve().as_uri()}?mode=ro"
 
 def _hash(path: Path) -> str:
@@ -565,7 +565,7 @@ def snapshot(args) -> int:
     conn = None
     validated = False
     try:
-        conn = sqlite3.connect(_uri(tmp), uri=True, timeout=args.busy_timeout)
+        conn = sqlite3.connect(_uri(tmp, immutable=True), uri=True, timeout=args.busy_timeout)
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise SystemExit(f"snapshot integrity check failed: {integrity}")
@@ -613,7 +613,7 @@ def prepare(args) -> int:
         raise SystemExit('captured.db does not match capture manifest')
     if Path(capture.get('source_path', '')).resolve() == db:
         raise SystemExit('refusing to benchmark the capture source directly')
-    conn=sqlite3.connect(_uri(db), uri=True); recovered=_recover_queries(conn)
+    conn=sqlite3.connect(_uri(db, immutable=True), uri=True); recovered=_recover_queries(conn)
     if not recovered: raise SystemExit('named production call query was not recovered; refusing to invent a baseline')
     if len(recovered) < 2:
         raise SystemExit(
@@ -631,7 +631,7 @@ def prepare(args) -> int:
         raise SystemExit("broad candidate has fewer than1000matches; choose a representative fixture")
     selective_query = _selective_term(conn, exact)
     nohit_query = "phoenixbenchmarknosuchterm9f3c2"
-    if conn.execute("SELECT count(*) FROM message_fts WHERE message_fts MATCH ?", (nohit_query,)).fetchone()[0] != 0:
+    if conn.execute("SELECT count(*) FROM message_fts WHERE message_fts MATCH ?",('"' + nohit_query + '"*',)).fetchone()[0] != 0:
         raise SystemExit("no-hit candidate exists in fixture; refusing unverified scenario")
     scenarios=[
       {'id':'observed-slow-exact','kind':'tool','query':exact,'source_call_id':recovered[0]['source_call_id'],'expected':'hit'},
