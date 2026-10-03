@@ -333,11 +333,16 @@ def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
     for call_id in _recover_fallback_call_ids(conn, columns):
         if call_id.casefold() in seen_ids:
             continue
+        replacement_transcript = os.environ.get("PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT")
+        if "conversation_id" in columns and "created_at" in columns and not replacement_transcript:
+            raise SystemExit("replacement calls require PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT for bounded recovery")
+        predicate = "conversation_id = ? AND (content LIKE ? OR display_data LIKE ?)" if replacement_transcript else "content LIKE ? OR display_data LIKE ?"
+        params = (replacement_transcript, f"%{call_id}%", f"%{call_id}%", RECOVERY_MESSAGE_LIMIT) if replacement_transcript else (f"%{call_id}%", f"%{call_id}%", RECOVERY_MESSAGE_LIMIT)
         rows = conn.execute(
             f"SELECT {conversation},message_id,content,display_data FROM messages "
-            "WHERE content LIKE ? OR display_data LIKE ? "
+            f"WHERE {predicate} "
             f"ORDER BY {order} LIMIT ?",
-            (f"%{call_id}%", f"%{call_id}%", RECOVERY_MESSAGE_LIMIT),
+            params,
         ).fetchall()
         _recover_from_rows(rows, call_id, found, seen_ids)
     return found
@@ -881,6 +886,10 @@ def _validate_run(run: dict, name: str) -> dict:
     phases = {}
     for sample in run["samples"]:
         key = (sample.get("case_id"), sample.get("surface"))
+        count = sample.get("result_count")
+        identity = sample.get("result_identity")
+        if not isinstance(count, int) or count < 0 or not isinstance(identity, list) or len(identity) != count:
+            raise SystemExit(f"refusing comparison: {name} missing count/order evidence")
         digest = sample.get("result_digest")
         phase = sample.get("phase")
         if not key[0] or not key[1] or not digest or not phase:

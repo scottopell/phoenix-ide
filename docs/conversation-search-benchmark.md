@@ -74,11 +74,11 @@ the guard. See the baseline summary below.
 
 Two production calls are preconfigured (19.058 s and 11.890 s tool durations).
 Scenario preparation requires both exact query inputs to be recovered and
-refuses to substitute a duplicate. The selective case is a candidate term
-from the observed query, not yet proven selective; verify its result count
-and match breadth when the snapshot is available before treating it as a
-selectivity contrast. Captured FTS freshness is assumed for read-only runs;
-no reconciliation is performed or freshness guarantee fabricated.
+refuses to substitute a duplicate. Older fe2 runs lacked full freshness and
+selectivity qualification. Actual063a historical pair validated fingerprints;
+current source validates eligible representative cases but has not been remeasured.
+Replacement call recovery requires an exact transcript in
+`PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT`, avoiding full-corpus content scans.
 
 ## Baseline: 2026-10-03
 

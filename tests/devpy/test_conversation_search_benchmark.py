@@ -17,12 +17,12 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def _complete_run(**overrides):
         samples = [
             {"case_id": "case", "surface": "tool", "phase": "first_use_fresh_pool_os_cache_uncontrolled", "iteration": 0,
-             "ok": True, "result_digest": "one", "duration_ms": 100},
+             "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 100},
             {"case_id": "case", "surface": "tool", "phase": "warmup_discarded", "iteration": 0,
-             "ok": True, "result_digest": "one", "duration_ms": 100},
+             "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 100},
             *[
                 {"case_id": "case", "surface": "tool", "phase": "warm", "iteration": i,
-                 "ok": True, "result_digest": "one", "duration_ms": i + 1}
+                 "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": i + 1}
                 for i in range(10)
             ],
         ]
@@ -81,7 +81,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         conn.execute("INSERT INTO messages VALUES (?, ?, ?, NULL, ?)", (
             "replacement", "replacement-message", json.dumps({"tool_use_id": replacement, "query": "replacement query"}), 2))
         conn.commit()
-        with mock.patch.dict("os.environ", {"PHOENIX_SEARCH_CALL_IDS": replacement}):
+        with mock.patch.dict("os.environ", {"PHOENIX_SEARCH_CALL_IDS": replacement, "PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT":"replacement"}):
             recovered = bench._recover_queries(conn)
         self.assertEqual([item["query"] for item in recovered], ["known query", "replacement query"])
 
@@ -221,7 +221,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 {"tool_use_id": "other-call", "query": "must not leak"},
             ]}), 1))
         conn.commit()
-        self.assertEqual(bench._recover_queries(conn)[0]["query"], "the exact query")
+        with mock.patch.dict("os.environ", {"PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT":"conv"}):
+            self.assertEqual(bench._recover_queries(conn)[0]["query"], "the exact query")
 
     def test_recovery_decodes_serialized_arguments(self):
         conn = sqlite3.connect(":memory:")
@@ -230,7 +231,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "conv", "msg", json.dumps({"tool_use_id": bench.CALL_IDS[0],
                                         "arguments": json.dumps({"query": "decoded query"})}), 1))
         conn.commit()
-        self.assertEqual(bench._recover_queries(conn)[0]["query"], "decoded query")
+        with mock.patch.dict("os.environ", {"PHOENIX_SEARCH_REPLACEMENT_TRANSCRIPT":"conv"}):
+            self.assertEqual(bench._recover_queries(conn)[0]["query"], "decoded query")
 
     def test_recovery_known_transcript_uses_bounded_conversation_lookup(self):
         conn = sqlite3.connect(":memory:")
@@ -290,7 +292,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             runs.mkdir()
             samples = self._complete_run()["samples"]
             samples.append({"case_id": "case", "surface": "retriever", "phase": "warmup_discarded",
-                            "iteration": 0, "ok": True, "result_digest": "one", "duration_ms": 999})
+                            "iteration": 0, "ok": True, "result_count":1, "result_identity":["id"], "result_digest": "one", "duration_ms": 999})
             (runs / "suite-1.json").write_text(json.dumps(self._complete_run(samples=samples)))
             bench.report(type("Args", (), {"artifacts": str(root)})())
             report = (root / "report.md").read_text()
