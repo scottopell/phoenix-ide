@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import time
@@ -19,8 +20,15 @@ from pathlib import Path
 
 DEFAULT_ARTIFACTS = Path("conversation-search-benchmark")
 # Every named slow call is retained; duplicate IDs differing only in case are
-# rejected rather than silently collapsing two production observations.
-CALL_IDS = ["call_w7yaFJY51rJxTjog4DKeE2wo", "call_AHuEHesog7J4anh2hSiia6kh"]
+# rejected rather than silently collapsing two production observations. Known
+# transcript ids let capture use the indexed conversation_id column rather than
+# scanning every content blob in a multi-gigabyte database.
+KNOWN_CALLS = [
+    {"conversation_id": "9bc3b72d", "prefix": True, "call_id": "call_w7yaFJY51rJxTjog4DKeE2wo"},
+    {"conversation_id": "ca640950-4b82-4499-a1af-9846827f29dc", "call_id": "call_AHuEHesog7J4anh2hSiia6kh"},
+]
+CALL_IDS = [item["call_id"] for item in KNOWN_CALLS]
+RECOVERY_MESSAGE_LIMIT = 2_000
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -73,14 +81,24 @@ def _hash(path: Path) -> str:
     return h.hexdigest()
 
 def _json_strings(value):
-    """Yield query-shaped strings in a single tool block only."""
+    """Yield query strings from one tool block, decoding serialized arguments."""
     if isinstance(value, dict):
-        for key in ("query", "input", "arguments"):
+        for key in ("query", "input"):
             candidate = value.get(key)
             if isinstance(candidate, str):
                 yield candidate
             elif isinstance(candidate, (dict, list)):
                 yield from _json_strings(candidate)
+        arguments = value.get("arguments")
+        if isinstance(arguments, (dict, list)):
+            yield from _json_strings(arguments)
+        elif isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (dict, list)):
+                yield from _json_strings(decoded)
         # Do not recurse through arbitrary sibling blocks: a message may contain
         # several tool calls and recovering a query from the wrong one is worse
         # than refusing to make a baseline.
@@ -90,61 +108,94 @@ def _json_strings(value):
 
 
 
-def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
-    found = []
-    seen_ids = set()
-    for call_id in observed_call_ids():
-        try:
-            rows = conn.execute(
-                "SELECT conversation_id,message_id,content,display_data FROM messages "
-                "WHERE content LIKE ? OR display_data LIKE ? ORDER BY created_at, message_id",
-                (f"%{call_id}%", f"%{call_id}%"),
-            ).fetchall()
-        except sqlite3.OperationalError as error:
-            if "no such table: messages" in str(error):
-                return found
-            rows = conn.execute(
-                "SELECT NULL,message_id,content,display_data FROM messages "
-                "WHERE content LIKE ? OR display_data LIKE ? ORDER BY message_id",
-                (f"%{call_id}%", f"%{call_id}%"),
-            ).fetchall()
-        for conversation_id, message_id, content, display_data in rows:
-            for raw in (content, display_data):
-                try:
-                    parsed = json.loads(raw) if raw else None
-                except (TypeError, ValueError):
-                    continue
-                # Only inspect the exact object/list containing this call id.
-                # Sibling tool blocks in the same message must not contribute.
-                def matching_blocks(value):
-                    if isinstance(value, dict):
-                        direct_ids = {
-                            value.get(key)
-                            for key in ("tool_use_id", "tool_call_id", "id")
-                            if isinstance(value.get(key), str)
-                        }
-                        if call_id in direct_ids:
-                            yield value
-                        else:
-                            for item in value.values():
-                                yield from matching_blocks(item)
-                    elif isinstance(value, list):
-                        for item in value:
-                            yield from matching_blocks(item)
+def _message_columns(conn: sqlite3.Connection) -> set[str]:
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    except sqlite3.Error:
+        return set()
 
-                for block in matching_blocks(parsed):
-                    query = next(iter(_json_strings(block)), None)
-                    if query and query.strip() and call_id.lower() not in seen_ids:
-                        found.append(
-                            {
-                                "query": query,
-                                "source_call_id": call_id,
-                                "conversation_id": conversation_id,
-                                "message_id": message_id,
-                            }
-                        )
-                        seen_ids.add(call_id.lower())
-                        break
+
+def _recover_from_rows(rows, call_id: str, found: list[dict], seen_ids: set[str]) -> None:
+    for conversation_id, message_id, content, display_data in rows:
+        for raw in (content, display_data):
+            try:
+                parsed = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                continue
+
+            def matching_blocks(value):
+                if isinstance(value, dict):
+                    direct_ids = {
+                        value.get(key)
+                        for key in ("tool_use_id", "tool_call_id", "id")
+                        if isinstance(value.get(key), str)
+                    }
+                    if call_id in direct_ids:
+                        yield value
+                    else:
+                        for item in value.values():
+                            yield from matching_blocks(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        yield from matching_blocks(item)
+
+            for block in matching_blocks(parsed):
+                query = next(iter(_json_strings(block)), None)
+                if query and query.strip() and call_id.lower() not in seen_ids:
+                    found.append({
+                        "query": query,
+                        "source_call_id": call_id,
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                    })
+                    seen_ids.add(call_id.lower())
+                    return
+
+
+def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
+    """Recover named calls using bounded indexed transcript lookups when known."""
+    found: list[dict] = []
+    seen_ids: set[str] = set()
+    columns = _message_columns(conn)
+    if not columns:
+        return found
+
+    if "conversation_id" in columns:
+        # The first production id is intentionally a stable prefix; the second
+        # is already a complete UUID. Both predicates remain indexable and are
+        # bounded to a small transcript window.
+        known_rows = False
+        for item in KNOWN_CALLS:
+            predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id LIKE ?"
+            value = item["conversation_id"] + "%" if item.get("prefix") else item["conversation_id"]
+            if conn.execute(f"SELECT 1 FROM messages WHERE {predicate} LIMIT 1", (value,)).fetchone():
+                known_rows = True
+                break
+        if known_rows:
+            order = "created_at, message_id" if "created_at" in columns else "message_id"
+            for item in KNOWN_CALLS:
+                predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id LIKE ?"
+                value = item["conversation_id"] + "%" if item.get("prefix") else item["conversation_id"]
+                rows = conn.execute(
+                    f"SELECT conversation_id,message_id,content,display_data FROM messages "
+                    f"WHERE {predicate} ORDER BY {order} LIMIT ?",
+                    (value, RECOVERY_MESSAGE_LIMIT),
+                ).fetchall()
+                _recover_from_rows(rows, item["call_id"], found, seen_ids)
+            return found
+
+    # Synthetic fixtures and older schemas retain the LIKE fallback so tests can
+    # exercise recovery without manufacturing production transcript ids.
+    conversation = "conversation_id" if "conversation_id" in columns else "NULL"
+    order = "created_at, message_id" if "created_at" in columns else "message_id"
+    for call_id in observed_call_ids():
+        rows = conn.execute(
+            f"SELECT {conversation},message_id,content,display_data FROM messages "
+            "WHERE content LIKE ? OR display_data LIKE ? "
+            f"ORDER BY {order} LIMIT ?",
+            (f"%{call_id}%", f"%{call_id}%", RECOVERY_MESSAGE_LIMIT),
+        ).fetchall()
+        _recover_from_rows(rows, call_id, found, seen_ids)
     return found
 
 def _counts(conn):
@@ -261,8 +312,11 @@ def prepare(args) -> int:
       {'id':'scoped-existing-transcript','kind':'retriever','scope':'conversation','query':exact,'conversation_ids':ids,'expected':'hit'},
     ]
     conn.close()
-    _write_private(outdir/'scenarios.json', json.dumps({'version':1,'scenarios':scenarios},indent=2)+'\n')
-    print(f'wrote frozen scenarios: {outdir/"scenarios.json"}'); return 0
+    scenarios_path = outdir/'scenarios.json'
+    if scenarios_path.exists() and not getattr(args, "force", False):
+        raise SystemExit(f'frozen scenarios exist (use --force only to replace): {scenarios_path}')
+    _write_private(scenarios_path, json.dumps({'version':1,'scenarios':scenarios},indent=2)+'\n')
+    print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
 def run(args) -> int:
     outdir=Path(args.artifacts).expanduser().resolve(); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
@@ -289,10 +343,39 @@ def run(args) -> int:
         PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
         PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor(),
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
+    process = subprocess.Popen(
+        cmd,
+        cwd=Path(__file__).parents[1],
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
     try:
-        subprocess.run(cmd,cwd=Path(__file__).parents[1],env=env,check=True,timeout=args.timeout)
+        process.wait(timeout=args.timeout)
     except subprocess.TimeoutExpired as error:
-        raise SystemExit(f'benchmark timed out after {args.timeout}s; child process was stopped') from error
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        else:
+            process.kill()
+            process.wait()
+        failure = {
+            "kind": "conversation-search-benchmark-failure",
+            "run_label": label,
+            "status": "outer_timeout",
+            "timeout_seconds": args.timeout,
+            "command": cmd,
+            "recorded_at_unix": time.time(),
+        }
+        failures_dir = result_dir / "failures"
+        _private(failures_dir)
+        _write_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
+        raise SystemExit(f'benchmark timed out after {args.timeout}s; process group was stopped') from error
+    if process.returncode:
+        raise SystemExit(f'benchmark failed with exit status {process.returncode}')
     print(output); return 0
 
 def _median(values):
@@ -317,16 +400,25 @@ def report(args) -> int:
     files = sorted((outdir / "runs").glob("*.json"))
     if not files:
         raise SystemExit("no run results")
-    runs = [json.loads(path.read_text()) for path in files]
-    rows = [sample for run in runs for sample in run.get("samples", [])]
+    runs = [(path, json.loads(path.read_text())) for path in files]
+    rows = []
+    for path, run in runs:
+        run_label = run.get("run_label") or path.stem
+        for sample in run.get("samples", []):
+            # The Rust harness emits one warmup invocation per case/surface.
+            # Keep failed warmups visible, but never let successful warmups
+            # influence the report's timings or counts.
+            if sample.get("phase") == "warmup_discarded" and sample.get("ok"):
+                continue
+            rows.append((run_label, path.name, sample))
     by = {}
-    for sample in rows:
-        by.setdefault((sample["case_id"], sample.get("phase", "unknown")), []).append(sample)
+    for run_label, filename, sample in rows:
+        by.setdefault((run_label, filename, sample["case_id"], sample.get("surface", "unknown"), sample.get("phase", "unknown")), []).append(sample)
     lines = ["# Conversation search benchmark report", "", f"raw files: {len(files)}", ""]
-    for (case, phase), values in by.items():
+    for (run_label, filename, case, surface, phase), values in by.items():
         durations = [x["duration_ms"] for x in values if x.get("ok")]
         errors = [x.get("error", x.get("result")) for x in values if not x.get("ok")]
-        lines += [f"## {case} — {phase}", f"samples: {len(values)} successful: {len(durations)}"]
+        lines += [f"## {run_label} / {filename} — {case} — {surface} — {phase}", f"samples: {len(values)} successful: {len(durations)}"]
         if durations:
             lines.append(
                 f"median_ms: {_median(durations):.3f} min_ms: {min(durations):.3f} "
@@ -339,38 +431,67 @@ def report(args) -> int:
     print(outdir / "report.md")
     return 0
 
+def _metadata_has_values(value) -> bool:
+    if isinstance(value, dict):
+        return bool(value) and all(_metadata_has_values(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(_metadata_has_values(item) for item in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None
+
+
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "samples"}
+    required = {"fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "explain_plans", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
+    for key in required - {"samples", "explain_plans"}:
+        if not _metadata_has_values(run[key]):
+            raise SystemExit(f"refusing comparison: {name} has empty metadata: {key}")
+    if run["explain_enabled"] and not _metadata_has_values(run["explain_plans"]):
+        raise SystemExit(f"refusing comparison: {name} has empty metadata: explain_plans")
     if not isinstance(run["samples"], list) or not run["samples"]:
         raise SystemExit(f"refusing comparison: {name} has no samples")
     digests = {}
+    phases = {}
     for sample in run["samples"]:
         key = (sample.get("case_id"), sample.get("surface"))
         digest = sample.get("result_digest")
-        if not key[0] or not key[1] or not digest:
+        phase = sample.get("phase")
+        if not key[0] or not key[1] or not digest or not phase:
             raise SystemExit(f"refusing comparison: {name} has incomplete sample output metadata")
+        if sample.get("ok") is not True:
+            raise SystemExit(f"refusing comparison: {name} has errors/timeouts for {key[0]} ({key[1]})")
+        if not isinstance(sample.get("duration_ms"), (int, float)):
+            raise SystemExit(f"refusing comparison: {name} has invalid duration for {key[0]} ({key[1]})")
         prior = digests.setdefault(key, digest)
         if prior != digest:
             raise SystemExit(f"refusing comparison: output mismatch for {key[0]} ({key[1]}) in {name}")
-    return digests
+        phases.setdefault(key, {}).setdefault(phase, []).append(sample)
+    expected_warm = run["measured_warm_runs"]
+    if expected_warm != 10:
+        raise SystemExit(f"refusing comparison: {name} must declare exactly 10 measured warm runs")
+    for key, by_phase in phases.items():
+        warm = by_phase.get("warm", [])
+        iterations = sorted(sample.get("iteration") for sample in warm)
+        if len(warm) != 10 or iterations != list(range(10)):
+            raise SystemExit(f"refusing comparison: {name} has incomplete warm iterations for {key[0]} ({key[1]})")
+    return {"digests": digests, "phases": phases}
 
 
 def compare(args) -> int:
     a = json.loads(Path(args.before).read_text())
     b = json.loads(Path(args.after).read_text())
-    digests_a = _validate_run(a, "before")
-    digests_b = _validate_run(b, "after")
-    keys = ("fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs")
+    validated_a = _validate_run(a, "before")
+    validated_b = _validate_run(b, "after")
+    keys = ("fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "explain_plans")
     if any(a.get(key) != b.get(key) for key in keys):
-        raise SystemExit("refusing comparison: fixture, scenarios, profile, or measurement regime differ")
-    phases_a = {sample.get("phase") for sample in a["samples"]}
-    phases_b = {sample.get("phase") for sample in b["samples"]}
-    if phases_a != phases_b:
-        raise SystemExit("refusing comparison: cold/warm measurement regimes differ")
-    if digests_a != digests_b:
+        raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
+    if validated_a["phases"].keys() != validated_b["phases"].keys():
+        raise SystemExit("refusing comparison: case/surface regimes differ")
+    if validated_a["digests"] != validated_b["digests"]:
+        digests_a, digests_b = validated_a["digests"], validated_b["digests"]
         raise SystemExit("refusing comparison: output mismatch (identity/digests differ between runs)")
     medians = []
     for run in (a, b):
@@ -401,6 +522,7 @@ def main():
     s.set_defaults(func=snapshot)
     for name in ('prepare','run','report'):
       x=sub.add_parser(name); x.add_argument('--artifacts',default=str(DEFAULT_ARTIFACTS)); x.set_defaults(func=globals()[name])
+    sub.choices['prepare'].add_argument('--force',action='store_true')
     sub.choices['run'].add_argument('--label',default='suite-1')
     sub.choices['run'].add_argument('--timeout',type=float,default=1800.0)
     sub.choices['run'].add_argument('--force',action='store_true')
