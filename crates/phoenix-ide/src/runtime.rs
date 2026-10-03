@@ -751,6 +751,12 @@ enum BashLifecycleBridgeAction {
     Reconcile,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionOccurrenceRecovery {
+    source_message_id: String,
+    needs_resume: bool,
+}
+
 type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
 type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryReceipt>>>;
 
@@ -3738,6 +3744,51 @@ impl RuntimeManager {
         Ok(ids)
     }
 
+    async fn execution_occurrence_recovery(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ExecutionOccurrenceRecovery>, String> {
+        let Some(source_message_id) = self
+            .db
+            .latest_execution_occurrence_message_id(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let messages = self
+            .db
+            .get_recovery_messages(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(source_index) = messages
+            .iter()
+            .position(|message| message.message_id == source_message_id)
+        else {
+            return Err("execution occurrence source message is missing".to_string());
+        };
+        let suffix = &messages[source_index..];
+        let needs_resume = if suffix.iter().any(|message| {
+            matches!(
+                message.message_type,
+                phoenix_core::domain::db_schema::MessageType::Agent
+            )
+        }) {
+            let tail = self
+                .db
+                .get_recovery_tail_status(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            recovery::decide_recovery(suffix, &tail).needs_auto_continue
+        } else {
+            true
+        };
+        Ok(Some(ExecutionOccurrenceRecovery {
+            source_message_id,
+            needs_resume,
+        }))
+    }
+
     async fn startup_resumable_owner(
         &self,
         conversation_id: &str,
@@ -3772,14 +3823,10 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
             let recovery_decision = self.owned_baton_recovery_decision(&conversation_id).await?;
             let has_queued_steering = self.has_queued_steering(&conversation_id).await?;
-            let has_execution_occurrence = self
-                .db
-                .has_execution_occurrence(&conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let has_resumable_occurrence = self
-                .execution_occurrence_needs_resume(&conversation_id)
-                .await?;
+            let occurrence_recovery = self.execution_occurrence_recovery(&conversation_id).await?;
+            let has_resumable_occurrence = occurrence_recovery
+                .as_ref()
+                .is_some_and(|occurrence| occurrence.needs_resume);
             if recovery_decision.as_ref().is_some_and(|decision| {
                 decision.reason == recovery::RecoveryReason::RestartLoopDetected
             }) && !has_queued_steering
@@ -3790,8 +3837,7 @@ impl RuntimeManager {
             let settled_occurrence = self
                 .settle_completed_execution_occurrence(
                     &conversation_id,
-                    has_execution_occurrence,
-                    has_resumable_occurrence,
+                    occurrence_recovery.as_ref(),
                 )
                 .await?;
             if settled_occurrence && !has_queued_steering {
@@ -3882,62 +3928,19 @@ impl RuntimeManager {
     async fn settle_completed_execution_occurrence(
         &self,
         conversation_id: &str,
-        has_occurrence: bool,
-        needs_resume: bool,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
     ) -> Result<bool, String> {
-        if !has_occurrence || needs_resume {
+        let Some(occurrence) = occurrence.filter(|occurrence| !occurrence.needs_resume) else {
             return Ok(false);
-        }
-        let source_message_id = self
-            .db
-            .latest_execution_occurrence_message_id(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "execution occurrence disappeared before settlement".to_string())?;
+        };
         self.db
-            .settle_execution_occurrence(conversation_id, &source_message_id, &ConvState::Idle)
+            .settle_execution_occurrence(
+                conversation_id,
+                &occurrence.source_message_id,
+                &ConvState::Idle,
+            )
             .await
             .map_err(|error| error.to_string())
-    }
-
-    async fn execution_occurrence_needs_resume(
-        &self,
-        conversation_id: &str,
-    ) -> Result<bool, String> {
-        let Some(source_message_id) = self
-            .db
-            .latest_execution_occurrence_message_id(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(false);
-        };
-        let messages = self
-            .db
-            .get_recovery_messages(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(source_index) = messages
-            .iter()
-            .position(|message| message.message_id == source_message_id)
-        else {
-            return Err("execution occurrence source message is missing".to_string());
-        };
-        let suffix = &messages[source_index..];
-        if !suffix.iter().any(|message| {
-            matches!(
-                message.message_type,
-                phoenix_core::domain::db_schema::MessageType::Agent
-            )
-        }) {
-            return Ok(true);
-        }
-        let tail = self
-            .db
-            .get_recovery_tail_status(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(recovery::decide_recovery(suffix, &tail).needs_auto_continue)
     }
 
     async fn has_queued_steering(&self, conversation_id: &str) -> Result<bool, String> {
@@ -5734,22 +5737,22 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
-        let occurrence_source_message_id = self
-            .db
-            .latest_execution_occurrence_message_id(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut has_resumable_occurrence = self
-            .execution_occurrence_needs_resume(conversation_id)
-            .await?;
+        let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
+        let mut has_resumable_occurrence = occurrence_recovery
+            .as_ref()
+            .is_some_and(|occurrence| occurrence.needs_resume);
         if recovered_terminal_obligation.is_none() && initial_state != conv.state {
             let projected = if has_resumable_occurrence {
                 self.db
                     .project_execution_occurrence_requesting(
                         conversation_id,
-                        occurrence_source_message_id.as_deref().ok_or_else(|| {
-                            "resumable execution occurrence lost its source identity".to_string()
-                        })?,
+                        &occurrence_recovery
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "resumable execution occurrence lost its source identity"
+                                    .to_string()
+                            })?
+                            .source_message_id,
                         &initial_state,
                     )
                     .await
@@ -6785,8 +6788,9 @@ impl RuntimeManager {
         }
 
         if self
-            .execution_occurrence_needs_resume(conversation_id)
+            .execution_occurrence_recovery(conversation_id)
             .await?
+            .is_some_and(|occurrence| occurrence.needs_resume)
         {
             return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
         }
@@ -6806,8 +6810,9 @@ impl RuntimeManager {
         if decision.needs_auto_continue
             && !self.owed_baton_needs_auto_continue(conversation_id).await?
             && !self
-                .execution_occurrence_needs_resume(conversation_id)
+                .execution_occurrence_recovery(conversation_id)
                 .await?
+                .is_some_and(|occurrence| occurrence.needs_resume)
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -10140,6 +10145,14 @@ mod scope_liveness_tests {
         requests: std::sync::atomic::AtomicUsize,
     }
 
+    struct PersistedStateRecordingLlm {
+        db: crate::db::Database,
+        conversation_id: String,
+        observed_state: std::sync::Mutex<Option<ConvState>>,
+        entered: Notify,
+        release: Notify,
+    }
+
     struct FailingLlm;
 
     #[async_trait::async_trait]
@@ -10166,6 +10179,34 @@ mod scope_liveness_tests {
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for PersistedStateRecordingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            let conversation = self
+                .db
+                .get_conversation(&self.conversation_id)
+                .await
+                .map_err(|error| phoenix_llm::LlmError::invalid_request(error.to_string()))?;
+            *self.observed_state.lock().expect("observed state lock") = Some(conversation.state);
+            self.entered.notify_one();
+            self.release.notified().await;
             Ok(phoenix_llm::LlmResponse {
                 provider_replay: None,
                 content: Vec::new(),
@@ -13082,6 +13123,94 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn completed_occurrence_settlement_preserves_replacement_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-replaced-before-settlement";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "classified-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'classified-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "classified-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("settled response"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let classified = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!classified.needs_resume);
+
+        manager
+            .db()
+            .add_message(
+                "replacement-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("newer accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-occurrence', 'wake')
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 message_id = excluded.message_id,
+                 source_kind = excluded.source_kind",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        assert!(!manager
+            .settle_completed_execution_occurrence(conversation_id, Some(&classified))
+            .await
+            .unwrap());
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-occurrence")
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // One fixture proves the occurrence across its full state lifecycle.
     async fn typed_occurrence_preserves_wait_and_tool_states_until_idle_settlement() {
         let llm = Arc::new(RecordingLlm {
@@ -13247,11 +13376,24 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn typed_occurrence_persists_requesting_before_provider_dispatch() {
-        let llm = Arc::new(RecordingLlm {
-            requests: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
         let conversation_id = "restart-occurrence-persisted-requesting";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
         manager
             .db()
             .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
@@ -13278,18 +13420,23 @@ mod scope_liveness_tests {
         .await
         .unwrap();
 
-        manager.settle_persisted_llm_requests().await.unwrap();
-
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(matches!(
-            manager
-                .db()
-                .get_conversation(conversation_id)
-                .await
-                .unwrap()
-                .state,
-            ConvState::LlmRequesting { .. }
-        ));
+        let settle = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.settle_persisted_llm_requests().await }
+        });
+        llm.entered.notified().await;
+        {
+            let observed_state = llm.observed_state.lock().expect("observed state lock");
+            assert!(
+                matches!(
+                    observed_state.as_ref(),
+                    Some(ConvState::LlmRequesting { .. })
+                ),
+                "provider observed {observed_state:?}"
+            );
+        }
+        llm.release.notify_one();
+        settle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
