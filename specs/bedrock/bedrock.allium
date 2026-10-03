@@ -2419,6 +2419,10 @@ rule ModeChangeNotification {
 --       True exactly when an accepted wake, seeded fork, or interaction response
 --       occurrence still owns its first model response.
 --
+--   newer_queued_steering_awaits_dispatch(conversation: Conversation) -> Boolean
+--       True exactly when accepted steering newer than the exhausted recovery
+--       owner remains queued for dispatch.
+--
 --   recoverable_tool_results_await_model_step(conversation: Conversation) -> Boolean
 --       True exactly when that active turn has a complete persisted tool-result
 --       round whose next model step has not settled. An interrupted or
@@ -2636,6 +2640,8 @@ rule ServerRestartOwedDirectTurn {
 rule ServerRestartExhaustedDirectTurn {
     when: ServerRestarted(conversation)
     requires: active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
+    requires: not newer_queued_steering_awaits_dispatch(conversation)
     requires: restart_recovery_exhausted(conversation)
     ensures: conversation.core_status = error
     ensures: not active_materialized_turn_owns_conversation(conversation)

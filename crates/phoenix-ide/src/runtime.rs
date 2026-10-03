@@ -3854,12 +3854,16 @@ impl RuntimeManager {
             let has_resumable_occurrence = occurrence_recovery
                 .as_ref()
                 .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
-            if recovery_decision.as_ref().is_some_and(|decision| {
-                decision.reason == recovery::RecoveryReason::RestartLoopDetected
-            }) && !has_queued_steering
-                && !has_resumable_occurrence
+            if self
+                .settle_restart_exhaustion(
+                    &conversation_id,
+                    occurrence_recovery.as_ref(),
+                    recovery_decision.as_ref(),
+                    has_queued_steering,
+                    has_resumable_occurrence,
+                )
+                .await?
             {
-                self.persist_restart_loop_failure(&conversation_id).await?;
                 continue;
             }
             let settled_occurrence = self
@@ -3871,21 +3875,16 @@ impl RuntimeManager {
             if settled_occurrence && !has_queued_steering {
                 continue;
             }
-            if matches!(conversation.state, ConvState::Idle)
-                && !has_queued_steering
-                && !has_resumable_occurrence
+            if self
+                .settle_nonresumable_idle_baton(
+                    &conversation_id,
+                    &conversation.state,
+                    recovery_decision.as_ref(),
+                    has_queued_steering || has_resumable_occurrence,
+                )
+                .await?
             {
-                if let Some(decision) = recovery_decision
-                    .as_ref()
-                    .filter(|decision| !decision.needs_auto_continue)
-                {
-                    self.persist_nonresumable_baton_settlement(
-                        &conversation_id,
-                        decision.reason.clone(),
-                    )
-                    .await?;
-                    continue;
-                }
+                continue;
             }
             let resumable_owner = self
                 .startup_resumable_owner(
@@ -3954,6 +3953,54 @@ impl RuntimeManager {
         receipt
             .await
             .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
+    }
+
+    async fn settle_nonresumable_idle_baton(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        recovery_decision: Option<&recovery::RecoveryDecision>,
+        has_newer_authority: bool,
+    ) -> Result<bool, String> {
+        let Some(decision) = recovery_decision.filter(|decision| {
+            matches!(state, ConvState::Idle)
+                && !has_newer_authority
+                && !decision.needs_auto_continue
+        }) else {
+            return Ok(false);
+        };
+        self.persist_nonresumable_baton_settlement(conversation_id, decision.reason.clone())
+            .await?;
+        Ok(true)
+    }
+
+    async fn settle_restart_exhaustion(
+        &self,
+        conversation_id: &str,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        recovery_decision: Option<&recovery::RecoveryDecision>,
+        has_queued_steering: bool,
+        has_resumable_occurrence: bool,
+    ) -> Result<bool, String> {
+        if has_queued_steering {
+            return Ok(false);
+        }
+        let exhausted_occurrence_owns_baton = occurrence.is_some_and(|occurrence| {
+            occurrence.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
+        }) && self
+            .db
+            .has_owed_baton(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let baton_recovery_exhausted = !has_resumable_occurrence
+            && recovery_decision.is_some_and(|decision| {
+                decision.reason == recovery::RecoveryReason::RestartLoopDetected
+            });
+        if !exhausted_occurrence_owns_baton && !baton_recovery_exhausted {
+            return Ok(false);
+        }
+        self.persist_restart_loop_failure(conversation_id).await?;
+        Ok(true)
     }
 
     async fn settle_execution_occurrence_recovery(
@@ -13362,6 +13409,76 @@ mod scope_liveness_tests {
             .unwrap();
         assert_eq!(recovery.source_message_id, "resumable-wake");
         assert_eq!(recovery.disposition, ExecutionOccurrenceDisposition::Resume);
+    }
+
+    #[tokio::test]
+    async fn exhausted_interaction_occurrence_atomically_releases_baton() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-interaction-occurrence-exhausted";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-interaction-response",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-interaction-response', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("exhausted-interaction-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        let storage = DatabaseStorage::new(manager.db().clone());
+        assert!(storage
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error { .. }
+        ));
     }
 
     #[tokio::test]
