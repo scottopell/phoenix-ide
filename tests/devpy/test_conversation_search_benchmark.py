@@ -1,10 +1,11 @@
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-
+from unittest import mock
 ROOT = Path(__file__).parents[2]
 spec = importlib.util.spec_from_file_location("conversation_search_benchmark", ROOT / "scripts/conversation_search_benchmark.py")
 bench = importlib.util.module_from_spec(spec)
@@ -46,7 +47,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                          ('{"tool_use_id":"call_w7yaFJY51rJxTjog4DKeE2wo","query":"exact observed"}',))
             conn.commit()
             out = root / "fixture"
-            args = type("Args", (), {"source": str(source), "output": "", "artifacts": str(out),
+            args = type("Args", (), {"source": str(source), "artifacts": str(out),
                                       "force": False, "retries": 2, "busy_timeout": 1.0})()
             bench.snapshot(args)
             self.assertEqual(sqlite3.connect(out / "captured.db").execute(
@@ -55,6 +56,128 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             manifest = json.loads((out / "capture-manifest.json").read_text())
             self.assertEqual(manifest["integrity_check"], "ok")
             self.assertEqual(manifest["recovered_queries"][0]["query"], "exact observed")
+            source_conn = sqlite3.connect(source)
+            self.assertEqual(
+                manifest["logical_size_bytes"],
+                source_conn.execute("PRAGMA page_count").fetchone()[0]
+                * source_conn.execute("PRAGMA page_size").fetchone()[0],
+            )
+            source_conn.close()
+
+    def test_recovery_uses_configured_replacement_after_partial_known_calls(self):
+        replacement = "call_replacement_123"
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE messages(conversation_id TEXT, message_id TEXT, content TEXT, display_data TEXT, created_at INTEGER)")
+        conn.execute("INSERT INTO messages VALUES (?, ?, ?, NULL, ?)", (
+            "9bc3b72d-extra", "known", json.dumps({"tool_use_id": bench.CALL_IDS[0], "query": "known query"}), 1))
+        conn.execute("INSERT INTO messages VALUES (?, ?, ?, NULL, ?)", (
+            "replacement", "replacement-message", json.dumps({"tool_use_id": replacement, "query": "replacement query"}), 2))
+        conn.commit()
+        with mock.patch.dict("os.environ", {"PHOENIX_SEARCH_CALL_IDS": replacement}):
+            recovered = bench._recover_queries(conn)
+        self.assertEqual([item["query"] for item in recovered], ["known query", "replacement query"])
+
+    def test_recovery_prefix_predicate_is_indexable(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE messages(conversation_id TEXT, message_id TEXT, content TEXT, display_data TEXT, created_at INTEGER)")
+        conn.execute("CREATE INDEX messages_conversation ON messages(conversation_id)")
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM messages WHERE conversation_id GLOB ? LIMIT 1",
+            ("9bc3*",),
+        ).fetchall()
+        self.assertIn("USING COVERING INDEX messages_conversation", plan[0][3])
+
+    def test_prepare_rejects_duplicate_normalized_observed_queries(self):
+        self.assertEqual(bench._normalize_query("  Same   Query "), "same query")
+        self.assertEqual(bench._normalize_query("same query"), "same query")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "captured.db"
+            db.write_bytes(b"fixture")
+            fixture_hash = bench._hash(db)
+            (root / "capture-manifest.json").write_text(json.dumps({
+                "kind": "conversation-search-fixture", "snapshot_path": str(db),
+                "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "source_path": str(root / "source.db"),
+            }))
+            args = type("Args", (), {"artifacts": str(root), "force": True})()
+            with mock.patch.object(bench, "_recover_queries", return_value=[
+                {"query": "Same   Query", "source_call_id": "one", "message_id": "m1"},
+                {"query": "same query", "source_call_id": "two", "message_id": "m2"},
+            ]), mock.patch.object(bench.sqlite3, "connect") as connect:
+                connection = connect.return_value
+                connection.execute.return_value.fetchone.return_value = None
+                with self.assertRaisesRegex(SystemExit, "duplicate normalized"):
+                    bench.prepare(args)
+
+    def test_scenarios_are_bound_to_fixture_hash_at_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "captured.db"
+            db.write_bytes(b"fixture")
+            fixture_hash = bench._hash(db)
+            (root / "capture-manifest.json").write_text(json.dumps({
+                "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "source_path": str(root / "source.db"),
+            }))
+            (root / "scenarios.json").write_text(json.dumps({
+                "version": 1, "fixture_sha256": "different", "scenarios": [],
+            }))
+            with self.assertRaisesRegex(SystemExit, "does not match"):
+                bench.run(type("Args", (), {"artifacts": str(root), "label": "suite", "force": False, "timeout": 1})())
+
+    def test_force_run_removes_stale_result_and_publishes_temp_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "captured.db"
+            db.write_bytes(b"fixture")
+            fixture_hash = bench._hash(db)
+            (root / "capture-manifest.json").write_text(json.dumps({
+                "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "source_path": str(root / "source.db"),
+            }))
+            (root / "scenarios.json").write_text(json.dumps({
+                "version": 1, "fixture_sha256": fixture_hash, "scenarios": [],
+            }))
+            runs = root / "runs"
+            runs.mkdir()
+            stale = runs / "suite.json"
+            stale.write_text("stale")
+            failure = runs / "failures" / "suite.json"
+            failure.parent.mkdir()
+            failure.write_text("old failure")
+
+            class CompletedProcess:
+                returncode = 0
+
+                def wait(self, timeout=None):
+                    return None
+
+            def fake_popen(*args, **kwargs):
+                Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text("fresh")
+                return CompletedProcess()
+
+            with mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
+                bench, "_git_commit", return_value="commit"
+            ), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
+                bench.platform, "processor", return_value="processor"
+            ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
+                bench.run(type("Args", (), {"artifacts": str(root), "label": "suite", "force": True, "timeout": 1})())
+            self.assertEqual(stale.read_text(), "fresh")
+            self.assertFalse(failure.exists())
+            self.assertEqual(list(runs.glob(".*.tmp")), [])
+
+    def test_run_refuses_dirty_source_tree(self):
+        with mock.patch.object(bench.subprocess, "check_output", return_value=" M scripts/example.py\n"):
+            with self.assertRaisesRegex(SystemExit, "dirty source"):
+                bench._ensure_clean_source()
+
+    def test_snapshot_cli_does_not_offer_custom_output(self):
+        completed = subprocess.run(
+            ["python", str(ROOT / "scripts/conversation_search_benchmark.py"), "snapshot", "--help"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertNotIn("--output", completed.stdout)
 
     def test_recovery_matches_exact_tool_block_not_sibling(self):
         conn = sqlite3.connect(":memory:")
@@ -95,18 +218,36 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             artifacts.mkdir()
             source = artifacts / "source.db"
             sqlite3.connect(source).close()
-            args = type("Args", (), {"source": str(source), "output": "", "artifacts": str(artifacts),
+            args = type("Args", (), {"source": str(source), "artifacts": str(artifacts),
                                       "force": False, "retries": 1, "busy_timeout": 1.0})()
             with self.assertRaises(SystemExit):
                 bench.snapshot(args)
 
     def test_snapshot_refuses_missing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
-            args = type("Args", (), {"source": str(Path(tmp) / "missing"), "output": "",
+            args = type("Args", (), {"source": str(Path(tmp) / "missing"),
                                       "artifacts": tmp, "force": False, "retries": 1,
                                       "busy_timeout": 1.0})()
             with self.assertRaises(SystemExit):
                 bench.snapshot(args)
+
+    def test_snapshot_uses_logical_capacity_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.db"
+            conn = sqlite3.connect(source)
+            conn.execute("CREATE TABLE payload(value TEXT)")
+            conn.execute("INSERT INTO payload VALUES (?)", ("x" * 4096,))
+            conn.commit()
+            conn.close()
+            out = root / "fixture"
+            args = type("Args", (), {"source": str(source), "artifacts": str(out),
+                                      "force": False, "retries": 1, "busy_timeout": 1.0,
+                                      "deadline": 1.0})()
+            logical_size = sqlite3.connect(source).execute("PRAGMA page_count").fetchone()[0] * sqlite3.connect(source).execute("PRAGMA page_size").fetchone()[0]
+            with mock.patch.object(bench.shutil, "disk_usage", return_value=type("Usage", (), {"free": logical_size * 2 - 1})()):
+                with self.assertRaisesRegex(SystemExit, "logical snapshot"):
+                    bench.snapshot(args)
 
     def test_report_separates_runs_surfaces_and_discards_successful_warmup(self):
         with tempfile.TemporaryDirectory() as tmp:
