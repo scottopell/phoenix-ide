@@ -261,7 +261,7 @@ fn successful_group_signal_outcome(
 
 #[cfg(target_os = "linux")]
 struct StoppedIncarnationGuard {
-    pidfd: libc::c_long,
+    pidfd: libc::c_int,
 }
 
 #[cfg(target_os = "linux")]
@@ -275,7 +275,7 @@ impl Drop for StoppedIncarnationGuard {
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             );
-            libc::close(self.pidfd as libc::c_int);
+            libc::close(self.pidfd);
         }
     }
 }
@@ -290,6 +290,9 @@ pub fn exact_stop_supported() -> bool {
             if pidfd < 0 {
                 return false;
             }
+            let Ok(pidfd) = libc::c_int::try_from(pidfd) else {
+                return false;
+            };
             let supported = libc::id_t::try_from(pidfd).is_ok_and(|pidfd_id| {
                 let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
                 let status = unsafe {
@@ -303,7 +306,7 @@ pub fn exact_stop_supported() -> bool {
                 status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
             });
             unsafe {
-                libc::close(pidfd as libc::c_int);
+                libc::close(pidfd);
             }
             supported
         })
@@ -642,9 +645,9 @@ impl Handle {
                 Err(error)
             };
         }
+        let pidfd = libc::c_int::try_from(pidfd)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         if current_process_identity(live.pid) != Some(self.launch_identity.process) {
-            let pidfd = i32::try_from(pidfd)
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
             if unsafe { libc::close(pidfd) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
