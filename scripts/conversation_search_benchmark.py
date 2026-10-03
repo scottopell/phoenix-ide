@@ -201,8 +201,11 @@ def _write_atomic_private(path: Path, text: str) -> None:
         raise SystemExit(f"refusing symlinked private artifact: {path}")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     _remove_private(temporary)
-    _write_private(temporary, text)
-    os.replace(temporary, path)
+    try:
+        _write_private(temporary, text)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     os.chmod(path, 0o600)
 
 

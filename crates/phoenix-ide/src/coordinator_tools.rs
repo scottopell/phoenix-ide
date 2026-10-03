@@ -992,31 +992,7 @@ mod tests {
                 retriever.mark_reconciled();
                 let service = GlobalReadService::new(db.clone(), retriever.clone());
                 let tool = SearchConversations(service.clone());
-                let retrieval_request = if *surface == "retriever" {
-                    Some(if is_scoped {
-                        let ids = scenario["conversation_ids"]
-                            .as_array()
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .filter_map(|id| id.as_str().map(str::to_owned))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        crate::db::RetrievalRequest::natural_language(
-                            query,
-                            crate::db::RetrievalScope::Conversations(ids),
-                            10,
-                        )
-                    } else {
-                        service
-                            .search_request(query)
-                            .await
-                            .expect("build global search request")
-                    })
-                } else {
-                    None
-                };
+                let retrieval_request = (*surface == "retriever").then(|| policy_request.clone());
                 for (phase, count) in [
                     (
                         "first_operation_setup_connection_used_os_cache_uncontrolled",
