@@ -12,4 +12,4 @@ Add an opt-in Project Coordinator profile to ordinary ProductConversations witho
 
 ## Rebase allocation coordination
 
-ADR-074 and migrations 113 through 119 are allocated on the rebased mainline. ADR-074 supersedes ADR-049's bounded exclusions on ordinary coordination profiles, normalized profile persistence, and profile-selected compaction wording while preserving its protected-handoff and durable-operation decisions. If main gains newer ADRs or migrations before publication, renumber this append-only decision/migration set and its tests without changing its semantics.
+ADR-075 and migrations 113 through 119 are allocated on the rebased mainline. ADR-075 supersedes ADR-049's bounded exclusions on ordinary coordination profiles, normalized profile persistence, and profile-selected compaction wording while preserving its protected-handoff and durable-operation decisions. If main gains newer ADRs or migrations before publication, renumber this append-only decision/migration set and its tests without changing its semantics.

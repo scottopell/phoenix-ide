@@ -7681,19 +7681,6 @@ where
                 ),
             ));
         }
-        if project_coordinator_profile.is_some() {
-            let estimated_prompt_tokens = request_system_blocks
-                .iter()
-                .map(|block| estimate_text_tokens(&block.text))
-                .sum::<usize>()
-                + estimate_messages_tokens(&frozen_messages);
-            if estimated_prompt_tokens > self.context.context_window {
-                return Err(format!(
-                    "Project Coordinator profile prompt exceeds context window after reserving charter: estimated {estimated_prompt_tokens} tokens > {} token window",
-                    self.context.context_window
-                ));
-            }
-        }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -7702,6 +7689,19 @@ where
             &callable_tool_names,
             request_tool_surface == LlmToolSurface::SubAgentTerminal,
         );
+        if project_coordinator_profile.is_some() {
+            let estimated_prompt_tokens = request_system_blocks
+                .iter()
+                .map(|block| estimate_text_tokens(&block.text))
+                .sum::<usize>()
+                + estimate_messages_tokens(&messages);
+            if estimated_prompt_tokens > self.context.context_window {
+                return Err(format!(
+                    "Project Coordinator profile prompt exceeds context window after projecting provider messages: estimated {estimated_prompt_tokens} tokens > {} token window",
+                    self.context.context_window
+                ));
+            }
+        }
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let request = LlmRequest {
@@ -13068,6 +13068,92 @@ mod dispatch_context_budget_tests {
             }
         ));
         assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn profiled_dispatch_estimates_projected_provider_messages() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "profile-budget-after-tool-projection";
+        let mut context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 20_000);
+        context.is_coordinator = false;
+        context.is_sub_agent = false;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .add_message(
+                "removed-tool-call",
+                conv_id,
+                &MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "removed-call".to_string(),
+                    name: "removed_tool".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .add_message(
+                "removed-tool-result",
+                conv_id,
+                &MessageContent::tool(
+                    "removed-call",
+                    "large historical result ".repeat(80_000),
+                    false,
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage.set_project_coordinator_profile(
+            conv_id,
+            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile::new(
+                "coordinate owners without taking implementation by default".to_string(),
+                1,
+                1,
+            )
+            .expect("valid profile"),
+        );
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("ok")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .expect("stripped unavailable tool history should not trip profile budget guard");
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| !matches!(block, ContentBlock::ToolUse { name, .. } if name == "removed_tool")
+                && !matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "removed-call")));
     }
 
     #[tokio::test]
