@@ -406,16 +406,19 @@ async fn ensure_project_coordinator_profile_writable(
     if kind != "ordinary" {
         return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
     }
-    let owns_sub_agent_conversation: bool = sqlx::query_scalar(
+    let has_user_root: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM conversations
-             WHERE product_conversation_id = ?1 AND runtime_role = 'sub_agent'
+             WHERE product_conversation_id = ?1
+               AND runtime_role = 'user'
+               AND parent_conversation_id IS NULL
+               AND user_initiated = 1
          )",
     )
     .bind(product_conversation_id.as_str())
     .fetch_one(&mut **tx)
     .await?;
-    if owns_sub_agent_conversation {
+    if !has_user_root {
         return Err(ProjectCoordinatorProfileWriteError::NotOrdinary.into());
     }
     if ordinary_lifecycle.as_deref() != Some("open") {
@@ -444,7 +447,62 @@ mod tests {
     }
 
     async fn ordinary(db: &Database, id: &str) -> ProductConversationId {
+        let product_conversation_id = product_conversation(db, id, "ordinary").await;
+        insert_user_root(db, &product_conversation_id, &format!("conv-{id}")).await;
+        product_conversation_id
+    }
+
+    async fn ordinary_without_user_root(db: &Database, id: &str) -> ProductConversationId {
         product_conversation(db, id, "ordinary").await
+    }
+
+    async fn insert_user_root(
+        db: &Database,
+        product_conversation_id: &ProductConversationId,
+        conversation_id: &str,
+    ) {
+        let scope_id = format!("scope-{conversation_id}");
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, created_at, updated_at,
+                 environment_kind, cwd, worktree_path, worktree_id, worktree_fingerprint
+             ) VALUES (
+                 ?1, 'work', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 'allocated_worktree', '/tmp/project-coordinator-profile', '/tmp/project-coordinator-profile',
+                 ?2, ?3
+             )",
+        )
+        .bind(&scope_id)
+        .bind(format!("worktree-{conversation_id}"))
+        .bind(format!("fingerprint-{conversation_id}"))
+        .execute(&db.pool)
+        .await
+        .expect("insert work scope");
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+             VALUES (?1, ?2)",
+        )
+        .bind(&scope_id)
+        .bind(product_conversation_id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("insert scope owner");
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role, work_scope_id,
+                 user_initiated, state, state_kind, state_updated_at, created_at,
+                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
+             ) VALUES (?1, ?2, 'user', ?4,
+                       1, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
+        )
+        .bind(conversation_id)
+        .bind(product_conversation_id.as_str())
+        .bind(serde_json::json!({ "type": "idle" }).to_string())
+        .bind(&scope_id)
+        .execute(&db.pool)
+        .await
+        .expect("insert user root conversation");
     }
 
     #[tokio::test]
@@ -527,69 +585,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sub_agent_owned_product_conversation_rejects_profile_writes() {
+    async fn product_conversation_without_user_root_rejects_profile_writes() {
         let db = Database::open_in_memory().await.expect("database");
-        let id = product_conversation(&db, "pc-project-coordinator-sub-agent", "ordinary").await;
-        sqlx::query(
-            "INSERT INTO work_scopes (
-                 id, authority_kind, created_at, updated_at,
-                 environment_kind, cwd, worktree_path, worktree_id, worktree_fingerprint
-             ) VALUES (
-                 'scope-sub-agent', 'work', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                 'allocated_worktree', '/tmp/sub-agent', '/tmp/sub-agent',
-                 'sub-agent-worktree', 'sub-agent-fingerprint'
-             )",
-        )
-        .execute(&db.pool)
-        .await
-        .expect("insert work scope");
-        sqlx::query(
-            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
-             VALUES ('scope-sub-agent', ?1)",
-        )
-        .bind(id.as_str())
-        .execute(&db.pool)
-        .await
-        .expect("insert scope owner");
-        sqlx::query(
-            "INSERT INTO conversations (
-                 id, product_conversation_id, runtime_role, work_scope_id,
-                 user_initiated, state, state_kind, state_updated_at, created_at,
-                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
-             ) VALUES ('conv-sub-agent-parent', ?1, 'user', 'scope-sub-agent',
-                       1, ?2, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
-        )
-        .bind(id.as_str())
-        .bind(serde_json::json!({ "type": "idle" }).to_string())
-        .execute(&db.pool)
-        .await
-        .expect("insert sub-agent parent conversation");
-        sqlx::query(
-            "INSERT INTO conversations (
-                 id, product_conversation_id, parent_conversation_id, runtime_role, work_scope_id,
-                 user_initiated, state, state_kind, state_updated_at, created_at,
-                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
-             ) VALUES ('conv-sub-agent', ?1, 'conv-sub-agent-parent', 'sub_agent', 'scope-sub-agent',
-                       0, ?2, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
-        )
-        .bind(id.as_str())
-        .bind(serde_json::json!({ "type": "idle" }).to_string())
-        .execute(&db.pool)
-        .await
-        .expect("insert sub-agent conversation");
+        let id = ordinary_without_user_root(&db, "pc-project-coordinator-no-user-root").await;
 
         let error = db
             .write_project_coordinator_profile(&id, Some("charter"), 0)
             .await
-            .expect_err("sub-agent aggregate rejects profile");
+            .expect_err("aggregate without user root rejects profile");
 
         assert!(matches!(
             error,
             ProjectCoordinatorProfileWriteDbError::Domain(
                 ProjectCoordinatorProfileWriteError::NotOrdinary
             )
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_with_child_sub_agent_allows_profile_writes() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-with-child-agent").await;
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, state, state_kind, state_updated_at, created_at,
+                 updated_at, archived, transcript_generation, model, llm_language, cm_kind
+             ) VALUES ('conv-child-sub-agent', ?1, ?2, 'sub_agent',
+                       0, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
+        )
+        .bind(id.as_str())
+        .bind(format!("conv-{}", id.as_str()))
+        .bind(serde_json::json!({ "type": "idle" }).to_string())
+        .execute(&db.pool)
+        .await
+        .expect("insert child sub-agent conversation");
+
+        let outcome = db
+            .write_project_coordinator_profile(&id, Some("charter"), 0)
+            .await
+            .expect("child sub-agent must not make parent aggregate ineligible");
+
+        assert!(matches!(
+            outcome,
+            ProjectCoordinatorProfileWriteOutcome::Saved(ref profile)
+                if profile.charter() == "charter" && profile.revision() == 1
         ));
     }
 

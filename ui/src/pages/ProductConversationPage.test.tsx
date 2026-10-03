@@ -770,7 +770,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot)
       .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Before delete', presentation_mode: 'idle' } }))
-      .mockRejectedValueOnce(new ApiResponseError(404, 'Not found'));
+      .mockRejectedValueOnce(new ApiResponseError('Not found', 404));
 
     renderPage('/product-conversations/pc-1');
     await waitForPageReady();

@@ -1036,7 +1036,8 @@ function ProductConversationPageInner() {
       refresh();
     };
     const reconciled = (authoritativeIdentities: ReadonlySet<string>) => {
-      if (!authoritativeIdentities.has(snapshot?.product_conversation_id ?? productConversationId)) refresh();
+      const activeProductConversationId = snapshot?.product_conversation_id ?? productConversationId;
+      if (activeProductConversationId && !authoritativeIdentities.has(activeProductConversationId)) refresh();
     };
     const unsubscribes = [
       ...[...notificationIds].map((id) => subscribeProductConversationSnapshotChanged(id, refresh)),
