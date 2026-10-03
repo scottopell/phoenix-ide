@@ -431,12 +431,6 @@ impl GlobalReadService {
             .clone()
             .filter(|name| !name.trim().is_empty())
             .or_else(|| root.title.clone().filter(|title| !title.trim().is_empty()))
-            .or_else(|| {
-                conversation
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-            })
             .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
             .unwrap_or_else(|| "Untitled conversation".to_string());
         Ok(serde_json::json!({
