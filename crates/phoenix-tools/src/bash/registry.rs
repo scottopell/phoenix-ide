@@ -695,8 +695,11 @@ impl BashHandleRegistry {
         if registered.handle.controller_scope != *controller_scope {
             return Ok(false);
         }
-        registered.handle.signal_live_incarnation(signal).await?;
-        Ok(true)
+        Ok(registered
+            .handle
+            .signal_live_incarnation(signal)
+            .await?
+            .is_some())
     }
 
     #[doc(hidden)]
