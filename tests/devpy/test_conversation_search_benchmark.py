@@ -168,7 +168,6 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             (root / "scenarios.json").write_text(json.dumps({
                 "version": 1, "fixture_sha256": fixture_hash, "expected_case_surface_set": [], "scenarios": [],
             }))
-            (root / "capture-manifest.json").write_text("{}")
             runs = root / "runs"
             runs.mkdir()
             stale = runs / "suite.json"
