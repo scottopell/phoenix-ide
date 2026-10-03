@@ -7568,6 +7568,79 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Atomically project an execution occurrence to `LlmRequesting` if its
+    /// durable owner still exists.
+    ///
+    /// # Errors
+    /// Returns a database error if the projection fails.
+    pub async fn project_execution_occurrence_requesting(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1
+                   AND source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Atomically settle an execution occurrence even when the conversation
+    /// projection is already the requested terminal kind.
+    ///
+    /// # Errors
+    /// Returns a database error if settlement fails.
+    pub async fn settle_execution_occurrence(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// List conversations whose adopted wake, seeded fork, or accepted
     /// interaction response still owns the first model response after restart.
     ///

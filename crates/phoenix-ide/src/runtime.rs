@@ -3780,6 +3780,13 @@ impl RuntimeManager {
             let has_resumable_occurrence = self
                 .execution_occurrence_needs_resume(&conversation_id)
                 .await?;
+            if recovery_decision.as_ref().is_some_and(|decision| {
+                decision.reason == recovery::RecoveryReason::RestartLoopDetected
+            }) && !has_queued_steering
+            {
+                self.persist_restart_loop_failure(&conversation_id).await?;
+                continue;
+            }
             if self
                 .settle_completed_execution_occurrence(
                     &conversation_id,
@@ -3788,13 +3795,6 @@ impl RuntimeManager {
                 )
                 .await?
             {
-                continue;
-            }
-            if recovery_decision.as_ref().is_some_and(|decision| {
-                decision.reason == recovery::RecoveryReason::RestartLoopDetected
-            }) && !has_queued_steering
-            {
-                self.persist_restart_loop_failure(&conversation_id).await?;
                 continue;
             }
             if matches!(conversation.state, ConvState::Idle) && !has_queued_steering {
@@ -3889,7 +3889,7 @@ impl RuntimeManager {
             return Ok(false);
         }
         self.db
-            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .settle_execution_occurrence(conversation_id, &ConvState::Idle)
             .await
             .map_err(|error| error.to_string())?;
         Ok(true)
@@ -5726,7 +5726,7 @@ impl RuntimeManager {
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
         let startup_llm_recovery_ack = Arc::new(AsyncMutex::new(Some(startup_llm_recovery_ack_rx)));
-        let (initial_state, initial_state_updated_at, needs_auto_continue) =
+        let (mut initial_state, mut initial_state_updated_at, mut needs_auto_continue) =
             if let Some(obligation) = &recovered_terminal_obligation {
                 (
                     obligation.projection.state.clone(),
@@ -5736,13 +5736,27 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
-        if recovered_terminal_obligation.is_none() && initial_state != conv.state {
-            self.db
-                .update_conversation_state(conversation_id, &initial_state)
+        let mut has_resumable_occurrence = self
+            .execution_occurrence_needs_resume(conversation_id)
+            .await?;
+        if recovered_terminal_obligation.is_none()
+            && initial_state != conv.state
+            && has_resumable_occurrence
+            && !self
+                .db
+                .project_execution_occurrence_requesting(conversation_id, &initial_state)
                 .await
-                .map_err(|error| {
-                    format!("failed to persist recovered state before startup effects: {error}")
-                })?;
+                .map_err(|error| error.to_string())?
+        {
+            let committed = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            initial_state = committed.state;
+            initial_state_updated_at = committed.state_updated_at;
+            needs_auto_continue = false;
+            has_resumable_occurrence = false;
         }
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
@@ -5763,9 +5777,6 @@ impl RuntimeManager {
             } else {
                 None
             };
-        let has_resumable_occurrence = self
-            .execution_occurrence_needs_resume(conversation_id)
-            .await?;
         let resumable_owner = startup_creation_completion.is_some()
             || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
             || needs_auto_continue
