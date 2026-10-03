@@ -1803,9 +1803,13 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
   const scope = typeof value['work_scope_id'] === 'string' ? value['work_scope_id'] : null;
   const cwd = typeof value['cwd'] === 'string' ? value['cwd'] : null;
   const ownerName = typeof value['owner_name'] === 'string' ? value['owner_name'] : null;
+  const ownerProductConversationId = typeof value['owner_product_conversation_id'] === 'string' ? value['owner_product_conversation_id'] : null;
   const projectPath = typeof value['project_path'] === 'string' ? value['project_path'] : null;
   if (!scope && !cwd) return null;
-  return <div className="coordinator-environment"><strong>Environment</strong>{ownerName && <span>{ownerName}</span>}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{scope && <details><summary>WorkScope ID</summary><code>{scope}</code></details>}</div>;
+  const ownerIdentity = ownerName && ownerProductConversationId
+    ? <Link to={`/product-conversations/${encodeURIComponent(ownerProductConversationId)}`} title={`Owning conversation: ${ownerName}`}>{ownerName}</Link>
+    : ownerName ? <span title="Historical environment owner; stable conversation unavailable">{ownerName}</span> : null;
+  return <div className="coordinator-environment"><strong>Environment</strong>{ownerIdentity}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{(scope || ownerProductConversationId) && <details><summary>IDs</summary>{scope && <code>{scope}</code>}{ownerProductConversationId && <code>{ownerProductConversationId}</code>}</details>}</div>;
 }
 
 function BashResponseView({ response }: { response: Record<string, unknown> }) {

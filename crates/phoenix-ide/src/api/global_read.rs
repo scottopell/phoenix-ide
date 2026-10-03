@@ -204,6 +204,7 @@ pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
     pub(crate) owner_name: String,
+    pub(crate) owner_product_conversation_id: Option<String>,
     pub(crate) project_path: Option<String>,
 }
 
@@ -271,8 +272,9 @@ impl GlobalReadService {
                 .to_string()
         })?;
         let (work_scope_id, worktree_path, cwd) = row;
-        let (owner_name, project_path) = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT COALESCE(NULLIF(owner.cm_task_title, ''), NULLIF(owner.title, ''), NULLIF(owner.slug, ''), 'Untitled conversation'), project.canonical_path
+        let (owner_name, owner_product_conversation_id, project_path) =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT COALESCE(NULLIF(owner.cm_task_title, ''), NULLIF(owner.title, ''), NULLIF(owner.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
              FROM conversations owner
              LEFT JOIN projects project ON project.id = owner.project_id
              LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
@@ -304,6 +306,7 @@ impl GlobalReadService {
             work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
                 .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
             owner_name,
+            owner_product_conversation_id,
             project_path,
         })
     }

@@ -59,6 +59,28 @@ describe('Global coordinator tool results', () => {
     expect(screen.getByText('Watch not found')).toBeInTheDocument();
   });
 
+  it('links the authoritative Bash environment owner and keeps IDs secondary', () => {
+    render(
+      <MemoryRouter>
+        <ToolUseBlock
+          block={{ type: 'tool_use', id: 'bash-owner', name: 'bash', input: { cmd: 'pwd', wait_seconds: 1 } }}
+          result={{
+            message_id: 'result-owner', sequence_id: 2, conversation_id: 'coordinator', message_type: 'tool', created_at: new Date().toISOString(),
+            content: { tool_use_id: 'bash-owner', result: JSON.stringify({ command: 'pwd', output: '/repo', status: 'completed' }) },
+            display_data: { coordinator_environment: {
+              owner_name: 'Readable owner', owner_product_conversation_id: 'product-owner',
+              work_scope_id: 'scope-owner', cwd: '/repo', project_path: '/repo',
+            } },
+          }}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('href', '/product-conversations/product-owner');
+    expect(screen.getByRole('link', { name: 'Readable owner' })).toHaveAttribute('title', 'Owning conversation: Readable owner');
+    expect(screen.getByText('scope-owner')).not.toBeVisible();
+  });
+
   it('renders active watches with stable and current transcript links', () => {
     render(
       <MemoryRouter>

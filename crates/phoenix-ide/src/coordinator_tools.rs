@@ -203,6 +203,7 @@ impl Tool for WorkScopeCoordinatorBash {
                     "work_scope_id": binding.work_scope_id.clone(),
                     "cwd": binding.path.clone(),
                     "owner_name": binding.owner_name,
+                    "owner_product_conversation_id": binding.owner_product_conversation_id,
                     "project_path": binding.project_path,
                 });
                 (
