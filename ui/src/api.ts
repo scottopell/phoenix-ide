@@ -1304,6 +1304,7 @@ export interface LiveCoordinatorBashHandle {
   label: string | null;
   cwd: string;
   started_at_ms: number;
+  can_stop: boolean;
 }
 
 export const api = {
@@ -2007,6 +2008,11 @@ export const api = {
     const resp = await fetch('/api/coordinator/bash/live');
     if (!resp.ok) throw new Error('Failed to list live Coordinator bash handles');
     return resp.json();
+  },
+
+  async stopLiveCoordinatorBashHandle(handleId: string): Promise<void> {
+    const resp = await fetch(`/api/coordinator/bash/${encodeURIComponent(handleId)}/stop`, { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to stop live Coordinator bash handle');
   },
 
   /** One handle's combined inspection snapshot — identity + state, an output

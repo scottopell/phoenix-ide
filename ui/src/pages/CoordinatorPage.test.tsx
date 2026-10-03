@@ -12,6 +12,7 @@ const { apiMock } = vi.hoisted(() => ({
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
     listLiveCoordinatorBashHandles: vi.fn(),
+    stopLiveCoordinatorBashHandle: vi.fn(),
   },
 }));
 
@@ -75,6 +76,7 @@ describe('CoordinatorPage', () => {
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
+    apiMock.stopLiveCoordinatorBashHandle.mockResolvedValue(undefined);
     apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
       aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
       auto_continue_on_context_exhaustion: false,
@@ -89,15 +91,21 @@ describe('CoordinatorPage', () => {
 
   it('shows only server-reported live Coordinator commands with inspect navigation', async () => {
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([{
-      handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123,
+      handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
     }]);
 
     renderPage();
 
     const running = await screen.findByRole('region', { name: 'Running commands' });
     expect(running).toHaveTextContent('UI tests');
+    expect(running).toHaveTextContent('pnpm test');
     expect(running).toHaveTextContent('/repo/ui');
+    expect(running).toHaveTextContent('started');
+    expect(running).toHaveTextContent('b-live');
     expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '?viewer=inspect&handle=b-live');
+    fireEvent.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
+    expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
   it('mounts only the shared conversation runtime with the briefing action', async () => {

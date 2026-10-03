@@ -390,6 +390,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/coordinator/bash/live",
             get(list_live_coordinator_bash_handles),
         )
+        .route(
+            "/api/coordinator/bash/:handle_id/stop",
+            post(stop_live_coordinator_bash_handle),
+        )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -4061,6 +4065,7 @@ struct LiveCoordinatorBashHandle {
     label: Option<String>,
     cwd: String,
     started_at_ms: u128,
+    can_stop: bool,
 }
 
 async fn list_live_coordinator_bash_handles(
@@ -4083,9 +4088,37 @@ async fn list_live_coordinator_bash_handles(
                     .started_at
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |duration| duration.as_millis()),
+                can_stop: cfg!(target_os = "linux"),
             })
             .collect(),
     )
+}
+
+async fn stop_live_coordinator_bash_handle(
+    State(state): State<AppState>,
+    Path(handle_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    match phoenix_tools::bash::stop_exact_handle_for_scope(
+        state.runtime.bash_handles().as_ref(),
+        &phoenix_core::work_scope::ResourceScopeKey::Coordinator,
+        &handle_id,
+    )
+    .await
+    {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(error) => Err(coordinator_stop_error(&handle_id, error)),
+    }
+}
+
+fn coordinator_stop_error(handle_id: &str, error: phoenix_tools::bash::BashError) -> AppError {
+    match error {
+        phoenix_tools::bash::BashError::HandleNotFound { .. } => AppError::NotFound(format!(
+            "handle {handle_id} not found or not controllable by Coordinator"
+        )),
+        error => AppError::Internal(format!(
+            "failed to stop Coordinator Bash handle {handle_id}: {error:?}"
+        )),
+    }
 }
 
 async fn inspect_bash_handle(
@@ -4104,7 +4137,11 @@ async fn inspect_bash_handle(
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
     let actor = resolved.actor;
-    let actor_scope = resolved.scope;
+    let actor_scope = if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        crate::work_scope::ResourceScopeKey::Coordinator
+    } else {
+        resolved.scope
+    };
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &handle_id,
@@ -12716,6 +12753,78 @@ pub(crate) mod hard_delete_cascade_tests {
                 .any(|l| l.bytes.contains("final line")),
             "tombstone output tail must include the final line"
         );
+    }
+
+    #[test]
+    fn coordinator_stop_preserves_not_found_and_signaling_failures() {
+        let not_found = super::coordinator_stop_error(
+            "b-missing",
+            phoenix_tools::bash::BashError::HandleNotFound {
+                handle_id: "b-missing".into(),
+            },
+        );
+        assert!(matches!(not_found, AppError::NotFound(_)));
+
+        let signaling_failure = super::coordinator_stop_error(
+            "b-live",
+            phoenix_tools::bash::BashError::SpawnFailed {
+                error_message: "pidfd_send_signal failed".into(),
+            },
+        );
+        assert!(
+            matches!(signaling_failure, AppError::Internal(message) if message.contains("pidfd_send_signal failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_can_inspect_coordinator_controlled_handle() {
+        use phoenix_tools::bash::handle::{FinalCause, Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("coordinator");
+        let owner = crate::scope("coordinator-handle-owner");
+        let handle = Handle::new_live_for_actor(
+            crate::work_scope::ResourceScopeKey::Coordinator,
+            HandleId::new("b-coordinator"),
+            coordinator.id.clone(),
+            crate::work_scope::ResourceAuthority::Restricted,
+            "printf coordinator-output".into(),
+            None,
+            7,
+            7,
+            RING_BUFFER_BYTES,
+        );
+        handle
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::from_millis(1),
+                std::time::SystemTime::now(),
+                phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&owner, handle)
+            .await;
+
+        let Json(inspection) = super::inspect_bash_handle(
+            State(state),
+            Path("b-coordinator".to_string()),
+            Query(super::InspectQuery {
+                conversation_id: coordinator.id,
+                since: None,
+            }),
+        )
+        .await
+        .expect("Coordinator-controlled handle must be visible to the Coordinator");
+
+        assert_eq!(inspection.handle_id, "b-coordinator");
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UnwatchResultView, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -26,7 +26,7 @@ describe('Global coordinator tool results', () => {
     );
     expect(screen.getByText('Queued as steering')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '@conv:product-1' })).toHaveAttribute('href', '/product-conversations/product-1');
-    expect(screen.getByRole('link', { name: 'transcript-1' })).toHaveAttribute('href', '/conversations/transcript-1');
+    expect(screen.getByRole('link', { name: 'transcript-1' })).toHaveAttribute('href', '/c/transcript-1');
     expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
   });
 
@@ -44,6 +44,17 @@ describe('Global coordinator tool results', () => {
     expect(screen.queryByText(/understanding or completion/i)).not.toBeInTheDocument();
   });
 
+  it('renders unwatch outcomes without claiming the watch list is empty', () => {
+    const { rerender } = render(
+      <MemoryRouter><UnwatchResultView response={{ product_conversation_id: 'product-2', ended: true }} /></MemoryRouter>,
+    );
+    expect(screen.getByText('Watch ended')).toBeInTheDocument();
+    expect(screen.queryByText('No active watches.')).not.toBeInTheDocument();
+
+    rerender(<MemoryRouter><UnwatchResultView response={{ product_conversation_id: 'product-2', ended: false }} /></MemoryRouter>);
+    expect(screen.getByText('Watch not found')).toBeInTheDocument();
+  });
+
   it('renders active watches with stable and current transcript links', () => {
     render(
       <MemoryRouter>
@@ -53,7 +64,7 @@ describe('Global coordinator tool results', () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole('link', { name: '@conv:product-3' })).toHaveAttribute('href', '/product-conversations/product-3');
-    expect(screen.getByRole('link', { name: '@transcript:transcript-3' })).toHaveAttribute('href', '/conversations/transcript-3');
+    expect(screen.getByRole('link', { name: '@transcript:transcript-3' })).toHaveAttribute('href', '/c/transcript-3');
     expect(screen.getByText('Idle')).toBeInTheDocument();
   });
 });

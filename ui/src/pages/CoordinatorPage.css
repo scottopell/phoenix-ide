@@ -4,10 +4,16 @@
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
   color: var(--text-primary);
 }
 
-.coordinator-conversation,
+.coordinator-conversation {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .coordinator-conversation #app {
   height: 100%;
   min-height: 0;
@@ -51,7 +57,10 @@
 
 .global-live-commands {
   display: grid;
+  flex: 0 0 auto;
   gap: 6px;
+  max-height: min(35dvh, 320px);
+  overflow-y: auto;
   margin: 0 12px 8px;
   padding: 8px 10px;
   border: 1px solid var(--border-color);
@@ -78,9 +87,32 @@
   white-space: nowrap;
 }
 
+.global-live-command > div > span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-live-command-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .global-live-command a {
   color: var(--accent-blue);
   white-space: nowrap;
+}
+
+.global-live-command button {
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--accent-red);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
 }
 
 .global-live-commands-error {

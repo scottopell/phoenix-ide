@@ -17,6 +17,7 @@ interface CoordinatorPageFixtureData {
 function GlobalLiveCommands() {
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,8 +38,22 @@ function GlobalLiveCommands() {
       <strong>Running</strong>
       {handles.map((handle) => (
         <div className="global-live-command" key={handle.handle_id}>
-          <div><strong>{handle.label ?? handle.command}</strong><code>{handle.cwd}</code></div>
-          <a href={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</a>
+          <div>
+            {handle.label && <strong>{handle.label}</strong>}
+            <code>{handle.command}</code>
+            <span>{handle.cwd} · started {new Date(handle.started_at_ms).toLocaleString()}</span>
+            <span>{handle.handle_id}</span>
+          </div>
+          <div className="global-live-command-actions">
+            <a href={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</a>
+            {handle.can_stop && <button type="button" disabled={stopping === handle.handle_id} onClick={() => {
+              setStopping(handle.handle_id);
+              void api.stopLiveCoordinatorBashHandle(handle.handle_id)
+                .then(() => undefined)
+                .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to stop command'))
+                .finally(() => setStopping(null));
+            }}>{stopping === handle.handle_id ? 'stopping…' : 'stop'}</button>}
+          </div>
         </div>
       ))}
     </section>

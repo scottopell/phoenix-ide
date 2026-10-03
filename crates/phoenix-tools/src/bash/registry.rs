@@ -662,7 +662,7 @@ impl BashHandleRegistry {
             self.handles_by_id.read().await.values().cloned().collect();
         let mut live = Vec::new();
         for entry in registered {
-            if entry.owner != ResourceScopeKey::Coordinator {
+            if entry.handle.controller_scope != ResourceScopeKey::Coordinator {
                 continue;
             }
             if matches!(&*entry.handle.state().await, HandleState::Live(_)) {
@@ -1337,6 +1337,48 @@ mod tests {
             None,
         );
         assert!(registry.lifecycle_sink().is_none());
+    }
+
+    #[tokio::test]
+    async fn live_coordinator_handles_excludes_work_and_terminal_entries() {
+        let registry = BashHandleRegistry::new();
+        let coordinator = Handle::new_live_for_actor_with_owner_and_launch_identity(
+            ResourceScopeKey::Coordinator,
+            HandleId::new("b-coordinator"),
+            launch_identity(31, "coordinator-live"),
+            "global".to_string(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            "sleep 60".to_string(),
+            Some("global command".to_string()),
+            std::path::PathBuf::from("/repo"),
+            31,
+            31,
+            RING_BUFFER_BYTES,
+        );
+        registry
+            .register_existing_handle(&scope("environment"), coordinator.clone())
+            .await;
+        registry
+            .register_existing_handle(
+                &scope("work"),
+                make_handle("work", "b-work", RING_BUFFER_BYTES),
+            )
+            .await;
+
+        let live = registry.live_coordinator_handles().await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].handle_id.0, "b-coordinator");
+        assert_eq!(live[0].working_dir, std::path::PathBuf::from("/repo"));
+
+        coordinator
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::ZERO,
+                std::time::SystemTime::now(),
+                20,
+            )
+            .await;
+        assert!(registry.live_coordinator_handles().await.is_empty());
     }
 
     #[tokio::test]

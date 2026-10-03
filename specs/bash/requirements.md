@@ -144,6 +144,24 @@ it needs to choose which handle to retire.
 
 ---
 
+### REQ-BASH-016: Coordinator Live-Handle Surface
+
+WHEN the Global Coordinator launches a Bash handle in the live Phoenix process
+THE SYSTEM SHALL retain the validated spawn working directory as immutable handle metadata
+AND SHALL expose that handle to the Coordinator UI only while its process-local registry state is live
+
+THE Coordinator live-handle surface SHALL include the exact handle identifier, command, optional label, validated spawn working directory, and start time
+AND SHALL NOT reconstruct handles from persisted messages, process identifiers, process groups, working directories, or a previous Phoenix process epoch
+
+WHEN the Coordinator requests stop for an exact listed handle
+THE SYSTEM SHALL verify Coordinator controller scope and current live state before sending one TERM signal to the process group
+AND SHALL leave final output draining and terminal-state transition to the existing handle lifecycle owner
+
+WHEN Phoenix restarts
+THE Coordinator live-handle surface SHALL be empty until the new process launches Coordinator-owned handles
+
+---
+
 ### REQ-BASH-003: Handle Operations (Peek, Wait, Kill)
 
 WHEN agent calls `bash(peek=<handle>, ...)`

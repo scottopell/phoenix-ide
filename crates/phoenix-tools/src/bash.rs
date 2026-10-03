@@ -28,6 +28,7 @@ pub mod sandbox;
 pub use handle::FinalCause;
 pub use handle::HandleId;
 pub use handle::{BashLaunchIdentity, BASH_LAUNCH_UUID_ENV_VAR};
+pub use operations::{stop_exact_handle_for_scope, BashError};
 pub use reaper::{install_reaper, shutdown_kill_tree, shutdown_kill_tree_until};
 pub use registry::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,

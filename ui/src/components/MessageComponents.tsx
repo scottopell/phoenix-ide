@@ -1731,7 +1731,7 @@ function canonicalTargetLink(target: string | undefined, conversationId: string 
     return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
   }
   const transcript = target?.startsWith('@transcript:') ? target.slice('@transcript:'.length) : conversationId;
-  return transcript ? `/conversations/${encodeURIComponent(transcript)}` : null;
+  return transcript ? `/c/${encodeURIComponent(transcript)}` : null;
 }
 
 export function SendConversationMessageView({ response }: { response: SendConversationOutcome }) {
@@ -1748,7 +1748,7 @@ export function SendConversationMessageView({ response }: { response: SendConver
         <span>Recipient</span>
         {link ? <Link to={link}>{response.target ?? response.conversation_id}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
       </div>
-      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/conversations/${encodeURIComponent(response.conversation_id)}`}>{response.conversation_id}</Link></div>}
+      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.conversation_id)}`}>{response.conversation_id}</Link></div>}
       {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
       {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
     </div>
@@ -1759,9 +1759,20 @@ function WatchLink({ watch }: { watch: WatchSnapshot }) {
   return (
     <li className="coordinator-watch-row">
       <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>@conv:{watch.product_conversation_id}</Link>
-      <Link to={`/conversations/${encodeURIComponent(watch.current_transcript_id)}`}>@transcript:{watch.current_transcript_id}</Link>
+      <Link to={`/c/${encodeURIComponent(watch.current_transcript_id)}`}>@transcript:{watch.current_transcript_id}</Link>
       <span>{watch.current_state?.type ?? 'active'}</span>
     </li>
+  );
+}
+
+type UnwatchOutcome = { product_conversation_id: string; ended: boolean };
+
+export function UnwatchResultView({ response }: { response: UnwatchOutcome }) {
+  return (
+    <div className="coordinator-result-card">
+      <strong>{response.ended ? 'Watch ended' : 'Watch not found'}</strong>
+      <Link to={`/product-conversations/${encodeURIComponent(response.product_conversation_id)}`}>@conv:{response.product_conversation_id}</Link>
+    </div>
   );
 }
 
@@ -2963,15 +2974,23 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
 
 
   const svgArtifact = svgArtifactFromResult(name, result);
+  const watchTool = name === 'list_watched_conversations'
+    || name === 'watch_conversation'
+    || name === 'unwatch_conversation';
+  let watchJson: unknown = null;
+  if (!isError && watchTool) {
+    try { watchJson = JSON.parse(resultText); } catch { watchJson = null; }
+  }
   const structuredResult = !isError ? tryParseJson(resultText) : null;
   const sendOutcome = name === 'send_conversation_message' && structuredResult && !Array.isArray(structuredResult)
     && typeof structuredResult === 'object' && 'outcome' in structuredResult
     ? structuredResult as SendConversationOutcome
     : null;
-  const watchingResult = (name === 'list_watched_product_conversations'
-    || name === 'watch_product_conversation'
-    || name === 'unwatch_product_conversation') && structuredResult !== null
-    ? structuredResult
+  const watchingResult = name !== 'unwatch_conversation' && watchJson !== null ? watchJson : null;
+  const unwatchOutcome = name === 'unwatch_conversation' && watchJson && typeof watchJson === 'object'
+    && typeof (watchJson as Record<string, unknown>)['product_conversation_id'] === 'string'
+    && typeof (watchJson as Record<string, unknown>)['ended'] === 'boolean'
+    ? watchJson as UnwatchOutcome
     : null;
   return (
     <>
@@ -3025,6 +3044,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
             </div>
           ) : sendOutcome ? (
             <SendConversationMessageView response={sendOutcome} />
+          ) : unwatchOutcome ? (
+            <UnwatchResultView response={unwatchOutcome} />
           ) : watchingResult ? (
             <WatchingResultView response={watchingResult} />
           ) : bashResponse ? (
