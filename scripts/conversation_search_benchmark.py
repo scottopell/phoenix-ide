@@ -844,6 +844,12 @@ def _validate_run(run: dict, name: str) -> dict:
     if expected_warm != 10:
         raise SystemExit(f"refusing comparison: {name} must declare exactly 10 measured warm runs")
     for key, by_phase in phases.items():
+        first_phases = [phase for phase in by_phase if phase.startswith("first_")]
+        if len(first_phases) != 1 or set(by_phase) != {first_phases[0], "warmup_discarded", "warm"}:
+            raise SystemExit(f"refusing comparison: {name} has incomplete measurement phases")
+        for phase, count in [(first_phases[0], 1), ("warmup_discarded", run["warmup_runs"])]:
+            if sorted(sample.get("iteration") for sample in by_phase[phase]) != list(range(count)):
+                raise SystemExit(f"refusing comparison: {name} has incomplete {phase} iterations")
         warm = by_phase.get("warm", [])
         iterations = sorted(sample.get("iteration") for sample in warm)
         if len(warm) != 10 or iterations != list(range(10)):

@@ -3198,7 +3198,9 @@ impl Database {
     /// # Errors
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn open_read_only(path: &str) -> DbResult<Self> {
-        let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=ro"))?
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
             .read_only(true)
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
