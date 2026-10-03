@@ -2423,6 +2423,10 @@ rule ModeChangeNotification {
 --       True exactly when accepted steering newer than the exhausted recovery
 --       owner remains queued for dispatch.
 --
+--   pending_approval_owns_next_transition(conversation: Conversation) -> Boolean
+--       True exactly when task approval remains required before model dispatch
+--       or terminal settlement.
+--
 --   recoverable_tool_results_await_model_step(conversation: Conversation) -> Boolean
 --       True exactly when that active turn has a complete persisted tool-result
 --       round whose next model step has not settled. An interrupted or
@@ -2643,6 +2647,7 @@ rule ServerRestartExhaustedDirectTurn {
     requires: active_materialized_turn_owns_conversation(conversation)
     requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: not newer_queued_steering_awaits_dispatch(conversation)
+    requires: not pending_approval_owns_next_transition(conversation)
     requires: restart_recovery_exhausted(conversation)
     ensures: conversation.core_status = error
     ensures: not active_materialized_turn_owns_conversation(conversation)

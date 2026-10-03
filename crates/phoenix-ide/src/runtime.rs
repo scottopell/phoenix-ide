@@ -4058,6 +4058,18 @@ impl RuntimeManager {
         let exhausted_occurrence_owns_baton = occurrence
             .is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
             && baton_recovery.is_some();
+        if let Some(occurrence) = occurrence
+            .filter(|occurrence| occurrence.restart_loop_detected() && baton_recovery.is_some())
+        {
+            let current_source = self
+                .db
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if current_source.as_deref() != Some(occurrence.source_message_id.as_str()) {
+                return Ok(true);
+            }
+        }
         let baton_recovery_exhausted = !has_resumable_occurrence
             && baton_recovery.is_some_and(|recovery| {
                 recovery.decision.reason == recovery::RecoveryReason::RestartLoopDetected
@@ -4293,7 +4305,9 @@ impl RuntimeManager {
                         terminal: ActiveDirectTurnTerminal::Failed {
                             reason: initialization_error.to_string(),
                         },
-                        state: if resumable_owner {
+                        state: if self.has_queued_steering(conversation_id).await? {
+                            ConvState::Idle
+                        } else if resumable_owner {
                             error_state
                         } else {
                             ConvState::Idle
@@ -6083,7 +6097,11 @@ impl RuntimeManager {
                 .has_committed_steering_turn(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-        let startup_llm_recovery = if needs_auto_continue && active_direct_turn.is_some() {
+        let materialized_baton = matches!(
+            active_direct_turn,
+            Some(LoadedActiveDirectTurn::Materialized { .. })
+        );
+        let startup_llm_recovery = if needs_auto_continue && materialized_baton {
             crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
         } else if resumable_owner {
             crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
@@ -6092,6 +6110,7 @@ impl RuntimeManager {
         };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
+            let is_materialized = matches!(loaded, LoadedActiveDirectTurn::Materialized { .. });
             let active = loaded.into_active();
             if let Some(obligation) = recovered_terminal_obligation {
                 let terminal = match obligation.terminal {
@@ -6118,8 +6137,10 @@ impl RuntimeManager {
                 )
                 .await?;
                 None
-            } else {
+            } else if is_materialized {
                 Some(active)
+            } else {
+                None
             }
         } else {
             None
@@ -14004,6 +14025,63 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn replacement_occurrence_blocks_stale_exhausted_baton_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-exhausted-occurrence-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let baton = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for message_id in ["exhausted-old-occurrence", "replacement-new-occurrence"] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-new-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let stale = ExecutionOccurrenceRecovery {
+            source_message_id: "exhausted-old-occurrence".to_string(),
+            disposition: ExecutionOccurrenceDisposition::RestartLoopDetected,
+        };
+
+        assert!(manager
+            .settle_restart_exhaustion(conversation_id, Some(&stale), Some(&baton), false, false,)
+            .await
+            .unwrap());
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-new-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
