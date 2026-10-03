@@ -3865,33 +3865,13 @@ impl RuntimeManager {
                 .as_ref()
                 .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
             if self
-                .settle_restart_exhaustion(
+                .settle_startup_recovery_owners(
                     &conversation_id,
+                    &conversation.state,
                     occurrence_recovery.as_ref(),
                     baton_recovery.as_ref(),
                     has_queued_steering,
                     has_resumable_occurrence,
-                )
-                .await?
-            {
-                continue;
-            }
-            let settled_occurrence = self
-                .settle_occurrence_unless_deferred(
-                    &conversation_id,
-                    occurrence_recovery.as_ref(),
-                    has_queued_steering,
-                )
-                .await?;
-            if settled_occurrence && !has_queued_steering && baton_recovery.is_none() {
-                continue;
-            }
-            if self
-                .settle_nonresumable_idle_baton(
-                    &conversation_id,
-                    &conversation.state,
-                    baton_recovery.as_ref(),
-                    has_queued_steering || has_resumable_occurrence,
                 )
                 .await?
             {
@@ -3968,6 +3948,70 @@ impl RuntimeManager {
         receipt
             .await
             .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
+    }
+
+    async fn settle_startup_recovery_owners(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        baton: Option<&BatonRecovery>,
+        has_queued_steering: bool,
+        has_resumable_occurrence: bool,
+    ) -> Result<bool, String> {
+        if self
+            .settle_restart_exhaustion(
+                conversation_id,
+                occurrence,
+                baton,
+                has_queued_steering,
+                has_resumable_occurrence,
+            )
+            .await?
+        {
+            return Ok(true);
+        }
+        let settled_occurrence = self
+            .settle_occurrence_unless_deferred(conversation_id, occurrence, has_queued_steering)
+            .await?;
+        let Some(baton_state) = self
+            .remaining_baton_state(
+                conversation_id,
+                state,
+                settled_occurrence,
+                has_queued_steering || baton.is_some(),
+            )
+            .await?
+        else {
+            return Ok(true);
+        };
+        self.settle_nonresumable_idle_baton(
+            conversation_id,
+            &baton_state,
+            baton,
+            has_queued_steering || has_resumable_occurrence,
+        )
+        .await
+    }
+
+    async fn remaining_baton_state(
+        &self,
+        conversation_id: &str,
+        prior_state: &ConvState,
+        settled_occurrence: bool,
+        has_remaining_authority: bool,
+    ) -> Result<Option<ConvState>, String> {
+        if !settled_occurrence {
+            return Ok(Some(prior_state.clone()));
+        }
+        if !has_remaining_authority {
+            return Ok(None);
+        }
+        self.db
+            .get_conversation(conversation_id)
+            .await
+            .map(|conversation| Some(conversation.state))
+            .map_err(|error| error.to_string())
     }
 
     async fn settle_nonresumable_idle_baton(
@@ -5363,7 +5407,7 @@ impl RuntimeManager {
                                     ),
                                     provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
                                         &conversation_id,
-                                        &conversation.state,
+                                    &conversation.state,
                                     ),
                                 },
                             )
@@ -13426,11 +13470,6 @@ mod scope_liveness_tests {
         materialize_restart_direct_turn(&manager, conversation_id).await;
         manager
             .db()
-            .update_conversation_state(conversation_id, &ConvState::Idle)
-            .await
-            .unwrap();
-        manager
-            .db()
             .add_message(
                 "completed-occurrence-source",
                 conversation_id,
@@ -13799,6 +13838,73 @@ mod scope_liveness_tests {
                 .into_active(),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_conflict_still_settles_classified_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-terminal-conflict-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "conflicted-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'conflicted-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        DatabaseStorage::new(manager.db().clone())
+            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: classified.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+                execution_occurrence_message_id: None,
+            })
+            .await
+            .unwrap();
+
+        manager
+            .persist_restart_loop_failure(
+                conversation_id,
+                &classified.turn,
+                Some("conflicted-occurrence"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
     }
 
     #[tokio::test]

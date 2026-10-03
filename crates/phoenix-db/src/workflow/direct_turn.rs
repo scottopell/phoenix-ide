@@ -2384,17 +2384,34 @@ impl WorkflowRepository {
                 ))
             })
             .await?;
-        let occurrence = if let Some(message_id) = execution_occurrence_message_id {
-            load_exact_execution_occurrence_tx(&mut tx.tx, input, message_id).await?
-        } else {
-            None
-        };
-        let step = telemetry
+        let occurrence =
+            load_exact_execution_occurrence_tx(&mut tx.tx, input, execution_occurrence_message_id)
+                .await?;
+        let step = match telemetry
             .observe_db(
                 SqlitePhase::Statement,
                 self.terminalize_authoritative_turn_in_tx(&mut tx, input),
             )
-            .await?;
+            .await
+        {
+            Ok(step) => step,
+            Err(error @ DbError::DirectTurnConflict(TurnConflict::AlreadyTerminal))
+                if occurrence.is_some() =>
+            {
+                let terminal = persisted_turn_terminal_tx(&mut tx.tx, &input.command).await?;
+                settle_captured_execution_occurrence_tx(
+                    &mut tx.tx,
+                    occurrence.expect("guarded occurrence"),
+                    &terminal,
+                )
+                .await?;
+                telemetry
+                    .observe_commit_db(transaction_timing, tx.commit())
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(occurrence) = occurrence {
             let (TurnOutcome::Terminal { terminal, .. }
             | TurnOutcome::TerminalReplay { terminal, .. }) = &step.outcome
@@ -2982,15 +2999,18 @@ struct CapturedExecutionOccurrence {
 async fn load_exact_execution_occurrence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     input: &TerminalizeAuthoritativeTurnInput,
-    message_id: &str,
+    message_id: Option<&str>,
 ) -> DbResult<Option<CapturedExecutionOccurrence>> {
     let (turn_id, _, _) = terminal_command_parts(&input.command)?;
-    let occurrence = sqlx::query_as::<_, (String, String)>(
-        "SELECT occurrence.source_kind, occurrence.conversation_id
+    let occurrence = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT occurrence.source_kind, occurrence.conversation_id, occurrence.message_id
          FROM steering_execution_occurrences occurrence
-         WHERE occurrence.message_id = ?1
-           AND occurrence.conversation_id = (
+         WHERE occurrence.conversation_id = (
                SELECT conversation_id FROM durable_turns WHERE turn_id = ?2
+           )
+           AND (
+               occurrence.message_id = ?1
+               OR (?1 IS NULL AND occurrence.source_kind = 'interaction_response')
            )",
     )
     .bind(message_id)
@@ -2998,12 +3018,35 @@ async fn load_exact_execution_occurrence_tx(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(occurrence.map(
-        |(source_kind, conversation_id)| CapturedExecutionOccurrence {
+        |(source_kind, conversation_id, message_id)| CapturedExecutionOccurrence {
             source_kind,
             conversation_id,
-            message_id: message_id.to_string(),
+            message_id,
         },
     ))
+}
+
+async fn persisted_turn_terminal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    command: &TurnCommand,
+) -> DbResult<TurnTerminal> {
+    let (turn_id, _, _) = terminal_command_parts(command)?;
+    let (kind, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT terminal_kind, terminal_reason FROM durable_turns WHERE turn_id = ?1",
+    )
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .fetch_one(&mut **tx)
+    .await?;
+    match kind.as_str() {
+        "Completed" => Ok(TurnTerminal::Completed),
+        "Cancelled" => Ok(TurnTerminal::Cancelled),
+        "Failed" => Ok(TurnTerminal::Failed {
+            reason: reason.unwrap_or_else(|| "turn failed".to_string()),
+        }),
+        other => Err(DbError::Serialization(format!(
+            "unknown durable turn terminal kind: {other}"
+        ))),
+    }
 }
 
 async fn settle_captured_execution_occurrence_tx(
