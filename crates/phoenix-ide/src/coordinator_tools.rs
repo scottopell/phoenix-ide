@@ -186,7 +186,7 @@ impl Tool for WorkScopeCoordinatorBash {
             Err(error) => return ToolOutput::error(error),
         };
         let context_input = invocation.to_context_tool_value();
-        let spawn_target = match &invocation {
+        let (spawn_target, environment_display) = match &invocation {
             BashInvocation::Run {
                 target: BashSpawnTarget::WorkScope(work_scope_id),
                 ..
@@ -199,10 +199,19 @@ impl Tool for WorkScopeCoordinatorBash {
                     Ok(path) => path,
                     Err(error) => return ToolOutput::error(error),
                 };
-                ValidatedBashSpawnTarget {
-                    working_dir: binding.path.clone(),
-                    lifecycle_scope: binding.work_scope_id.clone(),
-                }
+                let display = json!({
+                    "work_scope_id": binding.work_scope_id.clone(),
+                    "cwd": binding.path.clone(),
+                    "owner_name": binding.owner_name,
+                    "project_path": binding.project_path,
+                });
+                (
+                    ValidatedBashSpawnTarget {
+                        working_dir: binding.path.clone(),
+                        lifecycle_scope: binding.work_scope_id.clone(),
+                    },
+                    display,
+                )
             }
             BashInvocation::Run {
                 target: BashSpawnTarget::Context,
@@ -214,10 +223,6 @@ impl Tool for WorkScopeCoordinatorBash {
                 return BashTool.run(context_input, ctx).await;
             }
         };
-        let environment_display = json!({
-            "work_scope_id": spawn_target.lifecycle_scope.clone(),
-            "cwd": spawn_target.working_dir.clone(),
-        });
         let mut output = BashTool
             .run_explicit_target(context_input, spawn_target, ctx)
             .await;
@@ -564,7 +569,19 @@ impl Tool for SendConversationMessage {
             outcome = output.kind(),
             "Cross-conversation message action committed"
         );
-        encode_message_output(&output)
+        let display_identity = match output.conversation_id() {
+            Some(conversation_id) => self
+                .service
+                .conversation_display_identity(conversation_id)
+                .await
+                .ok(),
+            None => None,
+        };
+        let encoded = encode_message_output(&output);
+        match display_identity {
+            Some(identity) => encoded.with_display(json!({ "recipient_identity": identity })),
+            None => encoded,
+        }
     }
 }
 

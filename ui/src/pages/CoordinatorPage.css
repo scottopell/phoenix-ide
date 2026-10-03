@@ -55,6 +55,39 @@
   color: var(--accent-red);
 }
 
+.global-active-watches {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 6px;
+  max-height: min(25dvh, 240px);
+  overflow-y: auto;
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.global-active-watch {
+  display: grid;
+  gap: 3px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-color);
+}
+
+.global-active-watch > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.global-active-watch code,
+.global-active-watch span {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
 .global-live-commands {
   display: grid;
   flex: 0 0 auto;

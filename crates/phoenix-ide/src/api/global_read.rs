@@ -203,6 +203,8 @@ pub(crate) struct GlobalReadService {
 pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
+    pub(crate) owner_name: String,
+    pub(crate) project_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -249,23 +251,15 @@ impl GlobalReadService {
                AND environment.lifecycle = 'active'
                AND environment.environment_kind <> 'none'
                AND EXISTS (
-                   SELECT 1
-                   FROM conversations owner
-                   LEFT JOIN product_conversations product
-                     ON product.id = owner.product_conversation_id
+                   SELECT 1 FROM conversations owner
+                   LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
                    WHERE owner.work_scope_id = environment.id
-                     AND (
-                         (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
-                         OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0)
-                     )
+                     AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                       OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
                      AND json_extract(owner.state, '$.type') NOT IN (
-                         'completed', 'failed', 'handed_off', 'creation_failed',
-                         'creation_cancelled', 'terminal'
-                     )
-                     AND NOT (
-                         json_extract(owner.state, '$.type') = 'context_exhausted'
-                         AND owner.continued_in_conv_id IS NOT NULL
-                     )
+                       'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
+                     AND NOT (json_extract(owner.state, '$.type') = 'context_exhausted'
+                       AND owner.continued_in_conv_id IS NOT NULL)
                )",
         )
         .bind(requested_work_scope_id)
@@ -277,6 +271,17 @@ impl GlobalReadService {
                 .to_string()
         })?;
         let (work_scope_id, worktree_path, cwd) = row;
+        let (owner_name, project_path) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT COALESCE(NULLIF(owner.cm_task_title, ''), NULLIF(owner.title, ''), NULLIF(owner.slug, ''), 'Untitled conversation'), project.canonical_path
+             FROM conversations owner
+             LEFT JOIN projects project ON project.id = owner.project_id
+             WHERE owner.work_scope_id = ?1 AND owner.continued_in_conv_id IS NULL
+             ORDER BY owner.created_at DESC LIMIT 1",
+        )
+        .bind(&work_scope_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|error| format!("failed to resolve Coordinator bash environment identity: {error}"))?;
         let preferred = worktree_path
             .as_deref()
             .filter(|path| !path.trim().is_empty())
@@ -291,6 +296,8 @@ impl GlobalReadService {
             path: canonical,
             work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
                 .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
+            owner_name,
+            project_path,
         })
     }
 
@@ -395,6 +402,38 @@ impl GlobalReadService {
             .await
             .map(|conversation| conversation.product_conversation_id.to_string())
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn conversation_display_identity(
+        &self,
+        conversation_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let display_name = conversation
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                conversation
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+            })
+            .or_else(|| {
+                conversation
+                    .slug
+                    .clone()
+                    .filter(|slug| !slug.trim().is_empty())
+            })
+            .unwrap_or_else(|| "Untitled conversation".to_string());
+        Ok(serde_json::json!({
+            "display_name": display_name,
+            "transcript_slug": conversation.slug,
+        }))
     }
 
     pub(crate) async fn resolve_message_target(

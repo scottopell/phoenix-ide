@@ -11,6 +11,9 @@ pub struct WatchSnapshot {
     pub current_transcript_id: String,
     pub current_state: phoenix_core::domain::sm_state::ConvState,
     pub enrolled_at_us: i64,
+    pub display_name: String,
+    pub transcript_slug: Option<String>,
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,15 +39,21 @@ fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
         current_state: serde_json::from_str(&state)
             .map_err(|error| DbError::Serialization(error.to_string()))?,
         enrolled_at_us: row.try_get("enrolled_at_us")?,
+        display_name: row.try_get("display_name")?,
+        transcript_slug: row.try_get("transcript_slug")?,
+        project_path: row.try_get("project_path")?,
     })
 }
 
 const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolled_at_us,
-    c.id AS transcript_id, c.state
+    c.id AS transcript_id, c.state,
+    COALESCE(NULLIF(c.cm_task_title, ''), NULLIF(c.title, ''), NULLIF(c.slug, ''), 'Untitled conversation') AS display_name,
+    c.slug AS transcript_slug, project.canonical_path AS project_path
     FROM coordinator_watches w
     JOIN product_conversations p ON p.id = w.source_product_conversation_id
     JOIN conversations c ON c.product_conversation_id = p.id
       AND c.parent_conversation_id IS NULL AND c.continued_in_conv_id IS NULL
+    LEFT JOIN projects project ON project.id = c.project_id
     WHERE w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open'
       AND (?1 IS NULL OR w.source_product_conversation_id = ?1)
     ORDER BY w.enrolled_at_us, w.id";

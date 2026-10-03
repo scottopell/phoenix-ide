@@ -12,6 +12,7 @@ const { apiMock } = vi.hoisted(() => ({
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
     listLiveCoordinatorBashHandles: vi.fn(),
+    listActiveCoordinatorWatches: vi.fn(),
     stopLiveCoordinatorBashHandle: vi.fn(),
   },
 }));
@@ -72,10 +73,12 @@ const coordinatorConversation = (): Conversation => ({
 
 describe('CoordinatorPage', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([]);
     apiMock.stopLiveCoordinatorBashHandle.mockResolvedValue(undefined);
     apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
       aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
@@ -87,6 +90,34 @@ describe('CoordinatorPage', () => {
       auto_continue_on_context_exhaustion: true,
       admission: null,
     });
+  });
+
+  it('shows the current server-backed watch inventory with readable names and secondary IDs', async () => {
+    apiMock.listActiveCoordinatorWatches.mockResolvedValue([{
+      product_conversation_id: 'product-readable',
+      transcript_id: 'transcript-readable',
+      transcript_slug: 'fix-readable-target',
+      display_name: 'Fix readable target',
+      project_path: '/repo/phoenix',
+      state: 'idle',
+    }]);
+    renderPage();
+    expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/fix-readable-target');
+    expect(screen.getByTitle('ProductConversation ID')).toHaveTextContent('product-readable');
+  });
+
+  it('removes ended watches when the current server inventory refreshes', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-ended', transcript_id: 'transcript-ended', transcript_slug: null,
+        display_name: 'Ending watch', project_path: null, state: 'idle',
+      }])
+      .mockResolvedValue([]);
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Ending watch' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Active watches' })).not.toBeInTheDocument(), { timeout: 3_000 });
   });
 
   it('shows only server-reported live Coordinator commands with inspect navigation', async () => {

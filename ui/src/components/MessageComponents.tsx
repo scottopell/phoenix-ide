@@ -1716,6 +1716,8 @@ type SendConversationOutcome = {
   target?: string;
   conversation_id?: string;
   message_id: string;
+  display_name?: string;
+  transcript_slug?: string;
   reason_code?: string;
   message?: string;
 };
@@ -1724,6 +1726,9 @@ type WatchSnapshot = {
   product_conversation_id: string;
   current_transcript_id: string;
   current_state: { type?: string };
+  display_name?: string;
+  transcript_slug?: string;
+  project_path?: string;
 };
 
 function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
@@ -1746,9 +1751,10 @@ export function SendConversationMessageView({ response }: { response: SendConver
       <div className="coordinator-result-heading"><strong>{label}</strong></div>
       <div className="coordinator-result-row">
         <span>Recipient</span>
-        {link ? <Link to={link}>{response.target ?? response.conversation_id}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
+        {link ? <Link to={link}>{response.display_name ?? 'Open conversation'}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
       </div>
-      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.conversation_id)}`}>{response.conversation_id}</Link></div>}
+      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.transcript_slug ?? response.conversation_id)}`}>Open current transcript</Link></div>}
+      <details><summary>IDs</summary><code>{response.target ?? 'Unresolved'}</code>{response.conversation_id && <code>{response.conversation_id}</code>}</details>
       {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
       {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
     </div>
@@ -1758,9 +1764,11 @@ export function SendConversationMessageView({ response }: { response: SendConver
 function WatchLink({ watch }: { watch: WatchSnapshot }) {
   return (
     <li className="coordinator-watch-row">
-      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>@conv:{watch.product_conversation_id}</Link>
-      <Link to={`/c/${encodeURIComponent(watch.current_transcript_id)}`}>@transcript:{watch.current_transcript_id}</Link>
+      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>{watch.display_name ?? 'Open conversation'}</Link>
+      <Link to={`/c/${encodeURIComponent(watch.transcript_slug ?? watch.current_transcript_id)}`}>current transcript</Link>
       <span>{watch.current_state?.type ?? 'active'}</span>
+      {watch.project_path && <code>{watch.project_path}</code>}
+      <details><summary>IDs</summary><code>{watch.product_conversation_id}</code><code>{watch.current_transcript_id}</code></details>
     </li>
   );
 }
@@ -1793,8 +1801,10 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
   const value = environment as Record<string, unknown>;
   const scope = typeof value['work_scope_id'] === 'string' ? value['work_scope_id'] : null;
   const cwd = typeof value['cwd'] === 'string' ? value['cwd'] : null;
+  const ownerName = typeof value['owner_name'] === 'string' ? value['owner_name'] : null;
+  const projectPath = typeof value['project_path'] === 'string' ? value['project_path'] : null;
   if (!scope && !cwd) return null;
-  return <div className="coordinator-environment"><strong>Environment</strong>{scope && <span>{scope}</span>}{cwd && <code title={cwd}>{cwd}</code>}</div>;
+  return <div className="coordinator-environment"><strong>Environment</strong>{ownerName && <span>{ownerName}</span>}{projectPath && <code title={projectPath}>{projectPath}</code>}{cwd && <code title={cwd}>{cwd}</code>}{scope && <details><summary>WorkScope ID</summary><code>{scope}</code></details>}</div>;
 }
 
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
@@ -2982,9 +2992,15 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
     try { watchJson = JSON.parse(resultText); } catch { watchJson = null; }
   }
   const structuredResult = !isError ? tryParseJson(resultText) : null;
+  const recipientIdentity = result?.display_data && typeof result.display_data === 'object'
+    ? (result.display_data as Record<string, unknown>)['recipient_identity']
+    : null;
   const sendOutcome = name === 'send_conversation_message' && structuredResult && !Array.isArray(structuredResult)
     && typeof structuredResult === 'object' && 'outcome' in structuredResult
-    ? structuredResult as SendConversationOutcome
+    ? {
+        ...structuredResult as SendConversationOutcome,
+        ...(recipientIdentity && typeof recipientIdentity === 'object' ? recipientIdentity as Record<string, string> : {}),
+      } as SendConversationOutcome
     : null;
   const watchingResult = name !== 'unwatch_conversation' && watchJson !== null ? watchJson : null;
   const unwatchOutcome = name === 'unwatch_conversation' && watchJson && typeof watchJson === 'object'

@@ -25,8 +25,9 @@ describe('Global coordinator tool results', () => {
       </MemoryRouter>,
     );
     expect(screen.getByText('Queued as steering')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '@conv:product-1' })).toHaveAttribute('href', '/product-conversations/product-1');
-    expect(screen.getByRole('link', { name: 'transcript-1' })).toHaveAttribute('href', '/c/transcript-1');
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-1');
+    expect(screen.getByRole('link', { name: 'Open current transcript' })).toHaveAttribute('href', '/c/transcript-1');
+    expect(screen.getByText('@conv:product-1')).toBeInTheDocument();
     expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
   });
 
@@ -63,8 +64,9 @@ describe('Global coordinator tool results', () => {
         }]} />
       </MemoryRouter>,
     );
-    expect(screen.getByRole('link', { name: '@conv:product-3' })).toHaveAttribute('href', '/product-conversations/product-3');
-    expect(screen.getByRole('link', { name: '@transcript:transcript-3' })).toHaveAttribute('href', '/c/transcript-3');
+    expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-3');
+    expect(screen.getByRole('link', { name: 'current transcript' })).toHaveAttribute('href', '/c/transcript-3');
+    expect(screen.getByText('product-3')).toBeInTheDocument();
     expect(screen.getByText('Idle')).toBeInTheDocument();
   });
 });

@@ -1307,6 +1307,15 @@ export interface LiveCoordinatorBashHandle {
   can_stop: boolean;
 }
 
+export interface ActiveCoordinatorWatch {
+  product_conversation_id: string;
+  transcript_id: string;
+  transcript_slug: string | null;
+  display_name: string;
+  project_path: string | null;
+  state: string;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -2001,6 +2010,12 @@ export const api = {
       method: 'DELETE',
     });
     if (!resp.ok) throw new Error('Failed to stop browser session');
+    return resp.json();
+  },
+
+  async listActiveCoordinatorWatches(): Promise<ActiveCoordinatorWatch[]> {
+    const resp = await fetch('/api/coordinator/watches');
+    if (!resp.ok) throw new Error('Failed to list active watches');
     return resp.json();
   },
 

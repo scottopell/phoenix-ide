@@ -391,6 +391,10 @@ pub fn create_router(state: AppState) -> Router {
             get(list_live_coordinator_bash_handles),
         )
         .route(
+            "/api/coordinator/watches",
+            get(list_active_coordinator_watches),
+        )
+        .route(
             "/api/coordinator/bash/:handle_id/stop",
             post(stop_live_coordinator_bash_handle),
         )
@@ -4066,6 +4070,45 @@ struct LiveCoordinatorBashHandle {
     cwd: String,
     started_at_ms: u128,
     can_stop: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveCoordinatorWatchResponse {
+    product_conversation_id: String,
+    transcript_id: String,
+    transcript_slug: Option<String>,
+    display_name: String,
+    project_path: Option<String>,
+    state: String,
+}
+
+async fn list_active_coordinator_watches(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ActiveCoordinatorWatchResponse>>, AppError> {
+    let snapshots = state.db.list_coordinator_watches().await.map_err(|error| {
+        AppError::Internal(format!("failed to list Coordinator watches: {error}"))
+    })?;
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(|watch| ActiveCoordinatorWatchResponse {
+                product_conversation_id: watch.product_conversation_id.to_string(),
+                transcript_id: watch.current_transcript_id,
+                transcript_slug: watch.transcript_slug,
+                display_name: watch.display_name,
+                project_path: watch.project_path,
+                state: serde_json::to_value(&watch.current_state)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(|kind| kind.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "active".to_string()),
+            })
+            .collect(),
+    ))
 }
 
 async fn list_live_coordinator_bash_handles(

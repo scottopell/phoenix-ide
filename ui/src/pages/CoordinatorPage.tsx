@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { api, type LiveCoordinatorBashHandle } from '../api';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { api, type ActiveCoordinatorWatch, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
@@ -12,6 +12,42 @@ const ConversationPage = lazy(() =>
 interface CoordinatorPageFixtureData {
   coordinatorId: string;
   conversation: ReactNode;
+}
+
+function GlobalActiveWatches() {
+  const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void api.listActiveCoordinatorWatches()
+        .then((value) => { if (!cancelled) setWatches(value); })
+        .catch(() => { if (!cancelled) setWatches([]); });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  if (watches.length === 0) return null;
+  return (
+    <section className="global-active-watches" aria-label="Active watches">
+      <strong>Watching</strong>
+      {watches.map((watch) => (
+        <div className="global-active-watch" key={watch.product_conversation_id}>
+          <div>
+            <Link to={`/product-conversations/${watch.product_conversation_id}`}>{watch.display_name}</Link>
+            <span>{watch.state}</span>
+          </div>
+          {watch.project_path && <code>{watch.project_path}</code>}
+          <div>
+            <Link to={`/c/${watch.transcript_slug || watch.transcript_id}`}>current transcript</Link>
+            <code title="ProductConversation ID">{watch.product_conversation_id}</code>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 function GlobalLiveCommands() {
@@ -136,7 +172,12 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         </div>
       )}
 
-      {!fixtureData && !loading && !error && <GlobalLiveCommands />}
+      {!fixtureData && !loading && !error && (
+        <>
+          <GlobalActiveWatches />
+          <GlobalLiveCommands />
+        </>
+      )}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
