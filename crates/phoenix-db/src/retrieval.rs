@@ -149,11 +149,6 @@ impl RetrievalRequest {
     pub fn limit(&self) -> usize {
         self.limit
     }
-    /// The backend lexical expression generated from this natural-language request.
-    #[must_use]
-    pub fn lexical_expression(&self) -> Option<String> {
-        build_fts_query(&self.query, self.match_mode)
-    }
 }
 
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
@@ -268,6 +263,12 @@ pub struct Fts5Retriever {
 }
 
 impl Fts5Retriever {
+    /// The backend lexical expression generated from this natural-language request.
+    #[must_use]
+    pub fn lexical_expression(request: &RetrievalRequest) -> Option<String> {
+        build_fts_query(&request.query, request.match_mode)
+    }
+
     /// Build a retriever over the given pool. Call [`Self::reconcile`] once at
     /// startup to bring the index in line with `messages`.
     #[must_use]

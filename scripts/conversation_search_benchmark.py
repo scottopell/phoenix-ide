@@ -491,7 +491,7 @@ def snapshot(args) -> int:
     if not source.exists(): raise SystemExit(f'source does not exist: {source}')
     _private(outdir)
     dest = requested
-    if dest.exists() and not args.force: raise SystemExit(f'fixture exists (use --force only to replace): {dest}')
+    if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
     source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
     try:
         logical_size = _logical_database_size(source_conn)
@@ -568,7 +568,11 @@ def snapshot(args) -> int:
       'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
       'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
-    _write_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
+    try:
+        _write_atomic_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
     print(f'captured immutable fixture: {dest}\nsha256: {manifest["sha256"]}\ncounts: {manifest["counts"]}')
     print(f'next: ./dev.py conversation-search prepare --artifacts {outdir}')
     return 0
@@ -598,12 +602,15 @@ def prepare(args) -> int:
     row=conn.execute('SELECT conversation_id FROM messages WHERE message_id=?',(recovered[0]['message_id'],)).fetchone()
     if row: ids=[row[0]]
     selective_query = _selective_term(conn, exact)
+    nohit_query = "phoenixbenchmarknosuchterm9f3c2"
+    if conn.execute("SELECT count(*) FROM message_fts WHERE message_fts MATCH ?", (nohit_query,)).fetchone()[0] != 0:
+        raise SystemExit("no-hit candidate exists in fixture; refusing unverified scenario")
     scenarios=[
       {'id':'observed-slow-exact','kind':'tool','query':exact,'source_call_id':recovered[0]['source_call_id'],'expected':'hit'},
       {'id':'observed-slow-other','kind':'tool','query':recovered[1]['query'],'source_call_id':recovered[1]['source_call_id'],'expected':'hit'},
       {'id':'broad-common','kind':'tool','query':'conversation','expected':'hit'},
       {'id':'selective-known-match','kind':'tool','query':selective_query,'expected':'hit'},
-      {'id':'verified-no-hit','kind':'tool','query':'phoenixbenchmarknosuchterm9f3c2','expected':'no_hit'},
+      {'id':'verified-no-hit','kind':'tool','query':nohit_query,'expected':'no_hit'},
       {'id':'scoped-existing-transcript','kind':'retriever','scope':'conversation','query':exact,'conversation_ids':ids,'expected':'hit'},
     ]
     conn.close()
@@ -665,7 +672,7 @@ def run(args) -> int:
         PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST=str(capture.get("schema_digest", "")),
         PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER=json.dumps(capture.get("migration_ledger")),
         PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
-        PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor(),
+        PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor() or "unknown",
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
     process = subprocess.Popen(
         cmd,

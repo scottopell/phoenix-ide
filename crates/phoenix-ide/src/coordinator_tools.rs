@@ -962,7 +962,7 @@ mod tests {
                     .await
                     .expect("build search request")
             };
-            let lexical_expression = policy_request.lexical_expression();
+            let lexical_expression = crate::db::Fts5Retriever::lexical_expression(&policy_request);
             let policy = serde_json::json!({
                 "scope": format!("{:?}", policy_request.scope()),
                 "visibility": format!("{:?}", policy_request.visibility()),
@@ -977,7 +977,7 @@ mod tests {
                 Some(
                     tokio::time::timeout(
                         std::time::Duration::from_secs(300),
-                        policy_service.search_with_hits(query),
+                        policy_service.search_hits(query),
                     )
                     .await
                     .expect("oracle timeout")
@@ -1116,10 +1116,13 @@ mod tests {
                                     result_identity,
                                 } => {
                                     if ok {
-                                        let (expected_output, hits) =
-                                            tool_oracle.as_ref().expect("tool oracle");
+                                        let hits = tool_oracle.as_ref().expect("tool oracle");
+                                        let expected_output = policy_service
+                                            .format_search_hits(hits)
+                                            .await
+                                            .expect("oracle formatting");
                                         let (count, identity) = structured_search_result(hits);
-                                        if output == *expected_output {
+                                        if output == expected_output {
                                             (true, output, Some(count), Some(identity), None)
                                         } else {
                                             (
@@ -1148,7 +1151,7 @@ mod tests {
                             "result_identity": result_identity, "expected": expected,
                         }));
                         if !ok {
-                            failures.push(format!("benchmark scenario {case_id} failed: {output}"));
+                            failures.push(format!("benchmark scenario {case_id}/{phase} failed; private evidence retained"));
                         }
                         if let Some(error) = format_error {
                             failures.push(format!(
