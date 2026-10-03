@@ -85,11 +85,11 @@ function GlobalLiveCommands() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
-  if (error) return <div className="global-live-commands-error">{error}</div>;
-  if (handles.length === 0) return null;
+  if (handles.length === 0 && !error) return null;
   return (
     <section className="global-live-commands" aria-label="Running commands">
       <strong>Running</strong>
+      {error && <span className="global-live-commands-error" role="status">{error}</span>}
       {handles.map((handle) => (
         <div className="global-live-command" key={handle.handle_id}>
           <div>

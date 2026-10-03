@@ -420,19 +420,12 @@ impl GlobalReadService {
             .get_conversation(conversation_id)
             .await
             .map_err(|error| error.to_string())?;
-        let root_id = self
+        let aggregate = self
             .db
-            .product_conversation_member_ids(conversation.product_conversation_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "ProductConversation has no root transcript".to_string())?;
-        let root = self
-            .db
-            .get_conversation(&root_id)
+            .get_ordinary_product_conversation(&conversation.product_conversation_id)
             .await
             .map_err(|error| error.to_string())?;
+        let root = aggregate.root.conversation;
         let display_name = root
             .title
             .clone()
