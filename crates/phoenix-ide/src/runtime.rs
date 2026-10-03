@@ -4210,7 +4210,10 @@ impl RuntimeManager {
     ) -> Result<(), String> {
         let classified = settlement.turn.clone();
         let conversation_id = settlement.conversation_id.clone();
-        if let Err(error) = storage.settle_active_direct_turn(&settlement).await {
+        if let Err(error) = storage
+            .settle_active_direct_turn_if_occurrence_unchanged(&settlement)
+            .await
+        {
             let active = storage.load_active_direct_turn(&conversation_id).await?;
             if active.is_some_and(|active| {
                 let active = active.active();
@@ -4326,27 +4329,9 @@ impl RuntimeManager {
                 execution_occurrence_message_id: occurrence_recovery
                     .map(|occurrence| occurrence.source_message_id.clone()),
             };
-            let storage = DatabaseStorage::new(self.db.clone());
-            if settlement.execution_occurrence_message_id.is_some() {
-                match storage
-                    .settle_active_direct_turn_if_occurrence_current(&settlement)
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(error) => {
-                        let active = storage.load_active_direct_turn(conversation_id).await?;
-                        if active.is_some_and(|active| {
-                            let active = active.active();
-                            active.turn_id == baton_recovery.turn.turn_id
-                                && active.generation == baton_recovery.turn.generation
-                        }) {
-                            return Err(error);
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-            return self.settle_classified_baton(&storage, settlement).await;
+            return self
+                .settle_classified_baton(&DatabaseStorage::new(self.db.clone()), settlement)
+                .await;
         }
         if let Some(occurrence) = occurrence_recovery {
             let committed = self
@@ -14191,6 +14176,73 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn newly_adopted_occurrence_blocks_exhausted_baton_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-exhausted-new-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "new-exhaustion-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("new accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'new-exhaustion-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let prior_state = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap()
+            .state;
+
+        manager
+            .persist_restart_loop_failure(conversation_id, &classified.turn, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-exhaustion-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            prior_state
+        );
     }
 
     #[tokio::test]

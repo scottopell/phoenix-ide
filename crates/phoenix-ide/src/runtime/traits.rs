@@ -1445,16 +1445,17 @@ impl DatabaseStorage {
         &self.db
     }
 
-    pub async fn settle_active_direct_turn_if_occurrence_current(
+    pub async fn settle_active_direct_turn_if_occurrence_unchanged(
         &self,
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<bool, String> {
-        let occurrence_message_id = settlement
+        let expectation = settlement
             .execution_occurrence_message_id
             .as_deref()
-            .ok_or_else(|| {
-                "exact occurrence settlement requires an occurrence identity".to_string()
-            })?;
+            .map_or(
+                phoenix_db::workflow::ExecutionOccurrenceExpectation::Absent,
+                phoenix_db::workflow::ExecutionOccurrenceExpectation::Exact,
+            );
         let repo = self.db.workflow_repository();
         repo.terminalize_authoritative_turn_if_occurrence_unchanged(
             &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
@@ -1471,7 +1472,7 @@ impl DatabaseStorage {
                     &settlement.state,
                 ),
             },
-            occurrence_message_id,
+            expectation,
         )
         .await
         .map(|outcome| {
