@@ -1732,6 +1732,7 @@ type WatchSnapshot = {
 };
 
 function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
+  if (!conversationId) return null;
   if (target?.startsWith('@conv:')) {
     return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
   }

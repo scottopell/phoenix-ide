@@ -42,6 +42,7 @@ describe('Global coordinator tool results', () => {
     );
     expect(screen.getByText('Rejected')).toBeInTheDocument();
     expect(screen.getByText('Recipient cannot accept messages in this state')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open target transcript' })).toHaveAttribute('href', '/c/transcript-2');
     expect(screen.queryByText(/understanding or completion/i)).not.toBeInTheDocument();
   });
 

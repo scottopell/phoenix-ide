@@ -259,6 +259,26 @@ fn successful_group_signal_outcome(
     }
 }
 
+#[cfg(target_os = "linux")]
+struct StoppedIncarnationGuard {
+    pidfd: libc::c_long,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StoppedIncarnationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd,
+                libc::SIGCONT,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+    }
+}
+
 impl Handle {
     /// Construct a fresh live handle for a freshly spawned child.
     ///
@@ -602,6 +622,7 @@ impl Handle {
         let result = if stopped != 0 {
             Err(std::io::Error::last_os_error())
         } else {
+            let _resume_on_exit = StoppedIncarnationGuard { pidfd };
             let pidfd_id = libc::id_t::try_from(pidfd)
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);

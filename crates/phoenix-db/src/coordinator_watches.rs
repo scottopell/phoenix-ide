@@ -47,12 +47,17 @@ fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
 
 const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolled_at_us,
     c.id AS transcript_id, c.state,
-    COALESCE(NULLIF(c.cm_task_title, ''), NULLIF(c.title, ''), NULLIF(c.slug, ''), 'Untitled conversation') AS display_name,
+    COALESCE(NULLIF(root.cm_task_title, ''), NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation') AS display_name,
     c.slug AS transcript_slug, project.canonical_path AS project_path
     FROM coordinator_watches w
     JOIN product_conversations p ON p.id = w.source_product_conversation_id
     JOIN conversations c ON c.product_conversation_id = p.id
       AND c.parent_conversation_id IS NULL AND c.continued_in_conv_id IS NULL
+    JOIN conversations root ON root.product_conversation_id = p.id
+      AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM conversations predecessor
+        WHERE predecessor.product_conversation_id = root.product_conversation_id
+          AND predecessor.continued_in_conv_id = root.id)
     LEFT JOIN projects project ON project.id = c.project_id
     WHERE w.ended_at_us IS NULL AND p.ordinary_lifecycle = 'open'
       AND (?1 IS NULL OR w.source_product_conversation_id = ?1)
