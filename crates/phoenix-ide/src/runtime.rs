@@ -4301,36 +4301,52 @@ impl RuntimeManager {
                 .latest_execution_occurrence_message_id(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            current_source
-                .as_deref()
-                .filter(|source| *source == classified.source_message_id)
-                .map(|_| classified)
+            if current_source.as_deref() != Some(classified.source_message_id.as_str()) {
+                return Ok(());
+            }
+            Some(classified)
         } else {
             None
         };
         if let Some(baton_recovery) = baton_recovery {
-            return self
-                .settle_classified_baton(
-                    &DatabaseStorage::new(self.db.clone()),
-                    ActiveDirectTurnSettlement {
-                        conversation_id: conversation_id.to_string(),
-                        turn: baton_recovery.turn.clone(),
-                        terminal: ActiveDirectTurnTerminal::Failed {
-                            reason: initialization_error.to_string(),
-                        },
-                        state: if self.has_queued_steering(conversation_id).await? {
-                            ConvState::Idle
-                        } else if resumable_owner {
-                            error_state
-                        } else {
-                            ConvState::Idle
-                        },
-                        state_updated_at,
-                        execution_occurrence_message_id: occurrence_recovery
-                            .map(|occurrence| occurrence.source_message_id.clone()),
-                    },
-                )
-                .await;
+            let settlement = ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: baton_recovery.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Failed {
+                    reason: initialization_error.to_string(),
+                },
+                state: if self.has_queued_steering(conversation_id).await? {
+                    ConvState::Idle
+                } else if resumable_owner {
+                    error_state
+                } else {
+                    ConvState::Idle
+                },
+                state_updated_at,
+                execution_occurrence_message_id: occurrence_recovery
+                    .map(|occurrence| occurrence.source_message_id.clone()),
+            };
+            let storage = DatabaseStorage::new(self.db.clone());
+            if settlement.execution_occurrence_message_id.is_some() {
+                match storage
+                    .settle_active_direct_turn_if_occurrence_current(&settlement)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        let active = storage.load_active_direct_turn(conversation_id).await?;
+                        if active.is_some_and(|active| {
+                            let active = active.active();
+                            active.turn_id == baton_recovery.turn.turn_id
+                                && active.generation == baton_recovery.turn.generation
+                        }) {
+                            return Err(error);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            return self.settle_classified_baton(&storage, settlement).await;
         }
         if let Some(occurrence) = occurrence_recovery {
             let committed = self
@@ -14175,6 +14191,89 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn replacement_occurrence_blocks_initialization_failure_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-initialization-occurrence-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let baton = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for message_id in [
+            "classified-initialization-occurrence",
+            "replacement-initialization-occurrence",
+        ] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-initialization-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let classified = ExecutionOccurrenceRecovery {
+            source_message_id: "classified-initialization-occurrence".to_string(),
+            disposition: ExecutionOccurrenceDisposition::Resume,
+        };
+
+        let prior_state = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap()
+            .state;
+
+        manager
+            .persist_startup_llm_initialization_failure(
+                conversation_id,
+                "invalid model",
+                true,
+                Some(&baton),
+                Some(&classified),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-initialization-occurrence")
+        );
+        assert!(DatabaseStorage::new(manager.db().clone())
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            prior_state
+        );
     }
 
     #[tokio::test]

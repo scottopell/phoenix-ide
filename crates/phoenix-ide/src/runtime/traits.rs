@@ -1444,6 +1444,44 @@ impl DatabaseStorage {
     pub fn inner(&self) -> &Database {
         &self.db
     }
+
+    pub async fn settle_active_direct_turn_if_occurrence_current(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<bool, String> {
+        let occurrence_message_id = settlement
+            .execution_occurrence_message_id
+            .as_deref()
+            .ok_or_else(|| {
+                "exact occurrence settlement requires an occurrence identity".to_string()
+            })?;
+        let repo = self.db.workflow_repository();
+        repo.terminalize_authoritative_turn_if_occurrence_unchanged(
+            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                command: direct_turn_terminal_command(
+                    &settlement.turn,
+                    settlement.terminal.clone(),
+                ),
+                projection: Some(phoenix_db::workflow::PersistedConversationProjection {
+                    state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                }),
+                provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(
+                    &settlement.conversation_id,
+                    &settlement.state,
+                ),
+            },
+            occurrence_message_id,
+        )
+        .await
+        .map(|outcome| {
+            matches!(
+                outcome,
+                phoenix_db::workflow::TerminalizeAuthoritativeTurnOutcome::Settled(_)
+            )
+        })
+        .map_err(|error| error.to_string())
+    }
 }
 
 fn direct_turn_terminal_command(
