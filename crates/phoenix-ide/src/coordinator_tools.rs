@@ -951,6 +951,21 @@ mod tests {
                 assert!(!setup_hits.is_empty(), "representative candidate has no eligible hits under actual tool policy; choose another candidate before benchmarking");
             }
 
+            if case_id == "broad-common" {
+                let request = policy_service
+                    .search_request(query)
+                    .await
+                    .expect("broad policy")
+                    .with_limit(1000);
+                let eligible = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    policy_retriever.retrieve(request),
+                )
+                .await
+                .expect("broad timeout")
+                .expect("broad results");
+                assert!(eligible.len() >= 1000, "broad candidate has fewer than1000 eligible matches; choose another candidate before benchmarking");
+            }
             let policy_request = if is_retriever && is_scoped {
                 crate::db::RetrievalRequest::natural_language(
                     query,
