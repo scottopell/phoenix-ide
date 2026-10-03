@@ -256,9 +256,9 @@ impl GlobalReadService {
                    WHERE owner.work_scope_id = environment.id
                      AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
                        OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
-                     AND json_extract(owner.state, '$.type') NOT IN (
+                     AND owner.state_kind NOT IN (
                        'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
-                     AND NOT (json_extract(owner.state, '$.type') = 'context_exhausted'
+                     AND NOT (owner.state_kind = 'context_exhausted'
                        AND owner.continued_in_conv_id IS NOT NULL)
                )",
         )
@@ -281,7 +281,7 @@ impl GlobalReadService {
                AND owner.continued_in_conv_id IS NULL
                AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
                  OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
-               AND json_extract(owner.state, '$.type') NOT IN (
+               AND owner.state_kind NOT IN (
                  'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
              ORDER BY owner.created_at DESC LIMIT 1",
         )
@@ -427,9 +427,10 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())?;
         let root = aggregate.root.conversation;
         let display_name = root
-            .title
+            .chain_name
             .clone()
-            .filter(|title| !title.trim().is_empty())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| root.title.clone().filter(|title| !title.trim().is_empty()))
             .or_else(|| {
                 conversation
                     .title

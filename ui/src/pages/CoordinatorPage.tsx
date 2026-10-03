@@ -61,6 +61,7 @@ function GlobalActiveWatches() {
 }
 
 function GlobalLiveCommands() {
+  const location = useLocation();
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState<Set<string>>(() => new Set());
@@ -85,6 +86,13 @@ function GlobalLiveCommands() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
+  const inspectTarget = (handleId: string) => {
+    const search = new URLSearchParams(location.search);
+    search.set('viewer', 'inspect');
+    search.set('handle', handleId);
+    return { pathname: location.pathname, search: `?${search.toString()}`, hash: location.hash };
+  };
+
   if (handles.length === 0 && !error) return null;
   return (
     <section className="global-live-commands" aria-label="Running commands">
@@ -99,7 +107,7 @@ function GlobalLiveCommands() {
             <span>{handle.handle_id}</span>
           </div>
           <div className="global-live-command-actions">
-            <Link to={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</Link>
+            <Link to={inspectTarget(handle.handle_id)}>output →</Link>
             {handle.can_stop && <button type="button" disabled={stopping.has(handle.handle_id)} onClick={() => {
               setStopping((current) => new Set(current).add(handle.handle_id));
               void api.stopLiveCoordinatorBashHandle(handle.handle_id)

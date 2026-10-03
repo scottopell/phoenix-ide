@@ -2157,6 +2157,7 @@ mod tests {
             HandleId::new("b-1"),
             "emitter".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             1234,
             1234,
             RING_BUFFER_BYTES,

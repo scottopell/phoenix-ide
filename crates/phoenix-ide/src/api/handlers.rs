@@ -4131,7 +4131,7 @@ async fn list_live_coordinator_bash_handles(
                     .started_at
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |duration| duration.as_millis()),
-                can_stop: cfg!(target_os = "linux"),
+                can_stop: phoenix_tools::bash::exact_stop_supported(),
             })
             .collect(),
     )
@@ -12476,6 +12476,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,
@@ -12662,6 +12663,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "sleep 30".into(),
             Some("sleeper".into()),
+            std::path::PathBuf::from("/tmp"),
             pgid,
             pid,
             RING_BUFFER_BYTES,
@@ -12746,6 +12748,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "echo bye".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             7,
             7,
             RING_BUFFER_BYTES,
@@ -12838,6 +12841,7 @@ pub(crate) mod hard_delete_cascade_tests {
             crate::work_scope::ResourceAuthority::Restricted,
             "printf coordinator-output".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             7,
             7,
             RING_BUFFER_BYTES,
@@ -12914,6 +12918,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-1"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,
@@ -15497,6 +15502,7 @@ pub(crate) mod hard_delete_cascade_tests {
             HandleId::new("b-parent"),
             "npm run dev".into(),
             Some("dev".into()),
+            std::path::PathBuf::from("/tmp"),
             4321,
             1234,
             RING_BUFFER_BYTES,

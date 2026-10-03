@@ -275,7 +275,42 @@ impl Drop for StoppedIncarnationGuard {
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             );
+            libc::close(self.pidfd as libc::c_int);
         }
+    }
+}
+
+#[must_use]
+pub fn exact_stop_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+            if pidfd < 0 {
+                return false;
+            }
+            let supported = libc::id_t::try_from(pidfd).is_ok_and(|pidfd_id| {
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                let status = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        pidfd_id,
+                        info.as_mut_ptr(),
+                        libc::WSTOPPED | libc::WNOHANG,
+                    )
+                };
+                status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+            });
+            unsafe {
+                libc::close(pidfd as libc::c_int);
+            }
+            supported
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -287,13 +322,14 @@ impl Handle {
     /// supplied by the agent on the run call (REQ-BASH-002).
     // pgid/pid mirror the `Handle` entity field names from `bash.allium`;
     // renaming for clippy's similar-names lint would diverge from the spec.
-    #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
     #[must_use]
     pub fn new_live(
         controller_scope: ResourceScopeKey,
         handle_id: HandleId,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -305,6 +341,7 @@ impl Handle {
             ResourceAuthority::Work,
             cmd,
             label,
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -320,6 +357,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -331,6 +369,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -346,6 +385,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -358,7 +398,7 @@ impl Handle {
             authority,
             cmd,
             label,
-            std::path::PathBuf::from("."),
+            working_dir,
             pgid,
             pid,
             ring_bytes_cap,
@@ -698,11 +738,6 @@ impl Handle {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        let pidfd =
-            i32::try_from(pidfd).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        if unsafe { libc::close(pidfd) } != 0 && result.is_ok() {
-            return Err(std::io::Error::last_os_error());
-        }
         result
     }
 
@@ -804,6 +839,7 @@ mod tests {
             HandleId::new("b-1"),
             "echo hi".into(),
             None,
+            std::path::PathBuf::from("/tmp"),
             12345,
             12345,
             super::super::ring::RING_BUFFER_BYTES,

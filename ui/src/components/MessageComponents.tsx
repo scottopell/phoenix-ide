@@ -1755,7 +1755,7 @@ export function SendConversationMessageView({ response }: { response: SendConver
         {link ? <Link to={link}>{response.display_name ?? 'Open conversation'}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
       </div>
       {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/c/${encodeURIComponent(response.transcript_slug ?? response.conversation_id)}`}>{response.outcome === 'rejected' ? 'Open target transcript' : 'Open receiving transcript'}</Link></div>}
-      <details><summary>IDs</summary><code>{response.target ?? 'Unresolved'}</code>{response.conversation_id && <code>{response.conversation_id}</code>}</details>
+      <details><summary>IDs</summary><code>{response.target ?? 'Unresolved'}</code>{response.conversation_id && <code>{response.conversation_id}</code>}<code>{response.message_id}</code>{response.reason_code && <code>{response.reason_code}</code>}</details>
       {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
       {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
     </div>

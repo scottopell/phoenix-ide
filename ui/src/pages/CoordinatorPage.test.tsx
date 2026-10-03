@@ -138,7 +138,7 @@ describe('CoordinatorPage', () => {
       handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,
     }]);
 
-    renderPage();
+    renderPage('/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source');
 
     const running = await screen.findByRole('region', { name: 'Running commands' });
     expect(running).toHaveTextContent('UI tests');
@@ -146,7 +146,7 @@ describe('CoordinatorPage', () => {
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('started');
     expect(running).toHaveTextContent('b-live');
-    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?viewer=inspect&handle=b-live');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
