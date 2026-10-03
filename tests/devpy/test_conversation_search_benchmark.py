@@ -37,7 +37,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
             "explain_plans": [], "samples": samples,
-            "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
+            "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
         value.update(overrides)
         return value
@@ -135,7 +135,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 connection = connect.return_value
                 connection.execute.return_value.fetchone.return_value = None
                 with self.assertRaisesRegex(SystemExit, "duplicate normalized"):
-                    connect.return_value.execute.return_value.fetchone.return_value = (0,)
+                    connect.return_value.execute.return_value.fetchone.side_effect = [(1000,), (0,)]
                     bench.prepare(args)
 
     def test_scenarios_are_bound_to_fixture_hash_at_run(self):
@@ -357,7 +357,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 connect.return_value.execute.return_value.fetchone.return_value = ("conv",)
                 connect.return_value.execute.return_value.fetchall.return_value = [(1,)]
                 with mock.patch.object(bench, "_selective_term", return_value="verifiedterm"):
-                    connect.return_value.execute.return_value.fetchone.return_value = (0,)
+                    connect.return_value.execute.return_value.fetchone.side_effect = [(1000,), (0,)]
                     bench.prepare(args)
             scenarios = json.loads((root / "scenarios.json").read_text())["scenarios"]
             no_hit = next(item for item in scenarios if item["id"] == "verified-no-hit")

@@ -383,6 +383,8 @@ def _has_table(conn, name: str) -> bool:
 
 
 def _fixture_fingerprint(path: Path) -> dict:
+    if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        raise SystemExit("immutable fixture has SQLite sidecars; refusing changed state")
     try:
         stat = path.stat()
         return {
@@ -566,16 +568,16 @@ def snapshot(args) -> int:
             conn.close()
         if not validated:
             tmp.unlink(missing_ok=True)
-    os.replace(tmp, dest)
-    os.chmod(dest, 0o600)
     manifest = {'kind':'conversation-search-fixture','source_path':str(source),
-      'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':dest.stat().st_size,
-      'sha256':_hash(dest),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
+      'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':tmp.stat().st_size,
+      'sha256':_hash(tmp),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
       'logical_size_bytes':logical_size,'page_size_bytes':page_size,
       'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
       'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
     try:
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o600)
         _write_atomic_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
     except BaseException:
         dest.unlink(missing_ok=True)
@@ -608,6 +610,9 @@ def prepare(args) -> int:
     exact=recovered[0]['query']; ids=[]
     row=conn.execute('SELECT conversation_id FROM messages WHERE message_id=?',(recovered[0]['message_id'],)).fetchone()
     if row: ids=[row[0]]
+    broad_count = conn.execute("SELECT count(*) FROM message_fts WHERE message_fts MATCH 'conversation'").fetchone()[0]
+    if broad_count < 1000:
+        raise SystemExit("broad candidate has fewer than1000matches; choose a representative fixture")
     selective_query = _selective_term(conn, exact)
     nohit_query = "phoenixbenchmarknosuchterm9f3c2"
     if conn.execute("SELECT count(*) FROM message_fts WHERE message_fts MATCH ?", (nohit_query,)).fetchone()[0] != 0:
@@ -832,7 +837,7 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "tool_oracle_regime", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
