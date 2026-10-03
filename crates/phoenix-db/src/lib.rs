@@ -7381,6 +7381,21 @@ impl Database {
         Ok(())
     }
 
+    /// List conversations with accepted steering still queued for dispatch.
+    ///
+    /// # Errors
+    /// Returns a database error if discovery fails.
+    pub async fn queued_steering_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT conversation_id
+             FROM steering_messages
+             ORDER BY conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Return the current steering queue depth.
     ///
     /// # Errors

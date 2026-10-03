@@ -3762,6 +3762,13 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| error.to_string())?,
         );
+        ids.extend(
+            self.db
+                .queued_steering_conversation_ids()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+
         ids.sort();
         ids.dedup();
         Ok(ids)
@@ -4080,6 +4087,19 @@ impl RuntimeManager {
         if has_queued_steering
             && occurrence.is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
         {
+            let occurrence = occurrence.expect("guarded exhausted occurrence");
+            self.db
+                .settle_execution_occurrence(
+                    conversation_id,
+                    &occurrence.source_message_id,
+                    &ExecutionOccurrenceTerminal::Failed {
+                        reason: "Restart recovery was superseded by newer accepted steering."
+                            .to_string(),
+                    },
+                    &ConvState::Idle,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             return Ok(false);
         }
         self.settle_execution_occurrence_recovery(conversation_id, occurrence)
@@ -13598,7 +13618,14 @@ mod scope_liveness_tests {
         let conversation_id = "restart-occurrence-invalid-model";
         manager
             .db()
-            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .create_conversation(
+                conversation_id,
+                "typed input",
+                "/definitely/missing/restart-recovery-cwd",
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
         manager
@@ -13632,9 +13659,32 @@ mod scope_liveness_tests {
         .execute(manager.db().pool())
         .await
         .unwrap();
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "queued after initialization failure".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "initialization-failure-steering".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "initialization-failure-fingerprint",
+            )
+            .await
+            .unwrap();
 
         manager.settle_persisted_llm_requests().await.unwrap();
 
+        assert!(manager
+            .startup_llm_recovery_conversation_ids()
+            .await
+            .unwrap()
+            .contains(&conversation_id.to_string()));
         assert!(!manager
             .db()
             .has_execution_occurrence(conversation_id)
