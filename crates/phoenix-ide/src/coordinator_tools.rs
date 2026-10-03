@@ -908,6 +908,7 @@ mod tests {
         let mut samples = Vec::new();
         let mut failures = Vec::new();
         let mut explain_plans = Vec::new();
+        let mut case_policies = Vec::new();
         let explain = std::env::var_os("PHOENIX_SEARCH_BENCH_EXPLAIN").is_some();
         let sqlite_regime = {
             let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
@@ -963,60 +964,74 @@ mod tests {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
             let expected = scenario["expected"].as_str().unwrap_or("hit");
+            let context = context("benchmark");
             let is_retriever = scenario["kind"] == "retriever";
             let is_scoped = scenario["scope"] == "conversation";
-            // A newly opened pool gives one separately labeled process/pool-cold
-            // observation. Subsequent calls are serial warm observations.
-            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
-            let retriever = Arc::new(db.fts_retriever());
-            retriever.mark_reconciled();
-            let service = GlobalReadService::new(db.clone(), retriever.clone());
-            let context = context("benchmark");
-            if explain {
-                let request = if is_retriever && is_scoped {
-                    crate::db::RetrievalRequest::natural_language(
-                        query,
-                        crate::db::RetrievalScope::Conversations(
-                            scenario["conversation_ids"]
-                                .as_array()
-                                .map(|values| {
-                                    values
-                                        .iter()
-                                        .filter_map(|id| id.as_str().map(str::to_owned))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        ),
-                        10,
-                    )
-                } else {
-                    service
-                        .search_request(query)
-                        .await
-                        .expect("build search request")
-                };
-                let lexical_expression = request.lexical_expression();
-                let policy = serde_json::json!({
-                    "scope": if is_scoped { "conversation" } else { "global_excluding_coordinator_chain" },
-                    "visibility": format!("{:?}", request.visibility()),
-                    "grouping": format!("{:?}", request.grouping()),
-                    "match_mode": format!("{:?}", request.match_mode()),
-                    "limit": request.limit(),
-                    "lexical_expression": lexical_expression,
-                });
-                let plan = retriever.explain(request).await.expect("explain retrieval");
-                eprintln!("EXPLAIN {case_id}: {plan:?}");
-                explain_plans.push(serde_json::json!({
-                    "case_id": case_id, "surface": if is_retriever { "retriever" } else { "tool" },
-                    "query": query, "policy": policy, "plan": plan,
-                }));
-            }
+            // Resolve the exact request policy before any timed operation. This
+            // metadata applies even when EXPLAIN output is disabled.
+            let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let policy_retriever = Arc::new(policy_db.fts_retriever());
+            policy_retriever.mark_reconciled();
+            let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
+            let policy_request = if is_retriever && is_scoped {
+                crate::db::RetrievalRequest::natural_language(
+                    query,
+                    crate::db::RetrievalScope::Conversations(
+                        scenario["conversation_ids"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|id| id.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    10,
+                )
+            } else {
+                policy_service
+                    .search_request(query)
+                    .await
+                    .expect("build search request")
+            };
+            let lexical_expression = policy_request.lexical_expression();
+            let policy = serde_json::json!({
+                "scope": format!("{:?}", policy_request.scope()),
+                "visibility": format!("{:?}", policy_request.visibility()),
+                "grouping": format!("{:?}", policy_request.grouping()),
+                "match_mode": format!("{:?}", policy_request.match_mode()),
+                "limit": policy_request.limit(),
+                "lexical_expression": lexical_expression,
+            });
             let surfaces: &[&str] = if is_retriever {
                 &["retriever"]
             } else {
                 &["tool", "retriever"]
             };
             for surface in surfaces {
+                case_policies.push(serde_json::json!({
+                    "case_id": case_id,
+                    "surface": surface,
+                    "policy": policy,
+                }));
+                if explain {
+                    let plan_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+                    let plan_retriever = Arc::new(plan_db.fts_retriever());
+                    plan_retriever.mark_reconciled();
+                    let plan = plan_retriever
+                        .explain(policy_request.clone())
+                        .await
+                        .expect("explain retrieval");
+                    eprintln!("EXPLAIN {case_id} ({surface}): {plan:?}");
+                    explain_plans.push(serde_json::json!({
+                        "case_id": case_id, "surface": surface,
+                        "query": query, "policy": policy, "plan": plan,
+                    }));
+                }
+                // A newly opened pool gives one separately labeled setup
+                // connection observation. Subsequent calls are serial warm
+                // observations; OS cache state is intentionally uncontrolled.
                 let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
                 let retriever = Arc::new(db.fts_retriever());
                 retriever.mark_reconciled();
@@ -1048,7 +1063,10 @@ mod tests {
                     None
                 };
                 for (phase, count) in [
-                    ("first_use_fresh_pool_os_cache_uncontrolled", 1usize),
+                    (
+                        "first_operation_setup_connection_used_os_cache_uncontrolled",
+                        1usize,
+                    ),
                     ("warmup_discarded", 1usize),
                     ("warm", 10usize),
                 ] {
@@ -1177,7 +1195,8 @@ mod tests {
             "fixture_validation": fixture_validation,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
-            "measurement_regimes": ["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
+            "measurement_regimes": ["first_operation_setup_connection_used_os_cache_uncontrolled", "warm"],
+            "case_policies": case_policies,
             "explain_plans": explain_plans, "explain_enabled": explain,
             "samples": samples});
         let output = serde_json::to_vec_pretty(&value).unwrap();

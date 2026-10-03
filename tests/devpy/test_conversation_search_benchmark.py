@@ -34,6 +34,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}},
             "expected_case_surface_set": [["case", "tool"]],
+            "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
+            "run_uuid": __import__("uuid").uuid4().hex, "started_at":"start", "completed_at":"end",
             "explain_plans": [], "samples": samples,
         }
         value.update(overrides)
@@ -363,7 +365,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             before, after = root / "a.json", root / "b.json"
             base = self._complete_run()
             before.write_text(json.dumps(base))
-            after.write_text(json.dumps({**base, "runtime": {"worker_threads": 3}}))
+            after.write_text(json.dumps({**base, "run_uuid":"other", "runtime": {"worker_threads": 3}}))
             with self.assertRaisesRegex(SystemExit, "regime"):
                 bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
 
