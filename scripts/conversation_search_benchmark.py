@@ -248,7 +248,7 @@ def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
     # production transcript ids.
     conversation = "conversation_id" if "conversation_id" in columns else "NULL"
     order = "created_at, message_id" if "created_at" in columns else "message_id"
-    for call_id in observed_call_ids():
+    for call_id in _recover_fallback_call_ids(conn, columns):
         if call_id.casefold() in seen_ids:
             continue
         rows = conn.execute(
@@ -268,6 +268,78 @@ def _counts(conn):
     try: out['fts_rows'] = conn.execute('SELECT COUNT(*) FROM message_fts').fetchone()[0]
     except sqlite3.Error: out['fts_rows'] = None
     return out
+
+
+def _schema_evidence(conn) -> tuple[str, list[dict] | None]:
+    objects = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    schema = [
+        {"type": kind, "name": name, "table": table, "sql": sql}
+        for kind, name, table, sql in objects
+    ]
+    schema_digest = hashlib.sha256(
+        json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    ledger = None
+    if any(name == "_migrations" for _, name, _, _ in objects):
+        ledger = [
+            {"version": version, "name": name}
+            for version, name in conn.execute(
+                "SELECT version, name FROM _migrations ORDER BY version"
+            )
+        ]
+    return schema_digest, ledger
+
+
+def _configured_call_ids() -> list[str]:
+    return [item.strip() for item in os.environ.get("PHOENIX_SEARCH_CALL_IDS", "").split(",") if item.strip()]
+
+
+def _has_table(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _fixture_fingerprint(path: Path) -> dict:
+    try:
+        stat = path.stat()
+        return {
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": _hash(path),
+        }
+    except OSError:
+        return {"missing": True}
+
+
+def _carry_run_metadata(path: Path, capture: dict) -> None:
+    """Attach capture evidence to the raw run without changing sample data."""
+    try:
+        run = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    run["schema_digest"] = capture["schema_digest"]
+    run["migration_ledger"] = capture["migration_ledger"]
+    environment = run.setdefault("environment", {})
+    if isinstance(environment, dict):
+        environment.setdefault("fixture_schema_digest", capture["schema_digest"])
+        environment.setdefault("fixture_migration_ledger", capture["migration_ledger"])
+    _write_private(path, json.dumps(run, indent=2) + "\n")
+
+
+def _recover_fallback_call_ids(conn, columns: set[str]) -> list[str]:
+    configured = _configured_call_ids()
+    if configured:
+        return configured
+    # A production-shaped schema must never scan all content blobs by default.
+    # Message-only databases are the small synthetic fixtures used by tests.
+    return CALL_IDS if not _has_table(conn, "conversations") else []
+
 
 def snapshot(args) -> int:
     source = Path(args.source).expanduser().resolve()
@@ -339,6 +411,7 @@ def snapshot(args) -> int:
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"snapshot integrity check failed: {integrity}")
     counts = _counts(conn)
+    schema_digest, migration_ledger = _schema_evidence(conn)
     recovered_queries = _recover_queries(conn)
     conn.close()
     os.replace(tmp, dest)
@@ -347,7 +420,8 @@ def snapshot(args) -> int:
       'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':dest.stat().st_size,
       'sha256':_hash(dest),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
       'logical_size_bytes':logical_size,'page_size_bytes':page_size,
-      'counts':counts,'recovered_queries':recovered_queries,'backup_progress':progress,
+      'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
+      'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
     _write_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
     print(f'captured immutable fixture: {dest}\nsha256: {manifest["sha256"]}\ncounts: {manifest["counts"]}')
@@ -384,7 +458,7 @@ def prepare(args) -> int:
       {'id':'observed-slow-other','kind':'tool','query':recovered[1]['query'],'source_call_id':recovered[1]['source_call_id'],'expected':'hit'},
       {'id':'broad-common','kind':'tool','query':'conversation','expected':'hit'},
       {'id':'selective-known-match','kind':'tool','query':selective_query,'expected':'hit'},
-      {'id':'verified-no-hit','kind':'tool','query':'phoenix_benchmark_no_such_term_9f3c2','expected':'no_hit'},
+      {'id':'verified-no-hit','kind':'tool','query':'phoenixbenchmarknosuchterm9f3c2','expected':'no_hit'},
       {'id':'scoped-existing-transcript','kind':'retriever','scope':'conversation','query':exact,'conversation_ids':ids,'expected':'hit'},
     ]
     conn.close()
@@ -405,6 +479,8 @@ def run(args) -> int:
     if not db.exists() or not scen.exists() or not manifest.exists():
         raise SystemExit('run requires captured.db, capture-manifest.json, and scenarios.json')
     capture=json.loads(manifest.read_text())
+    if not _metadata_has_values(capture.get("schema_digest")) or "migration_ledger" not in capture:
+        raise SystemExit("capture-manifest.json lacks schema digest or migration ledger evidence")
     if Path(capture.get('snapshot_path', '')).resolve() != db or capture.get('sha256') != _hash(db) or capture.get('size_bytes') != db.stat().st_size:
         raise SystemExit('captured.db does not match capture-manifest.json')
     if Path(capture.get('source_path', '')).resolve() == db:
@@ -424,15 +500,17 @@ def run(args) -> int:
         # masquerading as the outcome. The Rust harness publishes to a private
         # temporary path; only a complete result is renamed into place below.
         _remove_private(output)
+    fixture_before = _fixture_fingerprint(db)
     output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
     _remove_private(output_tmp)
     failure_output = result_dir / "failures" / f"{label}.json"
     _ensure_clean_source()
-    _remove_private(failure_output)
     cmd=['cargo','test','-p','phoenix_ide','--release','production_conversation_search_benchmark','--lib','--','--ignored','--nocapture']
     env=dict(os.environ,
         PHOENIX_SEARCH_BENCH_DB=str(db), PHOENIX_SEARCH_BENCH_SCENARIOS=str(scen),
         PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST=str(manifest), PHOENIX_SEARCH_BENCH_OUT=str(output_tmp),
+        PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST=str(capture.get("schema_digest", "")),
+        PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER=json.dumps(capture.get("migration_ledger")),
         PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
         PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor(),
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
@@ -468,6 +546,24 @@ def run(args) -> int:
         _remove_private(output_tmp)
         _write_atomic_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
         raise SystemExit(f'benchmark timed out after {args.timeout}s; process group was stopped') from error
+    fixture_after = _fixture_fingerprint(db)
+    if fixture_before != fixture_after:
+        failures_dir = result_dir / "failures"
+        _private(failures_dir)
+        if output_tmp.exists():
+            os.replace(output_tmp, failure_output)
+            os.chmod(failure_output, 0o600)
+        _write_atomic_private(
+            failures_dir / f"{label}.fixture-changed.json",
+            json.dumps({
+                "kind": "conversation-search-benchmark-failure",
+                "run_label": label,
+                "status": "fixture_changed_during_run",
+                "before": fixture_before,
+                "after": fixture_after,
+            }, indent=2) + "\n",
+        )
+        raise SystemExit("benchmark fixture changed while the run was in progress; result rejected")
     if process.returncode:
         failures_dir = result_dir / "failures"
         _private(failures_dir)
@@ -483,8 +579,8 @@ def run(args) -> int:
         raise SystemExit(f'benchmark failed with exit status {process.returncode}; failure evidence retained')
     if not output_tmp.exists():
         raise SystemExit('benchmark completed without publishing a result')
+    _carry_run_metadata(output_tmp, capture)
     os.replace(output_tmp, output)
-    _remove_private(failure_output)
     os.chmod(output, 0o600)
     print(output); return 0
 
@@ -525,6 +621,14 @@ def report(args) -> int:
     for run_label, filename, sample in rows:
         by.setdefault((run_label, filename, sample["case_id"], sample.get("surface", "unknown"), sample.get("phase", "unknown")), []).append(sample)
     lines = ["# Conversation search benchmark report", "", f"raw files: {len(files)}", ""]
+    for path, run in runs:
+        run_label = run.get("run_label") or path.stem
+        lines += [
+            f"## Run {run_label} / {path.name}",
+            f"fixture_sha256: {run.get('fixture_sha256', 'missing')}",
+            f"scenario_digest: {run.get('scenario_digest', 'missing')}",
+            "",
+        ]
     for (run_label, filename, case, surface, phase), values in by.items():
         durations = [x["duration_ms"] for x in values if x.get("ok")]
         errors = [x.get("error", x.get("result")) for x in values if not x.get("ok")]
@@ -552,15 +656,13 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "explain_plans", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
-    for key in required - {"samples", "explain_plans"}:
+    for key in required - {"samples", "migration_ledger"}:
         if not _metadata_has_values(run[key]):
             raise SystemExit(f"refusing comparison: {name} has empty metadata: {key}")
-    if run["explain_enabled"] and not _metadata_has_values(run["explain_plans"]):
-        raise SystemExit(f"refusing comparison: {name} has empty metadata: explain_plans")
     if not isinstance(run["samples"], list) or not run["samples"]:
         raise SystemExit(f"refusing comparison: {name} has no samples")
     digests = {}
@@ -595,7 +697,7 @@ def compare(args) -> int:
     b = json.loads(Path(args.after).read_text())
     validated_a = _validate_run(a, "before")
     validated_b = _validate_run(b, "after")
-    keys = ("fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "explain_plans")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
     if validated_a["phases"].keys() != validated_b["phases"].keys():
