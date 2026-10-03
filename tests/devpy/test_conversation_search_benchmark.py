@@ -73,6 +73,31 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             args = type("Args", (), {"source": str(Path(tmp) / "missing"), "output": "", "artifacts": tmp, "force": False, "retries": 1, "busy_timeout": 1.0})()
             with self.assertRaises(SystemExit): bench.snapshot(args)
 
+    def test_compare_refuses_missing_metadata_and_output_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            before, after = root / "a.json", root / "b.json"
+            metadata = {
+                "fixture_sha256": "a", "scenario_digest": "s", "profile": "release",
+                "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
+                "environment": {}, "sqlite_pragmas": {}, "samples": [
+                    {"case_id": "case", "surface": "tool", "phase": "warm", "ok": True, "result_digest": "one", "duration_ms": 1}
+                ],
+            }
+            before.write_text(json.dumps(metadata))
+            incomplete = dict(metadata)
+            incomplete.pop("commit")
+            after.write_text(json.dumps(incomplete))
+            with self.assertRaisesRegex(SystemExit, "missing metadata"):
+                bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
+            after.write_text(json.dumps({**metadata, "samples": [{**metadata["samples"][0], "result_digest": "two"}]}))
+            with self.assertRaisesRegex(SystemExit, "output mismatch"):
+                bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
+
+    def test_run_rejects_path_traversal_label(self):
+        with self.assertRaisesRegex(SystemExit, "label"):
+            bench._label("../escape")
+
     def test_compare_refuses_fixture_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -710,7 +710,26 @@ mod tests {
     async fn production_conversation_search_benchmark() {
         use crate::db::MessageRetriever;
         use sha2::{Digest, Sha256};
-        use std::time::Instant;
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        fn digest_file(path: &str) -> String {
+            let mut file = std::fs::File::open(path).expect("open benchmark fixture");
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer).expect("read benchmark fixture");
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            format!("{hasher:x}")
+        }
+
+        fn digest_bytes(bytes: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(bytes))
+        }
 
         let db_path = std::env::var("PHOENIX_SEARCH_BENCH_DB")
             .expect("PHOENIX_SEARCH_BENCH_DB must point at an immutable fixture");
@@ -718,26 +737,45 @@ mod tests {
             .expect("PHOENIX_SEARCH_BENCH_SCENARIOS must point at frozen scenarios");
         let output_path = std::env::var("PHOENIX_SEARCH_BENCH_OUT")
             .expect("PHOENIX_SEARCH_BENCH_OUT must point at a private result file");
-        let scenarios: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(scenario_path).unwrap()).unwrap();
-        let fixture_sha256 = Sha256::digest(std::fs::read(&db_path).unwrap())
-            .as_slice()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let scenario_digest = Sha256::digest(
-            std::fs::read(std::env::var("PHOENIX_SEARCH_BENCH_SCENARIOS").unwrap()).unwrap(),
+        let manifest_path = std::env::var("PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST")
+            .expect("PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST must identify capture metadata");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("read capture manifest"),
         )
-        .as_slice()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .expect("parse capture manifest");
+        let fixture = std::path::Path::new(&db_path)
+            .canonicalize()
+            .expect("canonicalize fixture");
+        assert_eq!(
+            manifest["snapshot_path"].as_str(),
+            Some(fixture.to_str().unwrap()),
+            "fixture path differs from capture manifest"
+        );
+        assert_eq!(
+            manifest["size_bytes"].as_u64(),
+            Some(std::fs::metadata(&fixture).unwrap().len()),
+            "fixture size differs from capture manifest"
+        );
+        let fixture_sha256 = digest_file(fixture.to_str().unwrap());
+        assert_eq!(
+            manifest["sha256"].as_str(),
+            Some(fixture_sha256.as_str()),
+            "fixture hash differs from capture manifest"
+        );
+        let scenario_bytes = std::fs::read(&scenario_path).expect("read scenarios");
+        let scenario_digest = digest_bytes(&scenario_bytes);
+        let scenarios: serde_json::Value =
+            serde_json::from_slice(&scenario_bytes).expect("parse scenarios");
         let mut samples = Vec::new();
+        let mut failures = Vec::new();
+        let mut explain_plans = Vec::new();
         let explain = std::env::var_os("PHOENIX_SEARCH_BENCH_EXPLAIN").is_some();
         for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
+            let expected = scenario["expected"].as_str().unwrap_or("hit");
             let is_retriever = scenario["kind"] == "retriever";
+            let is_scoped = scenario["scope"] == "conversation";
             // A newly opened pool gives one separately labeled process/pool-cold
             // observation. Subsequent calls are serial warm observations.
             let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
@@ -747,7 +785,7 @@ mod tests {
             let tool = SearchConversations(service.clone());
             let context = context("benchmark");
             if explain {
-                let request = if is_retriever {
+                let request = if is_retriever && is_scoped {
                     crate::db::RetrievalRequest::natural_language(
                         query,
                         crate::db::RetrievalScope::Conversations(
@@ -769,84 +807,149 @@ mod tests {
                         .await
                         .expect("build search request")
                 };
+                let lexical_expression = request.lexical_expression();
+                let policy = serde_json::json!({
+                    "scope": if is_scoped { "conversation" } else { "global_excluding_coordinator_chain" },
+                    "visibility": format!("{:?}", request.visibility()),
+                    "grouping": format!("{:?}", request.grouping()),
+                    "match_mode": format!("{:?}", request.match_mode()),
+                    "limit": request.limit(),
+                    "lexical_expression": lexical_expression,
+                });
                 let plan = retriever.explain(request).await.expect("explain retrieval");
                 eprintln!("EXPLAIN {case_id}: {plan:?}");
+                explain_plans.push(serde_json::json!({
+                    "case_id": case_id, "surface": if is_retriever { "retriever" } else { "tool" },
+                    "query": query, "policy": policy, "plan": plan,
+                }));
             }
-            for (phase, count) in [
-                ("first_use_process_pool_cold", 1usize),
-                ("warmup_discarded", 1usize),
-                ("warm", 10usize),
-            ] {
-                for iteration in 0..count {
-                    let started = Instant::now();
-                    let (ok, output) = if is_retriever {
-                        let ids = scenario["conversation_ids"]
-                            .as_array()
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .filter_map(|id| id.as_str().map(str::to_owned))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let request = crate::db::RetrievalRequest::natural_language(
-                            query,
-                            crate::db::RetrievalScope::Conversations(ids),
-                            20,
-                        );
-                        match retriever.retrieve(request).await {
-                            Ok(hits) => (
-                                true,
-                                serde_json::to_string(
-                                    &hits
-                                        .iter()
-                                        .map(|hit| {
-                                            (
-                                                &hit.conversation_id,
-                                                &hit.message_id,
-                                                hit.score,
-                                                &hit.snippet,
-                                            )
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .unwrap(),
-                            ),
-                            Err(error) => (false, error.to_string()),
+            let surfaces: &[&str] = if is_retriever {
+                &["retriever"]
+            } else {
+                &["tool", "retriever"]
+            };
+            for surface in surfaces {
+                for (phase, count) in [
+                    ("first_use_process_pool_cold", 1usize),
+                    ("warmup_discarded", 1usize),
+                    ("warm", 10usize),
+                ] {
+                    for iteration in 0..count {
+                        let started = Instant::now();
+                        let invocation = async {
+                            let (ok, output, result_count, result_identity) = if *surface
+                                == "retriever"
+                            {
+                                let ids = scenario["conversation_ids"]
+                                    .as_array()
+                                    .map(|values| {
+                                        values
+                                            .iter()
+                                            .filter_map(|id| id.as_str().map(str::to_owned))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let scope = if is_retriever && is_scoped {
+                                    crate::db::RetrievalScope::Conversations(ids)
+                                } else {
+                                    let coordinator_chain = service
+                                        .search_request(query)
+                                        .await
+                                        .expect("build global search request")
+                                        .scope()
+                                        .clone();
+                                    coordinator_chain
+                                };
+                                let request =
+                                    crate::db::RetrievalRequest::natural_language(query, scope, 10);
+
+                                match retriever.retrieve(request).await {
+                                    Ok(hits) => {
+                                        let identity = hits
+                                            .iter()
+                                            .map(|hit| {
+                                                format!(
+                                                    "{}:{}",
+                                                    hit.conversation_id, hit.message_id
+                                                )
+                                            })
+                                            .collect::<Vec<_>>();
+                                        (
+                                            true,
+                                            serde_json::to_string(&identity).unwrap(),
+                                            Some(hits.len()),
+                                            Some(identity),
+                                        )
+                                    }
+                                    Err(error) => (false, error.to_string(), None, None),
+                                }
+                            } else {
+                                let result = tool
+                                    .run(serde_json::json!({"query": query}), context.clone())
+                                    .await;
+                                let output = result.output().to_string();
+                                (result.is_success(), output, None, None)
+                            };
+                            (ok, output, result_count, result_identity)
+                        };
+                        let (ok, output, result_count, result_identity) =
+                            tokio::time::timeout(Duration::from_secs(300), invocation)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    (
+                                        false,
+                                        "per-case timeout after 300 seconds".to_string(),
+                                        None,
+                                        None,
+                                    )
+                                });
+                        let digest = digest_bytes(output.as_bytes());
+                        samples.push(serde_json::json!({
+                            "case_id": case_id, "surface": surface,
+                            "phase": phase, "iteration": iteration,
+                            "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "ok": ok, "result": output, "result_digest": digest,
+                            "result_bytes": output.len(), "result_count": result_count,
+                            "result_identity": result_identity, "expected": expected,
+                        }));
+                        if !ok {
+                            failures.push(format!("benchmark scenario {case_id} failed: {output}"));
                         }
-                    } else {
-                        let result = tool
-                            .run(serde_json::json!({"query": query}), context.clone())
-                            .await;
-                        (result.is_success(), result.output().to_string())
-                    };
-                    if phase == "warmup_discarded" {
-                        continue;
+                        if expected == "no_hit" && output != "No matching messages found." {
+                            failures
+                                .push(format!("expected no-hit case {case_id}, got tool output"));
+                        }
+                        if expected == "hit" && result_count == Some(0) {
+                            failures.push(format!("expected hit case {case_id}, got zero results"));
+                        }
                     }
-                    let digest = Sha256::digest(output.as_bytes())
-                        .as_slice()
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>();
-                    samples.push(serde_json::json!({
-                        "case_id": case_id, "phase": phase, "iteration": iteration,
-                        "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
-                        "ok": ok, "result": output, "result_digest": digest,
-                        "result_bytes": output.len(),
-                    }));
-                    assert!(ok, "benchmark scenario {case_id} failed: {output}");
                 }
             }
         }
         let value = serde_json::json!({"fixture_sha256": fixture_sha256,
             "scenario_digest": scenario_digest, "profile": "release",
-            "sqlite": {"pool_max_connections": 10, "busy_timeout_ms": 5000,
-                       "journal_mode": "fixture-preserved", "read_only": true},
+            "commit": std::env::var("PHOENIX_SEARCH_BENCH_COMMIT").unwrap_or_else(|_| "unknown".into()),
+            "environment": {"host": std::env::var("PHOENIX_SEARCH_BENCH_HOST").unwrap_or_default(), "platform": std::env::var("PHOENIX_SEARCH_BENCH_PLATFORM").unwrap_or_default(), "processor": std::env::var("PHOENIX_SEARCH_BENCH_PROCESSOR").unwrap_or_default(), "cpu_count": std::env::var("PHOENIX_SEARCH_BENCH_CPU_COUNT").unwrap_or_default()},
+            "sqlite_pragmas": {"pool_max_connections": 10, "busy_timeout_ms": 5000,
+                       "journal_mode": "fixture-preserved", "read_only": true, "foreign_keys": true},
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
             "measurement_regimes": ["first_use_process_pool_cold", "warm"],
+            "explain_plans": explain_plans, "explain_enabled": explain,
             "samples": samples});
-        std::fs::write(output_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let output = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&output_path, output).unwrap();
+        let mut perms = std::fs::metadata(&output_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&output_path, perms).unwrap();
+        }
+        assert!(
+            failures.is_empty(),
+            "benchmark failures (raw samples saved): {failures:?}"
+        );
     }
 
     #[tokio::test]

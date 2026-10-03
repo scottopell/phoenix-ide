@@ -148,6 +148,11 @@ impl RetrievalRequest {
     pub fn limit(&self) -> usize {
         self.limit
     }
+    /// The backend lexical expression generated from this natural-language request.
+    #[must_use]
+    pub fn lexical_expression(&self) -> Option<String> {
+        build_fts_query(&self.query, self.match_mode)
+    }
 }
 
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
