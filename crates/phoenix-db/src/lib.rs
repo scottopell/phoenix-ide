@@ -3201,6 +3201,7 @@ impl Database {
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .read_only(true)
+            .immutable(true)
             .read_only(true)
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
