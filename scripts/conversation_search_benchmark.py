@@ -124,7 +124,7 @@ def _build_configuration() -> dict:
     forwarded = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("CARGO")
+        if key.startswith("CARGO_PROFILE_") or key in {"CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_JOBS"}
         or key in {
             "RUSTFLAGS", "RUSTUP_TOOLCHAIN", "TARGET", "PROFILE", "RUSTC",
             "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
@@ -461,11 +461,18 @@ def _stop_process(process) -> None:
         if process.poll() is not None:
             return
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.wait()
+                return
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
         else:
             process.kill()
@@ -701,6 +708,10 @@ def run(args) -> int:
         _stop_process(process)
         _remove_private(output_tmp)
         raise
+    _ensure_clean_source()
+    if _git_commit() != env["PHOENIX_SEARCH_BENCH_COMMIT"]:
+        _remove_private(output_tmp)
+        raise SystemExit("source changed during compilation/run; refusing mislabeled evidence")
     completed_at_unix = time.time()
     fixture_after = _fixture_fingerprint(db)
     if fixture_before != fixture_after:
