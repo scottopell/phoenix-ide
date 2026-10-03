@@ -32,6 +32,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment": {"host": "host"}, "sqlite_pragmas": {"read_only": True},
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
+            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}},
+            "expected_case_surface_set": [["case", "tool"]],
             "explain_plans": [], "samples": samples,
         }
         value.update(overrides)
@@ -161,7 +163,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 "source_path": str(root / "source.db"),
             }))
             (root / "scenarios.json").write_text(json.dumps({
-                "version": 1, "fixture_sha256": fixture_hash, "scenarios": [],
+                "version": 1, "fixture_sha256": fixture_hash, "expected_case_surface_set": [], "scenarios": [],
             }))
             runs = root / "runs"
             runs.mkdir()
@@ -184,8 +186,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 return CompletedProcess()
 
             with mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
-                bench, "_git_commit", return_value="commit"
-            ), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
+                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}}
+            ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
                 bench.run(type("Args", (), {"artifacts": str(root), "label": "suite", "force": True, "timeout": 1})())
@@ -292,6 +294,45 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             self.assertIn("fixture_sha256: a", report)
             self.assertIn("scenario_digest: s", report)
 
+    def test_artifacts_inside_repo_must_be_git_ignored(self):
+        with mock.patch.object(bench.subprocess, "run", return_value=type("Result", (), {"returncode": 1})()):
+            with self.assertRaisesRegex(SystemExit, "unignored"):
+                bench._ensure_ignored_artifacts(ROOT / "not-ignored")
+
+    def test_uri_percent_encodes_reserved_filename_characters(self):
+        path = Path(tempfile.gettempdir()) / "db?name#fragment.sqlite"
+        self.assertIn("%3Fname%23fragment.sqlite", bench._uri(path))
+
+    def test_snapshot_validation_removes_temp_on_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.db"
+            sqlite3.connect(source).close()
+            args = type("Args", (), {"source": str(source), "artifacts": str(root / "fixture"),
+                                      "force": False, "retries": 1, "busy_timeout": 1.0, "deadline": 1.0})()
+            original = bench._counts
+            try:
+                bench._counts = mock.Mock(side_effect=RuntimeError("validation interrupted"))
+                with self.assertRaisesRegex(RuntimeError, "validation interrupted"):
+                    bench.snapshot(args)
+                self.assertEqual(list((root / "fixture").glob(".captured.db.*.tmp")), [])
+            finally:
+                bench._counts = original
+
+    def test_build_configuration_records_compiler_and_forwarded_environment(self):
+        with mock.patch.object(bench.subprocess, "check_output", side_effect=["rustc\nhost: x86_64-test\n", "cargo 1"]):
+            with mock.patch.dict("os.environ", {"RUSTFLAGS": "-C opt-level=3", "CARGO_BUILD_TARGET": "wasm32"}, clear=True):
+                config = bench._build_configuration()
+        self.assertEqual(config["target"], "wasm32")
+        self.assertEqual(config["environment"]["RUSTFLAGS"], "-C opt-level=3")
+        self.assertEqual(config["rustc_version_verbose"], "rustc\nhost: x86_64-test")
+
+    def test_selective_term_requires_bounded_nonzero_match(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE VIRTUAL TABLE message_fts USING fts5(body)")
+        conn.executemany("INSERT INTO message_fts(body) VALUES (?)", [("rareterm",), ("rareterm",)])
+        self.assertEqual(bench._selective_term(conn, "rareterm common"), "rareterm")
+
     def test_prepare_uses_single_alphanumeric_no_hit_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -309,7 +350,9 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 {"query": "second query", "source_call_id": "two", "message_id": "m2"},
             ]), mock.patch.object(bench.sqlite3, "connect") as connect:
                 connect.return_value.execute.return_value.fetchone.return_value = ("conv",)
-                bench.prepare(args)
+                connect.return_value.execute.return_value.fetchall.return_value = [(1,)]
+                with mock.patch.object(bench, "_selective_term", return_value="verifiedterm"):
+                    bench.prepare(args)
             scenarios = json.loads((root / "scenarios.json").read_text())["scenarios"]
             no_hit = next(item for item in scenarios if item["id"] == "verified-no-hit")
             self.assertRegex(no_hit["query"], r"^[A-Za-z0-9]+$")
