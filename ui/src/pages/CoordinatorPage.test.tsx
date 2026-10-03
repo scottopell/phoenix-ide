@@ -120,6 +120,19 @@ describe('CoordinatorPage', () => {
     await waitFor(() => expect(screen.queryByRole('region', { name: 'Active watches' })).not.toBeInTheDocument(), { timeout: 3_000 });
   });
 
+  it('retains the last successful watch inventory and reports refresh failure', async () => {
+    apiMock.listActiveCoordinatorWatches
+      .mockResolvedValueOnce([{
+        product_conversation_id: 'product-retained', transcript_id: 'transcript-retained', transcript_slug: null,
+        display_name: 'Retained watch', project_path: null, state: 'idle',
+      }])
+      .mockRejectedValue(new Error('offline'));
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+    expect(await screen.findByRole('status', {}, { timeout: 3_000 })).toHaveTextContent('Could not refresh active watches');
+    expect(screen.getByRole('link', { name: 'Retained watch' })).toBeInTheDocument();
+  });
+
   it('shows only server-reported live Coordinator commands with inspect navigation', async () => {
     apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([{
       handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123, can_stop: true,

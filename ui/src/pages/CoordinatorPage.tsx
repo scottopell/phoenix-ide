@@ -16,23 +16,33 @@ interface CoordinatorPageFixtureData {
 
 function GlobalActiveWatches() {
   const [watches, setWatches] = useState<ActiveCoordinatorWatch[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const refresh = () => {
-      void api.listActiveCoordinatorWatches()
-        .then((value) => { if (!cancelled) setWatches(value); })
-        .catch(() => { if (!cancelled) setWatches([]); });
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api.listActiveCoordinatorWatches();
+        if (!cancelled) { setWatches(value); setError(null); }
+      } catch {
+        if (!cancelled) setError('Could not refresh active watches');
+      } finally {
+        inFlight = false;
+      }
     };
-    refresh();
-    const timer = window.setInterval(refresh, 2_000);
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 2_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
-  if (watches.length === 0) return null;
+  if (watches.length === 0 && !error) return null;
   return (
     <section className="global-active-watches" aria-label="Active watches">
       <strong>Watching</strong>
+      {error && <span className="coordinator-error" role="status">{error}</span>}
       {watches.map((watch) => (
         <div className="global-active-watch" key={watch.product_conversation_id}>
           <div>
@@ -57,13 +67,21 @@ function GlobalLiveCommands() {
 
   useEffect(() => {
     let cancelled = false;
-    const refresh = () => {
-      void api.listLiveCoordinatorBashHandles()
-        .then((value) => { if (!cancelled) { setHandles(value); setError(null); } })
-        .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands'); });
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api.listLiveCoordinatorBashHandles();
+        if (!cancelled) { setHandles(value); setError(null); }
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands');
+      } finally {
+        inFlight = false;
+      }
     };
-    refresh();
-    const timer = window.setInterval(refresh, 5_000);
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 

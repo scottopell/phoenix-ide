@@ -420,7 +420,20 @@ impl GlobalReadService {
             .get_conversation(conversation_id)
             .await
             .map_err(|error| error.to_string())?;
-        let display_name = conversation
+        let root_id = self
+            .db
+            .product_conversation_member_ids(conversation.product_conversation_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "ProductConversation has no root transcript".to_string())?;
+        let root = self
+            .db
+            .get_conversation(&root_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let display_name = root
             .title
             .clone()
             .filter(|title| !title.trim().is_empty())
@@ -430,12 +443,7 @@ impl GlobalReadService {
                     .clone()
                     .filter(|title| !title.trim().is_empty())
             })
-            .or_else(|| {
-                conversation
-                    .slug
-                    .clone()
-                    .filter(|slug| !slug.trim().is_empty())
-            })
+            .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
             .unwrap_or_else(|| "Untitled conversation".to_string());
         Ok(serde_json::json!({
             "display_name": display_name,

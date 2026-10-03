@@ -36,10 +36,11 @@
 }
 
 .coordinator-page__automatic-continuation {
-  position: absolute;
+  position: relative;
   z-index: 10;
-  top: 12px;
-  right: 16px;
+  align-self: flex-end;
+  flex: 0 0 auto;
+  margin: 12px 16px 8px;
   padding: 4px 8px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
