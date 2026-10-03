@@ -4306,6 +4306,11 @@ impl RuntimeManager {
                 .await;
         }
         if let Some(occurrence) = occurrence_recovery {
+            let settlement_state = if self.has_queued_steering(conversation_id).await? {
+                ConvState::Idle
+            } else {
+                error_state.clone()
+            };
             self.db
                 .settle_execution_occurrence(
                     conversation_id,
@@ -4313,7 +4318,7 @@ impl RuntimeManager {
                     &ExecutionOccurrenceTerminal::Failed {
                         reason: initialization_error.to_string(),
                     },
-                    &error_state,
+                    &settlement_state,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -13711,7 +13716,7 @@ mod scope_liveness_tests {
                 .await
                 .unwrap()
                 .state,
-            ConvState::Error { .. }
+            ConvState::Idle
         ));
     }
 
