@@ -3921,6 +3921,8 @@ impl RuntimeManager {
                     &conversation_id,
                     &error,
                     resumable_owner,
+                    baton_recovery.as_ref(),
+                    occurrence_recovery.as_ref(),
                 )
                 .await?;
                 continue;
@@ -3937,6 +3939,8 @@ impl RuntimeManager {
                         &conversation_id,
                         &error.to_string(),
                         resumable_owner,
+                        baton_recovery.as_ref(),
+                        occurrence_recovery.as_ref(),
                     )
                     .await?;
                     continue;
@@ -4204,44 +4208,56 @@ impl RuntimeManager {
         conversation_id: &str,
         initialization_error: &str,
         resumable_owner: bool,
+        baton_recovery: Option<&BatonRecovery>,
+        occurrence_recovery: Option<&ExecutionOccurrenceRecovery>,
     ) -> Result<(), String> {
         let state_updated_at = Utc::now();
-        let storage = DatabaseStorage::new(self.db.clone());
-        if let Some(turn) = storage.load_active_direct_turn(conversation_id).await? {
-            storage
-                .settle_active_direct_turn(&ActiveDirectTurnSettlement {
-                    conversation_id: conversation_id.to_string(),
-                    turn: turn.into_active(),
-                    terminal: ActiveDirectTurnTerminal::Failed {
+        let error_state = ConvState::Error {
+            message: format!(
+                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
+            ),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        if let Some(baton_recovery) = baton_recovery {
+            return self
+                .settle_classified_baton(
+                    &DatabaseStorage::new(self.db.clone()),
+                    ActiveDirectTurnSettlement {
+                        conversation_id: conversation_id.to_string(),
+                        turn: baton_recovery.turn.clone(),
+                        terminal: ActiveDirectTurnTerminal::Failed {
+                            reason: initialization_error.to_string(),
+                        },
+                        state: if resumable_owner {
+                            error_state
+                        } else {
+                            ConvState::Idle
+                        },
+                        state_updated_at,
+                        execution_occurrence_message_id: occurrence_recovery
+                            .map(|occurrence| occurrence.source_message_id.clone()),
+                    },
+                )
+                .await;
+        }
+        if let Some(occurrence) = occurrence_recovery {
+            self.db
+                .settle_execution_occurrence(
+                    conversation_id,
+                    &occurrence.source_message_id,
+                    &ExecutionOccurrenceTerminal::Failed {
                         reason: initialization_error.to_string(),
                     },
-                    state: if resumable_owner {
-                        ConvState::Error {
-                            message: format!(
-                                "The server restarted while this accepted request was pending, and recovery could not initialize: {initialization_error}"
-                            ),
-                            error_kind: crate::db::ErrorKind::InvalidRequest,
-                            resets_at: None,
-                        }
-                    } else {
-                        ConvState::Idle
-                    },
-                    state_updated_at,
-                    execution_occurrence_message_id: None,
-                })
+                    &error_state,
+                )
                 .await
-        } else {
-            let state = ConvState::Error {
-                message: format!(
-                    "The server restarted while this model request was in progress, and recovery could not initialize: {initialization_error}"
-                ),
-                error_kind: crate::db::ErrorKind::InvalidRequest,
-                resets_at: None,
-            };
-            storage
-                .update_state(conversation_id, &state, state_updated_at)
-                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
         }
+        DatabaseStorage::new(self.db.clone())
+            .update_state(conversation_id, &error_state, state_updated_at)
+            .await
     }
 
     pub async fn start_direct_turn_worker(
@@ -13535,6 +13551,65 @@ mod scope_liveness_tests {
         ));
         llm.release.notify_one();
         settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialization_failure_settles_ownerless_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-invalid-model";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_model_and_effort(
+                conversation_id,
+                "claude-sonnet-5",
+                Some(phoenix_core::domain::llm_types::ModelEffort::High),
+                ServiceTier::Standard,
+                "anthropic",
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "invalid-model-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'invalid-model-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error { .. }
+        ));
     }
 
     #[tokio::test]
