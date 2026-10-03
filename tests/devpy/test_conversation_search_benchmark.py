@@ -135,6 +135,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 connection = connect.return_value
                 connection.execute.return_value.fetchone.return_value = None
                 with self.assertRaisesRegex(SystemExit, "duplicate normalized"):
+                    connect.return_value.execute.return_value.fetchone.return_value = (0,)
                     bench.prepare(args)
 
     def test_scenarios_are_bound_to_fixture_hash_at_run(self):
@@ -356,6 +357,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 connect.return_value.execute.return_value.fetchone.return_value = ("conv",)
                 connect.return_value.execute.return_value.fetchall.return_value = [(1,)]
                 with mock.patch.object(bench, "_selective_term", return_value="verifiedterm"):
+                    connect.return_value.execute.return_value.fetchone.return_value = (0,)
                     bench.prepare(args)
             scenarios = json.loads((root / "scenarios.json").read_text())["scenarios"]
             no_hit = next(item for item in scenarios if item["id"] == "verified-no-hit")

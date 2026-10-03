@@ -305,15 +305,14 @@ impl GlobalReadService {
     }
 
     pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
-        self.search_with_hits(query)
-            .await
-            .map(|(formatted, _)| formatted)
+        let hits = self.search_hits(query).await?;
+        self.format_search_hits(&hits).await
     }
 
-    pub(crate) async fn search_with_hits(
+    pub(crate) async fn search_hits(
         &self,
         query: &str,
-    ) -> Result<(String, Vec<crate::db::RetrievedChunk>), String> {
+    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
         let query = query.trim();
         if query.is_empty() {
             return Err("query is required".to_string());
@@ -329,14 +328,20 @@ impl GlobalReadService {
             .retrieve(self.search_request(query).await?)
             .await
             .map_err(|e| format!("search failed: {e}"))?;
-        let formatted = if hits.is_empty() {
-            "No matching messages found.".to_string()
+        Ok(hits)
+    }
+
+    pub(crate) async fn format_search_hits(
+        &self,
+        hits: &[crate::db::RetrievedChunk],
+    ) -> Result<String, String> {
+        if hits.is_empty() {
+            Ok("No matching messages found.".to_string())
         } else {
-            format_global_search_hits(self, &hits)
+            format_global_search_hits(self, hits)
                 .await
-                .map_err(|error| format!("search citation failed: {error}"))?
-        };
-        Ok((formatted, hits))
+                .map_err(|e| format!("search citation failed: {e}"))
+        }
     }
 
     pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
