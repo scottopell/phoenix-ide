@@ -1699,6 +1699,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broad_preflight_uses_eligible_not_raw_matches() {
+        let db = seed().await;
+        for index in 0..20 {
+            db.add_message(
+                &format!("excluded-broad-{index}"),
+                "c-a",
+                &MessageContent::user("broadcandidate"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "eligible-broad",
+            "c-b",
+            &MessageContent::user("broadcandidate"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let retriever = db.fts_retriever();
+        assert_eq!(
+            retriever
+                .retrieve(global_request("broadcandidate").with_limit(1000))
+                .await
+                .unwrap()
+                .len(),
+            21
+        );
+        let policy = RetrievalRequest::natural_language(
+            "broadcandidate",
+            RetrievalScope::GlobalExcluding(vec!["c-a".into()]),
+            20,
+        )
+        .with_limit(1000);
+        assert_eq!(retriever.retrieve(policy).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn hidden_messages_are_excluded_even_when_already_indexed() {
         let db = seed().await;
         db.add_message(
