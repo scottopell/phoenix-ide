@@ -45,7 +45,7 @@ def _artifact_root(value: str) -> Path:
     raw = Path(value).expanduser().absolute()
     if raw.is_symlink():
         raise SystemExit("refusing symlinked artifact root")
-    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file():
+    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file() and not (raw / ".capture-pending").is_file():
         raise SystemExit("refusing nonempty unrecognized artifact root; choose a dedicated directory")
     return raw.resolve()
 
@@ -500,6 +500,13 @@ def snapshot(args) -> int:
     if not source.exists(): raise SystemExit(f'source does not exist: {source}')
     _private(outdir)
     dest = requested
+    pending = outdir / ".capture-pending"
+    if pending.exists() and not (outdir / "capture-manifest.json").exists():
+        allowed = {"captured.db", ".capture-pending"}
+        if any(path.name not in allowed for path in outdir.iterdir()):
+            raise SystemExit("partial capture contains unrecognized files; refusing recovery")
+        _remove_private(dest)
+        _remove_private(pending)
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
     source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
     try:
@@ -575,10 +582,12 @@ def snapshot(args) -> int:
       'counts':counts,'schema_digest':schema_digest,'migration_ledger':migration_ledger,
       'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
+    _write_atomic_private(outdir / ".capture-pending", "initial capture staged\n")
     try:
         os.replace(tmp, dest)
         os.chmod(dest, 0o600)
         _write_atomic_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
+        _remove_private(outdir / ".capture-pending")
     except BaseException:
         dest.unlink(missing_ok=True)
         raise
