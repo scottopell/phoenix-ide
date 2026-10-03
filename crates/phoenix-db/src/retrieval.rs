@@ -30,7 +30,7 @@ use crate::sqlite_telemetry::{
 use crate::sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{Message, MessageType};
+use phoenix_core::domain::db_schema::{InputOrigin, Message, MessageType};
 use phoenix_core::domain::message_text::index_text;
 use sqlx::{Connection, Row, SqlitePool};
 use thiserror::Error;
@@ -173,6 +173,8 @@ pub struct RetrievedChunk {
     pub chunk: ChunkRef,
     /// Role of the source message.
     pub message_type: MessageType,
+    /// Server-recorded source of the message, not inferred from its role.
+    pub origin: InputOrigin,
     /// When the source message was written.
     pub created_at: DateTime<Utc>,
     /// Display/assembly snippet around the match.
@@ -339,7 +341,7 @@ impl Fts5Retriever {
         .fetch_one(&self.pool)
         .await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM messages",
         )
         .try_map(crate::parse_message_row)
         .fetch_all(&self.pool)
@@ -393,7 +395,7 @@ impl Fts5Retriever {
     ) -> Result<FtsMessageReconcileOutcome, RetrievalError> {
         let mut tx = self.pool.begin().await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&planned_message.message_id)
@@ -519,7 +521,9 @@ impl Fts5Retriever {
         let mut sql = String::from(
             "WITH ranked_hits AS (\
                  SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
-                        meta.message_type, meta.created_at, c.transcript_generation, \
+                        meta.message_type, meta.created_at, source.origin_kind, \
+                        source.origin_product_conversation_id, source.origin_transcript_id, \
+                        source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, c.transcript_generation, \
                         (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
                         snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
                         bm25(message_fts) AS score",
@@ -571,7 +575,7 @@ impl Fts5Retriever {
         match request.grouping {
             RetrievalGrouping::None => {
                 sql.push_str(
-                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
+                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
                       FROM ranked_hits \
                       ORDER BY score, created_at DESC \
                       LIMIT ?",
@@ -580,14 +584,14 @@ impl Fts5Retriever {
             RetrievalGrouping::BestPerConversation => {
                 sql.push_str(
                     ", grouped_hits AS (\
-                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score, \
+                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score, \
                                 ROW_NUMBER() OVER (\
                                     PARTITION BY conversation_id \
                                     ORDER BY score, created_at DESC, message_id\
                                 ) AS conversation_rank \
                          FROM ranked_hits\
                      ) \
-                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
                      FROM grouped_hits \
                      WHERE conversation_rank = 1 \
                      ORDER BY score, created_at DESC, conversation_id \
@@ -672,7 +676,7 @@ impl MessageRetriever for Fts5Retriever {
         // Current source messages for these conversations.
         let mut messages = {
             let sql = format!(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at \
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id \
                  FROM messages WHERE conversation_id IN ({placeholders})"
             );
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -763,8 +767,10 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::ProductConversationUnavailable(_)
         | crate::DbError::SteeringQueueFull
         | crate::DbError::CloseFoundationPrecondition(_)
+        | crate::DbError::CloseFoundationStaleLatest { .. }
         | crate::DbError::CloseFoundationRepairRequired(_)
         | crate::DbError::CloseFoundationNotFound(_)
+        | crate::DbError::SubAgentLifecycleConflict(_)
         | crate::DbError::DirectTurnConflict(_)
         | crate::DbError::ForkProposalConflict(_)
         | crate::DbError::GitRepositoryWorkScopeProjectConflict { .. }
@@ -1163,6 +1169,26 @@ fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx:
             char_range: None,
         },
         message_type: crate::parse_message_type(&row.try_get::<String, _>("message_type")?),
+        origin: InputOrigin::from_db_parts(
+            &row.try_get::<String, _>("origin_kind")?,
+            row.try_get("origin_product_conversation_id")?,
+            row.try_get("origin_transcript_id")?,
+            row.try_get("origin_subscription_event_id")?,
+        )
+        .and_then(|origin| {
+            origin.with_source_call_columns(
+                row.try_get("origin_source_message_id")
+                    .map_err(|e| e.to_string())?,
+                row.try_get("origin_source_tool_use_id")
+                    .map_err(|e| e.to_string())?,
+            )
+        })
+        .map_err(|error| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?,
         created_at: crate::parse_datetime(&row.try_get::<String, _>("created_at")?),
         snippet: truncate_chars(&snippet, MAX_SNIPPET_CHARS),
         score: row.try_get("score")?,
@@ -1406,6 +1432,7 @@ mod tests {
     async fn standalone_fts_upsert_records_exact_shared_collector_outcomes() {
         let db = seed().await;
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: "fts-outcome".to_string(),
             conversation_id: "c-a".to_string(),
             sequence_id: 1,
@@ -1888,6 +1915,93 @@ mod tests {
                 .unwrap();
         assert_eq!(current_fts_rows, 1);
         assert_eq!(current_locator_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieval_reads_canonical_message_origin_in_both_groupings() {
+        let db = seed().await;
+        db.add_message(
+            "provenance-hit",
+            "c-a",
+            &MessageContent::user("distinctive provenance needle"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sender = db.get_conversation("c-a").await.unwrap();
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'internal_conversation', \
+             origin_product_conversation_id = ?1, origin_transcript_id = ?2, origin_source_message_id = 'sender-call-message', origin_source_tool_use_id = 'sender-call-tool' \
+             WHERE message_id = 'provenance-hit'",
+        )
+        .bind(sender.product_conversation_id.as_str())
+        .bind(&sender.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for grouping in [
+            RetrievalGrouping::None,
+            RetrievalGrouping::BestPerConversation,
+        ] {
+            let hits = db
+                .fts_retriever()
+                .retrieve(RetrievalRequest {
+                    query: "provenance needle".to_string(),
+                    scope: RetrievalScope::Global,
+                    visibility: RetrievalVisibility::All,
+                    grouping,
+                    match_mode: RetrievalMatchMode::ExactTerms,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            let hit = hits
+                .iter()
+                .find(|hit| hit.message_id == "provenance-hit")
+                .unwrap();
+            assert_eq!(
+                hit.origin,
+                InputOrigin::InternalConversation {
+                    product_conversation_id: sender.product_conversation_id.clone(),
+                    transcript_id: sender.id.clone(),
+                    source_call: Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                        message_id: "sender-call-message".into(),
+                        tool_use_id: "sender-call-tool".into()
+                    })),
+                }
+            );
+        }
+
+        db.watch_product_conversation(&sender.product_conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO coordinator_watch_events(event_id, watch_id, source_occurrence_kind, source_occurrence_id, source_generation, source_transcript_id, terminal_kind, occurred_at_us) SELECT 'event-1', id, 'creation', 'test-creation', 0, 'c-a', 'completed', 1790640000000000 FROM coordinator_watches WHERE source_product_conversation_id = ?1 AND ended_at_us IS NULL")
+            .bind(sender.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "UPDATE messages SET origin_kind = 'subscription_event', \
+             origin_product_conversation_id = NULL, origin_transcript_id = NULL, \
+             origin_source_message_id = NULL, origin_source_tool_use_id = NULL, origin_subscription_event_id = 'event-1' WHERE message_id = 'provenance-hit'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let hits = db
+            .fts_retriever()
+            .retrieve(RetrievalRequest::natural_language(
+                "provenance",
+                RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits[0].origin,
+            InputOrigin::SubscriptionEvent {
+                event_id: "event-1".into()
+            }
+        );
     }
 
     #[tokio::test]

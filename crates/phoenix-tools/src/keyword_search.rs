@@ -443,9 +443,11 @@ impl KeywordSearchTool {
         let request = LlmRequest {
             system: vec![SystemContent::new(FILTER_SYSTEM_PROMPT)],
             messages: vec![LlmMessage {
+                source_message_id: None,
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(user_content)],
             }],
+            provider_replay: None,
             tools: vec![],
             max_tokens: Some(
                 selection

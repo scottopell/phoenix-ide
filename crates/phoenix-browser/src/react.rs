@@ -123,14 +123,17 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
   // __perfReset opens a window (t0 = performance.now(), accumulators zeroed,
   // React commit buffer cleared); __perfRead closes it and returns the in-page
   // accumulators in one call.
-  var __lt_ms = 0, __lt_n = 0, __win_t0 = null;
+  var __lt_ms = 0, __lt_n = 0, __win_t0 = null, __po = null;
+  function __recordLongTasks(entries) {
+    entries.forEach(function (e) {
+      if (__win_t0 == null || e.startTime < __win_t0) return;
+      __lt_ms += e.duration;
+      __lt_n += 1;
+    });
+  }
   try {
-    var __po = new PerformanceObserver(function (l) {
-      l.getEntries().forEach(function (e) {
-        if (__win_t0 == null || e.startTime < __win_t0) return;
-        __lt_ms += e.duration;
-        __lt_n += 1;
-      });
+    __po = new PerformanceObserver(function (l) {
+      __recordLongTasks(l.getEntries());
     });
     __po.observe({ entryTypes: ['longtask'] });
   } catch (e) {}
@@ -706,6 +709,9 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
      * mirror __reactStatus()/__getCommits() over the same window.
      */
     __perfRead: function () {
+      try {
+        if (__po && __po.takeRecords) __recordLongTasks(__po.takeRecords());
+      } catch (e) {}
       var t0 = __win_t0;
       var wall = (t0 != null)
         ? (((typeof performance !== 'undefined' && performance.now)

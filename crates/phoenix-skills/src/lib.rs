@@ -1361,6 +1361,101 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_phoenix_api_payload_is_operational_and_cache_independent() {
+        let catalog = AuthenticatedCoordinatorSkillCatalog::discover(None)
+            .expect("authenticated coordinator catalog");
+        let trusted = invoke_trusted_coordinator_builtin("phoenix-api", &catalog).unwrap();
+
+        for required in [
+            "POST /api/product-conversations/new",
+            "\"request_id\"",
+            "\"cwd\"",
+            "\"model\"",
+            "\"effort\"",
+            "\"objective\"",
+            "GET /api/auth/status",
+            "GET /api/models",
+            "GET /api/settings/llm-language",
+            "explicitly requested supported language",
+            "effort_capabilities",
+            "work_scope_id",
+            "UUID_BYTES <<<\"$(od -An -N16 -tx1 /dev/urandom)",
+            "creation_request_id=%s",
+            "creation_cwd_b64=",
+            "leading/trailing-whitespace WorkScope path is unsupported",
+            "objective.trim()",
+            "Reject larger text objectives before UUID generation",
+            "INTENT_B64",
+            "repeat the step-3 POST at most once",
+            "GET /api/product-conversations/creation",
+            "product_conversation_id",
+            "root `transcript_row_id`",
+            "current `latest_transcript_row_id`",
+            "canonical_route",
+            "agent_working",
+            "ORIGIN_B64",
+            "CA_CERT_PATH_B64",
+            "B64_DEC=(-d)",
+            "B64_DEC=(-D)",
+            "CURL_TLS=(--globoff)",
+            "--cacert",
+            "curl -q",
+            "--connect-timeout 10",
+            "--max-time 30",
+            "no_proxy='*'",
+            "NO_PROXY='*'",
+            "same Phoenix server that owns that WorkScope",
+            "llm_language",
+            "ordered `images` collection",
+            "requires exactly `images: []`",
+            "Truncation is inconclusive",
+            "HTTP 408, 425, 429",
+            "60-second lockout window",
+            "`no_op` is omitted when false",
+            "stored normalized language always wins",
+            "`llm_language` is the explicit exception",
+            "only runtime commands required are `curl`, `base64`, and `od`",
+        ] {
+            assert!(
+                trusted.contains(required),
+                "missing operational contract: {required}"
+            );
+        }
+        assert!(
+            !trusted.contains("(?:"),
+            "Bash ERE must avoid non-capturing groups"
+        );
+        assert!(
+            !trusted.contains("--decode"),
+            "base64 flags must support macOS"
+        );
+        assert!(
+            !trusted.contains("--insecure"),
+            "TLS verification must remain enabled"
+        );
+        assert!(
+            !trusted.contains("tr -d"),
+            "UUID recipe must use Bash plus od"
+        );
+        assert!(
+            !trusted.contains("jq "),
+            "supported recipe must not require jq"
+        );
+        assert!(trusted.contains("Do not use `POST /api/conversations/{id}/chat`"));
+        for forbidden in [
+            "UPDATE conversations",
+            "INSERT INTO conversations",
+            "DELETE FROM conversations",
+            "localhost:8031",
+        ] {
+            assert!(
+                !trusted.contains(forbidden),
+                "forbidden bypass or guessed target: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn filesystem_skill_cannot_self_promote_to_coordinator() {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join(".agents/skills/impostor");

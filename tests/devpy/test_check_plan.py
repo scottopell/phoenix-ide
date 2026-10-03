@@ -210,17 +210,18 @@ class CheckPlanTests(unittest.TestCase):
             run.call_args_list[0].args[0],
         )
 
-    def test_rust_timing_checker_change_runs_structural_and_self_tests(self):
-        cats = self.dev._categorize_changed_paths({"scripts/check_rust_test_timing.py"})
-        self.assertIn("ASTGREP", cats)
-        self.assertIn("SPECS", cats)
-        with mock.patch.object(
-            self.dev, "_changed_paths_vs_base",
-            return_value={"scripts/check_rust_test_timing.py"},
-        ):
-            active, _ = self.dev._gate_lanes()
-        self.assertIn("ast-grep", active)
-        self.assertIn("spec-shape", active)
+    def test_rust_checker_changes_run_structural_and_self_tests(self):
+        for path in ("scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"):
+            with self.subTest(path=path):
+                cats = self.dev._categorize_changed_paths({path})
+                self.assertIn("ASTGREP", cats)
+                self.assertIn("SPECS", cats)
+                with mock.patch.object(
+                    self.dev, "_changed_paths_vs_base", return_value={path},
+                ):
+                    active, _ = self.dev._gate_lanes()
+                self.assertIn("ast-grep", active)
+                self.assertIn("spec-shape", active)
 
     def test_check_profile_scripts_run_their_devpy_unit_tests(self):
         for path in (

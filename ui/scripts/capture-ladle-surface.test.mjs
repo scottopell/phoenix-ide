@@ -23,6 +23,14 @@ describe('capture-ladle-surface viewport helpers', () => {
     expect(screenshotFileName('shell-full', matrix[1])).toBe('shell-full--mobile.png');
   });
 
+  it('preserves real interaction capabilities in named viewport entries', () => {
+    expect(normalizeViewportMatrix([
+      { name: 'touch', width: 390, height: 844, hasTouch: true, isMobile: true },
+    ], { width: 960, height: 900 })).toEqual([
+      { name: 'touch', width: 390, height: 844, hasTouch: true, isMobile: true },
+    ]);
+  });
+
   it('installs only the selected allowlisted browser engine', () => {
     expect(playwrightInstallArgs('chromium')).toEqual(['exec', 'playwright', 'install', 'chromium']);
     expect(playwrightInstallArgs('webkit')).toEqual(['exec', 'playwright', 'install', 'webkit']);

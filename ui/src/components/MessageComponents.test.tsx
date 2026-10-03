@@ -1,15 +1,17 @@
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
-import { api, ConflictError, type ContentBlock, type ConversationState, type Message, type ForkProposalSummary } from '../api';
+import { api, ConflictError, type ContentBlock, type ConversationState, type InputOrigin, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
+import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
@@ -96,13 +98,14 @@ function systemMessage(messageId: string, text: string, sequenceId = 2): Message
   };
 }
 
-function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null } = {}): Message {
+function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null; origin?: InputOrigin } = {}): Message {
   return {
     message_id: messageId,
     sequence_id: options.sequenceId ?? 2,
     conversation_id: 'agent-1',
     message_type: 'user',
     content: { text, ...(options.isMeta ? { is_meta: true } : {}) },
+    origin: options.origin ?? { kind: options.isMeta ? 'system_generated' : 'user_api' },
     display_data: options.displayData ?? null,
     created_at: '2026-01-01T00:00:01Z',
   };
@@ -196,16 +199,83 @@ describe('user message provenance rendering', () => {
     expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
   });
 
-  it('keeps regular user messages authored as you', () => {
+  it('does not attribute historical or unattributed input to the user', () => {
+    for (const origin of [{ kind: 'unknown_historical' } as const, undefined]) {
+      const message = userMessage('old-input', 'Old text', { origin: { kind: 'unknown_historical' } });
+      if (!origin) delete message.origin;
+      const { unmount } = render(<MemoryRouter><UserMessage message={message} /></MemoryRouter>);
+      expect(screen.getByText('Unknown input').closest('.message')).toHaveClass('meta');
+      expect(screen.queryByText('You')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('opens the pinned source message and tool, not the receiving message', () => {
+    render(<MemoryRouter><UserMessage message={userMessage('recipient-message', 'forwarded', {
+      origin: { kind: 'internal_conversation', product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: { message_id: 'source-message', tool_use_id: 'source-tool' } },
+    })} /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-member · source call' })).toHaveAttribute('href', '/c/source-member?source_transcript=source-member&source_tool=source-tool#message-source-message');
+  });
+
+  it('shows both source identities without treating an aggregate route as a pinned transcript', () => {
+    render(<MemoryRouter><UserMessage message={userMessage('received', 'From another conversation', {
+      origin: { kind: 'internal_conversation', source_call: null, product_conversation_id: 'source-product', transcript_id: 'source-row' },
+    })} /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByText(/From conversation ID source-product/).closest('.message')).toHaveClass('meta');
+    expect(screen.queryByRole('link', { name: /source-product/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('renders system-generated input as meta without claiming human authorship', () => {
+    const { container } = render(<MemoryRouter><UserMessage message={userMessage('automatic', 'System prompt', {
+      origin: { kind: 'system_generated' },
+    })} /></MemoryRouter>);
+    expect(container.querySelector('.message.meta')).toBeInTheDocument();
+    expect(screen.getByText('System input')).toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('attributes authoritative queued steering separately from optimistic local input', () => {
+    render(<MemoryRouter><>
+      <QueuedUserMessage message={{ localId: 'queued', text: 'queued', images: [], status: 'steering_queued', origin: {
+        kind: 'internal_conversation', source_call: null, product_conversation_id: 'source', transcript_id: 'source-row',
+      } }} onRetry={() => {}} />
+      <QueuedUserMessage message={{ localId: 'local', text: 'local', images: [], status: 'pending' }} onRetry={() => {}} />
+    </></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' })).toHaveAttribute('href', '/c/source-row');
+    expect(screen.getByRole('link', { name: 'transcript ID source-row · source call unavailable' }).closest('.message')).toHaveClass('meta', 'steering-queued');
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
+  it('shows the origin of generated meta input instead of suppressing its sender', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage
+          message={userMessage('generated-meta', 'Generated seed', {
+            isMeta: true,
+            origin: { kind: 'system_generated' },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('System input')).toBeInTheDocument();
+    expect(screen.getByText('Generated seed')).toBeInTheDocument();
+  });
+
+  it('labels user-facing API input by channel', () => {
     render(
       <MemoryRouter>
         <UserMessage message={userMessage('plain-user', 'Hello there')} />
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('You')).toBeInTheDocument();
+    expect(screen.getByText('User · API').closest('.message')).toHaveClass('user');
     expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy your message' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
   });
 });
 
@@ -1033,6 +1103,7 @@ describe('message copy affordances', () => {
       <UserMessage
         message={{
           message_id: 'user-copy',
+          origin: { kind: 'user_api' },
           sequence_id: 1,
           conversation_id: 'agent-1',
           message_type: 'user',
@@ -1043,7 +1114,7 @@ describe('message copy affordances', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Copy your message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy input message' }));
 
     await waitFor(() => {
       expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
@@ -1059,6 +1130,7 @@ describe('message copy affordances', () => {
           conversation_id: 'agent-1',
           message_type: 'user',
           content: { text: 'Great, push and open a PR please' },
+          origin: { kind: 'user_api' },
           display_data: null,
           created_at: '2026-01-01T00:00:00Z',
         }}
@@ -1124,7 +1196,7 @@ describe('message copy affordances', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole('button', { name: 'Copy your message' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy input message' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Copy Phoenix message' })).not.toBeInTheDocument();
   });
 
@@ -2072,6 +2144,32 @@ describe('markdown table rendering', () => {
     '| one | `direct_turn_id` | three | four | five | six |',
   ].join('\n');
 
+  const semanticTableMarkdown = [
+    '| Model | Completed | Failed | Min | Median | Max |',
+    '| --- | ---: | ---: | ---: | ---: | ---: |',
+    '| gpt-5.4-mini | 159 | 0 | 5 s | 30.2 s | 43.1 s |',
+    '| gpt-5.6-sol | 138 | 2 | 8 s | 55.2 s | 84.4 s |',
+    '',
+    '| Status | Detail |',
+    '| --- | --- |',
+    '| Restart RCA #817 | A qualified candidate needs merge or a concrete intervention before deployment proceeds |',
+    '',
+    '| Revision | Destination |',
+    '| --- | --- |',
+    '| `4fd574ee` | `0123456789abcdef0123456789abcdef01234567` |',
+  ].join('\n');
+
+  function expectSemanticTableAnnotations(container: HTMLElement) {
+    const tables = container.querySelectorAll('.markdown-table-scroll table');
+    expect(tables).toHaveLength(3);
+    expect([...tables[0]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
+      .toEqual(['atomic', 'numeric', 'numeric', 'numeric', 'numeric', 'numeric']);
+    expect([...tables[1]!.querySelectorAll('th')].map((cell) => cell.dataset['columnKind']))
+      .toEqual(['compact', 'prose']);
+    expect(tables[2]!.querySelector('code')?.dataset['tokenKind']).toBe('short-atomic');
+    expect(tables[2]!.querySelectorAll('code')[1]?.dataset['tokenKind']).toBe('breakable');
+  }
+
   it('wraps finalized agent message tables in a local horizontal scroll container', () => {
     render(
       <MemoryRouter>
@@ -2090,6 +2188,19 @@ describe('markdown table rendering', () => {
     const inlineCode = screen.getByText('direct_turn_id');
     expect(inlineCode.tagName).toBe('CODE');
     expect(inlineCode.closest('td')).not.toBeNull();
+  });
+
+  it('classifies finalized table columns and inline code at the renderer boundary', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-semantic-table', [{ type: 'text', text: semanticTableMarkdown }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expectSemanticTableAnnotations(container);
   });
 
   it('keeps finalized agent message task lists enabled for plus and ordered markers', () => {
@@ -2143,6 +2254,19 @@ describe('markdown table rendering', () => {
 
     expect(screen.getByText('Footnotes')).toBeInTheDocument();
     expect(screen.getByText('Footnote content')).toBeInTheDocument();
+  });
+
+  it('classifies streaming table columns and inline code at the renderer boundary', async () => {
+    const { container } = render(
+      <MemoryRouter>
+        <StreamingMessageView
+          buffer={{ text: semanticTableMarkdown, lastSequence: 1, startedAt: Date.now(), requestId: 'semantic-table' }}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(3));
+    expectSemanticTableAnnotations(container);
   });
 
   it('wraps streaming message tables in a local horizontal scroll container', async () => {
@@ -2920,6 +3044,7 @@ describe('SubAgentStatus inline activity', () => {
         sequence_id: 101,
         message: {
           message_id: 'child-live-message',
+          origin: { kind: 'unknown_historical' },
           conversation_id: childConversation.id,
           sequence_id: 101,
           message_type: 'agent',
@@ -2965,10 +3090,10 @@ describe('SubAgentStatus inline activity', () => {
 
     fireEvent.click(screen.getByText(/Review telescope config/));
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    act(() => emitInit(FakeEventSource.instances[0]!, [initialMessage], [{
+    act(() => emitInit(FakeEventSource.instances[0]!, [{ ...initialMessage, origin: { kind: 'unknown_historical' } }], [{
       type: 'message',
       sequence_id: pendingTool.sequence_id,
-      message: pendingTool,
+      message: { ...pendingTool, origin: { kind: 'unknown_historical' } },
     }], baseConversation, { anchor: 2, tip: 3 }));
 
     expect(await screen.findByText('bash')).toBeInTheDocument();
@@ -3137,6 +3262,28 @@ describe('SubAgentStatus inline activity', () => {
     expect(screen.getByText(/Done without collapsing/)).toBeInTheDocument();
   });
 
+  it('renders implicit completion as successful with its exact result', () => {
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [],
+      completed_results: [{
+        agent_id: 'agent-1',
+        task: 'Finish during grace turn',
+        outcome: { type: 'implicit_completion', result: 'Exact grace-turn result.' },
+      }],
+    };
+
+    const { container } = render(
+      <MemoryRouter>
+        <SubAgentStatus stateData={state} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('completed')).toBeInTheDocument();
+    expect(screen.getByText('Exact grace-turn result.')).toBeInTheDocument();
+    expect(container.querySelector('.subagent-item.implicit-completion .subagent-icon svg')).not.toBeNull();
+  });
+
   it('renders timeout as a distinct state', async () => {
     const state: ConversationState = {
       type: 'awaiting_sub_agents',
@@ -3156,6 +3303,33 @@ describe('SubAgentStatus inline activity', () => {
 
     expect(screen.getByText('timed out')).toBeInTheDocument();
     expect(screen.getByText(/exceeded its time limit/)).toBeInTheDocument();
+  });
+});
+
+describe('sub-agent persistent summary', () => {
+  it('counts success and implicit completion together in a mixed summary', () => {
+    const block: ContentBlock = { type: 'tool_use', id: 'spawn-mixed', name: 'spawn_agents', input: { tasks: [] } };
+    const result = toolMessage('spawn-mixed', 'Sub-agent results', 2, {
+      type: 'subagent_summary',
+      results: [
+        { agent_id: 'success', task: 'Success task', outcome: { type: 'success', result: 'Success result' } },
+        { agent_id: 'implicit', task: 'Grace task', outcome: { type: 'implicit_completion', result: 'Grace result' } },
+        { agent_id: 'failed', task: 'Failure task', outcome: { type: 'failure', error: 'Failure result' } },
+        { agent_id: 'timeout', task: 'Timeout task', outcome: { type: 'timed_out' } },
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ToolUseBlock block={block} result={result} onOpenFile={undefined} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.subagent-summary-stats .success')).toHaveTextContent('2');
+    expect(container.querySelectorAll('.subagent-summary-stats .error')).toHaveLength(2);
+    expect(screen.getByText('Grace result')).toBeInTheDocument();
+    expect(within(container.querySelector('.subagent-item.implicit-completion') as HTMLElement).getByText('completed')).toBeInTheDocument();
+    expect(container.querySelector('.subagent-item.implicit-completion .subagent-icon svg')).not.toBeNull();
   });
 });
 
@@ -3686,5 +3860,68 @@ describe('AgentMessage compact find reveal', () => {
     const highlight = document.querySelector('.viewer-find-inline-match--active');
     expect(highlight).not.toBeNull();
     expect(highlight).toHaveTextContent('alpha target');
+  });
+});
+
+describe('published SVG placement', () => {
+  it.each(['full', 'compact'] as const)('keeps one artifact visible in %s tool groups and inspection', (density) => {
+    mockDensity = density;
+    const owner = agentMessage('svg-owner', [{ type: 'tool_use', id: 'svg-use', name: 'present_svg', input: { path: '/staging/chart.svg' } }]);
+    const output = toolMessage('svg-use', JSON.stringify({ artifact_id: 'svg-1', conversation_id: 'agent-1', title: 'Sizes', description: 'Measured directory sizes.', width: 800, height: 400, validation: 'accepted_static_svg' }));
+    Element.prototype.scrollIntoView = vi.fn();
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[{ kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map([['svg-use', output]]), isFirstInTurn: true }]} /></MemoryRouter>);
+    expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+    if (density === 'compact') {
+      fireEvent.click(screen.getByRole('button', { name: /present_svg:.*expand tool detail/i }));
+      expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+      fireEvent.click(screen.getByRole('button', { name: 'Collapse expanded tool detail' }));
+      expect(screen.getAllByRole('img', { name: 'Measured directory sizes.' })).toHaveLength(1);
+    }
+  });
+});
+
+
+describe('tool result ownership across repeated provider IDs', () => {
+  const rounds = () => [1, 2].flatMap((round) => [
+    agentMessage(`owner-${round}`, [{ type: 'tool_use', id: 'reused', name: 'present_svg', input: { path: `/chart-${round}.svg` } }], round * 2 - 1),
+    { ...toolMessage('reused', JSON.stringify({ artifact_id: `svg-${round}`, conversation_id: 'agent-1', title: `Chart ${round}`, description: `Measured sizes ${round}`, width: 800, height: 400, validation: 'accepted_static_svg' }), round * 2), message_id: `owner-${round}-result` },
+  ]);
+
+  it.each(['full', 'compact'] as const)('preserves distinct chronological SVG references in %s density on live append and reload', (density) => {
+    mockDensity = density;
+    const messages = rounds();
+    const grouped = (rows: Message[]) => {
+      const unit = buildRenderUnits({ messages: rows, pendingMessages: [], convState: { type: 'idle' }, streamingHandle: null }).historicalUnits[0];
+      if (unit?.kind !== 'tool_only_agent_turn_group') throw new Error('expected grouped tool turns');
+      return <MemoryRouter><ToolOnlyAgentTurnGroup members={unit.members} /></MemoryRouter>;
+    };
+    const { rerender, unmount } = render(grouped(messages.slice(0, 2)));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    rerender(grouped(messages));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    expect(screen.getByRole('img', { name: 'Measured sizes 2' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-2');
+    unmount();
+    render(grouped(messages));
+    expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
+  });
+
+  it.each([false, true])('renders child-owned artifacts under a parent share context (full=%s) across live append and reload', (full) => {
+    const messages = rounds();
+    const transcript = (rows: Message[]) => <SvgArtifactAccessContext.Provider value={{ kind: 'share', token: 'parent-share-token' }}><SubAgentTranscript inline={{ type: 'ready', atom: { ...createInitialAtom(), messages: rows }, error: null }} running={false} full={full} /></SvgArtifactAccessContext.Provider>;
+    const { rerender, unmount } = render(transcript(messages.slice(0, 2)));
+    expect(screen.getByRole('img', { name: 'Measured sizes 1' })).toHaveAttribute('src', '/api/conversations/agent-1/svg-artifacts/svg-1');
+    rerender(transcript(messages));
+    const assertArtifacts = () => {
+      expect(screen.getAllByRole('img').map((img) => img.getAttribute('src'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1', '/api/conversations/agent-1/svg-artifacts/svg-2']);
+      expect(screen.getAllByRole('link', { name: 'Download SVG' }).map((link) => link.getAttribute('href'))).toEqual(['/api/conversations/agent-1/svg-artifacts/svg-1/download', '/api/conversations/agent-1/svg-artifacts/svg-2/download']);
+      const outputs = document.querySelectorAll('.subagent-activity-output');
+      expect(outputs).toHaveLength(2);
+      expect(outputs[0]?.getAttribute('title')).toContain('svg-1');
+      expect(outputs[1]?.getAttribute('title')).toContain('svg-2');
+    };
+    assertArtifacts();
+    unmount();
+    render(transcript(messages));
+    assertArtifacts();
   });
 });

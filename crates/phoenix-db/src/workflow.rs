@@ -3348,6 +3348,7 @@ mod tests {
     fn valid_direct_turn_payload(message_id: &str) -> Vec<u8> {
         phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "gate".to_string(),
                 images: Vec::new(),
                 files: Vec::new(),

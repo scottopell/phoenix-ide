@@ -38,6 +38,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::Page;
 use futures::StreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
@@ -54,6 +55,10 @@ const DEFAULT_JPEG_QUALITY: i64 = 70;
 /// the right behaviour for a live view — never block the source.
 const BROADCAST_CAPACITY: usize = 16;
 
+/// Outer liveness ceiling for best-effort teardown while the generation lock
+/// serializes stop against replacement startup.
+const SCREENCAST_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// One event broadcast to all attached viewers.
 #[derive(Debug, Clone)]
 pub enum ScreencastEvent {
@@ -61,6 +66,46 @@ pub enum ScreencastEvent {
     Frame { jpeg: Arc<[u8]> },
     /// The page's main frame navigated to a new URL.
     Url(String),
+}
+
+#[derive(Default)]
+pub(crate) struct ScreencastLifecycle {
+    generation: Mutex<u64>,
+}
+
+fn next_generation(current: u64) -> u64 {
+    current.wrapping_add(1)
+}
+
+fn generation_owns_stop(current: u64, broker: u64) -> bool {
+    current == broker
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScreencastStopOutcome<T> {
+    Superseded,
+    Completed(T),
+    TimedOut,
+}
+
+async fn stop_owned_generation<F, T>(
+    lifecycle: &ScreencastLifecycle,
+    broker_generation: u64,
+    timeout: Duration,
+    stop: F,
+) -> ScreencastStopOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let generation = lifecycle.generation.lock().await;
+    if !generation_owns_stop(*generation, broker_generation) {
+        return ScreencastStopOutcome::Superseded;
+    }
+
+    match tokio::time::timeout(timeout, stop).await {
+        Ok(result) => ScreencastStopOutcome::Completed(result),
+        Err(_) => ScreencastStopOutcome::TimedOut,
+    }
 }
 
 /// Per-`BrowserSession` screencast broker. One source (CDP), many sinks
@@ -77,6 +122,8 @@ pub struct ScreencastBroker {
     /// Aborted on `Drop` so we don't leak a CDP listener after the last
     /// viewer detaches.
     listener_task: JoinHandle<()>,
+    lifecycle: Arc<ScreencastLifecycle>,
+    generation: u64,
 }
 
 impl ScreencastBroker {
@@ -90,7 +137,10 @@ impl ScreencastBroker {
     /// # Errors
     /// Returns [`BrowserError`] when subscribing to CDP events or issuing
     /// `Page.startScreencast` fails.
-    pub async fn start(page: Page) -> Result<Arc<Self>, BrowserError> {
+    pub(crate) async fn start(
+        page: Page,
+        lifecycle: Arc<ScreencastLifecycle>,
+    ) -> Result<Arc<Self>, BrowserError> {
         // Subscribe to events FIRST so we don't miss the first frame between
         // startScreencast returning and the listener actually being ready.
         let frame_events = page
@@ -118,9 +168,13 @@ impl ScreencastBroker {
             max_height: None,
             every_nth_frame: Some(1),
         };
+        let mut generation = lifecycle.generation.lock().await;
         page.execute(params).await.map_err(|e| {
             BrowserError::OperationFailed(format!("screencast: Page.startScreencast failed: {e}"))
         })?;
+        *generation = next_generation(*generation);
+        let broker_generation = *generation;
+        drop(generation);
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let last_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -144,6 +198,8 @@ impl ScreencastBroker {
             last_url,
             page,
             listener_task,
+            lifecycle,
+            generation: broker_generation,
         }))
     }
 
@@ -172,9 +228,27 @@ impl Drop for ScreencastBroker {
         // already gone, the call will just fail and the screencast was
         // implicitly torn down.
         let page = self.page.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let broker_generation = self.generation;
         tokio::spawn(async move {
-            if let Err(e) = page.execute(StopScreencastParams::default()).await {
-                tracing::debug!(error = %e, "Page.stopScreencast failed during broker drop — likely page already closed");
+            match stop_owned_generation(
+                &lifecycle,
+                broker_generation,
+                SCREENCAST_STOP_TIMEOUT,
+                page.execute(StopScreencastParams::default()),
+            )
+            .await
+            {
+                ScreencastStopOutcome::Superseded | ScreencastStopOutcome::Completed(Ok(_)) => {}
+                ScreencastStopOutcome::Completed(Err(e)) => {
+                    tracing::debug!(error = %e, "Page.stopScreencast failed during broker drop — likely page already closed");
+                }
+                ScreencastStopOutcome::TimedOut => {
+                    tracing::warn!(
+                        timeout_secs = SCREENCAST_STOP_TIMEOUT.as_secs(),
+                        "Page.stopScreencast timed out during broker drop"
+                    );
+                }
             }
         });
         tracing::debug!("ScreencastBroker dropped — last viewer detached");
@@ -290,5 +364,45 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{
+        generation_owns_stop, next_generation, stop_owned_generation, ScreencastLifecycle,
+        ScreencastStopOutcome,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn stale_broker_cannot_stop_replacement_generation() {
+        let first = next_generation(0);
+        assert!(generation_owns_stop(first, first));
+        let replacement = next_generation(first);
+        assert!(!generation_owns_stop(replacement, first));
+        assert!(generation_owns_stop(replacement, replacement));
+    }
+
+    #[tokio::test]
+    async fn stalled_owned_stop_releases_generation_lock_at_deadline() {
+        let lifecycle = Arc::new(ScreencastLifecycle::default());
+        let generation = next_generation(0);
+        *lifecycle.generation.lock().await = generation;
+
+        assert_eq!(
+            stop_owned_generation(
+                &lifecycle,
+                generation,
+                std::time::Duration::ZERO,
+                std::future::pending::<()>(),
+            )
+            .await,
+            ScreencastStopOutcome::TimedOut
+        );
+        assert!(
+            lifecycle.generation.try_lock().is_ok(),
+            "bounded stop must release the generation lock"
+        );
     }
 }

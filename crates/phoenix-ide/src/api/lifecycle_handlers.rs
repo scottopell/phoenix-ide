@@ -93,12 +93,17 @@ async fn ensure_task_approval_authorized(
 
 async fn require_task_lifecycle_admission(
     state: &AppState,
-    conversation_id: &str,
+    conversation: &crate::db::Conversation,
 ) -> Result<(), AppError> {
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::SubAgent {
+        return Err(AppError::BadRequest(
+            "Sub-agents cannot own task lifecycle decisions".to_string(),
+        ));
+    }
     match state
         .runtime
         .db()
-        .message_target_admission(conversation_id)
+        .message_target_admission(&conversation.id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
     {
@@ -150,7 +155,7 @@ pub(crate) async fn approve_task(
     }
 
     ensure_task_approval_authorized(&state, &conv).await?;
-    require_task_lifecycle_admission(&state, &id).await?;
+    require_task_lifecycle_admission(&state, &conv).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
     // 3. Dispatch approval event to state machine
@@ -195,7 +200,7 @@ pub(crate) async fn reject_task(
         ));
     }
 
-    require_task_lifecycle_admission(&state, &id).await?;
+    require_task_lifecycle_admission(&state, &conv).await?;
 
     state
         .runtime
@@ -236,7 +241,7 @@ pub(crate) async fn task_feedback(
         ));
     }
 
-    require_task_lifecycle_admission(&state, &id).await?;
+    require_task_lifecycle_admission(&state, &conv).await?;
 
     state
         .runtime
@@ -743,7 +748,12 @@ pub(crate) async fn retry_close_retirement(
 }
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
-async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Result<(), AppError> {
+async fn run_legacy_close_compat(
+    state: &AppState,
+    id: &str,
+    action: &str,
+    require_idle_latest: bool,
+) -> Result<(), AppError> {
     use phoenix_core::domain::close::{CloseAttemptId, CloseCompletionOutcome, ClosePhase};
 
     let transcript = state
@@ -799,20 +809,37 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
             }
             let attempt_id = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
                 .expect("UUID is a valid Close attempt id");
-            state
-                .db
-                .begin_close_foundation(
-                    &transcript.product_conversation_id,
-                    &expected_latest_transcript,
-                    attempt_id.as_str(),
-                )
-                .await
-                .map_err(|error| {
-                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error.to_string(),
-                        "close_start_failed",
-                    )))
-                })?
+            let begin = if require_idle_latest {
+                state
+                    .db
+                    .begin_direct_close_foundation(
+                        &transcript.product_conversation_id,
+                        &expected_latest_transcript,
+                        attempt_id.as_str(),
+                    )
+                    .await
+            } else {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &transcript.product_conversation_id,
+                        &expected_latest_transcript,
+                        attempt_id.as_str(),
+                    )
+                    .await
+            };
+            begin.map_err(|error| {
+                let error_type =
+                    if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                        "stale_latest_close_transcript"
+                    } else {
+                        "close_start_failed"
+                    };
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    error.to_string(),
+                    error_type,
+                )))
+            })?
         }
     };
     loop {
@@ -963,7 +990,14 @@ pub(crate) async fn close_legacy_compat(
     id: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, action).await
+    run_legacy_close_compat(state, id, action, false).await
+}
+
+pub(crate) async fn close_product_conversation_with_active_work(
+    state: &AppState,
+    id: &str,
+) -> Result<(), AppError> {
+    run_legacy_close_compat(state, id, "archive", false).await
 }
 
 pub(crate) async fn abandon_task(
@@ -976,7 +1010,7 @@ pub(crate) async fn abandon_task(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "abandon").await?;
+    run_legacy_close_compat(&state, &id, "abandon", false).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -997,7 +1031,7 @@ pub(crate) async fn mark_merged(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "mark as merged").await?;
+    run_legacy_close_compat(&state, &id, "mark as merged", false).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -1098,6 +1132,90 @@ mod tests {
         ensure_task_approval_authorized(&state, &conversation)
             .await
             .expect("active allocated WorkScope authorizes approval");
+    }
+
+    #[tokio::test]
+    async fn attached_work_child_cannot_own_task_lifecycle_decisions() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let id = "work-child-lifecycle-parent";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_mode_and_cwd(
+                id,
+                &ConvMode::Work {
+                    branch_name: NonEmptyString::new("task-approval").unwrap(),
+                    worktree_path: NonEmptyString::new("/tmp/task-approval").unwrap(),
+                    base_branch: NonEmptyString::new("main").unwrap(),
+                    task_id: NonEmptyString::new("12345").unwrap(),
+                    task_title: NonEmptyString::new("approval").unwrap(),
+                },
+                "/tmp/task-approval",
+            )
+            .await
+            .unwrap();
+        let parent = state.db.get_conversation(id).await.unwrap();
+        let child = state
+            .db
+            .create_subagent_conversation(
+                "work-child-lifecycle",
+                "work-child-lifecycle",
+                "/tmp/task-approval",
+                id,
+                "gpt-5.4",
+                &ConvMode::AttachedWorkChild,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                parent.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+        ensure_task_approval_authorized(&state, &parent)
+            .await
+            .unwrap();
+        require_task_lifecycle_admission(&state, &parent)
+            .await
+            .unwrap();
+        let authority = crate::resource_authority::resolve_resource_authority(&state.db, &child)
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(
+            authority.task_approval_authority(),
+            crate::resource_authority::TaskApprovalAuthority::SubAgent
+        );
+        assert!(ensure_task_approval_authorized(&state, &child)
+            .await
+            .is_err());
+        assert!(matches!(
+            require_task_lifecycle_admission(&state, &child).await,
+            Err(AppError::BadRequest(message)) if message == "Sub-agents cannot own task lifecycle decisions"
+        ));
+        assert!(run_legacy_close_compat(&state, &child.id, "abandon", false)
+            .await
+            .is_err());
+        assert!(
+            run_legacy_close_compat(&state, &child.id, "mark as merged", false)
+                .await
+                .is_err()
+        );
+        let retained_parent = state.db.get_conversation(id).await.unwrap();
+        assert_eq!(
+            retained_parent.attached_work_scope_id,
+            parent.attached_work_scope_id
+        );
+        assert!(!retained_parent.archived);
     }
 
     #[tokio::test]

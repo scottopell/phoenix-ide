@@ -25,9 +25,11 @@ phoenix-core = { path = "../phoenix-core" }
 # LlmLanguage, Priority, the task-approval handoff parcel, …).
 phoenix-core = { path = "../phoenix-core" }
 phoenix-workflow = { path = "../phoenix-workflow" }
+phoenix-svg = { path = "../phoenix-svg" }
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx-core = { version = "0.9", default-features = false }
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 
 # Serialization (JSON-in-TEXT columns + derives on persisted row types)

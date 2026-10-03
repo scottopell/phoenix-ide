@@ -110,6 +110,7 @@ fn arb_user_message() -> impl Strategy<Value = LlmMessage> {
         1..6,
     )
     .prop_map(|content| LlmMessage {
+        source_message_id: None,
         role: MessageRole::User,
         content,
     })
@@ -125,6 +126,7 @@ fn arb_assistant_message() -> impl Strategy<Value = LlmMessage> {
         1..6,
     )
     .prop_map(|content| LlmMessage {
+        source_message_id: None,
         role: MessageRole::Assistant,
         content,
     })
@@ -145,13 +147,17 @@ fn make_anthropic_response(
     stop_reason: Option<&str>,
 ) -> AnthropicResponse {
     AnthropicResponse {
+        id: "msg_test".to_string(),
+        model: "claude-opus-5-5".to_string(),
         content,
         stop_reason: stop_reason.map(String::from),
+        stop_details: None,
         usage: AnthropicUsage {
             input_tokens: 10,
             output_tokens: 5,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            speed: None,
         },
     }
 }
@@ -168,13 +174,17 @@ proptest! {
         stop_reason in proptest::option::of("[a-z_]{3,10}")
     ) {
         let resp = AnthropicResponse {
+            id: "msg_test".to_string(),
+            model: "claude-opus-5-5".to_string(),
             content: vec![],
             stop_reason,
+            stop_details: None,
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                speed: None,
             },
         };
         let result = anthropic::test_helpers::normalize_response(resp);
@@ -255,7 +265,7 @@ proptest! {
             images: vec![],
             is_error,
         };
-        let msg = LlmMessage { role: MessageRole::User, content: vec![block] };
+        let msg = LlmMessage { source_message_id: None, role: MessageRole::User, content: vec![block] };
         let translated = anthropic::test_helpers::translate_message(&msg);
         prop_assert_eq!(translated.content.len(), 1);
         if let super::anthropic::AnthropicContentBlock::ToolResult { content: wire_content, .. } =
@@ -286,7 +296,7 @@ proptest! {
             images,
             is_error,
         };
-        let msg = LlmMessage { role: MessageRole::User, content: vec![block] };
+        let msg = LlmMessage { source_message_id: None, role: MessageRole::User, content: vec![block] };
         let translated = anthropic::test_helpers::translate_message(&msg);
         prop_assert_eq!(translated.content.len(), 1);
         if let super::anthropic::AnthropicContentBlock::ToolResult { content: wire_content, .. } =
@@ -319,6 +329,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
     LlmRequest {
         system: vec![],
         messages,
+        provider_replay: None,
         tools: vec![],
         max_tokens: None,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
@@ -336,6 +347,7 @@ proptest! {
         text in "[a-zA-Z0-9 _.!?,]{1,100}",
     ) {
         let msg = LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::Text { text: text.clone() }],
         };
@@ -361,6 +373,7 @@ proptest! {
         data in "[a-zA-Z0-9+/]{10,50}",
     ) {
         let msg = LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![
                 ContentBlock::Text { text: text.clone() },
@@ -400,6 +413,7 @@ proptest! {
         is_error in any::<bool>(),
     ) {
         let msg = LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
@@ -440,6 +454,7 @@ proptest! {
             .collect();
 
         let msg = LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
@@ -642,6 +657,7 @@ mod codex_request_shape {
 
     fn user_msg(text: &str) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::Text {
                 text: text.to_string(),

@@ -26,7 +26,15 @@ pub struct KeywordSearchInput {
     pub search_terms: Vec<String>,
 }
 
-/// Input for the `read_image` tool
+/// Input for file-based static SVG publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresentSvgInput {
+    pub path: String,
+    pub title: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadImageInput {
     pub path: String,
@@ -148,6 +156,7 @@ pub enum ToolInput {
     Patch(PatchInput),
     KeywordSearch(KeywordSearchInput),
     ReadImage(ReadImageInput),
+    PresentSvg(PresentSvgInput),
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
@@ -276,6 +285,9 @@ impl<'de> Deserialize<'de> for ToolInput {
             "keyword_search" => {
                 parse_tool_input_or_malformed::<KeywordSearchInput>("keyword_search", payload)
             }
+            "present_svg" => {
+                parse_tool_input_or_malformed::<PresentSvgInput>("present_svg", payload)
+            }
             "read_image" => parse_tool_input_or_malformed::<ReadImageInput>("read_image", payload),
             "spawn_agents" => {
                 parse_tool_input_or_malformed::<SpawnAgentsInput>("spawn_agents", payload)
@@ -334,6 +346,12 @@ impl From<KeywordSearchInput> for ToolInput {
         ToolInput::KeywordSearch(input)
     }
 }
+impl From<PresentSvgInput> for ToolInput {
+    fn from(input: PresentSvgInput) -> Self {
+        Self::PresentSvg(input)
+    }
+}
+
 impl From<ReadImageInput> for ToolInput {
     fn from(input: ReadImageInput) -> Self {
         ToolInput::ReadImage(input)
@@ -381,6 +399,7 @@ impl ToolInput {
             ToolInput::Patch(_) => "patch",
             ToolInput::KeywordSearch(_) => "keyword_search",
             ToolInput::ReadImage(_) => "read_image",
+            ToolInput::PresentSvg(_) => "present_svg",
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
@@ -405,6 +424,7 @@ impl ToolInput {
             ToolInput::Patch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ReadImage(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::PresentSvg(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
@@ -468,6 +488,7 @@ impl ToolInput {
             "patch" => parse::<PatchInput>(name, value),
             "keyword_search" => parse::<KeywordSearchInput>(name, value),
             "read_image" => parse::<ReadImageInput>(name, value),
+            "present_svg" => parse::<PresentSvgInput>(name, value),
             "spawn_agents" => parse::<SpawnAgentsInput>(name, value),
             "submit_result" => parse::<SubmitResultInput>(name, value),
             "submit_error" => parse::<SubmitErrorInput>(name, value),
@@ -798,6 +819,7 @@ mod tests {
             },
             ConvState::CancellingTool {
                 tool_use_id: "t1".into(),
+                cause: crate::domain::sm_event::CancelCause::UserRequested,
                 skipped_tools: vec![],
                 completed_results: vec![],
                 assistant_message: AssistantMessage::default(),
@@ -1129,6 +1151,9 @@ pub enum ConvState {
     CancellingTool {
         /// The tool being aborted
         tool_use_id: String,
+        // owned: pre-cause rows were created only by user cancellation.
+        #[serde(default)]
+        cause: crate::domain::sm_event::CancelCause,
         /// Tools that were skipped
         skipped_tools: Vec<ToolCall>,
         /// Tool results completed before cancellation
@@ -1293,6 +1318,7 @@ pub enum CoreState {
     },
     CancellingTool {
         tool_use_id: String,
+        cause: crate::domain::sm_event::CancelCause,
         skipped_tools: Vec<ToolCall>,
         completed_results: Vec<ToolResult>,
         assistant_message: AssistantMessage,
@@ -1450,12 +1476,14 @@ impl From<CoreState> for ConvState {
             },
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1546,12 +1574,14 @@ impl TryFrom<ConvState> for ParentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(ParentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1670,12 +1700,14 @@ impl TryFrom<ConvState> for SubAgentState {
             })),
             ConvState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
             } => Ok(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -2147,6 +2179,9 @@ pub enum SubAgentOutcome {
     Success {
         result: String,
     },
+    ImplicitCompletion {
+        result: String,
+    },
     Failure {
         error: String,
         error_kind: ErrorKind,
@@ -2277,7 +2312,7 @@ pub struct ConvContext {
     /// Resource namespace for this runtime. Ordinary conversations carry a
     /// persisted work scope; the Coordinator occupies its disjoint namespace.
     pub resource_scope: crate::work_scope::ResourceScopeKey,
-    /// Effective authority used for same-scope runtime resources.
+    /// Runtime authority projected from the persisted `WorkScope`.
     pub resource_authority: crate::work_scope::ResourceAuthority,
     /// Persisted worktree location, if this conversation has one. This is
     /// environment context only and never participates in resource identity.
@@ -2419,5 +2454,24 @@ impl ConvContext {
             persona: None,
             is_coordinator: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod svg_input_tests {
+    use super::*;
+
+    #[test]
+    fn present_svg_survives_checkpoint_roundtrip_without_raw_markup() {
+        let args = serde_json::json!({"path":"/var/tmp/chart.svg","title":"Storage","description":"Directory sizes in GiB"});
+        let input = ToolInput::from_name_and_value("present_svg", args.clone());
+        assert!(matches!(input, ToolInput::PresentSvg(_)));
+        let saved = serde_json::to_string(&input).unwrap();
+        let restored: ToolInput = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.tool_name(), "present_svg");
+        assert_eq!(restored.to_value(), args);
+        let malformed =
+            ToolInput::from_name_and_value("present_svg", serde_json::json!({"path":"/tmp/x.svg"}));
+        assert!(matches!(malformed, ToolInput::Malformed { .. }));
     }
 }

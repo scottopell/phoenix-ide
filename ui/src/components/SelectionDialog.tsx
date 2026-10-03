@@ -96,6 +96,7 @@ export function SelectionDialog({
       onKeyDown={(event) => {
         if (event.key === 'Escape') {
           event.preventDefault();
+          event.stopPropagation();
           requestClose();
           return;
         }

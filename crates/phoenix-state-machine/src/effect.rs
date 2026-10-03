@@ -46,6 +46,7 @@ pub enum PersistError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SteeringDrainMessage {
     pub content: MessageContent,
+    pub origin: phoenix_core::domain::db_schema::InputOrigin,
     pub display_data: Option<Value>,
     pub usage_data: Option<UsageData>,
     pub message_id: String,
@@ -98,16 +99,7 @@ impl CheckpointData {
     }
 }
 
-/// Derive the message ID used to persist a tool result.
-///
-/// Both `persist_checkpoint` and `persist_sub_agent_results` must agree on
-/// this ID: the former creates the message, the latter updates it in-place
-/// when sub-agent results arrive. Single-sourcing the convention here
-/// prevents silent divergence.
-#[must_use]
-pub fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
-}
+pub use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
@@ -126,6 +118,11 @@ pub enum Effect {
         /// re-drain). Default `false` for normal write paths to avoid the
         /// extra `message_exists` query.
         idempotent: bool,
+    },
+    /// User input accepted by a parent interaction (approval feedback or question response).
+    PersistUserInputMessage {
+        content: MessageContent,
+        message_id: String,
     },
     PersistAuthoritativeUserMessage {
         payload: PreparedDirectTurnPayload,
@@ -174,7 +171,10 @@ pub enum Effect {
     AbortLlm,
 
     /// Cancel all pending sub-agents
-    CancelSubAgents { ids: Vec<String> },
+    CancelSubAgents {
+        ids: Vec<String>,
+        cause: crate::event::CancelCause,
+    },
 
     /// Notify parent of sub-agent completion (sub-agent only)
     NotifyParent { outcome: SubAgentOutcome },
@@ -250,13 +250,13 @@ pub enum Effect {
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
-    /// Execute git operations for task approval (REQ-BED-028).
+    /// Adopt an approved task in the current conversation (REQ-BED-028).
     ///
-    /// `task_file` (relative to the conversation cwd) is the canonical
-    /// source: the executor reads it from disk to derive task id, slug,
-    /// priority, and status, then sets up the branch and worktree. The
-    /// remaining fields are the snapshot the user approved and are used for
-    /// the user-facing branch announcement message.
+    /// `task_file` (relative to the conversation cwd) is the canonical source:
+    /// the executor reads it from disk to derive task id, slug, priority, and
+    /// status, then sets up the branch and worktree. The remaining fields are
+    /// the snapshot the user approved and are used for the user-facing branch
+    /// announcement message.
     ApproveTask {
         task_file: String,
         title: String,
@@ -324,6 +324,7 @@ impl Effect {
     ) -> Self {
         let text = text.into();
         let submitted = SubmittedDirectTurnIdentity {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.clone(),
             images: images.clone(),
             files: files.clone().into_iter().map(Into::into).collect(),
@@ -407,7 +408,7 @@ impl Effect {
         images: Vec<ToolContentImage>,
     ) -> Self {
         let tool_use_id = tool_use_id.into();
-        let message_id = tool_result_message_id(&tool_use_id);
+        let message_id = uuid::Uuid::new_v4().to_string();
         Effect::PersistMessage {
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.clone(),

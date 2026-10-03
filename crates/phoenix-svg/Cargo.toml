@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-svg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Bounded static SVG validation and validated snapshot capability."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+roxmltree = "0.20"
+svgtypes = "0.15"
+xmlparser = "0.13"
+
+[lints]
+workspace = true

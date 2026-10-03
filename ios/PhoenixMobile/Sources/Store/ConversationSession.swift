@@ -1,39 +1,6 @@
 import Foundation
 import Observation
 
-protocol SessionTiming: Sendable {
-    func sleep(seconds: TimeInterval) async throws
-}
-
-struct LiveSessionTiming: SessionTiming {
-    func sleep(seconds: TimeInterval) async throws {
-        try await Task.sleep(for: .seconds(seconds))
-    }
-}
-
-typealias ConversationEventStreamOpener = @Sendable (PhoenixAPI, String) async throws -> AsyncThrowingStream<PhoenixEvent, Error>
-
-@Sendable
-func defaultConversationEventStreamOpener(
-    api: PhoenixAPI,
-    conversationId: String
-) async throws -> AsyncThrowingStream<PhoenixEvent, Error> {
-    let (bytes, _) = try await api.openStream(conversationId: conversationId)
-    return AsyncThrowingStream { continuation in
-        let task = Task {
-            do {
-                for try await event in ConversationSession.decodedEvents(from: bytes) {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
-        }
-        continuation.onTermination = { @Sendable _ in task.cancel() }
-    }
-}
-
 /// Live model for one open conversation: cached snapshot + SSE reducer +
 /// outbox. Owns the stream lifecycle (connect, reconnect with backoff,
 /// resync via init snapshots) and drains the outbox whenever sending might
@@ -65,14 +32,12 @@ final class ConversationSession {
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
     private(set) var isHardDeleted = false
-    private(set) var isHardDeletePending = false
     private(set) var isArchiving = false
     var acceptsChatMessage: Bool {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        guard case .current = hydrationAuthority else { return false }
-        return !isHardDeleted && !isHardDeletePending && !isArchiving && conversation?.archived != true
+        !isHardDeleted && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
@@ -86,36 +51,20 @@ final class ConversationSession {
     private var connectivityToken: UUID?
     private var streamTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
-    private var drainGeneration = 0
-    private var lastCompletedDrainGeneration = 0
     private var staleCheckTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
-    private var outboxAuthorityGeneration = 0
-    private var liveWorkGeneration = 0
-    private let retryTiming: any SessionTiming
-    private let staleCheckTiming: any SessionTiming
-    private let openEventStream: ConversationEventStreamOpener
-    private let deliveryTriggerAllowed: () -> Bool
-    struct HardDeleteContext: Sendable {
-        let conversationId: String
-        let aggregateAuthority: String
-        let configurationIdentity: APIConfigurationIdentity
-    }
-
     private var onConversationUpdate: ((Conversation) -> Void)?
-    private var onSessionEvent: ((ProductConversationSessionEvent) -> Void)?
-    private var onHardDeleted: @MainActor (HardDeleteContext) async -> Void
-    private var hardDeleteReportTask: Task<Void, Never>?
+    private var onHardDeleted: (String) -> Void
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
     private var streamBlockedUntilConfigurationChange = false
     private let snapshotWriter: VersionedDiskWriter
     private var latestSnapshotRevision = 0
-    private var pendingSnapshotConfigurationIdentity: APIConfigurationIdentity?
+    private var pendingAuthoritativeSyncedAt: Date?
     private var snapshotPersistenceEnabled = true
     private var snapshotNeedsOutboxReconciliation = false
     private var snapshotNeedsOutboxDrain = false
@@ -133,58 +82,13 @@ final class ConversationSession {
     /// Retain the newest fields until the identity-bearing message arrives.
     private var pendingMessagePatches: [String: PendingMessagePatch] = [:]
 
-    enum HydrationAuthority: Equatable {
-        case none
-        case legacyReadOnly(PersistedSnapshotAuthority?)
-        case current(AuthoritativeSnapshotReceipt)
-    }
-
-    private(set) var hydrationAuthority: HydrationAuthority = .none
-    var authoritativeSnapshotReceipt: AuthoritativeSnapshotReceipt? {
-        guard case .current(let receipt) = hydrationAuthority else { return nil }
-        return receipt
-    }
-    // MARK: - Persistence
-
-    struct PersistedSnapshotAuthority: Codable, Equatable, Sendable {
-        let configurationIdentity: APIConfigurationIdentity
-        let aggregateAuthority: String
-        let syncedAt: Date
-    }
-
-    private let aggregateAuthority: String
-    var aggregateAuthorityIdentity: String { aggregateAuthority }
-
-    private static func receiptIdentity(
-        for conversation: Conversation,
-        sessionConversationId: String,
-        expectedAggregateAuthority: String
-    ) -> (conversationId: String, aggregateId: String)? {
-        guard conversation.id == sessionConversationId else { return nil }
-        guard conversation.aggregateIdentity == expectedAggregateAuthority else { return nil }
-        return (conversation.id, expectedAggregateAuthority)
-    }
-
-    private static func aggregateAuthority(conversationId: String, aggregateAuthority: String?) -> String {
-        aggregateAuthority ?? conversationId
-    }
-
-    struct AuthoritativeSnapshotReceipt: Equatable, Sendable {
-
-        let conversationId: String
-        let aggregateId: String
-        let configurationIdentity: APIConfigurationIdentity
-        let revision: Int
-        let syncedAt: Date
-        let segmentOrdinal: Int64?
-        let handoff: ProductConversationHandoff?
-    }
+    private var snapshotName: String { "conv-\(conversationId)" }
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
-    /// versioning rule). Additive-optional fields remain compatible.
-    static let snapshotSchemaVersion = 1
+    /// versioning rule). Additive-optional fields (syncedAt) need no bump.
+    private static let snapshotSchemaVersion = 1
 
-    struct PersistedSnapshot: Codable, Sendable {
+    private struct Snapshot: Codable, Sendable {
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
@@ -193,92 +97,59 @@ final class ConversationSession {
         var transcriptGeneration: Int64?
         /// Missing in snapshots written before cache freshness was tracked.
         var syncedAt: Date?
-        /// owned: snapshots written before authority scoping had no persisted
-        /// authority metadata; rendering remains valid, but authoritative
-        /// replay stays locked until a current authoritative init rewrites it.
-        var authoritative: PersistedSnapshotAuthority?
-        // owned: pre-feature snapshots had no aggregate segment ordinal; nil
-        // means multi-member ordering is unproven and must not be fabricated.
-        var segmentOrdinal: Int64? = nil
-        // owned: pre-feature snapshots had no ProductConversation handoff.
-        var handoff: ProductConversationHandoff? = nil
+    }
+
+    static func hasCachedSnapshot(conversationId: String) -> Bool {
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion)
+        else { return false }
+        return snapshot.conversation != nil && snapshot.syncedAt != nil
+    }
+
+    static func cachedConversation(conversationId: String) -> Conversation? {
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion),
+              snapshot.syncedAt != nil
+        else { return nil }
+        return snapshot.conversation
     }
 
     private var transcriptGeneration: Int64?
+    private var deliveryAllowed = true
     private(set) var snapshotSyncedAt: Date?
-    private var pendingAuthoritativeSnapshot: PersistedSnapshotAuthority?
-    private var segmentOrdinal: Int64?
-    private(set) var productConversationHandoff: ProductConversationHandoff?
 
     init(
         conversationId: String,
         api: PhoenixAPI,
         connectivity: ConnectivityMonitor,
-        outboxPersistence: OutboxPersistenceHandle,
-        snapshotPersistence: VersionedDiskWriter,
-        retryTiming: any SessionTiming,
-        staleCheckTiming: any SessionTiming,
-        openEventStream: @escaping ConversationEventStreamOpener = defaultConversationEventStreamOpener,
-        deliveryTriggerAllowed: @escaping () -> Bool = { true },
-        legacySnapshotPersistenceScope: PersistenceScopeIdentity? = nil,
-        aggregateAuthority: String? = nil,
         onConversationUpdate: ((Conversation) -> Void)? = nil,
-        onHardDeleted: @escaping @MainActor (HardDeleteContext) async -> Void = { _ in }
+        onHardDeleted: @escaping (String) -> Void = { _ in }
     ) {
         self.conversationId = conversationId
         self.api = api
         self.connectivity = connectivity
-        self.retryTiming = retryTiming
-        self.staleCheckTiming = staleCheckTiming
-        self.openEventStream = openEventStream
-        self.deliveryTriggerAllowed = deliveryTriggerAllowed
-        self.aggregateAuthority = Self.aggregateAuthority(
-            conversationId: conversationId,
-            aggregateAuthority: aggregateAuthority)
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
-        self.outbox = Outbox(
-            conversationId: conversationId,
-            aggregateAuthority: self.aggregateAuthority,
-            persistenceScope: PersistenceScopeIdentity(
-                serverURL: api.configurationIdentity.serverURL,
-                credentialGeneration: api.configurationIdentity.credentialGeneration),
-            persistence: outboxPersistence)
-        self.snapshotWriter = snapshotPersistence
+        self.outbox = Outbox(conversationId: conversationId)
+        self.snapshotWriter = DiskStore.versionedWriter(
+            name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
         // Cached snapshot renders immediately; the stream refreshes it.
-        let loadedSnapshot: DiskStore.VersionedLoad<PersistedSnapshot> = DiskStore.loadVersionedResult(
-            PersistedSnapshot.self,
-            source: snapshotWriter.destinationURL,
-            version: Self.snapshotSchemaVersion)
-        if case .value(let snap) = loadedSnapshot,
-           let persistedConversation = snap.conversation,
-           let authority = snap.authoritative,
-           authority.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope,
-           authority.aggregateAuthority == self.aggregateAuthority,
-           let receiptIdentity = Self.receiptIdentity(
-               for: persistedConversation,
-               sessionConversationId: conversationId,
-               expectedAggregateAuthority: self.aggregateAuthority)
+        if let snap = DiskStore.loadVersioned(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
         {
-            conversation = persistedConversation
+            conversation = snap.conversation
             messages = snap.messages
-            durableMessageSequenceCeiling = snap.messages.map { $0.sequence_id }.max() ?? 0
+            durableMessageSequenceCeiling = snap.messages.map(\.sequence_id).max() ?? 0
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
-            segmentOrdinal = snap.segmentOrdinal
-            productConversationHandoff = snap.handoff
-            hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
-                conversationId: receiptIdentity.conversationId,
-                aggregateId: receiptIdentity.aggregateId,
-                configurationIdentity: api.configurationIdentity,
-                revision: 0,
-                syncedAt: authority.syncedAt,
-                segmentOrdinal: snap.segmentOrdinal,
-                handoff: snap.handoff))
             replayFromPendingAnchor = true
-            presentationMode = persistedConversation.presentation_mode
+            presentationMode = snap.conversation?.presentation_mode
             // Busy flag follows the cached mode the same way live
             // state_change events derive it — a snapshot taken mid-turn
             // must not open looking idle.
@@ -288,27 +159,6 @@ final class ConversationSession {
             // the matching outbox row not yet pruned. Reconcile at load so the
             // same user message never renders twice while offline.
             reconcileOutbox()
-        } else if case .value(let snap) = loadedSnapshot,
-                  (snap.authoritative == nil
-                    && legacySnapshotPersistenceScope == api.configurationIdentity.persistenceScope)
-                    || snap.authoritative?.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope,
-                  let persistedConversation = snap.conversation,
-                  Self.receiptIdentity(
-                      for: persistedConversation,
-                      sessionConversationId: conversationId,
-                      expectedAggregateAuthority: self.aggregateAuthority) != nil
-        {
-            conversation = persistedConversation
-            messages = snap.messages
-            durableMessageSequenceCeiling = snap.messages.map { $0.sequence_id }.max() ?? 0
-            lastSequenceId = snap.lastSequenceId
-            transcriptGeneration = snap.transcriptGeneration
-            snapshotSyncedAt = snap.syncedAt
-            presentationMode = persistedConversation.presentation_mode
-            productConversationHandoff = snap.handoff
-            agentWorking = presentationMode == "working"
-            rebuildToolUseIndex()
-            hydrationAuthority = .legacyReadOnly(snap.authoritative)
         }
     }
 
@@ -324,13 +174,7 @@ final class ConversationSession {
     }
 
     func replaceAPI(_ api: PhoenixAPI) {
-        invalidateOutboxAuthority()
-        invalidateLiveWork()
-        inFlight.removeAll()
         self.api = api
-        pendingSnapshotConfigurationIdentity = nil
-        pendingAuthoritativeSnapshot = nil
-        hydrationAuthority = .none
         streamBlockedUntilConfigurationChange = false
         if viewIsActive {
             streamTask?.cancel()
@@ -341,57 +185,9 @@ final class ConversationSession {
         drainOutbox()
     }
 
-    func revokeConfigurationForReplacement() {
-        invalidateConfiguration()
-        snapshotPersistenceEnabled = false
-        stop()
-    }
-
-    func revokeForHardDelete() {
-        isHardDeleted = true
-        isHardDeletePending = false
-        snapshotPersistenceEnabled = false
-        invalidateOutboxAuthority()
-        conversation = nil
-        messages = []
-        durableMessageSequenceCeiling = 0
-        presentationMode = "done"
-        agentWorking = false
-        streamingText = ""
-        streamingRequestId = nil
-        pendingMessagePatches.removeAll()
-        toolUseIndex = [:]
-        hydrationAuthority = .none
-        stop()
-    }
-
-    func invalidateConfiguration() {
-        invalidateOutboxAuthority()
-        invalidateLiveWork()
-        streamBlockedUntilConfigurationChange = true
-        streamTask?.cancel()
-        streamTask = nil
-        staleCheckTask?.cancel()
-        staleCheckTask = nil
-        inFlight.removeAll()
-        drainGeneration &+= 1
-        drainTask?.cancel()
-        drainTask = nil
-        pendingSnapshotConfigurationIdentity = nil
-        pendingAuthoritativeSnapshot = nil
-        hydrationAuthority = .none
-        actionAttempt = nil
-        connection = .idle
-        onSessionEvent?(.connectionChanged(.idle))
-    }
-
-    func setSessionEventObserver(_ observer: ((ProductConversationSessionEvent) -> Void)?) {
-        onSessionEvent = observer
-    }
-
     func adoptOpenOwnership(
         onConversationUpdate: @escaping (Conversation) -> Void,
-        onHardDeleted: @escaping @MainActor (HardDeleteContext) async -> Void
+        onHardDeleted: @escaping (String) -> Void
     ) {
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
@@ -399,8 +195,9 @@ final class ConversationSession {
 
     func stop() {
         viewIsActive = false
-        invalidateLiveWork()
         pauseLiveTasks()
+        drainTask?.cancel()
+        drainTask = nil
         if let token = connectivityToken {
             connectivity.removePathObserver(token)
             connectivityToken = nil
@@ -411,15 +208,16 @@ final class ConversationSession {
     /// of its disk-backed outbox.
     func closeView() {
         viewIsActive = false
-        invalidateLiveWork()
         pauseLiveTasks()
     }
 
     /// Background suspension preserves whether the view is open so a later
     /// foreground transition resumes only that conversation's live stream.
     func pauseForBackground() {
-        invalidateLiveWork()
         pauseLiveTasks()
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
     }
 
     private func pauseLiveTasks() {
@@ -428,114 +226,73 @@ final class ConversationSession {
         staleCheckTask?.cancel()
         staleCheckTask = nil
         connection = .idle
-        onSessionEvent?(.connectionChanged(.idle))
         persistSnapshot()
-    }
-
-    private func invalidateOutboxAuthority() {
-        outboxAuthorityGeneration &+= 1
-    }
-
-    private func invalidateLiveWork() {
-        liveWorkGeneration &+= 1
-    }
-
-    private func isCurrentLiveWork(_ generation: Int, apiIdentity: APIConfigurationIdentity) -> Bool {
-        !Task.isCancelled && generation == liveWorkGeneration && viewIsActive
-            && apiIdentity == api.configurationIdentity && !isHardDeleted
     }
 
     private func resumeLiveTasks() {
         guard viewIsActive, !isHardDeleted,
               !streamBlockedUntilConfigurationChange
         else { return }
-        let generation = liveWorkGeneration
-        let apiIdentity = api.configurationIdentity
         if streamTask == nil {
-            streamTask = Task { await streamLoop(generation: generation, apiIdentity: apiIdentity) }
+            streamTask = Task { await streamLoop() }
         }
         if staleCheckTask == nil {
-            staleCheckTask = Task { await staleCheckLoop(generation: generation, apiIdentity: apiIdentity) }
+            staleCheckTask = Task { await staleCheckLoop() }
         }
+    }
+
+    func suspendDeliveryForReconciliation() {
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
     }
 
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
-        guard !isHardDeleted, deliveryTriggerAllowed() else { return }
+        guard !isHardDeleted else { return }
+        deliveryAllowed = true
         resumeLiveTasks()
         drainOutbox()
     }
 
-    func resyncAfterConnectivityRestore() {
-        connectivityRestored()
-    }
-
     private func connectivityRestored() {
-        guard !isHardDeleted, deliveryTriggerAllowed() else { return }
+        guard !isHardDeleted else { return }
         if viewIsActive, !streamBlockedUntilConfigurationChange {
+            // Wake the stream loop out of its backoff sleep by restarting it.
             streamTask?.cancel()
-            streamTask = nil
-            resumeLiveTasks()
+            streamTask = Task { await streamLoop() }
         }
         drainOutbox()
     }
 
     private func connectivityLost() {
-        invalidateLiveWork()
+        deliveryAllowed = false
+        drainTask?.cancel()
+        drainTask = nil
         streamTask?.cancel()
         streamTask = nil
         staleCheckTask?.cancel()
         staleCheckTask = nil
         connection = .offline
-        onSessionEvent?(.connectionChanged(.offline))
     }
 
-    private func snapshotForPersistence(authoritative: Bool) -> PersistedSnapshot {
-        let authority: PersistedSnapshotAuthority?
+    private func snapshotForPersistence(authoritative: Bool) -> Snapshot {
         let syncedAt: Date?
         if authoritative {
             let now = Date()
-            let currentAuthority = PersistedSnapshotAuthority(
-                configurationIdentity: api.configurationIdentity,
-                aggregateAuthority: aggregateAuthority,
-                syncedAt: now)
-            pendingAuthoritativeSnapshot = currentAuthority
-            authority = currentAuthority
+            pendingAuthoritativeSyncedAt = now
             syncedAt = now
-        } else if let pendingAuthoritativeSnapshot,
-                  pendingAuthoritativeSnapshot.configurationIdentity == api.configurationIdentity
-        {
-            authority = pendingAuthoritativeSnapshot
-            syncedAt = pendingAuthoritativeSnapshot.syncedAt
-        } else if let receipt = authoritativeSnapshotReceipt,
-                  receipt.configurationIdentity == api.configurationIdentity
-        {
-            authority = PersistedSnapshotAuthority(
-                configurationIdentity: receipt.configurationIdentity,
-                aggregateAuthority: receipt.aggregateId,
-                syncedAt: receipt.syncedAt)
-            syncedAt = receipt.syncedAt
-        } else if case .legacyReadOnly(let persistedAuthority) = hydrationAuthority,
-                  let persistedAuthority,
-                  persistedAuthority.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope
-        {
-            authority = persistedAuthority
-            syncedAt = persistedAuthority.syncedAt
         } else {
-            authority = nil
-            syncedAt = snapshotSyncedAt
+            syncedAt = pendingAuthoritativeSyncedAt ?? snapshotSyncedAt
         }
-        return PersistedSnapshot(
+        return Snapshot(
             conversation: conversation,
             messages: Self.durableMessages(
                 messages, through: durableMessageSequenceCeiling),
             lastSequenceId: lastSequenceId,
             transcriptGeneration: transcriptGeneration,
-            syncedAt: syncedAt,
-            authoritative: authority,
-            segmentOrdinal: segmentOrdinal,
-            handoff: productConversationHandoff)
+            syncedAt: syncedAt)
     }
 
     private func persistSnapshot(
@@ -548,54 +305,25 @@ final class ConversationSession {
             snapshotNeedsOutboxReconciliation || reconcileOutboxOnSuccess
         snapshotNeedsOutboxDrain = snapshotNeedsOutboxDrain || drainOutboxAfter
         let snapshot = snapshotForPersistence(authoritative: authoritative)
-        let configurationIdentity = api.configurationIdentity
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
-        pendingSnapshotConfigurationIdentity = configurationIdentity
         Task { [weak self, snapshotWriter] in
             let didSave = await snapshotWriter.save(snapshot, revision: revision)
             self?.completeSnapshotPersistence(
-                snapshot,
-                revision: revision,
-                didSave: didSave,
-                configurationIdentity: configurationIdentity)
+                snapshot, revision: revision, didSave: didSave)
         }
     }
 
     @discardableResult
     private func completeSnapshotPersistence(
-        _ snapshot: PersistedSnapshot,
-        revision: Int,
-        didSave: Bool,
-        configurationIdentity: APIConfigurationIdentity
+        _ snapshot: Snapshot, revision: Int, didSave: Bool
     ) -> Bool {
-        guard latestSnapshotRevision == revision,
-              pendingSnapshotConfigurationIdentity == configurationIdentity,
-              api.configurationIdentity == configurationIdentity,
-              snapshotPersistenceEnabled,
+        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
               !isHardDeleted
         else { return false }
         if didSave {
             snapshotSyncedAt = snapshot.syncedAt
-            pendingAuthoritativeSnapshot = nil
-            pendingSnapshotConfigurationIdentity = nil
-            if let persistedConversation = snapshot.conversation,
-               let authority = snapshot.authoritative,
-               authority.aggregateAuthority == aggregateAuthority,
-               let receiptIdentity = Self.receiptIdentity(
-                   for: persistedConversation,
-                   sessionConversationId: conversationId,
-                   expectedAggregateAuthority: self.aggregateAuthority)
-            {
-                hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
-                    conversationId: receiptIdentity.conversationId,
-                    aggregateId: receiptIdentity.aggregateId,
-                    configurationIdentity: authority.configurationIdentity,
-                    revision: revision,
-                    syncedAt: authority.syncedAt,
-                    segmentOrdinal: snapshot.segmentOrdinal,
-                    handoff: snapshot.handoff))
-            }
+            pendingAuthoritativeSyncedAt = nil
             if snapshotNeedsOutboxReconciliation {
                 snapshotNeedsOutboxReconciliation = false
                 reconcileOutbox()
@@ -612,51 +340,19 @@ final class ConversationSession {
     func flushSnapshotPersistence() async -> Bool {
         guard !isHardDeleted, snapshotPersistenceEnabled else { return false }
         let snapshot = snapshotForPersistence(authoritative: false)
-        let configurationIdentity = api.configurationIdentity
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
-        pendingSnapshotConfigurationIdentity = configurationIdentity
         let didSave = await snapshotWriter.save(snapshot, revision: revision)
-        return completeSnapshotPersistence(
-            snapshot,
-            revision: revision,
-            didSave: didSave,
-            configurationIdentity: configurationIdentity)
-    }
-
-    func currentDrainTaskForTesting() -> Task<Void, Never>? {
-        drainTask
-    }
-
-    func currentStreamTaskForTesting() -> Task<Void, Never>? {
-        streamTask
-    }
-
-    func awaitHardDeleteReportForTesting() async {
-        await hardDeleteReportTask?.value
+        return completeSnapshotPersistence(snapshot, revision: revision, didSave: didSave)
     }
 
     func clearCachedSnapshotAndWait() async {
-        invalidateOutboxAuthority()
         snapshotPersistenceEnabled = false
         snapshotNeedsOutboxReconciliation = false
         snapshotNeedsOutboxDrain = false
-        pendingSnapshotConfigurationIdentity = nil
-        pendingAuthoritativeSnapshot = nil
-        drainGeneration &+= 1
-        drainTask?.cancel()
-        drainTask = nil
-        hydrationAuthority = .none
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
         await snapshotWriter.remove(revision: revision)
-    }
-
-    // MARK: - Sending
-
-    var canSendPersistedOutbox: Bool {
-        !isHardDeletePending
-            && authoritativeSnapshotReceipt?.configurationIdentity == api.configurationIdentity
     }
 
     // MARK: - Sending
@@ -667,7 +363,7 @@ final class ConversationSession {
     /// same idempotent delivery.
     @discardableResult
     func send(text: String, images: [ImagePayload] = []) async -> Bool {
-        guard !isHardDeleted, !isHardDeletePending else { return false }
+        guard !isHardDeleted else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
@@ -675,74 +371,54 @@ final class ConversationSession {
         }
         guard await outbox.enqueue(text: trimmed, images: images) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
-            onSessionEvent?(.errorToastChanged(lastErrorToast))
             return false
         }
         drainOutbox()
-        onSessionEvent?(.outboxChanged)
         return true
     }
 
     func retryEntry(_ localId: String) {
         outbox.retry(localId)
         drainOutbox()
-        onSessionEvent?(.outboxChanged)
     }
 
     func dismissEntry(_ localId: String) async {
         await outbox.dismiss(localId)
-        onSessionEvent?(.outboxChanged)
     }
 
     func beginArchiving() -> Bool {
         guard !isArchiving, outbox.visibleEntries.isEmpty else { return false }
-        isArchiving = true
+        setCloseAdmissionFenced(true)
         return true
     }
 
+    func setCloseAdmissionFenced(_ fenced: Bool) {
+        isArchiving = fenced
+        if fenced {
+            drainTask?.cancel()
+            drainTask = nil
+        }
+    }
+
     func endArchiving() {
-        isArchiving = false
+        setCloseAdmissionFenced(false)
     }
 
     /// Attempt delivery of every sendable entry, oldest first. Safe to call
     /// eagerly and repeatedly: entry-level `inFlight` guards duplicate
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
-    @discardableResult
-    func drainOutbox() -> Int? {
-        guard !isHardDeleted, deliveryTriggerAllowed() else { return nil }
-        if drainTask != nil {
-            return drainGeneration
-        }
-        drainGeneration &+= 1
-        let generation = drainGeneration
+    func drainOutbox() {
+        guard drainTask == nil, !isHardDeleted, !isArchiving, deliveryAllowed else { return }
         drainTask = Task {
-            defer {
-                if drainGeneration == generation,
-                   authoritativeSnapshotReceipt?.configurationIdentity == api.configurationIdentity,
-                   !isHardDeleted
-                {
-                    lastCompletedDrainGeneration = max(lastCompletedDrainGeneration, generation)
-                }
-                if drainGeneration == generation {
-                    drainTask = nil
-                }
-            }
+            defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
             // while a drain is already running is picked up by this pass
             // instead of waiting for the next trigger.
             while !Task.isCancelled {
                 // Never POST an entry whose durable copy is missing. This
                 // retries the persistence point on every delivery trigger.
-                let authorityGeneration = outboxAuthorityGeneration
-                let configurationIdentity = api.configurationIdentity
-                guard authoritativeSnapshotReceipt?.configurationIdentity == configurationIdentity,
-                      await outbox.prepareForDelivery(),
-                      authorityGeneration == outboxAuthorityGeneration,
-                      configurationIdentity == api.configurationIdentity,
-                      authoritativeSnapshotReceipt?.configurationIdentity == configurationIdentity,
-                      !isHardDeleted
-                else { return }
+                guard await outbox.prepareForDelivery() else { return }
                 let sendable = outbox.entries.filter {
                     $0.status == .pending && !$0.acceptedByServer
                         && !inFlight.contains($0.localId)
@@ -751,37 +427,27 @@ final class ConversationSession {
                 inFlight.insert(entry.localId)
                 defer { inFlight.remove(entry.localId) }
                 outbox.markAttempted(entry.localId)
-                guard authorityGeneration == outboxAuthorityGeneration,
-                      configurationIdentity == api.configurationIdentity,
-                      authoritativeSnapshotReceipt?.configurationIdentity == configurationIdentity,
-                      !isHardDeleted
-                else { return }
                 do {
                     let response = try await api.sendChat(
                         conversationId: conversationId,
                         text: entry.text,
                         images: entry.images,
                         messageId: entry.localId)
-                    guard authorityGeneration == outboxAuthorityGeneration,
-                          configurationIdentity == self.api.configurationIdentity,
-                          !isHardDeleted
-                    else { return }
+                    // A completion racing stop() (cache clear, sign-out)
+                    // must not mutate — and re-persist — the outbox after
+                    // its files were deleted.
+                    guard !Task.isCancelled else { return }
                     outbox.markAccepted(entry.localId, steering: response.steering ?? false)
                     if response.already_persisted == true {
                         await reconcileAlreadyPersisted(entry.localId)
                     }
                 } catch let error as APIError where error.isRetryableChatDeliveryFailure {
-                    guard authorityGeneration == outboxAuthorityGeneration,
-                          configurationIdentity == self.api.configurationIdentity,
-                          !isHardDeleted
-                    else { return }
+                    // Offline or unreachable: stay pending. The next drain
+                    // trigger (connectivity restore, reconnect, foreground)
+                    // retries automatically.
                     return
                 } catch {
-                    guard authorityGeneration == outboxAuthorityGeneration,
-                          configurationIdentity == self.api.configurationIdentity,
-                          !isHardDeleted,
-                          !Task.isCancelled
-                    else { return }
+                    guard !Task.isCancelled else { return }
                     outbox.markFailed(
                         entry.localId,
                         error: (error as? APIError)?.errorDescription
@@ -789,32 +455,6 @@ final class ConversationSession {
                 }
             }
         }
-        return generation
-    }
-
-    #if DEBUG
-    var latestSnapshotRevisionForTesting: Int { latestSnapshotRevision }
-
-    func currentDrainGenerationForTesting() -> Int? {
-        drainTask == nil ? nil : drainGeneration
-    }
-    #endif
-
-    func awaitDrainOutbox(generation: Int) async -> Bool {
-        if lastCompletedDrainGeneration >= generation {
-            return true
-        }
-        if generation != drainGeneration {
-            return false
-        }
-        while generation == drainGeneration {
-            guard let drainTask else { return false }
-            await drainTask.value
-            if lastCompletedDrainGeneration >= generation {
-                return true
-            }
-        }
-        return false
     }
 
     /// The action currently being executed, or nil. Views use this to
@@ -837,7 +477,6 @@ final class ConversationSession {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
-                onSessionEvent?(.errorToastChanged(lastErrorToast))
                 return
             }
         case .outboxed:
@@ -877,14 +516,12 @@ final class ConversationSession {
                 actionAttempt = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
-                onSessionEvent?(.errorToastChanged(lastErrorToast))
             }
         }
     }
 
     func clearErrorToast() {
         lastErrorToast = nil
-        onSessionEvent?(.errorToastChanged(nil))
     }
 
     // MARK: - Stream lifecycle
@@ -893,7 +530,7 @@ final class ConversationSession {
     /// ConversationSession is MainActor-isolated, so iterating and JSON-
     /// decoding a multi-megabyte init here directly would freeze input and
     /// scrolling. Only decoded events cross back to the reducer.
-    fileprivate nonisolated static func decodedEvents(
+    private nonisolated static func decodedEvents(
         from bytes: URLSession.AsyncBytes
     ) -> AsyncThrowingStream<PhoenixEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -918,144 +555,64 @@ final class ConversationSession {
         }
     }
 
-    private func streamLoop(generation: Int, apiIdentity: APIConfigurationIdentity) async {
+    private func streamLoop() async {
         retryDelay = 1
         while !Task.isCancelled {
-            guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
             if !connectivity.isOnline {
                 connection = .offline
-                onSessionEvent?(.connectionChanged(.offline))
-                return
+                // No point burning retries with no path; the connectivity
+                // observer restarts this loop the moment a path appears.
+                // Meanwhile poll slowly in case the monitor is wrong.
+                try? await Task.sleep(for: .seconds(30))
+                continue
             }
 
             connection = .connecting
-            onSessionEvent?(.connectionChanged(.connecting))
             do {
-                let events = try await openEventStream(api, conversationId)
-                guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+                let (bytes, _) = try await api.openStream(conversationId: conversationId)
                 connection = .live
-                onSessionEvent?(.connectionChanged(.live))
-                for try await event in events {
-                    guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
-                    if case .initSnapshot(let snapshot) = event,
-                       !matchesSessionBinding(snapshot.conversation)
-                    {
-                        reportMisroutedInit()
-                        break
-                    }
+                for try await event in Self.decodedEvents(from: bytes) {
+                    if Task.isCancelled { return }
                     receive(event)
                 }
-            } catch is CancellationError {
-                return
+                // Server closed the stream (e.g. broadcast lag): reconnect
+                // promptly — the next init resyncs any missed state.
             } catch let error as APIError {
-                guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+                if Task.isCancelled { return }
                 if error.isNotFound {
                     handleHardDeletion()
                     return
                 }
                 if case .certificatePinMismatch = error {
                     lastErrorToast = error.errorDescription
-                    onSessionEvent?(.errorToastChanged(lastErrorToast))
                     connection = .idle
-                    onSessionEvent?(.connectionChanged(.idle))
                     return
                 }
                 if error.isPermanentStreamAuthenticationFailure {
                     streamBlockedUntilConfigurationChange = true
                     lastErrorToast = error.errorDescription
-                    onSessionEvent?(.errorToastChanged(lastErrorToast))
                     connection = .idle
-                    onSessionEvent?(.connectionChanged(.idle))
                     return
                 }
             } catch {
-                guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+                if Task.isCancelled { return }
             }
 
-            guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
             persistSnapshot()
             let jitter = Double.random(in: 0...0.3) * retryDelay
             connection = .waitingToRetry(nextAttempt: Date().addingTimeInterval(retryDelay + jitter))
-            onSessionEvent?(.connectionChanged(connection))
-            do {
-                try await retryTiming.sleep(seconds: retryDelay + jitter)
-            } catch is CancellationError {
-                return
-            } catch {
-                return
-            }
-            guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+            try? await Task.sleep(for: .seconds(retryDelay + jitter))
             retryDelay = min(retryDelay * 2, 30)
         }
     }
 
-    private func staleCheckLoop(generation: Int, apiIdentity: APIConfigurationIdentity) async {
+    private func staleCheckLoop() async {
         while !Task.isCancelled {
-            do {
-                try await staleCheckTiming.sleep(seconds: 20)
-            } catch is CancellationError {
-                return
-            } catch {
-                return
-            }
-            guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+            try? await Task.sleep(for: .seconds(20))
             if connection == .live {
                 outbox.surfaceStaleAcceptedEntries()
             }
         }
-    }
-
-    func persistAuthoritativeRESTSegment(
-        transcriptRowId: String,
-        aggregateId: String,
-        slug: String?,
-        title: String?,
-        updatedAt: String,
-        archived: Bool,
-        presentationMode: String,
-        requiresAction: Bool,
-        segmentOrdinal: Int64,
-        handoff: ProductConversationHandoff? = nil,
-        replacingMessages: Bool = false,
-        messages incomingMessages: [Message]
-    ) {
-        let projectedConversation = Conversation(
-            id: transcriptRowId,
-            product_conversation_id: aggregateId,
-            slug: slug ?? conversation?.slug,
-            title: title ?? conversation?.title,
-            model: conversation?.model,
-            cwd: conversation?.cwd,
-            created_at: conversation?.created_at,
-            updated_at: updatedAt,
-            message_count: incomingMessages.count,
-            state: conversation?.state,
-            state_updated_at: conversation?.state_updated_at,
-            branch_name: conversation?.branch_name,
-            task_title: conversation?.task_title,
-            archived: archived,
-            project_name: conversation?.project_name,
-            conv_mode_label: conversation?.conv_mode_label,
-            presentation_mode: presentationMode,
-            requires_action: requiresAction,
-            transcript_generation: conversation?.transcript_generation,
-            runtime_role: conversation?.runtime_role)
-        guard matchesSessionBinding(projectedConversation), !isHardDeleted else { return }
-        conversation = projectedConversation
-        self.segmentOrdinal = segmentOrdinal
-        productConversationHandoff = handoff
-        let cachedMessages = replacingMessages ? [] : messages
-        let byId = Dictionary(
-            (cachedMessages + incomingMessages).map { ($0.message_id, $0) },
-            uniquingKeysWith: { _, newer in newer })
-        messages = byId.values.sorted {
-            if $0.sequence_id == $1.sequence_id { return $0.message_id < $1.message_id }
-            return $0.sequence_id < $1.sequence_id
-        }
-        durableMessageSequenceCeiling = messages.map(\.sequence_id).max() ?? 0
-        lastSequenceId = durableMessageSequenceCeiling
-        onSessionEvent?(.messagesChanged)
-        persistSnapshot(authoritative: true)
     }
 
     // MARK: - Reducer
@@ -1064,13 +621,8 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
-            guard matchesSessionBinding(snap.conversation) else {
-                reportMisroutedInit()
-                return
-            }
             retryDelay = 1
             let previousSequenceFloor = lastSequenceId
-            let previousTypedState = typedState
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
             let mustReplayFromAnchor = replayFromPendingAnchor
             replayFromPendingAnchor = false
@@ -1119,12 +671,8 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
-            onSessionEvent?(.messagesChanged)
             if let conversation {
                 onConversationUpdate?(conversation)
-                emitAggregateTopologyInvalidationIfNeeded(
-                    previousState: previousTypedState,
-                    conversation: conversation)
             }
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
@@ -1143,20 +691,6 @@ final class ConversationSession {
 
     /// Sequence-guarded application of non-init events. Events at or below
     /// the current floor were already absorbed via a snapshot — drop them.
-    private func matchesSessionBinding(_ conversation: Conversation) -> Bool {
-        conversation.id == conversationId
-            && conversation.aggregateIdentity == aggregateAuthority
-    }
-
-    private func reportMisroutedInit() {
-        let error = APIError.decoding(underlying: NSError(
-            domain: "ConversationSession",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Conversation identity does not match this session."]))
-        lastErrorToast = error.errorDescription
-        onSessionEvent?(.errorToastChanged(lastErrorToast))
-    }
-
     private func applyLive(_ event: PhoenixEvent) {
         switch event {
         case .initSnapshot:
@@ -1173,19 +707,14 @@ final class ConversationSession {
                let messageDate = message.createdAtDate,
                var conversation,
                conversation.updatedAtDate.map({ messageDate > $0 }) ?? true {
-                let previousState = typedState
                 conversation.updated_at = createdAt
                 self.conversation = conversation
                 onConversationUpdate?(conversation)
-                emitAggregateTopologyInvalidationIfNeeded(
-                    previousState: previousState,
-                    conversation: conversation)
             }
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
                 rebuildToolUseIndex()
-                onSessionEvent?(.messagesChanged)
             }
             // Snapshot before outbox prune — see the init branch.
             persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
@@ -1236,7 +765,6 @@ final class ConversationSession {
             cancelNeedsAgentDoneFallback = false
             if let mode { presentationMode = mode }
             if var conversation {
-                let previousState = typedState
                 conversation.state = state
                 if let stateUpdatedAt { conversation.state_updated_at = stateUpdatedAt }
                 if let mode {
@@ -1246,9 +774,6 @@ final class ConversationSession {
                 self.conversation = conversation
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
-                emitAggregateTopologyInvalidationIfNeeded(
-                    previousState: previousState,
-                    conversation: conversation)
             }
             clearResolvedActionIfStateAdvanced(
                 currentState: ConversationState.parse(state))
@@ -1301,7 +826,6 @@ final class ConversationSession {
                 actionAttempt = nil
             }
             if shouldMoveToIdle {
-                let previousState = typedState
                 conversation?.state = .string("idle")
                 // The mode must move with the state, or the snapshot
                 // persists idle-with-working-mode and a cold reopen seeds
@@ -1309,12 +833,7 @@ final class ConversationSession {
                 presentationMode = "idle"
                 conversation?.presentation_mode = "idle"
                 conversation?.requires_action = false
-                if let conversation {
-                    onConversationUpdate?(conversation)
-                    emitAggregateTopologyInvalidationIfNeeded(
-                        previousState: previousState,
-                        conversation: conversation)
-                }
+                if let conversation { onConversationUpdate?(conversation) }
             }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
@@ -1331,7 +850,6 @@ final class ConversationSession {
             // conversation — this event exists precisely so clients don't
             // need a reconnect to see it.
             if var conv = conversation {
-                let previousState = typedState
                 if let v = update["cwd"]?.stringValue { conv.cwd = v }
                 if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
                 if let v = update["task_title"]?.stringValue { conv.task_title = v }
@@ -1343,9 +861,6 @@ final class ConversationSession {
                 conversation = conv
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conv)
-                emitAggregateTopologyInvalidationIfNeeded(
-                    previousState: previousState,
-                    conversation: conv)
             }
 
         case .steerMessageQueued(let seq, let messageId):
@@ -1355,7 +870,6 @@ final class ConversationSession {
         case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
-            onSessionEvent?(.errorToastChanged(lastErrorToast))
             if retryable, actionAttempt?.action.waitsForAuthoritativeStateChange == true {
                 actionAttempt = nil
             }
@@ -1372,25 +886,46 @@ final class ConversationSession {
         }
     }
 
+    func markHardDeleted() {
+        handleHardDeletion()
+    }
+
     private func handleHardDeletion() {
-        guard !isHardDeleted, !isHardDeletePending else { return }
-        invalidateLiveWork()
+        guard !isHardDeleted else { return }
         streamTask?.cancel()
         streamTask = nil
         drainTask?.cancel()
         drainTask = nil
         staleCheckTask?.cancel()
         staleCheckTask = nil
-        let hardDeleteContext = HardDeleteContext(
-            conversationId: conversationId,
-            aggregateAuthority: conversation?.aggregateIdentity ?? aggregateAuthority,
-            configurationIdentity: api.configurationIdentity)
-        isHardDeletePending = true
+        if let token = connectivityToken {
+            connectivity.removePathObserver(token)
+            connectivityToken = nil
+        }
+        inFlight.removeAll()
+        isHardDeleted = true
+        conversation = nil
+        messages = []
+        durableMessageSequenceCeiling = 0
+        presentationMode = "done"
+        agentWorking = false
+        streamingText = ""
+        streamingRequestId = nil
+        pendingMessagePatches.removeAll()
+        toolUseIndex = [:]
         actionAttempt = nil
         connection = .idle
-        hardDeleteReportTask = Task { @MainActor [hardDeleteContext, onHardDeleted] in
-            await onHardDeleted(hardDeleteContext)
+        snapshotPersistenceEnabled = false
+        snapshotNeedsOutboxReconciliation = false
+        snapshotNeedsOutboxDrain = false
+        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = snapshotRemovalRevision
+        DiskStore.remove(name: snapshotName)
+        Task { [snapshotWriter] in
+            await snapshotWriter.remove(revision: snapshotRemovalRevision)
         }
+        outbox.clear()
+        onHardDeleted(conversationId)
     }
 
     private func applyIfNewer(_ seq: Int64) -> Bool {
@@ -1511,12 +1046,9 @@ final class ConversationSession {
     }
 
     private func restartStreamForResync() {
-        guard streamTask != nil, viewIsActive, !streamBlockedUntilConfigurationChange else { return }
-        invalidateLiveWork()
-        let generation = liveWorkGeneration
-        let apiIdentity = api.configurationIdentity
+        guard streamTask != nil, !streamBlockedUntilConfigurationChange else { return }
         streamTask?.cancel()
-        streamTask = Task { await streamLoop(generation: generation, apiIdentity: apiIdentity) }
+        streamTask = Task { await streamLoop() }
     }
 
     nonisolated static func reconcileTranscript(
@@ -1584,28 +1116,6 @@ final class ConversationSession {
                 ).map(\.message_id)))
     }
 
-    private func emitAggregateTopologyInvalidationIfNeeded(
-        previousState: ConversationState,
-        conversation: Conversation
-    ) {
-        let currentState = typedState
-        guard previousState != currentState else { return }
-        let reason: ProductConversationTopologyInvalidation.Reason
-        if let topologyReason = currentState.productConversationTopologyInvalidationReason {
-            reason = topologyReason
-        } else if previousState.acceptsChatMessage != currentState.acceptsChatMessage {
-            reason = .chatCapabilityChanged
-        } else {
-            return
-        }
-        onSessionEvent?(
-            .aggregateTopologyInvalidated(
-                ProductConversationTopologyInvalidation(
-                    transcriptRowId: conversation.transcriptRowIdentity,
-                    aggregateIdentity: conversation.aggregateIdentity,
-                    reason: reason)))
-    }
-
     private func rebuildToolUseIndex() {
         var index: [String: ToolUseRef] = [:]
         for message in messages where message.message_type == "agent" {
@@ -1618,7 +1128,6 @@ final class ConversationSession {
             }
         }
         toolUseIndex = index
-        onSessionEvent?(.messagesChanged)
     }
 }
 

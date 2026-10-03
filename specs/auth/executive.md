@@ -14,8 +14,8 @@ enables real-time conversation sharing for pair programming and demos.
 | REQ-AUTH-002 | Stateless Password Verification | ✅ Complete | `api/auth.rs:19` constant-time compare via `subtle`-style `constant_time_eq`; used at `:47,:58,:171` |
 | REQ-AUTH-003 | Login Flow | ✅ Complete | Login endpoint in `api/auth.rs`; cookie set on success; login page styled at `ui/src/index.css:7545` |
 | REQ-AUTH-004 | Share Token Creation | ✅ Complete | `api/handlers.rs:3346,3351,3365`; reuses existing token if present; 302 to `/s/{token}` |
-| REQ-AUTH-005 | Read-Only Share View | ✅ Complete | `api/handlers.rs:3374`; share page styled at `ui/src/index.css:7643` |
-| REQ-AUTH-006 | Share Token Exemption from Auth | ✅ Complete | `api/handlers.rs:3401`; share routes validate token instead of password; `ui/src/api.ts:811-812` `getSharedConversation` |
+| REQ-AUTH-005 | Read-Only Share View | ✅ Complete | `serve_share_page` and `SharePage`; full transcript including SVG cards uses share-scoped retrieval URLs; SharePage integration regression |
+| REQ-AUTH-006 | Share Token Exemption from Auth | ✅ Complete | Share handlers validate tokens instead of passwords; SVG preview/source/download derive owner from token and recheck revocation per request; router test covers anonymous success, cross-owner denial, revocation and protected-route 401 |
 | REQ-AUTH-007 | Multiple Simultaneous Viewers | ✅ Complete | `api/handlers.rs:3446`; SSE-validated on token, no per-viewer mutation |
 | REQ-AUTH-008 | Share Token Persistence | ✅ Complete | `share_tokens` table in `db/schema.rs:172-182`; CRUD at `db.rs:212-280` |
 

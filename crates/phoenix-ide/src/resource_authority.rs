@@ -8,6 +8,7 @@ pub(crate) struct ResolvedResourceAuthority {
     pub(crate) scope: ResourceScopeKey,
     pub(crate) authority: ResourceAuthority,
     pub(crate) actor: EffectiveResourceAccess,
+    runtime_role: RuntimeRole,
     lifecycle: Option<WorkScopeLifecycle>,
     environment: Option<EnvironmentContext>,
 }
@@ -16,12 +17,25 @@ pub(crate) struct ResolvedResourceAuthority {
 pub(crate) enum TaskApprovalAuthority {
     GitBackedActiveWorkScope,
     NotGitBacked,
+    SubAgent,
     Retired,
     Unattached,
 }
 
 impl ResolvedResourceAuthority {
+    pub(crate) fn worktree_path(&self) -> Option<&str> {
+        match &self.environment {
+            Some(EnvironmentContext::AllocatedWorktree { worktree_path, .. }) => {
+                Some(worktree_path)
+            }
+            Some(EnvironmentContext::None | EnvironmentContext::UnownedCwd { .. }) | None => None,
+        }
+    }
+
     pub(crate) fn task_approval_authority(&self) -> TaskApprovalAuthority {
+        if self.runtime_role == RuntimeRole::SubAgent {
+            return TaskApprovalAuthority::SubAgent;
+        }
         match (&self.scope, self.lifecycle, &self.environment) {
             (
                 ResourceScopeKey::Work(_),
@@ -70,7 +84,8 @@ pub(crate) async fn resolve_resource_authority(
                 ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                     ResourceAuthority::Restricted
                 }
-                ConvMode::Direct
+                ConvMode::AttachedWorkChild
+                | ConvMode::Direct
                 | ConvMode::Work { .. }
                 | ConvMode::Branch { .. }
                 | ConvMode::DetachedApprovedTask { .. } => ResourceAuthority::Work,
@@ -93,6 +108,7 @@ pub(crate) async fn resolve_resource_authority(
         scope,
         authority,
         actor,
+        runtime_role: conversation.runtime_role,
         lifecycle,
         environment,
     })
@@ -125,6 +141,7 @@ pub(crate) mod tests {
             scope: scope.clone(),
             authority: ResourceAuthority::Restricted,
             actor: actor.clone(),
+            runtime_role: RuntimeRole::User,
             lifecycle: Some(lifecycle),
             environment: Some(environment),
         };

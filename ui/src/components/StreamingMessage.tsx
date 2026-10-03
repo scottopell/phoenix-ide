@@ -1,29 +1,21 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { ConversationMarkdownTable } from './conversationMarkdownTable';
+import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_URL_TRANSFORM, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
 
 // Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
-
-type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
-
-function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
-  void node;
-  return (
-    <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
-    </div>
-  );
-}
 
 type StreamingMarkdownComponentsContext = {
   rootDir?: string | undefined;
@@ -39,14 +31,18 @@ function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMa
         filePathCopyContext={rootDir ? { rootDir } : undefined}
       />
     ),
-    table: MarkdownTable,
+    code: ({ children, node, ...props }: React.ComponentPropsWithoutRef<'code'> & { node?: unknown }) => {
+      void node;
+      return <code {...props} data-token-kind={inlineCodeTokenKind(children)}>{children}</code>;
+    },
+    table: ConversationMarkdownTable,
     img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
       <ConversationMarkdownImage
         {...props}
         src={resolveConversationMarkdownImageSrc(src, rootDir)}
       />
     ),
-  };
+  } satisfies Components;
 }
 
 const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});

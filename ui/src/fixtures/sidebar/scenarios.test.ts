@@ -7,6 +7,7 @@ describe('sidebar fixture scenarios', () => {
       'expanded-all-active',
       'expanded-project-archived',
       'expanded-empty-project',
+      'product-actions-continued',
       'collapsed-overflow',
     ]);
 
@@ -16,10 +17,22 @@ describe('sidebar fixture scenarios', () => {
     expect(sidebarFixtureData.conversations.length).toBeGreaterThan(9);
   });
 
+  it('scopes product conversation rows to the continued-actions scenario', () => {
+    expect(sidebarFixtureData.productConversations?.['product-actions-continued']).toHaveLength(1);
+    for (const scenario of sidebarScenarios.filter((item) => item.id !== 'product-actions-continued')) {
+      expect(sidebarFixtureData.productConversations?.[scenario.id] ?? []).toHaveLength(0);
+    }
+  });
+
   it('keeps every active scenario slug backed by fixture data', () => {
     const slugs = new Set([
       ...sidebarFixtureData.conversations.map((conv) => conv.slug),
       ...sidebarFixtureData.archivedConversations.map((conv) => conv.slug),
+      ...Object.values(sidebarFixtureData.productConversations ?? {}).flatMap((rows) => (rows ?? []).flatMap((row) => [
+        row.product_conversation_id,
+        row.canonical_root.slug,
+        row.latest_transcript_row_id,
+      ].filter((identity): identity is string => Boolean(identity)))),
     ]);
 
     for (const scenario of sidebarScenarios) {

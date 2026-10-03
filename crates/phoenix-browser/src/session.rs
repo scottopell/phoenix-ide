@@ -306,6 +306,73 @@ const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 // BrowserFetcher::fetch() is NOT bounded by it. Task 45001.
 const SESSION_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionInitPhase {
+    Launch,
+    FirstPage,
+    ReactHelper,
+    ConsoleListener,
+    ProfilingListener,
+}
+
+impl std::fmt::Display for SessionInitPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Launch => "browser launch",
+            Self::FirstPage => "first page creation",
+            Self::ReactHelper => "React helper installation",
+            Self::ConsoleListener => "console listener setup",
+            Self::ProfilingListener => "profiling listener setup",
+        })
+    }
+}
+
+async fn init_phase<T>(
+    phase: SessionInitPhase,
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, BrowserError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| BrowserError::InitPhaseTimeout { phase, timeout })
+}
+
+#[cfg(test)]
+mod init_phase_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn init_phase_distinguishes_success_error_and_timeout() {
+        let ok = init_phase(SessionInitPhase::FirstPage, Duration::from_secs(5), async {
+            Ok::<_, &str>(7)
+        })
+        .await
+        .expect("phase succeeds")
+        .expect("operation succeeds");
+        assert_eq!(ok, 7);
+
+        let operation_error = init_phase(SessionInitPhase::Launch, Duration::from_secs(5), async {
+            Err::<(), _>("launch rejected")
+        })
+        .await
+        .expect("phase does not time out")
+        .expect_err("operation error preserved");
+        assert_eq!(operation_error, "launch rejected");
+
+        let timed_out = init_phase(
+            SessionInitPhase::ReactHelper,
+            Duration::ZERO,
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("pending phase times out");
+        assert!(
+            matches!(timed_out, BrowserError::InitPhaseTimeout { phase: SessionInitPhase::ReactHelper, timeout } if timeout == Duration::ZERO)
+        );
+        assert!(timed_out.to_string().contains("React helper installation"));
+    }
+}
+
 /// Default viewport dimensions
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
@@ -332,6 +399,12 @@ pub enum BrowserError {
 
     #[error("Browser session init timed out after {0:?}")]
     InitTimeout(Duration),
+
+    #[error("Browser session {phase} timed out after {timeout:?}")]
+    InitPhaseTimeout {
+        phase: SessionInitPhase,
+        timeout: Duration,
+    },
 
     #[error("browser session access denied for this actor")]
     AccessDenied,
@@ -577,6 +650,7 @@ pub struct BrowserSession {
     /// the last viewer drops, the broker drops, and `Page.stopScreencast`
     /// fires automatically.
     screencast: Arc<tokio::sync::Mutex<std::sync::Weak<crate::screencast::ScreencastBroker>>>,
+    screencast_lifecycle: Arc<crate::screencast::ScreencastLifecycle>,
 }
 
 /// Maximum bytes stored per console arg in the capture buffer.
@@ -735,6 +809,34 @@ impl BrowserSession {
             .map_err(|e| BrowserError::LaunchFailed(e.clone()))
     }
 
+    async fn first_page(
+        browser: &mut Browser,
+        handler_task: &JoinHandle<()>,
+        user_data_dir: &Path,
+    ) -> Result<Page, BrowserError> {
+        match init_phase(
+            SessionInitPhase::FirstPage,
+            SESSION_INIT_TIMEOUT,
+            browser.new_page("about:blank"),
+        )
+        .await
+        {
+            Ok(Ok(page)) => Ok(page),
+            Ok(Err(error)) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(user_data_dir);
+                Err(BrowserError::LaunchFailed(error.to_string()))
+            }
+            Err(error) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(user_data_dir);
+                Err(error)
+            }
+        }
+    }
+
     /// Launch browser and create a session
     async fn launch_and_init(
         tmp_root: &Path,
@@ -758,18 +860,23 @@ impl BrowserSession {
 
         // Browser::launch can hang on a wedged chromium subprocess. Bound it.
         // If launch itself times out there is no browser handle to clean up.
-        let (mut browser, mut handler) =
-            match tokio::time::timeout(SESSION_INIT_TIMEOUT, Browser::launch(config)).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    cleanup_unmarked_profile();
-                    return Err(BrowserError::LaunchFailed(e.to_string()));
-                }
-                Err(_) => {
-                    cleanup_unmarked_profile();
-                    return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT));
-                }
-            };
+        let (mut browser, mut handler) = match init_phase(
+            SessionInitPhase::Launch,
+            SESSION_INIT_TIMEOUT,
+            Browser::launch(config),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                cleanup_unmarked_profile();
+                return Err(BrowserError::LaunchFailed(e.to_string()));
+            }
+            Err(error) => {
+                cleanup_unmarked_profile();
+                return Err(error);
+            }
+        };
         let chrome_pid = browser
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
@@ -800,26 +907,7 @@ impl BrowserSession {
             }
         });
 
-        // new_page can hang on a wedged CDP socket after launch. Bound it, and
-        // on timeout/error kill the chromium we already launched so the failure
-        // path doesn't orphan a process behind the returned error.
-        let page = match tokio::time::timeout(SESSION_INIT_TIMEOUT, browser.new_page("about:blank"))
-            .await
-        {
-            Ok(Ok(page)) => page,
-            Ok(Err(e)) => {
-                handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-                return Err(BrowserError::LaunchFailed(e.to_string()));
-            }
-            Err(_) => {
-                handler_task.abort();
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-                return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT));
-            }
-        };
+        let page = Self::first_page(&mut browser, &handler_task, &user_data_dir).await?;
 
         // Auto-inject the __phoenix React helper into every future document.
         // Runs before page JS, so React registers its fiber roots into our hook
@@ -830,10 +918,16 @@ impl BrowserSession {
             chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
                 crate::react::PHOENIX_REACT_HELPER_SCRIPT.to_string(),
             );
-        match tokio::time::timeout(SESSION_INIT_TIMEOUT, page.execute(inject_params)).await {
+        match init_phase(
+            SessionInitPhase::ReactHelper,
+            SESSION_INIT_TIMEOUT,
+            page.execute(inject_params),
+        )
+        .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::warn!("Failed to auto-inject React helper: {e}"),
-            Err(_) => tracing::warn!("Auto-inject React helper timed out"),
+            Err(error) => tracing::warn!(%error, "Auto-inject React helper timed out"),
         }
 
         Ok(Self {
@@ -851,6 +945,7 @@ impl BrowserSession {
             console_event: Arc::new(tokio::sync::Notify::new()),
             last_activity: Instant::now(),
             screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+            screencast_lifecycle: Arc::new(crate::screencast::ScreencastLifecycle::default()),
         })
     }
 
@@ -980,7 +1075,11 @@ impl BrowserSession {
         }
         // No live broker — create one. The first attach pays the screencast
         // start-up cost; subsequent attaches share the same broker.
-        let broker = crate::screencast::ScreencastBroker::start(self.page.clone()).await?;
+        let broker = crate::screencast::ScreencastBroker::start(
+            self.page.clone(),
+            Arc::clone(&self.screencast_lifecycle),
+        )
+        .await?;
         *slot = Arc::downgrade(&broker);
         let (rx, url) = broker.subscribe().await;
         Ok((broker, rx, url))
@@ -1470,6 +1569,7 @@ struct ScopedSession {
     authority: ResourceAuthority,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
+    destination_retirement_generation: u64,
     current_kill: std::sync::Mutex<Option<Arc<KillAttempt>>>,
     teardown_failed: Arc<AtomicBool>,
 }
@@ -1583,6 +1683,78 @@ impl BrowserSessionManager {
         manager
     }
 
+    /// Promote a restricted actor's existing session to the shared `WorkScope` key.
+    ///
+    /// Returns `true` when a live entry moved. If the destination is already
+    /// occupied, the restricted entry is left unchanged.
+    pub async fn promote_actor_to_work_scope(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor_conversation_id: &str,
+    ) -> bool {
+        let restricted =
+            EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let work = EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Work);
+        let old_key = session_key(work_scope, &restricted);
+        let new_key = work_scope.stable_key();
+        let mut state = self.state.write().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &restricted).is_some()
+            || Self::actor_is_fenced(&state, work_scope, &work).is_some()
+        {
+            return false;
+        }
+        if state.sessions.contains_key(&new_key) {
+            return false;
+        }
+        let Some(entry) = state.sessions.get(&old_key) else {
+            return false;
+        };
+        if !Self::destination_generation_is_current(
+            &state,
+            &new_key,
+            entry.destination_retirement_generation,
+        ) {
+            return false;
+        }
+        if entry
+            .current_kill
+            .lock()
+            .is_ok_and(|current| current.is_some())
+        {
+            return false;
+        }
+        let Some(mut entry) = state.sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.authority = ResourceAuthority::Work;
+        state.sessions.insert(new_key, entry);
+        true
+    }
+
+    /// Revert a prior actor-to-WorkScope promotion when the caller cannot
+    /// complete the authority transition.
+    pub async fn demote_work_scope_to_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor_conversation_id: &str,
+    ) -> bool {
+        let restricted =
+            EffectiveResourceAccess::new(actor_conversation_id, ResourceAuthority::Restricted);
+        let old_key = work_scope.stable_key();
+        let new_key = session_key(work_scope, &restricted);
+        let mut state = self.state.write().await;
+        if state.sessions.contains_key(&new_key) {
+            return false;
+        }
+        let Some(mut entry) = state.sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.authority = ResourceAuthority::Restricted;
+        state.sessions.insert(new_key, entry);
+        true
+    }
+
     /// Install the predicate that gates idle reaping on `ResourceScopeKey` liveness.
     ///
     /// Set-once: a second call is a no-op (returns the supplied hook unused via
@@ -1689,6 +1861,44 @@ impl BrowserSessionManager {
         retirement.generation = retirement.generation.wrapping_add(1);
         retirement.fenced = true;
         BrowserRetirementGeneration(retirement.generation)
+    }
+
+    fn retirement_generation(
+        state: &BrowserSessionRegistryState,
+        key: &BrowserRetirementFenceKey,
+    ) -> u64 {
+        state
+            .retirements
+            .get(key)
+            .map_or(0, |retirement| retirement.generation)
+    }
+
+    fn destination_generation_is_current(
+        state: &BrowserSessionRegistryState,
+        destination_key: &str,
+        observed_generation: u64,
+    ) -> bool {
+        observed_generation
+            == Self::retirement_generation(
+                state,
+                &BrowserRetirementFenceKey::Session(destination_key.to_string()),
+            )
+    }
+
+    fn destination_generation(
+        state: &BrowserSessionRegistryState,
+        work_scope: &ResourceScopeKey,
+    ) -> u64 {
+        Self::retirement_generation(
+            state,
+            &BrowserRetirementFenceKey::Session(work_scope.stable_key()),
+        )
+    }
+
+    fn reopen_retirement(state: &mut BrowserSessionRegistryState, key: &BrowserRetirementFenceKey) {
+        if let Some(retirement) = state.retirements.get_mut(key) {
+            retirement.fenced = false;
+        }
     }
 
     fn permit_fence_key(permit: &BrowserRetirementPermit) -> BrowserRetirementFenceKey {
@@ -1821,7 +2031,8 @@ impl BrowserSessionManager {
     }
 
     async fn setup_session_listeners(session: Arc<RwLock<BrowserSession>>) {
-        match tokio::time::timeout(
+        match init_phase(
+            SessionInitPhase::ConsoleListener,
             SESSION_INIT_TIMEOUT,
             BrowserSession::setup_console_listener(session.clone()),
         )
@@ -1829,9 +2040,10 @@ impl BrowserSessionManager {
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "Failed to set up console listener"),
-            Err(_) => tracing::warn!("console listener setup timed out"),
+            Err(error) => tracing::warn!(%error, "console listener setup timed out"),
         }
-        match tokio::time::timeout(
+        match init_phase(
+            SessionInitPhase::ProfilingListener,
             SESSION_INIT_TIMEOUT,
             BrowserSession::setup_profiling_listener(session),
         )
@@ -1839,7 +2051,7 @@ impl BrowserSessionManager {
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "Failed to set up profiling listener"),
-            Err(_) => tracing::warn!("profiling listener setup timed out"),
+            Err(error) => tracing::warn!(%error, "profiling listener setup timed out"),
         }
     }
 
@@ -1926,6 +2138,7 @@ impl BrowserSessionManager {
 
         Self::setup_session_listeners(session_arc.clone()).await;
 
+        let destination_retirement_generation = Self::destination_generation(&state, work_scope);
         state.sessions.insert(
             key.clone(),
             ScopedSession {
@@ -1934,6 +2147,7 @@ impl BrowserSessionManager {
                 authority: actor.authority(),
                 session: session_arc.clone(),
                 user_data_key: key.clone(),
+                destination_retirement_generation,
                 current_kill: std::sync::Mutex::new(None),
                 teardown_failed: Arc::new(AtomicBool::new(false)),
             },
@@ -2553,15 +2767,13 @@ impl BrowserSessionManager {
         if state.retirements.get(&key).is_some_and(|retirement| {
             retirement.fenced && retirement.generation == permit.generation.get()
         }) {
-            state.retirements.remove(&key);
+            Self::reopen_retirement(&mut state, &key);
         }
     }
 
     pub async fn reopen_after_repair(&self, work_scope: &ResourceScopeKey) {
         let mut state = self.state.write().await;
-        state
-            .retirements
-            .remove(&Self::scope_retirement_fence_key(work_scope));
+        Self::reopen_retirement(&mut state, &Self::scope_retirement_fence_key(work_scope));
     }
 
     pub async fn reopen_after_repair_for_actor(
@@ -2570,9 +2782,10 @@ impl BrowserSessionManager {
         actor: &EffectiveResourceAccess,
     ) {
         let mut state = self.state.write().await;
-        state
-            .retirements
-            .remove(&Self::actor_retirement_fence_key(work_scope, actor));
+        Self::reopen_retirement(
+            &mut state,
+            &Self::actor_retirement_fence_key(work_scope, actor),
+        );
     }
 
     pub async fn request_kill_session_for_actor(
@@ -3224,6 +3437,46 @@ mod lifecycle_hook_tests {
         assert!(matches!(
             manager.get_session(&scope).await,
             Err(super::BrowserError::RetirementFenced { work_scope }) if work_scope == scope
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_destination_retirement_rejects_preexisting_promotion_generation() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-destination-retirement-generation");
+        let work_actor = EffectiveResourceAccess::new("owner", ResourceAuthority::Work);
+        let destination_key = super::session_key(&scope, &work_actor);
+        let preexisting_generation = {
+            let state = manager.state.read().await;
+            BrowserSessionManager::retirement_generation(
+                &state,
+                &super::BrowserRetirementFenceKey::Session(destination_key.clone()),
+            )
+        };
+
+        let permit = manager
+            .begin_retirement_for_actor(&scope, &work_actor)
+            .await;
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::AbsenceVerified
+        );
+        manager.reopen_after_permit(permit).await;
+
+        let state = manager.state.read().await;
+        assert!(!BrowserSessionManager::destination_generation_is_current(
+            &state,
+            &destination_key,
+            preexisting_generation,
+        ));
+        let current_generation = BrowserSessionManager::retirement_generation(
+            &state,
+            &super::BrowserRetirementFenceKey::Session(destination_key.clone()),
+        );
+        assert!(BrowserSessionManager::destination_generation_is_current(
+            &state,
+            &destination_key,
+            current_generation,
         ));
     }
 

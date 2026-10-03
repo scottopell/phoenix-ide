@@ -90,8 +90,14 @@ impl ContinuationHistory {
         let accepted = accepted_message_id
             .and_then(|id| messages.iter().find(|message| message.message_id == id));
         let handoff = if let Some(message) = accepted {
-            if !matches!(message.content, MessageContent::User(_)) {
-                return Err("Accepted continuation handoff is not a user message".to_string());
+            if !matches!(
+                message.content,
+                MessageContent::User(_) | MessageContent::Continuation(_)
+            ) {
+                return Err(
+                    "Accepted continuation handoff lacks user or generated-context authority"
+                        .to_string(),
+                );
             }
             let mut rendered =
                 render_messages(std::iter::once(message), &std::collections::HashSet::new());
@@ -117,7 +123,7 @@ impl ContinuationHistory {
             "\n\nInput selection: {baseline} The remaining history is a bounded newest suffix; \
              intervening details may be omitted. Do not infer completion or authorization from \
              omissions. Preserve this transcript reference for retrieving missing details when \
-             relevant: @conv:{conversation_id}."
+             relevant: @transcript:{conversation_id}."
         )
     }
 }
@@ -171,6 +177,7 @@ mod tests {
 
     fn user(text: &str) -> LlmMessage {
         LlmMessage {
+            source_message_id: None,
             role: MessageRole::User,
             content: vec![ContentBlock::text(text)],
         }
@@ -178,6 +185,7 @@ mod tests {
 
     fn persisted(id: &str, text: &str) -> Message {
         Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: id.to_string(),
             conversation_id: "current".to_string(),
             sequence_id: 1,
@@ -228,8 +236,30 @@ mod tests {
         )
         .unwrap();
         let handoff = history.handoff.unwrap();
-        assert_eq!(handoff.message.content, user("edited").content);
+        assert_eq!(
+            handoff.message.content,
+            user("[Input of unknown historical origin]\nedited").content
+        );
         assert_eq!(handoff.message_id, "accepted");
+    }
+
+    #[test]
+    fn typed_generated_handoff_remains_protected_for_later_compaction() {
+        let mut generated = persisted("generated", "ignored");
+        generated.message_type = MessageType::Continuation;
+        generated.content = MessageContent::Continuation(crate::db::ContinuationContent {
+            summary: "authority-wrapped generated context".to_string(),
+        });
+        let history =
+            ContinuationHistory::from_projection(&[generated], Some("generated")).unwrap();
+        let handoff = history.handoff.unwrap();
+        let [phoenix_core::domain::llm_types::ContentBlock::Text { text }] =
+            handoff.message.content.as_slice()
+        else {
+            panic!("expected one protected generated-context text block");
+        };
+        assert!(text.contains("generated predecessor context"));
+        assert!(!text.contains("authority-wrapped generated context"));
     }
 
     #[test]
@@ -267,6 +297,7 @@ mod tests {
     #[test]
     fn assistant_work_after_opening_handoff_is_not_discarded() {
         let assistant = LlmMessage {
+            source_message_id: None,
             role: MessageRole::Assistant,
             content: vec![ContentBlock::text(
                 "Implemented the fix; tests passed; review is pending.",

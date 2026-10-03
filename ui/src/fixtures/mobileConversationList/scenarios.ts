@@ -1,9 +1,10 @@
-import type { Conversation, ConversationState, PrDisplayState } from '../../api';
+import type { Conversation, ConversationState, PrDisplayState, ProductConversationListRow } from '../../api';
 import { mobileConversationListScenarioDefinitions } from './types';
 import type { MobileConversationListFixtureData, MobileConversationListScenario } from './types';
 
 const now = Date.parse('2026-06-23T12:00:00Z');
 const isoAgo = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+const liveIsoAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
 function state(type: ConversationState['type']): ConversationState {
   switch (type) {
@@ -231,6 +232,38 @@ const namingContextConversations: Conversation[] = [
   }),
 ];
 
+const productConversations: ProductConversationListRow[] = [
+  {
+    product_conversation_id: 'mobile-product-open',
+    canonical_route: '/product-conversations/mobile-product-open',
+    canonical_root: {
+      transcript_row_id: 'mobile-product-open-root',
+      slug: 'mobile-product-open',
+      title: 'Qualify ProductConversation aggregate actions on a narrow mobile viewport',
+    },
+    lifecycle: { state: 'open', close_action: { availability: 'available' } },
+    latest_transcript_row_id: 'mobile-product-open-current',
+    updated_at: liveIsoAgo(3),
+    presentation: { kind: 'state', display_name: 'Qualify ProductConversation aggregate actions on a narrow mobile viewport', presentation_mode: 'working' },
+  },
+];
+
+const archivedProductConversations: ProductConversationListRow[] = [
+  {
+    product_conversation_id: 'mobile-product-history',
+    canonical_route: '/product-conversations/mobile-product-history',
+    canonical_root: {
+      transcript_row_id: 'mobile-product-history-root',
+      slug: 'mobile-product-history',
+      title: 'Completed aggregate retained in History',
+    },
+    lifecycle: { state: 'history' },
+    latest_transcript_row_id: 'mobile-product-history-current',
+    updated_at: liveIsoAgo(320),
+    presentation: { kind: 'state', display_name: 'Completed aggregate retained in History', presentation_mode: 'done' },
+  },
+];
+
 const archivedConversations: Conversation[] = [
   conv('archived-merged', 'archived-mobile-work', {
     archived: true,
@@ -268,6 +301,12 @@ const fixtureDataByDataset: Record<MobileConversationListScenario['dataset'], Mo
   'naming-context': {
     conversations: namingContextConversations,
     archivedConversations,
+  },
+  'product-conversations': {
+    conversations: [],
+    archivedConversations: [],
+    productConversations,
+    archivedProductConversations,
   },
   archived: {
     conversations: overviewConversations,

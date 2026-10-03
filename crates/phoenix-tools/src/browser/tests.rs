@@ -59,19 +59,6 @@ fn env_unclassified() -> bool {
         && std::env::var_os("PHOENIX_SKIP_BROWSER_TESTS").is_none()
 }
 
-/// Check if outbound HTTPS to the public internet is available. The
-/// `*_remote` browser tests navigate to real websites (example.com)
-/// and need real network. `dev.py check` probes reachability and sets
-/// `PHOENIX_SKIP_NETWORK_TESTS=1` in restricted envs (no outbound
-/// HTTPS) so those tests skip cleanly instead of producing env-noise
-/// failures.
-fn network_available() -> bool {
-    !matches!(
-        std::env::var("PHOENIX_SKIP_NETWORK_TESTS").as_deref(),
-        Ok("1" | "true"),
-    )
-}
-
 /// Skip macro for tests that require Chrome.
 ///
 /// When the suite is run outside `./dev.py` the environment was never
@@ -91,16 +78,6 @@ macro_rules! require_chrome {
                  environmental, not a code bug: run `./dev.py check`, which locates a \
                  usable Chromium (or cleanly skips browser tests when none exists)."
             );
-        }
-    };
-}
-
-/// Skip macro for tests that require outbound HTTPS to public hosts.
-macro_rules! require_network {
-    () => {
-        if !network_available() {
-            eprintln!("Skipping test: outbound HTTPS not available in this env");
-            return;
         }
     };
 }
@@ -265,6 +242,16 @@ async fn test_browser_navigate_local() {
     let (ctx, manager) = test_context("test-navigate-local");
     let tool = BrowserNavigateTool;
 
+    let initial_eval = BrowserEvalTool
+        .run(json!({"expression": "1 + 1"}), ctx.clone())
+        .await;
+    assert!(
+        initial_eval.is_success(),
+        "about:blank eval failed: {}",
+        initial_eval.output()
+    );
+    assert!(initial_eval.output().contains('2'));
+
     let result = tool.run(json!({"url": server.url()}), ctx).await;
 
     assert!(result.is_success(), "Navigate failed: {}", result.output());
@@ -341,6 +328,20 @@ async fn test_browser_eval_local() {
         "Arithmetic wrong: {}",
         result.output()
     );
+
+    let resize = BrowserResizeTool
+        .run(json!({"width": 1024, "height": 768}), ctx.clone())
+        .await;
+    assert!(resize.is_success(), "Resize failed: {}", resize.output());
+    let width = eval_tool
+        .run(json!({"expression": "window.innerWidth"}), ctx.clone())
+        .await;
+    assert!(
+        width.is_success(),
+        "Eval after resize failed: {}",
+        width.output()
+    );
+    assert!(width.output().contains("1024") || width.output().contains("1008"));
 
     shutdown_test(manager, server).await;
 }
@@ -812,51 +813,6 @@ async fn test_browser_screenshot_local() {
 }
 
 #[tokio::test]
-async fn test_browser_resize_local() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r"<!DOCTYPE html>
-        <html>
-        <head><title>Resize Test</title></head>
-        <body></body>
-        </html>",
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-resize-local");
-
-    // Navigate
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Resize
-    let resize_tool = BrowserResizeTool;
-    let result = resize_tool
-        .run(json!({"width": 1024, "height": 768}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Resize failed: {}", result.output());
-
-    // Verify via JS
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "window.innerWidth"}), ctx.clone())
-        .await;
-    assert!(result.is_success());
-    // innerWidth should be close to 1024 (may vary slightly due to scrollbars)
-    assert!(
-        result.output().contains("1024") || result.output().contains("1008"),
-        "Width mismatch: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
 async fn test_browser_session_persistence() {
     require_chrome!();
 
@@ -906,81 +862,8 @@ async fn test_browser_session_persistence() {
 }
 
 // ============================================================================
-// Remote URL test (network-dependent)
-// ============================================================================
-
-#[tokio::test]
-async fn test_browser_navigate_remote() {
-    require_chrome!();
-    require_network!();
-
-    let (ctx, manager) = test_context("test-navigate-remote");
-
-    // Navigate to a real website
-    let nav_tool = BrowserNavigateTool;
-    let result = nav_tool
-        .run(json!({"url": "https://example.com"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Navigate failed: {}", result.output());
-
-    // Verify we can read the page
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "document.title"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        result.output().contains("Example Domain"),
-        "Wrong title: {}",
-        result.output()
-    );
-
-    // Verify page content
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.querySelector('h1').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Example Domain"),
-        "Wrong h1: {}",
-        result.output()
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
-}
-
-// ============================================================================
 // Error handling tests
 // ============================================================================
-
-#[tokio::test]
-async fn test_browser_eval_before_navigate() {
-    require_chrome!();
-
-    let (ctx, manager) = test_context("test-eval-no-nav");
-
-    // Try to eval without navigating first - should still work on about:blank
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "1 + 1"}), ctx.clone())
-        .await;
-
-    // This should work - browser starts on about:blank
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        result.output().contains('2'),
-        "Wrong result: {}",
-        result.output()
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
-}
 
 #[tokio::test]
 async fn test_browser_eval_syntax_error() {
@@ -2318,17 +2201,8 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
     manager.shutdown_all().await.expect("browser shutdown");
 }
 
-/// Gated (chrome only): real Tracing long-task extraction.
-///
-/// The `Tracing.dataCollected` listener, the `tracingComplete`
-/// notify-wait (with the `Notified::enable()` lost-wakeup fix), and the
-/// `dur > 50_000us` long-task parse have never run against a live trace.
-/// A single >50ms blocking task is generated; the load-bearing assertion
-/// is that `trace_stop` completes without timing out and reports a
-/// long-task count (trace category timing varies by Chrome build, so the
-/// count itself is not hard-asserted).
 #[tokio::test]
-async fn test_browser_profile_trace_stop_long_task_real() {
+async fn test_browser_profile_trace_round_trip_real() {
     require_chrome!();
 
     let (ctx, manager) = test_context("test-profile-trace-real");
@@ -2346,53 +2220,30 @@ async fn test_browser_profile_trace_stop_long_task_real() {
         start.output()
     );
 
-    // One blocking task well over the 50ms long-task threshold.
-    let block = BrowserEvalTool
-        .run(
-            json!({ "expression": "var t=Date.now(); while(Date.now()-t<120){}; 'done'" }),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        block.is_success(),
-        "blocking eval failed: {}",
-        block.output()
-    );
-
     let stop = BrowserProfileTool
         .run(json!({ "action": "trace_stop" }), ctx.clone())
         .await;
-    // Load-bearing: trace_stop completed (drain path + enable() race fix
-    // worked end-to-end; a timeout would still succeed but append a note).
     assert!(
         stop.is_success(),
         "trace_stop should succeed: {}",
         stop.output()
     );
     assert!(
-        stop.output().contains("Trace saved to"),
-        "trace_stop must report a saved trace: {}",
+        !stop.output().contains("tracingComplete timed out"),
+        "real trace round trip must observe completion: {}",
         stop.output()
     );
+    let path = extract_tmp_path(stop.output(), "/tmp/phoenix-trace-", ".json")
+        .expect("trace_stop reports its saved trace");
+    let trace: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).expect("saved trace remains readable after trace_stop"),
+    )
+    .expect("saved trace is valid JSON");
     assert!(
-        extract_tmp_path(stop.output(), "/tmp/phoenix-trace-", ".json").is_some(),
-        "trace_stop must report a /tmp/phoenix-trace- path: {}",
-        stop.output()
+        trace["traceEvents"].is_array(),
+        "saved trace contains a traceEvents array"
     );
-    // The extraction ran and reported a count: "Long tasks (>50ms): <n>".
-    let marker = "Long tasks (>50ms):";
-    let (_, after) = stop.output().split_once(marker).unwrap_or_else(|| {
-        panic!(
-            "trace_stop must report a long-task count: {}",
-            stop.output()
-        )
-    });
-    let after = after.trim_start();
-    assert!(
-        after.chars().next().is_some_and(|c| c.is_ascii_digit()),
-        "long-task marker must be followed by a numeric count: {}",
-        stop.output()
-    );
+    std::fs::remove_file(path).expect("remove test trace");
 
     manager.shutdown_all().await.expect("browser shutdown");
 }

@@ -852,6 +852,7 @@ fn steer_entry_to_drain_message(
     };
     crate::effect::SteeringDrainMessage {
         content,
+        origin: entry.origin.clone(),
         display_data,
         usage_data,
         message_id,
@@ -1134,8 +1135,8 @@ fn handle_core_cancellation(
                 cause,
                 spawn_tool_id: spawn_tool_id.clone(),
             })
-            .with_effect(Effect::CancelSubAgents { ids })
-            .with_effect(Effect::PersistState))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::CancelSubAgents { ids, cause }))
         }
 
         // ToolExecuting + UserCancel -> CancellingTool
@@ -1147,10 +1148,11 @@ fn handle_core_cancellation(
                 pending_sub_agents,
                 assistant_message,
             },
-            CoreEvent::UserCancel { .. },
+            CoreEvent::UserCancel { cause, .. },
         ) => {
             let mut result = CoreTransitionResult::new(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
+                cause,
                 skipped_tools: remaining_tools.clone(),
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
@@ -1166,7 +1168,7 @@ fn handle_core_cancellation(
                     .iter()
                     .map(|p| p.agent_id.clone())
                     .collect();
-                result = result.with_effect(Effect::CancelSubAgents { ids });
+                result = result.with_effect(Effect::CancelSubAgents { ids, cause });
             }
 
             Ok(result)
@@ -1184,6 +1186,7 @@ fn handle_core_cancellation(
         (
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1212,7 +1215,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
-                    cause: CancelCause::UserRequested,
+                    cause: *cause,
                     spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1224,6 +1227,7 @@ fn handle_core_cancellation(
         (
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1253,7 +1257,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
-                    cause: CancelCause::UserRequested,
+                    cause: *cause,
                     spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1265,6 +1269,7 @@ fn handle_core_cancellation(
         (
             CoreState::CancellingTool {
                 tool_use_id,
+                cause,
                 skipped_tools,
                 completed_results,
                 assistant_message,
@@ -1279,6 +1284,7 @@ fn handle_core_cancellation(
                 .collect();
             Ok(CoreTransitionResult::new(CoreState::CancellingTool {
                 tool_use_id: tool_use_id.clone(),
+                cause: *cause,
                 skipped_tools: skipped_tools.clone(),
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
@@ -1731,6 +1737,7 @@ fn creation_provisioned_transition(
             | Effect::ApproveTaskFreshHandoff { .. }
             | Effect::PersistForkProposal { .. }
             | Effect::ResolveTask { .. }
+            | Effect::PersistUserInputMessage { .. }
             | Effect::CommitSteeringDrain { .. } => {}
         }
     }
@@ -1825,7 +1832,6 @@ pub fn transition_parent(
                     priority: *priority,
                     plan: plan.clone(),
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
@@ -1885,12 +1891,9 @@ pub fn transition_parent(
                     message_id: uuid::Uuid::new_v4().to_string(),
                     idempotent: false,
                 })
-                .with_effect(Effect::PersistMessage {
+                .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
-                    display_data: None,
-                    usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -1983,12 +1986,9 @@ pub fn transition_parent(
                 ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
                     attempt: 1,
                 }))
-                .with_effect(Effect::PersistMessage {
+                .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    display_data: None,
-                    usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -2198,6 +2198,7 @@ pub fn transition_parent(
                         | ToolInput::Patch(_)
                         | ToolInput::KeywordSearch(_)
                         | ToolInput::ReadImage(_)
+                        | ToolInput::PresentSvg(_)
                         | ToolInput::SpawnAgents(_)
                         | ToolInput::SubmitResult(_)
                         | ToolInput::SubmitError(_)
@@ -2438,6 +2439,7 @@ pub fn transition_parent(
                 | ToolInput::Patch(_)
                 | ToolInput::KeywordSearch(_)
                 | ToolInput::ReadImage(_)
+                | ToolInput::PresentSvg(_)
                 | ToolInput::SpawnAgents(_)
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
@@ -2813,6 +2815,27 @@ pub fn transition_sub_agent(
         // ============================================================
         // Terminal state absorption (Completed / Failed)
         // ============================================================
+        (
+            SubAgentState::Core(CoreState::Idle),
+            SubAgentEvent::SubAgent(SubAgentOnlyEvent::PersistedBootstrap),
+        ) => Ok(
+            SubAgentTransitionResult::new(SubAgentState::Core(CoreState::LlmRequesting {
+                attempt: 1,
+            }))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+            .with_effect(Effect::RequestLlm),
+        ),
+        (_, SubAgentEvent::SubAgent(SubAgentOnlyEvent::PersistedBootstrap)) => {
+            Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "PersistedSubAgentBootstrap",
+            })
+        }
+
+        // ============================================================
+        // Terminal state absorption (Completed / Failed)
+        // ============================================================
         (SubAgentState::Completed { .. } | SubAgentState::Failed { .. }, _event) => {
             Ok(SubAgentTransitionResult::new(state.clone()))
         }
@@ -2828,7 +2851,7 @@ pub fn transition_sub_agent(
         })
         .with_effect(Effect::PersistState)
         .with_effect(Effect::NotifyParent {
-            outcome: SubAgentOutcome::Success { result: text },
+            outcome: SubAgentOutcome::ImplicitCompletion { result: text },
         })),
 
         (
@@ -2870,10 +2893,11 @@ pub fn transition_sub_agent(
                 assistant_message,
                 pending_sub_agents,
             }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, cause }),
         ) => Ok(
             SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
+                cause,
                 skipped_tools: remaining_tools.clone(),
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
@@ -2896,7 +2920,9 @@ pub fn transition_sub_agent(
         // being cancelled, not checkpointed. Guarded on id match so a stale
         // outcome for a different tool_use does not settle the wrong round.
         (
-            SubAgentState::Core(CoreState::CancellingTool { tool_use_id, .. }),
+            SubAgentState::Core(CoreState::CancellingTool {
+                tool_use_id, cause, ..
+            }),
             SubAgentEvent::Core(
                 CoreEvent::ToolAborted {
                     tool_use_id: settled_id,
@@ -2907,18 +2933,29 @@ pub fn transition_sub_agent(
                 },
             ),
         ) if *tool_use_id == settled_id => {
-            let error = "Cancelled by parent".to_string();
-            Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
-                error: error.clone(),
-                error_kind: ErrorKind::Cancelled,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyParent {
-                outcome: SubAgentOutcome::Failure {
-                    error,
-                    error_kind: ErrorKind::Cancelled,
-                },
-            }))
+            let (error, error_kind, outcome) = match cause {
+                CancelCause::Timeout => (
+                    "Sub-agent timed out".to_string(),
+                    ErrorKind::TimedOut,
+                    SubAgentOutcome::TimedOut,
+                ),
+                CancelCause::UserRequested => {
+                    let error = "Cancelled by parent".to_string();
+                    (
+                        error.clone(),
+                        ErrorKind::Cancelled,
+                        SubAgentOutcome::Failure {
+                            error,
+                            error_kind: ErrorKind::Cancelled,
+                        },
+                    )
+                }
+            };
+            Ok(
+                SubAgentTransitionResult::new(SubAgentState::Failed { error, error_kind })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::NotifyParent { outcome }),
+            )
         }
 
         // ============================================================
@@ -2938,7 +2975,18 @@ pub fn transition_sub_agent(
         // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
-        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason, .. })) => {
+        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason, cause })) => {
+            if cause == CancelCause::Timeout {
+                return Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
+                    error: "Sub-agent timed out".to_string(),
+                    error_kind: ErrorKind::TimedOut,
+                })
+                .with_effect(Effect::AbortLlm)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::NotifyParent {
+                    outcome: SubAgentOutcome::TimedOut,
+                }));
+            }
             let error = reason
                 .clone()
                 .unwrap_or_else(|| "Cancelled by parent".to_string());
@@ -2946,6 +2994,7 @@ pub fn transition_sub_agent(
                 error: error.clone(),
                 error_kind: ErrorKind::Cancelled,
             })
+            .with_effect(Effect::AbortLlm)
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
                 outcome: SubAgentOutcome::Failure {
@@ -3116,6 +3165,7 @@ pub fn transition_sub_agent(
                     | ToolInput::Patch(_)
                     | ToolInput::KeywordSearch(_)
                     | ToolInput::ReadImage(_)
+                    | ToolInput::PresentSvg(_)
                     | ToolInput::SpawnAgents(_)
                     | ToolInput::ProposeTask(_)
                     | ToolInput::AskUserQuestion(_)
@@ -3231,6 +3281,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             end_turn,
             usage,
             request_id,
+            provider_replay: _,
         } => Event::LlmResponse {
             content,
             tool_calls,
@@ -3615,6 +3666,40 @@ mod tests {
                 thoughts: "inspect".to_string(),
             }),
         )
+    }
+
+    #[test]
+    fn same_conversation_approval_has_one_atomic_state_owner() {
+        let state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--review.md".to_string(),
+            title: "Review".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Check the result".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            },
+        )
+        .expect("task approval transitions");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(matches!(
+            result.effects.first(),
+            Some(Effect::ApproveTask { .. })
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(matches!(result.effects.last(), Some(Effect::RequestLlm)));
     }
 
     #[test]
@@ -4226,6 +4311,7 @@ mod tests {
     fn authoritative_user_message_persists_distinct_effect_with_authority() {
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "Hello".to_string(),
                 images: vec![],
                 files: vec![],
@@ -4300,6 +4386,7 @@ mod tests {
             lease_until: 100,
         };
         let message = phoenix_core::domain::sm_event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: "Hello".to_string(),
             llm_text: None,
             images: vec![],
@@ -4458,6 +4545,7 @@ mod tests {
                     lease_until: 100,
                 },
                 initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: "Hello".to_string(),
                     llm_text: None,
                     images: vec![],
@@ -4923,6 +5011,7 @@ mod tests {
         );
 
         let cancelling = ConvState::CancellingTool {
+            cause: CancelCause::UserRequested,
             tool_use_id: "sa-tool-1".to_string(),
             skipped_tools: vec![],
             completed_results: vec![],
@@ -5498,8 +5587,8 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
             is_coordinator: false,
@@ -6062,13 +6151,13 @@ mod tests {
             result.new_state
         );
 
-        // Should have PersistMessage (user answers) + PersistState + RequestLlm
+        // User answers are persisted with explicit user-input provenance.
         assert!(
             result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PersistMessage { .. })),
-            "Should have PersistMessage effect for user answers"
+                .any(|e| matches!(e, Effect::PersistUserInputMessage { .. })),
+            "Should have explicit user-input persistence effect for answers"
         );
         assert!(
             result
@@ -6451,6 +6540,7 @@ mod tests {
 
     fn mk_steer_entry(id: &str, text: &str) -> crate::event::SteerEntry {
         crate::event::SteerEntry {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             text: text.to_string(),
             llm_text: None,
             images: vec![],
@@ -7548,17 +7638,13 @@ mod teardown_tests {
         );
         assert_eq!(pending.len(), 2, "all agents stay pending until they drain");
 
-        let cancel = result
-            .effects
-            .iter()
-            .find_map(|e| {
-                if let Effect::CancelSubAgents { ids } = e {
-                    Some(ids.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("must emit Effect::CancelSubAgents");
+        assert!(matches!(
+            result.effects.as_slice(),
+            [Effect::PersistState, Effect::CancelSubAgents { .. }]
+        ));
+        let Effect::CancelSubAgents { ids: cancel, .. } = &result.effects[1] else {
+            unreachable!("effect order asserted above")
+        };
         assert_eq!(cancel.len(), 2, "cancel targets both pending agents");
 
         // The reroute must NOT directly fabricate per-agent results.

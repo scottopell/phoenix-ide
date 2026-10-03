@@ -704,6 +704,22 @@ export function buildConversationSearchProjection(
       case 'skill':
         addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageParts(unit.message));
         break;
+      case 'continuation': {
+        const summary = (unit.message.content as { summary?: string }).summary;
+        if (summary) {
+          addConversationSource(
+            sources,
+            unitIndex,
+            unit.kind,
+            unit.key,
+            'system-message',
+            summary,
+            'message-text',
+            { kind: 'message-text', fragmentId: 'message-text' },
+          );
+        }
+        break;
+      }
       case 'system':
         if (!isHiddenSystemMessage(unit.message)) {
           addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageParts(unit.message));
@@ -796,9 +812,10 @@ export function buildConversationSearchProjection(
   };
 }
 
-function subAgentOutcomeText(outcome: { type: 'success'; result?: string } | { type: 'failure'; error?: string; error_kind?: string } | { type: 'timed_out' }): string {
+function subAgentOutcomeText(outcome: { type: 'success' | 'implicit_completion'; result?: string } | { type: 'failure'; error?: string; error_kind?: string } | { type: 'timed_out' }): string {
   switch (outcome.type) {
     case 'success': return outcome.result ?? 'success';
+    case 'implicit_completion': return outcome.result ?? 'completed';
     case 'failure': return outcome.error ?? outcome.error_kind ?? 'failure';
     case 'timed_out': return 'timed out';
   }
@@ -1151,6 +1168,7 @@ function semanticSubAgentOutcome(outcome: unknown): string {
   }
   switch (value['type']) {
     case 'success': return 'Completed successfully';
+    case 'implicit_completion': return 'Completed';
     case 'failure': return 'Failed';
     case 'timed_out': return 'Timed out: sub-agent exceeded its time limit';
     default: return '';

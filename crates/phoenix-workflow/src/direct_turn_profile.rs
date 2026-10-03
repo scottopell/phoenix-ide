@@ -26,6 +26,7 @@ pub enum DirectTurnEvent {
     Accepted,
     Delivered(DirectTurnReceiptEvent),
     Terminal(DirectTurnTerminalEvent),
+    Rearmed { turn_id: u64, generation: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,3 +1,6 @@
+import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
+import { SvgArtifactCard } from './SvgArtifactCard';
+import { svgArtifactFromResult } from './svgArtifact';
 /**
  * Shared message rendering components used by both MessageList and VirtualizedMessageList.
  * 
@@ -20,9 +23,10 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
-import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
+import type { Message, InputOrigin, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
-import type { AgentTurnUnit } from '../conversation/renderUnits';
+import { agentTurnsInHistoricalUnit, buildHistoricalUnits, type AgentTurnUnit } from '../conversation/renderUnits';
+import { inputOriginPresentation } from '../conversation/inputOriginPresentation';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -41,6 +45,8 @@ import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkd
 import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { ConversationMarkdownTable } from './conversationMarkdownTable';
+import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
@@ -117,17 +123,6 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
     >
       {code}
     </SyntaxHighlighter>
-  );
-}
-
-type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
-
-function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
-  void node;
-  return (
-    <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
-    </div>
   );
 }
 
@@ -384,6 +379,17 @@ function FileChips({
   );
 }
 
+function InputSender({ origin }: { origin: InputOrigin | undefined }) {
+  if (origin?.kind !== 'internal_conversation') {
+    return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
+  }
+  return (
+    <span className="message-sender">
+      From conversation ID {origin.product_conversation_id} · <ConversationMarkdownAnchor href={`/c/${origin.transcript_id}${origin.source_call ? `?source_transcript=${encodeURIComponent(origin.transcript_id)}&source_tool=${encodeURIComponent(origin.source_call.tool_use_id)}#message-${encodeURIComponent(origin.source_call.message_id)}` : ''}`} title={origin.source_call ? "Open originating send call" : "Original send call unavailable (not recorded)"}>{origin.source_call ? `transcript ID ${origin.transcript_id} · source call` : `transcript ID ${origin.transcript_id} · source call unavailable`}</ConversationMarkdownAnchor>
+    </span>
+  );
+}
+
 export const UserMessage = memo(UserMessageImpl);
 
 function UserMessageImpl({ message, activeHighlight = null }: { message: Message; activeHighlight?: ConversationHighlight | null }) {
@@ -393,7 +399,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
   const files = content.files || [];
   const displayData = message.display_data as { type?: string } | null;
   const isWakeMeta = displayData?.type === 'wake_result' && content.is_meta === true;
-  const isMeta = content.is_meta === true;
+  const isMeta = content.is_meta === true || inputOriginPresentation(message.origin).className === 'meta';
   const timestamp = message.created_at;
 
   if (isWakeMeta) {
@@ -412,7 +418,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
     <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
-          {!isMeta && <span className="message-sender">You</span>}
+          <InputSender origin={message.origin} />
           {timestamp && (
             <span className="message-time" title={new Date(timestamp).toLocaleString()}>
               {formatMessageTime(timestamp)}
@@ -421,7 +427,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
           {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
         </span>
         <span className="message-header-actions">
-          <MessageCopyButton message={message} title={isMeta ? 'Copy system observation' : 'Copy your message'} />
+          <MessageCopyButton message={message} title={message.origin?.kind === 'system_generated' ? 'Copy system observation' : 'Copy input message'} />
         </span>
       </div>
       <div className="message-content">
@@ -464,10 +470,11 @@ function QueuedUserMessageImpl({
   activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
+  const isMeta = message.origin ? inputOriginPresentation(message.origin).className === 'meta' : false;
   return (
-    <div className={`message user${isSteeringQueued ? ' steering-queued' : ''}`}>
+    <div className={`message ${isMeta ? 'meta' : 'user'}${isSteeringQueued ? ' steering-queued' : ''}`}>
       <div className="message-header">
-        <span className="message-sender">You</span>
+        {message.origin ? <InputSender origin={message.origin} /> : <span className="message-sender">User · API</span>}
         {isSteeringQueued ? (
           <span className="message-status queued" title="Queued — will send when conversation is free">
             <span className="queued-label">⏳ Queued</span>
@@ -714,6 +721,7 @@ function CompactToolStripImpl({
           item.isError ? 'error' : '',
           !item.hasResult ? 'pending' : '',
           item.name === 'bash' ? 'wide' : '',
+          item.svgArtifact ? 'svg-artifact-tool' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError
@@ -767,6 +775,7 @@ function CompactToolStripImpl({
                 <span className="compact-tool-card-summary" title={summary}>{summary}</span>
               )}
             </button>
+            {item.svgArtifact && <SvgArtifactCard artifact={item.svgArtifact} />}
             {isFirstCardForOwner && (
               <span className="compact-tool-owner-copy message-mobile-copy-row">
                 <MessageCopyButton
@@ -1191,7 +1200,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           return <>{linkified}</>;
         }
         return (
-          <code className={className} {...props}>
+          <code className={className} data-token-kind={inlineCodeTokenKind(children)} {...props}>
             {children}
           </code>
         );
@@ -1207,7 +1216,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
           filePathCopyContext={filePathCopyContext}
         />
       ),
-      table: MarkdownTable,
+      table: ConversationMarkdownTable,
       img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
         <ConversationMarkdownImage
           {...props}
@@ -2878,7 +2887,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
     : 'Copy command';
 
 
+  const svgArtifact = svgArtifactFromResult(name, result);
   return (
+    <>
+    {svgArtifact && <SvgArtifactCard artifact={svgArtifact} />}
     <div className="tool-block" data-tool-id={toolId}>
       {/* Tool header with name */}
       <div className="tool-block-header">
@@ -3040,12 +3052,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
       {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
       {forkProposalId && <ForkProposalAffordance proposalId={forkProposalId} />}
     </div>
+    </>
   );
 }
 
 // =====================================================================// Sub-Agent Summary (persistent view after completion)
 // =====================================================================
-type SubAgentStatusKind = 'running' | 'success' | 'failure' | 'timed_out';
+type SubAgentStatusKind = 'running' | 'success' | 'implicit_completion' | 'failure' | 'timed_out';
 
 function statusKindFromOutcome(outcome: SubAgentResult['outcome'] | null): SubAgentStatusKind {
   if (!outcome) return 'running';
@@ -3056,6 +3069,7 @@ function getStatusLabel(status: SubAgentStatusKind): string {
   switch (status) {
     case 'running': return 'running…';
     case 'success': return 'success';
+    case 'implicit_completion': return 'completed';
     case 'failure': return 'failed';
     case 'timed_out': return 'timed out';
     default: status satisfies never; return '';
@@ -3065,6 +3079,7 @@ function getStatusLabel(status: SubAgentStatusKind): string {
 function getOutcomeText(outcome: SubAgentResult['outcome']): string {
   switch (outcome.type) {
     case 'success': return outcome.result || 'Completed successfully';
+    case 'implicit_completion': return outcome.result || 'Completed';
     case 'failure': return outcome.error || 'Failed';
     case 'timed_out': return 'Timed out: sub-agent exceeded its time limit';
     default: outcome satisfies never; return '';
@@ -3082,16 +3097,6 @@ function summarizeToolInput(name: string, input: Record<string, unknown>, displa
   return formatted.length > 120 ? `${formatted.slice(0, 119)}…` : formatted;
 }
 
-function buildToolResults(messages: Message[]): Map<string, Message> {
-  const map = new Map<string, Message>();
-  for (const msg of messages) {
-    if (msg.message_type !== 'tool' && msg.type !== 'tool') continue;
-    const content = msg.content as ToolResultContent;
-    if (content?.tool_use_id) map.set(content.tool_use_id, msg);
-  }
-  return map;
-}
-
 function countToolUses(messages: Message[]): number {
   let count = 0;
   for (const msg of messages) {
@@ -3106,12 +3111,13 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
   if (status === 'running') {
     return <span className="spinner"></span>;
   }
-  if (status === 'success') return <CheckIcon />;
+  if (status === 'success' || status === 'implicit_completion') return <CheckIcon />;
   return <XIcon />;
 }
 
 function ChildToolActivity({ block, result, liveProgress }: { block: ContentBlock; result: Message | undefined; liveProgress?: import('../generated/sse').BashToolProgress | undefined }) {
   const name = block.name || 'tool';
+  const artifact = svgArtifactFromResult(name, result);
   const input = (block.input || {}) as Record<string, unknown>;
   const output = getToolResultText(result);
   const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
@@ -3123,14 +3129,17 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
   const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
 
   return (
-    <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
-      <span className="subagent-activity-tag">{name}</span>
-      <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
-      <span className="subagent-activity-arrow">→</span>
-      <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
-        {outputPreview}
-      </span>
-    </div>
+    <>
+      <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
+        <span className="subagent-activity-tag">{name}</span>
+        <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
+        <span className="subagent-activity-arrow">→</span>
+        <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
+          {outputPreview}
+        </span>
+      </div>
+      {artifact && <SvgArtifactAccessContext.Provider value={{ kind: 'owner' }}><SvgArtifactCard artifact={artifact} /></SvgArtifactAccessContext.Provider>}
+    </>
   );
 }
 
@@ -3140,7 +3149,7 @@ function ChildToolActivity({ block, result, liveProgress }: { block: ContentBloc
 // `toolResults` map are referentially stable across token-only atom updates, so
 // a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
 // memoization for the same re-parse-on-unchanged-content problem.
-const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: Map<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: ReadonlyMap<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -3184,20 +3193,15 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
 export function SubAgentTranscript({ inline, running, full = false, finalResult }: { inline: InlineStreamState; running: boolean; full?: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const { atom } = inline;
   const messages = atom.messages;
-  // Derived once per messages change, not per streaming token. `sse_token`
-  // preserves `atom.messages` identity (only `streamingBuffer` grows), so a
-  // stable `toolResults` map lets the memoized ChildAgentActivity rows bail
-  // while the active step's buffer streams.
-  const toolResults = useMemo(() => buildToolResults(messages), [messages]);
-  const agentMessages = useMemo(
-    () => messages.filter((m) => m.message_type === 'agent' || m.type === 'agent'),
+  const agentTurns = useMemo(
+    () => buildHistoricalUnits({ messages, pendingMessages: [] }).historicalUnits.flatMap(agentTurnsInHistoricalUnit),
     [messages],
   );
-  const visibleAgentMessages = useMemo(
-    () => (full ? agentMessages : agentMessages.slice(-12)),
-    [full, agentMessages],
+  const visibleAgentTurns = useMemo(
+    () => (full ? agentTurns : agentTurns.slice(-12)),
+    [full, agentTurns],
   );
-  const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
+  const hiddenCount = Math.max(0, agentTurns.length - visibleAgentTurns.length);
   const toolCount = useMemo(() => countToolUses(messages), [messages]);
   const rootDir = atom.conversation?.worktree_path ?? atom.conversation?.cwd ?? undefined;
   const markdownComponents = useMemo(
@@ -3215,17 +3219,17 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
       {inline.type === 'connecting' && <div className="subagent-activity-placeholder">Loading sub-agent activity…</div>}
       {inline.type === 'error' && <div className="subagent-activity-error">{inline.error}</div>}
       {hiddenCount > 0 && (
-        <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
+        <div className="subagent-activity-placeholder">Showing latest {visibleAgentTurns.length} agent steps ({hiddenCount} earlier hidden)</div>
       )}
-      {visibleAgentMessages.map((message) => (
-        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
+      {visibleAgentTurns.map((turn) => (
+        <ChildAgentActivity key={turn.key} message={turn.agent} toolResults={turn.toolResultsByUseId} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
           <StreamingBlocks text={atom.streamingBuffer.text} rootDir={rootDir} />
         </div>
       )}
-      {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
+      {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentTurns.length === 0 && !atom.streamingBuffer?.text && (
         <div className="subagent-activity-placeholder">No sub-agent activity yet.</div>
       )}
       {finalResult?.text && (
@@ -3343,7 +3347,7 @@ function SubAgentSummaryRow({ result, revealRequest, activeHighlight }: { result
 
 /** Persistent summary of completed subagents (shown in spawn_agents tool result) */
 function SubAgentSummary({ results, revealRequest = null, activeHighlight = null }: { results: SubAgentResult[]; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
-  const successCount = results.filter(r => r.outcome.type === 'success').length;
+  const successCount = results.filter(r => r.outcome.type === 'success' || r.outcome.type === 'implicit_completion').length;
   const timeoutCount = results.filter(r => r.outcome.type === 'timed_out').length;
   const failCount = results.filter(r => r.outcome.type === 'failure').length;
 

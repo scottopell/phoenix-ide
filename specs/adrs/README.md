@@ -33,12 +33,12 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [019](019_runtime-ownership-requires-positive-evidence.md) | Runtime ownership requires positive evidence | Accepted | REQ-DEPLOY-002A, REQ-RU-004A |
 | [020](020_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
-| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 | REQ-GR-001–005, REQ-GR-007–011A |
+| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Partially superseded by ADR-027 and ADR-066 | REQ-GR-001–005, REQ-GR-007–011A |
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
 | [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
-| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Accepted | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
+| [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Partially superseded by ADR-066 | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
@@ -69,7 +69,24 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
 | [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
 | [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
-| [058](058_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
+| [058](058_svg-presentation-uses-atomic-conversation-snapshots.md) | SVG presentation uses atomic conversation snapshots | Accepted | REQ-SVG-001–007 |
+| [059](059_anthropic-private-replay-uses-active-opaque-state.md) | Anthropic private replay uses active opaque state | Accepted | REQ-LLM-004, REQ-LLM-005, REQ-LLM-006 |
+| [060](060_model-qualified-parallel-work-admission.md) | Parallel Work admission is explicitly model-qualified | Accepted | REQ-SA-001/003–005, REQ-PROJ-008, REQ-BED-008/018, REQ-LLM-003 |
+| [061](061_gpt-6-sol-is-manually-qualified-for-parallel-work.md) | GPT-6 Sol is manually qualified for parallel Work | Accepted | REQ-SA-001, REQ-PROJ-008 |
+| [062](062_codex-catalog-discovery-is-advisory-for-builtins.md) | Codex catalog discovery is advisory for supported built-ins | Accepted | REQ-LLM-003, REQ-LLM-004h |
+| [063](063_direct-distribution-uses-protected-signing-and-private-drafts.md) | Direct distribution uses protected signing and private draft publication | Proposed | REQ-DESKTOP-REL-003/005/007; `ArchitecturePair`, `ReleasePublication` |
+| [064](064_modern-build-identity-is-full-length-and-legacy-rollback-is-role-bound.md) | Modern build identity is full-length and legacy rollback is role-bound | Accepted | REQ-DEPLOY-002; REQ-PD-002/009/010/014; REQ-LDD-007/008/011/016; `RuntimeIdentity`, `DeployTransaction` |
+| [065](065_release-candidates-share-the-stable-artifact-path.md) | Release candidates share the stable artifact path | Accepted | REQ-DESKTOP-REL-001/003/005/007/008/009; `ReleaseIdentity`, `ReleasePublication` |
+| [066](066_coordinator-activity-is-queried-on-demand.md) | Coordinator activity is queried on demand | Accepted | REQ-GR-010/011/013 |
+| [067](067_workscope-authority-projects-one-runtime-capability.md) | WorkScope authority projects one runtime capability | Accepted | REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority |
+| [068](068_work-children-share-parent-development-trust.md) | Work children share parent development trust | Accepted | REQ-PROJ-008, REQ-BED-018; unsandboxed Work children and parent lifecycle ownership |
+| [069](069_roadmap-records-are-typed-facts-projected-milestone-first.md) | Roadmap records are typed facts projected milestone-first | Accepted | REQ-ROADMAP-001, REQ-ROADMAP-002, REQ-ROADMAP-003, REQ-ROADMAP-004, REQ-ROADMAP-005, REQ-ROADMAP-006, REQ-ROADMAP-007, REQ-ROADMAP-008, REQ-ROADMAP-009, REQ-ROADMAP-010, REQ-ROADMAP-011, REQ-ROADMAP-012, REQ-ROADMAP-013, REQ-ROADMAP-014 |
+| [070](070_trusted-input-provenance-and-global-watches.md) | Trusted input provenance and explicit Global conversation watches | Accepted | REQ-GR-007, REQ-GR-014, REQ-GR-015 |
+| [071](071_historical-input-retries-retain-unknown-provenance.md) | Historical input retries retain unknown provenance | Accepted | REQ-GR-014, REQ-DWF-039, REQ-COMP-001 |
+
+| [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
+
+| [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
 
 ## For agents: which decisions bind your task
 
@@ -77,7 +94,9 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
+| Specifying parallel Work-child qualification, admission, shared WorkScope collaboration, cancellation/start, or parent-result delivery | 059, then 052 and 026 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -93,9 +112,12 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
+| Specifying authoritative build identity, candidate verification, legacy predecessor rollback, or bare-supervisor replacement | 064, then 017 and 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying Work-subagent trust, sandboxing, or inherited worktree ownership | 068, then 067 |
+| Specifying approval-time or restart-time runtime capability projection from WorkScope authority | 067, then 049, 026, and 039 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -106,7 +128,10 @@ Consult the relevant ADRs before starting work of each kind.
 | Migrating invalid historical continuation dispatch intents | 053, then 034 and 026 |
 | Retiring commission-review execution, pending approval state, or specialized history/viewer authority | 038, then 034 |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
-| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
+| Evaluating proposed signed macOS direct-distribution authentication or draft publication mechanisms | Proposed ADR-063 (non-binding), then 034, 018, and 017 |
+| Specifying modern build identity or role-bound legacy predecessor rollback | 064, then 034, 017, and 010 |
+| Working on stable/RC release version parsing, Apple bundle mapping, or prerelease publication classification | 065, then proposed 063 and 018 |
+| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 066 for on-demand activity, 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
@@ -130,7 +155,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   ├── ADR-038 (Commission review is retired with forward history recovery)
-      │   └── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   ├── ADR-053 (Invalid continuation intents retire without fabricated identity)
+      │   └── ADR-060 (Parallel Work admission is explicitly model-qualified)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
@@ -138,6 +164,9 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
+      │   │       └── ADR-063 [Proposed] (direct distribution uses protected signing and private draft publication)
+      │   │           └── ADR-065 (Release candidates share the stable artifact path)
+      │   │   └── ADR-064 (Modern build identity is full-length and legacy rollback is role-bound)
       │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
@@ -158,6 +187,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
+          ├── ADR-067 (WorkScope authority projects one runtime capability)
           ├── ADR-028 (iOS companion adds read-only project context and prose review)
           │   └── ADR-029 (iOS companion uses session-scoped prose feedback)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)

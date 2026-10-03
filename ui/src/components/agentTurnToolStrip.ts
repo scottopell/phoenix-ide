@@ -9,9 +9,11 @@
 // source of truth for what a turn did is the turn itself.
 
 import type { ContentBlock, Message, ToolResultContent } from '../api';
+import { svgArtifactFromResult, type SvgArtifact } from './svgArtifact';
 import type { BashToolProgress } from '../generated/sse';
 
 export interface ToolStripItem {
+  svgArtifact?: SvgArtifact | null;
   /** Persisted agent message that owns this tool call. */
   ownerMessage: Message;
   /** Tool name as it appears on the content block (e.g. `bash`, `patch`). */
@@ -342,6 +344,7 @@ export function deriveToolStripItems(
       ? summarizeBashCompactCard(input, result, liveBashProgress[toolId]?.progress, block.display)
       : { commandIdentity: null, finalStatus: null, outputTail: null };
     items.push({
+      svgArtifact: svgArtifactFromResult(name, result),
       ownerMessage: message,
       name,
       toolId,

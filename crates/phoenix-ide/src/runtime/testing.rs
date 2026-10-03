@@ -171,6 +171,7 @@ impl LlmClient for StreamingMockLlmClient {
                 .await;
         }
         Ok(LlmResponse {
+            provider_replay: None,
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
@@ -549,16 +550,34 @@ pub struct MaterializeAuthoritativeUserMessageCall {
     pub now: Timestamp,
 }
 
+type StoredSvgArtifacts = HashMap<
+    (String, crate::tools::present_svg::SvgInvocationId),
+    (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
+>;
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    svg_artifacts: Mutex<StoredSvgArtifacts>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    sub_agent_terminals: Mutex<
+        HashMap<
+            String,
+            (
+                phoenix_db::SubAgentTerminalCause,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >,
+    >,
+    sub_agent_acceptances: Mutex<HashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
+    approval_authority_unclassified: Mutex<bool>,
+    fail_approval_authority_persistence: Mutex<bool>,
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
@@ -602,6 +621,8 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_tool_round_persist: Mutex<bool>,
+    fail_sub_agent_acceptance_once: Mutex<bool>,
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -622,12 +643,17 @@ pub struct InMemoryStorage {
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
+            svg_artifacts: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             state_updated_ats: Mutex::new(HashMap::new()),
+            sub_agent_terminals: Mutex::new(HashMap::new()),
+            sub_agent_acceptances: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
+            approval_authority_unclassified: Mutex::new(false),
+            fail_approval_authority_persistence: Mutex::new(false),
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
@@ -666,6 +692,8 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_tool_round_persist: Mutex::new(false),
+            fail_sub_agent_acceptance_once: Mutex::new(false),
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
@@ -686,6 +714,14 @@ impl InMemoryStorage {
         *self.fail_continuation_commit.lock().unwrap() = fail;
     }
 
+    pub fn set_approval_authority_unclassified(&self, unclassified: bool) {
+        *self.approval_authority_unclassified.lock().unwrap() = unclassified;
+    }
+
+    pub fn set_fail_approval_authority_persistence(&self, fail: bool) {
+        *self.fail_approval_authority_persistence.lock().unwrap() = fail;
+    }
+
     pub fn set_accepted_continuation_handoff_message_id(&self, conv_id: &str, message_id: &str) {
         self.accepted_continuation_handoff_message_ids
             .lock()
@@ -703,6 +739,18 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_tool_round_persist(&self, fail: bool) {
+        *self.fail_tool_round_persist.lock().unwrap() = fail;
+    }
+
+    pub fn fail_sub_agent_acceptance_once(&self) {
+        *self.fail_sub_agent_acceptance_once.lock().unwrap() = true;
+    }
+
+    pub fn sub_agent_acceptance_count(&self) -> usize {
+        self.sub_agent_acceptances.lock().unwrap().len()
     }
 
     pub fn set_fail_message_add(&self, fail: bool) {
@@ -1097,6 +1145,10 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn accepted_continuation_handoff_message_id(
         &self,
         conv_id: &str,
@@ -1127,6 +1179,7 @@ impl MessageStore for InMemoryStorage {
         drop(id_guard);
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id: seq_id,
@@ -1156,6 +1209,29 @@ impl MessageStore for InMemoryStorage {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
+        self.add_message_with_seq_and_origin(
+            message_id,
+            conv_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            &phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_origin(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+    ) -> Result<Message, String> {
         if *self.fail_message_add.lock().unwrap() {
             return Err("injected message persistence failure".to_string());
         }
@@ -1179,6 +1255,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: origin.clone(),
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1270,6 +1347,7 @@ impl MessageStore for InMemoryStorage {
         }
 
         let msg = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conv_id.to_string(),
             sequence_id,
@@ -1420,6 +1498,7 @@ impl MessageStore for InMemoryStorage {
             });
         let sequence_id = allocate_sequence(persisted_sequence_max);
         let message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -1767,6 +1846,9 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
     ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
@@ -1886,6 +1968,41 @@ impl StateStore for InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), state.clone());
+        Ok(())
+    }
+
+    async fn update_state_and_record_sub_agent_terminal(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        cause: phoenix_db::SubAgentTerminalCause,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_terminals
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), (cause, terminal_at));
+        Ok(())
+    }
+
+    async fn update_state_and_accept_sub_agent(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        child_conversation_id: &str,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_sub_agent_acceptance_once.lock().unwrap()) {
+            return Err("injected sub-agent acceptance failure".to_string());
+        }
+        self.update_state(conv_id, state, state_updated_at).await?;
+        self.sub_agent_acceptances.lock().unwrap().insert(
+            child_conversation_id.to_string(),
+            (conv_id.to_string(), accepted_at),
+        );
         Ok(())
     }
 
@@ -2059,7 +2176,10 @@ impl StateStore for InMemoryStorage {
         approval_message: &Message,
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
+        if *self.fail_approval_authority_persistence.lock().unwrap() {
+            return Err("injected approval authority persistence failure".to_string());
+        }
         self.persist_approved_task_authority(conv_id, approval)
             .await?;
         self.messages
@@ -2068,7 +2188,19 @@ impl StateStore for InMemoryStorage {
             .entry(conv_id.to_string())
             .or_default()
             .push(approval_message.clone());
-        self.update_state(conv_id, state, state_updated_at).await
+        self.update_state(conv_id, state, state_updated_at).await?;
+        if *self.approval_authority_unclassified.lock().unwrap() {
+            Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified)
+        } else {
+            Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(()))
+        }
+    }
+
+    async fn get_approved_task_objective(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>, String> {
+        Ok(self.approved_task_authority(conv_id))
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
@@ -2124,12 +2256,75 @@ impl StateStore for InMemoryStorage {
             .copied())
     }
 
+    async fn load_provider_replay_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::AnthropicReplayPayload>, String> {
+        Ok(None)
+    }
+    async fn update_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.update_state(conversation_id, state, state_updated_at)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_state_and_provider_replay(
+        &self,
+        conversation_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        _update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
+    ) -> Result<(), String> {
+        self.persist_tool_round_and_state(
+            conversation_id,
+            assistant,
+            tool_results,
+            state,
+            state_updated_at,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_and_clear_provider_replay_with_origin(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &crate::db::MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&crate::db::UsageData>,
+        origin: &phoenix_core::domain::db_schema::InputOrigin,
+        _state: &phoenix_core::domain::sm_state::ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::Message, String> {
+        self.add_message_with_seq_and_origin(
+            message_id,
+            conversation_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+            origin,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_turn_usage(
         &self,
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
         _effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+        _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         _usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -2406,6 +2601,49 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 // Tests
 // ============================================================================
 
+#[async_trait]
+impl crate::runtime::traits::SvgArtifactRepository for InMemoryStorage {
+    async fn lookup(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+    ) -> Result<Option<crate::tools::present_svg::SvgArtifactReference>, String> {
+        Ok(self
+            .svg_artifacts
+            .lock()
+            .unwrap()
+            .get(&(conversation_id.to_string(), invocation.clone()))
+            .map(|(reference, _)| reference.clone()))
+    }
+    async fn publish(
+        &self,
+        conversation_id: &str,
+        invocation: &crate::tools::present_svg::SvgInvocationId,
+        draft: crate::tools::present_svg::SvgArtifactDraft,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_svg::SvgArtifactReference, String>>
+    {
+        use crate::tools::present_svg::{SvgArtifactReference, SvgValidationOutcome};
+        let mut artifacts = self.svg_artifacts.lock().unwrap();
+        let (reference, _) = artifacts
+            .entry((conversation_id.to_string(), invocation.clone()))
+            .or_insert_with(|| {
+                (
+                    SvgArtifactReference {
+                        artifact_id: uuid::Uuid::new_v4().to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        title: draft.metadata.title().into(),
+                        description: draft.metadata.description().into(),
+                        width: draft.svg.width(),
+                        height: draft.svg.height(),
+                        validation: SvgValidationOutcome::AcceptedStaticSvg,
+                    },
+                    draft.svg.into_bytes(),
+                )
+            });
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(reference.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2433,6 +2671,7 @@ mod tests {
     async fn test_mock_llm_client() {
         let mock = MockLlmClient::new("test-model");
         mock.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
@@ -2440,6 +2679,7 @@ mod tests {
         });
 
         let request = LlmRequest {
+            provider_replay: None,
             system: vec![],
             messages: vec![],
             tools: vec![],
@@ -2516,6 +2756,7 @@ mod tests {
     async fn test_simple_text_response() {
         let llm = MockLlmClient::new("test-model");
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2541,6 +2782,7 @@ mod tests {
         let llm = MockLlmClient::new("test-model");
         // First response: tool call
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2552,6 +2794,7 @@ mod tests {
         });
         // Second response: text after tool
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
@@ -2604,6 +2847,7 @@ mod tests {
             Duration::from_secs(5),
         ));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
@@ -2714,6 +2958,7 @@ mod tests {
         // Fast LLM, long tool delay that we'll cancel
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2725,6 +2970,7 @@ mod tests {
         });
         // This response won't be used since tool is cancelled
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -2827,6 +3073,7 @@ mod tests {
         // 5 second tool delay - we should NOT wait for this
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -2944,6 +3191,7 @@ mod tests {
 
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3039,6 +3287,39 @@ mod tests {
         );
     }
 
+    async fn storage_with_spawn_round(conv_id: &str, tool_use_id: &str) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        let assistant_id = format!("{conv_id}-spawn-assistant");
+        storage
+            .add_message(
+                &assistant_id,
+                conv_id,
+                &MessageContent::agent(vec![ContentBlock::tool_use(
+                    tool_use_id,
+                    "spawn_agents",
+                    serde_json::json!({"tasks": [{"task": "do thing", "mode": "work"}]}),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .add_message(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant_id,
+                    tool_use_id,
+                ),
+                conv_id,
+                &MessageContent::tool(tool_use_id, "Spawning sub-agents", false),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
     /// REQ-BED-005a `CancellingSubAgentsDeadlineFires`: a parent wedged in
     /// `CancellingSubAgents` because a cancelled sub-agent never reported back
     /// must still reach `Idle` within the bounded cancellation deadline.
@@ -3057,11 +3338,11 @@ mod tests {
         use std::path::PathBuf;
         use tokio::sync::mpsc;
 
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = storage_with_spawn_round("test-conv", "spawn-1").await;
         let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx = mpsc::channel::<Event>(32).0;
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 2);
         let mut broadcast_rx = broadcast_tx.subscribe();
 
         let initial_state = ConvState::CancellingSubAgents {
@@ -3091,7 +3372,7 @@ mod tests {
             broadcast_tx,
         );
 
-        tokio::spawn(async move { runtime.run().await });
+        let runtime_task = tokio::spawn(async move { runtime.run().await });
 
         // Liveness assertion: AgentDone within a bounded deadline. The backstop
         // is CANCELLING_SUBAGENTS_DEADLINE (6s); this window is longer so it
@@ -3107,6 +3388,9 @@ mod tests {
             }
         }
 
+        runtime_task.abort();
+        let _ = runtime_task.await;
+
         assert!(
             agent_done,
             "A parent wedged in CancellingSubAgents with a silent sub-agent must still \
@@ -3117,6 +3401,22 @@ mod tests {
         assert!(
             matches!(final_state, Some(ConvState::Idle)),
             "Conversation should return to Idle after the backstop fires, got {final_state:?}"
+        );
+        let messages = storage.get_all_messages("test-conv");
+        let result = messages
+            .iter()
+            .find(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "spawn-1"))
+            .expect("durable spawn result");
+        assert!(
+            matches!(&result.content, MessageContent::Tool(tool) if tool.content.starts_with("Sub-agent results"))
+        );
+        assert_eq!(
+            result
+                .display_data
+                .as_ref()
+                .and_then(|data| data.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("subagent_summary")
         );
     }
 
@@ -3596,6 +3896,7 @@ mod tests {
         // LLM returns a single tool call
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -3607,6 +3908,7 @@ mod tests {
         });
         // After tool completes, LLM returns text
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
@@ -3712,6 +4014,7 @@ mod tests {
         // 4th RequestLlm should trip it. Queue 10 for headroom.
         for _ in 0..10 {
             llm.queue_response(LlmResponse {
+                provider_replay: None,
                 content: vec![ContentBlock::tool_use(
                     "tool-x",
                     "bash",
@@ -4281,6 +4584,7 @@ mod tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         // Turn 1: a tool call (will wedge).
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
@@ -4292,6 +4596,7 @@ mod tests {
         });
         // Turn 2: a tool call (cooperative now), then...
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::tool_use(
                 "tool-2",
                 "bash",
@@ -4303,6 +4608,7 @@ mod tests {
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
         llm.queue_response(LlmResponse {
+            provider_replay: None,
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
@@ -4479,6 +4785,7 @@ mod tests {
         );
         let initial_state = ConvState::CancellingTool {
             tool_use_id: "wedged-tool".to_string(),
+            cause: crate::state_machine::event::CancelCause::UserRequested,
             skipped_tools: vec![],
             completed_results: vec![],
             assistant_message,
@@ -4499,7 +4806,12 @@ mod tests {
             event_tx,
             broadcast_tx,
         )
-        .with_parent(parent_tx);
+        .with_parent_dispatch(
+            "parent-conv".to_string(),
+            Arc::new(crate::runtime::TestConversationEventDispatcher::new(
+                parent_tx,
+            )),
+        );
 
         tokio::spawn(async move { runtime.run().await });
 
