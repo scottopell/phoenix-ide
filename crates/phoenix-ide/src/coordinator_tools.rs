@@ -200,8 +200,8 @@ impl Tool for WorkScopeCoordinatorBash {
                     Err(error) => return ToolOutput::error(error),
                 };
                 ValidatedBashSpawnTarget {
-                    working_dir: binding.path,
-                    lifecycle_scope: binding.work_scope_id,
+                    working_dir: binding.path.clone(),
+                    lifecycle_scope: binding.work_scope_id.clone(),
                 }
             }
             BashInvocation::Run {
@@ -214,9 +214,26 @@ impl Tool for WorkScopeCoordinatorBash {
                 return BashTool.run(context_input, ctx).await;
             }
         };
-        BashTool
+        let environment_display = json!({
+            "work_scope_id": spawn_target.lifecycle_scope.clone(),
+            "cwd": spawn_target.working_dir.clone(),
+        });
+        let mut output = BashTool
             .run_explicit_target(context_input, spawn_target, ctx)
-            .await
+            .await;
+        if matches!(invocation, BashInvocation::Run { .. }) {
+            match &mut output {
+                ToolOutput::Success { display_data, .. }
+                | ToolOutput::Error { display_data, .. } => {
+                    let display = display_data.get_or_insert_with(|| json!({}));
+                    if let Some(object) = display.as_object_mut() {
+                        object.insert("coordinator_environment".to_string(), environment_display);
+                    }
+                }
+                ToolOutput::TrustedInstructions(_) => {}
+            }
+        }
+        output
     }
 }
 

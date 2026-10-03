@@ -16,7 +16,7 @@ import { svgArtifactFromResult } from './svgArtifact';
  */
 
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { MessageReviewAction } from './MessageReviewAction';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
@@ -1711,6 +1711,81 @@ function BashOutputView({
   );
 }
 
+type SendConversationOutcome = {
+  outcome: 'delivered' | 'queued_as_steering' | 'rejected';
+  target?: string;
+  conversation_id?: string;
+  message_id: string;
+  reason_code?: string;
+  message?: string;
+};
+
+type WatchSnapshot = {
+  product_conversation_id: string;
+  current_transcript_id: string;
+  current_state: { type?: string };
+};
+
+function canonicalTargetLink(target: string | undefined, conversationId: string | undefined) {
+  if (target?.startsWith('@conv:')) {
+    return `/product-conversations/${encodeURIComponent(target.slice('@conv:'.length))}`;
+  }
+  const transcript = target?.startsWith('@transcript:') ? target.slice('@transcript:'.length) : conversationId;
+  return transcript ? `/conversations/${encodeURIComponent(transcript)}` : null;
+}
+
+export function SendConversationMessageView({ response }: { response: SendConversationOutcome }) {
+  const link = canonicalTargetLink(response.target, response.conversation_id);
+  const label = response.outcome === 'queued_as_steering'
+    ? 'Queued as steering'
+    : response.outcome === 'delivered'
+      ? 'Delivered'
+      : 'Rejected';
+  return (
+    <div className={`coordinator-result-card coordinator-send-${response.outcome}`}>
+      <div className="coordinator-result-heading"><strong>{label}</strong></div>
+      <div className="coordinator-result-row">
+        <span>Recipient</span>
+        {link ? <Link to={link}>{response.target ?? response.conversation_id}</Link> : <code>{response.target ?? 'Unresolved'}</code>}
+      </div>
+      {response.conversation_id && <div className="coordinator-result-row"><span>Transcript</span><Link to={`/conversations/${encodeURIComponent(response.conversation_id)}`}>{response.conversation_id}</Link></div>}
+      {response.outcome !== 'rejected' && <p className="coordinator-result-note">Accepted by Phoenix; recipient understanding or completion is not implied.</p>}
+      {response.outcome === 'rejected' && <p className="coordinator-result-error">{response.message ?? response.reason_code ?? 'Message rejected'}</p>}
+    </div>
+  );
+}
+
+function WatchLink({ watch }: { watch: WatchSnapshot }) {
+  return (
+    <li className="coordinator-watch-row">
+      <Link to={`/product-conversations/${encodeURIComponent(watch.product_conversation_id)}`}>@conv:{watch.product_conversation_id}</Link>
+      <Link to={`/conversations/${encodeURIComponent(watch.current_transcript_id)}`}>@transcript:{watch.current_transcript_id}</Link>
+      <span>{watch.current_state?.type ?? 'active'}</span>
+    </li>
+  );
+}
+
+export function WatchingResultView({ response }: { response: unknown }) {
+  const watches = Array.isArray(response) ? response : [response];
+  const valid = watches.filter((value): value is WatchSnapshot => {
+    if (!value || typeof value !== 'object') return false;
+    const row = value as Record<string, unknown>;
+    return typeof row['product_conversation_id'] === 'string' && typeof row['current_transcript_id'] === 'string';
+  });
+  if (valid.length === 0) return <div className="coordinator-result-card">No active watches.</div>;
+  return <div className="coordinator-result-card"><strong>Watching</strong><ul className="coordinator-watch-list">{valid.map((watch) => <WatchLink key={watch.product_conversation_id} watch={watch} />)}</ul></div>;
+}
+
+function CoordinatorEnvironment({ displayData }: { displayData: Record<string, unknown> | null | undefined }) {
+  const environment = displayData?.['coordinator_environment'];
+  if (!environment || typeof environment !== 'object') return null;
+  const value = environment as Record<string, unknown>;
+  const scope = typeof value['work_scope_id'] === 'string' ? value['work_scope_id'] : null;
+  const cwd = typeof value['cwd'] === 'string' ? value['cwd'] : null;
+  if (!scope && !cwd) return null;
+  return <div className="coordinator-environment"><strong>Environment</strong>{scope && <span>{scope}</span>}{cwd && <code title={cwd}>{cwd}</code>}</div>;
+}
+
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
@@ -2888,6 +2963,16 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
 
 
   const svgArtifact = svgArtifactFromResult(name, result);
+  const structuredResult = !isError ? tryParseJson(resultText) : null;
+  const sendOutcome = name === 'send_conversation_message' && structuredResult && !Array.isArray(structuredResult)
+    && typeof structuredResult === 'object' && 'outcome' in structuredResult
+    ? structuredResult as SendConversationOutcome
+    : null;
+  const watchingResult = (name === 'list_watched_product_conversations'
+    || name === 'watch_product_conversation'
+    || name === 'unwatch_product_conversation') && structuredResult !== null
+    ? structuredResult
+    : null;
   return (
     <>
     {svgArtifact && <SvgArtifactCard artifact={svgArtifact} />}
@@ -2938,8 +3023,12 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
                 className="message-image"
               />
             </div>
+          ) : sendOutcome ? (
+            <SendConversationMessageView response={sendOutcome} />
+          ) : watchingResult ? (
+            <WatchingResultView response={watchingResult} />
           ) : bashResponse ? (
-            <BashResponseView response={bashResponse} />
+            <><CoordinatorEnvironment displayData={result?.display_data as Record<string, unknown> | undefined} /><BashResponseView response={bashResponse} /></>
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
           ) : name === 'browser_profile' &&

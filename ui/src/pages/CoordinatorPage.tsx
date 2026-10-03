@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { api } from '../api';
+import { api, type LiveCoordinatorBashHandle } from '../api';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
@@ -12,6 +12,37 @@ const ConversationPage = lazy(() =>
 interface CoordinatorPageFixtureData {
   coordinatorId: string;
   conversation: ReactNode;
+}
+
+function GlobalLiveCommands() {
+  const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void api.listLiveCoordinatorBashHandles()
+        .then((value) => { if (!cancelled) { setHandles(value); setError(null); } })
+        .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : 'Failed to load live commands'); });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 5_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  if (error) return <div className="global-live-commands-error">{error}</div>;
+  if (handles.length === 0) return null;
+  return (
+    <section className="global-live-commands" aria-label="Running commands">
+      <strong>Running</strong>
+      {handles.map((handle) => (
+        <div className="global-live-command" key={handle.handle_id}>
+          <div><strong>{handle.label ?? handle.command}</strong><code>{handle.cwd}</code></div>
+          <a href={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</a>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
@@ -89,6 +120,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           <AutomaticContinuationControl scope={{ kind: 'coordinator' }} />
         </div>
       )}
+
+      {!fixtureData && !loading && !error && <GlobalLiveCommands />}
 
       <section className="coordinator-conversation" aria-label="Coordinator conversation">
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (

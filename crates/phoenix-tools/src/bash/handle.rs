@@ -209,6 +209,8 @@ pub struct Handle {
     /// entry of the cap-reached error. See REQ-BASH-002 / REQ-BASH-010 and
     /// the `Handle.label` field in `bash.allium`.
     pub label: Option<String>,
+    /// Canonical working directory captured at spawn time.
+    pub working_dir: std::path::PathBuf,
     pub started_at: SystemTime,
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
@@ -233,6 +235,7 @@ impl std::fmt::Debug for Handle {
             .field("launch_identity", &self.launch_identity)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
+            .field("working_dir", &self.working_dir)
             .field("started_at", &self.started_at)
             .finish_non_exhaustive()
     }
@@ -335,6 +338,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            std::path::PathBuf::from("."),
             pgid,
             pid,
             ring_bytes_cap,
@@ -351,6 +355,7 @@ impl Handle {
         authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
+        working_dir: std::path::PathBuf,
         pgid: i32,
         pid: u32,
         ring_bytes_cap: usize,
@@ -369,6 +374,7 @@ impl Handle {
             authority,
             cmd,
             label,
+            working_dir,
             started_at: SystemTime::now(),
             state: RwLock::new(Arc::new(HandleState::Live(live))),
             kill_attempt: RwLock::new(None),

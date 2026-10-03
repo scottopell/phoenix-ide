@@ -199,7 +199,7 @@ pub(crate) struct GlobalReadService {
     stable_resolution_test_hook: Option<Arc<StableResolutionTestHook>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,

@@ -386,6 +386,10 @@ pub fn create_router(state: AppState) -> Router {
         // `ResourceScopeKey::stable_key()`; `:handle_id` names a bash handle in that
         // scope. See `specs/process-inspector/` REQ-PINSP-005.
         .route("/api/bash/:handle_id/inspect", get(inspect_bash_handle))
+        .route(
+            "/api/coordinator/bash/live",
+            get(list_live_coordinator_bash_handles),
+        )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -4050,6 +4054,40 @@ struct InspectQuery {
 /// belongs to the handle's owning work scope, reads the output window for the
 /// optional `since` cursor via the existing ring/tombstone read helpers, and
 /// attaches a request-time process-group resource sample iff the handle is live.
+#[derive(serde::Serialize)]
+struct LiveCoordinatorBashHandle {
+    handle_id: String,
+    command: String,
+    label: Option<String>,
+    cwd: String,
+    started_at_ms: u128,
+}
+
+async fn list_live_coordinator_bash_handles(
+    State(state): State<AppState>,
+) -> Json<Vec<LiveCoordinatorBashHandle>> {
+    let handles = state
+        .runtime
+        .bash_handles()
+        .live_coordinator_handles()
+        .await;
+    Json(
+        handles
+            .into_iter()
+            .map(|handle| LiveCoordinatorBashHandle {
+                handle_id: handle.handle_id.0.clone(),
+                command: handle.cmd.clone(),
+                label: handle.label.clone(),
+                cwd: handle.working_dir.to_string_lossy().into_owned(),
+                started_at_ms: handle
+                    .started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis()),
+            })
+            .collect(),
+    )
+}
+
 async fn inspect_bash_handle(
     State(state): State<AppState>,
     Path(handle_id): Path<String>,

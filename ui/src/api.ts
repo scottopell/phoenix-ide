@@ -1298,6 +1298,14 @@ export const streamApi = {
   subscribeToChainStream,
 };
 
+export interface LiveCoordinatorBashHandle {
+  handle_id: string;
+  command: string;
+  label: string | null;
+  cwd: string;
+  started_at_ms: number;
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1992,6 +2000,12 @@ export const api = {
       method: 'DELETE',
     });
     if (!resp.ok) throw new Error('Failed to stop browser session');
+    return resp.json();
+  },
+
+  async listLiveCoordinatorBashHandles(): Promise<LiveCoordinatorBashHandle[]> {
+    const resp = await fetch('/api/coordinator/bash/live');
+    if (!resp.ok) throw new Error('Failed to list live Coordinator bash handles');
     return resp.json();
   },
 

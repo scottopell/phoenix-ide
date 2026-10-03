@@ -3,7 +3,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentTranscript, SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentTranscript, SubAgentStatus, AgentMessage, SendConversationMessageView, ToolOnlyAgentTurnGroup, ToolUseBlock, UserMessage, QueuedUserMessage, TerminalToolResultHighlight, WatchingResultView } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -14,6 +14,49 @@ import { ForkProposalReview } from './ForkProposalReview';
 import { createInitialAtom } from '../conversation/atom';
 import { buildRenderUnits } from '../conversation/renderUnits';
 import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
+
+describe('Global coordinator tool results', () => {
+  it('renders queued delivery truthfully with recipient navigation', () => {
+    render(
+      <MemoryRouter>
+        <SendConversationMessageView response={{
+          outcome: 'queued_as_steering', target: '@conv:product-1', conversation_id: 'transcript-1', message_id: 'message-1',
+        }} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('Queued as steering')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '@conv:product-1' })).toHaveAttribute('href', '/product-conversations/product-1');
+    expect(screen.getByRole('link', { name: 'transcript-1' })).toHaveAttribute('href', '/conversations/transcript-1');
+    expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
+  });
+
+  it('renders rejected delivery without implying acceptance', () => {
+    render(
+      <MemoryRouter>
+        <SendConversationMessageView response={{
+          outcome: 'rejected', target: '@transcript:transcript-2', conversation_id: 'transcript-2', message_id: 'message-2',
+          reason_code: 'invalid_state_for_message', message: 'Recipient cannot accept messages in this state',
+        }} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('Rejected')).toBeInTheDocument();
+    expect(screen.getByText('Recipient cannot accept messages in this state')).toBeInTheDocument();
+    expect(screen.queryByText(/understanding or completion/i)).not.toBeInTheDocument();
+  });
+
+  it('renders active watches with stable and current transcript links', () => {
+    render(
+      <MemoryRouter>
+        <WatchingResultView response={[{
+          product_conversation_id: 'product-3', current_transcript_id: 'transcript-3', current_state: { type: 'Idle' },
+        }]} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('link', { name: '@conv:product-3' })).toHaveAttribute('href', '/product-conversations/product-3');
+    expect(screen.getByRole('link', { name: '@transcript:transcript-3' })).toHaveAttribute('href', '/conversations/transcript-3');
+    expect(screen.getByText('Idle')).toBeInTheDocument();
+  });
+});
 
 let mockDensity: 'full' | 'compact' = 'full';
 

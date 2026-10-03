@@ -29,7 +29,7 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 
-use super::handle::{BashLaunchIdentity, Handle, HandleId};
+use super::handle::{BashLaunchIdentity, Handle, HandleId, HandleState};
 use super::ring::RING_BUFFER_BYTES;
 
 /// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
@@ -656,6 +656,23 @@ impl BashHandleRegistry {
         }
     }
 
+    /// Snapshots process-local live handles controlled by the Global Coordinator.
+    pub async fn live_coordinator_handles(&self) -> Vec<Arc<Handle>> {
+        let registered: Vec<RegisteredHandle> =
+            self.handles_by_id.read().await.values().cloned().collect();
+        let mut live = Vec::new();
+        for entry in registered {
+            if entry.owner != ResourceScopeKey::Coordinator {
+                continue;
+            }
+            if matches!(&*entry.handle.state().await, HandleState::Live(_)) {
+                live.push(entry.handle);
+            }
+        }
+        live.sort_by(|left, right| left.handle_id.0.cmp(&right.handle_id.0));
+        live
+    }
+
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
         self.handles_by_id.read().await.get(handle_id).cloned()
     }
@@ -1239,6 +1256,7 @@ mod tests {
             phoenix_core::work_scope::ResourceAuthority::Work,
             format!("cmd for {id}"),
             None,
+            std::path::PathBuf::from("."),
             process_group_id,
             process_id,
             ring_bytes_cap,
@@ -2205,6 +2223,7 @@ mod tests {
                 phoenix_core::work_scope::ResourceAuthority::Work,
                 "sleep 60".to_string(),
                 None,
+                std::path::PathBuf::from("."),
                 pgid,
                 pid,
                 RING_BUFFER_BYTES,

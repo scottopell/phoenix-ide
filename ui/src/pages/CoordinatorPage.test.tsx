@@ -11,6 +11,7 @@ const { apiMock } = vi.hoisted(() => ({
     resolveCoordinatorRoute: vi.fn(),
     getCoordinatorAutomaticContinuation: vi.fn(),
     updateCoordinatorAutomaticContinuation: vi.fn(),
+    listLiveCoordinatorBashHandles: vi.fn(),
   },
 }));
 
@@ -73,6 +74,7 @@ describe('CoordinatorPage', () => {
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([]);
     apiMock.getCoordinatorAutomaticContinuation.mockResolvedValue({
       aggregate: { kind: 'coordinator', product_conversation_id: 'coordinator-product' },
       auto_continue_on_context_exhaustion: false,
@@ -83,6 +85,19 @@ describe('CoordinatorPage', () => {
       auto_continue_on_context_exhaustion: true,
       admission: null,
     });
+  });
+
+  it('shows only server-reported live Coordinator commands with inspect navigation', async () => {
+    apiMock.listLiveCoordinatorBashHandles.mockResolvedValue([{
+      handle_id: 'b-live', command: 'pnpm test', label: 'UI tests', cwd: '/repo/ui', started_at_ms: 123,
+    }]);
+
+    renderPage();
+
+    const running = await screen.findByRole('region', { name: 'Running commands' });
+    expect(running).toHaveTextContent('UI tests');
+    expect(running).toHaveTextContent('/repo/ui');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '?viewer=inspect&handle=b-live');
   });
 
   it('mounts only the shared conversation runtime with the briefing action', async () => {

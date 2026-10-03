@@ -48,3 +48,43 @@
 .coordinator-error {
   color: var(--accent-red);
 }
+
+.global-live-commands {
+  display: grid;
+  gap: 6px;
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.global-live-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.global-live-command > div {
+  display: grid;
+  min-width: 0;
+}
+
+.global-live-command code {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-live-command a {
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+
+.global-live-commands-error {
+  margin: 0 12px 8px;
+  color: var(--accent-red);
+  font-size: 0.85rem;
+}

@@ -787,6 +787,7 @@ fn spawn_child(
         ctx.resource_access.authority(),
         cmd.to_string(),
         label,
+        spawn_context.working_dir.clone(),
         pgid,
         pid,
         ring_bytes_cap,
