@@ -4,7 +4,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-main
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'prepare-main' && 'preparation' || 'release' }}
   cancel-in-progress: false
 
 on:
@@ -12,12 +12,19 @@ on:
     branches: [main]
     paths:
       - 'crates/phoenix-ide/Cargo.toml'
-  # Manual retry is bound to an existing immutable release tag.
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing release tag to retry (for example v1.2.3 or v1.2.3-rc.1)
+      operation:
+        description: Protected operation to run
         required: true
+        default: retry-release
+        type: choice
+        options:
+          - prepare-main
+          - retry-release
+      tag:
+        description: Existing immutable release tag (retry-release only)
+        required: false
         type: string
 
 jobs:
@@ -27,11 +34,14 @@ jobs:
   gate:
     if: github.ref == 'refs/heads/main'
     permissions:
-      contents: write
+      contents: read
     runs-on: ubuntu-latest
     outputs:
+      preparation: ${{ steps.ver.outputs.preparation }}
       release: ${{ steps.ver.outputs.release }}
+      create_tag: ${{ steps.ver.outputs.create_tag }}
       tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
       channel: ${{ steps.ver.outputs.channel }}
       commit: ${{ steps.ver.outputs.commit }}
     steps:
@@ -42,33 +52,69 @@ jobs:
       - name: Resolve version, tag if new
         id: ver
         env:
+          OPERATION: ${{ inputs.operation }}
           RETRY_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]]; then
-            TAG=$RETRY_TAG
-            VERSION=$(python3 scripts/release_version.py validate-tag "$TAG") || {
-              echo "Manual retry requires a supported existing release tag: $TAG" >&2
-              exit 1
-            }
-            case "$VERSION" in
-              *-rc.*) CHANNEL=rc ;;
-              *) CHANNEL=stable ;;
+            case "$OPERATION" in
+              prepare-main)
+                [[ -z "$RETRY_TAG" ]] || {
+                  echo "prepare-main does not accept a release tag" >&2
+                  exit 1
+                }
+                VERSION=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+                VERSION=$(python3 scripts/release_version.py validate "$VERSION") || {
+                  echo "Current main version is not supported for desktop preparation: $VERSION" >&2
+                  exit 1
+                }
+                case "$VERSION" in
+                  *-rc.*) CHANNEL=rc ;;
+                  *) CHANNEL=stable ;;
+                esac
+                echo "Preparing protected desktop artifacts from exact main commit $GITHUB_SHA without a tag or release."
+                echo "preparation=true" >> "$GITHUB_OUTPUT"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                echo "create_tag=false" >> "$GITHUB_OUTPUT"
+                echo "tag=" >> "$GITHUB_OUTPUT"
+                echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+                echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+                echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              retry-release)
+                TAG=$RETRY_TAG
+                VERSION=$(python3 scripts/release_version.py validate-tag "$TAG") || {
+                  echo "Manual retry requires a supported existing release tag: $TAG" >&2
+                  exit 1
+                }
+                case "$VERSION" in
+                  *-rc.*) CHANNEL=rc ;;
+                  *) CHANNEL=stable ;;
+                esac
+                git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
+                  echo "Manual dispatch cannot create missing tag $TAG" >&2
+                  exit 1
+                }
+                TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+                git merge-base --is-ancestor "$TAG_COMMIT" origin/main || {
+                  echo "Tagged commit $TAG_COMMIT is not on main" >&2
+                  exit 1
+                }
+                echo "Retrying $TAG from its immutable main commit $TAG_COMMIT."
+                echo "preparation=false" >> "$GITHUB_OUTPUT"
+                echo "release=true" >> "$GITHUB_OUTPUT"
+                echo "create_tag=false" >> "$GITHUB_OUTPUT"
+                echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+                echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+                echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+                echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              *)
+                echo "Unsupported release operation: $OPERATION" >&2
+                exit 1
+                ;;
             esac
-            git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
-              echo "Manual dispatch cannot create missing tag $TAG" >&2
-              exit 1
-            }
-            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
-            git merge-base --is-ancestor "$TAG_COMMIT" origin/main || {
-              echo "Tagged commit $TAG_COMMIT is not on main" >&2
-              exit 1
-            }
-            echo "Retrying $TAG from its immutable main commit $TAG_COMMIT."
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-            echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
-            echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-            echo "release=true" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
 
           VERSION=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
@@ -85,32 +131,55 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "preparation=false" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             TAG_COMMIT=$(git rev-list -n 1 "$TAG")
             if [ "$TAG_COMMIT" = "$GITHUB_SHA" ]; then
               echo "Tag $TAG already points at this exact commit — retrying its release."
               echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "create_tag=false" >> "$GITHUB_OUTPUT"
             else
               echo "Tag $TAG already points at $TAG_COMMIT, not $GITHUB_SHA — nothing to release."
               echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "create_tag=false" >> "$GITHUB_OUTPUT"
             fi
           else
             git tag --list 'v*' | python3 scripts/release_version.py validate-new-from-tags "$VERSION" >/dev/null || {
               echo "Release version $VERSION must be newer than every supported release tag." >&2
               exit 1
             }
-            echo "Tagging $(git rev-parse --short HEAD) as $TAG"
-            # Annotated tags need a committer identity; the runner has none.
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$TAG" -m "$TAG"
-            git push origin "$TAG"
+            echo "Tag $TAG is eligible for creation at exact commit $GITHUB_SHA."
+            echo "create_tag=true" >> "$GITHUB_OUTPUT"
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build-linux:
+  tag-release:
     needs: gate
-    if: needs.gate.outputs.release == 'true'
+    if: needs.gate.outputs.create_tag == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.gate.outputs.commit }}
+          fetch-depth: 0
+      - name: Create exact release tag
+        run: |
+          TAG=${{ needs.gate.outputs.tag }}
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && {
+            echo "Tag $TAG appeared after the gate; refusing replacement." >&2
+            exit 1
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+  build-linux:
+    needs: [gate, tag-release]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.release == 'true' && (needs.tag-release.result == 'success' || needs.tag-release.result == 'skipped') }}
     strategy:
       matrix:
         include:
@@ -166,8 +235,8 @@ jobs:
 
   build-macos:
     environment: macos-release-signing
-    needs: gate
-    if: needs.gate.outputs.release == 'true'
+    needs: [gate, tag-release]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.gate.outputs.preparation == 'true' || (needs.gate.outputs.release == 'true' && (needs.tag-release.result == 'success' || needs.tag-release.result == 'skipped'))) }}
     strategy:
       matrix:
         include:
@@ -253,12 +322,51 @@ jobs:
           codesign --force --sign "$MACOS_SIGNING_IDENTITY" --options runtime --timestamp "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           codesign --verify --strict --verbose=2 "$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
           export MACOS_SIGNING_IDENTITY APPLE_TEAM_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_API_KEY_PATH
+          receipt_args=()
+          if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
+            receipt_args+=("$RUNNER_TEMP/release-assets/PREPARATION-RECEIPT-${{ matrix.target }}.json")
+          fi
           macos/Phoenix/scripts/package-desktop-release.sh \
             "$RUNNER_TEMP/release-assets/${{ matrix.asset }}" \
             "${{ matrix.target }}" \
-            "${{ needs.gate.outputs.tag }}" \
+            "v${{ needs.gate.outputs.version }}" \
             "${{ needs.gate.outputs.commit }}" \
-            "$RUNNER_TEMP/release-assets"
+            "$RUNNER_TEMP/release-assets" \
+            "${receipt_args[@]}"
+          if [[ "${{ needs.gate.outputs.preparation }}" == true ]]; then
+            short_commit=${{ needs.gate.outputs.commit }}
+            short_commit=${short_commit:0:12}
+            standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}"
+            archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-v${{ needs.gate.outputs.version }}.zip"
+            prepared_standalone="$RUNNER_TEMP/release-assets/${{ matrix.asset }}-prepared-$short_commit"
+            prepared_archive="$RUNNER_TEMP/release-assets/Phoenix-macos-${{ matrix.target }}-prepared-$short_commit.zip"
+            mv "$standalone" "$prepared_standalone"
+            mv "$archive" "$prepared_archive"
+            manifest="$RUNNER_TEMP/release-assets/PREPARATION-SHA256SUMS-${{ matrix.target }}"
+            receipt="$RUNNER_TEMP/release-assets/PREPARATION-RECEIPT-${{ matrix.target }}.json"
+            (
+              cd "$RUNNER_TEMP/release-assets"
+              shasum -a 256 "$(basename "$prepared_standalone")" "$(basename "$prepared_archive")" \
+                > "$(basename "$manifest")"
+              shasum -a 256 -c "$(basename "$manifest")"
+            )
+            python3 - "$receipt" "$manifest" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          receipt_path, manifest_path = map(Path, sys.argv[1:])
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+          digests = {}
+          for line in manifest_path.read_text(encoding="utf-8").splitlines():
+              digest, name = line.split(maxsplit=1)
+              digests[name] = digest
+          if len(digests) != 2:
+              raise SystemExit("preparation manifest must contain exactly two payloads")
+          receipt["sha256"] = digests
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          fi
       - name: Remove protected material
         if: always()
         run: |
@@ -275,13 +383,22 @@ jobs:
           [[ ! -e "$RUNNER_TEMP/phoenix-notary-api-key.p8" ]]
           exit "$cleanup_failed"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.gate.outputs.release == 'true'
         with:
           name: macos-${{ matrix.target }}
           path: ${{ runner.temp }}/release-assets/*
           if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.gate.outputs.preparation == 'true'
+        with:
+          name: desktop-preparation-${{ matrix.target }}-${{ needs.gate.outputs.commit }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     needs: [gate, build-linux, build-macos]
+    if: needs.gate.outputs.release == 'true'
     environment: macos-release-signing
     permissions:
       contents: write

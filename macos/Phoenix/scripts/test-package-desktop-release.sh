@@ -308,9 +308,33 @@ grep -F 'notarytool log submission-fixture' "$tmp/xcrun.log" >/dev/null
 unset FAKE_NOTARY_EXIT
 : > "$tmp/xcrun.log"
 
+receipt="$tmp/preparation-receipt.json"
 asset=$("$root/macos/Phoenix/scripts/package-desktop-release.sh" \
   "$tmp/sidecar" aarch64-apple-darwin v1.2.3 \
-  0123456789abcdef0123456789abcdef01234567 "$tmp/out")
+  0123456789abcdef0123456789abcdef01234567 "$tmp/out" "$receipt")
+python3 - "$receipt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert receipt == {
+    "schema": 1,
+    "operation": "prepare-main",
+    "target": "aarch64-apple-darwin",
+    "version": "1.2.3",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "checks": {
+        "developer_id_signature": "verified",
+        "hardened_runtime": "verified",
+        "notarization": "accepted",
+        "notarization_submission_id": "submission-fixture",
+        "stapled_ticket": "validated",
+        "gatekeeper": "accepted",
+        "embedded_helper_bytes": "identical",
+    },
+}
+PY
 [[ -s "$asset" ]]
 grep -F -- '--verify --strict --verbose=2' "$tmp/codesign.log" >/dev/null
 grep -F -- '--force --sign Developer ID Application: Phoenix Test' "$tmp/codesign.log" >/dev/null

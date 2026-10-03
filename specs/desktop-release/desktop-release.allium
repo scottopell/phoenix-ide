@@ -3,7 +3,7 @@
 --
 -- Scope: exact-tag gating, paired architecture-specific helper/app builds,
 -- Developer ID signing, notarization, and private publication preparation.
--- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009.
+-- Requirement traceability: REQ-DESKTOP-REL-001/002/003/005/007/008/009/010.
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | refused }
 enum ArtifactState { pending | built | verified | failed }
@@ -113,10 +113,23 @@ entity ReleasePublication {
     }
 }
 
+value PreparationIdentity {
+    version: String
+    full_commit: FullCommitIdentity
+}
+
+entity DesktopPreparation {
+    identity: PreparationIdentity
+    apple_silicon_pair: ArchitecturePair
+    intel_pair: ArchitecturePair
+    verified: Boolean
+}
+
 surface DesktopReleaseWorkflow {
     context gate: ReleaseGate
     context pair: ArchitecturePair
     context publication: ReleasePublication
+    context preparation: DesktopPreparation
 
     provides:
         ReleaseTagCreated(gate)
@@ -136,6 +149,7 @@ surface DesktopReleaseWorkflow {
         InaccessiblePublicationPublished(gate, publication)
         PublishedReleaseRetried(gate, publication)
         PublishedReleaseMismatchFound(publication)
+        ProtectedPreparationRequested(preparation)
 }
 
 -- Helpers
@@ -193,6 +207,20 @@ surface DesktopReleaseWorkflow {
 --   stable publication metadata is prerelease=false and make_latest=true unless a
 --   newer stable is already latest, in which case publication is refused; RC
 --   metadata is prerelease=true and make_latest=false.
+-- preparation_identity_is_current_main(preparation) -> Boolean
+--   preparation identity is the exact current main commit and its source version.
+-- preparation_uses_release_security_path(preparation) -> Boolean
+--   preparation.apple_silicon_pair and preparation.intel_pair have their matching
+--   targets and satisfy the signing, notarization, stapling, Gatekeeper,
+--   helper-byte, complete identity, and checksum checks.
+-- preparation_has_no_release_authority(preparation) -> Boolean
+--   preparation creates or moves no tag, creates or mutates no GitHub release,
+--   performs no deployment or installation, and grants no stable/RC decision.
+-- sanitized_preparation_receipts_exist(preparation) -> Boolean
+--   GitHub Actions artifacts record exact identity, target, command-derived
+--   verification results, notarization submission identity, and independently
+--   rechecked artifact digests without protected credential material; they are
+--   not attached to or published as a GitHub Release.
 -- publication_has_workflow_sole_writer(publication) -> Boolean
 --   no other release workflow can concurrently create a tag or mutate publication.
 -- public_release_differs(publication) -> Boolean
@@ -361,6 +389,14 @@ invariant CompletedArchitecturePairHasOneIdentity {
         helper_identity_resolves_to_release(ArchitecturePair) and
         helper_bytes_are_paired(ArchitecturePair)
     )
+}
+
+rule ProtectedMainPreparationProducesPrivateEvidence {
+    when: ProtectedPreparationRequested(preparation)
+    requires: preparation_identity_is_current_main(preparation)
+    ensures: preparation_has_no_release_authority(preparation)
+    ensures: preparation_uses_release_security_path(preparation) implies sanitized_preparation_receipts_exist(preparation)
+    ensures: preparation.verified = preparation_uses_release_security_path(preparation)
 }
 
 invariant PublicReleaseIsExact {
