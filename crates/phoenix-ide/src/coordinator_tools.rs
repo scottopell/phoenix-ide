@@ -896,6 +896,16 @@ mod tests {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
             let expected = scenario["expected"].as_str().unwrap_or("hit");
+            if case_id == "selective-known-match" {
+                let setup_hits = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    policy_service.search_hits(query),
+                )
+                .await
+                .expect("selective policy timeout")
+                .expect("selective policy validation");
+                assert!(!setup_hits.is_empty(), "selective candidate has no eligible hits under actual tool policy; choose another candidate before benchmarking");
+            }
             let context = context("benchmark");
             let is_retriever = scenario["kind"] == "retriever";
             let is_scoped = scenario["scope"] == "conversation";
