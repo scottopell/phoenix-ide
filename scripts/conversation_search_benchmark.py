@@ -212,7 +212,7 @@ def _write_atomic_private(path: Path, text: str) -> None:
 
 
 def _uri(path: Path, *, immutable: bool = False) -> str:
-    return f"{path.resolve().as_uri()}?mode=ro"
+    return f"{path.resolve().as_uri()}?mode=ro" + ("&immutable=1" if immutable else "")
 
 def _hash(path: Path) -> str:
     h = hashlib.sha256()
