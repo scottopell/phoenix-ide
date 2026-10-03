@@ -634,6 +634,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_profile_insert_without_user_root_is_rejected_by_schema() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id =
+            ordinary_without_user_root(&db, "pc-project-coordinator-direct-no-user-root").await;
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 1, 'direct')",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect("direct retained revision");
+
+        let insert_error = sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profiles
+                 (product_conversation_id, charter, updated_at_unix_micros)
+             VALUES (?1, 'direct charter', 1)",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("schema must reject profile without user root");
+
+        assert!(insert_error
+            .to_string()
+            .contains("Project Coordinator profile requires ordinary ProductConversation"));
+    }
+
+    #[tokio::test]
     async fn product_conversation_with_child_sub_agent_allows_profile_writes() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-with-child-agent").await;
@@ -929,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_retained_revision_replace_is_rejected_while_profile_active() {
+    async fn direct_retained_revision_replace_is_rejected() {
         let db = Database::open_in_memory().await.expect("database");
         let id = ordinary(&db, "pc-project-coordinator-direct-revision-replace").await;
         db.write_project_coordinator_profile(&id, Some("first"), 0)
@@ -956,6 +986,27 @@ mod tests {
             .expect("profile retained after rejected replace");
         assert_eq!(profile.charter(), "first");
         assert_eq!(profile.revision(), 1);
+
+        db.write_project_coordinator_profile(&id, None, 1)
+            .await
+            .expect("disable");
+        let disabled_replace_error = sqlx::query(
+            "INSERT OR REPLACE INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 0, 'disabled-replacement')",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("disabled retained revision replacement must be rejected");
+        assert!(disabled_replace_error
+            .to_string()
+            .contains("Project Coordinator retained revision"));
+        let retained_revision = db
+            .get_project_coordinator_profile_revision(&id)
+            .await
+            .expect("retained revision");
+        assert_eq!(retained_revision, 2);
     }
 
     #[tokio::test]

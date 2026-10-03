@@ -7673,13 +7673,26 @@ where
             );
         }
         let mut request_system_blocks = vec![SystemContent::cached(&system_prompt)];
-        if let Some(profile) = project_coordinator_profile {
+        if let Some(profile) = project_coordinator_profile.as_ref() {
             request_system_blocks.push(SystemContent::cached(
                 crate::system_prompt::project_coordinator_charter_block(
                     profile.charter(),
                     llm_language,
                 ),
             ));
+        }
+        if project_coordinator_profile.is_some() {
+            let estimated_prompt_tokens = request_system_blocks
+                .iter()
+                .map(|block| estimate_text_tokens(&block.text))
+                .sum::<usize>()
+                + estimate_messages_tokens(&frozen_messages);
+            if estimated_prompt_tokens > self.context.context_window {
+                return Err(format!(
+                    "Project Coordinator profile prompt exceeds context window after reserving charter: estimated {estimated_prompt_tokens} tokens > {} token window",
+                    self.context.context_window
+                ));
+            }
         }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
@@ -13125,6 +13138,69 @@ mod dispatch_context_budget_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_project_coordinator_profile_reaches_provider_request() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "project-coordinator-profile-provider-request";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 20_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .add_message(
+                "user-message",
+                conv_id,
+                &MessageContent::User(UserContent::new("Coordinate this work")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist message");
+        storage.set_project_coordinator_profile(
+            conv_id,
+            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile::new(
+                "Stay evidence-first.".to_string(),
+                1,
+                1,
+            )
+            .expect("valid profile"),
+        );
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("accepted by provider")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+
+        let requests = llm.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].system[0].text.contains("Project Coordinator"));
+        assert!(requests[0]
+            .system
+            .iter()
+            .any(|block| block.text.contains("Stay evidence-first.")));
+    }
+
+    #[tokio::test]
     async fn conservative_prompt_estimate_cannot_short_circuit_provider_dispatch() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "large-estimate-still-dispatches";
@@ -14105,6 +14181,45 @@ mod authoritative_user_message_effect_tests {
             .expect_err("profile lookup failure must fail closed before dispatch");
 
         assert!(error.contains("failed to load Project Coordinator profile"));
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_project_coordinator_profile_over_budget_stops_before_provider_dispatch() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        rt.context.context_window = 256;
+        let conv = rt.context.conversation_id.clone();
+        storage
+            .add_message(
+                "ordinary-history",
+                &conv,
+                &MessageContent::user("ordinary retained history ".repeat(800)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage.set_project_coordinator_profile(
+            &conv,
+            phoenix_core::domain::product_conversation::ProjectCoordinatorProfile::new(
+                "durable charter ".repeat(1_000),
+                1,
+                1,
+            )
+            .expect("valid profile"),
+        );
+
+        let error = rt
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .expect_err("profile prompt budget overflow must fail before dispatch");
+
+        assert!(error.contains("Project Coordinator profile prompt exceeds context window"));
         assert!(rt.llm_client.recorded_requests().is_empty());
         assert!(rt.llm_task_handle.is_none());
     }

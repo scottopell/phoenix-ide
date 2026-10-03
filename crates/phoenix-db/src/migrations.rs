@@ -1392,8 +1392,15 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinar
 CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
 BEFORE INSERT ON product_conversation_coordinator_profiles
 FOR EACH ROW WHEN NOT EXISTS (
-    SELECT 1 FROM product_conversations
-    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
 )
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
@@ -1422,8 +1429,15 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinar
 CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_update
 BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
 FOR EACH ROW WHEN NOT EXISTS (
-    SELECT 1 FROM product_conversations
-    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
 )
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
@@ -1478,11 +1492,11 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
 BEFORE INSERT ON product_conversation_coordinator_profile_revisions
 FOR EACH ROW WHEN EXISTS (
-    SELECT 1 FROM product_conversation_coordinator_profiles
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
     WHERE product_conversation_id = NEW.product_conversation_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
 END;
 DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
@@ -1572,8 +1586,15 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinar
 CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
 BEFORE INSERT ON product_conversation_coordinator_profiles
 FOR EACH ROW WHEN NOT EXISTS (
-    SELECT 1 FROM product_conversations
-    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
 )
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
@@ -1599,8 +1620,15 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinar
 CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_update
 BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
 FOR EACH ROW WHEN NOT EXISTS (
-    SELECT 1 FROM product_conversations
-    WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
 )
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
@@ -1673,11 +1701,11 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
 BEFORE INSERT ON product_conversation_coordinator_profile_revisions
 FOR EACH ROW WHEN EXISTS (
-    SELECT 1 FROM product_conversation_coordinator_profiles
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
     WHERE product_conversation_id = NEW.product_conversation_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
 END;
 DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
@@ -1726,11 +1754,11 @@ DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
 BEFORE INSERT ON product_conversation_coordinator_profile_revisions
 FOR EACH ROW WHEN EXISTS (
-    SELECT 1 FROM product_conversation_coordinator_profiles
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
     WHERE product_conversation_id = NEW.product_conversation_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
 END;
 ";
 
@@ -11620,6 +11648,16 @@ mod tests {
              );
              INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
              VALUES ('pc-legacy-shape', 'ordinary', 'open');
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 product_conversation_id TEXT,
+                 parent_conversation_id TEXT,
+                 runtime_role TEXT NOT NULL,
+                 user_initiated INTEGER NOT NULL
+             );
+             INSERT INTO conversations
+                 (id, product_conversation_id, parent_conversation_id, runtime_role, user_initiated)
+             VALUES ('conv-legacy-shape', 'pc-legacy-shape', NULL, 'user', 1);
              CREATE TABLE product_conversation_coordinator_profile_revisions (
                  product_conversation_id TEXT PRIMARY KEY NOT NULL,
                  revision INTEGER NOT NULL,
