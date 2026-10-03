@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{InputOrigin, Message, MessageType};
 use phoenix_core::domain::message_text::index_text;
+use serde::Serialize;
 use sqlx::{Connection, Row, SqlitePool};
 use thiserror::Error;
 
@@ -159,7 +160,7 @@ impl RetrievalRequest {
 /// message in the lexical backend (`ordinal` 0, `char_range` `None`); a
 /// chunking backend assigns a distinct ordinal/range per chunk. Present
 /// unconditionally so the result shape is stable across backends.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChunkRef {
     /// 0 for a whole-message chunk.
     pub ordinal: u32,
@@ -168,7 +169,7 @@ pub struct ChunkRef {
 }
 
 /// One ranked retrieval result, carrying provenance (REQ-RET-006).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RetrievedChunk {
     /// Source conversation.
     pub conversation_id: String,
@@ -599,9 +600,9 @@ fn build_retrieval_sql(
     sql
 }
 
-fn retrieval_match_parts(
-    request: &RetrievalRequest,
-) -> Option<(String, Option<(String, Option<String>)>)> {
+type RetrievalMatchParts = Option<(String, Option<(String, Option<String>)>)>;
+
+fn retrieval_match_parts(request: &RetrievalRequest) -> RetrievalMatchParts {
     let match_expr = build_fts_query(&request.query, request.match_mode)?;
     let terms = content_terms(&request.query);
     let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
@@ -653,6 +654,10 @@ impl Fts5Retriever {
 
     /// Return `EXPLAIN QUERY PLAN` for the exact retrieval statement and binds.
     /// This diagnostic query is intentionally outside timed benchmark invocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetrievalError::Db`] when `SQLite` cannot execute the diagnostic query.
     pub async fn explain(&self, request: RetrievalRequest) -> Result<Vec<String>, RetrievalError> {
         if matches!(&request.scope, RetrievalScope::Conversations(ids) if ids.is_empty()) {
             return Ok(Vec::new());

@@ -707,7 +707,21 @@ mod tests {
     /// immutable fixture and frozen scenarios through environment variables.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "private production fixture benchmark; run via dev.py conversation-search run"]
+    #[allow(
+        clippy::format_collect,
+        clippy::large_stack_arrays,
+        clippy::too_many_lines
+    )]
     async fn production_conversation_search_benchmark() {
+        enum InvocationResult {
+            Retriever(Result<Vec<crate::db::RetrievedChunk>, String>),
+            Tool {
+                ok: bool,
+                output: String,
+                result_count: Option<usize>,
+            },
+        }
+
         use crate::db::MessageRetriever;
         use sha2::{Digest, Sha256};
         use std::io::Read;
@@ -736,6 +750,45 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect()
+        }
+        async fn observe_sqlite_regime(db: &crate::db::Database) -> Value {
+            let mut connection = db
+                .pool()
+                .acquire()
+                .await
+                .expect("acquire benchmark connection");
+            let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query SQLite version");
+            let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query journal mode");
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query synchronous mode");
+            let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query busy timeout");
+            let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query foreign keys");
+            let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("query query_only");
+            json!({
+                "sqlite_version": sqlite_version,
+                "journal_mode": journal_mode,
+                "synchronous": synchronous,
+                "busy_timeout_ms": busy_timeout_ms,
+                "foreign_keys": foreign_keys != 0,
+                "query_only": query_only != 0,
+            })
         }
 
         let db_path = std::env::var("PHOENIX_SEARCH_BENCH_DB")
@@ -777,7 +830,11 @@ mod tests {
         let mut failures = Vec::new();
         let mut explain_plans = Vec::new();
         let explain = std::env::var_os("PHOENIX_SEARCH_BENCH_EXPLAIN").is_some();
-        for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
+        let sqlite_regime = {
+            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            observe_sqlite_regime(&db).await
+        };
+        'scenarios: for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
             let expected = scenario["expected"].as_str().unwrap_or("hit");
@@ -840,6 +897,31 @@ mod tests {
                 retriever.mark_reconciled();
                 let service = GlobalReadService::new(db.clone(), retriever.clone());
                 let tool = SearchConversations(service.clone());
+                let retrieval_request = if *surface == "retriever" {
+                    Some(if is_scoped {
+                        let ids = scenario["conversation_ids"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|id| id.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        crate::db::RetrievalRequest::natural_language(
+                            query,
+                            crate::db::RetrievalScope::Conversations(ids),
+                            10,
+                        )
+                    } else {
+                        service
+                            .search_request(query)
+                            .await
+                            .expect("build global search request")
+                    })
+                } else {
+                    None
+                };
                 for (phase, count) in [
                     ("first_use_fresh_pool_os_cache_uncontrolled", 1usize),
                     ("warmup_discarded", 1usize),
@@ -848,78 +930,74 @@ mod tests {
                     for iteration in 0..count {
                         let started = Instant::now();
                         let invocation = async {
-                            let (ok, output, result_count, result_identity) = if *surface
-                                == "retriever"
-                            {
-                                let ids = scenario["conversation_ids"]
-                                    .as_array()
-                                    .map(|values| {
-                                        values
-                                            .iter()
-                                            .filter_map(|id| id.as_str().map(str::to_owned))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let scope = if is_retriever && is_scoped {
-                                    crate::db::RetrievalScope::Conversations(ids)
-                                } else {
-                                    let coordinator_chain = service
-                                        .search_request(query)
+                            if *surface == "retriever" {
+                                let request = retrieval_request
+                                    .clone()
+                                    .expect("retrieval request prepared before timing");
+                                InvocationResult::Retriever(
+                                    retriever
+                                        .retrieve(request)
                                         .await
-                                        .expect("build global search request")
-                                        .scope()
-                                        .clone();
-                                    coordinator_chain
-                                };
-                                let request =
-                                    crate::db::RetrievalRequest::natural_language(query, scope, 10);
-
-                                match retriever.retrieve(request).await {
-                                    Ok(hits) => {
-                                        let identity = hits
-                                            .iter()
-                                            .map(|hit| {
-                                                format!(
-                                                    "{}:{}",
-                                                    hit.conversation_id, hit.message_id
-                                                )
-                                            })
-                                            .collect::<Vec<_>>();
-                                        (
-                                            true,
-                                            serde_json::to_string(&identity).unwrap(),
-                                            Some(hits.len()),
-                                            Some(identity),
-                                        )
-                                    }
-                                    Err(error) => (false, error.to_string(), None, None),
-                                }
+                                        .map_err(|error| error.to_string()),
+                                )
                             } else {
                                 let result = tool
                                     .run(serde_json::json!({"query": query}), context.clone())
                                     .await;
                                 let output = result.output().to_string();
-                                let count = (output == "No matching messages found.").then_some(0);
-                                (result.is_success(), output, count, None)
-                            };
-                            (ok, output, result_count, result_identity)
+                                let result_count =
+                                    (output == "No matching messages found.").then_some(0);
+                                InvocationResult::Tool {
+                                    ok: result.is_success(),
+                                    output,
+                                    result_count,
+                                }
+                            }
                         };
-                        let (ok, output, result_count, result_identity) =
-                            tokio::time::timeout(Duration::from_secs(300), invocation)
-                                .await
-                                .unwrap_or_else(|_| {
-                                    (
-                                        false,
-                                        "per-case timeout after 300 seconds".to_string(),
-                                        None,
-                                        None,
-                                    )
-                                });
+                        let (timed_out, invocation_result) = match tokio::time::timeout(
+                            Duration::from_secs(300),
+                            invocation,
+                        )
+                        .await
+                        {
+                            Ok(result) => (false, result),
+                            Err(_) => (
+                                true,
+                                InvocationResult::Tool {
+                                    ok: false,
+                                    output: "per-case timeout after 300 seconds".to_string(),
+                                    result_count: None,
+                                },
+                            ),
+                        };
+                        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let (ok, output, result_count, result_identity) = match invocation_result {
+                            InvocationResult::Retriever(Ok(hits)) => {
+                                let identity = hits
+                                    .iter()
+                                    .map(|hit| {
+                                        format!("{}:{}", hit.conversation_id, hit.message_id)
+                                    })
+                                    .collect::<Vec<_>>();
+                                (
+                                    true,
+                                    serde_json::to_string(&hits).unwrap(),
+                                    Some(hits.len()),
+                                    Some(identity),
+                                )
+                            }
+                            InvocationResult::Retriever(Err(error)) => (false, error, None, None),
+                            InvocationResult::Tool {
+                                ok,
+                                output,
+                                result_count,
+                            } => (ok, output, result_count, None),
+                        };
                         let digest = digest_bytes(output.as_bytes());
                         samples.push(serde_json::json!({
                             "case_id": case_id, "surface": surface,
                             "phase": phase, "iteration": iteration,
-                            "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "duration_ms": duration_ms,
                             "ok": ok, "result": output, "result_digest": digest,
                             "result_bytes": output.len(), "result_count": result_count,
                             "result_identity": result_identity, "expected": expected,
@@ -934,6 +1012,9 @@ mod tests {
                         if expected == "hit" && result_count == Some(0) {
                             failures.push(format!("expected hit case {case_id}, got zero results"));
                         }
+                        if timed_out {
+                            break 'scenarios;
+                        }
                     }
                 }
             }
@@ -942,8 +1023,7 @@ mod tests {
             "scenario_digest": scenario_digest, "profile": "release",
             "commit": std::env::var("PHOENIX_SEARCH_BENCH_COMMIT").unwrap_or_else(|_| "unknown".into()),
             "environment": {"host": std::env::var("PHOENIX_SEARCH_BENCH_HOST").unwrap_or_default(), "platform": std::env::var("PHOENIX_SEARCH_BENCH_PLATFORM").unwrap_or_default(), "processor": std::env::var("PHOENIX_SEARCH_BENCH_PROCESSOR").unwrap_or_default(), "cpu_count": std::env::var("PHOENIX_SEARCH_BENCH_CPU_COUNT").unwrap_or_default()},
-            "sqlite_pragmas": {"pool_max_connections": 10, "busy_timeout_ms": 5000,
-                       "journal_mode": "fixture-preserved", "read_only": true, "foreign_keys": true},
+            "sqlite_pragmas": sqlite_regime,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
             "measurement_regimes": ["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
