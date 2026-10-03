@@ -186,7 +186,7 @@ impl Tool for WorkScopeCoordinatorBash {
             Err(error) => return ToolOutput::error(error),
         };
         let context_input = invocation.to_context_tool_value();
-        let spawn_target = match &invocation {
+        let (spawn_target, environment_display) = match &invocation {
             BashInvocation::Run {
                 target: BashSpawnTarget::WorkScope(work_scope_id),
                 ..
@@ -199,10 +199,20 @@ impl Tool for WorkScopeCoordinatorBash {
                     Ok(path) => path,
                     Err(error) => return ToolOutput::error(error),
                 };
-                ValidatedBashSpawnTarget {
-                    working_dir: binding.path,
-                    lifecycle_scope: binding.work_scope_id,
-                }
+                let display = json!({
+                    "work_scope_id": binding.work_scope_id.clone(),
+                    "cwd": binding.path.clone(),
+                    "owner_name": binding.owner_name,
+                    "owner_product_conversation_id": binding.owner_product_conversation_id,
+                    "project_path": binding.project_path,
+                });
+                (
+                    ValidatedBashSpawnTarget {
+                        working_dir: binding.path.clone(),
+                        lifecycle_scope: binding.work_scope_id.clone(),
+                    },
+                    display,
+                )
             }
             BashInvocation::Run {
                 target: BashSpawnTarget::Context,
@@ -214,9 +224,22 @@ impl Tool for WorkScopeCoordinatorBash {
                 return BashTool.run(context_input, ctx).await;
             }
         };
-        BashTool
+        let mut output = BashTool
             .run_explicit_target(context_input, spawn_target, ctx)
-            .await
+            .await;
+        if matches!(invocation, BashInvocation::Run { .. }) {
+            match &mut output {
+                ToolOutput::Success { display_data, .. }
+                | ToolOutput::Error { display_data, .. } => {
+                    let display = display_data.get_or_insert_with(|| json!({}));
+                    if let Some(object) = display.as_object_mut() {
+                        object.insert("coordinator_environment".to_string(), environment_display);
+                    }
+                }
+                ToolOutput::TrustedInstructions(_) => {}
+            }
+        }
+        output
     }
 }
 
@@ -547,7 +570,19 @@ impl Tool for SendConversationMessage {
             outcome = output.kind(),
             "Cross-conversation message action committed"
         );
-        encode_message_output(&output)
+        let display_identity = match output.conversation_id() {
+            Some(conversation_id) => self
+                .service
+                .conversation_display_identity(conversation_id)
+                .await
+                .ok(),
+            None => None,
+        };
+        let encoded = encode_message_output(&output);
+        match display_identity {
+            Some(identity) => encoded.with_display(json!({ "recipient_identity": identity })),
+            None => encoded,
+        }
     }
 }
 
