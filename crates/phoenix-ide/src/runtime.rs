@@ -49,7 +49,7 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
-use crate::db::{ConvMode, Database};
+use crate::db::{ConvMode, Database, ExecutionOccurrenceTerminal};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use chrono::{DateTime, Utc};
@@ -752,9 +752,22 @@ enum BashLifecycleBridgeAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionOccurrenceDisposition {
+    Resume,
+    Completed,
+    RestartLoopDetected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutionOccurrenceRecovery {
     source_message_id: String,
-    needs_resume: bool,
+    disposition: ExecutionOccurrenceDisposition,
+}
+
+impl ExecutionOccurrenceRecovery {
+    fn needs_resume(&self) -> bool {
+        self.disposition == ExecutionOccurrenceDisposition::Resume
+    }
 }
 
 type StartupLlmRecoveryReceipt = oneshot::Receiver<Result<(), String>>;
@@ -3756,37 +3769,46 @@ impl RuntimeManager {
         else {
             return Ok(None);
         };
-        let messages = self
-            .db
-            .get_recovery_messages(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(source_index) = messages
-            .iter()
-            .position(|message| message.message_id == source_message_id)
-        else {
-            return Err("execution occurrence source message is missing".to_string());
-        };
-        let suffix = &messages[source_index..];
-        let needs_resume = if suffix.iter().any(|message| {
-            matches!(
-                message.message_type,
-                phoenix_core::domain::db_schema::MessageType::Agent
-            )
-        }) {
+        for _ in 0..3 {
+            let messages = self
+                .db
+                .get_recovery_messages_from_source(conversation_id, &source_message_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !messages.iter().any(|message| {
+                matches!(
+                    message.message_type,
+                    phoenix_core::domain::db_schema::MessageType::Agent
+                )
+            }) {
+                return Ok(Some(ExecutionOccurrenceRecovery {
+                    source_message_id,
+                    disposition: ExecutionOccurrenceDisposition::Resume,
+                }));
+            }
             let tail = self
                 .db
                 .get_recovery_tail_status(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            recovery::decide_recovery(suffix, &tail).needs_auto_continue
-        } else {
-            true
-        };
-        Ok(Some(ExecutionOccurrenceRecovery {
-            source_message_id,
-            needs_resume,
-        }))
+            let decision = recovery::decide_recovery(&messages, &tail);
+            let disposition = match decision.reason {
+                recovery::RecoveryReason::TranscriptChanged => continue,
+                recovery::RecoveryReason::RestartLoopDetected => {
+                    ExecutionOccurrenceDisposition::RestartLoopDetected
+                }
+                _ if decision.needs_auto_continue => ExecutionOccurrenceDisposition::Resume,
+                _ => ExecutionOccurrenceDisposition::Completed,
+            };
+            return Ok(Some(ExecutionOccurrenceRecovery {
+                source_message_id,
+                disposition,
+            }));
+        }
+        Err(
+            "restart transcript changed repeatedly during execution occurrence classification"
+                .to_string(),
+        )
     }
 
     async fn startup_resumable_owner(
@@ -3826,7 +3848,7 @@ impl RuntimeManager {
             let occurrence_recovery = self.execution_occurrence_recovery(&conversation_id).await?;
             let has_resumable_occurrence = occurrence_recovery
                 .as_ref()
-                .is_some_and(|occurrence| occurrence.needs_resume);
+                .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
             if recovery_decision.as_ref().is_some_and(|decision| {
                 decision.reason == recovery::RecoveryReason::RestartLoopDetected
             }) && !has_queued_steering
@@ -3835,7 +3857,7 @@ impl RuntimeManager {
                 continue;
             }
             let settled_occurrence = self
-                .settle_completed_execution_occurrence(
+                .settle_execution_occurrence_recovery(
                     &conversation_id,
                     occurrence_recovery.as_ref(),
                 )
@@ -3925,19 +3947,41 @@ impl RuntimeManager {
             .map_err(|_| "runtime exited before acknowledging startup LLM recovery".to_string())?
     }
 
-    async fn settle_completed_execution_occurrence(
+    async fn settle_execution_occurrence_recovery(
         &self,
         conversation_id: &str,
         occurrence: Option<&ExecutionOccurrenceRecovery>,
     ) -> Result<bool, String> {
-        let Some(occurrence) = occurrence.filter(|occurrence| !occurrence.needs_resume) else {
+        let Some(occurrence) = occurrence else {
             return Ok(false);
+        };
+        let (terminal, state) = match occurrence.disposition {
+            ExecutionOccurrenceDisposition::Resume => return Ok(false),
+            ExecutionOccurrenceDisposition::Completed => {
+                (ExecutionOccurrenceTerminal::Completed, ConvState::Idle)
+            }
+            ExecutionOccurrenceDisposition::RestartLoopDetected => {
+                let message =
+                    "Automatic restart recovery stopped after repeated crashes for this accepted input."
+                        .to_string();
+                (
+                    ExecutionOccurrenceTerminal::Failed {
+                        reason: message.clone(),
+                    },
+                    ConvState::Error {
+                        message,
+                        error_kind: crate::db::ErrorKind::InvalidRequest,
+                        resets_at: None,
+                    },
+                )
+            }
         };
         self.db
             .settle_execution_occurrence(
                 conversation_id,
                 &occurrence.source_message_id,
-                &ConvState::Idle,
+                &terminal,
+                &state,
             )
             .await
             .map_err(|error| error.to_string())
@@ -5740,7 +5784,7 @@ impl RuntimeManager {
         let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
         let mut has_resumable_occurrence = occurrence_recovery
             .as_ref()
-            .is_some_and(|occurrence| occurrence.needs_resume);
+            .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
         if recovered_terminal_obligation.is_none() && initial_state != conv.state {
             let projected = if has_resumable_occurrence {
                 self.db
@@ -6790,7 +6834,7 @@ impl RuntimeManager {
         if self
             .execution_occurrence_recovery(conversation_id)
             .await?
-            .is_some_and(|occurrence| occurrence.needs_resume)
+            .is_some_and(|occurrence| occurrence.needs_resume())
         {
             return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
         }
@@ -6812,7 +6856,7 @@ impl RuntimeManager {
             && !self
                 .execution_occurrence_recovery(conversation_id)
                 .await?
-                .is_some_and(|occurrence| occurrence.needs_resume)
+                .is_some_and(|occurrence| occurrence.needs_resume())
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -13125,6 +13169,175 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn restart_marker_preserves_exact_batched_wake_occurrence() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-batched-wake-marker";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for (message_id, terminal) in [
+            ("resumable-wake", "Completed"),
+            ("later-cancelled-wake", "Cancelled"),
+        ] {
+            manager
+                .db()
+                .add_message(
+                    message_id,
+                    conversation_id,
+                    &crate::db::MessageContent::user("wake"),
+                    Some(&serde_json::json!({
+                        "type": "wake_result",
+                        "adopted": true,
+                        "terminal": { terminal: {} },
+                    })),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'resumable-wake', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "wake-restart-marker",
+                conversation_id,
+                &crate::db::MessageContent::System(crate::db::SystemContent {
+                    text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovery = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.source_message_id, "resumable-wake");
+        assert_eq!(recovery.disposition, ExecutionOccurrenceDisposition::Resume);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn exhausted_ownerless_occurrence_settles_as_failure() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-occurrence-exhausted";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-occurrence', 'seeded_fork')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-tool-request",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                        id: "exhausted-tool".to_string(),
+                        name: "think".to_string(),
+                        input: serde_json::json!({"thoughts": "recover"}),
+                    },
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "exhausted-tool-result",
+                conversation_id,
+                &crate::db::MessageContent::Tool(phoenix_core::domain::db_schema::ToolContent {
+                    tool_use_id: "exhausted-tool".to_string(),
+                    content: "done".to_string(),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("exhausted-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let recovery = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovery.disposition,
+            ExecutionOccurrenceDisposition::RestartLoopDetected
+        );
+        assert!(manager
+            .settle_execution_occurrence_recovery(conversation_id, Some(&recovery))
+            .await
+            .unwrap());
+        assert!(!manager
+            .db()
+            .has_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn completed_occurrence_settlement_preserves_replacement_occurrence() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "restart-occurrence-replaced-before-settlement";
@@ -13171,7 +13384,10 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!classified.needs_resume);
+        assert_eq!(
+            classified.disposition,
+            ExecutionOccurrenceDisposition::Completed
+        );
 
         manager
             .db()
@@ -13198,7 +13414,7 @@ mod scope_liveness_tests {
         .unwrap();
 
         assert!(!manager
-            .settle_completed_execution_occurrence(conversation_id, Some(&classified))
+            .settle_execution_occurrence_recovery(conversation_id, Some(&classified))
             .await
             .unwrap());
         assert_eq!(

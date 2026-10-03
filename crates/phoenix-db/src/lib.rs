@@ -557,6 +557,12 @@ pub enum CreationClaimOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionOccurrenceTerminal {
+    Completed,
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreationCasOutcome {
     Applied,
     ClaimLost,
@@ -7623,6 +7629,7 @@ impl Database {
         &self,
         conversation_id: &str,
         source_message_id: &str,
+        terminal: &ExecutionOccurrenceTerminal,
         state: &ConvState,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -7640,13 +7647,17 @@ impl Database {
         };
         let source_kind =
             crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+        let (terminal_kind, terminal_reason) = match terminal {
+            ExecutionOccurrenceTerminal::Completed => ("Completed", None),
+            ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+        };
         crate::coordinator_watches::record_steering_event_tx(
             &mut tx,
             source_kind,
             source_message_id,
             conversation_id,
-            "Completed",
-            None,
+            terminal_kind,
+            terminal_reason,
         )
         .await?;
         sqlx::query(
@@ -13044,6 +13055,42 @@ impl Database {
         let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
         Ok(tail)
+    }
+
+    /// Get the recovery suffix beginning at an exact durable input source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::MessageNotFound`] when the scoped source is absent,
+    /// or a database/decoding error when retrieval fails.
+    pub async fn get_recovery_messages_from_source(
+        &self,
+        conversation_id: &str,
+        source_message_id: &str,
+    ) -> DbResult<Vec<Message>> {
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut rows = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
+                 FROM messages
+                 WHERE conversation_id = ?1
+                   AND sequence_id >= (
+                       SELECT sequence_id FROM messages
+                       WHERE conversation_id = ?1 AND message_id = ?2
+                   )
+                 ORDER BY sequence_id ASC",
+            )
+            .bind(conversation_id)
+            .bind(source_message_id)
+            .try_map(parse_message_row)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Err(DbError::MessageNotFound(source_message_id.to_string()));
+            }
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the exact projection consumed by runtime recovery: the newest agent

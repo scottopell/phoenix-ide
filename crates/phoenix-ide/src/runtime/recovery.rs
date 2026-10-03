@@ -131,6 +131,7 @@ pub fn should_auto_continue(
     let adopted_wake_tail = messages
         .iter()
         .rev()
+        .filter(|message| !is_restart_marker(message))
         .take_while(|message| is_adopted_wake_result(message));
     if adopted_wake_tail
         .filter_map(wake_terminal_object)
@@ -527,6 +528,20 @@ mod tests {
             user_msg(1, "start"),
             adopted_wake_msg(2, false),
             adopted_wake_msg(3, true),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn restart_marker_is_transparent_to_adopted_wake_tail() {
+        let messages = vec![
+            adopted_wake_msg(1, false),
+            adopted_wake_msg(2, true),
+            system_restart_msg(3),
         ];
 
         let decision = should_auto_continue(&messages, None);
