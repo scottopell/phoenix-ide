@@ -2601,6 +2601,9 @@ where
         }
 
         // REQ-BED-030: crash recovery for AwaitingRecovery.
+        if let Some(ack) = self.startup_llm_recovery_ack.take() {
+            let _ = ack.send(Ok(()));
+        }
 
         if let ConvState::AwaitingContinuation { request } = &self.state {
             tracing::info!(

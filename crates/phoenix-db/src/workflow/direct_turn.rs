@@ -2384,16 +2384,26 @@ impl WorkflowRepository {
                 ))
             })
             .await?;
+        let occurrence = if let Some(message_id) = execution_occurrence_message_id {
+            load_exact_execution_occurrence_tx(&mut tx.tx, input, message_id).await?
+        } else {
+            None
+        };
         let step = telemetry
             .observe_db(
                 SqlitePhase::Statement,
                 self.terminalize_authoritative_turn_in_tx(&mut tx, input),
             )
             .await?;
-        if !matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
-            if let Some(message_id) = execution_occurrence_message_id {
-                settle_exact_execution_occurrence_tx(&mut tx.tx, input, message_id).await?;
-            }
+        if let Some(occurrence) = occurrence {
+            let (TurnOutcome::Terminal { terminal, .. }
+            | TurnOutcome::TerminalReplay { terminal, .. }) = &step.outcome
+            else {
+                return Err(DbError::Serialization(
+                    "terminal command produced nonterminal outcome".to_string(),
+                ));
+            };
+            settle_captured_execution_occurrence_tx(&mut tx.tx, occurrence, terminal).await?;
         }
         if cut == TransactionCut::BeforeCommit {
             telemetry
@@ -2963,17 +2973,18 @@ fn terminal_from_sql(
     }
 }
 
-async fn settle_exact_execution_occurrence_tx(
+struct CapturedExecutionOccurrence {
+    source_kind: String,
+    conversation_id: String,
+    message_id: String,
+}
+
+async fn load_exact_execution_occurrence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     input: &TerminalizeAuthoritativeTurnInput,
     message_id: &str,
-) -> DbResult<()> {
-    let (turn_id, _, terminal) = terminal_command_parts(&input.command)?;
-    let (terminal_kind, terminal_reason) = match &terminal {
-        TurnTerminal::Completed => ("Completed", None),
-        TurnTerminal::Cancelled => ("Cancelled", None),
-        TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
-    };
+) -> DbResult<Option<CapturedExecutionOccurrence>> {
+    let (turn_id, _, _) = terminal_command_parts(&input.command)?;
     let occurrence = sqlx::query_as::<_, (String, String)>(
         "SELECT occurrence.source_kind, occurrence.conversation_id
          FROM steering_execution_occurrences occurrence
@@ -2986,21 +2997,38 @@ async fn settle_exact_execution_occurrence_tx(
     .bind(to_i64(turn_id.0, "turn_id")?)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((source_kind, conversation_id)) = occurrence else {
-        return Ok(());
+    Ok(occurrence.map(
+        |(source_kind, conversation_id)| CapturedExecutionOccurrence {
+            source_kind,
+            conversation_id,
+            message_id: message_id.to_string(),
+        },
+    ))
+}
+
+async fn settle_captured_execution_occurrence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    occurrence: CapturedExecutionOccurrence,
+    terminal: &TurnTerminal,
+) -> DbResult<()> {
+    let (terminal_kind, terminal_reason) = match terminal {
+        TurnTerminal::Completed => ("Completed", None),
+        TurnTerminal::Cancelled => ("Cancelled", None),
+        TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
     };
-    let source_kind = crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+    let source_kind =
+        crate::coordinator_watches::MessageExecutionSource::from_db(&occurrence.source_kind)?;
     crate::coordinator_watches::record_steering_event_tx(
         tx,
         source_kind,
-        message_id,
-        &conversation_id,
+        &occurrence.message_id,
+        &occurrence.conversation_id,
         terminal_kind,
         terminal_reason,
     )
     .await?;
     sqlx::query("DELETE FROM steering_execution_occurrences WHERE message_id = ?1")
-        .bind(message_id)
+        .bind(&occurrence.message_id)
         .execute(&mut **tx)
         .await?;
     Ok(())
