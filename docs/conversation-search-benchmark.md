@@ -33,8 +33,9 @@ invent the exact scenario when the call cannot be recovered.
 The ignored release-mode Rust test opens the fixture read-only through
 `Database::open_read_only`, calls the real `search_conversations` Tool::run
 for tool cases and `Fts5Retriever::retrieve` for the scoped case, and emits
-raw samples. Each case has one process/pool-first-use sample followed by ten
-serial warm samples. Results include success/error state, result digest and
+raw samples. Each case/surface opens a fresh pool for one first-use sample,
+then a discarded warmup and ten serial warm samples. The process and OS cache
+are not cold: fixture hashing and preceding cases can warm the filesystem. Results include success/error state, result digest and
 bytes; no errors are silently dropped. `compare` refuses mismatched fixture or
 scenario digests.
 
@@ -48,3 +49,19 @@ The comparison command refuses missing metadata, fixture/scenario/regime
 mismatches, or changed output digests and prints paired per-case warm medians.
 This harness does not optimize retrieval, rebuild FTS, migrate, ANALYZE,
 checkpoint, or claim that an idle snapshot reproduces production contention.
+
+## Initial execution status
+
+The first production capture attempt was refused by the free-space guard:
+2.9 GiB available versus a roughly 4.8 GB source database. No production
+snapshot or measured baseline exists yet. Allow at least twice the source
+size for capture plus headroom for release compilation, or use another
+private artifact volume. Do not delete unrelated data or bypass the guard.
+
+Two production calls are preconfigured (19.058 s and 11.890 s tool durations).
+Scenario preparation requires both exact query inputs to be recovered and
+refuses to substitute a duplicate. The selective case is a candidate term
+from the observed query, not yet proven selective; verify its result count
+and match breadth when the snapshot is available before treating it as a
+selectivity contrast. Captured FTS freshness is assumed for read-only runs;
+no reconciliation is performed or freshness guarantee fabricated.
