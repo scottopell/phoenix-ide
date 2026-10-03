@@ -723,13 +723,14 @@ async fn project_coordinator_snapshot_settings(
         .get_project_coordinator_profile_settings(product_conversation_id)
         .await
         .map_err(db_to_app)?;
+    let revision = settings.revision();
     let profile = settings
-        .profile
+        .into_profile()
         .map(|profile| ProjectCoordinatorProfileView {
             charter: profile.charter().to_string(),
             updated_at_unix_micros: profile.updated_at_unix_micros(),
         });
-    Ok((settings.revision, profile))
+    Ok((revision, profile))
 }
 
 async fn snapshot_view(

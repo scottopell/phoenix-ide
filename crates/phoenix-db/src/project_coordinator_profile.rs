@@ -14,9 +14,27 @@ pub enum ProjectCoordinatorProfileWriteOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectCoordinatorProfileSettings {
-    pub profile: Option<ProjectCoordinatorProfile>,
-    pub revision: i64,
+pub enum ProjectCoordinatorProfileSettings {
+    Enabled(ProjectCoordinatorProfile),
+    Disabled { revision: i64 },
+}
+
+impl ProjectCoordinatorProfileSettings {
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        match self {
+            Self::Enabled(profile) => profile.revision(),
+            Self::Disabled { revision } => *revision,
+        }
+    }
+
+    #[must_use]
+    pub fn into_profile(self) -> Option<ProjectCoordinatorProfile> {
+        match self {
+            Self::Enabled(profile) => Some(profile),
+            Self::Disabled { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -43,17 +61,26 @@ async fn ensure_project_coordinator_profile_revision_row(
     product_conversation_id: &ProductConversationId,
     write_token: &str,
 ) -> Result<(), ProjectCoordinatorProfileWriteDbError> {
-    sqlx::query(
-        "INSERT INTO product_conversation_coordinator_profile_revisions
-                 (product_conversation_id, revision, last_write_token)
-             VALUES (?1, 0, ?2)
-             ON CONFLICT(product_conversation_id) DO UPDATE
-             SET last_write_token = excluded.last_write_token",
+    let updated = sqlx::query(
+        "UPDATE product_conversation_coordinator_profile_revisions
+         SET last_write_token = ?2
+         WHERE product_conversation_id = ?1",
     )
     .bind(product_conversation_id.as_str())
     .bind(write_token)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profile_revisions
+                     (product_conversation_id, revision, last_write_token)
+                 VALUES (?1, 0, ?2)",
+        )
+        .bind(product_conversation_id.as_str())
+        .bind(write_token)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -207,13 +234,17 @@ impl Database {
         .await?;
         let revision = row.get("retained_revision");
         let charter: Option<String> = row.try_get("charter")?;
-        let profile = charter
-            .map(|charter| {
-                ProjectCoordinatorProfile::new(charter, revision, row.get("updated_at_unix_micros"))
-                    .map_err(|error| crate::DbError::Serialization(error.to_string()))
-            })
-            .transpose()?;
-        Ok(ProjectCoordinatorProfileSettings { profile, revision })
+        if let Some(charter) = charter {
+            let profile = ProjectCoordinatorProfile::new(
+                charter,
+                revision,
+                row.get("updated_at_unix_micros"),
+            )
+            .map_err(|error| crate::DbError::Serialization(error.to_string()))?;
+            Ok(ProjectCoordinatorProfileSettings::Enabled(profile))
+        } else {
+            Ok(ProjectCoordinatorProfileSettings::Disabled { revision })
+        }
     }
 
     /// Reads the retained revision even when the profile is disabled.
@@ -898,6 +929,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_retained_revision_replace_is_rejected_while_profile_active() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-direct-revision-replace").await;
+        db.write_project_coordinator_profile(&id, Some("first"), 0)
+            .await
+            .expect("enable");
+
+        let replace_error = sqlx::query(
+            "INSERT OR REPLACE INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES (?1, 0, 'replacement')",
+        )
+        .bind(id.as_str())
+        .execute(&db.pool)
+        .await
+        .expect_err("active retained revision replacement must be rejected");
+
+        assert!(replace_error
+            .to_string()
+            .contains("Project Coordinator retained revision"));
+        let profile = db
+            .get_project_coordinator_profile(&id)
+            .await
+            .expect("profile read")
+            .expect("profile retained after rejected replace");
+        assert_eq!(profile.charter(), "first");
+        assert_eq!(profile.revision(), 1);
+    }
+
+    #[tokio::test]
     async fn direct_retained_revision_owner_update_is_rejected() {
         let db = Database::open_in_memory().await.expect("database");
         let source = ordinary(&db, "pc-project-coordinator-revision-owner-source").await;
@@ -1077,8 +1138,10 @@ mod tests {
             .get_project_coordinator_profile_settings(&id)
             .await
             .expect("disabled settings");
-        assert_eq!(disabled.profile, None);
-        assert_eq!(disabled.revision, 2);
+        assert_eq!(
+            disabled,
+            ProjectCoordinatorProfileSettings::Disabled { revision: 2 }
+        );
         let stale_disabled = db
             .write_project_coordinator_profile(&id, Some("stale disabled editor"), 0)
             .await

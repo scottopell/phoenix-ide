@@ -1474,6 +1474,16 @@ BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator active profile content is replaced through the revision fence');
 END;
 
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
+END;
 DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
 BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
@@ -1659,6 +1669,16 @@ FOR EACH ROW
 BEGIN
     SELECT RAISE(ABORT, 'Project Coordinator retained revision owner is immutable');
 END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
+END;
 DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
 CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
 BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
@@ -1692,6 +1712,25 @@ BEGIN
         SELECT 1 FROM product_conversation_coordinator_profile_revisions
         WHERE product_conversation_id = NEW.product_conversation_id AND revision > 0
     );
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_delete;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_delete
+BEFORE DELETE ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be deleted');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be replaced');
 END;
 ";
 
