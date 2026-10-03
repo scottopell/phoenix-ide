@@ -7524,8 +7524,8 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Report whether an adopted wake or accepted interaction response still
-    /// owns the conversation's first model response.
+    /// Report whether an adopted wake, seeded fork, or accepted interaction
+    /// response still owns the conversation's first model response.
     ///
     /// # Errors
     /// Returns a database error if the lookup fails.
@@ -7539,13 +7539,7 @@ impl Database {
                  FROM steering_execution_occurrences occurrence
                  JOIN messages source ON source.message_id = occurrence.message_id
                  WHERE occurrence.conversation_id = ?1
-                   AND occurrence.source_kind IN ('wake', 'interaction_response')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM messages response
-                       WHERE response.conversation_id = occurrence.conversation_id
-                         AND response.message_type = 'agent'
-                         AND response.sequence_id > source.sequence_id
-                   )
+                   AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
              )",
         )
         .bind(conversation_id)
@@ -7554,8 +7548,8 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// List conversations whose adopted wake or accepted interaction response
-    /// still owns the first model response after restart.
+    /// List conversations whose adopted wake, seeded fork, or accepted
+    /// interaction response still owns the first model response after restart.
     ///
     /// # Errors
     /// Returns a database error if the lookup fails.
@@ -7566,14 +7560,8 @@ impl Database {
              JOIN steering_execution_occurrences occurrence
                ON occurrence.conversation_id = c.id
              JOIN messages source ON source.message_id = occurrence.message_id
-             WHERE occurrence.source_kind IN ('wake', 'interaction_response')
+             WHERE occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
                AND c.state_kind IN ('idle', 'llm_requesting')
-               AND NOT EXISTS (
-                   SELECT 1 FROM messages response
-                   WHERE response.conversation_id = occurrence.conversation_id
-                     AND response.message_type = 'agent'
-                     AND response.sequence_id > source.sequence_id
-               )
              ORDER BY c.created_at, c.id",
         )
         .fetch_all(&self.pool)

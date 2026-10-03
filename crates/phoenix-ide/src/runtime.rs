@@ -12856,6 +12856,7 @@ mod scope_liveness_tests {
     async fn startup_resumes_typed_wake_and_interaction_occurrences() {
         for (source_kind, conversation_id) in [
             ("wake", "restart-adopted-wake"),
+            ("seeded_fork", "restart-seeded-fork"),
             ("interaction_response", "restart-interaction-response"),
         ] {
             let llm = Arc::new(RecordingLlm {
@@ -12897,7 +12898,8 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn typed_occurrence_preserves_wait_state_and_stops_after_agent_response() {
+    #[allow(clippy::too_many_lines)] // One fixture proves the occurrence across its full state lifecycle.
+    async fn typed_occurrence_preserves_wait_and_tool_states_until_idle_settlement() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -12958,10 +12960,101 @@ mod scope_liveness_tests {
             .unwrap();
         manager
             .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::ToolExecuting {
+                    current_tool: phoenix_core::domain::sm_state::ToolCall::new(
+                        "occurrence-agent-tool",
+                        phoenix_core::domain::sm_state::ToolInput::Think(
+                            phoenix_core::domain::sm_state::ThinkInput {
+                                thoughts: "continue".to_string(),
+                            },
+                        ),
+                    ),
+                    remaining_tools: Vec::new(),
+                    completed_results: Vec::new(),
+                    pending_sub_agents: Vec::new(),
+                    assistant_message: phoenix_core::domain::sm_state::AssistantMessage::new(
+                        "occurrence-agent-response".to_string(),
+                        vec![phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                            "occurrence-agent-tool",
+                            "think",
+                            serde_json::json!({"thoughts": "continue"}),
+                        )],
+                        None,
+                        None,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .db()
+            .has_resumable_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+        manager
+            .db()
             .update_conversation_state(conversation_id, &ConvState::Idle)
             .await
             .unwrap();
         assert!(!manager
+            .db()
+            .has_resumable_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn turn_terminalization_preserves_newer_execution_occurrence() {
+        use crate::runtime::traits::{
+            ActiveDirectTurnSettlement, ActiveDirectTurnTerminal, MessageStore,
+        };
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "terminal-preserves-newer-occurrence";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .add_message(
+                "newer-wake-input",
+                conversation_id,
+                &crate::db::MessageContent::user("newer durable wake"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'newer-wake-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let storage = DatabaseStorage::new(manager.db().clone());
+        let active = MessageStore::load_active_direct_turn(&storage, conversation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active();
+
+        MessageStore::settle_active_direct_turn(
+            &storage,
+            &ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: active,
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(manager
             .db()
             .has_resumable_execution_occurrence(conversation_id)
             .await
