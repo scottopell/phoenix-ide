@@ -2116,7 +2116,7 @@ fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<std::process::Output, String> {
-    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    let mut command = phoenix_core::git::command();
     command
         .args([
             "status",
@@ -2144,7 +2144,7 @@ fn run_bounded_git_command_until(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
-    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    let mut command = phoenix_core::git::command();
     command
         .args(arguments)
         .current_dir(repository)
@@ -2171,7 +2171,7 @@ fn run_bounded_git_paths_until(
     operation: &str,
 ) -> Result<std::process::Output, String> {
     // `Command::args` accepts path OsStrings, preserving bytes on Unix.
-    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    let mut command = phoenix_core::git::command();
     command
         .args(arguments)
         .args(paths.iter().map(|path| path_buf_from_git_bytes(path)))
