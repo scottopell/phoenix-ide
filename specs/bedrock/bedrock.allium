@@ -2611,6 +2611,8 @@ rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
     requires: not committed_steering_turn_awaiting_first_response(conversation)
+    requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: conversation.core_status not in {
         awaiting_continuation,
         recoverable_continuation_failure
@@ -2622,7 +2624,6 @@ rule ServerRestartOrdinaryConversation {
 
 rule ServerRestartOwedDirectTurn {
     when: ServerRestarted(conversation)
-    requires: conversation.core_status = idle
     requires: active_materialized_turn_owns_conversation(conversation)
     requires: recoverable_tool_results_await_model_step(conversation)
     requires: not restart_recovery_exhausted(conversation)

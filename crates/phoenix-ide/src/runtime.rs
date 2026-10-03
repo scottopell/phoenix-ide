@@ -751,6 +751,12 @@ enum BashLifecycleBridgeAction {
     Reconcile,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct BatonRecovery {
+    turn: ActiveDirectTurn,
+    decision: recovery::RecoveryDecision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionOccurrenceDisposition {
     Resume,
@@ -767,6 +773,10 @@ struct ExecutionOccurrenceRecovery {
 impl ExecutionOccurrenceRecovery {
     fn needs_resume(&self) -> bool {
         self.disposition == ExecutionOccurrenceDisposition::Resume
+    }
+
+    fn restart_loop_detected(&self) -> bool {
+        self.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
     }
 }
 
@@ -3820,12 +3830,12 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
         conversation: &crate::db::Conversation,
-        recovery_decision: Option<&recovery::RecoveryDecision>,
+        baton_recovery: Option<&BatonRecovery>,
         has_resumable_occurrence: bool,
     ) -> Result<bool, String> {
         Ok(
             matches!(conversation.state, ConvState::SeededLlmRequesting { .. })
-                || recovery_decision.is_some_and(|decision| decision.needs_auto_continue)
+                || baton_recovery.is_some_and(|recovery| recovery.decision.needs_auto_continue)
                 || has_resumable_occurrence
                 || self
                     .db
@@ -3848,7 +3858,7 @@ impl RuntimeManager {
                 .get_conversation(&conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            let recovery_decision = self.owned_baton_recovery_decision(&conversation_id).await?;
+            let baton_recovery = self.owned_baton_recovery(&conversation_id).await?;
             let has_queued_steering = self.has_queued_steering(&conversation_id).await?;
             let occurrence_recovery = self.execution_occurrence_recovery(&conversation_id).await?;
             let has_resumable_occurrence = occurrence_recovery
@@ -3858,7 +3868,7 @@ impl RuntimeManager {
                 .settle_restart_exhaustion(
                     &conversation_id,
                     occurrence_recovery.as_ref(),
-                    recovery_decision.as_ref(),
+                    baton_recovery.as_ref(),
                     has_queued_steering,
                     has_resumable_occurrence,
                 )
@@ -3867,9 +3877,10 @@ impl RuntimeManager {
                 continue;
             }
             let settled_occurrence = self
-                .settle_execution_occurrence_recovery(
+                .settle_occurrence_unless_deferred(
                     &conversation_id,
                     occurrence_recovery.as_ref(),
+                    has_queued_steering,
                 )
                 .await?;
             if settled_occurrence && !has_queued_steering {
@@ -3879,7 +3890,7 @@ impl RuntimeManager {
                 .settle_nonresumable_idle_baton(
                     &conversation_id,
                     &conversation.state,
-                    recovery_decision.as_ref(),
+                    baton_recovery.as_ref(),
                     has_queued_steering || has_resumable_occurrence,
                 )
                 .await?
@@ -3890,7 +3901,7 @@ impl RuntimeManager {
                 .startup_resumable_owner(
                     &conversation_id,
                     &conversation,
-                    recovery_decision.as_ref(),
+                    baton_recovery.as_ref(),
                     has_resumable_occurrence,
                 )
                 .await?;
@@ -3959,18 +3970,22 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
         state: &ConvState,
-        recovery_decision: Option<&recovery::RecoveryDecision>,
+        baton_recovery: Option<&BatonRecovery>,
         has_newer_authority: bool,
     ) -> Result<bool, String> {
-        let Some(decision) = recovery_decision.filter(|decision| {
+        let Some(recovery) = baton_recovery.filter(|recovery| {
             matches!(state, ConvState::Idle)
                 && !has_newer_authority
-                && !decision.needs_auto_continue
+                && !recovery.decision.needs_auto_continue
         }) else {
             return Ok(false);
         };
-        self.persist_nonresumable_baton_settlement(conversation_id, decision.reason.clone())
-            .await?;
+        self.persist_nonresumable_baton_settlement(
+            conversation_id,
+            &recovery.turn,
+            recovery.decision.reason.clone(),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -3978,29 +3993,46 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
         occurrence: Option<&ExecutionOccurrenceRecovery>,
-        recovery_decision: Option<&recovery::RecoveryDecision>,
+        baton_recovery: Option<&BatonRecovery>,
         has_queued_steering: bool,
         has_resumable_occurrence: bool,
     ) -> Result<bool, String> {
         if has_queued_steering {
             return Ok(false);
         }
-        let exhausted_occurrence_owns_baton = occurrence.is_some_and(|occurrence| {
-            occurrence.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
-        }) && self
-            .db
-            .has_owed_baton(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let exhausted_occurrence_owns_baton = occurrence
+            .is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
+            && baton_recovery.is_some();
         let baton_recovery_exhausted = !has_resumable_occurrence
-            && recovery_decision.is_some_and(|decision| {
-                decision.reason == recovery::RecoveryReason::RestartLoopDetected
+            && baton_recovery.is_some_and(|recovery| {
+                recovery.decision.reason == recovery::RecoveryReason::RestartLoopDetected
             });
         if !exhausted_occurrence_owns_baton && !baton_recovery_exhausted {
             return Ok(false);
         }
-        self.persist_restart_loop_failure(conversation_id).await?;
+        self.persist_restart_loop_failure(
+            conversation_id,
+            &baton_recovery
+                .expect("exhausted baton recovery has an owner")
+                .turn,
+        )
+        .await?;
         Ok(true)
+    }
+
+    async fn settle_occurrence_unless_deferred(
+        &self,
+        conversation_id: &str,
+        occurrence: Option<&ExecutionOccurrenceRecovery>,
+        has_queued_steering: bool,
+    ) -> Result<bool, String> {
+        if has_queued_steering
+            && occurrence.is_some_and(ExecutionOccurrenceRecovery::restart_loop_detected)
+        {
+            return Ok(false);
+        }
+        self.settle_execution_occurrence_recovery(conversation_id, occurrence)
+            .await
     }
 
     async fn settle_execution_occurrence_recovery(
@@ -4053,23 +4085,22 @@ impl RuntimeManager {
 
     async fn owed_baton_needs_auto_continue(&self, conversation_id: &str) -> Result<bool, String> {
         Ok(self
-            .owned_baton_recovery_decision(conversation_id)
+            .owned_baton_recovery(conversation_id)
             .await?
-            .is_some_and(|decision| decision.needs_auto_continue))
+            .is_some_and(|recovery| recovery.decision.needs_auto_continue))
     }
 
-    async fn owned_baton_recovery_decision(
+    async fn owned_baton_recovery(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<recovery::RecoveryDecision>, String> {
-        if !self
-            .db
-            .has_owed_baton(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
+    ) -> Result<Option<BatonRecovery>, String> {
+        let storage = DatabaseStorage::new(self.db.clone());
+        let Some(turn) = storage.load_active_direct_turn(conversation_id).await? else {
             return Ok(None);
-        }
+        };
+        let LoadedActiveDirectTurn::Materialized { active: turn, .. } = turn else {
+            return Ok(None);
+        };
         for _ in 0..3 {
             let messages = self
                 .db
@@ -4083,50 +4114,70 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
             let decision = recovery::decide_recovery(&messages, &tail);
             if decision.reason != recovery::RecoveryReason::TranscriptChanged {
-                return Ok(Some(decision));
+                return Ok(Some(BatonRecovery { turn, decision }));
             }
         }
         Err("restart transcript changed repeatedly during durable baton classification".to_string())
     }
 
+    async fn settle_classified_baton(
+        &self,
+        storage: &DatabaseStorage,
+        settlement: ActiveDirectTurnSettlement,
+    ) -> Result<(), String> {
+        let classified = settlement.turn.clone();
+        let conversation_id = settlement.conversation_id.clone();
+        if let Err(error) = storage.settle_active_direct_turn(&settlement).await {
+            let active = storage.load_active_direct_turn(&conversation_id).await?;
+            if active.is_some_and(|active| {
+                let active = active.active();
+                active.turn_id == classified.turn_id && active.generation == classified.generation
+            }) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     async fn persist_nonresumable_baton_settlement(
         &self,
         conversation_id: &str,
+        turn: &ActiveDirectTurn,
         reason: recovery::RecoveryReason,
     ) -> Result<(), String> {
         let storage = DatabaseStorage::new(self.db.clone());
-        let turn = storage
-            .load_active_direct_turn(conversation_id)
-            .await?
-            .ok_or_else(|| "non-resumable baton lost its active direct-turn owner".to_string())?;
         let terminal = ActiveDirectTurnTerminal::Failed {
             reason: format!(
                 "Restart recovery settled without durable terminal evidence: {reason:?}"
             ),
         };
-        storage
-            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+        self.settle_classified_baton(
+            &storage,
+            ActiveDirectTurnSettlement {
                 conversation_id: conversation_id.to_string(),
-                turn: turn.into_active(),
+                turn: turn.clone(),
                 terminal,
                 state: ConvState::Idle,
                 state_updated_at: Utc::now(),
-            })
-            .await
+            },
+        )
+        .await
     }
 
-    async fn persist_restart_loop_failure(&self, conversation_id: &str) -> Result<(), String> {
+    async fn persist_restart_loop_failure(
+        &self,
+        conversation_id: &str,
+        turn: &ActiveDirectTurn,
+    ) -> Result<(), String> {
         let storage = DatabaseStorage::new(self.db.clone());
-        let Some(turn) = storage.load_active_direct_turn(conversation_id).await? else {
-            return Ok(());
-        };
         let message =
             "Automatic restart recovery stopped after repeated crashes in the same user turn."
                 .to_string();
-        storage
-            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+        self.settle_classified_baton(
+            &storage,
+            ActiveDirectTurnSettlement {
                 conversation_id: conversation_id.to_string(),
-                turn: turn.into_active(),
+                turn: turn.clone(),
                 terminal: ActiveDirectTurnTerminal::Failed {
                     reason: message.clone(),
                 },
@@ -4136,8 +4187,9 @@ impl RuntimeManager {
                     resets_at: None,
                 },
                 state_updated_at: Utc::now(),
-            })
-            .await
+            },
+        )
+        .await
     }
 
     async fn persist_startup_llm_initialization_failure(
@@ -12432,7 +12484,14 @@ mod scope_liveness_tests {
         manager: &RuntimeManager,
         conversation_id: &str,
     ) {
-        materialize_restart_direct_turn_encoding(manager, conversation_id, false).await;
+        materialize_restart_direct_turn_encoding(
+            manager,
+            conversation_id,
+            false,
+            "restart-user-message",
+            1,
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_lines)] // Shared fixture covers acceptance, claiming, and materialization.
@@ -12440,6 +12499,8 @@ mod scope_liveness_tests {
         manager: &RuntimeManager,
         conversation_id: &str,
         historical_source: bool,
+        message_id: &str,
+        sequence_id: i64,
     ) {
         use phoenix_core::domain::sm_event::{
             PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -12471,7 +12532,7 @@ mod scope_liveness_tests {
             text: "resume exactly this turn".to_string(),
             images: Vec::new(),
             files: Vec::new(),
-            message_id: "restart-user-message".to_string(),
+            message_id: message_id.to_string(),
             user_agent: None,
             skill_invocation: None,
             expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
@@ -12489,7 +12550,7 @@ mod scope_liveness_tests {
         let repo = manager.db().workflow_repository();
         let accepted = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                client_key: ClientTurnKey::new("restart-user-message").expect("client key"),
+                client_key: ClientTurnKey::new(message_id).expect("client key"),
                 prepared: PreparedTurn::from_exact_payload(
                     &conversation,
                     if historical_source {
@@ -12528,7 +12589,7 @@ mod scope_liveness_tests {
             turn_id,
             authority: claim.authority.expect("claim authority"),
             prepared: payload,
-            sequence_id: 1,
+            sequence_id,
             created_at: Timestamp(3),
             accepted_state: ConvState::LlmRequesting { attempt: 1 },
             state_updated_at: Utc::now(),
@@ -12767,6 +12828,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn exhausted_baton_drains_newer_accepted_input_before_failure() {
         use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
         use phoenix_core::domain::db_schema::{SystemContent, ToolContent};
@@ -12822,6 +12884,41 @@ mod scope_liveness_tests {
             .unwrap();
         manager
             .db()
+            .add_message(
+                "exhausted-occurrence-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted input before crashes"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'exhausted-occurrence-input', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("queued-occurrence-restart-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(SystemContent {
+                        text: RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
             .append_steering_entry(
                 conversation_id,
                 &crate::state_machine::event::SteerEntry {
@@ -12839,7 +12936,13 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        manager.settle_persisted_llm_requests().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.settle_persisted_llm_requests(),
+        )
+        .await
+        .expect("startup recovery acknowledged queued input")
+        .unwrap();
 
         assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(manager
@@ -13409,6 +13512,63 @@ mod scope_liveness_tests {
             .unwrap();
         assert_eq!(recovery.source_message_id, "resumable-wake");
         assert_eq!(recovery.disposition, ExecutionOccurrenceDisposition::Resume);
+    }
+
+    #[tokio::test]
+    async fn classified_baton_settlement_does_not_touch_replacement_turn() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-classified-baton-replaced";
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        let classified = manager
+            .owned_baton_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let storage = DatabaseStorage::new(manager.db().clone());
+        storage
+            .settle_active_direct_turn(&ActiveDirectTurnSettlement {
+                conversation_id: conversation_id.to_string(),
+                turn: classified.turn.clone(),
+                terminal: ActiveDirectTurnTerminal::Completed,
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        materialize_restart_direct_turn_encoding(
+            &manager,
+            conversation_id,
+            false,
+            "replacement-user-message",
+            4,
+        )
+        .await;
+        let replacement = storage
+            .load_active_direct_turn(conversation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active();
+        assert_ne!(replacement.turn_id, classified.turn.turn_id);
+
+        manager
+            .persist_nonresumable_baton_settlement(
+                conversation_id,
+                &classified.turn,
+                recovery::RecoveryReason::LastMessageNotTool,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .load_active_direct_turn(conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active(),
+            replacement
+        );
     }
 
     #[tokio::test]
@@ -13984,7 +14144,8 @@ mod scope_liveness_tests {
             .create_conversation(id, "restart", "/tmp", true, None, None)
             .await
             .expect("create conversation");
-        materialize_restart_direct_turn_encoding(&manager, id, true).await;
+        materialize_restart_direct_turn_encoding(&manager, id, true, "restart-user-message", 1)
+            .await;
         manager.db().reset_all_to_idle().await.unwrap();
         manager.settle_persisted_llm_requests().await.unwrap();
         assert_eq!(
