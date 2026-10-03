@@ -9,11 +9,11 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sqlite3
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -21,6 +21,37 @@ DEFAULT_ARTIFACTS = Path("conversation-search-benchmark")
 # Every named slow call is retained; duplicate IDs differing only in case are
 # rejected rather than silently collapsing two production observations.
 CALL_IDS = ["call_w7yaFJY51rJxTjog4DKeE2wo"]
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _private(path: Path) -> None:
+    """Create a private directory and reject symlinked artifact roots."""
+    if path.exists() and path.is_symlink():
+        raise SystemExit(f"refusing symlinked artifact directory: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _label(label: str) -> str:
+    if not LABEL_RE.fullmatch(label):
+        raise SystemExit("label must contain only letters, digits, '.', '_' or '-' and be at most 64 characters")
+    return label
+
+
+def _write_private(path: Path, text: str) -> None:
+    if path.exists() and path.is_symlink():
+        raise SystemExit(f"refusing symlinked private artifact: {path}")
+    path.write_text(text)
+    os.chmod(path, 0o600)
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parents[1], text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def observed_call_ids():
@@ -57,19 +88,6 @@ def _json_strings(value):
         for item in value:
             yield from _json_strings(item)
 
-
-def _tool_block_ids(value):
-    if isinstance(value, dict):
-        for key in ("tool_use_id", "tool_call_id", "id"):
-            candidate = value.get(key)
-            if isinstance(candidate, str):
-                yield candidate
-        for item in value.values():
-            if isinstance(item, (dict, list)):
-                yield from _tool_block_ids(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _tool_block_ids(item)
 
 
 def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
@@ -150,7 +168,7 @@ def snapshot(args) -> int:
     ):
         raise SystemExit("refusing to overwrite or capture from the artifact directory")
     if not source.exists(): raise SystemExit(f'source does not exist: {source}')
-    outdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _private(outdir)
     dest = requested
     if dest.exists() and not args.force: raise SystemExit(f'fixture exists (use --force only to replace): {dest}')
     if shutil.disk_usage(outdir).free < source.stat().st_size * 2:
@@ -202,12 +220,12 @@ def snapshot(args) -> int:
     conn.close()
     os.replace(tmp, dest)
     os.chmod(dest, 0o600)
-    manifest = {'kind':'conversation-search-fixture','source_path_not_retained':True,
+    manifest = {'kind':'conversation-search-fixture','source_path':str(source),
       'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':dest.stat().st_size,
       'sha256':_hash(dest),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
       'counts':counts,'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
-    (outdir/'capture-manifest.json').write_text(json.dumps(manifest, indent=2)+'\n'); os.chmod(outdir/'capture-manifest.json',0o600)
+    _write_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
     print(f'captured immutable fixture: {dest}\nsha256: {manifest["sha256"]}\ncounts: {manifest["counts"]}')
     print(f'next: ./dev.py conversation-search prepare --artifacts {outdir}')
     return 0
@@ -215,6 +233,13 @@ def snapshot(args) -> int:
 def prepare(args) -> int:
     outdir = Path(args.artifacts).expanduser().resolve(); db = outdir/'captured.db'; manifest = outdir/'capture-manifest.json'
     if not db.exists() or not manifest.exists(): raise SystemExit('capture-manifest.json and captured.db are required')
+    capture = json.loads(manifest.read_text())
+    if capture.get('kind') != 'conversation-search-fixture' or capture.get('snapshot_path') != str(db):
+        raise SystemExit('capture manifest does not identify this captured.db')
+    if capture.get('size_bytes') != db.stat().st_size or capture.get('sha256') != _hash(db):
+        raise SystemExit('captured.db does not match capture manifest')
+    if Path(capture.get('source_path', '')).resolve() == db:
+        raise SystemExit('refusing to benchmark the capture source directly')
     conn=sqlite3.connect(_uri(db), uri=True); recovered=_recover_queries(conn)
     if not recovered: raise SystemExit('named production call query was not recovered; refusing to invent a baseline')
     if len(recovered) < 2:
@@ -228,23 +253,47 @@ def prepare(args) -> int:
     selective_terms = [term for term in re.findall(r"[A-Za-z0-9_]{6,}", exact) if term.lower() not in {"conversation", "search"}]
     selective_query = selective_terms[0] if selective_terms else "conversation"
     scenarios=[
-      {'id':'observed-slow-exact','kind':'tool','query':exact,'source_call_id':recovered[0]['source_call_id']},
-      {'id':'observed-slow-other','kind':'tool','query':recovered[1]['query'],'source_call_id':recovered[1]['source_call_id']},
-      {'id':'broad-common','kind':'tool','query':'conversation'},
-      {'id':'selective-known-match','kind':'tool','query':selective_query},
-      {'id':'verified-no-hit','kind':'tool','query':'phoenix_benchmark_no_such_term_9f3c2'},
-      {'id':'scoped-existing-transcript','kind':'retriever','query':exact,'conversation_ids':ids},
+      {'id':'observed-slow-exact','kind':'tool','query':exact,'source_call_id':recovered[0]['source_call_id'],'expected':'hit'},
+      {'id':'observed-slow-other','kind':'tool','query':recovered[1]['query'],'source_call_id':recovered[1]['source_call_id'],'expected':'hit'},
+      {'id':'broad-common','kind':'tool','query':'conversation','expected':'hit'},
+      {'id':'selective-known-match','kind':'tool','query':selective_query,'expected':'hit'},
+      {'id':'verified-no-hit','kind':'tool','query':'phoenix_benchmark_no_such_term_9f3c2','expected':'no_hit'},
+      {'id':'scoped-existing-transcript','kind':'retriever','scope':'conversation','query':exact,'conversation_ids':ids,'expected':'hit'},
     ]
-    conn.close(); (outdir/'scenarios.json').write_text(json.dumps({'version':1,'scenarios':scenarios},indent=2)+'\n'); os.chmod(outdir/'scenarios.json',0o600)
+    conn.close()
+    _write_private(outdir/'scenarios.json', json.dumps({'version':1,'scenarios':scenarios},indent=2)+'\n')
     print(f'wrote frozen scenarios: {outdir/"scenarios.json"}'); return 0
 
 def run(args) -> int:
     outdir=Path(args.artifacts).expanduser().resolve(); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
-    if not db.exists() or not scen.exists(): raise SystemExit('run requires captured.db and scenarios.json')
-    result_dir=outdir/'runs'; result_dir.mkdir(mode=0o700,exist_ok=True)
+    manifest=outdir/'capture-manifest.json'
+    if not db.exists() or not scen.exists() or not manifest.exists():
+        raise SystemExit('run requires captured.db, capture-manifest.json, and scenarios.json')
+    capture=json.loads(manifest.read_text())
+    if capture.get('snapshot_path') != str(db) or capture.get('sha256') != _hash(db) or capture.get('size_bytes') != db.stat().st_size:
+        raise SystemExit('captured.db does not match capture-manifest.json')
+    if Path(capture.get('source_path', '')).resolve() == db:
+        raise SystemExit('refusing to benchmark the capture source directly')
+    scenarios=json.loads(scen.read_text())
+    if scenarios.get('version') != 1 or not isinstance(scenarios.get('scenarios'), list):
+        raise SystemExit('invalid scenarios manifest')
+    result_dir=outdir/'runs'; _private(result_dir)
+    label=_label(args.label)
+    output=result_dir/f'{label}.json'
+    if output.exists() and not args.force:
+        raise SystemExit(f'result exists (use --force only to replace): {output}')
     cmd=['cargo','test','-p','phoenix_ide','--release','production_conversation_search_benchmark','--lib','--','--ignored','--nocapture']
-    env=dict(os.environ,PHOENIX_SEARCH_BENCH_DB=str(db),PHOENIX_SEARCH_BENCH_SCENARIOS=str(scen),PHOENIX_SEARCH_BENCH_OUT=str(result_dir/f'{args.label}.json'))
-    subprocess.run(cmd,cwd=Path(__file__).parents[1],env=env,check=True); print(env['PHOENIX_SEARCH_BENCH_OUT']); return 0
+    env=dict(os.environ,
+        PHOENIX_SEARCH_BENCH_DB=str(db), PHOENIX_SEARCH_BENCH_SCENARIOS=str(scen),
+        PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST=str(manifest), PHOENIX_SEARCH_BENCH_OUT=str(output),
+        PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
+        PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor(),
+        PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
+    try:
+        subprocess.run(cmd,cwd=Path(__file__).parents[1],env=env,check=True,timeout=args.timeout)
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f'benchmark timed out after {args.timeout}s; child process was stopped') from error
+    print(output); return 0
 
 def _median(values):
     values = sorted(values)
@@ -286,21 +335,57 @@ def report(args) -> int:
         if errors:
             lines.append(f"errors: {errors!r}")
         lines.append("")
-    (outdir / "report.md").write_text("\n".join(lines))
+    _write_private(outdir / "report.md", "\n".join(lines))
     print(outdir / "report.md")
     return 0
+
+def _validate_run(run: dict, name: str) -> dict:
+    required = {"fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "samples"}
+    missing = sorted(required - run.keys())
+    if missing:
+        raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
+    if not isinstance(run["samples"], list) or not run["samples"]:
+        raise SystemExit(f"refusing comparison: {name} has no samples")
+    digests = {}
+    for sample in run["samples"]:
+        key = (sample.get("case_id"), sample.get("surface"))
+        digest = sample.get("result_digest")
+        if not key[0] or not key[1] or not digest:
+            raise SystemExit(f"refusing comparison: {name} has incomplete sample output metadata")
+        prior = digests.setdefault(key, digest)
+        if prior != digest:
+            raise SystemExit(f"refusing comparison: output mismatch for {key[0]} ({key[1]}) in {name}")
+    return digests
+
 
 def compare(args) -> int:
     a = json.loads(Path(args.before).read_text())
     b = json.loads(Path(args.after).read_text())
+    digests_a = _validate_run(a, "before")
+    digests_b = _validate_run(b, "after")
     keys = ("fixture_sha256", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or measurement regime differ")
-    phases_a = {sample.get("phase") for sample in a.get("samples", [])}
-    phases_b = {sample.get("phase") for sample in b.get("samples", [])}
+    phases_a = {sample.get("phase") for sample in a["samples"]}
+    phases_b = {sample.get("phase") for sample in b["samples"]}
     if phases_a != phases_b:
         raise SystemExit("refusing comparison: cold/warm measurement regimes differ")
-    print("comparable fixture/scenarios/profile/regimes; see reports for raw distributions")
+    if digests_a != digests_b:
+        raise SystemExit("refusing comparison: output mismatch (identity/digests differ between runs)")
+    medians = []
+    for run in (a, b):
+        by = {}
+        for sample in run["samples"]:
+            if sample.get("phase") == "warm" and sample.get("ok"):
+                by.setdefault((sample["case_id"], sample["surface"]), []).append(sample["duration_ms"])
+        medians.append(by)
+    print("comparable fixture/scenarios/profile/regimes; per-case warm medians (before -> after):")
+    for key in sorted(set(medians[0]) | set(medians[1])):
+        before = _median(medians[0].get(key, []))
+        after = _median(medians[1].get(key, []))
+        if before is None or after is None:
+            raise SystemExit(f"refusing comparison: missing successful warm samples for {key[0]} ({key[1]})")
+        print(f"  {key[0]} ({key[1]}): {before:.3f} -> {after:.3f} ms")
     return 0
 
 def main():
@@ -317,6 +402,8 @@ def main():
     for name in ('prepare','run','report'):
       x=sub.add_parser(name); x.add_argument('--artifacts',default=str(DEFAULT_ARTIFACTS)); x.set_defaults(func=globals()[name])
     sub.choices['run'].add_argument('--label',default='suite-1')
+    sub.choices['run'].add_argument('--timeout',type=float,default=1800.0)
+    sub.choices['run'].add_argument('--force',action='store_true')
     c=sub.add_parser('compare'); c.add_argument('before'); c.add_argument('after'); c.set_defaults(func=compare)
     args = p.parse_args()
     return args.func(args)

@@ -38,7 +38,13 @@ serial warm samples. Results include success/error state, result digest and
 bytes; no errors are silently dropped. `compare` refuses mismatched fixture or
 scenario digests.
 
-No EXPLAIN plan is collected by default; any future diagnostic command must be
-outside timed runs and use the exact generated query/binds. This harness does
-not optimize retrieval, rebuild FTS, migrate, ANALYZE, checkpoint, or claim
-that an idle snapshot reproduces production contention.
+Set `PHOENIX_SEARCH_BENCH_EXPLAIN=1` for `EXPLAIN QUERY PLAN` captured outside
+timed runs, using the exact request builder and binds (including the generated
+lexical expression). Results include the fixture/scenario digests, source
+commit, host/platform/CPU, pool and read-only PRAGMAs, result counts/identity,
+and private raw output. Per-case warmup failures are retained and fail the run;
+case invocations have a bounded timeout and are stopped rather than stacked.
+The comparison command refuses missing metadata, fixture/scenario/regime
+mismatches, or changed output digests and prints paired per-case warm medians.
+This harness does not optimize retrieval, rebuild FTS, migrate, ANALYZE,
+checkpoint, or claim that an idle snapshot reproduces production contention.
