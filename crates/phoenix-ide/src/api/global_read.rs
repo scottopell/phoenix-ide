@@ -275,7 +275,14 @@ impl GlobalReadService {
             "SELECT COALESCE(NULLIF(owner.cm_task_title, ''), NULLIF(owner.title, ''), NULLIF(owner.slug, ''), 'Untitled conversation'), project.canonical_path
              FROM conversations owner
              LEFT JOIN projects project ON project.id = owner.project_id
-             WHERE owner.work_scope_id = ?1 AND owner.continued_in_conv_id IS NULL
+             LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
+             WHERE owner.work_scope_id = ?1
+               AND owner.parent_conversation_id IS NULL
+               AND owner.continued_in_conv_id IS NULL
+               AND ((product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0))
+               AND json_extract(owner.state, '$.type') NOT IN (
+                 'completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal')
              ORDER BY owner.created_at DESC LIMIT 1",
         )
         .bind(&work_scope_id)

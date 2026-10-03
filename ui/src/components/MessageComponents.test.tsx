@@ -26,7 +26,7 @@ describe('Global coordinator tool results', () => {
     );
     expect(screen.getByText('Queued as steering')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Open conversation' })).toHaveAttribute('href', '/product-conversations/product-1');
-    expect(screen.getByRole('link', { name: 'Open current transcript' })).toHaveAttribute('href', '/c/transcript-1');
+    expect(screen.getByRole('link', { name: 'Open receiving transcript' })).toHaveAttribute('href', '/c/transcript-1');
     expect(screen.getByText('@conv:product-1')).toBeInTheDocument();
     expect(screen.getByText(/recipient understanding or completion is not implied/i)).toBeInTheDocument();
   });

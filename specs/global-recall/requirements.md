@@ -202,9 +202,15 @@ AND a WorkScope identifier SHALL NOT be accepted as read or message target synta
 
 WHEN a user opens `/global`
 THE SYSTEM SHALL present the normal Coordinator transcript, composer, conversation status, and conversation navigation
-AND MAY present a bounded runtime-activity surface containing only still-running Bash commands launched by the Coordinator, their authoritative command metadata, output navigation, and supported exact-stop controls
+AND MAY present bounded subordinate activity surfaces containing only:
+- still-running Bash commands launched by the Coordinator, their authoritative command metadata, output navigation, and supported exact-stop controls; and
+- the current server-backed set of active Coordinator watch subscriptions, with authoritative conversation identity and navigation
 
-THE runtime-activity surface SHALL remain subordinate to the transcript and composer and SHALL NOT invent durable or cross-restart command state
+THE activity surfaces SHALL remain subordinate to the transcript and composer
+
+THE Bash activity surface SHALL NOT invent durable or cross-restart command state
+
+THE watch activity surface SHALL reflect current subscription state rather than reconstructing state from transcript history
 
 THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, cross-scope resource explorer, or Conversation/Work view selector
 
