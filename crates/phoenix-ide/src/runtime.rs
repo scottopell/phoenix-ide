@@ -4320,11 +4320,19 @@ impl RuntimeManager {
                 .await;
         }
         if let Some(occurrence) = occurrence_recovery {
-            let settlement_state = if self.has_queued_steering(conversation_id).await? {
-                ConvState::Idle
-            } else {
-                error_state.clone()
-            };
+            let committed = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let settlement_state =
+                if matches!(committed.state, ConvState::AwaitingUserResponse { .. })
+                    || self.has_queued_steering(conversation_id).await?
+                {
+                    committed.state
+                } else {
+                    error_state.clone()
+                };
             self.db
                 .settle_execution_occurrence(
                     conversation_id,
@@ -7005,6 +7013,9 @@ impl RuntimeManager {
         conversation_id: &str,
         state: &ConvState,
     ) -> Result<Option<bool>, String> {
+        if matches!(state, ConvState::Idle) && self.has_queued_steering(conversation_id).await? {
+            return Ok(Some(true));
+        }
         if !matches!(state, ConvState::LlmRequesting { .. }) {
             return Ok(None);
         }

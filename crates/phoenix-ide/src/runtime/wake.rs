@@ -648,6 +648,55 @@ async fn deliver_pending(
                 current.receipt.terminal,
                 phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
             );
+            if manager
+                .try_get_handle(&current.conversation_id)
+                .await
+                .is_none()
+            {
+                let materialized = repo
+                    .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                        workflow_id: current.workflow_id,
+                        delivery_id: current.canonical_delivery.delivery_id,
+                        conversation_id: current.conversation_id.clone(),
+                        rendered_content: rendered.clone(),
+                        display_data: display_data.clone(),
+                        auto_resume,
+                        created_at: now,
+                        sequence_id: None,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match materialized {
+                    MaterializePendingDeliveryMessageOutcome::Materialized(_)
+                    | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
+                        let adopted = repo
+                            .adopt_materialized_pending_for_conversation(
+                                &current.conversation_id,
+                                now,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if matches!(adopted, WakeAdoptMaterializedPendingOutcome::Adopted(_)) {
+                            manager.get_or_create(&current.conversation_id).await?;
+                        }
+                    }
+                    MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                        repo.suppress_pending_for_archived_conversation(&current, now)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                if manager
+                    .db()
+                    .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    manager.resume_pending_close_settlements().await?;
+                }
+                cursor = Some(next_cursor);
+                continue;
+            }
             let handle = match manager.try_get_handle(&current.conversation_id).await {
                 Some(handle) => {
                     if !matches!(
