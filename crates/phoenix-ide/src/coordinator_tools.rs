@@ -896,6 +896,15 @@ mod tests {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
             let expected = scenario["expected"].as_str().unwrap_or("hit");
+            let context = context("benchmark");
+            let is_retriever = scenario["kind"] == "retriever";
+            let is_scoped = scenario["scope"] == "conversation";
+            // Resolve the exact request policy before any timed operation. This
+            // metadata applies even when EXPLAIN output is disabled.
+            let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let policy_retriever = Arc::new(policy_db.fts_retriever());
+            policy_retriever.mark_reconciled();
+            let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
             if case_id == "selective-known-match" {
                 let setup_hits = tokio::time::timeout(
                     std::time::Duration::from_secs(300),
@@ -906,15 +915,7 @@ mod tests {
                 .expect("selective policy validation");
                 assert!(!setup_hits.is_empty(), "selective candidate has no eligible hits under actual tool policy; choose another candidate before benchmarking");
             }
-            let context = context("benchmark");
-            let is_retriever = scenario["kind"] == "retriever";
-            let is_scoped = scenario["scope"] == "conversation";
-            // Resolve the exact request policy before any timed operation. This
-            // metadata applies even when EXPLAIN output is disabled.
-            let policy_db = crate::db::Database::open_read_only(&db_path).await.unwrap();
-            let policy_retriever = Arc::new(policy_db.fts_retriever());
-            policy_retriever.mark_reconciled();
-            let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
+
             let policy_request = if is_retriever && is_scoped {
                 crate::db::RetrievalRequest::natural_language(
                     query,
