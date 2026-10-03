@@ -3186,10 +3186,6 @@ impl Database {
         Ok(())
     }
 
-    /// Open or create database at the given path
-    ///
-    /// # Errors
-    ///
     /// Open an existing database read-only without migrations or reconciliation.
     /// Intended for offline measurement over an immutable fixture.
     ///
@@ -3222,6 +3218,9 @@ impl Database {
     }
 
     /// Open or create database at the given path.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn open(path: &str) -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
             .journal_mode(SqliteJournalMode::Wal)

@@ -62,10 +62,69 @@ def _git_commit() -> str:
         return "unknown"
 
 
+def _ensure_clean_source() -> None:
+    """Require the compiled benchmark source to be identified by a commit."""
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=Path(__file__).parents[1],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"unable to verify a clean benchmark source tree: {error}") from error
+    if status.strip():
+        raise SystemExit("refusing to benchmark a dirty source tree; commit all changes first")
+
+
 def observed_call_ids():
     """Allow the operator to add independently verified call IDs without code edits."""
     configured = os.environ.get("PHOENIX_SEARCH_CALL_IDS", "")
-    return list(dict.fromkeys(CALL_IDS + [item for item in configured.split(",") if item]))
+    values = CALL_IDS + [item.strip() for item in configured.split(",") if item.strip()]
+    seen: set[str] = set()
+    result = []
+    for value in values:
+        normalized = value.casefold()
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(value)
+    return result
+
+
+def _normalize_query(query: str) -> str:
+    """Normalize harmless query formatting differences for duplicate detection."""
+    return " ".join(query.split()).casefold()
+
+
+def _logical_database_size(conn: sqlite3.Connection) -> int:
+    """Return the logical source size, including committed pages still in WAL."""
+    page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    if not isinstance(page_count, int) or not isinstance(page_size, int) or page_count < 0 or page_size <= 0:
+        raise SystemExit("source reported invalid SQLite page_count/page_size")
+    return page_count * page_size
+
+
+def _ensure_backup_capacity(outdir: Path, remaining: int, page_size: int, free_reserve: int) -> None:
+    if shutil.disk_usage(outdir).free < remaining * page_size + free_reserve:
+        raise OSError("online backup would consume the configured free-space reserve")
+
+
+def _remove_private(path: Path) -> None:
+    if path.is_symlink():
+        raise SystemExit(f"refusing symlinked private artifact: {path}")
+    if path.exists():
+        path.unlink()
+
+
+def _write_atomic_private(path: Path, text: str) -> None:
+    """Publish a private text artifact without exposing a partial JSON document."""
+    if path.is_symlink():
+        raise SystemExit(f"refusing symlinked private artifact: {path}")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _remove_private(temporary)
+    _write_private(temporary, text)
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
 
 
 
@@ -166,29 +225,32 @@ def _recover_queries(conn: sqlite3.Connection) -> list[dict]:
         # bounded to a small transcript window.
         known_rows = False
         for item in KNOWN_CALLS:
-            predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id LIKE ?"
-            value = item["conversation_id"] + "%" if item.get("prefix") else item["conversation_id"]
+            predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id GLOB ?"
+            value = item["conversation_id"] + "*" if item.get("prefix") else item["conversation_id"]
             if conn.execute(f"SELECT 1 FROM messages WHERE {predicate} LIMIT 1", (value,)).fetchone():
                 known_rows = True
                 break
         if known_rows:
             order = "created_at, message_id" if "created_at" in columns else "message_id"
             for item in KNOWN_CALLS:
-                predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id LIKE ?"
-                value = item["conversation_id"] + "%" if item.get("prefix") else item["conversation_id"]
+                predicate = "conversation_id=?" if not item.get("prefix") else "conversation_id GLOB ?"
+                value = item["conversation_id"] + "*" if item.get("prefix") else item["conversation_id"]
                 rows = conn.execute(
                     f"SELECT conversation_id,message_id,content,display_data FROM messages "
                     f"WHERE {predicate} ORDER BY {order} LIMIT ?",
                     (value, RECOVERY_MESSAGE_LIMIT),
                 ).fetchall()
                 _recover_from_rows(rows, item["call_id"], found, seen_ids)
-            return found
 
-    # Synthetic fixtures and older schemas retain the LIKE fallback so tests can
-    # exercise recovery without manufacturing production transcript ids.
+    # Synthetic fixtures and older schemas retain the content fallback. It also
+    # allows an operator-supplied replacement call to complete partial recovery
+    # when only one of the known transcripts is present, without manufacturing
+    # production transcript ids.
     conversation = "conversation_id" if "conversation_id" in columns else "NULL"
     order = "created_at, message_id" if "created_at" in columns else "message_id"
     for call_id in observed_call_ids():
+        if call_id.casefold() in seen_ids:
+            continue
         rows = conn.execute(
             f"SELECT {conversation},message_id,content,display_data FROM messages "
             "WHERE content LIKE ? OR display_data LIKE ? "
@@ -210,7 +272,7 @@ def _counts(conn):
 def snapshot(args) -> int:
     source = Path(args.source).expanduser().resolve()
     outdir = Path(args.artifacts).expanduser().resolve()
-    requested = Path(args.output).expanduser().resolve() if args.output else outdir / "captured.db"
+    requested = outdir / "captured.db"
     if (
         source == requested
         or source == outdir
@@ -222,8 +284,17 @@ def snapshot(args) -> int:
     _private(outdir)
     dest = requested
     if dest.exists() and not args.force: raise SystemExit(f'fixture exists (use --force only to replace): {dest}')
-    if shutil.disk_usage(outdir).free < source.stat().st_size * 2:
-        raise SystemExit('insufficient free space for snapshot and safety margin')
+    source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
+    try:
+        logical_size = _logical_database_size(source_conn)
+        page_size = source_conn.execute("PRAGMA page_size").fetchone()[0]
+    finally:
+        source_conn.close()
+    # The backup needs one logical database copy, while the second copy is a
+    # reserve for WAL growth, SQLite journals, and a failed retry.
+    free_reserve = logical_size
+    if shutil.disk_usage(outdir).free < logical_size + free_reserve:
+        raise SystemExit('insufficient free space for logical snapshot and safety reserve')
     tmp = outdir / f'.captured.db.{os.getpid()}.tmp'
     tmp.unlink(missing_ok=True)
     started = time.time()
@@ -240,13 +311,14 @@ def snapshot(args) -> int:
             dst = sqlite3.connect(tmp, timeout=args.busy_timeout)
             def on_progress(status, remaining, total):
                 progress.update(pages=total - remaining, remaining=remaining, total=total)
+                _ensure_backup_capacity(outdir, remaining, page_size, free_reserve)
                 if time.monotonic() >= deadline:
                     raise TimeoutError("online backup deadline exceeded")
             with dst:
                 src.backup(dst, pages=256, sleep=0.05, progress=on_progress)
             last = None
             break
-        except (sqlite3.Error, TimeoutError) as error:
+        except (sqlite3.Error, OSError, TimeoutError) as error:
             last = error
             tmp.unlink(missing_ok=True)
             if time.monotonic() < deadline:
@@ -274,6 +346,7 @@ def snapshot(args) -> int:
     manifest = {'kind':'conversation-search-fixture','source_path':str(source),
       'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':dest.stat().st_size,
       'sha256':_hash(dest),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
+      'logical_size_bytes':logical_size,'page_size_bytes':page_size,
       'counts':counts,'recovered_queries':recovered_queries,'backup_progress':progress,
       'backup_deadline_seconds':deadline_seconds}
     _write_private(outdir/'capture-manifest.json', json.dumps(manifest, indent=2)+'\n')
@@ -285,7 +358,7 @@ def prepare(args) -> int:
     outdir = Path(args.artifacts).expanduser().resolve(); db = outdir/'captured.db'; manifest = outdir/'capture-manifest.json'
     if not db.exists() or not manifest.exists(): raise SystemExit('capture-manifest.json and captured.db are required')
     capture = json.loads(manifest.read_text())
-    if capture.get('kind') != 'conversation-search-fixture' or capture.get('snapshot_path') != str(db):
+    if capture.get('kind') != 'conversation-search-fixture' or Path(capture.get('snapshot_path', '')).resolve() != db:
         raise SystemExit('capture manifest does not identify this captured.db')
     if capture.get('size_bytes') != db.stat().st_size or capture.get('sha256') != _hash(db):
         raise SystemExit('captured.db does not match capture manifest')
@@ -298,6 +371,9 @@ def prepare(args) -> int:
             "fewer than two independently identified slow calls were recovered; "
             "set PHOENIX_SEARCH_CALL_IDS to verified IDs rather than duplicating a query"
         )
+    normalized_queries = [_normalize_query(item["query"]) for item in recovered]
+    if len(set(normalized_queries)) != len(normalized_queries):
+        raise SystemExit("recovered slow calls contain duplicate normalized queries; provide distinct verified call IDs")
     exact=recovered[0]['query']; ids=[]
     row=conn.execute('SELECT conversation_id FROM messages WHERE message_id=?',(recovered[0]['message_id'],)).fetchone()
     if row: ids=[row[0]]
@@ -315,7 +391,12 @@ def prepare(args) -> int:
     scenarios_path = outdir/'scenarios.json'
     if scenarios_path.exists() and not getattr(args, "force", False):
         raise SystemExit(f'frozen scenarios exist (use --force only to replace): {scenarios_path}')
-    _write_private(scenarios_path, json.dumps({'version':1,'scenarios':scenarios},indent=2)+'\n')
+    scenario_manifest = {
+        'version': 1,
+        'fixture_sha256': capture['sha256'],
+        'scenarios': scenarios,
+    }
+    _write_private(scenarios_path, json.dumps(scenario_manifest, indent=2)+'\n')
     print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
 def run(args) -> int:
@@ -324,22 +405,34 @@ def run(args) -> int:
     if not db.exists() or not scen.exists() or not manifest.exists():
         raise SystemExit('run requires captured.db, capture-manifest.json, and scenarios.json')
     capture=json.loads(manifest.read_text())
-    if capture.get('snapshot_path') != str(db) or capture.get('sha256') != _hash(db) or capture.get('size_bytes') != db.stat().st_size:
+    if Path(capture.get('snapshot_path', '')).resolve() != db or capture.get('sha256') != _hash(db) or capture.get('size_bytes') != db.stat().st_size:
         raise SystemExit('captured.db does not match capture-manifest.json')
     if Path(capture.get('source_path', '')).resolve() == db:
         raise SystemExit('refusing to benchmark the capture source directly')
     scenarios=json.loads(scen.read_text())
     if scenarios.get('version') != 1 or not isinstance(scenarios.get('scenarios'), list):
         raise SystemExit('invalid scenarios manifest')
+    if scenarios.get('fixture_sha256') != capture.get('sha256'):
+        raise SystemExit('scenarios.json does not match capture-manifest.json fixture')
     result_dir=outdir/'runs'; _private(result_dir)
     label=_label(args.label)
     output=result_dir/f'{label}.json'
     if output.exists() and not args.force:
         raise SystemExit(f'result exists (use --force only to replace): {output}')
+    if args.force:
+        # A failed forced rerun must not leave a previous successful result
+        # masquerading as the outcome. The Rust harness publishes to a private
+        # temporary path; only a complete result is renamed into place below.
+        _remove_private(output)
+    output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
+    _remove_private(output_tmp)
+    failure_output = result_dir / "failures" / f"{label}.json"
+    _ensure_clean_source()
+    _remove_private(failure_output)
     cmd=['cargo','test','-p','phoenix_ide','--release','production_conversation_search_benchmark','--lib','--','--ignored','--nocapture']
     env=dict(os.environ,
         PHOENIX_SEARCH_BENCH_DB=str(db), PHOENIX_SEARCH_BENCH_SCENARIOS=str(scen),
-        PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST=str(manifest), PHOENIX_SEARCH_BENCH_OUT=str(output),
+        PHOENIX_SEARCH_BENCH_CAPTURE_MANIFEST=str(manifest), PHOENIX_SEARCH_BENCH_OUT=str(output_tmp),
         PHOENIX_SEARCH_BENCH_COMMIT=_git_commit(), PHOENIX_SEARCH_BENCH_HOST=platform.node(),
         PHOENIX_SEARCH_BENCH_PLATFORM=platform.platform(), PHOENIX_SEARCH_BENCH_PROCESSOR=platform.processor(),
         PHOENIX_SEARCH_BENCH_CPU_COUNT=str(os.cpu_count() or 1))
@@ -372,10 +465,27 @@ def run(args) -> int:
         }
         failures_dir = result_dir / "failures"
         _private(failures_dir)
-        _write_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
+        _remove_private(output_tmp)
+        _write_atomic_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
         raise SystemExit(f'benchmark timed out after {args.timeout}s; process group was stopped') from error
     if process.returncode:
-        raise SystemExit(f'benchmark failed with exit status {process.returncode}')
+        failures_dir = result_dir / "failures"
+        _private(failures_dir)
+        if output_tmp.exists():
+            os.replace(output_tmp, failure_output)
+            os.chmod(failure_output, 0o600)
+        else:
+            _write_atomic_private(failure_output, json.dumps({
+                "kind": "conversation-search-benchmark-failure",
+                "run_label": label, "status": "process_failure",
+                "exit_status": process.returncode,
+            }, indent=2) + "\n")
+        raise SystemExit(f'benchmark failed with exit status {process.returncode}; failure evidence retained')
+    if not output_tmp.exists():
+        raise SystemExit('benchmark completed without publishing a result')
+    os.replace(output_tmp, output)
+    _remove_private(failure_output)
+    os.chmod(output, 0o600)
     print(output); return 0
 
 def _median(values):
@@ -514,7 +624,6 @@ def main():
     s=sub.add_parser("snapshot")
     s.add_argument("--source", default=os.environ.get("PHOENIX_PROD_DB", str(Path.home()/".phoenix-ide/prod.db")))
     s.add_argument("--artifacts", default=str(DEFAULT_ARTIFACTS))
-    s.add_argument("--output", default="")
     s.add_argument("--force", action="store_true")
     s.add_argument("--retries", type=int, default=5)
     s.add_argument("--busy-timeout", type=float, default=5.0)
