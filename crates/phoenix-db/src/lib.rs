@@ -11131,7 +11131,7 @@ impl Database {
             "SELECT c.id
              FROM conversations c
              JOIN durable_turns t ON t.conversation_id = c.id
-             WHERE c.state_kind = 'idle'
+             WHERE c.state_kind IN ('idle', 'llm_requesting')
                AND t.disposition = 'Runtime'
                AND t.owns_conversation = 1
                AND t.terminal_kind IS NULL
@@ -11154,7 +11154,7 @@ impl Database {
                FROM conversations c
                JOIN durable_turns t ON t.conversation_id = c.id
                WHERE c.id = ?1
-                 AND c.state_kind = 'idle'
+                 AND c.state_kind IN ('idle', 'llm_requesting')
                  AND t.disposition = 'Runtime'
                  AND t.owns_conversation = 1
                  AND t.terminal_kind IS NULL
