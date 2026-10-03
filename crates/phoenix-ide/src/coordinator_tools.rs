@@ -622,82 +622,14 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
     }
 }
 
-/// Extract the ordered citations from the search tool's rendered result.
-///
-/// The benchmark intentionally validates the same text boundary that a
-/// coordinator sees rather than deriving counts from retriever internals. A
-/// successful hit result has markdown hit headers (snippets may span lines), with the exact
-/// `@transcript:<id>#message-<id>` citation at the end of its metadata.
 #[cfg(test)]
-fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
-    const NO_HIT: &str = "No matching messages found.";
-
-    if output.trim() == NO_HIT {
-        return Ok(Vec::new());
-    }
-
-    let mut citations = Vec::new();
-    for (line_number, line) in output.split("\n- [").enumerate() {
-        let line = if line_number == 0 {
-            line.to_string()
-        } else {
-            format!("- [{line}")
-        };
-        if !line.starts_with("- [") {
-            return Err(format!(
-                "line {} does not start with '- ['",
-                line_number + 1
-            ));
-        }
-        let Some((header, _snippet)) = line.split_once(" — ") else {
-            continue;
-        };
-        let Some((_, metadata)) = header.rsplit_once(") ") else {
-            continue;
-        };
-        let marker = "@transcript:";
-        let mut markers = metadata.match_indices(marker);
-        let Some((marker_offset, _)) = markers.next() else {
-            return Err(format!(
-                "line {} is missing an @transcript citation",
-                line_number + 1
-            ));
-        };
-        if markers.next().is_some() {
-            return Err(format!(
-                "line {} contains multiple @transcript citations",
-                line_number + 1
-            ));
-        }
-        let citation = metadata
-            .get(marker_offset..)
-            .ok_or("invalid citation boundary")?;
-        let Some((transcript_id, message_id)) = citation
-            .strip_prefix(marker)
-            .and_then(|value| value.split_once("#message-"))
-        else {
-            return Err(format!(
-                "line {} has an invalid transcript citation",
-                line_number + 1
-            ));
-        };
-        if transcript_id.is_empty()
-            || message_id.is_empty()
-            || citation.chars().any(char::is_whitespace)
-            || transcript_id.contains('#')
-            || message_id.contains('#')
-        {
-            return Err(format!(
-                "line {} has an invalid transcript citation",
-                line_number + 1
-            ));
-        }
-        citations.push(citation.to_string());
-    }
-    if citations.is_empty() {
-        return Err("successful search result is empty".to_string());
-    }
-    Ok(citations)
+fn structured_search_result(hits: &[crate::db::RetrievedChunk]) -> (usize, Vec<String>) {
+    (
+        hits.len(),
+        hits.iter()
+            .map(|hit| format!("{}:{}", hit.conversation_id, hit.message_id))
+            .collect(),
+    )
 }
 
 fn result(value: Result<String, String>) -> ToolOutput {
@@ -1004,6 +936,19 @@ mod tests {
                 "limit": policy_request.limit(),
                 "lexical_expression": lexical_expression,
             });
+            let tool_oracle = if is_retriever {
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        policy_service.search_with_hits(query),
+                    )
+                    .await
+                    .expect("oracle timeout")
+                    .expect("oracle result"),
+                )
+            };
             let surfaces: &[&str] = if is_retriever {
                 &["retriever"]
             } else {
@@ -1117,16 +1062,11 @@ mod tests {
                         let (ok, output, result_count, result_identity, format_error) =
                             match invocation_result {
                                 InvocationResult::Retriever(Ok(hits)) => {
-                                    let identity = hits
-                                        .iter()
-                                        .map(|hit| {
-                                            format!("{}:{}", hit.conversation_id, hit.message_id)
-                                        })
-                                        .collect::<Vec<_>>();
+                                    let (count, identity) = structured_search_result(&hits);
                                     (
                                         true,
                                         serde_json::to_string(&hits).unwrap(),
-                                        Some(hits.len()),
+                                        Some(count),
                                         Some(identity),
                                         None,
                                     )
@@ -1141,15 +1081,22 @@ mod tests {
                                     result_identity,
                                 } => {
                                     if ok {
-                                        match parse_search_tool_output(&output) {
-                                            Ok(citations) => (
-                                                true,
+                                        let (expected_output, hits) =
+                                            tool_oracle.as_ref().expect("tool oracle");
+                                        let (count, identity) = structured_search_result(hits);
+                                        if output == *expected_output {
+                                            (true, output, Some(count), Some(identity), None)
+                                        } else {
+                                            (
+                                                false,
                                                 output,
-                                                Some(citations.len()),
-                                                Some(citations),
-                                                None,
-                                            ),
-                                            Err(error) => (false, output, None, None, Some(error)),
+                                                Some(count),
+                                                Some(identity),
+                                                Some(
+                                                    "tool output differs from service formatter"
+                                                        .to_string(),
+                                                ),
+                                            )
                                         }
                                     } else {
                                         (false, output, result_count, result_identity, None)
@@ -1195,6 +1142,7 @@ mod tests {
             "fixture_validation": fixture_validation,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
+            "tool_oracle_regime": "one precomputed service query per tool case before sequence",
             "measurement_regimes": ["first_operation_setup_connection_used_os_cache_uncontrolled", "warm"],
             "case_policies": case_policies,
             "explain_plans": explain_plans, "explain_enabled": explain,
@@ -1215,33 +1163,37 @@ mod tests {
     }
 
     #[test]
-    fn search_tool_result_parser_derives_ordered_citations_and_no_hit_count() {
-        let output = "- [first · user · 2026-01-01](/messages/one) @transcript:one#message-m1 — first\n- [second · assistant · 2026-01-02](/messages/two) @conv:p · @transcript:two#message-m2 — second";
-        assert_eq!(
-            parse_search_tool_output(output).unwrap(),
-            vec!["@transcript:one#message-m1", "@transcript:two#message-m2"]
-        );
-        assert!(parse_search_tool_output("No matching messages found.")
-            .unwrap()
-            .is_empty());
-    }
+    fn structured_search_oracle_preserves_count_and_ordered_ids() {
+        let hit = |conversation_id: &str, message_id: &str| crate::db::RetrievedChunk {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            chunk: crate::db::ChunkRef {
+                ordinal: 0,
+                char_range: None,
+            },
+            message_type: phoenix_core::domain::db_schema::MessageType::User,
+            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+            created_at: chrono::Utc::now(),
+            snippet: "snippet".to_string(),
+            score: 0.0,
+            transcript_generation: 0,
+            message_count: 1,
+        };
+        let hits = vec![
+            hit("conversation-a", "message-1"),
+            hit("conversation-b", "message-2"),
+        ];
 
-    #[test]
-    fn search_tool_result_parser_accepts_multiline_snippets() {
-        let output = "- [title](/c/a) @transcript:t#message-m — snippet\n   continued snippet\n- [title](/c/a) @transcript:t#message-n — another\n```\nmultiline\n```\n";
         assert_eq!(
-            parse_search_tool_output(output).unwrap(),
-            vec!["@transcript:t#message-m", "@transcript:t#message-n"]
+            structured_search_result(&hits),
+            (
+                2,
+                vec![
+                    "conversation-a:message-1".to_string(),
+                    "conversation-b:message-2".to_string(),
+                ]
+            )
         );
-    }
-
-    #[test]
-    fn search_tool_result_parser_rejects_invalid_hit_format() {
-        let error = parse_search_tool_output("- [broken result]").unwrap_err();
-        assert!(error.contains("empty"));
-        let error =
-            parse_search_tool_output("- [broken](/x) @transcript:one — snippet").unwrap_err();
-        assert!(error.contains("invalid transcript citation"));
     }
 
     #[tokio::test]

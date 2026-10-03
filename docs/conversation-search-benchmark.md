@@ -146,3 +146,34 @@ PRAGMA measurement; `verification.json` labels offline Python PRAGMA reads
 separately. Captured index row counts agree, but a full content-fingerprint
 freshness sweep was not performed and the read-only harness deliberately does
 not rebuild the captured index.
+
+## Corrected historical qualification and current source boundary
+
+The fe2f6a506 table above is historical and superseded for experiment pairing.
+The actual qualified before suites ran source063a82ff2: exact tool medians
+1668.460/1684.375ms; scoped retriever4360.658/4354.053ms. The paired experiment
+ran source42740b6c1: scoped73.722/72.906ms, all complete result digests equal
+across11surfaces. Both measured source versions validate full captured index
+fingerprints and physical mappings read-only. Raw files are
+`qualified-before-1/2.json` and `after-scope-1/2.json`; prior raw evidence is
+retained, not rewritten. These are historical measured commits, NOT a claim
+that later committed harness heads were measured.
+
+The current harness avoids parsing unsanitized snippets. It precomputes one
+structured service result per tool case before the sample sequence, then
+checks timed tool outputs against that immutable formatter result and stores
+structured count/order. No oracle query runs between samples. This setup
+regime is explicit and **unmeasured**; do not compare new-regime runs to the
+historical pair as though cache preparation were unchanged. No new release
+campaign was performed merely for metadata or documentation corrections.
+
+A tiny-scope regression allegation was checked in memory using the existing
+Rust-linked SQLite3.51.3 archive (Python here links3.53.0).300k common-token
+FTS rows and15selected rows, production-shaped locator/index plus source and
+conversation joins, hidden predicate, BM25/order/LIMIT, snippet, and correlated
+count: locator-first0:=M1 roughly77ms versus FTS-first0:M1 roughly24ms; ANALYZE
+roughly78ms versus24ms. The reported0.23→30ms regression was not reproduced.
+This dismisses that specific unsupported reproducer claim, not every possible
+workload regression. Schema/provenance constants and corpus content are
+synthetic; no production data or indices were mutated. Residual global
+performance variation and lack of live19s reproduction remain as above.
