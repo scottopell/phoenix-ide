@@ -657,6 +657,82 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
     }
 }
 
+/// Extract the ordered citations from the search tool's rendered result.
+///
+/// The benchmark intentionally validates the same text boundary that a
+/// coordinator sees rather than deriving counts from retriever internals. A
+/// successful hit result is one markdown hit per line, with the exact
+/// `@transcript:<id>#message-<id>` citation at the end of its metadata.
+fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
+    const NO_HIT: &str = "No matching messages found.";
+
+    if output.trim() == NO_HIT {
+        return Ok(Vec::new());
+    }
+
+    let mut citations = Vec::new();
+    for (line_number, line) in output.lines().enumerate() {
+        if !line.starts_with("- [") {
+            return Err(format!(
+                "line {} does not start with '- ['",
+                line_number + 1
+            ));
+        }
+        let Some((header, _snippet)) = line.split_once(" — ") else {
+            return Err(format!(
+                "line {} is missing the hit/snippet separator",
+                line_number + 1
+            ));
+        };
+        let Some((_, metadata)) = header.rsplit_once(") ") else {
+            return Err(format!(
+                "line {} is missing the citation metadata",
+                line_number + 1
+            ));
+        };
+        let marker = "@transcript:";
+        let mut markers = metadata.match_indices(marker);
+        let Some((marker_offset, _)) = markers.next() else {
+            return Err(format!(
+                "line {} is missing an @transcript citation",
+                line_number + 1
+            ));
+        };
+        if markers.next().is_some() {
+            return Err(format!(
+                "line {} contains multiple @transcript citations",
+                line_number + 1
+            ));
+        }
+        let citation = &metadata[marker_offset..];
+        let Some((transcript_id, message_id)) = citation
+            .strip_prefix(marker)
+            .and_then(|value| value.split_once("#message-"))
+        else {
+            return Err(format!(
+                "line {} has an invalid transcript citation",
+                line_number + 1
+            ));
+        };
+        if transcript_id.is_empty()
+            || message_id.is_empty()
+            || citation.chars().any(char::is_whitespace)
+            || transcript_id.contains('#')
+            || message_id.contains('#')
+        {
+            return Err(format!(
+                "line {} has an invalid transcript citation",
+                line_number + 1
+            ));
+        }
+        citations.push(citation.to_string());
+    }
+    if citations.is_empty() {
+        return Err("successful search result is empty".to_string());
+    }
+    Ok(citations)
+}
+
 fn result(value: Result<String, String>) -> ToolOutput {
     match value {
         Ok(value) => ToolOutput::success(value),
@@ -754,6 +830,7 @@ mod tests {
                 ok: bool,
                 output: String,
                 result_count: Option<usize>,
+                result_identity: Option<Vec<String>>,
             },
         }
 
@@ -869,6 +946,53 @@ mod tests {
             let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
             observe_sqlite_regime(&db).await
         };
+        // Validate the immutable fixture before marking any retriever as
+        // reconciled. This is setup evidence, not a measured search path. The
+        // bounded batches keep SQLite bind counts reasonable while the existing
+        // freshness check compares typed source content (including attachments)
+        // with the indexed fingerprint.
+        const FRESHNESS_BATCH_SIZE: usize = 64;
+        let fixture_validation = {
+            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let retriever = db.fts_retriever();
+            let transcript_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT conversation_id FROM messages ORDER BY conversation_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("list fixture transcript ids");
+            for batch in transcript_ids.chunks(FRESHNESS_BATCH_SIZE) {
+                if !retriever
+                    .is_fresh_for(batch)
+                    .await
+                    .expect("check fixture index freshness")
+                {
+                    panic!(
+                        "benchmark fixture is stale: FTS freshness failed for a transcript batch ({} transcripts)",
+                        batch.len()
+                    );
+                }
+            }
+            let orphan_counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT\n                     COALESCE(SUM(CASE WHEN m.message_id IS NULL THEN 1 ELSE 0 END), 0),\n                     COALESCE(SUM(CASE WHEN f.rowid IS NULL THEN 1 ELSE 0 END), 0),\n                     (SELECT COUNT(*)\n                        FROM message_fts f\n                        LEFT JOIN message_fts_rows r ON r.fts_rowid = f.rowid\n                       WHERE r.fts_rowid IS NULL)\n                   FROM message_fts_rows r\n                   LEFT JOIN messages m ON m.message_id = r.message_id\n                   LEFT JOIN message_fts f ON f.rowid = r.fts_rowid",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("check fixture FTS orphan rows");
+            let (locator_orphans, missing_physical_rows, unlocated_physical_rows) = orphan_counts;
+            if locator_orphans != 0 || missing_physical_rows != 0 || unlocated_physical_rows != 0 {
+                panic!(
+                    "benchmark fixture has stale FTS rows: locator_orphans={locator_orphans}, missing_physical_rows={missing_physical_rows}, unlocated_physical_rows={unlocated_physical_rows}"
+                );
+            }
+            json!({
+                "transcript_count": transcript_ids.len(),
+                "freshness_batch_size": FRESHNESS_BATCH_SIZE,
+                "locator_orphans": locator_orphans,
+                "missing_physical_rows": missing_physical_rows,
+                "unlocated_physical_rows": unlocated_physical_rows,
+            })
+        };
         'scenarios: for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
             let case_id = scenario["id"].as_str().unwrap();
             let query = scenario["query"].as_str().unwrap();
@@ -980,12 +1104,11 @@ mod tests {
                                     .run(serde_json::json!({"query": query}), context.clone())
                                     .await;
                                 let output = result.output().to_string();
-                                let result_count =
-                                    (output == "No matching messages found.").then_some(0);
                                 InvocationResult::Tool {
                                     ok: result.is_success(),
                                     output,
-                                    result_count,
+                                    result_count: None,
+                                    result_identity: None,
                                 }
                             }
                         };
@@ -1002,32 +1125,53 @@ mod tests {
                                     ok: false,
                                     output: "per-case timeout after 300 seconds".to_string(),
                                     result_count: None,
+                                    result_identity: None,
                                 },
                             ),
                         };
                         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-                        let (ok, output, result_count, result_identity) = match invocation_result {
-                            InvocationResult::Retriever(Ok(hits)) => {
-                                let identity = hits
-                                    .iter()
-                                    .map(|hit| {
-                                        format!("{}:{}", hit.conversation_id, hit.message_id)
-                                    })
-                                    .collect::<Vec<_>>();
-                                (
-                                    true,
-                                    serde_json::to_string(&hits).unwrap(),
-                                    Some(hits.len()),
-                                    Some(identity),
-                                )
-                            }
-                            InvocationResult::Retriever(Err(error)) => (false, error, None, None),
-                            InvocationResult::Tool {
-                                ok,
-                                output,
-                                result_count,
-                            } => (ok, output, result_count, None),
-                        };
+                        let (ok, output, result_count, result_identity, format_error) =
+                            match invocation_result {
+                                InvocationResult::Retriever(Ok(hits)) => {
+                                    let identity = hits
+                                        .iter()
+                                        .map(|hit| {
+                                            format!("{}:{}", hit.conversation_id, hit.message_id)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    (
+                                        true,
+                                        serde_json::to_string(&hits).unwrap(),
+                                        Some(hits.len()),
+                                        Some(identity),
+                                        None,
+                                    )
+                                }
+                                InvocationResult::Retriever(Err(error)) => {
+                                    (false, error, None, None, None)
+                                }
+                                InvocationResult::Tool {
+                                    ok,
+                                    output,
+                                    result_count,
+                                    result_identity,
+                                } => {
+                                    if ok {
+                                        match parse_search_tool_output(&output) {
+                                            Ok(citations) => (
+                                                true,
+                                                output,
+                                                Some(citations.len()),
+                                                Some(citations),
+                                                None,
+                                            ),
+                                            Err(error) => (false, output, None, None, Some(error)),
+                                        }
+                                    } else {
+                                        (false, output, result_count, result_identity, None)
+                                    }
+                                }
+                            };
                         let digest = digest_bytes(output.as_bytes());
                         samples.push(serde_json::json!({
                             "case_id": case_id, "surface": surface,
@@ -1039,6 +1183,11 @@ mod tests {
                         }));
                         if !ok {
                             failures.push(format!("benchmark scenario {case_id} failed: {output}"));
+                        }
+                        if let Some(error) = format_error {
+                            failures.push(format!(
+                                "benchmark scenario {case_id} returned invalid hit format: {error}"
+                            ));
                         }
                         if expected == "no_hit" && result_count != Some(0) {
                             failures
@@ -1059,6 +1208,7 @@ mod tests {
             "commit": std::env::var("PHOENIX_SEARCH_BENCH_COMMIT").unwrap_or_else(|_| "unknown".into()),
             "environment": {"host": std::env::var("PHOENIX_SEARCH_BENCH_HOST").unwrap_or_default(), "platform": std::env::var("PHOENIX_SEARCH_BENCH_PLATFORM").unwrap_or_default(), "processor": std::env::var("PHOENIX_SEARCH_BENCH_PROCESSOR").unwrap_or_default(), "cpu_count": std::env::var("PHOENIX_SEARCH_BENCH_CPU_COUNT").unwrap_or_default()},
             "sqlite_pragmas": sqlite_regime,
+            "fixture_validation": fixture_validation,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
             "measurement_regimes": ["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
@@ -1077,6 +1227,27 @@ mod tests {
             failures.is_empty(),
             "benchmark failures (raw samples saved): {failures:?}"
         );
+    }
+
+    #[test]
+    fn search_tool_result_parser_derives_ordered_citations_and_no_hit_count() {
+        let output = "- [first · user · 2026-01-01](/messages/one) @transcript:one#message-m1 — first\n- [second · assistant · 2026-01-02](/messages/two) @conv:p · @transcript:two#message-m2 — second";
+        assert_eq!(
+            parse_search_tool_output(output).unwrap(),
+            vec!["@transcript:one#message-m1", "@transcript:two#message-m2"]
+        );
+        assert!(parse_search_tool_output("No matching messages found.")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn search_tool_result_parser_rejects_invalid_hit_format() {
+        let error = parse_search_tool_output("- [broken result]").unwrap_err();
+        assert!(error.contains("separator"));
+        let error =
+            parse_search_tool_output("- [broken](/x) @transcript:one — snippet").unwrap_err();
+        assert!(error.contains("invalid transcript citation"));
     }
 
     #[tokio::test]

@@ -27,7 +27,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             ],
         ]
         value = {
-            "fixture_sha256": "a", "scenario_digest": "s", "profile": "release",
+            "fixture_sha256": "a", "schema_digest": "schema", "migration_ledger": [],
+            "scenario_digest": "s", "profile": "release",
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment": {"host": "host"}, "sqlite_pragmas": {"read_only": True},
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
@@ -55,6 +56,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 '{"tool_use_id":"call_w7yaFJY51rJxTjog4DKeE2wo","query":"exact observed"}')
             manifest = json.loads((out / "capture-manifest.json").read_text())
             self.assertEqual(manifest["integrity_check"], "ok")
+            self.assertEqual(len(manifest["schema_digest"]), 64)
+            self.assertIsNone(manifest["migration_ledger"])
             self.assertEqual(manifest["recovered_queries"][0]["query"], "exact observed")
             source_conn = sqlite3.connect(source)
             self.assertEqual(
@@ -87,6 +90,25 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         ).fetchall()
         self.assertIn("USING COVERING INDEX messages_conversation", plan[0][3])
 
+    def test_recovery_does_not_full_scan_production_schema_without_configured_ids(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE conversations(id TEXT)")
+        conn.execute("CREATE TABLE messages(conversation_id TEXT, message_id TEXT, content TEXT, display_data TEXT, created_at INTEGER)")
+        conn.execute("INSERT INTO messages VALUES (?, ?, ?, NULL, ?)", (
+            "conv", "msg", json.dumps({"tool_use_id": bench.CALL_IDS[0], "query": "must not scan"}), 1))
+        conn.commit()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(bench._recover_queries(conn), [])
+
+    def test_schema_evidence_captures_digest_and_existing_migration_ledger(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE _migrations(version INTEGER, name TEXT)")
+        conn.execute("INSERT INTO _migrations VALUES (1, 'initial')")
+        conn.commit()
+        digest, ledger = bench._schema_evidence(conn)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(ledger, [{"version": 1, "name": "initial"}])
+
     def test_prepare_rejects_duplicate_normalized_observed_queries(self):
         self.assertEqual(bench._normalize_query("  Same   Query "), "same query")
         self.assertEqual(bench._normalize_query("same query"), "same query")
@@ -118,6 +140,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
                 "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "schema_digest": "schema", "migration_ledger": [],
                 "source_path": str(root / "source.db"),
             }))
             (root / "scenarios.json").write_text(json.dumps({
@@ -134,6 +157,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             fixture_hash = bench._hash(db)
             (root / "capture-manifest.json").write_text(json.dumps({
                 "snapshot_path": str(db), "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "schema_digest": "schema", "migration_ledger": [],
                 "source_path": str(root / "source.db"),
             }))
             (root / "scenarios.json").write_text(json.dumps({
@@ -154,6 +178,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                     return None
 
             def fake_popen(*args, **kwargs):
+                self.assertIn("PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST", kwargs["env"])
+                self.assertIn("PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER", kwargs["env"])
                 Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text("fresh")
                 return CompletedProcess()
 
@@ -164,7 +190,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
                 bench.run(type("Args", (), {"artifacts": str(root), "label": "suite", "force": True, "timeout": 1})())
             self.assertEqual(stale.read_text(), "fresh")
-            self.assertFalse(failure.exists())
+            self.assertTrue(failure.exists())
+            self.assertEqual(failure.read_text(), "old failure")
             self.assertEqual(list(runs.glob(".*.tmp")), [])
 
     def test_run_refuses_dirty_source_tree(self):
@@ -262,6 +289,30 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             report = (root / "report.md").read_text()
             self.assertNotIn("999.000", report)
             self.assertIn("suite-1.json — case — tool — warm", report)
+            self.assertIn("fixture_sha256: a", report)
+            self.assertIn("scenario_digest: s", report)
+
+    def test_prepare_uses_single_alphanumeric_no_hit_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "captured.db"
+            db.write_bytes(b"fixture")
+            fixture_hash = bench._hash(db)
+            (root / "capture-manifest.json").write_text(json.dumps({
+                "kind": "conversation-search-fixture", "snapshot_path": str(db),
+                "sha256": fixture_hash, "size_bytes": db.stat().st_size,
+                "source_path": str(root / "source.db"),
+            }))
+            args = type("Args", (), {"artifacts": str(root), "force": True})()
+            with mock.patch.object(bench, "_recover_queries", return_value=[
+                {"query": "first query", "source_call_id": "one", "message_id": "m1"},
+                {"query": "second query", "source_call_id": "two", "message_id": "m2"},
+            ]), mock.patch.object(bench.sqlite3, "connect") as connect:
+                connect.return_value.execute.return_value.fetchone.return_value = ("conv",)
+                bench.prepare(args)
+            scenarios = json.loads((root / "scenarios.json").read_text())["scenarios"]
+            no_hit = next(item for item in scenarios if item["id"] == "verified-no-hit")
+            self.assertRegex(no_hit["query"], r"^[A-Za-z0-9]+$")
 
     def test_compare_refuses_measurement_regime_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
