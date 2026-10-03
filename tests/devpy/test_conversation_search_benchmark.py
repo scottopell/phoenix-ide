@@ -37,6 +37,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
             "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
             "explain_plans": [], "samples": samples,
+            "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
         value.update(overrides)
         return value
@@ -167,6 +168,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             (root / "scenarios.json").write_text(json.dumps({
                 "version": 1, "fixture_sha256": fixture_hash, "expected_case_surface_set": [], "scenarios": [],
             }))
+            (root / "capture-manifest.json").write_text("{}")
             runs = root / "runs"
             runs.mkdir()
             stale = runs / "suite.json"
@@ -283,6 +285,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
     def test_report_separates_runs_surfaces_and_discards_successful_warmup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "capture-manifest.json").write_text("{}")
             runs = root / "runs"
             runs.mkdir()
             samples = self._complete_run()["samples"]
@@ -297,7 +300,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             self.assertIn("scenario_digest: s", report)
 
     def test_artifacts_inside_repo_must_be_git_ignored(self):
-        with mock.patch.object(bench.subprocess, "run", return_value=type("Result", (), {"returncode": 1})()):
+        with mock.patch.object(bench.subprocess, "check_output", return_value=""), mock.patch.object(bench.subprocess, "run", return_value=type("Result", (), {"returncode": 1})()):
             with self.assertRaisesRegex(SystemExit, "unignored"):
                 bench._ensure_ignored_artifacts(ROOT / "not-ignored")
 

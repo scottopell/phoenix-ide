@@ -41,6 +41,15 @@ def _private(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+def _artifact_root(value: str) -> Path:
+    raw = Path(value).expanduser().absolute()
+    if raw.is_symlink():
+        raise SystemExit("refusing symlinked artifact root")
+    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file():
+        raise SystemExit("refusing nonempty unrecognized artifact root; choose a dedicated directory")
+    return raw.resolve()
+
+
 def _label(label: str) -> str:
     if not LABEL_RE.fullmatch(label):
         raise SystemExit("label must contain only letters, digits, '.', '_' or '-' and be at most 64 characters")
@@ -73,7 +82,6 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
     if not relative.parts:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
     paths = [
-        outdir,
         outdir / "captured.db",
         outdir / "capture-manifest.json",
         outdir / "scenarios.json",
@@ -81,11 +89,14 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
         outdir / "runs",
         outdir / "runs" / "failures",
     ]
+    tracked = subprocess.check_output(["git", "ls-files", "--", str(relative)], cwd=repo, text=True)
+    if tracked.strip():
+        raise SystemExit("refusing tracked benchmark artifacts")
     for path in paths:
         try:
             candidate = path.relative_to(repo)
             result = subprocess.run(
-                ["git", "check-ignore", "--no-index", "--quiet", "--", str(candidate)],
+                ["git", "check-ignore", "--quiet", "--", str(candidate)],
                 cwd=repo,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -467,7 +478,7 @@ def _stop_process(process) -> None:
 
 def snapshot(args) -> int:
     source = Path(args.source).expanduser().resolve()
-    outdir = Path(args.artifacts).expanduser().resolve()
+    outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
     requested = outdir / "captured.db"
     if (
@@ -563,7 +574,7 @@ def snapshot(args) -> int:
     return 0
 
 def prepare(args) -> int:
-    outdir = Path(args.artifacts).expanduser().resolve(); db = outdir/'captured.db'; manifest = outdir/'capture-manifest.json'
+    outdir = _artifact_root(args.artifacts); db = outdir/'captured.db'; manifest = outdir/'capture-manifest.json'
     _ensure_ignored_artifacts(outdir)
     if not db.exists() or not manifest.exists(): raise SystemExit('capture-manifest.json and captured.db are required')
     capture = json.loads(manifest.read_text())
@@ -609,7 +620,7 @@ def prepare(args) -> int:
     print(f'wrote frozen scenarios: {scenarios_path}'); return 0
 
 def run(args) -> int:
-    outdir=Path(args.artifacts).expanduser().resolve(); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
+    outdir=_artifact_root(args.artifacts); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
     _ensure_ignored_artifacts(outdir)
     manifest=outdir/'capture-manifest.json'
     if not db.exists() or not scen.exists() or not manifest.exists():
@@ -748,7 +759,7 @@ def _iqr(values):
 
 
 def report(args) -> int:
-    outdir = Path(args.artifacts).expanduser().resolve()
+    outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
     files = sorted((outdir / "runs").glob("*.json"))
     if not files:
@@ -803,7 +814,7 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
@@ -864,13 +875,15 @@ def compare(args) -> int:
     validated_b = _validate_run(b, "after")
     if a["run_uuid"] == b["run_uuid"]:
         raise SystemExit("refusing comparison: same execution identity")
-    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "measurement_regimes")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
     if validated_a["phases"].keys() != validated_b["phases"].keys() or set(map(tuple, a["expected_case_surface_set"])) != set(map(tuple, validated_a["phases"])):
         raise SystemExit("refusing comparison: case/surface regimes differ from the frozen manifest")
     if set(map(tuple, b["expected_case_surface_set"])) != set(map(tuple, validated_b["phases"])):
         raise SystemExit("refusing comparison: case/surface regimes differ from the frozen manifest")
+    if {key: set(phases) for key, phases in validated_a["phases"].items()} != {key: set(phases) for key, phases in validated_b["phases"].items()}:
+        raise SystemExit("refusing comparison: measurement phase names differ")
     if validated_a["digests"] != validated_b["digests"]:
         digests_a, digests_b = validated_a["digests"], validated_b["digests"]
         raise SystemExit("refusing comparison: output mismatch (identity/digests differ between runs)")
