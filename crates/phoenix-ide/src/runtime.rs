@@ -10206,7 +10206,9 @@ mod scope_liveness_tests {
                 .map_err(|error| phoenix_llm::LlmError::invalid_request(error.to_string()))?;
             *self.observed_state.lock().expect("observed state lock") = Some(conversation.state);
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.release.notified())
+                .await
+                .expect("test released provider");
             Ok(phoenix_llm::LlmResponse {
                 provider_replay: None,
                 content: Vec::new(),
@@ -13424,7 +13426,9 @@ mod scope_liveness_tests {
             let manager = Arc::clone(&manager);
             async move { manager.settle_persisted_llm_requests().await }
         });
-        llm.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("provider entered");
         {
             let observed_state = llm.observed_state.lock().expect("observed state lock");
             assert!(
