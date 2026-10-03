@@ -34,6 +34,10 @@ private actor VersionedDiskSink {
     func replace<T: Codable & Equatable & Sendable>(
         expected: T?, replacement: T?, version: Int, revision: Int
     ) -> DiskConditionalMutationOutcome {
+        guard revision >= latestAttemptedRevision else {
+            return .expectationMismatch
+        }
+        latestAttemptedRevision = revision
         let current: T?
         switch DiskStore.loadVersionedResult(T.self, source: destination, version: version) {
         case .missing: current = nil
@@ -41,7 +45,6 @@ private actor VersionedDiskSink {
         case .incompatible, .unreadable: return .persistenceFailed
         }
         guard current == expected else { return .expectationMismatch }
-        latestAttemptedRevision = max(latestAttemptedRevision, revision)
         if let replacement {
             guard DiskStore.writeVersioned(replacement, to: destination, version: version) else {
                 return .persistenceFailed
@@ -390,6 +393,15 @@ enum DiskStore {
     }
 
     static func removeAllAndWait() async {
-        await versionedContext().removeAllAndWait()
+        let rootDirectory = directory.standardizedFileURL
+        let removals = versionedDestinations.values.compactMap { destination -> (VersionedDiskSink, Int)? in
+            let destinationURL = destination.destinationURL.standardizedFileURL
+            guard destinationURL.path.hasPrefix(rootDirectory.path + "/") else { return nil }
+            return (destination.sink, destination.reserveRevision())
+        }
+        for (sink, revision) in removals {
+            await sink.remove(revision: revision)
+        }
+        try? FileManager.default.removeItem(at: rootDirectory)
     }
 }

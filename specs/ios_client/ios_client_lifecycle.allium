@@ -177,6 +177,7 @@ rule SessionCreatedForConversation {
             synced: restored_cache_synced
         )
         DeliveryOwner.created(session: session, kind: retained_session)
+        DeliveryRecoveryGate.created(session: session, fence_classified: false)
 }
 
 rule SessionCreatedForPersistedQueueSweep {
@@ -199,6 +200,7 @@ rule SessionCreatedForPersistedQueueSweep {
             synced: false
         )
         DeliveryOwner.created(session: session, kind: persisted_queue_sweep)
+        DeliveryRecoveryGate.created(session: session, fence_classified: false)
 }
 
 rule OpenConversationOnline {

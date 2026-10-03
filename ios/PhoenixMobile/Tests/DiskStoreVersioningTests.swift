@@ -141,6 +141,34 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testProductionResetFencesPendingDefaultWriterBeforePublication() async {
+        freshDiskStore()
+        let writer = DiskStore.versionedWriter(name: "pending", version: 1)
+        let revision = writer.reserveRevision()
+
+        await DiskStore.removeAllAndWait()
+        _ = await writer.save(Record(name: "pending", count: 1), revision: revision)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: writer.destinationURL.path))
+    }
+
+    @MainActor
+    func testConditionalReplaceCannotPublishAfterNewerFence() async {
+        freshDiskStore()
+        let writer = DiskStore.versionedWriter(name: "records", version: 1)
+        let staleRevision = writer.reserveRevision()
+        await writer.fence(revision: writer.reserveRevision())
+
+        let outcome = await writer.replace(
+            expected: Optional<Record>.none,
+            replacement: Record(name: "stale", count: 1),
+            revision: staleRevision)
+
+        XCTAssertEqual(outcome, .expectationMismatch)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: writer.destinationURL.path))
+    }
+
+    @MainActor
     func testSupersededSaveReportsFailureWhenNewerRevisionDidNotCommit() async throws {
         freshDiskStore()
         let context = DiskStore.versionedContext()
