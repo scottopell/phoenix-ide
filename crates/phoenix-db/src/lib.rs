@@ -7586,6 +7586,33 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Report whether the current interaction response has a later agent checkpoint.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn interaction_response_has_post_source_agent(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM steering_execution_occurrences occurrence
+                 JOIN messages source ON source.message_id = occurrence.message_id
+                 JOIN messages later
+                   ON later.conversation_id = occurrence.conversation_id
+                  AND later.sequence_id > source.sequence_id
+                  AND later.message_type = 'agent'
+                 WHERE occurrence.conversation_id = ?1
+                   AND occurrence.source_kind = 'interaction_response'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Return the source message for the latest adopted execution occurrence.
     ///
     /// # Errors

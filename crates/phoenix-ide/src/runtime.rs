@@ -4295,6 +4295,19 @@ impl RuntimeManager {
             error_kind: crate::db::ErrorKind::InvalidRequest,
             resets_at: None,
         };
+        let occurrence_recovery = if let Some(classified) = occurrence_recovery {
+            let current_source = self
+                .db
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            current_source
+                .as_deref()
+                .filter(|source| *source == classified.source_message_id)
+                .map(|_| classified)
+        } else {
+            None
+        };
         if let Some(baton_recovery) = baton_recovery {
             return self
                 .settle_classified_baton(
@@ -4346,8 +4359,13 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
             return Ok(());
         }
+        let fallback_state = if self.has_queued_steering(conversation_id).await? {
+            ConvState::Idle
+        } else {
+            error_state
+        };
         DatabaseStorage::new(self.db.clone())
-            .update_state(conversation_id, &error_state, state_updated_at)
+            .update_state(conversation_id, &fallback_state, state_updated_at)
             .await
     }
 
@@ -7074,6 +7092,11 @@ impl RuntimeManager {
             && self
                 .db
                 .has_interaction_response_execution_occurrence(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+            && !self
+                .db
+                .interaction_response_has_post_source_agent(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?
         {
@@ -13661,6 +13684,122 @@ mod scope_liveness_tests {
         ));
         llm.release.notify_one();
         settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_wait_blocks_interaction_response_recovery() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-follow-up-question";
+        manager
+            .db()
+            .create_conversation(conversation_id, "wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "answered-interaction",
+                conversation_id,
+                &crate::db::MessageContent::user("first answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'answered-interaction', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .add_message(
+                "follow-up-agent",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("follow up"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let wait = ConvState::AwaitingUserResponse {
+            questions: Vec::new(),
+            tool_use_id: "follow-up-question".to_string(),
+        };
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &wait)
+            .await
+            .unwrap();
+
+        let (state, _, auto_continue) = manager
+            .determine_resume_state(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(state, wait);
+        assert!(!auto_continue);
+    }
+
+    #[tokio::test]
+    async fn queue_only_initialization_failure_remains_idle() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-queue-only-invalid-cwd";
+        manager
+            .db()
+            .create_conversation(
+                conversation_id,
+                "queued",
+                "/definitely/missing/queue-only-cwd",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                    text: "queued input".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "queue-only-steering".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "queue-only-fingerprint",
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .steering_queue_depth(conversation_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
