@@ -663,6 +663,7 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
 /// coordinator sees rather than deriving counts from retriever internals. A
 /// successful hit result has markdown hit headers (snippets may span lines), with the exact
 /// `@transcript:<id>#message-<id>` citation at the end of its metadata.
+#[cfg(test)]
 fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
     const NO_HIT: &str = "No matching messages found.";
 
@@ -703,7 +704,9 @@ fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
                 line_number + 1
             ));
         }
-        let citation = &metadata[marker_offset..];
+        let citation = metadata
+            .get(marker_offset..)
+            .ok_or("invalid citation boundary")?;
         let Some((transcript_id, message_id)) = citation
             .strip_prefix(marker)
             .and_then(|value| value.split_once("#message-"))
@@ -950,7 +953,7 @@ mod tests {
         // bounded batches keep SQLite bind counts reasonable while the existing
         // freshness check compares typed source content (including attachments)
         // with the indexed fingerprint.
-        const FRESHNESS_BATCH_SIZE: usize = 64;
+        let freshness_batch_size: usize = 64;
         let fixture_validation = {
             let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
             let retriever = db.fts_retriever();
@@ -960,7 +963,7 @@ mod tests {
             .fetch_all(db.pool())
             .await
             .expect("list fixture transcript ids");
-            for batch in transcript_ids.chunks(FRESHNESS_BATCH_SIZE) {
+            for batch in transcript_ids.chunks(freshness_batch_size) {
                 if !retriever
                     .is_fresh_for(batch)
                     .await
@@ -979,14 +982,13 @@ mod tests {
             .await
             .expect("check fixture FTS orphan rows");
             let (locator_orphans, missing_physical_rows, unlocated_physical_rows) = orphan_counts;
-            if locator_orphans != 0 || missing_physical_rows != 0 || unlocated_physical_rows != 0 {
-                panic!(
-                    "benchmark fixture has stale FTS rows: locator_orphans={locator_orphans}, missing_physical_rows={missing_physical_rows}, unlocated_physical_rows={unlocated_physical_rows}"
-                );
-            }
+            assert!(
+                locator_orphans == 0 && missing_physical_rows == 0 && unlocated_physical_rows == 0,
+                "benchmark fixture has stale FTS rows: locator_orphans={locator_orphans}, missing_physical_rows={missing_physical_rows}, unlocated_physical_rows={unlocated_physical_rows}"
+            );
             json!({
                 "transcript_count": transcript_ids.len(),
-                "freshness_batch_size": FRESHNESS_BATCH_SIZE,
+                "freshness_batch_size": freshness_batch_size,
                 "locator_orphans": locator_orphans,
                 "missing_physical_rows": missing_physical_rows,
                 "unlocated_physical_rows": unlocated_physical_rows,

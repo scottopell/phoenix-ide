@@ -62,6 +62,73 @@ def _git_commit() -> str:
         return "unknown"
 
 
+def _ensure_ignored_artifacts(outdir: Path) -> None:
+    """Refuse private benchmark output in a repository-visible directory."""
+    repo = Path(__file__).parents[1].resolve()
+    try:
+        relative = outdir.relative_to(repo)
+    except ValueError:
+        return
+    if not relative.parts:
+        raise SystemExit("refusing to write benchmark artifacts in the repository root")
+    paths = [
+        outdir,
+        outdir / "captured.db",
+        outdir / "capture-manifest.json",
+        outdir / "scenarios.json",
+        outdir / "report.md",
+        outdir / "runs",
+        outdir / "runs" / "failures",
+    ]
+    for path in paths:
+        try:
+            candidate = path.relative_to(repo)
+            result = subprocess.run(
+                ["git", "check-ignore", "--no-index", "--quiet", "--", str(candidate)],
+                cwd=repo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as error:
+            raise SystemExit(f"unable to verify ignored benchmark artifact path: {error}") from error
+        if result.returncode == 1:
+            raise SystemExit(
+                f"refusing unignored benchmark artifact path in repository: {path}; "
+                "add it to .gitignore or choose an external --artifacts directory"
+            )
+        if result.returncode != 0:
+            raise SystemExit(f"git check-ignore failed for benchmark artifact path: {path}")
+
+
+def _build_configuration() -> dict:
+    """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
+    repo = Path(__file__).parents[1]
+    try:
+        rustc = subprocess.check_output(["rustc", "-Vv"], cwd=repo, text=True).strip()
+        cargo = subprocess.check_output(["cargo", "-V"], cwd=repo, text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"unable to record release build configuration: {error}") from error
+    forwarded = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("CARGO")
+        or key in {
+            "RUSTFLAGS", "RUSTUP_TOOLCHAIN", "TARGET", "PROFILE", "RUSTC",
+            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+        }
+    }
+    host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
+    return {
+        "rustc_version_verbose": rustc,
+        "cargo_version": cargo,
+        "target": forwarded.get("CARGO_BUILD_TARGET") or forwarded.get("TARGET") or host,
+        "profile": "release",
+        "features": [],
+        "environment": forwarded,
+    }
+
+
 def _ensure_clean_source() -> None:
     """Require the compiled benchmark source to be identified by a commit."""
     try:
@@ -130,7 +197,7 @@ def _write_atomic_private(path: Path, text: str) -> None:
 
 
 def _uri(path: Path) -> str:
-    return f"file:{path.resolve()}?mode=ro"
+    return f"{path.resolve().as_uri()}?mode=ro"
 
 def _hash(path: Path) -> str:
     h = hashlib.sha256()
@@ -317,14 +384,16 @@ def _fixture_fingerprint(path: Path) -> dict:
         return {"missing": True}
 
 
-def _carry_run_metadata(path: Path, capture: dict) -> None:
-    """Attach capture evidence to the raw run without changing sample data."""
+def _carry_run_metadata(path: Path, capture: dict, build_configuration: dict, expected_case_surface_set: list[list[str]]) -> None:
+    """Attach immutable setup evidence to the raw run without changing samples."""
     try:
         run = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return
     run["schema_digest"] = capture["schema_digest"]
     run["migration_ledger"] = capture["migration_ledger"]
+    run["build_configuration"] = build_configuration
+    run["expected_case_surface_set"] = expected_case_surface_set
     environment = run.setdefault("environment", {})
     if isinstance(environment, dict):
         environment.setdefault("fixture_schema_digest", capture["schema_digest"])
@@ -341,9 +410,56 @@ def _recover_fallback_call_ids(conn, columns: set[str]) -> list[str]:
     return CALL_IDS if not _has_table(conn, "conversations") else []
 
 
+def _expected_case_surface_set(scenarios: list[dict]) -> list[list[str]]:
+    pairs = []
+    for scenario in scenarios:
+        surface_names = ["retriever"] if scenario.get("kind") == "retriever" else ["tool", "retriever"]
+        pairs.extend([scenario["id"], surface] for surface in surface_names)
+    return sorted(pairs)
+
+
+def _selective_term(conn: sqlite3.Connection, query: str) -> str:
+    candidates = [
+        term for term in re.findall(r"[A-Za-z0-9]{6,}", query)
+        if term.casefold() not in {"conversation", "search"}
+    ]
+    for term in candidates:
+        try:
+            rows = conn.execute(
+                "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1001", (term,)
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        if 0 < len(rows) <= 1000:
+            return term
+    raise SystemExit("no observed query token has a verified nonzero FTS match count below 1000")
+
+
+def _stop_process(process) -> None:
+    """Stop and reap a detached process group on every exceptional exit."""
+    try:
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        else:
+            process.kill()
+            process.wait()
+    finally:
+        # A mocked process may not expose poll; wait is still best effort in tests.
+        if process.poll() is None:
+            process.wait()
+
+
 def snapshot(args) -> int:
     source = Path(args.source).expanduser().resolve()
     outdir = Path(args.artifacts).expanduser().resolve()
+    _ensure_ignored_artifacts(outdir)
     requested = outdir / "captured.db"
     if (
         source == requested
@@ -395,6 +511,9 @@ def snapshot(args) -> int:
             tmp.unlink(missing_ok=True)
             if time.monotonic() < deadline:
                 time.sleep(min(2**attempt, 8, max(0, deadline - time.monotonic())))
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         finally:
             if src is not None:
                 src.close()
@@ -404,16 +523,22 @@ def snapshot(args) -> int:
         raise SystemExit(f"online backup failed before deadline ({deadline_seconds}s): {last}")
     # Integrity is checked while the fixture is still private and temporary.
     # Only a verified complete backup may become the published fixture.
-    conn = sqlite3.connect(_uri(tmp), uri=True, timeout=args.busy_timeout)
-    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if integrity != "ok":
-        conn.close()
-        tmp.unlink(missing_ok=True)
-        raise SystemExit(f"snapshot integrity check failed: {integrity}")
-    counts = _counts(conn)
-    schema_digest, migration_ledger = _schema_evidence(conn)
-    recovered_queries = _recover_queries(conn)
-    conn.close()
+    conn = None
+    validated = False
+    try:
+        conn = sqlite3.connect(_uri(tmp), uri=True, timeout=args.busy_timeout)
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise SystemExit(f"snapshot integrity check failed: {integrity}")
+        counts = _counts(conn)
+        schema_digest, migration_ledger = _schema_evidence(conn)
+        recovered_queries = _recover_queries(conn)
+        validated = True
+    finally:
+        if conn is not None:
+            conn.close()
+        if not validated:
+            tmp.unlink(missing_ok=True)
     os.replace(tmp, dest)
     os.chmod(dest, 0o600)
     manifest = {'kind':'conversation-search-fixture','source_path':str(source),
@@ -430,6 +555,7 @@ def snapshot(args) -> int:
 
 def prepare(args) -> int:
     outdir = Path(args.artifacts).expanduser().resolve(); db = outdir/'captured.db'; manifest = outdir/'capture-manifest.json'
+    _ensure_ignored_artifacts(outdir)
     if not db.exists() or not manifest.exists(): raise SystemExit('capture-manifest.json and captured.db are required')
     capture = json.loads(manifest.read_text())
     if capture.get('kind') != 'conversation-search-fixture' or Path(capture.get('snapshot_path', '')).resolve() != db:
@@ -451,8 +577,7 @@ def prepare(args) -> int:
     exact=recovered[0]['query']; ids=[]
     row=conn.execute('SELECT conversation_id FROM messages WHERE message_id=?',(recovered[0]['message_id'],)).fetchone()
     if row: ids=[row[0]]
-    selective_terms = [term for term in re.findall(r"[A-Za-z0-9_]{6,}", exact) if term.lower() not in {"conversation", "search"}]
-    selective_query = selective_terms[0] if selective_terms else "conversation"
+    selective_query = _selective_term(conn, exact)
     scenarios=[
       {'id':'observed-slow-exact','kind':'tool','query':exact,'source_call_id':recovered[0]['source_call_id'],'expected':'hit'},
       {'id':'observed-slow-other','kind':'tool','query':recovered[1]['query'],'source_call_id':recovered[1]['source_call_id'],'expected':'hit'},
@@ -468,6 +593,7 @@ def prepare(args) -> int:
     scenario_manifest = {
         'version': 1,
         'fixture_sha256': capture['sha256'],
+        'expected_case_surface_set': _expected_case_surface_set(scenarios),
         'scenarios': scenarios,
     }
     _write_private(scenarios_path, json.dumps(scenario_manifest, indent=2)+'\n')
@@ -475,6 +601,7 @@ def prepare(args) -> int:
 
 def run(args) -> int:
     outdir=Path(args.artifacts).expanduser().resolve(); db=outdir/'captured.db'; scen=outdir/'scenarios.json'
+    _ensure_ignored_artifacts(outdir)
     manifest=outdir/'capture-manifest.json'
     if not db.exists() or not scen.exists() or not manifest.exists():
         raise SystemExit('run requires captured.db, capture-manifest.json, and scenarios.json')
@@ -490,6 +617,9 @@ def run(args) -> int:
         raise SystemExit('invalid scenarios manifest')
     if scenarios.get('fixture_sha256') != capture.get('sha256'):
         raise SystemExit('scenarios.json does not match capture-manifest.json fixture')
+    expected_set = _expected_case_surface_set(scenarios['scenarios'])
+    if scenarios.get('expected_case_surface_set') != expected_set:
+        raise SystemExit('scenarios.json has an invalid expected case/surface set')
     result_dir=outdir/'runs'; _private(result_dir)
     label=_label(args.label)
     output=result_dir/f'{label}.json'
@@ -505,6 +635,7 @@ def run(args) -> int:
     _remove_private(output_tmp)
     failure_output = result_dir / "failures" / f"{label}.json"
     _ensure_clean_source()
+    build_configuration = _build_configuration()
     cmd=['cargo','test','-p','phoenix_ide','--release','production_conversation_search_benchmark','--lib','--','--ignored','--nocapture']
     env=dict(os.environ,
         PHOENIX_SEARCH_BENCH_DB=str(db), PHOENIX_SEARCH_BENCH_SCENARIOS=str(scen),
@@ -523,16 +654,7 @@ def run(args) -> int:
     try:
         process.wait(timeout=args.timeout)
     except subprocess.TimeoutExpired as error:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-        else:
-            process.kill()
-            process.wait()
+        _stop_process(process)
         failure = {
             "kind": "conversation-search-benchmark-failure",
             "run_label": label,
@@ -546,6 +668,10 @@ def run(args) -> int:
         _remove_private(output_tmp)
         _write_atomic_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
         raise SystemExit(f'benchmark timed out after {args.timeout}s; process group was stopped') from error
+    except BaseException:
+        _stop_process(process)
+        _remove_private(output_tmp)
+        raise
     fixture_after = _fixture_fingerprint(db)
     if fixture_before != fixture_after:
         failures_dir = result_dir / "failures"
@@ -579,7 +705,7 @@ def run(args) -> int:
         raise SystemExit(f'benchmark failed with exit status {process.returncode}; failure evidence retained')
     if not output_tmp.exists():
         raise SystemExit('benchmark completed without publishing a result')
-    _carry_run_metadata(output_tmp, capture)
+    _carry_run_metadata(output_tmp, capture, build_configuration, expected_set)
     os.replace(output_tmp, output)
     os.chmod(output, 0o600)
     print(output); return 0
@@ -603,6 +729,7 @@ def _iqr(values):
 
 def report(args) -> int:
     outdir = Path(args.artifacts).expanduser().resolve()
+    _ensure_ignored_artifacts(outdir)
     files = sorted((outdir / "runs").glob("*.json"))
     if not files:
         raise SystemExit("no run results")
@@ -656,15 +783,27 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
-    for key in required - {"samples", "migration_ledger"}:
+    for key in required - {"samples", "migration_ledger", "build_configuration", "expected_case_surface_set"}:
         if not _metadata_has_values(run[key]):
             raise SystemExit(f"refusing comparison: {name} has empty metadata: {key}")
+    build = run["build_configuration"]
+    if not isinstance(build, dict) or any(
+        key not in build or not isinstance(build[key], (str, list, dict))
+        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment")
+    ):
+        raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
     if not isinstance(run["samples"], list) or not run["samples"]:
         raise SystemExit(f"refusing comparison: {name} has no samples")
+    expected_set = run["expected_case_surface_set"]
+    if not isinstance(expected_set, list) or any(
+        not isinstance(pair, list) or len(pair) != 2 or not all(isinstance(value, str) and value for value in pair)
+        for pair in expected_set
+    ) or len({tuple(pair) for pair in expected_set}) != len(expected_set):
+        raise SystemExit(f"refusing comparison: {name} has invalid expected case/surface set")
     digests = {}
     phases = {}
     for sample in run["samples"]:
@@ -697,11 +836,13 @@ def compare(args) -> int:
     b = json.loads(Path(args.after).read_text())
     validated_a = _validate_run(a, "before")
     validated_b = _validate_run(b, "after")
-    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
-    if validated_a["phases"].keys() != validated_b["phases"].keys():
-        raise SystemExit("refusing comparison: case/surface regimes differ")
+    if validated_a["phases"].keys() != validated_b["phases"].keys() or set(map(tuple, a["expected_case_surface_set"])) != set(map(tuple, validated_a["phases"])):
+        raise SystemExit("refusing comparison: case/surface regimes differ from the frozen manifest")
+    if set(map(tuple, b["expected_case_surface_set"])) != set(map(tuple, validated_b["phases"])):
+        raise SystemExit("refusing comparison: case/surface regimes differ from the frozen manifest")
     if validated_a["digests"] != validated_b["digests"]:
         digests_a, digests_b = validated_a["digests"], validated_b["digests"]
         raise SystemExit("refusing comparison: output mismatch (identity/digests differ between runs)")
