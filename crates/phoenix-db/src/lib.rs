@@ -7535,9 +7535,17 @@ impl Database {
     ) -> DbResult<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS(
-                 SELECT 1 FROM steering_execution_occurrences
-                 WHERE conversation_id = ?1
-                   AND source_kind IN ('wake', 'interaction_response')
+                 SELECT 1
+                 FROM steering_execution_occurrences occurrence
+                 JOIN messages source ON source.message_id = occurrence.message_id
+                 WHERE occurrence.conversation_id = ?1
+                   AND occurrence.source_kind IN ('wake', 'interaction_response')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM messages response
+                       WHERE response.conversation_id = occurrence.conversation_id
+                         AND response.message_type = 'agent'
+                         AND response.sequence_id > source.sequence_id
+                   )
              )",
         )
         .bind(conversation_id)
@@ -7557,7 +7565,15 @@ impl Database {
              FROM conversations c
              JOIN steering_execution_occurrences occurrence
                ON occurrence.conversation_id = c.id
+             JOIN messages source ON source.message_id = occurrence.message_id
              WHERE occurrence.source_kind IN ('wake', 'interaction_response')
+               AND c.state_kind IN ('idle', 'llm_requesting')
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages response
+                   WHERE response.conversation_id = occurrence.conversation_id
+                     AND response.message_type = 'agent'
+                     AND response.sequence_id > source.sequence_id
+               )
              ORDER BY c.created_at, c.id",
         )
         .fetch_all(&self.pool)

@@ -3877,17 +3877,23 @@ impl RuntimeManager {
         {
             return Ok(None);
         }
-        let messages = self
-            .db
-            .get_recovery_messages(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let tail = self
-            .db
-            .get_recovery_tail_status(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(Some(recovery::decide_recovery(&messages, &tail)))
+        for _ in 0..3 {
+            let messages = self
+                .db
+                .get_recovery_messages(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let tail = self
+                .db
+                .get_recovery_tail_status(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let decision = recovery::decide_recovery(&messages, &tail);
+            if decision.reason != recovery::RecoveryReason::TranscriptChanged {
+                return Ok(Some(decision));
+            }
+        }
+        Err("restart transcript changed repeatedly during durable baton classification".to_string())
     }
 
     async fn persist_nonresumable_baton_settlement(
@@ -5645,6 +5651,14 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
+        if initial_state != conv.state {
+            self.db
+                .update_conversation_state(conversation_id, &initial_state)
+                .await
+                .map_err(|error| {
+                    format!("failed to persist recovered state before startup effects: {error}")
+                })?;
+        }
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -6645,6 +6659,13 @@ impl RuntimeManager {
             return Ok((conv.state, row_state_updated_at, auto_continue));
         }
 
+        if let Some(preserved) = self
+            .preserved_restart_state(conversation_id, &conv.state, row_state_updated_at)
+            .await
+        {
+            return Ok(preserved);
+        }
+
         if self
             .db
             .has_resumable_execution_occurrence(conversation_id)
@@ -6652,13 +6673,6 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())?
         {
             return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
-        }
-
-        if let Some(preserved) = self
-            .preserved_restart_state(conversation_id, &conv.state, row_state_updated_at)
-            .await
-        {
-            return Ok(preserved);
         }
 
         let messages = self
@@ -12880,6 +12894,125 @@ mod scope_liveness_tests {
 
             assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn typed_occurrence_preserves_wait_state_and_stops_after_agent_response() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-occurrence-wait";
+        manager
+            .db()
+            .create_conversation(conversation_id, "wait", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-wait-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'occurrence-wait-input', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingUserResponse {
+                    questions: Vec::new(),
+                    tool_use_id: "question".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        manager
+            .db()
+            .add_message(
+                "occurrence-agent-response",
+                conversation_id,
+                &crate::db::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("settled"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        assert!(!manager
+            .db()
+            .has_resumable_execution_occurrence(conversation_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn typed_occurrence_persists_requesting_before_provider_dispatch() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "restart-occurrence-persisted-requesting";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "occurrence-persist-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'occurrence-persist-input', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        manager.settle_persisted_llm_requests().await.unwrap();
+
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[tokio::test]
