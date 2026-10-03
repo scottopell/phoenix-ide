@@ -451,7 +451,7 @@ def _selective_term(conn: sqlite3.Connection, query: str) -> str:
     for term in candidates:
         try:
             rows = conn.execute(
-                "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1001", (term,)
+                "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1001", ('"' + term + '"*',)
             ).fetchall()
         except sqlite3.Error:
             continue
