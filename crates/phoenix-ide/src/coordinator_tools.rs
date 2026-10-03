@@ -940,17 +940,6 @@ mod tests {
             let policy_retriever = Arc::new(policy_db.fts_retriever());
             policy_retriever.mark_reconciled();
             let policy_service = GlobalReadService::new(policy_db, policy_retriever.clone());
-            if case_id == "selective-known-match" || case_id == "broad-common" {
-                let setup_hits = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    policy_service.search_hits(query),
-                )
-                .await
-                .expect("representative policy timeout")
-                .expect("representative policy validation");
-                assert!(!setup_hits.is_empty(), "representative candidate has no eligible hits under actual tool policy; choose another candidate before benchmarking");
-            }
-
             if case_id == "broad-common" {
                 let request = policy_service
                     .search_request(query)
@@ -1010,6 +999,12 @@ mod tests {
                     .expect("oracle result"),
                 )
             };
+            if case_id == "selective-known-match" {
+                assert!(
+                    tool_oracle.as_ref().is_some_and(|hits| !hits.is_empty()),
+                    "selective candidate has no eligible hits under actual policy"
+                );
+            }
             let tool_expected_output = if let Some(hits) = &tool_oracle {
                 Some(
                     policy_service
@@ -1191,7 +1186,7 @@ mod tests {
             "fixture_validation": fixture_validation,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
-            "tool_oracle_regime": "one precomputed service query per tool case before sequence",
+            "tool_oracle_regime": "one precomputed service query per tool case before sequence; broad-common additionally validates1000 eligible rows",
             "measurement_regimes": ["first_retrieval_after_pool_setup_connection_setup_excluded_os_cache_uncontrolled", "warm"],
             "case_policies": case_policies,
             "explain_plans": explain_plans, "explain_enabled": explain,
