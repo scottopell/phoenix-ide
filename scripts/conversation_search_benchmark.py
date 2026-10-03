@@ -506,8 +506,10 @@ def snapshot(args) -> int:
     pending = outdir / ".capture-pending"
     if pending.exists() and not (outdir / "capture-manifest.json").exists():
         allowed = {"captured.db", ".capture-pending"}
-        if any(path.name not in allowed for path in outdir.iterdir()):
+        if any(path.name not in allowed and not re.fullmatch(r"\.captured\.db\.\d+\.tmp", path.name) for path in outdir.iterdir()):
             raise SystemExit("partial capture contains unrecognized files; refusing recovery")
+        for staged in outdir.glob(".captured.db.*.tmp"):
+            _remove_private(staged)
         _remove_private(dest)
         _remove_private(pending)
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
@@ -522,6 +524,7 @@ def snapshot(args) -> int:
     free_reserve = logical_size
     if shutil.disk_usage(outdir).free < logical_size + free_reserve:
         raise SystemExit('insufficient free space for logical snapshot and safety reserve')
+    _write_atomic_private(pending, 'initial capture staged\n')
     tmp = outdir / f'.captured.db.{os.getpid()}.tmp'
     tmp.unlink(missing_ok=True)
     started = time.time()
