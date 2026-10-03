@@ -7524,6 +7524,47 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Report whether an adopted wake or accepted interaction response still
+    /// owns the conversation's first model response.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn has_resumable_execution_occurrence(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1
+                   AND source_kind IN ('wake', 'interaction_response')
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// List conversations whose adopted wake or accepted interaction response
+    /// still owns the first model response after restart.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn resumable_execution_occurrence_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT c.id
+             FROM conversations c
+             JOIN steering_execution_occurrences occurrence
+               ON occurrence.conversation_id = c.id
+             WHERE occurrence.source_kind IN ('wake', 'interaction_response')
+             ORDER BY c.created_at, c.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Remove one steering entry and report whether this call removed a row.
     /// The boolean is the publication fence for cancellation SSE: an
     /// idempotent retry succeeds but must not announce a second mutation.

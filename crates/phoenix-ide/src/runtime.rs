@@ -3715,20 +3715,31 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
-    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
-        let mut conversation_ids = self
+    async fn startup_llm_recovery_conversation_ids(&self) -> Result<Vec<String>, String> {
+        let mut ids = self
             .db
             .llm_requesting_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        conversation_ids.extend(
+        ids.extend(
             self.db
                 .owed_baton_conversation_ids()
                 .await
                 .map_err(|error| error.to_string())?,
         );
-        conversation_ids.sort();
-        conversation_ids.dedup();
+        ids.extend(
+            self.db
+                .resumable_execution_occurrence_conversation_ids()
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    pub async fn settle_persisted_llm_requests(self: &Arc<Self>) -> Result<(), String> {
+        let conversation_ids = self.startup_llm_recovery_conversation_ids().await?;
         for conversation_id in conversation_ids {
             let conversation = self
                 .db
@@ -3737,6 +3748,11 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
             let recovery_decision = self.owned_baton_recovery_decision(&conversation_id).await?;
             let has_queued_steering = self.has_queued_steering(&conversation_id).await?;
+            let has_resumable_occurrence = self
+                .db
+                .has_resumable_execution_occurrence(&conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
             if recovery_decision.as_ref().is_some_and(|decision| {
                 decision.reason == recovery::RecoveryReason::RestartLoopDetected
             }) && !has_queued_steering
@@ -3762,6 +3778,7 @@ impl RuntimeManager {
                     || recovery_decision
                         .as_ref()
                         .is_some_and(|decision| decision.needs_auto_continue)
+                    || has_resumable_occurrence
                     || self
                         .db
                         .has_pending_approval_request(&conversation_id)
@@ -5647,9 +5664,15 @@ impl RuntimeManager {
             } else {
                 None
             };
+        let has_resumable_occurrence = self
+            .db
+            .has_resumable_execution_occurrence(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
         let resumable_owner = startup_creation_completion.is_some()
             || matches!(initial_state, ConvState::SeededLlmRequesting { .. })
             || needs_auto_continue
+            || has_resumable_occurrence
             || self
                 .db
                 .has_pending_approval_request(conversation_id)
@@ -5660,13 +5683,14 @@ impl RuntimeManager {
                 .has_committed_steering_turn(conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-        let startup_llm_recovery = if needs_auto_continue {
-            crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
-        } else if resumable_owner {
-            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
-        } else {
-            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
-        };
+        let startup_llm_recovery =
+            if needs_auto_continue && active_direct_turn.is_some() && !has_resumable_occurrence {
+                crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
+            } else if resumable_owner {
+                crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+            } else {
+                crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+            };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
             let active = loaded.into_active();
@@ -6571,6 +6595,35 @@ impl RuntimeManager {
             .map(|owned| owned.then_some(false))
     }
 
+    async fn preserved_restart_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Option<(ConvState, DateTime<Utc>, bool)> {
+        if state.is_terminal() {
+            return Some((state.clone(), state_updated_at, false));
+        }
+        let startup_obligated = self
+            .startup_obligated_conversations
+            .read()
+            .await
+            .contains(conversation_id);
+        let preserved = match state {
+            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. } => startup_obligated,
+            ConvState::Provisioning { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::SeededLlmRequesting { .. } => true,
+            ConvState::Error { error_kind, .. } => error_kind.is_user_resumable(),
+            _ => false,
+        };
+        preserved.then(|| (state.clone(), state_updated_at, false))
+    }
+
     async fn determine_resume_state(
         &self,
         conversation_id: &str,
@@ -6592,48 +6645,20 @@ impl RuntimeManager {
             return Ok((conv.state, row_state_updated_at, auto_continue));
         }
 
-        if conv.state.is_terminal() {
-            tracing::debug!(
-                conv_id = %conversation_id,
-                state = ?std::mem::discriminant(&conv.state),
-                "Restoring persisted terminal state"
-            );
-            return Ok((conv.state, row_state_updated_at, false));
+        if self
+            .db
+            .has_resumable_execution_occurrence(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok((ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true));
         }
 
-        match &conv.state {
-            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. }
-                if self
-                    .startup_obligated_conversations
-                    .read()
-                    .await
-                    .contains(conversation_id) =>
-            {
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            ConvState::Provisioning { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::RecoverableContinuationFailure { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::SeededLlmRequesting { .. } => {
-                tracing::debug!(
-                    conv_id = %conversation_id,
-                    state = ?std::mem::discriminant(&conv.state),
-                    "Restoring persisted state (survives restart)"
-                );
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            ConvState::Error { error_kind, .. } if error_kind.is_user_resumable() => {
-                tracing::debug!(
-                    conv_id = %conversation_id,
-                    ?error_kind,
-                    "Restoring persisted user-resumable Error"
-                );
-                return Ok((conv.state, row_state_updated_at, false));
-            }
-            _ => {}
+        if let Some(preserved) = self
+            .preserved_restart_state(conversation_id, &conv.state, row_state_updated_at)
+            .await
+        {
+            return Ok(preserved);
         }
 
         let messages = self
@@ -6650,6 +6675,11 @@ impl RuntimeManager {
         let decision = recovery::decide_recovery(&messages, &tail_status);
         if decision.needs_auto_continue
             && !self.owed_baton_needs_auto_continue(conversation_id).await?
+            && !self
+                .db
+                .has_resumable_execution_occurrence(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -12753,7 +12783,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn startup_settles_nonresumable_idle_baton_without_waiting_for_ack() {
+    async fn startup_resumes_mixed_text_and_tool_result_baton() {
         use phoenix_core::domain::db_schema::ToolContent;
         use phoenix_core::domain::llm_types::ContentBlock;
 
@@ -12805,8 +12835,51 @@ mod scope_liveness_tests {
 
         manager.settle_persisted_llm_requests().await.unwrap();
 
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!manager.db().has_owed_baton(conversation_id).await.unwrap());
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_typed_wake_and_interaction_occurrences() {
+        for (source_kind, conversation_id) in [
+            ("wake", "restart-adopted-wake"),
+            ("interaction_response", "restart-interaction-response"),
+        ] {
+            let llm = Arc::new(RecordingLlm {
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+            manager
+                .db()
+                .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            manager
+                .db()
+                .add_message(
+                    &format!("{conversation_id}-input"),
+                    conversation_id,
+                    &crate::db::MessageContent::user("accepted durable input"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO steering_execution_occurrences
+                     (conversation_id, message_id, source_kind)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(conversation_id)
+            .bind(format!("{conversation_id}-input"))
+            .bind(source_kind)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+
+            manager.settle_persisted_llm_requests().await.unwrap();
+
+            assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
