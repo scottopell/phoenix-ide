@@ -702,6 +702,153 @@ mod tests {
         (tool, context)
     }
 
+    /// Release-only, opt-in fixture benchmark. It is ignored so normal test
+    /// runs never touch a private database. The Python driver supplies the
+    /// immutable fixture and frozen scenarios through environment variables.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "private production fixture benchmark; run via dev.py conversation-search run"]
+    async fn production_conversation_search_benchmark() {
+        use crate::db::MessageRetriever;
+        use sha2::{Digest, Sha256};
+        use std::time::Instant;
+
+        let db_path = std::env::var("PHOENIX_SEARCH_BENCH_DB")
+            .expect("PHOENIX_SEARCH_BENCH_DB must point at an immutable fixture");
+        let scenario_path = std::env::var("PHOENIX_SEARCH_BENCH_SCENARIOS")
+            .expect("PHOENIX_SEARCH_BENCH_SCENARIOS must point at frozen scenarios");
+        let output_path = std::env::var("PHOENIX_SEARCH_BENCH_OUT")
+            .expect("PHOENIX_SEARCH_BENCH_OUT must point at a private result file");
+        let scenarios: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scenario_path).unwrap()).unwrap();
+        let fixture_sha256 = Sha256::digest(std::fs::read(&db_path).unwrap())
+            .as_slice()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let scenario_digest = Sha256::digest(
+            std::fs::read(std::env::var("PHOENIX_SEARCH_BENCH_SCENARIOS").unwrap()).unwrap(),
+        )
+        .as_slice()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+        let mut samples = Vec::new();
+        let explain = std::env::var_os("PHOENIX_SEARCH_BENCH_EXPLAIN").is_some();
+        for scenario in scenarios["scenarios"].as_array().expect("scenarios array") {
+            let case_id = scenario["id"].as_str().unwrap();
+            let query = scenario["query"].as_str().unwrap();
+            let is_retriever = scenario["kind"] == "retriever";
+            // A newly opened pool gives one separately labeled process/pool-cold
+            // observation. Subsequent calls are serial warm observations.
+            let db = crate::db::Database::open_read_only(&db_path).await.unwrap();
+            let retriever = Arc::new(db.fts_retriever());
+            retriever.mark_reconciled();
+            let service = GlobalReadService::new(db.clone(), retriever.clone());
+            let tool = SearchConversations(service.clone());
+            let context = context("benchmark");
+            if explain {
+                let request = if is_retriever {
+                    crate::db::RetrievalRequest::natural_language(
+                        query,
+                        crate::db::RetrievalScope::Conversations(
+                            scenario["conversation_ids"]
+                                .as_array()
+                                .map(|values| {
+                                    values
+                                        .iter()
+                                        .filter_map(|id| id.as_str().map(str::to_owned))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        ),
+                        20,
+                    )
+                } else {
+                    service
+                        .search_request(query)
+                        .await
+                        .expect("build search request")
+                };
+                let plan = retriever.explain(request).await.expect("explain retrieval");
+                eprintln!("EXPLAIN {case_id}: {plan:?}");
+            }
+            for (phase, count) in [
+                ("first_use_process_pool_cold", 1usize),
+                ("warmup_discarded", 1usize),
+                ("warm", 10usize),
+            ] {
+                for iteration in 0..count {
+                    let started = Instant::now();
+                    let (ok, output) = if is_retriever {
+                        let ids = scenario["conversation_ids"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|id| id.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let request = crate::db::RetrievalRequest::natural_language(
+                            query,
+                            crate::db::RetrievalScope::Conversations(ids),
+                            20,
+                        );
+                        match retriever.retrieve(request).await {
+                            Ok(hits) => (
+                                true,
+                                serde_json::to_string(
+                                    &hits
+                                        .iter()
+                                        .map(|hit| {
+                                            (
+                                                &hit.conversation_id,
+                                                &hit.message_id,
+                                                hit.score,
+                                                &hit.snippet,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .unwrap(),
+                            ),
+                            Err(error) => (false, error.to_string()),
+                        }
+                    } else {
+                        let result = tool
+                            .run(serde_json::json!({"query": query}), context.clone())
+                            .await;
+                        (result.is_success(), result.output().to_string())
+                    };
+                    if phase == "warmup_discarded" {
+                        continue;
+                    }
+                    let digest = Sha256::digest(output.as_bytes())
+                        .as_slice()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    samples.push(serde_json::json!({
+                        "case_id": case_id, "phase": phase, "iteration": iteration,
+                        "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                        "ok": ok, "result": output, "result_digest": digest,
+                        "result_bytes": output.len(),
+                    }));
+                    assert!(ok, "benchmark scenario {case_id} failed: {output}");
+                }
+            }
+        }
+        let value = serde_json::json!({"fixture_sha256": fixture_sha256,
+            "scenario_digest": scenario_digest, "profile": "release",
+            "sqlite": {"pool_max_connections": 10, "busy_timeout_ms": 5000,
+                       "journal_mode": "fixture-preserved", "read_only": true},
+            "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
+            "warmup_runs": 1, "measured_warm_runs": 10,
+            "measurement_regimes": ["first_use_process_pool_cold", "warm"],
+            "samples": samples});
+        std::fs::write(output_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn coordinator_bash_is_available_without_platform_sandbox_support() {
         let (writing, coordinator) = application_tools().await;

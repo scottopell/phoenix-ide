@@ -315,14 +315,9 @@ impl GlobalReadService {
                     .to_string(),
             );
         }
-        let coordinator_chain = self.coordinator_chain_ids().await?;
         let hits = self
             .message_retriever
-            .retrieve(RetrievalRequest::natural_language(
-                query,
-                RetrievalScope::GlobalExcluding(coordinator_chain),
-                SEARCH_TOP_K,
-            ))
+            .retrieve(self.search_request(query).await?)
             .await
             .map_err(|e| format!("search failed: {e}"))?;
         if hits.is_empty() {
@@ -332,6 +327,15 @@ impl GlobalReadService {
                 .await
                 .map_err(|error| format!("search citation failed: {error}"))
         }
+    }
+
+    pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
+        let coordinator_chain = self.coordinator_chain_ids().await?;
+        Ok(RetrievalRequest::natural_language(
+            query,
+            RetrievalScope::GlobalExcluding(coordinator_chain),
+            SEARCH_TOP_K,
+        ))
     }
 
     async fn coordinator_chain_ids(&self) -> Result<Vec<String>, String> {

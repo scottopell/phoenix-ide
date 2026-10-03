@@ -10664,6 +10664,12 @@ def cmd_prod_override_unset(_name: str):
     _reject_prod_override_command()
 
 
+def cmd_conversation_search(args: list[str]) -> None:
+    """Run the private, opt-in production conversation-search benchmark helper."""
+    helper = ROOT / "scripts" / "conversation_search_benchmark.py"
+    subprocess.run([sys.executable, str(helper), *args], cwd=ROOT, check=True)
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -10841,6 +10847,13 @@ def main():
     # seed (offline)
     sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
 
+    # Private production conversation-search benchmark. Arguments are passed to
+    # the focused helper so the helper remains directly testable.
+    conversation_search_parser = sub.add_parser(
+        "conversation-search", help="Capture or benchmark a private immutable search fixture"
+    )
+    conversation_search_parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
+
     # qa
     qa_parser = sub.add_parser("qa", help="Run local QA capture workflows")
     qa_sub = qa_parser.add_subparsers(dest="qa_command", required=True)
@@ -11009,6 +11022,8 @@ def main():
         )
     elif args.command == "seed":
         cmd_seed()
+    elif args.command == "conversation-search":
+        cmd_conversation_search(args.benchmark_args)
     elif args.command == "qa":
         if args.qa_command == "grounding-panel":
             cmd_qa_grounding_panel()

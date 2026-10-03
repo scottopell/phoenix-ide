@@ -3190,7 +3190,38 @@ impl Database {
     ///
     /// # Errors
     ///
+    /// Open an existing database read-only without migrations or reconciliation.
+    /// Intended for offline measurement over an immutable fixture.
+    ///
+    /// # Errors
     /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn open_read_only(path: &str) -> DbResult<Self> {
+        let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=ro"))?
+            .read_only(true)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
+            .connect_with(opts)
+            .await?;
+        Ok(Self::new_with_generated_target_binding(
+            pool,
+            path.to_string(),
+            sqlite_workload_collector,
+        ))
+    }
+
+    /// Open or create database at the given path.
     pub async fn open(path: &str) -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
             .journal_mode(SqliteJournalMode::Wal)

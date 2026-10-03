@@ -499,6 +499,123 @@ impl Fts5Retriever {
     }
 }
 
+fn build_retrieval_sql(
+    request: &RetrievalRequest,
+    raw_prefix_guard: Option<(&str, Option<&str>)>,
+) -> String {
+    let (scope_ids, excluding): (&[String], bool) = match &request.scope {
+        RetrievalScope::Global => (&[], false),
+        RetrievalScope::GlobalExcluding(ids) => (ids, true),
+        RetrievalScope::Conversations(ids) => (ids, false),
+    };
+
+    let mut sql = String::from(
+        "WITH ranked_hits AS (\
+             SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
+                    meta.message_type, meta.created_at, source.origin_kind, \
+                    source.origin_product_conversation_id, source.origin_transcript_id, \
+                    source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, c.transcript_generation, \
+                    (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
+                    snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
+                    bm25(message_fts) AS score",
+    );
+    sql.push_str(
+        " FROM message_fts \
+           JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
+           JOIN messages source ON source.message_id = meta.message_id \
+           JOIN conversations c ON c.id = meta.conversation_id \
+           WHERE message_fts MATCH ? \
+             AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
+    );
+    if request.visibility == RetrievalVisibility::UserTopLevel {
+        sql.push_str(
+            " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
+              AND c.parent_conversation_id IS NULL \
+              AND NOT (c.archived = 1 AND EXISTS (\
+                  SELECT 1 FROM conversation_creation_jobs j \
+                  WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+              ))",
+        );
+    }
+    if let Some((_, earlier_expr)) = raw_prefix_guard {
+        if earlier_expr.is_some() {
+            sql.push_str(
+                " AND (message_fts.rowid IN (\
+                    SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
+                  ) OR instr(lower(message_fts.text), ?) > 0)",
+            );
+        } else {
+            sql.push_str(" AND instr(lower(message_fts.text), ?) > 0");
+        }
+    }
+    if !scope_ids.is_empty() {
+        if excluding {
+            sql.push_str(" AND meta.conversation_id NOT IN (");
+        } else {
+            sql.push_str(" AND meta.conversation_id IN (");
+        }
+        for i in 0..scope_ids.len() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+    sql.push(')');
+    match request.grouping {
+        RetrievalGrouping::None => {
+            sql.push_str(
+                " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                  FROM ranked_hits \
+                  ORDER BY score, created_at DESC \
+                  LIMIT ?",
+            );
+        }
+        RetrievalGrouping::BestPerConversation => {
+            sql.push_str(
+                ", grouped_hits AS (\
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score, \
+                            ROW_NUMBER() OVER (\
+                                PARTITION BY conversation_id \
+                                ORDER BY score, created_at DESC, message_id\
+                            ) AS conversation_rank \
+                     FROM ranked_hits\
+                 ) \
+                 SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                 FROM grouped_hits \
+                 WHERE conversation_rank = 1 \
+                 ORDER BY score, created_at DESC, conversation_id \
+                 LIMIT ?",
+            );
+        }
+    }
+
+    sql
+}
+
+fn retrieval_match_parts(
+    request: &RetrievalRequest,
+) -> Option<(String, Option<(String, Option<String>)>)> {
+    let match_expr = build_fts_query(&request.query, request.match_mode)?;
+    let terms = content_terms(&request.query);
+    let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
+        terms.last().and_then(|term| {
+            raw_prefix_guard(term).map(|guard| {
+                let earlier = terms[..terms.len() - 1]
+                    .iter()
+                    .map(|term| format!("\"{term}\""))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                (guard, (!earlier.is_empty()).then_some(earlier))
+            })
+        })
+    } else {
+        None
+    };
+    Some((match_expr, raw_prefix_guard))
+}
+
 impl Fts5Retriever {
     #[allow(clippy::too_many_lines)]
     async fn retrieve_match_expr(
@@ -507,99 +624,7 @@ impl Fts5Retriever {
         match_expr: &str,
         raw_prefix_guard: Option<(&str, Option<&str>)>,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let (scope_ids, excluding): (&[String], bool) = match &request.scope {
-            RetrievalScope::Global => (&[], false),
-            RetrievalScope::GlobalExcluding(ids) => (ids, true),
-            RetrievalScope::Conversations(ids) => {
-                if ids.is_empty() {
-                    return Ok(Vec::new());
-                }
-                (ids, false)
-            }
-        };
-
-        let mut sql = String::from(
-            "WITH ranked_hits AS (\
-                 SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
-                        meta.message_type, meta.created_at, source.origin_kind, \
-                        source.origin_product_conversation_id, source.origin_transcript_id, \
-                        source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, c.transcript_generation, \
-                        (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
-                        snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
-                        bm25(message_fts) AS score",
-        );
-        sql.push_str(
-            " FROM message_fts \
-               JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
-               JOIN messages source ON source.message_id = meta.message_id \
-               JOIN conversations c ON c.id = meta.conversation_id \
-               WHERE message_fts MATCH ? \
-                 AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
-        );
-        if request.visibility == RetrievalVisibility::UserTopLevel {
-            sql.push_str(
-                " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
-                  AND c.parent_conversation_id IS NULL \
-                  AND NOT (c.archived = 1 AND EXISTS (\
-                      SELECT 1 FROM conversation_creation_jobs j \
-                      WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
-                  ))",
-            );
-        }
-        if let Some((_, earlier_expr)) = raw_prefix_guard {
-            if earlier_expr.is_some() {
-                sql.push_str(
-                    " AND (message_fts.rowid IN (\
-                        SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
-                      ) OR instr(lower(message_fts.text), ?) > 0)",
-                );
-            } else {
-                sql.push_str(" AND instr(lower(message_fts.text), ?) > 0");
-            }
-        }
-        if !scope_ids.is_empty() {
-            if excluding {
-                sql.push_str(" AND meta.conversation_id NOT IN (");
-            } else {
-                sql.push_str(" AND meta.conversation_id IN (");
-            }
-            for i in 0..scope_ids.len() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-            }
-            sql.push(')');
-        }
-        sql.push(')');
-        match request.grouping {
-            RetrievalGrouping::None => {
-                sql.push_str(
-                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
-                      FROM ranked_hits \
-                      ORDER BY score, created_at DESC \
-                      LIMIT ?",
-                );
-            }
-            RetrievalGrouping::BestPerConversation => {
-                sql.push_str(
-                    ", grouped_hits AS (\
-                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score, \
-                                ROW_NUMBER() OVER (\
-                                    PARTITION BY conversation_id \
-                                    ORDER BY score, created_at DESC, message_id\
-                                ) AS conversation_rank \
-                         FROM ranked_hits\
-                     ) \
-                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
-                     FROM grouped_hits \
-                     WHERE conversation_rank = 1 \
-                     ORDER BY score, created_at DESC, conversation_id \
-                     LIMIT ?",
-                );
-            }
-        }
-
+        let sql = build_retrieval_sql(request, raw_prefix_guard);
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(match_expr);
         if let Some((guard, earlier_expr)) = raw_prefix_guard {
             if let Some(earlier_expr) = earlier_expr {
@@ -607,16 +632,58 @@ impl Fts5Retriever {
             }
             q = q.bind(guard);
         }
+        let scope_ids = match &request.scope {
+            RetrievalScope::Global => &[] as &[String],
+            RetrievalScope::GlobalExcluding(ids) | RetrievalScope::Conversations(ids) => ids,
+        };
         for id in scope_ids {
             q = q.bind(id);
         }
-        let limit = i64::try_from(request.limit).unwrap_or(i64::MAX);
-        q = q.bind(limit);
-
+        q = q.bind(i64::try_from(request.limit).unwrap_or(i64::MAX));
         q.try_map(parse_chunk_row)
             .fetch_all(&self.pool)
             .await
             .map_err(Into::into)
+    }
+
+    /// Return `EXPLAIN QUERY PLAN` for the exact retrieval statement and binds.
+    /// This diagnostic query is intentionally outside timed benchmark invocations.
+    pub async fn explain(&self, request: RetrievalRequest) -> Result<Vec<String>, RetrievalError> {
+        if matches!(&request.scope, RetrievalScope::Conversations(ids) if ids.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let Some((match_expr, raw_prefix_guard)) = retrieval_match_parts(&request) else {
+            return Ok(Vec::new());
+        };
+        let sql = build_retrieval_sql(
+            &request,
+            raw_prefix_guard
+                .as_ref()
+                .map(|(guard, earlier)| (guard.as_str(), earlier.as_deref())),
+        );
+        let mut q =
+            sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))).bind(match_expr);
+        if let Some((guard, earlier_expr)) = raw_prefix_guard.as_ref() {
+            if let Some(earlier_expr) = earlier_expr {
+                q = q.bind(earlier_expr);
+            }
+            q = q.bind(guard);
+        }
+        let scope_ids = match &request.scope {
+            RetrievalScope::Global => &[] as &[String],
+            RetrievalScope::GlobalExcluding(ids) | RetrievalScope::Conversations(ids) => ids,
+        };
+        for id in scope_ids {
+            q = q.bind(id);
+        }
+        q = q.bind(i64::try_from(request.limit).unwrap_or(i64::MAX));
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("detail")
+                    .map_err(RetrievalError::Db)
+            })
+            .collect()
     }
 }
 
@@ -630,23 +697,11 @@ impl MessageRetriever for Fts5Retriever {
         &self,
         request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
+        if matches!(&request.scope, RetrievalScope::Conversations(ids) if ids.is_empty()) {
             return Ok(Vec::new());
-        };
-        let terms = content_terms(&request.query);
-        let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
-            terms.last().and_then(|term| {
-                raw_prefix_guard(term).map(|guard| {
-                    let earlier = terms[..terms.len() - 1]
-                        .iter()
-                        .map(|term| format!("\"{term}\""))
-                        .collect::<Vec<_>>()
-                        .join(" OR ");
-                    (guard, (!earlier.is_empty()).then_some(earlier))
-                })
-            })
-        } else {
-            None
+        }
+        let Some((match_expr, raw_prefix_guard)) = retrieval_match_parts(&request) else {
+            return Ok(Vec::new());
         };
         self.retrieve_match_expr(
             &request,
