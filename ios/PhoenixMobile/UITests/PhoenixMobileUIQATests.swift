@@ -31,11 +31,10 @@ final class PhoenixMobileUIQATests: XCTestCase {
         serverField.typeText(String(serverURL.dropFirst("https://".count)))
         element("setup.connect").tap()
 
-        let newConversationButton = element("conversationList.new")
-        XCTAssertTrue(newConversationButton.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.navigationBars["Conversations"].waitForExistence(timeout: 20))
         attachScreenshot(named: "01-connected")
 
-        newConversationButton.tap()
+        element("conversationList.new").tap()
         let cwdField = element("newConversation.cwd")
         XCTAssertTrue(cwdField.waitForExistence(timeout: 10))
         replaceText(in: cwdField, with: workingDirectory)
@@ -59,6 +58,7 @@ final class PhoenixMobileUIQATests: XCTestCase {
             NSPredicate(format: "identifier BEGINSWITH %@", "conversationList.row."))
         let createdRow = rowQuery.firstMatch
         XCTAssertTrue(createdRow.waitForExistence(timeout: 20))
+        let createdRowIdentifier = createdRow.identifier
         createdRow.tap()
 
         XCTAssertTrue(message(identifier: "message.user", containing: seedMessage)
@@ -89,8 +89,8 @@ final class PhoenixMobileUIQATests: XCTestCase {
         app.launchArguments = []
         app.launch()
 
-        XCTAssertTrue(element("conversationList.new").waitForExistence(timeout: 15))
-        let persistedRow = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "conversationList.row.", seedMessage)).firstMatch
+        XCTAssertTrue(app.navigationBars["Conversations"].waitForExistence(timeout: 15))
+        let persistedRow = app.buttons[createdRowIdentifier]
         XCTAssertTrue(persistedRow.waitForExistence(timeout: 15))
         persistedRow.tap()
 

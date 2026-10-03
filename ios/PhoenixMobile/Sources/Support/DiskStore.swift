@@ -171,6 +171,8 @@ enum DiskStore {
     static var baseDirectory: URL = FileManager.default.urls(
         for: .applicationSupportDirectory, in: .userDomainMask)[0]
 
+    private static var versionedDestinations: [URL: VersionedDiskDestination] = [:]
+
 
     private static var directory: URL {
         let dir = baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
@@ -248,6 +250,14 @@ enum DiskStore {
     static func versionedContext(baseDirectory: URL? = nil) -> VersionedDiskContext {
         let resolvedBaseDirectory = baseDirectory ?? self.baseDirectory
         return VersionedDiskContext(rootDirectory: phoenixMobileDirectory(baseDirectory: resolvedBaseDirectory))
+    }
+
+    static func versionedWriter(name: String, version: Int) -> VersionedDiskWriter {
+        let destinationURL = url(for: name)
+        let destination = versionedDestinations[destinationURL]
+            ?? VersionedDiskDestination(destination: destinationURL)
+        versionedDestinations[destinationURL] = destination
+        return VersionedDiskWriter(destination: destination, version: version)
     }
 
     nonisolated static func names(in directory: URL, withPrefix prefix: String) -> [String] {

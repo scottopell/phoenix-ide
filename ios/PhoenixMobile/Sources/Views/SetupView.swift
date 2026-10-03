@@ -69,15 +69,10 @@ struct SetupView: View {
             errorText = "Enter a valid server URL."
             return
         }
-        let configurationIdentity = APIConfigurationIdentity(
-            serverURL: url.absoluteString,
-            credentialGeneration: AppModel.ephemeralCredentialGeneration(),
-            trustSelfSigned: trustSelfSigned)
         guard let probe = PhoenixAPI(
             baseURL: url,
             password: passwordText.isEmpty ? nil : passwordText,
-            allowSelfSigned: trustSelfSigned,
-            configurationIdentity: configurationIdentity)
+            allowSelfSigned: trustSelfSigned)
         else {
             errorText = "Use HTTPS when a server password is configured."
             return
