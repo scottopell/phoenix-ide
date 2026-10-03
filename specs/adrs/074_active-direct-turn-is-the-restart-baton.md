@@ -1,4 +1,4 @@
-# ADR-075: Active direct turn is the restart baton
+# ADR-074: Active direct turn is the restart baton
 
 - **Status:** Accepted
 - **Date:** 2026-10-03

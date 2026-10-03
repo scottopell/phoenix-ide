@@ -100,6 +100,6 @@ Remaining profile work is:
 - ADR-024 partitions direct-turn semantic authority across the reducer, aggregate,
   and normalized child effects with one writable authority per fact.
 - ADR-036 selects process fail-stop when local SQLite authority cannot be established and makes process-local runtime and observer continuity disposable.
-- ADR-075 selects the active materialized direct turn as the sole post-tool restart baton and rejects transcript-only execution authority.
+- ADR-074 selects the active materialized direct turn as the sole post-tool restart baton and rejects transcript-only execution authority.
 - ADR-007, ADR-011, and ADR-012 remain historical profile-specific context for
   creation and wake.
