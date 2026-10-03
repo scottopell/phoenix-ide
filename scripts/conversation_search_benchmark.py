@@ -16,6 +16,7 @@ import signal
 import sqlite3
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 DEFAULT_ARTIFACTS = Path("conversation-search-benchmark")
@@ -384,8 +385,17 @@ def _fixture_fingerprint(path: Path) -> dict:
         return {"missing": True}
 
 
-def _carry_run_metadata(path: Path, capture: dict, build_configuration: dict, expected_case_surface_set: list[list[str]]) -> None:
-    """Attach immutable setup evidence to the raw run without changing samples."""
+def _carry_run_metadata(
+    path: Path,
+    capture: dict,
+    build_configuration: dict,
+    expected_case_surface_set: list[list[str]],
+    *,
+    run_uuid: str,
+    started_at_unix: float,
+    completed_at_unix: float,
+) -> None:
+    """Attach immutable setup and execution identity evidence without changing samples."""
     try:
         run = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -394,10 +404,9 @@ def _carry_run_metadata(path: Path, capture: dict, build_configuration: dict, ex
     run["migration_ledger"] = capture["migration_ledger"]
     run["build_configuration"] = build_configuration
     run["expected_case_surface_set"] = expected_case_surface_set
-    environment = run.setdefault("environment", {})
-    if isinstance(environment, dict):
-        environment.setdefault("fixture_schema_digest", capture["schema_digest"])
-        environment.setdefault("fixture_migration_ledger", capture["migration_ledger"])
+    run["run_uuid"] = run_uuid
+    run["started_at_unix"] = started_at_unix
+    run["completed_at_unix"] = completed_at_unix
     _write_private(path, json.dumps(run, indent=2) + "\n")
 
 
@@ -631,6 +640,8 @@ def run(args) -> int:
         # temporary path; only a complete result is renamed into place below.
         _remove_private(output)
     fixture_before = _fixture_fingerprint(db)
+    run_uuid = uuid.uuid4().hex
+    started_at_unix = time.time()
     output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
     _remove_private(output_tmp)
     failure_output = result_dir / "failures" / f"{label}.json"
@@ -672,6 +683,7 @@ def run(args) -> int:
         _stop_process(process)
         _remove_private(output_tmp)
         raise
+    completed_at_unix = time.time()
     fixture_after = _fixture_fingerprint(db)
     if fixture_before != fixture_after:
         failures_dir = result_dir / "failures"
@@ -705,7 +717,15 @@ def run(args) -> int:
         raise SystemExit(f'benchmark failed with exit status {process.returncode}; failure evidence retained')
     if not output_tmp.exists():
         raise SystemExit('benchmark completed without publishing a result')
-    _carry_run_metadata(output_tmp, capture, build_configuration, expected_set)
+    _carry_run_metadata(
+        output_tmp,
+        capture,
+        build_configuration,
+        expected_set,
+        run_uuid=run_uuid,
+        started_at_unix=started_at_unix,
+        completed_at_unix=completed_at_unix,
+    )
     os.replace(output_tmp, output)
     os.chmod(output, 0o600)
     print(output); return 0
@@ -783,7 +803,7 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "run_uuid", "started_at", "completed_at", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
@@ -836,7 +856,9 @@ def compare(args) -> int:
     b = json.loads(Path(args.after).read_text())
     validated_a = _validate_run(a, "before")
     validated_b = _validate_run(b, "after")
-    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set")
+    if a["run_uuid"] == b["run_uuid"]:
+        raise SystemExit("refusing comparison: same execution identity")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
     if validated_a["phases"].keys() != validated_b["phases"].keys() or set(map(tuple, a["expected_case_surface_set"])) != set(map(tuple, validated_a["phases"])):
