@@ -949,6 +949,16 @@ mod tests {
                     .expect("oracle result"),
                 )
             };
+            let tool_expected_output = if let Some(hits) = &tool_oracle {
+                Some(
+                    policy_service
+                        .format_search_hits(hits)
+                        .await
+                        .expect("oracle formatting"),
+                )
+            } else {
+                None
+            };
             let surfaces: &[&str] = if is_retriever {
                 &["retriever"]
             } else {
@@ -1082,12 +1092,11 @@ mod tests {
                                 } => {
                                     if ok {
                                         let hits = tool_oracle.as_ref().expect("tool oracle");
-                                        let expected_output = policy_service
-                                            .format_search_hits(hits)
-                                            .await
+                                        let expected_output = tool_expected_output
+                                            .as_ref()
                                             .expect("oracle formatting");
                                         let (count, identity) = structured_search_result(hits);
-                                        if output == expected_output {
+                                        if &output == expected_output {
                                             (true, output, Some(count), Some(identity), None)
                                         } else {
                                             (
