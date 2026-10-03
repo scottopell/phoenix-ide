@@ -35,7 +35,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
-            "run_uuid": __import__("uuid").uuid4().hex, "started_at":"start", "completed_at":"end",
+            "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
             "explain_plans": [], "samples": samples,
         }
         value.update(overrides)

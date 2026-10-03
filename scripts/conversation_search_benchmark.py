@@ -803,7 +803,7 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "run_uuid", "started_at", "completed_at", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
