@@ -2601,6 +2601,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testConcurrentAggregateHardDeletesCommitOneFence() async throws {
         let gate = AsyncCandidateGate()
+        let discoveryGate = AsyncCandidateGate()
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-1", "row-2"],
             contentsByConversationId: ["row-1": .entries([]), "row-2": .entries([])],
@@ -2614,20 +2615,21 @@ final class AppModelProductConversationTests: XCTestCase {
         model.replaceAPIForTesting(api)
         let first = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
         let second = try XCTUnwrap(model.session(for: "row-2", aggregateAuthority: "pc-1"))
-        for (session, id) in [(first, "row-1"), (second, "row-2")] {
-            session.receive(.initSnapshot(.init(
-                conversation: conversation(id: id, aggregateId: "pc-1"), messages: [],
-                agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
-                pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
-        }
+        first.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"), messages: [],
+            agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
 
         first.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
         await gate.waitForEntry()
         store.aggregateMembersById["pc-1"] = ["row-1", "row-2"]
+        store.persistedMemberDiscoveryGate = discoveryGate
         second.receive(.conversationHardDeleted(seq: 1, conversationId: "row-2"))
-        await second.awaitHardDeleteReportForTesting()
+        await discoveryGate.waitForEntry()
         XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 1)
 
+        await discoveryGate.release()
+        await second.awaitHardDeleteReportForTesting()
         await gate.release()
         await first.awaitHardDeleteReportForTesting()
         XCTAssertEqual(store.hardDeleteFencePersistAttemptCount, 2)
