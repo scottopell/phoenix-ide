@@ -5949,7 +5949,7 @@ impl RuntimeManager {
         };
 
         let recovery_started = std::time::Instant::now();
-        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+        let mut active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
             &storage,
             conversation_id,
         )
@@ -6029,6 +6029,20 @@ impl RuntimeManager {
                 initial_state_updated_at = committed.state_updated_at;
                 needs_auto_continue = false;
                 has_resumable_occurrence = false;
+                active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+                    &storage,
+                    conversation_id,
+                )
+                .await?;
+                recovered_terminal_obligation = self
+                    .load_active_direct_turn_terminal_obligation(conversation_id)
+                    .await?
+                    .filter(|obligation| {
+                        active_direct_turn.as_ref().is_some_and(|loaded| {
+                            loaded.active().turn_id == obligation.turn_id
+                                && loaded.active().generation == obligation.expected_generation
+                        })
+                    });
             }
         }
         tracing::Span::current().record(
@@ -13871,6 +13885,27 @@ mod scope_liveness_tests {
         assert_ne!(replacement.turn_id, classified.turn.turn_id);
 
         manager
+            .db()
+            .add_message(
+                "replacement-interaction-response",
+                conversation_id,
+                &crate::db::MessageContent::user("replacement answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'replacement-interaction-response', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        manager
             .persist_nonresumable_baton_settlement(
                 conversation_id,
                 &classified.turn,
@@ -13887,6 +13922,15 @@ mod scope_liveness_tests {
                 .unwrap()
                 .into_active(),
             replacement
+        );
+        assert_eq!(
+            manager
+                .db()
+                .latest_execution_occurrence_message_id(conversation_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-interaction-response")
         );
     }
 

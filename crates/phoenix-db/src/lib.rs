@@ -7707,7 +7707,22 @@ impl Database {
         sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE id = ?4",
+             WHERE id = ?4
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM durable_turns owner
+                   LEFT JOIN messages canonical
+                     ON canonical.message_id = owner.canonical_message_id
+                   JOIN messages occurrence_source
+                     ON occurrence_source.message_id = ?5
+                   WHERE owner.conversation_id = ?4
+                     AND owner.owns_conversation = 1
+                     AND owner.terminal_kind IS NULL
+                     AND (
+                         owner.canonical_message_id IS NULL
+                         OR canonical.sequence_id > occurrence_source.sequence_id
+                     )
+               )",
         )
         .bind(
             serde_json::to_string(state)
@@ -7716,6 +7731,7 @@ impl Database {
         .bind(conv_state_kind(state))
         .bind(Utc::now().to_rfc3339())
         .bind(conversation_id)
+        .bind(source_message_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

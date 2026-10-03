@@ -3010,7 +3010,16 @@ async fn load_exact_execution_occurrence_tx(
            )
            AND (
                occurrence.message_id = ?1
-               OR (?1 IS NULL AND occurrence.source_kind = 'interaction_response')
+               OR (
+                   ?1 IS NULL
+                   AND occurrence.source_kind = 'interaction_response'
+                   AND EXISTS (
+                       SELECT 1 FROM durable_turns owner
+                       WHERE owner.turn_id = ?2
+                         AND owner.owns_conversation = 1
+                         AND owner.terminal_kind IS NULL
+                   )
+               )
            )",
     )
     .bind(message_id)
