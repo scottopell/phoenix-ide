@@ -658,15 +658,14 @@ impl BashHandleRegistry {
 
     /// Snapshots process-local live handles controlled by the Global Coordinator.
     pub async fn live_coordinator_handles(&self) -> Vec<Arc<Handle>> {
-        let registered: Vec<RegisteredHandle> =
-            self.handles_by_id.read().await.values().cloned().collect();
+        let by_id = self.handles_by_id.read().await;
         let mut live = Vec::new();
-        for entry in registered {
+        for entry in by_id.values() {
             if entry.handle.controller_scope != ResourceScopeKey::Coordinator {
                 continue;
             }
             if matches!(&*entry.handle.state().await, HandleState::Live(_)) {
-                live.push(entry.handle);
+                live.push(entry.handle.clone());
             }
         }
         live.sort_by(|left, right| left.handle_id.0.cmp(&right.handle_id.0));

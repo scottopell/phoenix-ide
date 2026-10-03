@@ -274,10 +274,15 @@ impl GlobalReadService {
         let (work_scope_id, worktree_path, cwd) = row;
         let (owner_name, owner_product_conversation_id, project_path) =
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT COALESCE(NULLIF(owner.cm_task_title, ''), NULLIF(owner.title, ''), NULLIF(owner.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
+            "SELECT COALESCE(NULLIF(root.chain_name, ''), NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation'), owner.product_conversation_id, project.canonical_path
              FROM conversations owner
              LEFT JOIN projects project ON project.id = owner.project_id
              LEFT JOIN product_conversations product ON product.id = owner.product_conversation_id
+             LEFT JOIN conversations root ON root.product_conversation_id = product.id
+               AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM conversations predecessor
+                 WHERE predecessor.product_conversation_id = root.product_conversation_id
+                   AND predecessor.continued_in_conv_id = root.id)
              WHERE owner.work_scope_id = ?1
                AND owner.parent_conversation_id IS NULL
                AND owner.continued_in_conv_id IS NULL

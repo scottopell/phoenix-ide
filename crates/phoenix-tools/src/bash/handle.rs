@@ -718,6 +718,9 @@ impl Handle {
                                 0,
                             )
                         };
+                        if resumed == 0 {
+                            pidfd.stopped = false;
+                        }
                         if let Some(error) = signal_error {
                             Err(error)
                         } else {
