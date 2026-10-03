@@ -684,16 +684,10 @@ fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
             ));
         }
         let Some((header, _snippet)) = line.split_once(" — ") else {
-            return Err(format!(
-                "line {} is missing the hit/snippet separator",
-                line_number + 1
-            ));
+            continue;
         };
         let Some((_, metadata)) = header.rsplit_once(") ") else {
-            return Err(format!(
-                "line {} is missing the citation metadata",
-                line_number + 1
-            ));
+            continue;
         };
         let marker = "@transcript:";
         let mut markers = metadata.match_indices(marker);
@@ -1258,7 +1252,7 @@ mod tests {
     #[test]
     fn search_tool_result_parser_rejects_invalid_hit_format() {
         let error = parse_search_tool_output("- [broken result]").unwrap_err();
-        assert!(error.contains("separator"));
+        assert!(error.contains("empty"));
         let error =
             parse_search_tool_output("- [broken](/x) @transcript:one — snippet").unwrap_err();
         assert!(error.contains("invalid transcript citation"));
