@@ -7529,10 +7529,7 @@ impl Database {
     ///
     /// # Errors
     /// Returns a database error if the lookup fails.
-    pub async fn has_resumable_execution_occurrence(
-        &self,
-        conversation_id: &str,
-    ) -> DbResult<bool> {
+    pub async fn has_execution_occurrence(&self, conversation_id: &str) -> DbResult<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1
@@ -7548,12 +7545,35 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Return the source message for the latest adopted execution occurrence.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn latest_execution_occurrence_message_id(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT occurrence.message_id
+             FROM steering_execution_occurrences occurrence
+             JOIN messages source ON source.message_id = occurrence.message_id
+             WHERE occurrence.conversation_id = ?1
+               AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             ORDER BY source.sequence_id DESC
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// List conversations whose adopted wake, seeded fork, or accepted
     /// interaction response still owns the first model response after restart.
     ///
     /// # Errors
     /// Returns a database error if the lookup fails.
-    pub async fn resumable_execution_occurrence_conversation_ids(&self) -> DbResult<Vec<String>> {
+    pub async fn execution_occurrence_conversation_ids(&self) -> DbResult<Vec<String>> {
         sqlx::query_scalar(
             "SELECT c.id
              FROM conversations c

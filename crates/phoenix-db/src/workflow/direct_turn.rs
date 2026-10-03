@@ -2414,13 +2414,7 @@ impl WorkflowRepository {
             .fetch_optional(&mut *tx.tx)
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
-        let canonical_message_id = row
-            .get::<Option<String>, _>("canonical_message_id")
-            .ok_or_else(|| {
-                DbError::Serialization(
-                    "materialized turn missing canonical message identity".to_string(),
-                )
-            })?;
+        let canonical_message_id = row.get::<Option<String>, _>("canonical_message_id");
         let turn = row_to_turn_tx(&mut tx.tx, row).await?;
         let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn_id).await?;
         let head = tx
@@ -2514,22 +2508,24 @@ impl WorkflowRepository {
         if let Some(projection) = &input.projection {
             update_conversation_projection_tx(tx, &turn.conversation, projection).await?;
         }
-        sqlx::query(
-            "DELETE FROM steering_execution_occurrences
-             WHERE conversation_id = ?1
-               AND message_id IN (
-                   SELECT occurrence.message_id
-                   FROM steering_execution_occurrences occurrence
-                   JOIN messages source ON source.message_id = occurrence.message_id
-                   JOIN messages turn_input ON turn_input.message_id = ?2
-                   WHERE occurrence.conversation_id = ?1
-                     AND source.sequence_id <= turn_input.sequence_id
-               )",
-        )
-        .bind(&turn.conversation.0)
-        .bind(&canonical_message_id)
-        .execute(&mut *tx.tx)
-        .await?;
+        if let Some(canonical_message_id) = canonical_message_id {
+            sqlx::query(
+                "DELETE FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1
+                   AND message_id IN (
+                       SELECT occurrence.message_id
+                       FROM steering_execution_occurrences occurrence
+                       JOIN messages source ON source.message_id = occurrence.message_id
+                       JOIN messages turn_input ON turn_input.message_id = ?2
+                       WHERE occurrence.conversation_id = ?1
+                         AND source.sequence_id <= turn_input.sequence_id
+                   )",
+            )
+            .bind(&turn.conversation.0)
+            .bind(&canonical_message_id)
+            .execute(&mut *tx.tx)
+            .await?;
+        }
         crate::coordinator_watches::record_terminal_event_tx(
             &mut tx.tx,
             turn_id.0,

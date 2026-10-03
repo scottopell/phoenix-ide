@@ -7201,7 +7201,11 @@ where
                 "Suppressing stale restart baton after durable ownership changed"
             );
             self.active_direct_turn = None;
-            self.install_live_state(ConvState::Idle, Utc::now(), false)?;
+            let committed = self
+                .storage
+                .get_state_snapshot(&self.context.conversation_id)
+                .await?;
+            self.install_live_state(committed.state, committed.state_updated_at, false)?;
             return Ok(());
         }
         self.resume_committed_steering_request().await
