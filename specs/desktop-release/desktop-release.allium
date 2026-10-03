@@ -391,7 +391,7 @@ invariant CompletedArchitecturePairHasOneIdentity {
     )
 }
 
-rule ProtectedMainPreparationProducesPrivateEvidence {
+rule ProtectedMainPreparationProducesActionsEvidence {
     when: ProtectedPreparationRequested(preparation)
     requires: preparation_identity_is_current_main(preparation)
     ensures: preparation_has_no_release_authority(preparation)
