@@ -127,7 +127,18 @@ entity ConversationClientStateDeletionOccurrence {
     session: IosConversationSession
 }
 
+entity HardDeleteFenceAuthority {
+    configuration_identity: String
+    aggregate_authority: String
+}
+
 entity DurableHardDeleteFence {
+    authority: HardDeleteFenceAuthority
+    session: IosConversationSession
+}
+
+entity HardDeleteCleanupCompletion {
+    authority: HardDeleteFenceAuthority
     session: IosConversationSession
 }
 
@@ -530,11 +541,20 @@ rule StaleOrDuplicateEventDiscarded {
 ------------------------------------------------------------
 
 rule HardDeletionFencePrecedesCleanup {
-    when: ConversationHardDeleted(session)
+    when: ConversationHardDeleted(
+        session,
+        configuration_identity,
+        aggregate_authority
+    )
 
     requires: session.state = live
 
-    ensures: DurableHardDeleteFence.created(session: session)
+    ensures:
+        let authority = HardDeleteFenceAuthority.created(
+            configuration_identity: configuration_identity,
+            aggregate_authority: aggregate_authority
+        )
+        DurableHardDeleteFence.created(authority: authority, session: session)
     ensures: session.view_open = false
     ensures: session.interaction_enabled = false
     ensures: session.state = deleted
@@ -550,7 +570,7 @@ rule HardDeletionFencePrecedesCleanup {
 
 rule HardDeletionEventReceived {
     -- REQ-IOS-005
-    when: ConversationHardDeleted(session)
+    when: ConversationHardDeleted(session, configuration_identity, aggregate_authority)
 
     requires: session.state = live
 
@@ -585,6 +605,20 @@ rule HardDeletionConfirmedWhileConnecting {
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
     ensures: ConversationClientStateDeletionOccurrence.created(session: session)
+}
+
+rule ExactHardDeleteFenceRetired {
+    when: HardDeleteCleanupCompleted(authority, session)
+
+    requires: exists DurableHardDeleteFence{authority: authority, session: session}
+    requires: session.state = deleted
+    requires: not exists session.cache
+    requires: not exists session.delivery_owner
+    requires: not exists session.retry_window
+    requires: not exists queue/LocalQueueEntry{scope: session.scope}
+
+    ensures: HardDeleteCleanupCompletion.created(authority: authority, session: session)
+    ensures: not exists DurableHardDeleteFence{authority: authority, session: session}
 }
 
 ------------------------------------------------------------

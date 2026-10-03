@@ -3,6 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# project.yml is the project source of truth; generate the Xcode project on a clean checkout.
+xcodegen generate
+
 if [[ -z "${PHOENIX_IOS_DEVELOPMENT_TEAM:-}" ]]; then
   cat >&2 <<'EOF'
 PHOENIX_IOS_DEVELOPMENT_TEAM is required for a signed physical-device build.
