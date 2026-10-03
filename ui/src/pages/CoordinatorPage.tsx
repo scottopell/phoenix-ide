@@ -63,7 +63,7 @@ function GlobalActiveWatches() {
 function GlobalLiveCommands() {
   const [handles, setHandles] = useState<LiveCoordinatorBashHandle[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [stopping, setStopping] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -99,14 +99,18 @@ function GlobalLiveCommands() {
             <span>{handle.handle_id}</span>
           </div>
           <div className="global-live-command-actions">
-            <a href={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</a>
-            {handle.can_stop && <button type="button" disabled={stopping === handle.handle_id} onClick={() => {
-              setStopping(handle.handle_id);
+            <Link to={`?viewer=inspect&handle=${encodeURIComponent(handle.handle_id)}`}>output →</Link>
+            {handle.can_stop && <button type="button" disabled={stopping.has(handle.handle_id)} onClick={() => {
+              setStopping((current) => new Set(current).add(handle.handle_id));
               void api.stopLiveCoordinatorBashHandle(handle.handle_id)
                 .then(() => undefined)
                 .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to stop command'))
-                .finally(() => setStopping(null));
-            }}>{stopping === handle.handle_id ? 'stopping…' : 'stop'}</button>}
+                .finally(() => setStopping((current) => {
+                  const next = new Set(current);
+                  next.delete(handle.handle_id);
+                  return next;
+                }));
+            }}>{stopping.has(handle.handle_id) ? 'stopping…' : 'stop'}</button>}
           </div>
         </div>
       ))}

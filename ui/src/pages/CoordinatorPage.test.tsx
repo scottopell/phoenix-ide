@@ -146,7 +146,7 @@ describe('CoordinatorPage', () => {
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('started');
     expect(running).toHaveTextContent('b-live');
-    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '?viewer=inspect&handle=b-live');
+    expect(screen.getByRole('link', { name: 'output →' })).toHaveAttribute('href', '/global/conv-coordinator?viewer=inspect&handle=b-live');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();

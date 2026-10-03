@@ -47,7 +47,7 @@ fn decode_snapshot(row: &sqlx::sqlite::SqliteRow) -> DbResult<WatchSnapshot> {
 
 const WATCH_SNAPSHOT: &str = "SELECT w.source_product_conversation_id, w.enrolled_at_us,
     c.id AS transcript_id, c.state,
-    COALESCE(NULLIF(root.cm_task_title, ''), NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation') AS display_name,
+    COALESCE(NULLIF(root.title, ''), NULLIF(root.slug, ''), 'Untitled conversation') AS display_name,
     c.slug AS transcript_slug, project.canonical_path AS project_path
     FROM coordinator_watches w
     JOIN product_conversations p ON p.id = w.source_product_conversation_id
