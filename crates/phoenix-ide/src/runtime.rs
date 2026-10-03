@@ -3787,14 +3787,14 @@ impl RuntimeManager {
                 self.persist_restart_loop_failure(&conversation_id).await?;
                 continue;
             }
-            if self
+            let settled_occurrence = self
                 .settle_completed_execution_occurrence(
                     &conversation_id,
                     has_execution_occurrence,
                     has_resumable_occurrence,
                 )
-                .await?
-            {
+                .await?;
+            if settled_occurrence && !has_queued_steering {
                 continue;
             }
             if matches!(conversation.state, ConvState::Idle) && !has_queued_steering {
@@ -3996,16 +3996,10 @@ impl RuntimeManager {
             .load_active_direct_turn(conversation_id)
             .await?
             .ok_or_else(|| "non-resumable baton lost its active direct-turn owner".to_string())?;
-        let terminal = if matches!(
-            reason,
-            recovery::RecoveryReason::AgentHasTextResponse
-                | recovery::RecoveryReason::RetiredToolCallSettled
-        ) {
-            ActiveDirectTurnTerminal::Completed
-        } else {
-            ActiveDirectTurnTerminal::Failed {
-                reason: format!("Restart recovery settled without dispatch: {reason:?}"),
-            }
+        let terminal = ActiveDirectTurnTerminal::Failed {
+            reason: format!(
+                "Restart recovery settled without durable terminal evidence: {reason:?}"
+            ),
         };
         storage
             .settle_active_direct_turn(&ActiveDirectTurnSettlement {

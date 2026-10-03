@@ -7626,7 +7626,30 @@ impl Database {
         state: &ConvState,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let deleted = sqlx::query(
+        let source_kind: Option<String> = sqlx::query_scalar(
+            "SELECT source_kind FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source_kind) = source_kind else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let source_kind =
+            crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+        crate::coordinator_watches::record_steering_event_tx(
+            &mut tx,
+            source_kind,
+            source_message_id,
+            conversation_id,
+            "Completed",
+            None,
+        )
+        .await?;
+        sqlx::query(
             "DELETE FROM steering_execution_occurrences
              WHERE conversation_id = ?1 AND message_id = ?2",
         )
@@ -7634,10 +7657,6 @@ impl Database {
         .bind(source_message_id)
         .execute(&mut *tx)
         .await?;
-        if deleted.rows_affected() == 0 {
-            tx.commit().await?;
-            return Ok(false);
-        }
         sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
