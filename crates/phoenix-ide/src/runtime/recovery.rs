@@ -110,8 +110,15 @@ pub fn should_auto_continue(
         return RecoveryDecision::idle(RecoveryReason::RetiredToolCallSettled);
     }
 
-    // Last message must be a tool result
-    let last_msg = messages.last().unwrap();
+    // Restart markers record recovery attempts but do not replace the semantic
+    // tool-result tail. A crash after marker persistence and before provider
+    // settlement must still be classifiable, while the full message slice below
+    // retains every marker for the bounded-loop count.
+    let last_msg = messages
+        .iter()
+        .rev()
+        .find(|message| !is_restart_marker(message))
+        .unwrap_or_else(|| messages.last().unwrap());
     if let Some(reason) = dismissal_marker_reason(last_msg) {
         // A deliberate dismissal (a question panel dismissed, or an error
         // banner dismissed) persists a hidden marker as the last message.
@@ -209,6 +216,13 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
         }
     }
     count
+}
+
+fn is_restart_marker(message: &Message) -> bool {
+    matches!(
+        &message.content,
+        MessageContent::System(system) if system.text.contains(RESTART_SYSTEM_MESSAGE_MARKER)
+    )
 }
 
 fn is_adopted_wake_result(message: &Message) -> bool {
@@ -779,6 +793,37 @@ mod tests {
         // 1 restart since last user msg → auto-continue
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn restart_marker_tail_remains_recoverable_until_bound() {
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn restart_marker_tail_reaches_explicit_bound() {
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4),
+            system_restart_msg(5),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::RestartLoopDetected);
     }
 
     #[test]

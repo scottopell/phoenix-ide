@@ -385,6 +385,7 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum StartupLlmRecovery {
     SettleInterrupted,
     ResumeCommittedSteering,
+    ResumeOwedBaton,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2571,6 +2572,9 @@ where
                         match self.startup_llm_recovery {
                             StartupLlmRecovery::ResumeCommittedSteering => {
                                 self.resume_committed_steering_request().await
+                            }
+                            StartupLlmRecovery::ResumeOwedBaton => {
+                                self.resume_owed_baton_request().await
                             }
                             StartupLlmRecovery::SettleInterrupted => {
                                 Box::pin(self.settle_interrupted_llm_request()).await
@@ -7175,6 +7179,32 @@ where
                 self.process_event(failure).await
             }
         }
+    }
+
+    async fn resume_owed_baton_request(&mut self) -> Result<(), String> {
+        let Some(expected) = self.active_direct_turn.as_ref() else {
+            return Err("owed-baton recovery has no active direct-turn identity".to_string());
+        };
+        let current = self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?;
+        let still_owned = current.as_ref().is_some_and(|loaded| {
+            loaded.active().turn_id == expected.turn_id
+                && loaded.active().generation == expected.generation
+        });
+        if !still_owned {
+            tracing::info!(
+                conversation_id = %self.context.conversation_id,
+                turn_id = expected.turn_id.0,
+                generation = expected.generation,
+                "Suppressing stale restart baton after durable ownership changed"
+            );
+            self.active_direct_turn = None;
+            self.install_live_state(ConvState::Idle, Utc::now(), false)?;
+            return Ok(());
+        }
+        self.resume_committed_steering_request().await
     }
 
     async fn settle_interrupted_llm_request(&mut self) -> Result<(), String> {

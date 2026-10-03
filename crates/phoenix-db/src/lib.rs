@@ -11118,6 +11118,55 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Idle conversations still owned by an active materialized direct turn.
+    ///
+    /// The active direct turn is the durable authority. Runtime recovery then
+    /// classifies the transcript as resumable, settled, or restart-loop failure;
+    /// transcript shape by itself never creates work.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn owed_baton_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT c.id
+             FROM conversations c
+             JOIN durable_turns t ON t.conversation_id = c.id
+             WHERE c.state_kind = 'idle'
+               AND t.disposition = 'Runtime'
+               AND t.owns_conversation = 1
+               AND t.terminal_kind IS NULL
+               AND t.canonical_message_id IS NOT NULL
+             ORDER BY c.created_at, c.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Whether one conversation has the typed active-turn/tool-result baton.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn has_owed_baton(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1
+               FROM conversations c
+               JOIN durable_turns t ON t.conversation_id = c.id
+               WHERE c.id = ?1
+                 AND c.state_kind = 'idle'
+                 AND t.disposition = 'Runtime'
+                 AND t.owns_conversation = 1
+                 AND t.terminal_kind IS NULL
+                 AND t.canonical_message_id IS NOT NULL
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Reset transient conversation states after restart.
     ///
     /// # Errors
