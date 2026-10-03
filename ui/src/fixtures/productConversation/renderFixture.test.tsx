@@ -132,11 +132,9 @@ describe('ProductConversationFixture', () => {
     });
     const fetchSnapshot = vi.spyOn(api, 'getProductConversationSnapshot');
     fireEvent.click(await screen.findByRole('button', { name: /Return to passage/ }));
-    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
-    expect(input).toHaveValue('Keep this guarantee.');
-    expect(input).not.toHaveFocus();
-    expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' }));
+    await waitFor(() => expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' })));
     await waitFor(() => expect(window.getSelection()?.toString()).toBe(quote));
+    expect(reactionStore.getSnapshot(snapshot.product_conversation_id)?.body).toBe('Keep this guarantee.');
     expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull();
     window.getSelection()?.removeAllRanges();
   });

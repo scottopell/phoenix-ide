@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -29,7 +29,9 @@ use super::types::{
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView, UpdateAutomaticContinuationRequest,
+    ProductConversationWorkIdentityView, ProjectCoordinatorProfileView,
+    ProjectCoordinatorProfileWriteRequest, ProjectCoordinatorProfileWriteResponse,
+    UpdateAutomaticContinuationRequest,
 };
 use super::AppState;
 use crate::db::{
@@ -37,7 +39,8 @@ use crate::db::{
     ProductConversationCloseUnavailableReason, ProductConversationHandoff,
     ProductConversationListLifecycle, ProductConversationListProjection,
     ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSource,
-    ProductConversationSourceKind,
+    ProductConversationSourceKind, ProjectCoordinatorProfileWriteDbError,
+    ProjectCoordinatorProfileWriteOutcome,
 };
 use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
@@ -161,6 +164,10 @@ pub fn automatic_continuation_routes() -> Router<AppState> {
                 .put(put_product_conversation_automatic_continuation),
         )
         .route(
+            "/api/product-conversations/:reference/project-coordinator-profile",
+            put(put_project_coordinator_profile),
+        )
+        .route(
             "/api/global/coordinator/automatic-continuation",
             get(get_coordinator_automatic_continuation).put(put_coordinator_automatic_continuation),
         )
@@ -207,6 +214,92 @@ pub async fn put_product_conversation_automatic_continuation(
     automatic_continuation_view(&state, product_conversation_id, false)
         .await
         .map(Json)
+}
+
+pub async fn put_project_coordinator_profile(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Json(request): Json<ProjectCoordinatorProfileWriteRequest>,
+) -> Result<Json<ProjectCoordinatorProfileWriteResponse>, AppError> {
+    let product_conversation_id = reference
+        .parse::<ProductConversationId>()
+        .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
+    let (charter, expected_revision) = match request {
+        ProjectCoordinatorProfileWriteRequest::Enable {
+            charter,
+            expected_revision,
+        } => (Some(charter), expected_revision),
+        ProjectCoordinatorProfileWriteRequest::Disable { expected_revision } => {
+            (None, expected_revision)
+        }
+    };
+    let _authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
+    let outcome = match state
+        .db
+        .write_project_coordinator_profile(
+            &product_conversation_id,
+            charter.as_deref(),
+            expected_revision,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit) => {
+            return Err(project_coordinator_ambiguous_commit_to_app(&state));
+        }
+        Err(error) => return Err(project_coordinator_write_to_app(error)),
+    };
+    let (revision, profile) = match outcome {
+        ProjectCoordinatorProfileWriteOutcome::Saved(profile) => (
+            profile.revision(),
+            Some(ProjectCoordinatorProfileView {
+                charter: profile.charter().to_string(),
+                updated_at_unix_micros: profile.updated_at_unix_micros(),
+            }),
+        ),
+        ProjectCoordinatorProfileWriteOutcome::Disabled { revision } => (revision, None),
+    };
+    Ok(Json(ProjectCoordinatorProfileWriteResponse {
+        revision,
+        profile,
+    }))
+}
+
+fn project_coordinator_ambiguous_commit_to_app(state: &AppState) -> AppError {
+    state
+        .runtime
+        .signal_fatal_local_authority("project_coordinator_profile_commit");
+    AppError::Internal(ProjectCoordinatorProfileWriteDbError::AmbiguousCommit.to_string())
+}
+
+fn project_coordinator_write_to_app(error: ProjectCoordinatorProfileWriteDbError) -> AppError {
+    use phoenix_core::domain::product_conversation::ProjectCoordinatorProfileWriteError;
+    match error {
+        ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::InvalidCharter
+            | ProjectCoordinatorProfileWriteError::InvalidProfile
+            | ProjectCoordinatorProfileWriteError::NotOrdinary,
+        ) => AppError::BadRequest(error.to_string()),
+        ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::RevisionConflict,
+        ) => AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+            error.to_string(),
+            "project_coordinator_revision_conflict",
+        ))),
+        ProjectCoordinatorProfileWriteDbError::Domain(
+            ProjectCoordinatorProfileWriteError::NotOpen,
+        ) => AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(
+            error.to_string(),
+            "project_coordinator_not_open",
+        ))),
+        ProjectCoordinatorProfileWriteDbError::Database(database) => db_to_app(database.into()),
+        ProjectCoordinatorProfileWriteDbError::AmbiguousCommit
+        | ProjectCoordinatorProfileWriteDbError::NotCommitted => {
+            AppError::Internal(error.to_string())
+        }
+    }
 }
 
 pub async fn get_coordinator_automatic_continuation(
@@ -621,6 +714,25 @@ fn close_action_view(
     }
 }
 
+async fn project_coordinator_snapshot_settings(
+    state: &AppState,
+    product_conversation_id: &ProductConversationId,
+) -> Result<(i64, Option<ProjectCoordinatorProfileView>), AppError> {
+    let settings = state
+        .db
+        .get_project_coordinator_profile_settings(product_conversation_id)
+        .await
+        .map_err(db_to_app)?;
+    let revision = settings.revision();
+    let profile = settings
+        .into_profile()
+        .map(|profile| ProjectCoordinatorProfileView {
+            charter: profile.charter().to_string(),
+            updated_at_unix_micros: profile.updated_at_unix_micros(),
+        });
+    Ok((revision, profile))
+}
+
 async fn snapshot_view(
     state: &AppState,
     mut aggregate: ProductConversationAggregate,
@@ -667,10 +779,15 @@ async fn snapshot_view(
         .iter()
         .map(|segment| segment_view(segment, &messages, &boundary_message_ids))
         .collect();
+    let (project_coordinator_revision, project_coordinator_profile) =
+        project_coordinator_snapshot_settings(state, aggregate.product_conversation.id()).await?;
+    let latest_segment = aggregate.segments.last().expect("aggregate has segment");
     Ok(ProductConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
         close,
+        project_coordinator_revision,
+        project_coordinator_profile,
 
         requested_transcript_row_id,
         canonical_root: ProductConversationTranscriptRowView {
@@ -689,17 +806,8 @@ async fn snapshot_view(
         presentation: presentation(
             root_title,
             aggregate.root.conversation.slug.as_deref(),
-            &aggregate
-                .segments
-                .last()
-                .expect("aggregate has segment")
-                .transcript_row
-                .conversation
-                .state,
-            aggregate
-                .segments
-                .last()
-                .expect("aggregate has segment")
+            &latest_segment.transcript_row.conversation.state,
+            latest_segment
                 .transcript_row
                 .conversation
                 .continued_in_conv_id
@@ -1135,6 +1243,17 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[tokio::test]
+    async fn project_coordinator_ambiguous_commit_closes_local_authority() {
+        let state = make_test_state().await;
+        assert!(state.runtime.acquire_local_authority_pass().is_ok());
+
+        let error = project_coordinator_ambiguous_commit_to_app(&state);
+
+        assert!(matches!(error, AppError::Internal(_)));
+        assert!(state.runtime.acquire_local_authority_pass().is_err());
+    }
 
     async fn create_completed_continuation(
         state: &AppState,

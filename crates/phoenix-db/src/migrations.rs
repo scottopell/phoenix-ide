@@ -575,6 +575,41 @@ const MIGRATIONS: &[Migration] = &[
         name: "input_source_tool_call",
         sql: MIGRATION_112,
     },
+    Migration {
+        version: 113,
+        name: "persist_project_coordinator_profiles",
+        sql: MIGRATION_113,
+    },
+    Migration {
+        version: 114,
+        name: "advance_project_coordinator_revision_on_direct_delete",
+        sql: MIGRATION_114,
+    },
+    Migration {
+        version: 115,
+        name: "reject_project_coordinator_profile_owner_moves",
+        sql: MIGRATION_115,
+    },
+    Migration {
+        version: 116,
+        name: "rebuild_project_coordinator_profiles_without_parallel_revision",
+        sql: "",
+    },
+    Migration {
+        version: 117,
+        name: "advance_project_coordinator_revision_on_direct_insert",
+        sql: MIGRATION_117,
+    },
+    Migration {
+        version: 118,
+        name: "repair_project_coordinator_legacy_profile_and_svg_collision",
+        sql: MIGRATION_118,
+    },
+    Migration {
+        version: 119,
+        name: "protect_project_coordinator_retained_revision_ownership",
+        sql: MIGRATION_119,
+    },
 ];
 
 const MIGRATION_112: &str = r"
@@ -1322,6 +1357,408 @@ FOR EACH ROW WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'automatic continuation admission requires eligible opted-in context exhaustion');
+END;
+";
+
+const MIGRATION_113: &str = r"
+CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profile_revisions (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
+    last_write_token TEXT NOT NULL CHECK (typeof(last_write_token) = 'text' AND length(last_write_token) > 0),
+    UNIQUE (product_conversation_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profiles (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+        ON DELETE CASCADE,
+    charter TEXT NOT NULL
+        CHECK (typeof(charter) = 'text'
+               AND instr(charter, char(0)) = 0
+               AND length(CAST(charter AS BLOB)) <= 32768),
+    updated_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profile_insert_admissions (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+        ON DELETE CASCADE,
+    write_token TEXT NOT NULL CHECK (typeof(write_token) = 'text' AND length(write_token) > 0)
+);
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+
+DROP TRIGGER IF EXISTS product_conversations_preserve_profile_ordinary_kind;
+CREATE TRIGGER product_conversations_preserve_profile_ordinary_kind
+BEFORE UPDATE OF kind ON product_conversations
+FOR EACH ROW WHEN NEW.kind != 'ordinary' AND EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation with Project Coordinator profile must remain ordinary');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_owner_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_reject_owner_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile owner is immutable');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND NOT EXISTS (
+          SELECT 1 FROM product_conversation_coordinator_profile_insert_admissions admission
+          WHERE admission.product_conversation_id = NEW.product_conversation_id
+            AND admission.write_token = product_conversation_coordinator_profile_revisions.last_write_token
+      );
+    DELETE FROM product_conversation_coordinator_profile_insert_admissions
+    WHERE product_conversation_id = NEW.product_conversation_id;
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision')
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM product_conversation_coordinator_profile_revisions
+        WHERE product_conversation_id = NEW.product_conversation_id
+          AND revision > 0
+    );
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_positive_revision_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND revision > 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_direct_content_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_reject_direct_content_update
+BEFORE UPDATE OF charter, updated_at_unix_micros ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile content is replaced through the revision fence');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
+BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN NEW.revision <= 0 AND EXISTS (
+    SELECT 1
+    FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_prevent_rollback_update;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_prevent_rollback_update
+BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN NEW.revision < OLD.revision
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile revision cannot roll back');
+END;
+
+";
+
+const MIGRATION_114: &str = r"
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_delete;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_delete
+BEFORE DELETE ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = OLD.product_conversation_id;
+END;
+";
+
+const MIGRATION_115: &str = r"
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_owner_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_reject_owner_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile owner is immutable');
+END;
+";
+
+const MIGRATION_117: &str = r"
+CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profile_insert_admissions (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+        ON DELETE CASCADE,
+    write_token TEXT NOT NULL CHECK (typeof(write_token) = 'text' AND length(write_token) > 0)
+);
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_insert;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND NOT EXISTS (
+          SELECT 1 FROM product_conversation_coordinator_profile_insert_admissions admission
+          WHERE admission.product_conversation_id = NEW.product_conversation_id
+            AND admission.write_token = product_conversation_coordinator_profile_revisions.last_write_token
+      );
+    DELETE FROM product_conversation_coordinator_profile_insert_admissions
+    WHERE product_conversation_id = NEW.product_conversation_id;
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision')
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM product_conversation_coordinator_profile_revisions
+        WHERE product_conversation_id = NEW.product_conversation_id
+          AND revision > 0
+    );
+END;
+";
+
+const MIGRATION_118: &str = r"
+CREATE TABLE IF NOT EXISTS product_conversation_coordinator_profile_insert_admissions (
+    product_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+        ON DELETE CASCADE,
+    write_token TEXT NOT NULL CHECK (typeof(write_token) = 'text' AND length(write_token) > 0)
+);
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+DROP TRIGGER IF EXISTS product_conversations_preserve_profile_ordinary_kind;
+CREATE TRIGGER product_conversations_preserve_profile_ordinary_kind
+BEFORE UPDATE OF kind ON product_conversations
+FOR EACH ROW WHEN OLD.kind = 'ordinary' AND NEW.kind <> 'ordinary' AND EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation with Project Coordinator profile must remain ordinary');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_owner_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_reject_owner_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile owner is immutable');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_ordinary_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1
+    FROM product_conversations pc
+    JOIN conversations root
+      ON root.product_conversation_id = pc.id
+     AND root.runtime_role = 'user'
+     AND root.parent_conversation_id IS NULL
+     AND root.user_initiated = 1
+    WHERE pc.id = NEW.product_conversation_id
+      AND pc.kind = 'ordinary'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile requires ordinary ProductConversation');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_delete;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_delete
+BEFORE DELETE ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = OLD.product_conversation_id;
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_insert;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = NEW.product_conversation_id
+      AND NOT EXISTS (
+          SELECT 1 FROM product_conversation_coordinator_profile_insert_admissions admission
+          WHERE admission.product_conversation_id = NEW.product_conversation_id
+            AND admission.write_token = product_conversation_coordinator_profile_revisions.last_write_token
+      );
+    DELETE FROM product_conversation_coordinator_profile_insert_admissions
+    WHERE product_conversation_id = NEW.product_conversation_id;
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM product_conversation_coordinator_profile_revisions
+        WHERE product_conversation_id = NEW.product_conversation_id AND revision > 0
+    );
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_require_positive_revision_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profiles
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id AND revision > 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_direct_content_update;
+CREATE TRIGGER product_conversation_coordinator_profiles_reject_direct_content_update
+BEFORE UPDATE OF charter, updated_at_unix_micros ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile content is replaced through the revision fence');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_delete;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_delete
+BEFORE DELETE ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be deleted');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_owner_update;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_owner_update
+BEFORE UPDATE OF product_conversation_id ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision owner is immutable');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
+BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN NEW.revision <= 0 AND EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profiles
+    WHERE product_conversation_id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_prevent_rollback_update;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_prevent_rollback_update
+BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN NEW.revision < OLD.revision
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator profile revision cannot roll back');
+END;
+";
+
+const MIGRATION_119: &str = r"
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+BEFORE INSERT ON product_conversation_coordinator_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE product_conversation_coordinator_profile_revisions
+    SET revision = revision + 1
+    WHERE product_conversation_id = NEW.product_conversation_id;
+    SELECT RAISE(ABORT, 'Project Coordinator active profile requires positive revision')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM product_conversation_coordinator_profile_revisions
+        WHERE product_conversation_id = NEW.product_conversation_id AND revision > 0
+    );
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_delete;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_delete
+BEFORE DELETE ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be deleted');
+END;
+DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_replace;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_replace
+BEFORE INSERT ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversation_coordinator_profile_revisions
+    WHERE product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision cannot be replaced');
 END;
 ";
 
@@ -10161,6 +10598,129 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+async fn project_coordinator_profiles_has_legacy_revision(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('product_conversation_coordinator_profiles')
+            WHERE name = 'revision'
+        )",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+async fn migration_112_backfill_svg_if_branch_local_v101(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    let migration_101_name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 101")
+            .fetch_optional(&mut **tx)
+            .await?;
+    if migration_101_name.as_deref() != Some("create_conversation_svg_artifacts") {
+        sqlx::raw_sql(
+            r"
+            CREATE TABLE IF NOT EXISTS conversation_svg_artifacts (
+                artifact_id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                assistant_message_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL,
+                title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+                description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+                width REAL NOT NULL CHECK(width > 0 AND width <= 16384),
+                height REAL NOT NULL CHECK(height > 0 AND height <= 16384),
+                bytes BLOB NOT NULL CHECK(typeof(bytes) = 'blob' AND length(bytes) BETWEEN 1 AND 2097152),
+                CHECK(width * height <= 64000000),
+                UNIQUE(conversation_id, assistant_message_id, tool_use_id)
+            );
+            ",
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE _migrations
+         SET name = 'create_conversation_svg_artifacts'
+         WHERE version = 101 AND name = 'persist_project_coordinator_profiles'",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn migration_115_rebuild_project_coordinator_profiles(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    if !project_coordinator_profiles_has_legacy_revision(tx).await? {
+        return Ok(());
+    }
+
+    sqlx::raw_sql(
+        r"
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_insert;
+        DROP TRIGGER IF EXISTS product_conversations_preserve_profile_ordinary_kind;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_owner_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_ordinary_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_insert;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_require_positive_revision_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_reject_direct_content_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_delete;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profiles_advance_revision_insert;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_keep_active_positive_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_prevent_rollback_update;
+        DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_delete;
+        ALTER TABLE product_conversation_coordinator_profiles
+            RENAME TO product_conversation_coordinator_profiles_legacy_101;
+        CREATE TABLE product_conversation_coordinator_profiles (
+            product_conversation_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES product_conversation_coordinator_profile_revisions(product_conversation_id)
+                ON DELETE CASCADE,
+            charter TEXT NOT NULL
+                CHECK (typeof(charter) = 'text'
+                       AND instr(charter, char(0)) = 0
+                       AND length(CAST(charter AS BLOB)) <= 32768),
+            updated_at_unix_micros INTEGER NOT NULL
+                CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0)
+        );
+        INSERT INTO product_conversation_coordinator_profiles
+            (product_conversation_id, charter, updated_at_unix_micros)
+        SELECT product_conversation_id, charter, updated_at_unix_micros
+        FROM product_conversation_coordinator_profiles_legacy_101;
+        CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_delete
+        BEFORE DELETE ON product_conversation_coordinator_profiles
+        FOR EACH ROW
+        BEGIN
+            UPDATE product_conversation_coordinator_profile_revisions
+            SET revision = revision + 1
+            WHERE product_conversation_id = OLD.product_conversation_id;
+        END;
+        DROP TABLE product_conversation_coordinator_profiles_legacy_101;
+        ",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn run_migration_preflight(
+    tx: &mut Transaction<'_, Sqlite>,
+    migration: &Migration,
+) -> DbResult<()> {
+    match migration.version {
+        65 => migration_065_preflight(tx).await?,
+        76 => migration_076_extend_close_retirement_resource_kinds(tx).await?,
+        112 | 117 | 118 => {
+            migration_112_backfill_svg_if_branch_local_v101(tx).await?;
+            migration_115_rebuild_project_coordinator_profiles(tx).await?;
+        }
+        116 => migration_115_rebuild_project_coordinator_profiles(tx).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -10230,13 +10790,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // column) and abort startup.
         let mut tx = pool.begin().await?;
 
-        if migration.version == 76 {
-            migration_076_extend_close_retirement_resource_kinds(&mut tx).await?;
-        }
-
-        if migration.version == 65 {
-            migration_065_preflight(&mut tx).await?;
-        }
+        run_migration_preflight(&mut tx, migration).await?;
 
         if migration.version == 80 && !migration_080_prepare(&mut tx).await? {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
@@ -11070,6 +11624,137 @@ mod tests {
     use std::str::FromStr;
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_118_repairs_already_stamped_legacy_project_coordinator_shape() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE _migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             WITH RECURSIVE versions(version) AS (
+                 SELECT 1 UNION ALL SELECT version + 1 FROM versions WHERE version < 117
+             )
+             INSERT INTO _migrations (version, name)
+             SELECT version, 'preexisting' FROM versions;
+             UPDATE _migrations
+             SET name = 'persist_project_coordinator_profiles'
+             WHERE version = 101;
+             CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 kind TEXT NOT NULL,
+                 ordinary_lifecycle TEXT
+             );
+             INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('pc-legacy-shape', 'ordinary', 'open');
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 product_conversation_id TEXT,
+                 parent_conversation_id TEXT,
+                 runtime_role TEXT NOT NULL,
+                 user_initiated INTEGER NOT NULL
+             );
+             INSERT INTO conversations
+                 (id, product_conversation_id, parent_conversation_id, runtime_role, user_initiated)
+             VALUES ('conv-legacy-shape', 'pc-legacy-shape', NULL, 'user', 1);
+             CREATE TABLE product_conversation_coordinator_profile_revisions (
+                 product_conversation_id TEXT PRIMARY KEY NOT NULL,
+                 revision INTEGER NOT NULL,
+                 last_write_token TEXT NOT NULL,
+                 UNIQUE (product_conversation_id, revision)
+             );
+             INSERT INTO product_conversation_coordinator_profile_revisions
+                 (product_conversation_id, revision, last_write_token)
+             VALUES ('pc-legacy-shape', 1, 'legacy-token');
+             CREATE TABLE product_conversation_coordinator_profiles (
+                 product_conversation_id TEXT PRIMARY KEY NOT NULL,
+                 revision INTEGER NOT NULL,
+                 charter TEXT NOT NULL,
+                 updated_at_unix_micros INTEGER NOT NULL
+             );
+             INSERT INTO product_conversation_coordinator_profiles
+                 (product_conversation_id, revision, charter, updated_at_unix_micros)
+             VALUES ('pc-legacy-shape', 1, 'legacy charter', 5);
+             CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_delete
+             BEFORE DELETE ON product_conversation_coordinator_profiles
+             FOR EACH ROW BEGIN SELECT 1; END;
+             CREATE TRIGGER product_conversation_coordinator_profiles_advance_revision_insert
+             BEFORE INSERT ON product_conversation_coordinator_profiles
+             FOR EACH ROW BEGIN SELECT 1; END;
+         DROP TRIGGER IF EXISTS product_conversation_coordinator_profile_revisions_reject_active_delete;
+CREATE TRIGGER product_conversation_coordinator_profile_revisions_reject_active_delete
+BEFORE DELETE ON product_conversation_coordinator_profile_revisions
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Project Coordinator retained revision with active profile cannot be deleted');
+END;
+
+    CREATE TRIGGER product_conversation_coordinator_profile_revisions_keep_active_positive_update
+             BEFORE UPDATE OF revision ON product_conversation_coordinator_profile_revisions
+             FOR EACH ROW BEGIN SELECT 1; END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('product_conversation_coordinator_profiles')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!columns.contains(&"revision".to_string()));
+        let charter: String = sqlx::query_scalar(
+            "SELECT charter FROM product_conversation_coordinator_profiles
+             WHERE product_conversation_id = 'pc-legacy-shape'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(charter, "legacy charter");
+        let svg_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'conversation_svg_artifacts'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(svg_exists);
+        let migration_101_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 101")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(migration_101_name, "create_conversation_svg_artifacts");
+        sqlx::query("DELETE FROM product_conversation_coordinator_profiles")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_coordinator_profiles
+                 (product_conversation_id, charter, updated_at_unix_micros)
+             VALUES ('pc-legacy-shape', 'current writer shape', 6)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let retained_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM product_conversation_coordinator_profile_revisions
+             WHERE product_conversation_id = 'pc-legacy-shape'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_revision, 3);
+    }
+
+    #[tokio::test]
     async fn migration_098_retires_shipped_empty_continuation_intent_without_losing_successor() {
         let pool = test_pool().await;
         sqlx::raw_sql(
@@ -11414,9 +12099,15 @@ mod tests {
         assert_eq!(
             ledger.iter().rev().take(3).copied().collect::<Vec<_>>(),
             vec![
-                (112, "input_source_tool_call"),
-                (111, "coordinator_conversation_watches"),
-                (110, "trusted_input_origin"),
+                (
+                    119,
+                    "protect_project_coordinator_retained_revision_ownership"
+                ),
+                (
+                    118,
+                    "repair_project_coordinator_legacy_profile_and_svg_collision"
+                ),
+                (117, "advance_project_coordinator_revision_on_direct_insert"),
             ]
         );
     }
@@ -16360,7 +17051,15 @@ mod tests {
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches')",
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (112, 'temporarily_skip_input_source_tool_call'),
+                    (113, 'temporarily_skip_project_coordinator_profiles'),
+                    (114, 'temporarily_skip_project_coordinator_delete_revision'),
+                    (115, 'temporarily_skip_project_coordinator_owner_moves'),
+                    (116, 'temporarily_skip_project_coordinator_profile_rebuild'),
+                    (117, 'temporarily_skip_project_coordinator_insert_revision'),
+                    (118, 'temporarily_skip_project_coordinator_repair'),
+                    (119, 'temporarily_skip_project_coordinator_retained_revision')",
         )
         .execute(&pool)
         .await
@@ -17258,7 +17957,15 @@ mod tests {
                     (102, 'temporarily_skip_automatic_continuation_superseded'),
                     (103, 'temporarily_skip_automatic_continuation_resume_phase'),
                     (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches')",
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (112, 'temporarily_skip_input_source_tool_call'),
+                    (113, 'temporarily_skip_project_coordinator_profiles'),
+                    (114, 'temporarily_skip_project_coordinator_delete_revision'),
+                    (115, 'temporarily_skip_project_coordinator_owner_moves'),
+                    (116, 'temporarily_skip_project_coordinator_profile_rebuild'),
+                    (117, 'temporarily_skip_project_coordinator_insert_revision'),
+                    (118, 'temporarily_skip_project_coordinator_repair'),
+                    (119, 'temporarily_skip_project_coordinator_retained_revision')",
         )
         .execute(pool)
         .await
