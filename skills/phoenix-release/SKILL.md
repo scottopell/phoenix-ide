@@ -15,6 +15,16 @@ The CI half is fully automated. `.github/workflows/release.yml` fires when a cha
 - Local `gh` authenticated with push + release-edit rights on `scottopell/phoenix-ide`.
 - The user has explicitly authorized the release. Push and tag operations are shared-state — never proceed without confirmation.
 
+## Optional pre-release desktop preparation
+
+When the user authorizes signing/notarization preparation but has not authorized a version, tag, or publication, dispatch the exact current `main` commit through the protected preparation operation:
+
+```bash
+gh workflow run release.yml --ref main -f operation=prepare-main
+```
+
+This runs only the production macOS signing/notarization matrix and retains commit-qualified Actions artifacts plus sanitized receipts. It does not create or move a tag, build Linux release assets, create or mutate a GitHub Release, publish, deploy, or install. Actions artifacts in this public repository are not confidential; they are qualification artifacts not attached to a GitHub Release. Preparation does not authorize a version or promise byte-identical future release builds.
+
 ## Step 1 — Decide the version
 
 Read current version from `crates/phoenix-ide/Cargo.toml` (the root `Cargo.toml` is workspace-only since the `crates/` restructure — it has no `[package]` block).
@@ -64,9 +74,9 @@ The verifier downloads by captured asset IDs and checks the exact nine-name set,
 
 For an explicitly authorized RC, substitute the exact `vX.Y.Z-rc.N` tag and `rc` channel. Verify GitHub reports `prerelease=true` and `isLatest=false`; artifact names include the full RC tag. RCs use the same signed, notarized, stapled, Gatekeeper-validated, checksummed path. Final stable promotion is a new version bump and build, never relabeling RC bytes.
 
-If the build fails, do not retry blindly. Open the run and fix the underlying issue. A manual dispatch may retry only when the existing version tag still points at that exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
+If the build fails, do not retry blindly. Open the run and fix the underlying issue. An exact-tag manual retry uses `gh workflow run release.yml --ref main -f operation=retry-release -f tag=vX.Y.Z` (or the exact RC tag) and may run only when that existing tag still points at the exact `main` commit. The publisher may recover an incomplete private draft, but it never replaces a differing public release or moves a tag. Never `--force` a tag.
 
-The workflow uses one non-cancelling concurrency group across tag creation, builds, and publication. GitHub keeps at most one pending run in a concurrency group, so a third overlapping request can visibly cancel and replace the older pending run. This is not a lossless queue. After the active release finishes, inspect every canceled release workflow: resume it only if its exact tag and version remain valid; otherwise record the intentional stale-version refusal. Exact-tag and private-draft retries converge without moving tags or mutating a differing public release, while an older version safely refuses after a newer release exists.
+Release operations use one non-cancelling concurrency group across tag creation, builds, and publication; preparation uses a separate non-cancelling group so it cannot replace a pending release. GitHub keeps at most one pending run in a concurrency group, so a third overlapping request can visibly cancel and replace the older pending run. This is not a lossless queue. After the active release finishes, inspect every canceled release workflow: resume it only if its exact tag and version remain valid; otherwise record the intentional stale-version refusal. Exact-tag and private-draft retries converge without moving tags or mutating a differing public release, while an older version safely refuses after a newer release exists.
 
 ## Step 4 — Draft polished release notes via sub-agent
 
