@@ -31,6 +31,8 @@ pub enum RecoveryReason {
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
     AgentHasTextResponse,
+    /// Tool result has no matching request in the last agent message.
+    OrphanToolResult,
     /// Last message marks a deliberate `ask_user_question` dismissal
     UserQuestionDismissed,
     /// Last message marks a deliberate error-banner dismissal
@@ -93,10 +95,11 @@ pub fn decide_recovery(messages: &[Message], tail_status: &RecoveryTailStatus) -
 ///
 /// A conversation needs auto-continuation when:
 /// 1. The last message is a tool result
-/// 2. The last agent message contains only `tool_use` blocks (no text)
+/// 2. The last agent message requested the tool represented by that result
 ///
-/// This indicates the conversation was interrupted after tools completed
-/// but before the LLM could provide a text response.
+/// This indicates the conversation was interrupted after tools completed but
+/// before the LLM could observe their results. Text accompanying the tool call
+/// does not settle the required post-tool provider step.
 pub fn should_auto_continue(
     messages: &[Message],
     settlement: Option<RecoverySettlementReason>,
@@ -110,8 +113,15 @@ pub fn should_auto_continue(
         return RecoveryDecision::idle(RecoveryReason::RetiredToolCallSettled);
     }
 
-    // Last message must be a tool result
-    let last_msg = messages.last().unwrap();
+    // Restart markers record recovery attempts but do not replace the semantic
+    // tool-result tail. A crash after marker persistence and before provider
+    // settlement must still be classifiable, while the full message slice below
+    // retains every marker for the bounded-loop count.
+    let last_msg = messages
+        .iter()
+        .rev()
+        .find(|message| !is_restart_marker(message))
+        .unwrap_or_else(|| messages.last().unwrap());
     if let Some(reason) = dismissal_marker_reason(last_msg) {
         // A deliberate dismissal (a question panel dismissed, or an error
         // banner dismissed) persists a hidden marker as the last message.
@@ -121,6 +131,7 @@ pub fn should_auto_continue(
     let adopted_wake_tail = messages
         .iter()
         .rev()
+        .filter(|message| !is_restart_marker(message))
         .take_while(|message| is_adopted_wake_result(message));
     if adopted_wake_tail
         .filter_map(wake_terminal_object)
@@ -143,29 +154,29 @@ pub fn should_auto_continue(
         return RecoveryDecision::idle(RecoveryReason::NoAgentMessage);
     };
 
-    // Check if the agent message has any text content
-    let agent_has_text = match &last_agent.content {
-        MessageContent::Agent(blocks) => blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { .. })),
-        // Non-agent content in agent message is unexpected, treat as having text (safe default)
-        _ => true,
+    let matching_tool_request = match (&last_agent.content, &last_msg.content) {
+        (MessageContent::Agent(blocks), MessageContent::Tool(result)) => blocks.iter().any(
+            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == &result.tool_use_id),
+        ),
+        _ => false,
     };
-
-    if agent_has_text {
-        RecoveryDecision::idle(RecoveryReason::AgentHasTextResponse)
-    } else {
-        // Check for restart loop: count consecutive restart system messages
-        // at the tail of the conversation. If we've already auto-continued
-        // MAX_CONSECUTIVE_RESTARTS times without the agent completing normally,
-        // stop to prevent infinite restart loops (e.g. agent running a command
-        // that restarts the server).
-        let consecutive_restarts = count_restart_messages_since_last_user_msg(messages);
-        if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS {
-            RecoveryDecision::idle(RecoveryReason::RestartLoopDetected)
+    if !matching_tool_request {
+        let agent_has_text = matches!(
+            &last_agent.content,
+            MessageContent::Agent(blocks)
+                if blocks.iter().any(|block| matches!(block, ContentBlock::Text { .. }))
+        );
+        return RecoveryDecision::idle(if agent_has_text {
+            RecoveryReason::AgentHasTextResponse
         } else {
-            RecoveryDecision::auto_continue()
-        }
+            RecoveryReason::OrphanToolResult
+        });
+    }
+
+    if restart_recovery_exhausted(messages) {
+        RecoveryDecision::idle(RecoveryReason::RestartLoopDetected)
+    } else {
+        RecoveryDecision::auto_continue()
     }
 }
 
@@ -209,6 +220,18 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
         }
     }
     count
+}
+
+#[must_use]
+pub(crate) fn restart_recovery_exhausted(messages: &[Message]) -> bool {
+    count_restart_messages_since_last_user_msg(messages) >= MAX_CONSECUTIVE_RESTARTS
+}
+
+fn is_restart_marker(message: &Message) -> bool {
+    matches!(
+        &message.content,
+        MessageContent::System(system) if system.text.contains(RESTART_SYSTEM_MESSAGE_MARKER)
+    )
 }
 
 fn is_adopted_wake_result(message: &Message) -> bool {
@@ -518,6 +541,20 @@ mod tests {
     }
 
     #[test]
+    fn restart_marker_is_transparent_to_adopted_wake_tail() {
+        let messages = vec![
+            adopted_wake_msg(1, false),
+            adopted_wake_msg(2, true),
+            system_restart_msg(3),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
     fn cancellation_only_adopted_wake_tail_stays_idle() {
         let messages = vec![user_msg(1, "start"), adopted_wake_msg(2, true)];
 
@@ -606,8 +643,8 @@ mod tests {
             tool_result(3, "some-tool", "output"),
         ];
         let decision = should_auto_continue(&messages, None);
-        // Empty blocks = no text, should auto-continue
-        assert!(decision.needs_auto_continue);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::OrphanToolResult);
     }
 
     #[test]
@@ -652,27 +689,8 @@ mod tests {
             tool_result(3, "tool-2-0", "files"),
         ];
         let decision = should_auto_continue(&messages, None);
-        // The agent DID provide text, so this is normal - don't auto-continue
-        // The agent will see the tool result and provide more text
-        // Wait - actually this IS an interrupted case! The tool completed but LLM didn't respond.
-        // Hmm, let me think about this...
-        //
-        // Actually NO - if the agent said "Let me check..." AND requested a tool,
-        // and the tool completed, the agent should still respond with the result.
-        // So this IS an interrupted case.
-        //
-        // But wait - the spec says we check if the last agent message has text.
-        // It does ("Let me check..."). So we DON'T auto-continue.
-        //
-        // This is a design decision: if the agent already provided some text in
-        // the same message as the tool_use, we consider that a "partial response"
-        // and the agent can continue when the user sends a new message.
-        //
-        // This is safer than auto-continuing because the agent might have actually
-        // finished their thought with "Let me check..." and then the user can
-        // see the tool result and decide what to do.
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::AgentHasTextResponse);
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
     }
 
     fn system_question_dismissed_msg(seq: i64) -> Message {
@@ -779,6 +797,37 @@ mod tests {
         // 1 restart since last user msg → auto-continue
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn restart_marker_tail_remains_recoverable_until_bound() {
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn restart_marker_tail_reaches_explicit_bound() {
+        let messages = vec![
+            user_msg(1, "Deploy"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "deploying..."),
+            system_restart_msg(4),
+            system_restart_msg(5),
+        ];
+
+        let decision = should_auto_continue(&messages, None);
+
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::RestartLoopDetected);
     }
 
     #[test]
@@ -1055,6 +1104,9 @@ mod proptests {
                     prop_assert!(!messages
                         .iter()
                         .any(|m| matches!(m.message_type, MessageType::Agent)));
+                }
+                RecoveryReason::OrphanToolResult => {
+                    prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::AgentHasTextResponse => {
                     // Last agent has text

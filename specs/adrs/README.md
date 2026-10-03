@@ -87,6 +87,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [072](072_source-input-links-pin-originating-tool-invocations.md) | Source input links pin originating tool invocations | Accepted | REQ-GR-014, REQ-COMP-001 |
 
 | [073](073_preserve-prelocator-prepared-turn-fingerprints.md) | Preserve prelocator prepared-turn fingerprints | Accepted | REQ-COMP-007 |
+| [074](074_active-direct-turn-is-the-restart-baton.md) | Active direct turn is the restart baton | Accepted | REQ-BED-007, REQ-DWF-CHAT-014, REQ-DWF-CHAT-016 |
 
 ## For agents: which decisions bind your task
 
@@ -122,6 +123,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying local SQLite authority classification, persistence-health fail-stop, or restart reconstruction | 036, then 024, 020, 014 |
+| Specifying post-tool direct-turn restart recovery or bounded owed-baton settlement | 074, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |

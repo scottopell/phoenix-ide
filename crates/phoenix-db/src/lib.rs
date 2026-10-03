@@ -557,6 +557,12 @@ pub enum CreationClaimOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionOccurrenceTerminal {
+    Completed,
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreationCasOutcome {
     Applied,
     ClaimLost,
@@ -7375,6 +7381,21 @@ impl Database {
         Ok(())
     }
 
+    /// List conversations with accepted steering still queued for dispatch.
+    ///
+    /// # Errors
+    /// Returns a database error if discovery fails.
+    pub async fn queued_steering_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT conversation_id
+             FROM steering_messages
+             ORDER BY conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Return the current steering queue depth.
     ///
     /// # Errors
@@ -7520,6 +7541,303 @@ impl Database {
         )
         .bind(conversation_id)
         .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Report whether an adopted wake, seeded fork, or accepted interaction
+    /// response still owns the conversation's first model response.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn has_execution_occurrence(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM steering_execution_occurrences occurrence
+                 JOIN messages source ON source.message_id = occurrence.message_id
+                 WHERE occurrence.conversation_id = ?1
+                   AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Report whether an accepted interaction response still owns its first model response.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn has_interaction_response_execution_occurrence(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1 AND source_kind = 'interaction_response'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Report whether the current interaction response has a later agent checkpoint.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn interaction_response_has_post_source_agent(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM steering_execution_occurrences occurrence
+                 JOIN messages source ON source.message_id = occurrence.message_id
+                 JOIN messages later
+                   ON later.conversation_id = occurrence.conversation_id
+                  AND later.sequence_id > source.sequence_id
+                  AND later.message_type = 'agent'
+                 WHERE occurrence.conversation_id = ?1
+                   AND occurrence.source_kind = 'interaction_response'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Return the source message for the latest adopted execution occurrence.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn latest_execution_occurrence_message_id(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT occurrence.message_id
+             FROM steering_execution_occurrences occurrence
+             JOIN messages source ON source.message_id = occurrence.message_id
+             WHERE occurrence.conversation_id = ?1
+               AND occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             ORDER BY source.sequence_id DESC
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Atomically project an execution occurrence to `LlmRequesting` if its
+    /// durable owner still exists.
+    ///
+    /// # Errors
+    /// Returns a database error if the projection fails.
+    pub async fn project_execution_occurrence_requesting(
+        &self,
+        conversation_id: &str,
+        source_message_id: &str,
+        state: &ConvState,
+        state_updated_at: &DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM steering_execution_occurrences
+                 WHERE conversation_id = ?1
+                   AND message_id = ?2
+                   AND source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+             )",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Atomically settle an execution occurrence even when the conversation
+    /// projection is already the requested terminal kind.
+    ///
+    /// # Errors
+    /// Returns a database error if settlement fails.
+    pub async fn settle_execution_occurrence(
+        &self,
+        conversation_id: &str,
+        source_message_id: &str,
+        terminal: &ExecutionOccurrenceTerminal,
+        state: &ConvState,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source_kind: Option<String> = sqlx::query_scalar(
+            "SELECT source_kind FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source_kind) = source_kind else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let source_kind =
+            crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
+        let (terminal_kind, terminal_reason) = match terminal {
+            ExecutionOccurrenceTerminal::Completed => ("Completed", None),
+            ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+        };
+        crate::coordinator_watches::record_steering_event_tx(
+            &mut tx,
+            source_kind,
+            source_message_id,
+            conversation_id,
+            terminal_kind,
+            terminal_reason,
+        )
+        .await?;
+        sqlx::query(
+            "DELETE FROM steering_execution_occurrences
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM durable_turns owner
+                   LEFT JOIN messages canonical
+                     ON canonical.message_id = owner.canonical_message_id
+                   JOIN messages occurrence_source
+                     ON occurrence_source.message_id = ?5
+                   WHERE owner.conversation_id = ?4
+                     AND owner.owns_conversation = 1
+                     AND owner.terminal_kind IS NULL
+                     AND (
+                         owner.canonical_message_id IS NULL
+                         OR canonical.sequence_id > occurrence_source.sequence_id
+                     )
+               )",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .bind(source_message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Atomically project an exact active direct turn to `LlmRequesting`.
+    ///
+    /// # Errors
+    /// Returns a database error if the projection fails.
+    pub async fn project_active_direct_turn_requesting(
+        &self,
+        conversation_id: &str,
+        turn_id: u64,
+        generation: u64,
+        state: &ConvState,
+        state_updated_at: &DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM durable_turns
+                 WHERE conversation_id = ?1
+                   AND turn_id = ?2
+                   AND generation = ?3
+                   AND owns_conversation = 1
+                   AND terminal_kind IS NULL
+             )",
+        )
+        .bind(conversation_id)
+        .bind(i64::try_from(turn_id).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .bind(i64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// List conversations whose adopted wake, seeded fork, or accepted
+    /// interaction response still owns the first model response after restart.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn execution_occurrence_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT c.id
+             FROM conversations c
+             JOIN steering_execution_occurrences occurrence
+               ON occurrence.conversation_id = c.id
+             JOIN messages source ON source.message_id = occurrence.message_id
+             WHERE occurrence.source_kind IN ('wake', 'seeded_fork', 'interaction_response')
+               AND (
+                   c.state_kind IN ('idle', 'llm_requesting')
+                   OR (
+                       occurrence.source_kind = 'interaction_response'
+                       AND c.state_kind = 'awaiting_user_response'
+                   )
+               )
+             ORDER BY c.created_at, c.id",
+        )
+        .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
     }
@@ -11118,6 +11436,55 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Idle conversations still owned by an active materialized direct turn.
+    ///
+    /// The active direct turn is the durable authority. Runtime recovery then
+    /// classifies the transcript as resumable, settled, or restart-loop failure;
+    /// transcript shape by itself never creates work.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn owed_baton_conversation_ids(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT c.id
+             FROM conversations c
+             JOIN durable_turns t ON t.conversation_id = c.id
+             WHERE c.state_kind IN ('idle', 'llm_requesting')
+               AND t.disposition = 'Runtime'
+               AND t.owns_conversation = 1
+               AND t.terminal_kind IS NULL
+               AND t.canonical_message_id IS NOT NULL
+             ORDER BY c.created_at, c.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Whether one conversation has the typed active-turn/tool-result baton.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the query fails.
+    pub async fn has_owed_baton(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1
+               FROM conversations c
+               JOIN durable_turns t ON t.conversation_id = c.id
+               WHERE c.id = ?1
+                 AND c.state_kind IN ('idle', 'llm_requesting')
+                 AND t.disposition = 'Runtime'
+                 AND t.owns_conversation = 1
+                 AND t.terminal_kind IS NULL
+                 AND t.canonical_message_id IS NOT NULL
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Reset transient conversation states after restart.
     ///
     /// # Errors
@@ -12774,6 +13141,42 @@ impl Database {
         let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
         Ok(tail)
+    }
+
+    /// Get the recovery suffix beginning at an exact durable input source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::MessageNotFound`] when the scoped source is absent,
+    /// or a database/decoding error when retrieval fails.
+    pub async fn get_recovery_messages_from_source(
+        &self,
+        conversation_id: &str,
+        source_message_id: &str,
+    ) -> DbResult<Vec<Message>> {
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut rows = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
+                 FROM messages
+                 WHERE conversation_id = ?1
+                   AND sequence_id >= (
+                       SELECT sequence_id FROM messages
+                       WHERE conversation_id = ?1 AND message_id = ?2
+                   )
+                 ORDER BY sequence_id ASC",
+            )
+            .bind(conversation_id)
+            .bind(source_message_id)
+            .try_map(parse_message_row)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Err(DbError::MessageNotFound(source_message_id.to_string()));
+            }
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the exact projection consumed by runtime recovery: the newest agent
