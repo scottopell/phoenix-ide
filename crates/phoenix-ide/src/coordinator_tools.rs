@@ -626,7 +626,7 @@ fn app_error_message(error: crate::api::handlers::AppError) -> String {
 ///
 /// The benchmark intentionally validates the same text boundary that a
 /// coordinator sees rather than deriving counts from retriever internals. A
-/// successful hit result is one markdown hit per line, with the exact
+/// successful hit result has markdown hit headers (snippets may span lines), with the exact
 /// `@transcript:<id>#message-<id>` citation at the end of its metadata.
 fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
     const NO_HIT: &str = "No matching messages found.";
@@ -636,7 +636,12 @@ fn parse_search_tool_output(output: &str) -> Result<Vec<String>, String> {
     }
 
     let mut citations = Vec::new();
-    for (line_number, line) in output.lines().enumerate() {
+    for (line_number, line) in output.split("\n- [").enumerate() {
+        let line = if line_number == 0 {
+            line.to_string()
+        } else {
+            format!("- [{line}")
+        };
         if !line.starts_with("- [") {
             return Err(format!(
                 "line {} does not start with '- ['",
@@ -1204,6 +1209,15 @@ mod tests {
         assert!(parse_search_tool_output("No matching messages found.")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn search_tool_result_parser_accepts_multiline_snippets() {
+        let output = "- [title](/c/a) @transcript:t#message-m — snippet\n   continued snippet\n- [title](/c/a) @transcript:t#message-n — another\n```\nmultiline\n```\n";
+        assert_eq!(
+            parse_search_tool_output(output).unwrap(),
+            vec!["@transcript:t#message-m", "@transcript:t#message-n"]
+        );
     }
 
     #[test]
