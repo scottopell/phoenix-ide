@@ -3781,9 +3781,14 @@ impl RuntimeManager {
                     phoenix_core::domain::db_schema::MessageType::Agent
                 )
             }) {
+                let disposition = if recovery::restart_recovery_exhausted(&messages) {
+                    ExecutionOccurrenceDisposition::RestartLoopDetected
+                } else {
+                    ExecutionOccurrenceDisposition::Resume
+                };
                 return Ok(Some(ExecutionOccurrenceRecovery {
                     source_message_id,
-                    disposition: ExecutionOccurrenceDisposition::Resume,
+                    disposition,
                 }));
             }
             let tail = self
@@ -3852,6 +3857,7 @@ impl RuntimeManager {
             if recovery_decision.as_ref().is_some_and(|decision| {
                 decision.reason == recovery::RecoveryReason::RestartLoopDetected
             }) && !has_queued_steering
+                && !has_resumable_occurrence
             {
                 self.persist_restart_loop_failure(&conversation_id).await?;
                 continue;
@@ -3865,7 +3871,10 @@ impl RuntimeManager {
             if settled_occurrence && !has_queued_steering {
                 continue;
             }
-            if matches!(conversation.state, ConvState::Idle) && !has_queued_steering {
+            if matches!(conversation.state, ConvState::Idle)
+                && !has_queued_steering
+                && !has_resumable_occurrence
+            {
                 if let Some(decision) = recovery_decision
                     .as_ref()
                     .filter(|decision| !decision.needs_auto_continue)
@@ -5758,7 +5767,7 @@ impl RuntimeManager {
             conversation_id,
         )
         .await?;
-        let recovered_terminal_obligation = self
+        let mut recovered_terminal_obligation = self
             .load_active_direct_turn_terminal_obligation(conversation_id)
             .await?
             .filter(|obligation| {
@@ -5767,6 +5776,13 @@ impl RuntimeManager {
                         && loaded.active().generation == obligation.expected_generation
                 })
             });
+        let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
+        let mut has_resumable_occurrence = occurrence_recovery
+            .as_ref()
+            .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
+        if has_resumable_occurrence {
+            recovered_terminal_obligation = None;
+        }
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
@@ -5781,10 +5797,6 @@ impl RuntimeManager {
             } else {
                 self.determine_resume_state(conversation_id).await?
             };
-        let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
-        let mut has_resumable_occurrence = occurrence_recovery
-            .as_ref()
-            .is_some_and(ExecutionOccurrenceRecovery::needs_resume);
         if recovered_terminal_obligation.is_none() && initial_state != conv.state {
             let projected = if has_resumable_occurrence {
                 self.db
@@ -5798,6 +5810,7 @@ impl RuntimeManager {
                             })?
                             .source_message_id,
                         &initial_state,
+                        &initial_state_updated_at,
                     )
                     .await
                     .map_err(|error| error.to_string())?
@@ -5809,6 +5822,7 @@ impl RuntimeManager {
                             turn.active().turn_id.0,
                             turn.active().generation,
                             &initial_state,
+                            &initial_state_updated_at,
                         )
                         .await
                         .map_err(|error| error.to_string())?
@@ -13096,6 +13110,127 @@ mod scope_liveness_tests {
 
             assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn interaction_response_occurrence_wins_over_nonresumable_baton_shape() {
+        let conversation_id = "restart-interaction-response-with-baton";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        materialize_restart_direct_turn(&manager, conversation_id).await;
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "interaction-response-input",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted answer"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'interaction-response-input', 'interaction_response')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+
+        let settle = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.settle_persisted_llm_requests().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("provider entered");
+        {
+            let observed_state = llm.observed_state.lock().expect("observed state lock");
+            assert!(matches!(
+                observed_state.as_ref(),
+                Some(ConvState::LlmRequesting { .. })
+            ));
+        }
+        llm.release.notify_one();
+        settle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_less_occurrence_recovery_is_bounded() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "restart-response-less-occurrence-exhausted";
+        manager
+            .db()
+            .create_conversation(conversation_id, "typed input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "response-less-occurrence",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted durable input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_execution_occurrences
+                 (conversation_id, message_id, source_kind)
+             VALUES (?1, 'response-less-occurrence', 'wake')",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        for index in 0..2 {
+            manager
+                .db()
+                .add_message(
+                    &format!("response-less-marker-{index}"),
+                    conversation_id,
+                    &crate::db::MessageContent::System(crate::db::SystemContent {
+                        text: recovery::RESTART_SYSTEM_MESSAGE_MARKER.to_string(),
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let occurrence = manager
+            .execution_occurrence_recovery(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            occurrence.disposition,
+            ExecutionOccurrenceDisposition::RestartLoopDetected
+        );
     }
 
     #[tokio::test]

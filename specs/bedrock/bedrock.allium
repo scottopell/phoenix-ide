@@ -2415,6 +2415,10 @@ rule ModeChangeNotification {
 --       True exactly when the latest accepted runtime direct turn is materialized,
 --       nonterminal, generation-current, and still owns this conversation.
 --
+--   durable_execution_occurrence_owns_first_response(conversation: Conversation) -> Boolean
+--       True exactly when an accepted wake, seeded fork, or interaction response
+--       occurrence still owns its first model response.
+--
 --   recoverable_tool_results_await_model_step(conversation: Conversation) -> Boolean
 --       True exactly when that active turn has a complete persisted tool-result
 --       round whose next model step has not settled. An interrupted or
@@ -2640,6 +2644,7 @@ rule ServerRestartExhaustedDirectTurn {
 rule ServerRestartWithoutDurableOwner {
     when: ServerRestarted(conversation)
     requires: not active_materialized_turn_owns_conversation(conversation)
+    requires: not durable_execution_occurrence_owns_first_response(conversation)
     requires: transcript_suggests_unfinished_work(conversation)
     ensures: conversation.core_status = idle
 }

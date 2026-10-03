@@ -7584,6 +7584,7 @@ impl Database {
         conversation_id: &str,
         source_message_id: &str,
         state: &ConvState,
+        state_updated_at: &DateTime<Utc>,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: bool = sqlx::query_scalar(
@@ -7612,7 +7613,7 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
         )
         .bind(conv_state_kind(state))
-        .bind(Utc::now().to_rfc3339())
+        .bind(state_updated_at.to_rfc3339())
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
@@ -7696,6 +7697,7 @@ impl Database {
         turn_id: u64,
         generation: u64,
         state: &ConvState,
+        state_updated_at: &DateTime<Utc>,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: bool = sqlx::query_scalar(
@@ -7727,7 +7729,7 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
         )
         .bind(conv_state_kind(state))
-        .bind(Utc::now().to_rfc3339())
+        .bind(state_updated_at.to_rfc3339())
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;

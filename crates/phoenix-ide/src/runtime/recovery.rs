@@ -173,8 +173,7 @@ pub fn should_auto_continue(
         });
     }
 
-    let consecutive_restarts = count_restart_messages_since_last_user_msg(messages);
-    if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS {
+    if restart_recovery_exhausted(messages) {
         RecoveryDecision::idle(RecoveryReason::RestartLoopDetected)
     } else {
         RecoveryDecision::auto_continue()
@@ -221,6 +220,11 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
         }
     }
     count
+}
+
+#[must_use]
+pub(crate) fn restart_recovery_exhausted(messages: &[Message]) -> bool {
+    count_restart_messages_since_last_user_msg(messages) >= MAX_CONSECUTIVE_RESTARTS
 }
 
 fn is_restart_marker(message: &Message) -> bool {
