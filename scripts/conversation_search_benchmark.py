@@ -7,6 +7,7 @@ backup API and never opens the production database writable.
 from __future__ import annotations
 import argparse
 import hashlib
+import fcntl
 import json
 import os
 import platform
@@ -45,7 +46,7 @@ def _artifact_root(value: str) -> Path:
     raw = Path(value).expanduser().absolute()
     if raw.is_symlink():
         raise SystemExit("refusing symlinked artifact root")
-    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file() and not (raw / ".capture-pending").is_file():
+    if raw.exists() and any(raw.iterdir()) and not (raw / "capture-manifest.json").is_file() and not (raw / ".capture-pending").is_file() and set(path.name for path in raw.iterdir()) != {".capture-lock"}:
         raise SystemExit("refusing nonempty unrecognized artifact root; choose a dedicated directory")
     return raw.resolve()
 
@@ -136,7 +137,8 @@ def _build_configuration() -> dict:
         }
     }
     host = next((line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:")), None)
-    config_paths = [Path.home() / ".cargo" / "config", Path.home() / ".cargo" / "config.toml"]
+    cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
+    config_paths = [cargo_home / "config", cargo_home / "config.toml"]
     project = Path(__file__).parents[1].resolve()
     config_paths += [parent / ".cargo" / name for parent in [project, *project.parents] for name in ("config", "config.toml")]
     config_hashes = {str(path): _hash(path) for path in config_paths if path.is_file()}
@@ -504,6 +506,17 @@ def _stop_process(process) -> None:
 
 
 def snapshot(args) -> int:
+    outdir = _artifact_root(args.artifacts)
+    _ensure_ignored_artifacts(outdir)
+    _private(outdir)
+    with (outdir / ".capture-lock").open("a") as lock:
+        os.chmod(lock.name, 0o600)
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise SystemExit("capture already active for this artifact directory")
+        return _snapshot_locked(args)
+
+
+def _snapshot_locked(args) -> int:
     source = Path(args.source).expanduser().resolve()
     outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
@@ -520,7 +533,7 @@ def snapshot(args) -> int:
     dest = requested
     pending = outdir / ".capture-pending"
     if pending.exists() and not (outdir / "capture-manifest.json").exists():
-        allowed = {"captured.db", ".capture-pending"}
+        allowed = {"captured.db", ".capture-pending", ".capture-lock"}
         if any(path.name not in allowed and not re.fullmatch(r"\.captured\.db\.\d+\.tmp(?:-journal|-wal|-shm)?", path.name) for path in outdir.iterdir()):
             raise SystemExit("partial capture contains unrecognized files; refusing recovery")
         for staged in outdir.glob(".captured.db.*.tmp*"):
