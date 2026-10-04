@@ -15,6 +15,12 @@ spec.loader.exec_module(bench)
 
 
 class ConversationSearchBenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        clean = {key:value for key,value in os.environ.items() if not key.startswith(("CARGO", "CC_")) and key not in {"CC","HOST_CC","TARGET_CC","CROSS_COMPILE","RUSTC","RUSTC_WRAPPER","RUSTC_WORKSPACE_WRAPPER","LIBSQLITE3_SYS_USE_PKG_CONFIG"}}
+        patch = mock.patch.dict(os.environ, clean, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     @staticmethod
     def _complete_run(**overrides):
         samples = [
