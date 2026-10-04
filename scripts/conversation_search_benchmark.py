@@ -7,6 +7,8 @@ backup API and never opens the production database writable.
 from __future__ import annotations
 import argparse
 import hashlib
+import math
+import stat
 try:
     import fcntl
 except ImportError:
@@ -519,8 +521,13 @@ def snapshot(args) -> int:
     outdir = _artifact_root(args.artifacts)
     _ensure_ignored_artifacts(outdir)
     _private(outdir)
-    with (outdir / ".capture-lock").open("a") as lock:
-        os.chmod(lock.name, 0o600)
+    fd = os.open(outdir / ".capture-lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        os.close(fd)
+        raise SystemExit("capture lock must be an owned unlinked regular file")
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "r+") as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise SystemExit("capture already active for this artifact directory")
         return _snapshot_locked(args)
@@ -546,6 +553,9 @@ def _snapshot_locked(args) -> int:
         raise SystemExit("incomplete prior capture; preserved files; choose a new dedicated artifact directory")
     if (outdir / "capture-manifest.json").exists(): raise SystemExit("existing capture manifest; use a new dedicated directory")
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
+    with source.open("rb") as source_file: header = source_file.read(20)
+    if len(header) >= 20 and header[18:20] == bytes([2,2]) and not all(Path(str(source) + suffix).is_file() for suffix in ("-wal", "-shm")):
+        raise SystemExit("WAL capture requires active source with existing usable WAL/SHM; stopped WAL databases unsupported without an operator-provided consistent snapshot")
     source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
     try:
         logical_size = _logical_database_size(source_conn)
@@ -787,10 +797,12 @@ def _run_reserved(args) -> int:
         _stop_process(process)
         _remove_private(output_tmp)
         raise
-    _ensure_clean_source()
-    if _git_commit() != env["PHOENIX_SEARCH_BENCH_COMMIT"]:
-        _remove_private(output_tmp)
-        raise SystemExit("source changed during compilation/run; refusing mislabeled evidence")
+    try:
+        _ensure_clean_source()
+        if _git_commit() != env["PHOENIX_SEARCH_BENCH_COMMIT"]: raise SystemExit("source changed during run")
+    except BaseException:
+        if output_tmp.exists(): os.replace(output_tmp, failure_output)
+        raise
     completed_at_unix = time.time()
     fixture_after = _fixture_fingerprint(db)
     if fixture_before != fixture_after:
@@ -922,6 +934,16 @@ def _validate_run(run: dict, name: str) -> dict:
     shape = {"transcript_count", "freshness_batch_size", "locator_orphans", "missing_physical_rows", "unlocated_physical_rows"}
     if not isinstance(freshness, dict) or set(freshness) != shape or any(type(v) is not int for v in freshness.values()) or freshness["transcript_count"] < 0 or freshness["freshness_batch_size"] <= 0 or any(freshness[k] != 0 for k in shape - {"transcript_count", "freshness_batch_size"}):
         raise SystemExit(f"refusing comparison: {name} invalid fixture freshness record")
+    policies = run["case_policies"]
+    try:
+        policy_keys = [(p["case_id"], p["surface"]) for p in policies]
+        assert len(set(policy_keys)) == len(policy_keys) and set(policy_keys) == {tuple(pair) for pair in run["expected_case_surface_set"]}
+        for p in policies:
+            v=p["policy"]
+            assert set(v)=={"scope","visibility","grouping","match_mode","limit","lexical_expression"}
+            assert type(v["limit"]) is int and v["limit"]>0
+            assert isinstance(v["scope"],str) and v["scope"] and v["visibility"] in {"All", "UserTopLevel"} and v["grouping"] and v["match_mode"] and v["lexical_expression"]
+    except (AssertionError,KeyError,TypeError): raise SystemExit(f"refusing comparison: {name} invalid case policies")
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
@@ -950,7 +972,8 @@ def _validate_run(run: dict, name: str) -> dict:
             raise SystemExit(f"refusing comparison: {name} has incomplete sample output metadata")
         if sample.get("ok") is not True:
             raise SystemExit(f"refusing comparison: {name} has errors/timeouts for {key[0]} ({key[1]})")
-        if not isinstance(sample.get("duration_ms"), (int, float)):
+        duration = sample.get("duration_ms")
+        if type(duration) not in (int, float) or not math.isfinite(duration) or duration < 0:
             raise SystemExit(f"refusing comparison: {name} has invalid duration for {key[0]} ({key[1]})")
         evidence = (count, tuple(identity), digest)
         prior = digests.setdefault(key, evidence)

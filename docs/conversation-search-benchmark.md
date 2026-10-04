@@ -196,3 +196,11 @@ choose a NEW dedicated artifact directory. No automatic capture recovery,
 partial-file deletion, replacement or compatibility guarantee is provided.
 A failure removing the completed pending marker does not delete a published
 verified fixture/manifest.
+
+Live WAL capture supports only an active source with existing usable WAL/SHM.
+A stopped WAL database with absent sidecars is refused BEFORE SQLite open;
+never use immutable mode on live source. The existence precheck is NOT a
+TOCTOU-free filesystem-write guarantee: source lifecycle must remain stable
+for capture, and arbitrary concurrent checkpoint/sidecar removal is unsupported.
+Disposable WAL tests verify committed rows and no new source files in this
+precondition; no custom VFS, raw live copy, or production service is introduced.

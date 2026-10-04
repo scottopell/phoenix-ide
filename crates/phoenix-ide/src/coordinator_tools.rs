@@ -999,12 +999,19 @@ mod tests {
                     .expect("oracle result"),
                 )
             };
-            if case_id == "selective-known-match" {
-                assert!(
-                    tool_oracle.as_ref().is_some_and(|hits| !hits.is_empty()),
-                    "selective candidate has no eligible hits under actual policy"
-                );
-            }
+            let setup_count = if let Some(hits) = &tool_oracle {
+                hits.len()
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    policy_retriever.retrieve(policy_request.clone()),
+                )
+                .await
+                .expect("scoped preflight timeout")
+                .expect("scoped preflight")
+                .len()
+            };
+            assert!((expected == "hit" && setup_count > 0) || (expected == "no_hit" && setup_count == 0), "scenario expected result does not match actual policy; choose suitable fixture before measurement");
             let tool_expected_output = if let Some(hits) = &tool_oracle {
                 Some(
                     policy_service
@@ -1186,7 +1193,7 @@ mod tests {
             "fixture_validation": fixture_validation,
             "runtime": {"worker_threads": 2, "measurement_clock": "monotonic"},
             "warmup_runs": 1, "measured_warm_runs": 10,
-            "tool_oracle_regime": "one precomputed service query per tool case before sequence; broad-common additionally validates1000 eligible rows",
+            "tool_oracle_regime": "one precomputed service query per tool case before sequence; broad-common additionally validates1000 eligible rows; scoped case preflights actual retrieval once",
             "measurement_regimes": ["first_retrieval_after_pool_setup_connection_setup_excluded_os_cache_uncontrolled", "warm"],
             "case_policies": case_policies,
             "explain_plans": explain_plans, "explain_enabled": explain,
