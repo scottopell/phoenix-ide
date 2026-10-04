@@ -32,7 +32,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "fixture_sha256": "a", "schema_digest": "schema", "migration_ledger": [],
             "scenario_digest": "s", "profile": "release",
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
-            "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"max_connections":10,"acquire_timeout_secs":300,"read_only":True,"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout":300000,"foreign_keys":1,"query_only":0},
+            "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout_ms":300000,"foreign_keys":True,"query_only":False},
             "runtime": {"worker_threads":2,"measurement_clock":"monotonic"}, "explain_enabled": False,
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
             "expected_case_surface_set": [["case", "tool"]],
