@@ -1807,6 +1807,9 @@ class PreparedArtifactTests(unittest.TestCase):
     def test_cmd_prod_deploy_rejects_incomplete_prepared_artifact_options(self):
         cases = [
             (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared"), paired_database_upgrade=True), "required together"),
+            (self.dev.ProdDeployControllerOptions(expected_full_commit="a" * 40), "requires all prepared"),
+            (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared")), "required together"),
+            (self.dev.ProdDeployControllerOptions(paired_database_upgrade=True), "required together"),
             (self.dev.ProdDeployControllerOptions(prepared_artifact=Path("prepared"), expected_full_commit="a" * 40), "required together"),
             (self.dev.ProdDeployControllerOptions(expected_full_commit="a" * 40, paired_database_upgrade=True), "required together"),
         ]
@@ -1814,6 +1817,24 @@ class PreparedArtifactTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(SystemExit, message):
                     self.dev.cmd_prod_deploy(controller=controller)
+
+    def test_failed_prepared_validation_records_requested_source_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "status.json"
+            controller = self.dev.ProdDeployControllerOptions(prepared_artifact=root / "artifact", expected_full_commit="a" * 40, paired_database_upgrade=True, transaction_id="failed-receipt")
+            with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, root / "unused.env")), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_claim_launchd_deploy"), \
+                 mock.patch.object(self.dev, "_release_launchd_deploy_claim"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), \
+                 mock.patch.object(self.dev, "_prepare_prepared_artifact", side_effect=SystemExit("receipt rejected")):
+                with self.assertRaisesRegex(SystemExit, "receipt rejected"):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                observed = json.loads(status.read_text())
+                self.assertEqual(observed["state"], "precondition_failed")
+                self.assertEqual(observed["source_kind"], "prepared_artifact")
 
     def test_cmd_prod_deploy_rejects_nonmac_and_release_for_prepared_artifact(self):
         controller = self.dev.ProdDeployControllerOptions(

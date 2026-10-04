@@ -10035,7 +10035,10 @@ def launchd_prod_deploy(
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
-    source_kind = "published_release" if release else "local_head"
+    source_kind = (
+        "prepared_artifact" if controller.prepared_artifact is not None
+        else "published_release" if release else "local_head"
+    )
     source_commit = None
     release_commit = None
     release_tag = release
@@ -10692,6 +10695,8 @@ def cmd_prod_deploy(
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
     supplied = (controller.prepared_artifact is not None, controller.paired_database_upgrade)
+    if controller.expected_full_commit is not None and release is None and not any(supplied):
+        raise SystemExit("--expected-full-commit requires all prepared paired options or an exact release controller")
     if any(supplied) and (not all(supplied) or controller.expected_full_commit is None):
         raise SystemExit("--prepared-artifact, --expected-full-commit, and --paired-database-upgrade are required together")
     if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):

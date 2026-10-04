@@ -5,7 +5,7 @@
 -- and bare Linux, with backend-specific activation ownership.
 -- This module owns shared guarantees. Platform-specific launchd mechanics
 -- are cumulative refinements in specs/launchd-deployment/launchd-deployment.allium.
--- Requirement traceability: REQ-PD-001 through REQ-PD-017. Runtime lifecycle
+-- Requirement traceability: REQ-PD-001 through REQ-PD-019. Runtime lifecycle
 -- rules model REQ-PD-002 through REQ-PD-014; backend selection, operator
 -- syntax, bare-Linux reboot integration, disposable test isolation, and
 -- release asset publication are interface/build obligations in requirements.md.
@@ -15,7 +15,7 @@ config {
 }
 
 enum BackendKind { launchd | systemd | bare_linux }
-enum SourceKind { local_head | published_release }
+enum SourceKind { local_head | published_release | prepared_artifact }
 enum TransactionState {
     preparing | prepared | handed_off | activating | committed
     | precondition_failed | activation_failed_rolled_back
@@ -31,6 +31,21 @@ value RuntimeEndpoint {
     version_url: String
 }
 
+value PreparedArtifactProof {
+    controller_source_commit: String
+    controller_helper_hash: String
+    candidate_database_path: String
+    predecessor_database_path: String
+    migration_ledger_version: Integer
+    product_conversation_upgrade: Boolean
+}
+
+value PreparedArtifactLifecycleObservation {
+    offline_ownership_proof: String?
+    snapshot_integrity_proof: String?
+    rollback_proof: String?
+}
+
 entity DeployTransaction {
     id: String
     backend: BackendKind
@@ -41,6 +56,8 @@ entity DeployTransaction {
     previous: RuntimeIdentity?
     expected_endpoint: RuntimeEndpoint
     previous_endpoint: RuntimeEndpoint?
+    prepared_artifact_proof: PreparedArtifactProof?
+    paired_lifecycle_observation: PreparedArtifactLifecycleObservation?
     state: TransactionState
     claim_generation: Integer
     created_at: Timestamp
@@ -94,12 +111,58 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD after required checks and compilation,
---   or release source is one resolved tag and commit with a host-target asset
---   matching its checksum and package version. A latest selection resolves to
---   stable tag and metadata; an exact RC selection has matching tag, prerelease
---   metadata, full embedded version, and commit. In either case expected.git_sha
---   is exactly source_commit, both are 40 lowercase hexadecimal characters,
---   and no prefix match establishes candidate identity.
+--   release source is one resolved tag and commit with a host-target asset
+--   matching its checksum and package version, or prepared_artifact is a
+--   protected host-target artifact whose exact full candidate identity is
+--   independently verified. A latest selection resolves to stable tag and
+--   metadata; an exact RC selection has matching tag, prerelease metadata, full
+--   embedded version, and commit. For every source, expected.git_sha is exactly
+--   source_commit, both are 40 lowercase hexadecimal characters, and no prefix
+--   match establishes candidate identity.
+-- prepared_artifact_source_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the protected standalone
+--   artifact and full identity are valid, and a trusted protected prepare-main
+--   receipt independently binds the controller helper and protocol. This is
+--   source-only evidence and does not assert database lifecycle observations.
+-- paired_database_preflight_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the immutable proof has
+--   legacy-schema eligibility, a configured candidate/predecessor database path
+--   pair, migration ledger version at most 69, and ProductConversation upgrade
+--   mode. It does not assert quiesce, offline ownership, or a snapshot.
+-- paired_database_proof_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, after quiesce the lifecycle
+--   observation proves exclusive offline ownership, verified SQLite snapshot
+--   integrity, and rollback proof for the configured path pair.
+-- controller_identity_is_independently_bound(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the controller helper hash
+--   is bound to the recorded clean controller source and protocol. The controller
+--   and candidate commits may be equal when that independently bound helper is
+--   valid.
+-- candidate_startup_proof_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, paired_database_proof_is_valid
+--   holds and the verified predecessor snapshot follows exclusive offline proof
+--   before candidate startup.
+-- paired_predecessor_start_order_is_valid(transaction) -> Boolean
+--   True for ordinary sources. For prepared_artifact, the matching database is
+--   restored and integrity-checked before predecessor startup is authorized.
+-- predecessor_start_authorized(transaction) -> Boolean
+--   Predecessor startup is authorized only after the matching database has been
+--   restored and integrity-checked; no startup may occur before that point.
+-- candidate_teardown_attempted(transaction) -> Boolean
+--   Failed activation or recovery records an attempt to tear down the candidate;
+--   this does not claim an operating-system failure made teardown complete.
+-- recovery_verification_unconfirmed(transaction) -> Boolean
+--   Durable status reports that recovery or teardown could not be confirmed,
+--   including when predecessor health failed after an attempted start.
+-- paired_transaction_retained(transaction) -> Boolean
+--   The private paired transaction directory, verified snapshot, proof files,
+--   and durable recovery status remain available for supported recovery.
+-- active_claim_retained(transaction) -> Boolean
+--   The matching deployment claim remains active until supported recovery is
+--   verified; a blind manual action cannot clear it.
+-- supported_recovery_verified(transaction) -> Boolean
+--   A supported recovery procedure has verified restored artifacts, matching
+--   database, service health, and claim generation before claim release.
 -- previous_rollback_identity_is_valid(transaction) -> Boolean
 --   No previous runtime exists, or previous is the identity captured from the
 --   already-installed rollback artifact and its git_sha is exactly 12 or 40
@@ -139,8 +202,18 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   Previous runtime artifacts, environment, service state, deployed SHA,
 --   endpoint, and captured runtime identity have been restored and verified;
 --   the identity may use the rollback-only 12-character legacy form admitted by
---   previous_rollback_identity_is_valid(transaction). No database is restored
---   or verified by this predicate.
+--   previous_rollback_identity_is_valid(transaction). Database restoration is
+--   feature-scoped and is represented by paired_predecessor_start_order_is_valid.
+-- paired_recovery_succeeded(transaction) -> Boolean
+--   True for ordinary sources when exact_previous_restored holds. For
+--   prepared_artifact, exact_previous_restored, paired_database_proof_is_valid,
+--   and paired_predecessor_start_order_is_valid all hold.
+-- paired_transaction_retained(transaction) -> Boolean
+--   The private paired transaction directory, verified snapshot, proof files,
+--   and durable recovery status remain available for manual recovery.
+-- active_claim_retained(transaction) -> Boolean
+--   The matching deployment claim remains active after incomplete paired recovery;
+--   later ordinary deploy and restart requests cannot release it.
 -- durable_terminal_status_exists(transaction) -> Boolean
 --   Redacted status durably records transaction's terminal state.
 -- DeploymentRequestRejectedBeforeTransaction(transaction)
@@ -155,6 +228,9 @@ rule PrepareCandidate {
     requires: transaction.state = preparing
     requires: claim_available(transaction)
     requires: selected_source_is_valid(transaction)
+    requires: prepared_artifact_source_is_valid(transaction)
+    requires: paired_database_preflight_is_valid(transaction)
+    requires: controller_identity_is_independently_bound(transaction)
     requires: previous_rollback_identity_is_valid(transaction)
     requires: selected_supervisor_artifact_matches_running(transaction)
     ensures: DeploymentClaim.created(
@@ -248,6 +324,7 @@ rule IndependentOwnerBeginsActivation {
     requires: current_claim_matches(transaction)
     requires: handoff_valid_for_backend(transaction, handoff)
     requires: backend_owner_independent(transaction, handoff)
+    requires: candidate_startup_proof_is_valid(transaction)
     ensures: transaction.state = activating
     ensures: atomic_install_complete(transaction)
 }
@@ -262,9 +339,10 @@ rule CommitVerifiedCandidate {
     ensures: DurableStatusWritten(transaction)
 }
 
-rule RollBackFailedActivation {
+rule RollBackFailedOrdinaryActivation {
     when: ActivationFailed(transaction, failure)
     requires: transaction.state = activating
+    requires: transaction.source_kind != prepared_artifact
     requires: current_claim_matches(transaction)
     requires: exact_previous_restored(transaction)
     ensures: transaction.state = activation_failed_rolled_back
@@ -272,6 +350,21 @@ rule RollBackFailedActivation {
     ensures: DurableStatusWritten(transaction)
     ensures: RuntimeArtifactRollbackRecorded(transaction)
     ensures: not DatabaseRollbackClaimed(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule RollBackFailedPreparedPairedActivation {
+    when: ActivationFailed(transaction, failure)
+    requires: transaction.state = activating
+    requires: transaction.source_kind = prepared_artifact
+    requires: current_claim_matches(transaction)
+    requires: paired_recovery_succeeded(transaction)
+    requires: paired_predecessor_start_order_is_valid(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: transaction.failure = failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: RuntimeArtifactRollbackRecorded(transaction)
+    ensures: DatabaseRollbackCompleted(transaction)
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
@@ -286,12 +379,29 @@ rule PreserveRollbackFailure {
     ensures: not DeployedShaWritten(transaction.source_commit)
 }
 
+rule PreservePreparedRecoveryFailure {
+    when: RollbackFailed(transaction, failure, rollback_failure)
+    requires: transaction.state = activating
+    requires: transaction.source_kind = prepared_artifact
+    requires: current_claim_matches(transaction)
+    ensures: candidate_teardown_attempted(transaction)
+    ensures: paired_transaction_retained(transaction)
+    ensures: recovery_verification_unconfirmed(transaction)
+    ensures: active_claim_retained(transaction)
+}
+
 rule MatchingTerminalClaimReleased {
     when: TerminalStatusPersisted(transaction, claim)
     requires: claim.active
     requires: claim.transaction = transaction
     requires: claim.generation = transaction.claim_generation
     requires: durable_terminal_status_exists(transaction)
+    requires: transaction.state in { committed, precondition_failed, activation_failed_rolled_back, activation_failed_rollback_failed }
+    requires: transaction.source_kind != prepared_artifact
+        or transaction.state != activation_failed_rollback_failed
+    requires: transaction.source_kind != prepared_artifact
+        or transaction.state != activation_failed_rolled_back
+        or supported_recovery_verified(transaction)
     ensures: claim.active = false
 }
 
@@ -338,11 +448,31 @@ invariant LegacyIdentityIsRollbackOnly {
             previous_rollback_identity_is_valid(transaction)
 }
 
-invariant AutomatedRollbackDoesNotClaimDatabaseRecovery {
+invariant OrdinaryRollbackIsRuntimeOnly {
     for transaction in DeployTransactions:
-        transaction.state = activation_failed_rolled_back implies
+        transaction.source_kind != prepared_artifact
+        and transaction.state = activation_failed_rolled_back implies
             RuntimeArtifactRollbackRecorded(transaction)
             and not DatabaseRollbackClaimed(transaction)
+}
+
+invariant PreparedArtifactIsLaunchdScoped {
+    for transaction in DeployTransactions:
+        transaction.source_kind = prepared_artifact implies
+            transaction.backend = launchd
+            and prepared_artifact_source_is_valid(transaction)
+            and paired_database_preflight_is_valid(transaction)
+            and controller_identity_is_independently_bound(transaction)
+}
+
+invariant FailedPreparedRecoveryRetainsManualRecovery {
+    for transaction in DeployTransactions:
+        transaction.source_kind = prepared_artifact
+        and transaction.state = activation_failed_rollback_failed implies
+            candidate_teardown_attempted(transaction)
+            and paired_transaction_retained(transaction)
+            and recovery_verification_unconfirmed(transaction)
+            and active_claim_retained(transaction)
 }
 
 invariant BareSupervisorChangeFailsBeforeDisruption {
