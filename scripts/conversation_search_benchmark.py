@@ -78,6 +78,10 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
     try:
         relative = outdir.relative_to(repo)
     except ValueError:
+        parent = outdir
+        while not parent.exists(): parent = parent.parent
+        foreign = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=parent, capture_output=True, text=True)
+        if foreign.returncode == 0: raise SystemExit("refusing artifacts inside another Git worktree")
         return
     if not relative.parts:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
@@ -511,9 +515,9 @@ def snapshot(args) -> int:
     pending = outdir / ".capture-pending"
     if pending.exists() and not (outdir / "capture-manifest.json").exists():
         allowed = {"captured.db", ".capture-pending"}
-        if any(path.name not in allowed and not re.fullmatch(r"\.captured\.db\.\d+\.tmp", path.name) for path in outdir.iterdir()):
+        if any(path.name not in allowed and not re.fullmatch(r"\.captured\.db\.\d+\.tmp(?:-journal|-wal|-shm)?", path.name) for path in outdir.iterdir()):
             raise SystemExit("partial capture contains unrecognized files; refusing recovery")
-        for staged in outdir.glob(".captured.db.*.tmp"):
+        for staged in outdir.glob(".captured.db.*.tmp*"):
             _remove_private(staged)
         _remove_private(dest)
         _remove_private(pending)
@@ -698,7 +702,7 @@ def run(args) -> int:
     started_at_unix = time.time()
     output_tmp = result_dir / f'.{label}.json.{os.getpid()}.tmp'
     _remove_private(output_tmp)
-    failure_output = result_dir / "failures" / f"{label}.json"
+    failure_output = result_dir / "failures" / f"{label}.{run_uuid}.json"
     _ensure_clean_source()
     build_configuration = _build_configuration()
     cmd=['cargo','test','-p','phoenix_ide','--release','production_conversation_search_benchmark','--lib','--','--ignored','--nocapture']
@@ -731,7 +735,7 @@ def run(args) -> int:
         failures_dir = result_dir / "failures"
         _private(failures_dir)
         _remove_private(output_tmp)
-        _write_atomic_private(failures_dir/f"{label}.json", json.dumps(failure, indent=2) + "\n")
+        _write_atomic_private(failures_dir/f"{label}.{run_uuid}.json", json.dumps(failure, indent=2) + "\n")
         raise SystemExit(f'benchmark timed out after {args.timeout}s; process group was stopped') from error
     except BaseException:
         _stop_process(process)
@@ -750,7 +754,7 @@ def run(args) -> int:
             os.replace(output_tmp, failure_output)
             os.chmod(failure_output, 0o600)
         _write_atomic_private(
-            failures_dir / f"{label}.fixture-changed.json",
+            failures_dir / f"{label}.{run_uuid}.fixture-changed.json",
             json.dumps({
                 "kind": "conversation-search-benchmark-failure",
                 "run_label": label,
