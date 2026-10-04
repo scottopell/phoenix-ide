@@ -197,10 +197,12 @@ partial-file deletion, replacement or compatibility guarantee is provided.
 A failure removing the completed pending marker does not delete a published
 verified fixture/manifest.
 
-Live WAL capture supports only an active source with existing usable WAL/SHM.
-A stopped WAL database with absent sidecars is refused BEFORE SQLite open;
-never use immutable mode on live source. The existence precheck is NOT a
-TOCTOU-free filesystem-write guarantee: source lifecycle must remain stable
-for capture, and arbitrary concurrent checkpoint/sidecar removal is unsupported.
-Disposable WAL tests verify committed rows and no new source files in this
-precondition; no custom VFS, raw live copy, or production service is introduced.
+Snapshot ingestion requires an explicitly supplied, operator-attested consistent
+OFFLINE standalone database, not a live production file or raw live copy.
+The known production path and any WAL/SHM/journal sidecars are refused before
+SQLite open. Operator provenance/consistency is a precondition, not inferred
+from mode=ro or absent sidecars. The existing private verified fixture and
+historical measurements remain valid evidence. The original live-online-capture
+acceptance is withdrawn: standard read-only online backup may alter SHM
+coordination bytes, which is not evidence application data changed. No custom
+VFS, permission changes, daemon, or new baseline campaign is introduced.

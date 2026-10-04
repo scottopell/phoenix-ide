@@ -563,10 +563,13 @@ def _snapshot_locked(args) -> int:
         raise SystemExit("incomplete prior capture; preserved files; choose a new dedicated artifact directory")
     if (outdir / "capture-manifest.json").exists(): raise SystemExit("existing capture manifest; use a new dedicated directory")
     if dest.exists(): raise SystemExit('fixture exists; capture into a new dedicated directory (replacement unsupported)')
-    with source.open("rb") as source_file: header = source_file.read(20)
-    if len(header) >= 20 and header[18:20] == bytes([2,2]) and not all(Path(str(source) + suffix).is_file() for suffix in ("-wal", "-shm")):
-        raise SystemExit("WAL capture requires active source with existing usable WAL/SHM; stopped WAL databases unsupported without an operator-provided consistent snapshot")
-    source_conn = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
+    if source == (Path.home() / ".phoenix-ide" / "prod.db").resolve():
+        raise SystemExit("live production source refused; supply a consistent offline snapshot")
+    if not getattr(args, "offline_snapshot", False):
+        raise SystemExit("explicit --offline-snapshot attestation required: source is a consistent standalone snapshot, not a live DB")
+    if any(Path(str(source) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        raise SystemExit("offline snapshot must be standalone without WAL/SHM/journal; live source refused")
+    source_conn = sqlite3.connect(_uri(source, immutable=True), uri=True, timeout=args.busy_timeout)
     try:
         logical_size = _logical_database_size(source_conn)
         page_size = source_conn.execute("PRAGMA page_size").fetchone()[0]
@@ -590,7 +593,7 @@ def _snapshot_locked(args) -> int:
             break
         src = dst = None
         try:
-            src = sqlite3.connect(_uri(source), uri=True, timeout=args.busy_timeout)
+            src = sqlite3.connect(_uri(source, immutable=True), uri=True, timeout=args.busy_timeout)
             dst = sqlite3.connect(tmp, timeout=args.busy_timeout)
             def on_progress(status, remaining, total):
                 progress.update(pages=total - remaining, remaining=remaining, total=total)
@@ -635,7 +638,7 @@ def _snapshot_locked(args) -> int:
         if not validated:
             tmp.unlink(missing_ok=True)
     try:
-        manifest = {'kind':'conversation-search-fixture','source_path':str(source),
+        manifest = {'kind':'conversation-search-fixture','source_path':str(source),'source_provenance':'operator-attested consistent offline snapshot',
           'captured_at_unix':started,'snapshot_path':str(dest),'size_bytes':tmp.stat().st_size,
           'sha256':_hash(tmp),'integrity_check':integrity,'sqlite_version':sqlite3.sqlite_version,
           'logical_size_bytes':logical_size,'page_size_bytes':page_size,
@@ -1056,7 +1059,8 @@ def compare(args) -> int:
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='command',required=True)
     s=sub.add_parser("snapshot")
-    s.add_argument("--source", default=os.environ.get("PHOENIX_PROD_DB", str(Path.home()/".phoenix-ide/prod.db")))
+    s.add_argument("--source", required=True)
+    s.add_argument("--offline-snapshot", action="store_true", help="attest source is a consistent standalone offline snapshot, never a live DB copy")
     s.add_argument("--artifacts", default=str(DEFAULT_ARTIFACTS))
     s.add_argument("--force", action="store_true")
     s.add_argument("--retries", type=int, default=5)

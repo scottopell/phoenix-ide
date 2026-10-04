@@ -148,8 +148,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             self.assertEqual(backup.execute("select v from x").fetchall(),[(42,)])
             reader.close();backup.close();self.assertEqual({p.name for p in parent.iterdir()},initial);conn.close()
             initial={p.name for p in parent.iterdir()};artifact=parent/"artifact"
-            with self.assertRaisesRegex(SystemExit,"WAL capture requires"):
-                bench.snapshot(type("Args",(),{"artifacts":str(artifact),"source":str(source),"force":False,"busy_timeout":1,"deadline":10,"retries":1})())
+            with self.assertRaisesRegex(SystemExit,"offline"):
+                bench.snapshot(type("Args",(),{"artifacts":str(artifact),"source":str(source),"force":False,"offline_snapshot":False,"busy_timeout":1,"deadline":10,"retries":1})())
             self.assertEqual({p.name for p in parent.iterdir()if p!=artifact},initial)
 
     def test_intervals_policies_and_harness_digest_are_checked(self):
@@ -159,6 +159,18 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         run=self._complete_run();run["case_policies"][0]["policy"]["grouping"]="unknown"
         with self.assertRaisesRegex(SystemExit,"policies"):bench._validate_run(run,"bad")
         self.assertEqual(len(bench._measurement_digest()),64)
+
+    def test_live_source_and_missing_attestation_are_refused_before_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); source=root/"source.db"; sqlite3.connect(source).close()
+            args=type("Args",(),{"source":str(source),"artifacts":str(root/"fixture"),"offline_snapshot":False})()
+            with mock.patch.object(bench.sqlite3,"connect") as opened:
+                with self.assertRaisesRegex(SystemExit,"attestation"): bench.snapshot(args)
+                opened.assert_not_called()
+            args.offline_snapshot=True;Path(str(source)+"-wal").write_bytes(b"live")
+            with mock.patch.object(bench.sqlite3,"connect") as opened:
+                with self.assertRaisesRegex(SystemExit,"standalone"): bench.snapshot(args)
+                opened.assert_not_called()
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
@@ -220,7 +232,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             conn.commit()
             out = root / "fixture"
             args = type("Args", (), {"source": str(source), "artifacts": str(out),
-                                      "force": False, "retries": 2, "busy_timeout": 1.0})()
+                                      "offline_snapshot": True, "force": False, "retries": 2, "busy_timeout": 1.0})()
+            conn.close()
             bench.snapshot(args)
             self.assertEqual(sqlite3.connect(out / "captured.db").execute(
                 "SELECT content FROM messages").fetchone()[0],
@@ -420,14 +433,14 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             source = artifacts / "source.db"
             sqlite3.connect(source).close()
             args = type("Args", (), {"source": str(source), "artifacts": str(artifacts),
-                                      "force": False, "retries": 1, "busy_timeout": 1.0})()
+                                      "offline_snapshot": True, "force": False, "retries": 1, "busy_timeout": 1.0})()
             with self.assertRaises(SystemExit):
                 bench.snapshot(args)
 
     def test_snapshot_refuses_missing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = type("Args", (), {"source": str(Path(tmp) / "missing"),
-                                      "artifacts": tmp, "force": False, "retries": 1,
+                                      "artifacts": tmp, "offline_snapshot": True, "force": False, "retries": 1,
                                       "busy_timeout": 1.0})()
             with self.assertRaises(SystemExit):
                 bench.snapshot(args)
@@ -443,7 +456,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             conn.close()
             out = root / "fixture"
             args = type("Args", (), {"source": str(source), "artifacts": str(out),
-                                      "force": False, "retries": 1, "busy_timeout": 1.0,
+                                      "offline_snapshot": True, "force": False, "retries": 1, "busy_timeout": 1.0,
                                       "deadline": 1.0})()
             logical_size = sqlite3.connect(source).execute("PRAGMA page_count").fetchone()[0] * sqlite3.connect(source).execute("PRAGMA page_size").fetchone()[0]
             with mock.patch.object(bench.shutil, "disk_usage", return_value=type("Usage", (), {"free": logical_size * 2 - 1})()):
@@ -482,7 +495,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             source = root / "source.db"
             sqlite3.connect(source).close()
             args = type("Args", (), {"source": str(source), "artifacts": str(root / "fixture"),
-                                      "force": False, "retries": 1, "busy_timeout": 1.0, "deadline": 1.0})()
+                                      "offline_snapshot": True, "force": False, "retries": 1, "busy_timeout": 1.0, "deadline": 1.0})()
             original = bench._counts
             try:
                 bench._counts = mock.Mock(side_effect=RuntimeError("validation interrupted"))
