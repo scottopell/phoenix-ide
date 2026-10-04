@@ -98,6 +98,10 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
         return
     if not relative.parts:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
+    nearest=outdir
+    while not nearest.exists(): nearest=nearest.parent
+    owner=subprocess.run(["git","rev-parse","--show-toplevel"],cwd=nearest,capture_output=True,text=True)
+    if owner.returncode==0 and Path(owner.stdout.strip()).resolve()!=repo.resolve(): raise SystemExit("nested Git artifact directory refused")
     root_check = subprocess.run(["git", "check-ignore", "--quiet", str(relative) + "/"], cwd=repo)
     if root_check.returncode: raise SystemExit("refusing unignored dedicated artifact root; ignore the entire directory")
     tracked = subprocess.check_output(["git", "ls-files", "--", str(relative)], cwd=repo, text=True)
@@ -139,6 +143,7 @@ def _build_configuration() -> dict:
     config_hashes = {("project/" + str(path.relative_to(project)) if path.is_relative_to(project) else str(path)): _hash(path) for path in config_paths if path.is_file()}
     return {
         "cargo_config_hashes": config_hashes,
+        "release_profile": __import__("tomllib").loads((project / "Cargo.toml").read_text() if (project / "Cargo.toml").exists() else "").get("profile", {}).get("release", {}),
         "rustc_version_verbose": rustc,
         "cargo_version": cargo,
         "target": forwarded.get("CARGO_BUILD_TARGET") or forwarded.get("TARGET") or host,
@@ -427,8 +432,8 @@ def _carry_run_metadata(
     """Attach immutable setup and execution identity evidence without changing samples."""
     try:
         run = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("child result cannot be decoded; not a successful benchmark") from error
     run["schema_digest"] = capture["schema_digest"]
     run["migration_ledger"] = capture["migration_ledger"]
     run["build_configuration"] = build_configuration
@@ -521,6 +526,7 @@ def snapshot(args) -> int:
 
 
 def _snapshot_locked(args) -> int:
+    if type(getattr(args,"deadline",300)) not in (int,float) or not math.isfinite(getattr(args,"deadline",300)) or getattr(args,"deadline",300) <= 0: raise SystemExit("snapshot deadline must be finite positive")
     source = Path(args.source).expanduser().resolve()
     outdir = Path(args.artifacts).expanduser().absolute()
     _ensure_ignored_artifacts(outdir)
@@ -910,7 +916,7 @@ def report(args) -> int:
         if errors:
             lines.append(f"errors: {errors!r}")
         lines.append("")
-    _write_private(outdir / "report.md", "\n".join(lines))
+    _write_atomic_private(outdir / "report.md", "\n".join(lines))
     print(outdir / "report.md")
     return 0
 
@@ -966,7 +972,7 @@ def _validate_run(run: dict, name: str) -> dict:
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
         key not in build or not isinstance(build[key], (str, list, dict))
-        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes")
+        for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes", "release_profile")
     ):
         raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
     if any(not isinstance(build[field],str) or not build[field].strip() for field in ("rustc_version_verbose", "cargo_version", "target", "profile")): raise SystemExit("missing compiler identity")

@@ -34,7 +34,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "warmup_runs": 1, "measured_warm_runs": 10, "commit": "deadbeef",
             "environment":{"host":"host","platform":"test","processor":"test","cpu_count":"2"}, "sqlite_pragmas":{"sqlite_version":"test","journal_mode":"wal","synchronous":2,"busy_timeout_ms":300000,"foreign_keys":True,"query_only":False},
             "runtime": {"worker_threads":2,"measurement_clock":"monotonic"}, "explain_enabled": False,
-            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
+            "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"Global","visibility":"All","grouping":"None","match_mode":"FinalTokenPrefix","lexical_expression":"x"}}],
             "measurement_digest":"harness", "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
@@ -215,6 +215,24 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             root=Path(d);target=root/"external";link=root/"report.md";link.symlink_to(target)
             with self.assertRaisesRegex(SystemExit,"symlink"):bench._write_private(link,"private")
             self.assertFalse(target.exists())
+
+    def test_report_atomic_writer_preserves_external_hardlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);external=root/"foreign";external.write_text("keep");external.chmod(0o644);report=root/"report.md";os.link(external,report)
+            bench._write_atomic_private(report,"new report")
+            self.assertEqual(external.read_text(),"keep");self.assertEqual(external.stat().st_mode&0o777,0o644)
+            self.assertEqual(report.read_text(),"new report")
+        with tempfile.TemporaryDirectory() as d:
+            raw=Path(d)/"raw.json";raw.write_text("malformed")
+            with self.assertRaisesRegex(SystemExit,"decoded"):
+                bench._carry_run_metadata(raw,{}, {}, [],run_uuid="id",started_at_unix=1,completed_at_unix=2,measurement_digest="hash")
+            self.assertEqual(raw.read_text(),"malformed")
+
+    def test_nonfinite_capture_deadline_is_refused(self):
+        for deadline in [float("nan"),float("inf"),-1,0]:
+            with tempfile.TemporaryDirectory() as d:
+                args=type("Args",(),{"artifacts":str(Path(d)/"artifact"),"source":"unused", "deadline":deadline})()
+                with self.assertRaisesRegex(SystemExit,"finite positive"):bench.snapshot(args)
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
@@ -409,16 +427,16 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             def fake_popen(*args, **kwargs):
                 self.assertIn("PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST", kwargs["env"])
                 self.assertIn("PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER", kwargs["env"])
-                Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text("fresh")
+                Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text(json.dumps(self._complete_run()))
                 return CompletedProcess()
 
             with mock.patch.object(bench, "_ensure_ignored_artifacts"), mock.patch.object(bench, "_ensure_clean_source"), mock.patch.object(
-                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}}
+                bench, "_build_configuration", return_value={"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}, "release_profile":{}}
             ), mock.patch.object(bench, "_git_commit", return_value="commit"), mock.patch.object(bench.platform, "platform", return_value="platform"), mock.patch.object(
                 bench.platform, "processor", return_value="processor"
             ), mock.patch.object(bench.subprocess, "Popen", side_effect=fake_popen):
                 bench.run(type("Args", (), {"artifacts": str(root), "label": "suite", "force": True, "timeout": 1})())
-            self.assertEqual(stale.read_text(), "fresh")
+            self.assertIn("samples",json.loads(stale.read_text()))
             self.assertTrue(failure.exists())
             self.assertEqual(failure.read_text(), "old failure")
             self.assertEqual(list(runs.glob(".*.tmp")), [])
