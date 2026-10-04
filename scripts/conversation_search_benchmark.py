@@ -130,6 +130,14 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
             raise SystemExit(f"git check-ignore failed for benchmark artifact path: {path}")
 
 
+def _measurement_digest() -> str:
+    root=Path(__file__).parents[1]
+    rust=(root/"crates/phoenix-ide/src/coordinator_tools.rs").read_text()
+    loop=rust.split("async fn production_conversation_search_benchmark()",1)[1].split("    #[test]",1)[0]
+    digest=hashlib.sha256(Path(__file__).read_bytes()+loop.encode())
+    return digest.hexdigest()
+
+
 def _build_configuration() -> dict:
     """Capture compiler, Cargo, target, profile, and feature inputs to the run."""
     repo = Path(__file__).parents[1]
@@ -438,6 +446,7 @@ def _carry_run_metadata(
     run_uuid: str,
     started_at_unix: float,
     completed_at_unix: float,
+    measurement_digest: str,
 ) -> None:
     """Attach immutable setup and execution identity evidence without changing samples."""
     try:
@@ -449,6 +458,7 @@ def _carry_run_metadata(
     run["build_configuration"] = build_configuration
     run["expected_case_surface_set"] = expected_case_surface_set
     run["run_uuid"] = run_uuid
+    run["measurement_digest"] = measurement_digest
     run["started_at_unix"] = started_at_unix
     run["completed_at_unix"] = completed_at_unix
     _write_atomic_private(path, json.dumps(run, indent=2) + "\n")
@@ -801,7 +811,9 @@ def _run_reserved(args) -> int:
         _ensure_clean_source()
         if _git_commit() != env["PHOENIX_SEARCH_BENCH_COMMIT"]: raise SystemExit("source changed during run")
     except BaseException:
-        if output_tmp.exists(): os.replace(output_tmp, failure_output)
+        if output_tmp.exists():
+            _private(failure_output.parent)
+            os.replace(output_tmp, failure_output)
         raise
     completed_at_unix = time.time()
     fixture_after = _fixture_fingerprint(db)
@@ -845,6 +857,7 @@ def _run_reserved(args) -> int:
         run_uuid=run_uuid,
         started_at_unix=started_at_unix,
         completed_at_unix=completed_at_unix,
+        measurement_digest=_measurement_digest(),
     )
     os.replace(output_tmp, output)
     os.chmod(output, 0o600)
@@ -923,13 +936,17 @@ def _metadata_has_values(value) -> bool:
 
 
 def _validate_run(run: dict, name: str) -> dict:
-    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "tool_oracle_regime", "fixture_validation", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
+    required = {"fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "commit", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "measurement_regimes", "tool_oracle_regime", "fixture_validation", "measurement_digest", "run_uuid", "started_at_unix", "completed_at_unix", "samples"}
     missing = sorted(required - run.keys())
     if missing:
         raise SystemExit(f"refusing comparison: {name} is missing metadata: {', '.join(missing)}")
     for key in required - {"samples", "migration_ledger", "build_configuration", "expected_case_surface_set"}:
         if not _metadata_has_values(run[key]):
             raise SystemExit(f"refusing comparison: {name} has empty metadata: {key}")
+    for field in ("started_at_unix", "completed_at_unix"):
+        value=run[field]
+        if type(value) not in (int,float) or not math.isfinite(value): raise SystemExit(f"refusing comparison: {name} invalid interval")
+    if run["started_at_unix"] > run["completed_at_unix"]: raise SystemExit(f"refusing comparison: {name} reversed interval")
     freshness = run["fixture_validation"]
     shape = {"transcript_count", "freshness_batch_size", "locator_orphans", "missing_physical_rows", "unlocated_physical_rows"}
     if not isinstance(freshness, dict) or set(freshness) != shape or any(type(v) is not int for v in freshness.values()) or freshness["transcript_count"] < 0 or freshness["freshness_batch_size"] <= 0 or any(freshness[k] != 0 for k in shape - {"transcript_count", "freshness_batch_size"}):
@@ -942,7 +959,9 @@ def _validate_run(run: dict, name: str) -> dict:
             v=p["policy"]
             assert set(v)=={"scope","visibility","grouping","match_mode","limit","lexical_expression"}
             assert type(v["limit"]) is int and v["limit"]>0
-            assert isinstance(v["scope"],str) and v["scope"] and v["visibility"] in {"All", "UserTopLevel"} and v["grouping"] and v["match_mode"] and v["lexical_expression"]
+            assert isinstance(v["scope"],str) and v["scope"] and v["visibility"] in {"All", "UserTopLevel"} and v["grouping"] in {"None", "BestPerConversation"} and v["match_mode"] in {"ExactTerms", "FinalTokenPrefix"} and isinstance(v["lexical_expression"], str) and v["lexical_expression"]
+            scope = v["scope"]
+            assert scope == "Global" or re.fullmatch(r'(?:Conversations|GlobalExcluding)\(\[.*\]\)', scope)
     except (AssertionError,KeyError,TypeError): raise SystemExit(f"refusing comparison: {name} invalid case policies")
     build = run["build_configuration"]
     if not isinstance(build, dict) or any(
@@ -1006,7 +1025,7 @@ def compare(args) -> int:
         raise SystemExit("refusing comparison: same-host run intervals overlap")
     if a["run_uuid"] == b["run_uuid"]:
         raise SystemExit("refusing comparison: same execution identity")
-    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "fixture_validation", "measurement_regimes")
+    keys = ("fixture_sha256", "schema_digest", "migration_ledger", "scenario_digest", "profile", "warmup_runs", "measured_warm_runs", "environment", "sqlite_pragmas", "runtime", "explain_enabled", "build_configuration", "expected_case_surface_set", "case_policies", "tool_oracle_regime", "fixture_validation", "measurement_digest", "measurement_regimes")
     if any(a.get(key) != b.get(key) for key in keys):
         raise SystemExit("refusing comparison: fixture, scenarios, profile, or full measurement regime differ")
     if validated_a["phases"].keys() != validated_b["phases"].keys() or set(map(tuple, a["expected_case_surface_set"])) != set(map(tuple, validated_a["phases"])):

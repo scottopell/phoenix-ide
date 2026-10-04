@@ -34,8 +34,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "runtime": {"worker_threads": 2}, "explain_enabled": False,
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}, "cargo_config_hashes":{}},
             "expected_case_surface_set": [["case", "tool"]],
-            "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"global","visibility":"All","grouping":"messages","match_mode":"NaturalLanguageRecall","lexical_expression":"x"}}],
-            "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
+            "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20,"scope":"Global","visibility":"All","grouping":"None","match_mode":"FinalTokenPrefix","lexical_expression":"x"}}],
+            "measurement_digest":"harness", "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
             "explain_plans": [], "samples": samples,
             "fixture_validation":{"transcript_count":1,"freshness_batch_size":64,"locator_orphans":0,"missing_physical_rows":0,"unlocated_physical_rows":0}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
@@ -151,6 +151,14 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit,"WAL capture requires"):
                 bench.snapshot(type("Args",(),{"artifacts":str(artifact),"source":str(source),"force":False,"busy_timeout":1,"deadline":10,"retries":1})())
             self.assertEqual({p.name for p in parent.iterdir()if p!=artifact},initial)
+
+    def test_intervals_policies_and_harness_digest_are_checked(self):
+        for start,end in [(3,2),(float("nan"),4),(True,4)]:
+            run=self._complete_run(started_at_unix=start,completed_at_unix=end)
+            with self.assertRaisesRegex(SystemExit,"interval"):bench._validate_run(run,"bad")
+        run=self._complete_run();run["case_policies"][0]["policy"]["grouping"]="unknown"
+        with self.assertRaisesRegex(SystemExit,"policies"):bench._validate_run(run,"bad")
+        self.assertEqual(len(bench._measurement_digest()),64)
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
