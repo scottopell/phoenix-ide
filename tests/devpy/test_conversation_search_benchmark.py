@@ -48,7 +48,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d).resolve()
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            (repo / ".gitignore").write_text("private/*\n")
+            (repo / ".gitignore").write_text("private/\n")
             with mock.patch.object(bench, "__file__", str(repo / "scripts" / "helper.py")):
                 bench._ensure_ignored_artifacts(repo / "private")
                 (repo / ".gitignore").write_text("private/captured.db\nprivate/capture-manifest.json\nprivate/scenarios.json\nprivate/report.md\nprivate/runs/\n")
@@ -209,6 +209,12 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             (base/"b/.cargo/config.toml").write_text("[build]\njobs=3\n")
             with mock.patch.object(bench,"__file__",str(base/"b/scripts/helper.py")),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
                 self.assertNotEqual(recorded[0],bench._build_configuration()["cargo_config_hashes"])
+
+    def test_dangling_private_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);target=root/"external";link=root/"report.md";link.symlink_to(target)
+            with self.assertRaisesRegex(SystemExit,"symlink"):bench._write_private(link,"private")
+            self.assertFalse(target.exists())
 
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:

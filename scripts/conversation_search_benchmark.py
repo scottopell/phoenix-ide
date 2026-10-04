@@ -41,7 +41,7 @@ LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 def _private(path: Path) -> None:
     """Create a private directory and reject symlinked artifact roots."""
-    if path.exists() and path.is_symlink():
+    if path.is_symlink():
         raise SystemExit(f"refusing symlinked artifact directory: {path}")
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
@@ -70,7 +70,7 @@ def _label(label: str) -> str:
 
 
 def _write_private(path: Path, text: str) -> None:
-    if path.exists() and path.is_symlink():
+    if path.is_symlink():
         raise SystemExit(f"refusing symlinked private artifact: {path}")
     path.write_text(text)
     os.chmod(path, 0o600)
@@ -98,6 +98,8 @@ def _ensure_ignored_artifacts(outdir: Path) -> None:
         return
     if not relative.parts:
         raise SystemExit("refusing to write benchmark artifacts in the repository root")
+    root_check = subprocess.run(["git", "check-ignore", "--quiet", str(relative) + "/"], cwd=repo)
+    if root_check.returncode: raise SystemExit("refusing unignored dedicated artifact root; ignore the entire directory")
     paths = [
         outdir / "__private_staged_probe__",
         outdir / "captured.db",
