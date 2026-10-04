@@ -24,7 +24,7 @@ Exact queries for the observed slow calls; deployed build/version versus benchma
 
 ### 1. Capture and identify a safe fixture
 
-- Add an explicit snapshot command through `./dev.py`. Use SQLite's supported online backup mechanism with a read-only source connection and bounded busy/retry handling. Capture committed WAL state consistently; never checkpoint, migrate, reconcile, vacuum, or otherwise write to production. Fail clearly rather than falling back to a raw live-file copy.
+- Ingest an explicitly supplied, operator-attested consistent OFFLINE standalone snapshot through `./dev.py`; refuse live production paths/inode aliases and source WAL/SHM/journal sidecars before SQLite open. Never raw-copy a live SQLite main file. This supported boundary supersedes the originally approved online-capture design after user-authorized safety adjudication.
 - Check available disk space for the snapshot plus any working copy. Put database, manifests, scenario inputs, and raw results in a private, ignored local artifact directory, outside production paths. Do not commit or upload the database, transcripts, snippets, or private query text.
 - Complete capture atomically; reject incomplete fixtures. Run integrity checks on the snapshot, not on production. Record capture time, snapshot hash/size, schema/migration identity, SQLite/FTS version, and corpus/index counts.
 - Keep the captured fixture immutable. Any migrations or reconciliation needed by the benchmark checkout occur only on an explicit disposable copy, outside measurement; record the changes and distinguish captured versus prepared fixture hashes. Preserve the captured FTS index by default: no unreported rebuild, ANALYZE, or optimization before baseline.
@@ -68,7 +68,7 @@ Use the tool's actual global exclusions and result limit for primary tool cases.
 
 ## Acceptance criteria
 
-- A consistent, private full-production snapshot can be captured while production remains running, without modifying the live DB or activating cloned workflows.
+- An operator-provided consistent offline production snapshot can be privately ingested and verified without activating cloned workflows. The original live-online-capture acceptance is withdrawn: standard mode=ro may modify SQLite SHM coordination bytes and cannot support the promised zero-filesystem-write boundary.
 - One documented command benchmarks actual search code against a fixed identified fixture in release mode; a later rerun reuses that fixture rather than silently recapturing production.
 - Representative cases include exact observed slow queries, broad/selective/no-hit behavior, and a scoped comparison.
 - Baseline contains raw repeated samples, separate first-use/warm results, environment identity, output checks, and exact-query diagnostic plans.
@@ -96,4 +96,8 @@ Two actual release suites pass on measured source fe2f6a506, execution136.98s/13
 
 The 19s live symptom is NOT reproduced in full: idle warmed fixture shows ~1.68s versus prod19.058s, with deployed-build/live-contention/cache parity unknown. No speedup claim. Strongest plan anomaly: scoped816-message search ~4.4s starts locator-first with repeated rowid/MATCH FTS while global starts FTS-first. Recommend one bounded scope-query-plan experiment preserving scope before LIMIT/output, then per-candidate projection/count investigation and live contention correlation. No optimization implemented.
 
-Validation now:12synthetic Python tests; two release baseline tests + diagnostic run; focused coordinator_tools/global_read release tests; Rust test-target compilation; dev.py cargo-fmt/task lanes. Full workspace tests/clippy not claimed. Full fingerprint freshness sweep and exact deployed PRAGMA/version parity remain limitations, not silent preparation changes. About12GiB free after execution. No live DB writes/application runtime/deployment/remote transfer occurred.
+Validation now:12synthetic Python tests; two release baseline tests + diagnostic run; focused coordinator_tools/global_read release tests; Rust test-target compilation; dev.py cargo-fmt/task lanes. Full workspace tests/clippy not claimed. Full fingerprint freshness sweep and exact deployed PRAGMA/version parity remain limitations, not silent preparation changes. About12GiB free after execution. No application-data mutation, application runtime, deployment or remote transfer occurred. Historical live capture may have changed SQLite-owned SHM coordination bytes; this is not evidence application data changed. Current source refuses live input.
+
+## Final bounded qualification
+
+Source ff1d3b3d05eac5cd43da08c475f1d535b70d650e qualified all hosted CI lanes and exact-head review,58 synthetic tests. This task-only wording update preserves source equivalence. Supported rig is offline-input-only, plain host bundled release build, stable single-owner checkout; current setup/oracle regime is unmeasured. Historical actual063a/42740 paired evidence retained/publicsource refs, privatefixture/raws unchanged. No universalhermeticity/corruption/recovery/coldcache guarantee or extra campaign.
