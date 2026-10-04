@@ -79,7 +79,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "reserved"):
                     bench.run(type("Args", (), {"artifacts":str(root), "label":"different","timeout":10})())
                 return 0
-            with mock.patch.object(bench, "_run_reserved", side_effect=nested):
+            with mock.patch.object(bench,"_validate_before_run"), mock.patch.object(bench, "_run_reserved", side_effect=nested):
                 self.assertEqual(bench.run(args), 0)
             self.assertFalse((root / "runs" / ".active-run.reserved").exists())
 
@@ -279,6 +279,21 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         self.assertEqual(conn.execute('select count(*) from message_fts where message_fts match ?', ('"abcdef"',)).fetchone()[0],1)
         self.assertEqual(conn.execute('select count(*) from message_fts where message_fts match ?', ('"abcdef"*',)).fetchone()[0],1002)
 
+    def test_constrained_overrides_plans_and_missing_fixture(self):
+        for key in ["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER","CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER","CARGO_INCREMENTAL","CARGO_PROFILE_RELEASE_INCREMENTAL"]:
+            with mock.patch.dict("os.environ",{key:"custom"}):
+                with self.assertRaisesRegex(SystemExit,"overrides unsupported"):bench._build_configuration()
+        with self.assertRaisesRegex(SystemExit,"EXPLAIN"):
+            bench._validate_run(self._complete_run(explain_enabled=True,explain_plans=[]),"bad")
+        run=self._complete_run(explain_enabled=True)
+        run["explain_plans"]=[{"case_id":"case","surface":"tool","query":"q","policy":run["case_policies"][0]["policy"],"plan":["SCAN message_fts"]}]
+        bench._validate_run(run,"valid")
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/"capture-manifest.json").write_text(json.dumps({"kind":"conversation-search-fixture"}))
+            with self.assertRaisesRegex(SystemExit,"existing fixture"):
+                bench.run(type("Args",(),{"timeout":10,"artifacts":str(root),"label":"x"})())
+            self.assertFalse((root/"runs").exists())
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
@@ -306,7 +321,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             previous = bench.signal.getsignal(bench.signal.SIGTERM)
             def interrupted(_):
                 bench.signal.getsignal(bench.signal.SIGTERM)(bench.signal.SIGTERM, None)
-            with mock.patch.object(bench, "_run_reserved", side_effect=interrupted):
+            with mock.patch.object(bench,"_validate_before_run"), mock.patch.object(bench, "_run_reserved", side_effect=interrupted):
                 with self.assertRaises(KeyboardInterrupt): bench.run(args)
             self.assertIs(bench.signal.getsignal(bench.signal.SIGTERM), previous)
             self.assertFalse((root / "runs" / ".active-run.reserved").exists())
