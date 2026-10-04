@@ -810,7 +810,16 @@ def activate(manifest: Manifest) -> str:
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
-                write_status(manifest, "activation_failed_rollback_failed", failure=failure, rollback_failure=str(rollback_exc))
+                rollback_failure = str(rollback_exc)
+                if manifest.paired_database_upgrade is not None:
+                    try:
+                        launchctl.stop()
+                        observed = launchctl.inspect()
+                        if observed["state"] != "not_loaded" or observed["pid"] is not None:
+                            raise ActivationError("failed paired recovery teardown is unconfirmed")
+                    except Exception as teardown_exc:
+                        rollback_failure += f"; recovery teardown failed: {teardown_exc}"
+                write_status(manifest, "activation_failed_rollback_failed", failure=failure, rollback_failure=rollback_failure)
                 return "activation_failed_rollback_failed"
         finally:
             for prepared in prepared_installs:

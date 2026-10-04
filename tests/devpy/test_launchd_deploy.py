@@ -207,7 +207,7 @@ class ActivationTests(unittest.TestCase):
         )
         return manifest, database, target_binary, target_plist, copied_helper
 
-    def _activate_full_paired(self, root: Path, *, health_failure=None, stop_failure=None, lsof=None, corrupt_backup=False):
+    def _activate_full_paired(self, root: Path, *, health_failure=None, stop_failure=None, lsof=None, corrupt_backup=False, predecessor_health_failure=None, predecessor_start_failure=None):
         import sqlite3
 
         manifest, database, target_binary, target_plist, copied_helper = self._full_paired_fixture(root)
@@ -246,6 +246,8 @@ class ActivationTests(unittest.TestCase):
                         conn.execute("UPDATE users SET name = 'candidate' WHERE id = 1")
                 self.pid += 1
                 self.loaded = True
+                if self.starts == 2 and predecessor_start_failure is not None:
+                    raise predecessor_start_failure
                 return self.pid
 
         launchctl = PairedFakeLaunchctl(manifest)
@@ -256,6 +258,8 @@ class ActivationTests(unittest.TestCase):
                     Path(manifest.paired_database_upgrade.backup_path).write_bytes(b"corrupt")
                 if failure is not None:
                     raise failure
+            elif predecessor_health_failure is not None:
+                raise predecessor_health_failure
 
         lsof_result = lsof or subprocess.CompletedProcess([], 1, "", "")
         with mock.patch.object(helper, "__file__", str(copied_helper)), \
@@ -299,6 +303,16 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual(manifest.transaction_id, claim.read_text().strip())
             self.assertEqual("activation_failed_rolled_back", json.loads(Path(manifest.status_path).read_text())["state"])
 
+    def test_paired_failed_predecessor_verification_or_loaded_transition_tears_down_job(self):
+        for failure_option in ("predecessor_health_failure", "predecessor_start_failure"):
+            with self.subTest(failure_option=failure_option), tempfile.TemporaryDirectory() as td:
+                result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate health failed"), **{failure_option: helper.ActivationError("recovery verification failed")})
+                state, manifest, *_rest, events, launchctl = result
+                self.assertEqual(state, "activation_failed_rollback_failed")
+                self.assertEqual(events, ["stop", "start", "stop", "start", "stop"])
+                self.assertFalse(launchctl.loaded)
+                self.assertFalse(helper.status_is_durable_terminal(manifest))
+
     def test_full_paired_activate_snapshot_failure_does_not_start_predecessor(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
             helper, "create_database_backup", side_effect=helper.ActivationError("snapshot failed")
@@ -306,7 +320,7 @@ class ActivationTests(unittest.TestCase):
             result = self._activate_full_paired(Path(td))
         state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
         self.assertEqual("activation_failed_rollback_failed", state)
-        self.assertEqual(["stop", "stop"], events)
+        self.assertEqual(["stop", "stop", "stop"], events)
         self.assertEqual(0, launchctl.starts)
 
     def test_full_paired_activate_restore_corruption_does_not_start_predecessor(self):
@@ -316,7 +330,7 @@ class ActivationTests(unittest.TestCase):
             )
         state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
         self.assertEqual("activation_failed_rollback_failed", state)
-        self.assertEqual(["stop", "start", "stop"], events)
+        self.assertEqual(["stop", "start", "stop", "stop"], events)
         self.assertEqual(1, launchctl.starts)
 
     def test_full_paired_activate_candidate_stop_failure_does_not_start_predecessor(self):
@@ -327,7 +341,7 @@ class ActivationTests(unittest.TestCase):
             )
         state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
         self.assertEqual("activation_failed_rollback_failed", state)
-        self.assertEqual(["stop", "start", "stop"], events)
+        self.assertEqual(["stop", "start", "stop", "stop"], events)
         self.assertEqual(1, launchctl.starts)
 
     def test_full_paired_activate_lsof_warning_after_stop_does_not_start_predecessor(self):
@@ -337,7 +351,7 @@ class ActivationTests(unittest.TestCase):
             )
         state, _manifest, _database, _target_binary, _target_plist, _old_binary, _old_plist, _claim, events, launchctl = result
         self.assertEqual("activation_failed_rollback_failed", state)
-        self.assertEqual(["stop", "stop"], events)
+        self.assertEqual(["stop", "stop", "stop"], events)
         self.assertEqual(0, launchctl.starts)
 
     def test_paired_lsof_warning_cannot_prove_ownership_without_leaking_stderr(self):
