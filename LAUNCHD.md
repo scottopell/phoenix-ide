@@ -102,10 +102,16 @@ that transaction or restart blindly. Inspect the proof, run SQLite integrity
 checks offline, and restore the matching predecessor binary, plist, and database
 before starting it.
 
-For a retained `activation_failed_rollback_failed` transaction, never remove the
+For a paired transaction interrupted in `prepared`/`activating`, with missing
+status, or retained in `activation_failed_rollback_failed`, never remove the
 active marker merely because its helper exited. Repair the named failed proof,
 then run `./dev.py prod recover-paired TRANSACTION_ID`. This hands recovery to the
 byte-bound retained helper, which verifies offline ownership and snapshot/context,
 restores the matching database/binary/plist, and verifies predecessor identity
 before claim release. Any unverified recovery attempts teardown and retains the
 claim. The command is not a general downgrade or an activation retry.
+Before a snapshot proof exists, recovery is permitted only after verifying that
+the installed runtime/configuration still match the captured predecessor and the
+exclusively owned database remains legacy. It then creates a verified offline
+snapshot before restoring/restarting. A missing proof with changed runtime or
+modern database fails closed; it is not permission to discard the ownership fence.

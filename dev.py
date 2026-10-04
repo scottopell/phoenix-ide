@@ -9799,8 +9799,14 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     try:
         status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     except (OSError, json.JSONDecodeError):
-        return None
-    if status is not None and status.get("transaction_id") == owner and status.get("source_kind") == "prepared_artifact" and status.get("state") == "activation_failed_rollback_failed":
+        status = {}
+    try:
+        manifest = json.loads((LAUNCHD_DEPLOY_DIR / "transactions" / owner / "manifest.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+    paired = manifest.get("paired_database_upgrade") is not None or manifest.get("source_kind") == "prepared_artifact" or status.get("source_kind") == "prepared_artifact"
+    resolved = status.get("transaction_id") == owner and status.get("state") in {"committed", "precondition_failed", "activation_failed_rolled_back"}
+    if paired and not resolved:
         return (
             f"paired recovery for {owner} is unverified. Do not remove its active marker or start any runtime. "
             "Preserve the private snapshot/proof and matching predecessor binary/config. "
@@ -10000,7 +10006,7 @@ def _helper_plist(
 
 
 def cmd_prod_recover_paired(transaction_id: str) -> None:
-    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9_-]+", transaction_id):
+    if sys.platform != "darwin" or not re.fullmatch(r"[A-Za-z0-9._-]+", transaction_id) or transaction_id in {".", ".."}:
         raise SystemExit("paired recovery requires macOS and a safe transaction ID")
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     manifest_path = staging / "manifest.json"

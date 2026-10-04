@@ -289,7 +289,7 @@ rule PreserveRollbackFailure {
 
 rule RecoverRetainedPairedTransaction {
     when: PairedRecoveryVerified(transaction, service)
-    requires: transaction.state = activation_failed_rollback_failed
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
     requires: transaction.source_kind = prepared_artifact
     requires: active_claim_retained(transaction)
     requires: paired_predecessor_start_order_is_valid(transaction)
@@ -300,8 +300,9 @@ rule RecoverRetainedPairedTransaction {
 
 rule PreservePreparedRecoveryFailure {
     when: RollbackFailed(transaction, failure, rollback_failure)
-    requires: transaction.state = activating
+    requires: transaction.state in { prepared, activating, activation_failed_rollback_failed }
     requires: transaction.source_kind = prepared_artifact
+    ensures: transaction.state = activation_failed_rollback_failed
     ensures: candidate_teardown_attempted(transaction)
     ensures: paired_transaction_retained(transaction)
     ensures: recovery_verification_unconfirmed(transaction)

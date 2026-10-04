@@ -958,11 +958,34 @@ def recover_paired(manifest: Manifest) -> str:
         if manifest.paired_database_upgrade is None:
             raise ActivationError("paired recovery requires a paired transaction")
         claim = Path(manifest.active_path)
-        status = json.loads(Path(manifest.status_path).read_text())
-        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id") != manifest.transaction_id or status.get("state") != "activation_failed_rollback_failed":
-            raise ActivationError("paired recovery must own the retained failed transaction")
+        try:
+            status = json.loads(Path(manifest.status_path).read_text())
+        except (OSError, json.JSONDecodeError):
+            status = {}
+        if claim.read_text().strip() != manifest.transaction_id or status.get("transaction_id", manifest.transaction_id) != manifest.transaction_id or status.get("state") not in {None, "prepared", "activating", "activation_failed_rollback_failed"}:
+            raise ActivationError("paired recovery must own a retained unresolved transaction")
         launchctl = Launchctl(manifest)
         try:
+            paired = manifest.paired_database_upgrade
+            if not Path(paired.proof_path).exists():
+                if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256 or sha256(Path(manifest.target_plist)) != manifest.rollback_plist_sha256:
+                    raise ActivationError("interrupted transaction has no snapshot proof and runtime changes are unresolved")
+                launchctl.stop()
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("interrupted predecessor stop is unconfirmed")
+                assert_database_exclusive(manifest)
+                validate_legacy_database(Path(paired.database_path))
+                backup = Path(paired.backup_path)
+                restore_capacity = _restore_capacity_path(manifest, Path(paired.database_path))
+                required = _source_capacity_bytes(Path(paired.database_path))
+                for destination in (backup, restore_capacity):
+                    if not destination.exists():
+                        _allocate_private_sqlite(destination, required)
+                    _regular_nosymlink(destination, "interrupted capacity")
+                reservation = DatabaseCapacityReservation(backup, restore_capacity, required)
+                _reservation_still_sufficient(manifest, reservation)
+                create_database_backup(manifest, reservation)
             restore(manifest, launchctl, None)
             write_status(manifest, "activation_failed_rolled_back", failure=status.get("failure"))
             return "activation_failed_rolled_back"

@@ -319,6 +319,9 @@ class ActivationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"), predecessor_health_failure=helper.ActivationError("recovery failed"))
             _state, manifest, database, *_rest, launchctl = result
+            status = json.loads(Path(manifest.status_path).read_text())
+            status["state"] = "activating"
+            Path(manifest.status_path).write_text(json.dumps(status))
             with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=launchctl), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_deployed_sha"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
                 self.assertEqual(helper.recover_paired(manifest), "activation_failed_rolled_back")
                 self.assertTrue(helper.status_is_durable_terminal(manifest))
@@ -327,6 +330,31 @@ class ActivationTests(unittest.TestCase):
             import sqlite3
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute("SELECT MAX(version) FROM _migrations").fetchone()[0], 69)
+
+    def test_repeated_recovery_failure_retains_claim_and_stops_unverified_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._activate_full_paired(Path(td), health_failure=helper.ActivationError("candidate failed"), predecessor_health_failure=helper.ActivationError("recovery failed"))
+            _state, manifest, _database, *_rest, backend = result
+            with mock.patch.object(helper, "__file__", manifest.paired_database_upgrade.controller_helper_path), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("recovery failed again")), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                self.assertEqual(helper.recover_paired(manifest), "activation_failed_rollback_failed")
+            self.assertFalse(backend.loaded)
+            self.assertEqual(Path(manifest.active_path).read_text().strip(), manifest.transaction_id)
+            self.assertFalse(helper.status_is_durable_terminal(manifest))
+
+    def test_interrupted_pre_snapshot_recovery_only_restores_unchanged_legacy(self):
+        for phase in ("prepared", "activating", None):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:
+                manifest, database, _binary, _plist, copied_helper = self._full_paired_fixture(Path(td))
+                Path(manifest.active_path).write_text(manifest.transaction_id + "\n")
+                if phase is not None:
+                    helper.write_status(manifest, phase)
+                backend = FakeLaunchctl(manifest)
+                backend.inspect = mock.Mock(return_value=("not_loaded", None))
+                with mock.patch.object(helper, "__file__", str(copied_helper)), mock.patch.object(helper, "Launchctl", return_value=backend), mock.patch.object(helper, "wait_for_identity"), mock.patch.object(helper, "restore_deployed_sha"), mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                    outcome = helper.recover_paired(manifest)
+                    self.assertEqual(outcome, "activation_failed_rolled_back", Path(manifest.status_path).read_text())
+                    self.assertTrue(Path(manifest.paired_database_upgrade.proof_path).exists())
+                    self.assertTrue(helper.status_is_durable_terminal(manifest))
 
     def test_paired_capacity_failure_occurs_before_any_stop(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(helper, "reserve_database_capacity", side_effect=helper.ActivationError("insufficient capacity")), mock.patch.object(helper, "Launchctl") as backend:
@@ -1066,17 +1094,38 @@ class PreparationTests(unittest.TestCase):
                     self.assertNotIn("remove the marker", str(error.exception))
                     self.assertEqual(active.read_text(), "broken-pair\n")
 
+    def test_interrupted_paired_manifest_fences_deploy_and_restart_without_terminal_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = root / "transactions" / "interrupted" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"source_kind": "prepared_artifact", "paired_database_upgrade": {"database_path": "retained"}}))
+            active = root / "active"
+            active.write_text("interrupted\n")
+            status = root / "status.json"
+            for state in ("prepared", "activating", None):
+                if state is None:
+                    status.unlink(missing_ok=True)
+                else:
+                    status.write_text(json.dumps({"transaction_id": "interrupted", "state": state}))
+                with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "claim.lock"), mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", root / "restart"):
+                    for admission in (self.dev._claim_launchd_deploy, self.dev._claim_launchd_restart):
+                        with self.subTest(state=state, admission=admission.__name__), self.assertRaises(SystemExit) as error:
+                            admission("new")
+                        self.assertIn("Do not remove", str(error.exception))
+                        self.assertEqual(active.read_text(), "interrupted\n")
+
     def test_supported_recovery_handoff_uses_retained_helper_without_clearing_claim(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            transaction = root / "transactions" / "failed-pair"
+            transaction = root / "transactions" / "failed.pair"
             transaction.mkdir(parents=True)
             retained = transaction / "helper.py"
             retained.write_text("retained helper")
             payload = {"paired_database_upgrade": {"controller_helper_path": str(retained), "controller_helper_sha256": self.dev._file_sha256(retained)}, "helper_label": "com.phoenix-ide.deploy.failed-pair"}
             (transaction / "manifest.json").write_text(json.dumps(payload))
-            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed-pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 113, "", f'Could not find service "{payload["helper_label"]}" in domain for user gui: {os.getuid()}'), subprocess.CompletedProcess([], 0, "", "")]) as backend, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
-                self.dev.cmd_prod_recover_paired("failed-pair")
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root), mock.patch.object(self.dev, "_deploy_claim_owner", return_value="failed.pair"), mock.patch.object(self.dev, "_paired_recovery_refusal", return_value="retain claim"), mock.patch.object(self.dev.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 113, "", f'Could not find service "{payload["helper_label"]}" in domain for user gui: {os.getuid()}'), subprocess.CompletedProcess([], 0, "", "")]) as backend, mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
+                self.dev.cmd_prod_recover_paired("failed.pair")
                 release.assert_not_called()
                 plist = plistlib.loads((transaction / "recovery-helper.plist").read_bytes())
                 self.assertEqual(plist["ProgramArguments"][2], "recover-paired")
