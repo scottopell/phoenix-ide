@@ -109,7 +109,7 @@ describe('CoordinatorPage', () => {
     }]);
     renderPage();
     const activity = await screen.findByLabelText('Global activity settings');
-    expect(activity).toHaveTextContent('Watching 1');
+    await waitFor(() => expect(activity).toHaveTextContent('Watching 1'));
     expect(await screen.findByRole('region', { name: 'Active watches' })).toBeInTheDocument();
 
     expect(screen.getByRole('link', { name: 'Fix readable target' })).toHaveAttribute('href', '/product-conversations/product-readable');
