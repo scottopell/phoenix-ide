@@ -982,6 +982,7 @@ def _validate_run(run: dict, name: str) -> dict:
         for key in ("rustc_version_verbose", "cargo_version", "target", "profile", "features", "environment", "cargo_config_hashes")
     ):
         raise SystemExit(f"refusing comparison: {name} has invalid build configuration")
+    if any(not isinstance(build[field],str) or not build[field].strip() for field in ("rustc_version_verbose", "cargo_version", "target", "profile")): raise SystemExit("missing compiler identity")
     if not isinstance(run["samples"], list) or not run["samples"]:
         raise SystemExit(f"refusing comparison: {name} has no samples")
     expected_set = run["expected_case_surface_set"]
