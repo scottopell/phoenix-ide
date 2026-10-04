@@ -35,7 +35,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             "build_configuration": {"rustc_version_verbose": "rustc", "cargo_version": "cargo", "target": "host", "profile": "release", "features": [], "environment": {}},
             "expected_case_surface_set": [["case", "tool"]],
             "case_policies": [{"case_id":"case","surface":"tool","policy":{"limit":20}}],
-            "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":1.0, "completed_at_unix":2.0,
+            "run_uuid": __import__("uuid").uuid4().hex, "started_at_unix":float(__import__("time").time_ns()), "completed_at_unix":float(__import__("time").time_ns()),
             "explain_plans": [], "samples": samples,
             "fixture_validation":{"transcript_count":1,"freshness_batch_size":64,"locator_orphans":0,"missing_physical_rows":0,"unlocated_physical_rows":0}, "tool_oracle_regime":"none historical", "measurement_regimes":["first_use_fresh_pool_os_cache_uncontrolled", "warm"],
         }
@@ -404,7 +404,7 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
             before, after = root / "a.json", root / "b.json"
             base = self._complete_run()
             before.write_text(json.dumps(base))
-            after.write_text(json.dumps({**base, "run_uuid":"other", "runtime": {"worker_threads": 3}}))
+            after.write_text(json.dumps({**base, "run_uuid":"other", "started_at_unix":0.0,"completed_at_unix":1.0, "runtime": {"worker_threads": 3}}))
             with self.assertRaisesRegex(SystemExit, "regime"):
                 bench.compare(type("Args", (), {"before": str(before), "after": str(after)})())
 
