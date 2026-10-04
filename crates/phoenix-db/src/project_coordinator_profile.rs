@@ -672,11 +672,11 @@ mod tests {
             .contains("Project Coordinator profile requires ordinary ProductConversation"));
     }
 
-    #[tokio::test]
-    async fn profile_remains_editable_after_initial_user_segment_deleted() {
-        let db = Database::open_in_memory().await.expect("database");
-        let id = ordinary(&db, "pc-project-coordinator-continuation-survives").await;
-        let initial_conversation_id = format!("conv-{}", id.as_str());
+    async fn replace_initial_user_root_with_continuation(
+        db: &Database,
+        product_conversation_id: &ProductConversationId,
+    ) {
+        let initial_conversation_id = format!("conv-{}", product_conversation_id.as_str());
         let continuation_scope_id = "scope-continuation-survives";
         sqlx::query(
             "INSERT INTO work_scopes (
@@ -697,10 +697,11 @@ mod tests {
              VALUES (?1, ?2)",
         )
         .bind(continuation_scope_id)
-        .bind(id.as_str())
+        .bind(product_conversation_id.as_str())
         .execute(&db.pool)
         .await
         .expect("insert continuation scope owner");
+
         let mut tx = db.pool.begin().await.expect("begin continuation fixture");
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
@@ -712,7 +713,7 @@ mod tests {
              ) VALUES (?1, 'conv-continuation-survives', ?2)",
         )
         .bind(&initial_conversation_id)
-        .bind(id.as_str())
+        .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
         .await
         .expect("insert continuation reservation");
@@ -731,7 +732,7 @@ mod tests {
                        0, ?3, 'idle', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
                        '2026-01-01T00:00:00Z', 0, 1, 'gpt-5.5', 'en', 'direct')",
         )
-        .bind(id.as_str())
+        .bind(product_conversation_id.as_str())
         .bind(continuation_scope_id)
         .bind(serde_json::json!({ "type": "idle" }).to_string())
         .execute(&mut *tx)
@@ -747,15 +748,17 @@ mod tests {
         .expect("consume continuation reservation");
         tx.commit().await.expect("commit continuation fixture");
 
-        db.write_project_coordinator_profile(&id, Some("initial charter"), 0)
-            .await
-            .expect("create profile");
         sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(initial_conversation_id)
             .execute(&db.pool)
             .await
             .expect("delete initial segment row");
+    }
 
+    async fn assert_one_surviving_continuation_user_root(
+        db: &Database,
+        product_conversation_id: &ProductConversationId,
+    ) {
         let surviving_user_roots: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversations
              WHERE product_conversation_id = ?1
@@ -763,11 +766,23 @@ mod tests {
                AND parent_conversation_id IS NULL
                AND user_initiated = 0",
         )
-        .bind(id.as_str())
+        .bind(product_conversation_id.as_str())
         .fetch_one(&db.pool)
         .await
         .expect("count surviving continuation roots");
         assert_eq!(surviving_user_roots, 1);
+    }
+
+    #[tokio::test]
+    async fn profile_remains_editable_after_initial_user_segment_deleted() {
+        let db = Database::open_in_memory().await.expect("database");
+        let id = ordinary(&db, "pc-project-coordinator-continuation-survives").await;
+        db.write_project_coordinator_profile(&id, Some("initial charter"), 0)
+            .await
+            .expect("create profile");
+
+        replace_initial_user_root_with_continuation(&db, &id).await;
+        assert_one_surviving_continuation_user_root(&db, &id).await;
 
         let updated = db
             .write_project_coordinator_profile(&id, Some("updated charter"), 1)
@@ -779,7 +794,10 @@ mod tests {
             {
                 profile.revision()
             }
-            other => panic!("unexpected update outcome: {other:?}"),
+            other @ (ProjectCoordinatorProfileWriteOutcome::Saved(_)
+            | ProjectCoordinatorProfileWriteOutcome::Disabled { .. }) => {
+                panic!("unexpected update outcome: {other:?}")
+            }
         };
 
         let disabled = db
@@ -792,7 +810,10 @@ mod tests {
             {
                 revision
             }
-            other => panic!("unexpected disable outcome: {other:?}"),
+            other @ (ProjectCoordinatorProfileWriteOutcome::Saved(_)
+            | ProjectCoordinatorProfileWriteOutcome::Disabled { .. }) => {
+                panic!("unexpected disable outcome: {other:?}")
+            }
         };
 
         let reenabled = db
