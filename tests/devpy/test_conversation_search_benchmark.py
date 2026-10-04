@@ -197,6 +197,19 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
         run=self._complete_run();run["environment"]["cpu_count"]="0"
         with self.assertRaisesRegex(SystemExit,"environment values"):bench._validate_run(run,"bad")
 
+    def test_project_cargo_config_identity_is_relative_and_hash_sensitive(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);recorded=[]
+            for name in ("a","b"):
+                repo=base/name;(repo/".cargo").mkdir(parents=True);(repo/".cargo/config.toml").write_text("[build]\njobs=2\n")
+                with mock.patch.object(bench,"__file__",str(repo/"scripts/helper.py")),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+                    recorded.append(bench._build_configuration()["cargo_config_hashes"])
+            self.assertEqual(recorded[0],recorded[1])
+            self.assertIn("project/.cargo/config.toml",recorded[0])
+            (base/"b/.cargo/config.toml").write_text("[build]\njobs=3\n")
+            with mock.patch.object(bench,"__file__",str(base/"b/scripts/helper.py")),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+                self.assertNotEqual(recorded[0],bench._build_configuration()["cargo_config_hashes"])
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"

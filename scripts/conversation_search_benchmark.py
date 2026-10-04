@@ -163,7 +163,7 @@ def _build_configuration() -> dict:
     config_paths = [cargo_home / "config", cargo_home / "config.toml"]
     project = Path(__file__).parents[1].resolve()
     config_paths += [parent / ".cargo" / name for parent in [project, *project.parents] for name in ("config", "config.toml")]
-    config_hashes = {str(path): _hash(path) for path in config_paths if path.is_file()}
+    config_hashes = {("project/" + str(path.relative_to(project)) if path.is_relative_to(project) else str(path)): _hash(path) for path in config_paths if path.is_file()}
     return {
         "cargo_config_hashes": config_hashes,
         "rustc_version_verbose": rustc,
