@@ -185,7 +185,7 @@
 
 @media (width <= 768px) {
   .global-statebar-summary {
-    gap: 6px;
-    font-size: max(0.72rem, 11px);
+    gap: 4px;
+    font-size: max(0.68rem, 10px);
   }
 }
