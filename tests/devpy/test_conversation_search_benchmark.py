@@ -294,6 +294,12 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                 bench.run(type("Args",(),{"timeout":10,"artifacts":str(root),"label":"x"})())
             self.assertFalse((root/"runs").exists())
 
+    def test_cargo_config_runner_is_refused_without_resolution(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo=Path(d);(repo/".cargo").mkdir();(repo/".cargo/config.toml").write_text('[target.x86_64_unknown_linux_gnu]\nrunner="custom"\n')
+            with mock.patch.object(bench,"__file__",str(repo/"scripts/helper.py")),mock.patch.object(bench.subprocess,"check_output",return_value="host: test"):
+                with self.assertRaisesRegex(SystemExit,"configuration unsupported"):bench._build_configuration()
+
     def test_atomic_replacement_failure_preserves_previous_manifest(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "scenarios.json"
@@ -485,6 +491,8 @@ class ConversationSearchBenchmarkTests(unittest.TestCase):
                     return None
 
             def fake_popen(*args, **kwargs):
+                blocked=bench.signal.pthread_sigmask(bench.signal.SIG_BLOCK, set())
+                self.assertTrue({bench.signal.SIGTERM,bench.signal.SIGHUP,bench.signal.SIGINT}.issubset(blocked))
                 self.assertIn("PHOENIX_SEARCH_BENCH_SCHEMA_DIGEST", kwargs["env"])
                 self.assertIn("PHOENIX_SEARCH_BENCH_MIGRATION_LEDGER", kwargs["env"])
                 Path(kwargs["env"]["PHOENIX_SEARCH_BENCH_OUT"]).write_text(json.dumps(self._complete_run()))
